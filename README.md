@@ -59,6 +59,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** first implementation slice — blueprint JSON and per-agent `.env` rendering with golden-file tests.
 - **2026-05-03:** second slice — `doctor.py` (read-only environment probe; resolves §10 Q7 — `atk` vs `a365` variant detection).
 - **2026-05-03:** third slice — `secrets.py` (OS-keychain wrapper; resolves §10 Q3 — macOS `security` and Linux `secret-tool`).
+- **2026-05-03:** fourth slice — reconcilers (`deep_diff` in `_common.py`, `reconcile_app.py`, `reconcile_blueprint.py`) producing `create`/`noop`/`patch`/`abort` plans against captured `a365 query-entra` JSON.
 
 ## Development
 
@@ -112,9 +113,9 @@ uv run python scripts/render_instance_env.py \
 | `_common.py` shared helpers (Jinja env, `safe_run`, `tcp_reachable`, `parse_env`) | done |
 | `doctor.py` (env probe — resolves §10 Q7) | done |
 | `secrets.py` (OS-keychain wrapper — resolves §10 Q3) | done |
+| `reconcile_app.py`, `reconcile_blueprint.py` (idempotent diff/plan) | done |
 | Adaptive Card templates | TODO |
 | Consent URL template | TODO |
-| `reconcile_app.py`, `reconcile_blueprint.py` | TODO |
 | `status.py` | TODO |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
 | `references/` content | TODO |

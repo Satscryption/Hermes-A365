@@ -78,6 +78,88 @@ def parse_env(text: str) -> dict[str, str]:
     return out
 
 
+def deep_diff(
+    actual: object,
+    desired: object,
+    *,
+    path: str = "",
+) -> dict[str, tuple[object, object]]:
+    """Compare two JSON-like structures; return differing leaf paths.
+
+    Returns a mapping ``{path: (actual_value, desired_value)}`` for every leaf
+    that differs. Used by the reconcilers to produce idempotent PATCH plans
+    against A365's blueprint and Entra app state.
+
+    Path notation:
+    - ``""`` for the root
+    - ``"foo"`` for a top-level dict key
+    - ``"foo/bar"`` for a nested dict key
+    - ``"items[3]"`` for a list index
+
+    Comparison semantics:
+    - Type mismatch is treated as a single root-level diff (no recursion).
+    - Lists are compared **positionally**; reordered lists report each
+      differing index. Callers that want set-comparison semantics for
+      specific paths should sort their inputs before calling.
+    - ``bool`` is *not* equal to its int form: ``True != 1`` here, even
+      though Python's ``==`` says otherwise. This matters for JSON round-trips.
+    """
+    # bool is a subclass of int in Python but they're distinct in JSON.
+    if isinstance(actual, bool) != isinstance(desired, bool):
+        key = path or "$"
+        return {key: (actual, desired)}
+
+    # Different container types (e.g. dict vs list, list vs str) → root diff.
+    if type(actual) is not type(desired):
+        key = path or "$"
+        return {key: (actual, desired)}
+
+    if isinstance(desired, dict):
+        assert isinstance(actual, dict)
+        keys = sorted(set(actual.keys()) | set(desired.keys()))
+        out: dict[str, tuple[object, object]] = {}
+        for k in keys:
+            child = f"{path}/{k}" if path else str(k)
+            if k not in actual:
+                out[child] = (None, desired[k])
+            elif k not in desired:
+                out[child] = (actual[k], None)
+            else:
+                out.update(deep_diff(actual[k], desired[k], path=child))
+        return out
+
+    if isinstance(desired, list):
+        assert isinstance(actual, list)
+        if len(actual) != len(desired):
+            key = path or "$"
+            return {key: (actual, desired)}
+        out = {}
+        for i, (a, d) in enumerate(zip(actual, desired, strict=True)):
+            out.update(deep_diff(a, d, path=f"{path}[{i}]"))
+        return out
+
+    if actual != desired:
+        key = path or "$"
+        return {key: (actual, desired)}
+    return {}
+
+
+def render_diff_human(diff: dict[str, tuple[object, object]]) -> str:
+    """Render a deep_diff result as a human-friendly multi-line string.
+
+    Empty diff renders as ``"(no differences)"``. Each line is one path with
+    the actual → desired transition.
+    """
+    if not diff:
+        return "(no differences)"
+    lines = []
+    width = max(len(p) for p in diff)
+    for path in sorted(diff):
+        actual, desired = diff[path]
+        lines.append(f"  {path:<{width}}  {actual!r} -> {desired!r}")
+    return "\n".join(lines)
+
+
 def jinja_env(*, extra_searchpaths: list[Path] | None = None) -> jinja2.Environment:
     """Construct a Jinja environment rooted at ``templates/``.
 
