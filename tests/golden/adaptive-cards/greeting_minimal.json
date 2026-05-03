@@ -1,0 +1,19 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "body": [
+    {
+      "size": "Large",
+      "text": "Hermes agent ready",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "text": "Ask me about your inbox, calendar, or M365 data.",
+      "type": "TextBlock",
+      "wrap": true
+    }
+  ],
+  "type": "AdaptiveCard",
+  "version": "1.6"
+}

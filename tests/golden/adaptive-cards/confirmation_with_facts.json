@@ -1,0 +1,33 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "body": [
+    {
+      "color": "Good",
+      "size": "Medium",
+      "text": "Reply sent",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "text": "Your reply has been delivered.",
+      "type": "TextBlock",
+      "wrap": true
+    },
+    {
+      "facts": [
+        {
+          "title": "Recipient",
+          "value": "team@contoso.com"
+        },
+        {
+          "title": "Subject",
+          "value": "Q2 plan"
+        }
+      ],
+      "type": "FactSet"
+    }
+  ],
+  "type": "AdaptiveCard",
+  "version": "1.6"
+}

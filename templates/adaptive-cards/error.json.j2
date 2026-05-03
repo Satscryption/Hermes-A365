@@ -1,0 +1,30 @@
+{# Adaptive Card v1.6 — error display.
+   Variables: heading (str), message (str), detail (str, optional).
+   Body builder: scripts/emit_card.py::emit_error. #}
+{
+  "type": "AdaptiveCard",
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "version": "1.6",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": {{ heading | tojson }},
+      "size": "Medium",
+      "weight": "Bolder",
+      "color": "Attention",
+      "wrap": true
+    },
+    {
+      "type": "TextBlock",
+      "text": {{ message | tojson }},
+      "wrap": true
+    }{% if detail %},
+    {
+      "type": "TextBlock",
+      "text": {{ detail | tojson }},
+      "wrap": true,
+      "isSubtle": true,
+      "spacing": "Small"
+    }{% endif %}
+  ]
+}

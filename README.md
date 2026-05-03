@@ -61,6 +61,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** third slice — `secrets.py` (OS-keychain wrapper; resolves §10 Q3 — macOS `security` and Linux `secret-tool`).
 - **2026-05-03:** fourth slice — reconcilers (`deep_diff` in `_common.py`, `reconcile_app.py`, `reconcile_blueprint.py`) producing `create`/`noop`/`patch`/`abort` plans against captured `a365 query-entra` JSON.
 - **2026-05-03:** fifth slice — `status.py` orchestrating nine components (license, T1/T2 apps, blueprint, instance, channels, activity bridge, telemetry, FIC) into a single report; exit codes 0/1/2/3 per spec. `QuerySource` Protocol abstracts `a365 query-entra` so the command works end-to-end with or without a live `a365` CLI.
+- **2026-05-03:** sixth slice — Adaptive Card v1.6 templates (`greeting`, `confirmation`, `error`) under `templates/adaptive-cards/` plus `emit_card.py` builder with typed dataclass inputs. Golden-file tests verify JSON validity and round-trip stability.
 
 ## Development
 
@@ -116,7 +117,7 @@ uv run python scripts/render_instance_env.py \
 | `secrets.py` (OS-keychain wrapper — resolves §10 Q3) | done |
 | `reconcile_app.py`, `reconcile_blueprint.py` (idempotent diff/plan) | done |
 | `status.py` (per-component report; resolves SPEC §6.11) | done |
-| Adaptive Card templates | TODO |
+| Adaptive Card templates + `emit_card.py` (greeting / confirmation / error) | done |
 | Consent URL template | TODO |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
 | `references/` content | TODO |
@@ -154,6 +155,14 @@ uv run python scripts/status.py --human                    # markdown table
 uv run python scripts/status.py inbox-helper --human       # for a specific agent
 uv run python scripts/status.py                            # JSON to stdout
 echo $?                                                    # 0=ok, 1=partial, 2=broken, 3=uninitialized
+```
+
+Adaptive Card payloads can be emitted from the CLI for ad-hoc testing:
+
+```bash
+uv run python scripts/emit_card.py greeting --command "Summarise mail" --command "List events"
+uv run python scripts/emit_card.py confirmation --action "Reply sent" --fact "Recipient=team@contoso.com"
+uv run python scripts/emit_card.py error --heading "FIC expired" --message "Rotate now"
 ```
 
 ## License

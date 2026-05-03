@@ -1,0 +1,34 @@
+{# Adaptive Card v1.6 — initial greeting / capability listing.
+   Variables: heading (str), subtitle (str), commands (list[str]).
+   Body builder: scripts/emit_card.py::emit_greeting. #}
+{
+  "type": "AdaptiveCard",
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "version": "1.6",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": {{ heading | tojson }},
+      "size": "Large",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "type": "TextBlock",
+      "text": {{ subtitle | tojson }},
+      "wrap": true
+    }{% if commands %},
+    {
+      "type": "TextBlock",
+      "text": "Try one of:",
+      "spacing": "Medium",
+      "weight": "Bolder",
+      "wrap": true
+    }{% for cmd in commands %},
+    {
+      "type": "TextBlock",
+      "text": {{ ("• " ~ cmd) | tojson }},
+      "wrap": true
+    }{% endfor %}{% endif %}
+  ]
+}

@@ -1,0 +1,29 @@
+{# Adaptive Card v1.6 — confirmation / success after an action.
+   Variables: action (str), message (str, optional), facts (dict[str,str], optional).
+   Body builder: scripts/emit_card.py::emit_confirmation. #}
+{
+  "type": "AdaptiveCard",
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "version": "1.6",
+  "body": [
+    {
+      "type": "TextBlock",
+      "text": {{ action | tojson }},
+      "size": "Medium",
+      "weight": "Bolder",
+      "color": "Good",
+      "wrap": true
+    }{% if message %},
+    {
+      "type": "TextBlock",
+      "text": {{ message | tojson }},
+      "wrap": true
+    }{% endif %}{% if facts %},
+    {
+      "type": "FactSet",
+      "facts": [{% for k, v in facts.items() %}{% if not loop.first %},{% endif %}
+        { "title": {{ k | tojson }}, "value": {{ v | tojson }} }{% endfor %}
+      ]
+    }{% endif %}
+  ]
+}

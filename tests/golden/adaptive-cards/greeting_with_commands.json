@@ -1,0 +1,36 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "body": [
+    {
+      "size": "Large",
+      "text": "Hermes here",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "text": "Pick a quick action.",
+      "type": "TextBlock",
+      "wrap": true
+    },
+    {
+      "spacing": "Medium",
+      "text": "Try one of:",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "text": "\u2022 Summarise unread mail",
+      "type": "TextBlock",
+      "wrap": true
+    },
+    {
+      "text": "\u2022 List today's events",
+      "type": "TextBlock",
+      "wrap": true
+    }
+  ],
+  "type": "AdaptiveCard",
+  "version": "1.6"
+}

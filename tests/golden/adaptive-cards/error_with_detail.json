@@ -1,0 +1,27 @@
+{
+  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+  "body": [
+    {
+      "color": "Attention",
+      "size": "Medium",
+      "text": "FIC expired",
+      "type": "TextBlock",
+      "weight": "Bolder",
+      "wrap": true
+    },
+    {
+      "text": "Token is past expiry.",
+      "type": "TextBlock",
+      "wrap": true
+    },
+    {
+      "isSubtle": true,
+      "spacing": "Small",
+      "text": "AADSTS70043: refresh token has expired.",
+      "type": "TextBlock",
+      "wrap": true
+    }
+  ],
+  "type": "AdaptiveCard",
+  "version": "1.6"
+}
