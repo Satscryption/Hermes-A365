@@ -47,6 +47,7 @@ class FakeQuerySource:
     available: bool = True
     license_payload: dict[str, Any] | None = None
     apps: dict[str, dict[str, Any]] = field(default_factory=dict)
+    apps_by_name: dict[str, dict[str, Any]] = field(default_factory=dict)
     consents: dict[str, dict[str, Any]] = field(default_factory=dict)
     blueprints: dict[str, dict[str, Any]] = field(default_factory=dict)
     instances: dict[str, dict[str, Any]] = field(default_factory=dict)
@@ -58,6 +59,9 @@ class FakeQuerySource:
 
     def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None:
         return self.apps.get(app_id)
+
+    def query_app_by_name(self, *, name: str) -> dict[str, Any] | None:
+        return self.apps_by_name.get(name)
 
     def query_consent(self, *, app_id: str) -> dict[str, Any] | None:
         return self.consents.get(app_id)

@@ -95,6 +95,7 @@ class QuerySource(Protocol):
 
     def query_license(self) -> dict[str, Any] | None: ...
     def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None: ...
+    def query_app_by_name(self, *, name: str) -> dict[str, Any] | None: ...
     def query_consent(self, *, app_id: str) -> dict[str, Any] | None: ...
     def query_blueprint(self, *, slug: str) -> dict[str, Any] | None: ...
     def query_instance(self, *, instance_id: str) -> dict[str, Any] | None: ...
@@ -112,6 +113,9 @@ class _UnavailableQuerySource:
         return None
 
     def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None:
+        return None
+
+    def query_app_by_name(self, *, name: str) -> dict[str, Any] | None:
         return None
 
     def query_consent(self, *, app_id: str) -> dict[str, Any] | None:
@@ -158,6 +162,9 @@ class A365CliQuerySource:
 
     def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None:
         return self._run("--by-app-id", app_id)
+
+    def query_app_by_name(self, *, name: str) -> dict[str, Any] | None:
+        return self._run("--by-name", name)
 
     def query_consent(self, *, app_id: str) -> dict[str, Any] | None:
         return self._run("--consent-status", "--app", app_id)

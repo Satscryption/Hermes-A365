@@ -63,6 +63,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** fifth slice — `status.py` orchestrating nine components (license, T1/T2 apps, blueprint, instance, channels, activity bridge, telemetry, FIC) into a single report; exit codes 0/1/2/3 per spec. `QuerySource` Protocol abstracts `a365 query-entra` so the command works end-to-end with or without a live `a365` CLI.
 - **2026-05-03:** sixth slice — Adaptive Card v1.6 templates (`greeting`, `confirmation`, `error`) under `templates/adaptive-cards/` plus `emit_card.py` builder with typed dataclass inputs. Golden-file tests verify JSON validity and round-trip stability.
 - **2026-05-03:** seventh slice — `license.py` (read-only recommendation per §6.1) and `consent.py` (admin-consent URL rendering + grant polling per §6.3) plus the `consent-url.txt.j2` template. The polling loop is fully testable via monkeypatched `time.sleep`/`time.monotonic`.
+- **2026-05-03:** eighth slice — `register.py` (Entra T1+T2 app registration and user-FIC, per §6.2). Composes `reconcile_app` plans with a new `Mutator` protocol (default `A365CliMutator` shells out; tests inject a `FakeMutator`). Default dry-run; `--apply` executes. AADSTS500011 retries with backoff (mockable `sleep_fn`); AADSTS90094 surfaces a `consent` follow-up rather than failing. T2 client secret stored via the keychain wrapper (never to disk). `~/.hermes/.env` updated atomically (tmp + rename) with `A365_TENANT_ID`, `A365_APP_ID`, optional `A365_CLI_VARIANT`. `QuerySource` gained `query_app_by_name` to support name-based lookup.
 
 ## Development
 
@@ -121,8 +122,9 @@ uv run python scripts/render_instance_env.py \
 | Adaptive Card templates + `emit_card.py` (greeting / confirmation / error) | done |
 | Consent URL template + `consent.py` (URL render + grant poll; §6.3) | done |
 | `license.py` (recommendation engine; §6.1) | done |
+| `register.py` (Entra T1+T2 app + user-FIC; §6.2) | done |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
-| `register.py`, `blueprint create`, `instance create`, `deploy`, `workiq`, `telemetry`, `fic rotate`, `cleanup` | TODO (will compose existing reconcilers + secrets + status helpers) |
+| `blueprint create`, `instance create`, `deploy`, `workiq`, `telemetry`, `fic rotate`, `cleanup` | TODO (will compose existing reconcilers + secrets + status helpers) |
 | `references/` content | TODO |
 | `SKILL.md` (drafted here, upstreamed later) | TODO |
 
@@ -181,6 +183,22 @@ Admin-consent URL rendering and grant polling:
 uv run python scripts/consent.py --print-url-only        # just emit the URL
 uv run python scripts/consent.py --no-open               # render + poll, no browser
 uv run python scripts/consent.py --timeout 60            # custom poll timeout (seconds)
+```
+
+Entra app registration (default dry-run; `--apply` to mutate):
+
+```bash
+# Plan only — prints what would change, no mutations
+uv run python scripts/register.py \
+    --app-name "Hermes Inbox Agent" \
+    --tenant-id contoso.onmicrosoft.com
+
+# Execute the plan
+uv run python scripts/register.py \
+    --app-name "Hermes Inbox Agent" \
+    --tenant-id contoso.onmicrosoft.com \
+    --cli-variant a365-dotnet \
+    --apply
 ```
 
 ## License
