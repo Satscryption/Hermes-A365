@@ -69,6 +69,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** eleventh slice — `deploy.py` (channel deployment for Teams / Outlook / M365 Copilot, per §6.9). Reads `AA_INSTANCE_ID` from the agent .env, queries the instance's currently-bound channels (state == `ok`), and computes a set diff against the desired list. New `Mutator.deploy` op hands the desired absolute set to `a365 deploy --instance=<id> --channels=<list>`; A365 reconciles additions/removals server-side. Empty desired list = unbind all. Idempotent: same set → noop, no mutator call. Surfaces deep-links from the response when present.
 - **2026-05-03:** twelfth slice — `workiq.py` (toggle Work IQ MCP exposure, per §6.6). Config-only — no local MCP server runs. Reads the cached blueprint at `~/.hermes/agents/<slug>/blueprint.json`, reconstitutes `BlueprintInputs`, applies `--enable`/`--disable`/`--set` to the workiq tool list, and delegates to `blueprint_create`'s pipeline so the underlying reconciler decides create vs patch. `--set` is mutually exclusive with the additive flags; unknown tool names are rejected up-front against the `WORKIQ_TOOLS` constant.
 - **2026-05-03:** thirteenth slice — `telemetry.py` (read-only OTLP / span verifier, per §6.8). Three checks: `HERMES_OTLP_ENDPOINT` set in agent .env, `AA_INSTANCE_ID` recorded, last span seen via `QuerySource.query_telemetry`. JSON output by default, `--human` for a markdown table. Exit codes mirror `status` (0 ok / 1 partial / 2 broken). Span injection itself is the activity bridge's responsibility (§6.7); this command only verifies the pipeline.
+- **2026-05-04:** fourteenth slice — `fic_rotate.py` (rotate the user-FIC for the T2 confidential client, per §6.10). New `Mutator.fic_rotate` op wraps `a365 fic rotate --app=<T2-appId>`; the new client secret is written to the OS keychain via the existing `secrets` wrapper, replacing the entry written at `register` time. Default dry-run; `--apply` rotates. Surfaces an explicit reminder to restart the activity bridge after rotation.
 
 ## Development
 
@@ -133,8 +134,9 @@ uv run python scripts/render_instance_env.py \
 | `deploy.py` (channel set reconciliation; §6.9) | done |
 | `workiq.py` (toggle Work IQ MCP exposure; §6.6) | done |
 | `telemetry.py` (OTLP / span verifier; §6.8) | done |
+| `fic_rotate.py` (rotate user-FIC + refresh keychain; §6.10) | done |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
-| `fic rotate`, `cleanup` | TODO (will compose existing reconcilers + secrets + status helpers) |
+| `cleanup` | TODO (destructive teardown — order: deploy → instance → blueprint → app T2 → app T1) |
 | `references/` content | TODO |
 | `SKILL.md` (drafted here, upstreamed later) | TODO |
 
@@ -275,6 +277,13 @@ Telemetry verifier (read-only):
 uv run python scripts/telemetry.py inbox-helper --human    # markdown table
 uv run python scripts/telemetry.py inbox-helper            # JSON
 echo $?                                                    # 0=ok, 1=partial, 2=broken
+```
+
+User-FIC rotation (refreshes the T2 client secret in the OS keychain):
+
+```bash
+uv run python scripts/fic_rotate.py             # plan only
+uv run python scripts/fic_rotate.py --apply     # rotate
 ```
 
 ## License
