@@ -4,7 +4,7 @@
 **Author:** Sadiq Jaffer (drafted with Claude)
 **Target:** Hermes Agent harness (`~/.hermes/hermes-agent/`)
 **Source repo:** <https://github.com/satscryption/Hermes-A365>
-**Replaces / parallels:** the OpenClaw integration with Microsoft Agent 365 used in Satscryption v0.5
+**Replaces / parallels:** the existing OpenClaw integration with Microsoft Agent 365 (the `SidU/openclaw-a365` Bot Framework channel plugin and surrounding tooling)
 
 > **Repo split note.** This spec, the reference material under `references/`, the prototype scripts under `scripts/`, and the templates under `templates/` are developed in the standalone repo `satscryption/Hermes-A365` so design and iteration can move at their own cadence. The final `SKILL.md` is **contributed upstream** to `hermes-agent/optional-skills/cloud-platforms/hermes-a365/SKILL.md` (see §3.1) and pulls in the artefacts from this repo at upstream-contribution time. Until that happens, this repo is the authoritative working tree.
 
@@ -22,23 +22,22 @@
 - OpenTelemetry observability with admin-center surface
 - Teams / Outlook / Microsoft 365 Copilot channel adapters
 
-In Satscryption v0.5, this was wired to OpenClaw via:
-- **`SidU/openclaw-a365`** — Bot Framework channel plugin bridging OpenClaw runtime to A365 activities
-- The v0.5 playbook's **Phase 01 "a365 Bootstrap"** — Entra app registration, admin consent, license decision
-- Per-agent containers with env-driven config (`A365_APP_ID`, `A365_APP_PASSWORD`, `A365_TENANT_ID`, `OWNER`, `OWNER_AAD_ID`, `AGENT_IDENTITY`, `AA_INSTANCE_ID`)
-- OpenClaw Gateway used as model proxy via `openclaw.json` `models.providers` `openai-completions` entries
+A typical OpenClaw-on-A365 deployment wires this together with:
+- **`SidU/openclaw-a365`** — Bot Framework channel plugin bridging the OpenClaw runtime to A365 activities
+- A bootstrap procedure for Entra app registration, admin consent, and license decision (per the public Microsoft Learn registration guide)
+- Per-agent runtime config (env-driven) with `A365_APP_ID`, `A365_APP_PASSWORD`, `A365_TENANT_ID`, `OWNER`, `OWNER_AAD_ID`, `AGENT_IDENTITY`, `AA_INSTANCE_ID`
 
 **The Hermes equivalent** must reproduce that integration surface for agents driven by the Hermes harness, expressed as a single optional-skill the user can invoke to bootstrap, deploy, and operate an A365-registered Hermes agent.
 
-> Reference for everything below:
+> Public references for everything below:
 > - Microsoft Learn — Agent 365 SDK and CLI: <https://learn.microsoft.com/en-us/microsoft-agent-365/developer/>
 > - Microsoft Learn — Agent 365 CLI reference: <https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli>
 > - Microsoft Learn — Custom client app registration: <https://learn.microsoft.com/en-us/microsoft-agent-365/developer/custom-client-app-registration>
-> - GA announcement (2026-05-01): <https://www.microsoft.com/en-us/security/blog/2026/05/01/microsoft-agent-365-now-generally-available-expands-capabilities-and-integrations/>
-> - Satscryption v0.5 playbook: `~/archive/v0.5-anthropic/playbook/Satscryption-Agent-Stack-v0.5/02-phase-01-a365-bootstrap.md`
-> - Satscryption reference: `~/Satscryption-Reference.zip` → `validated-commands.md` §2, §3, §4
-> - Hermes skill format: `~/.hermes/skills/software-development/hermes-agent-skill-authoring/SKILL.md`
-> - OpenClaw migration skill (for prior-art on Hermes-side conventions): `~/.hermes/hermes-agent/optional-skills/migration/openclaw-migration/SKILL.md`
+> - Microsoft Agent 365 GA announcement (2026-05-01): <https://www.microsoft.com/en-us/security/blog/2026/05/01/microsoft-agent-365-now-generally-available-expands-capabilities-and-integrations/>
+> - Bot Framework Activity protocol: <https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-activities>
+> - Adaptive Cards (v1.6): <https://adaptivecards.io/>
+> - `SidU/openclaw-a365` Bot Framework channel plugin: <https://github.com/SidU/openclaw-a365>
+> - Hermes skill format: see the Hermes Agent harness' built-in skill-authoring guide (bundled with the harness)
 
 ---
 
@@ -47,8 +46,8 @@ In Satscryption v0.5, this was wired to OpenClaw via:
 ### 2.1 Goals
 
 1. Provide a single Hermes optional-skill, **`hermes-a365`**, that walks a user from "fresh tenant" to "A365-governed Hermes agent answering in Teams/Outlook" without leaving the harness.
-2. Cover every capability A365 exposes that the v0.5 OpenClaw integration uses: licensing, Entra registration, blueprint, identity, MCP/Work IQ, Activity protocol, OpenTelemetry, channel adapters.
-3. Be safe-to-rerun and dry-run-by-default — match the conservative posture of the existing `openclaw-migration` skill.
+2. Cover every capability A365 exposes that the OpenClaw integration uses: licensing, Entra registration, blueprint, identity, MCP/Work IQ, Activity protocol, OpenTelemetry, channel adapters.
+3. Be safe-to-rerun and dry-run-by-default — every state-mutating subcommand should plan first, mutate only on explicit `--apply`.
 4. Encode all Microsoft state changes (tenant license, app registration, blueprint, deployment) as **idempotent steps** with explicit reconciliation against current Microsoft state, not blind re-application.
 5. Plug into Hermes' existing config (`~/.hermes/config.yaml`, `~/.hermes/.env`) and skill conventions — no parallel config tree.
 
@@ -62,21 +61,21 @@ In Satscryption v0.5, this was wired to OpenClaw via:
 
 ### 2.3 Mapping: A365-for-OpenClaw → Hermes equivalent
 
-| Capability (A365 for OpenClaw) | Source in v0.5 stack | Hermes equivalent (this skill) |
+| Capability | Origin in OpenClaw integration | Hermes equivalent (this skill) |
 |---|---|---|
-| Tenant license decision | Playbook Phase 01 §1 | `hermes a365 license` subcommand, recommends model |
-| Entra app registration (T1/T2/user-FIC) | Playbook Phase 01 §2-4; `validated-commands.md` §2.3-§2.5 | `hermes a365 register` — drives `a365 query-entra`, `a365 setup app` |
-| Admin consent | Playbook Phase 01 §5 | `hermes a365 consent` — emits the consent URL, polls `query-entra` for grant |
-| Agent blueprint | `validated-commands.md` §3.1 | `hermes a365 blueprint` — generates JSON from template, runs `a365 setup blueprint` |
-| Per-agent runtime env | `validated-commands.md` §3.3 | `hermes a365 instance create` — writes `~/.hermes/agents/<slug>/.env` |
-| OpenClaw Gateway as model proxy | `openclaw.json` providers | **Dropped.** Hermes uses native model config. |
+| Tenant license decision | Microsoft Learn — A365 licensing guidance | `hermes a365 license` — recommends model, never purchases |
+| Entra app registration (T1/T2/user-FIC) | Microsoft Learn — Custom client app registration | `hermes a365 register` — drives `a365 query-entra`, `a365 setup app` |
+| Admin consent | Microsoft Learn — Admin consent flow | `hermes a365 consent` — emits the consent URL, polls `query-entra` for grant |
+| Agent blueprint | A365 CLI `setup blueprint` | `hermes a365 blueprint` — generates JSON from template, runs `a365 setup blueprint` |
+| Per-agent runtime env | A365 SDK runtime config (env-driven) | `hermes a365 instance create` — writes `~/.hermes/agents/<slug>/.env` |
+| Model-backend abstraction | OpenClaw Gateway as model proxy via `openclaw.json` providers | **Dropped.** Hermes uses its own model config; A365 doesn't care which model backend the agent uses. |
 | Bot Framework Activity bridge | `SidU/openclaw-a365` plugin | `hermes a365 activity-bridge` — runs the Hermes-side activity adapter |
-| Adaptive Cards (`invoke` activity) | `validated-commands.md` §4.1 | Templates in `templates/adaptive-cards/`; helper `scripts/emit_card.py` |
+| Adaptive Cards (`invoke` activity) | Bot Framework Activity protocol — `invoke` shape | Templates in `templates/adaptive-cards/`; helper `scripts/emit_card.py` |
 | Work IQ MCP servers | A365 admin center + per-agent toggle | `hermes a365 workiq` — toggles MCP exposure per blueprint |
 | OpenTelemetry export | A365 SDK auto-instrumentation | `hermes a365 telemetry` — verifies OTLP endpoint + sampling |
-| Teams / Outlook / M365 Copilot channels | `a365 deploy` | `hermes a365 deploy` — wraps `a365 deploy --channels=...` |
-| Federated identity (user-FIC, T2) | `validated-commands.md` §2.5 | `hermes a365 fic rotate` — driven by `a365 fic` |
-| Cleanup | `a365 cleanup` | `hermes a365 cleanup` — destructive, requires `--confirm` |
+| Teams / Outlook / M365 Copilot channels | A365 CLI `a365 deploy` | `hermes a365 deploy` — wraps `a365 deploy --channels=...` |
+| Federated identity (user-FIC, T2) | A365 CLI `a365 fic` | `hermes a365 fic rotate` — driven by `a365 fic` |
+| Cleanup | A365 CLI `a365 cleanup` | `hermes a365 cleanup` — destructive, requires `--confirm` |
 
 ---
 
@@ -91,8 +90,8 @@ In Satscryption v0.5, this was wired to OpenClaw via:
 ```
 
 Rationale:
-- It ships with the Hermes harness (peer with `migration/openclaw-migration`), so a fresh Hermes install can opt into it without a separate distribution channel.
-- `cloud-platforms/` is a new top-level optional-skill category. The recon agent flagged that we shouldn't invent categories casually, but A365/AWS/GCP/Azure agent integrations don't fit any of the existing optional-skills categories (`blockchain`, `communication`, `health`, `migration`, `security`, `web-development`, `mlops`). Document the new category in the optional-skills index (if one exists) at the same time.
+- It ships with the Hermes harness as an opt-in optional-skill, so a fresh Hermes install can adopt it without a separate distribution channel.
+- `cloud-platforms/` is a new top-level optional-skill category. Don't invent categories casually, but A365/AWS/GCP/Azure agent integrations don't fit any existing Hermes optional-skill category (`blockchain`, `communication`, `health`, `migration`, `security`, `web-development`, `mlops`). Document the new category in the optional-skills index (if one exists) at the same time.
 - **Not** a default-loaded skill. It's heavy, opinionated, and only relevant to users with Microsoft tenants.
 
 ### 3.2 Frontmatter (validator-compliant)
@@ -115,7 +114,6 @@ metadata:
       - mcp
       - cloud-platforms
     related_skills:
-      - openclaw-migration
       - hermes-agent-skill-authoring
 ---
 ```
@@ -128,7 +126,7 @@ metadata:
 
 ### 3.3 CLI surface
 
-A single dispatch entry, `hermes a365 <subcommand>`, exposed via the harness' standard skill→CLI bridge (mirroring how `openclaw-migration` exposes `hermes claw migrate`). Subcommands:
+A single dispatch entry, `hermes a365 <subcommand>`, exposed via the harness' standard skill→CLI bridge. Subcommands:
 
 | Subcommand | Purpose |
 |---|---|
@@ -146,7 +144,7 @@ A single dispatch entry, `hermes a365 <subcommand>`, exposed via the harness' st
 | `hermes a365 status [<agent-slug>]` | All-up status: license, app, blueprint, instance, deployment, last activity |
 | `hermes a365 cleanup <agent-slug> --confirm` | Destructive: deletes blueprint, instance, app — never tenant licenses |
 
-**Default posture:** every state-mutating subcommand defaults to `--dry-run` unless `--apply` is passed (matching `openclaw-migration`'s posture).
+**Default posture:** every state-mutating subcommand defaults to `--dry-run` unless `--apply` is passed.
 
 ---
 
@@ -184,13 +182,13 @@ One subsection per CLI subcommand from §3.3, each laid out as:
   - Failure modes and remediation
 
 ## Conflict resolution
-Match the conventions in `openclaw-migration` SKILL.md §"Default workflow":
+Apply standard reconciliation:
   - Resource exists with same name but different config → reconcile/overwrite/abort
   - Resource exists owned by another agent → abort with pointer
   - License insufficient → halt and surface admin-center URL
 
 ## Common pitfalls
-Numbered list, derived from validated-commands.md §2 footnotes:
+Numbered list, drawn from operator experience and Microsoft Learn:
   1. Delegated permissions, not application permissions — A365 explicitly requires
      this. Pasting an application-permission consent URL silently breaks at runtime.
   2. CLI binary collision: `atk` (npm) and `a365` (.NET) both ship as `a365` on
@@ -214,9 +212,10 @@ Numbered list, derived from validated-commands.md §2 footnotes:
 ## One-shot recipes
 - "Bootstrap a single agent from a clean tenant" — calls register → consent →
   blueprint → instance → deploy in sequence with paired verification gates.
-- "Migrate one OpenClaw-on-A365 agent to Hermes" — calls `openclaw-migration`
-  for state, then `hermes a365 instance create --reuse-blueprint=<existing>` to
-  pivot the existing blueprint to the new Hermes runtime without re-registering.
+- "Re-target an existing OpenClaw-on-A365 agent at Hermes" — port any Hermes-side
+  state separately, then call `hermes a365 instance create --reuse-blueprint=<existing>`
+  to pivot the existing blueprint to the new Hermes runtime without re-registering
+  the Entra app.
 ```
 
 ---
@@ -258,7 +257,7 @@ optional-skills/cloud-platforms/hermes-a365/
 
 **Constraints from the Hermes validator:** subdir allowlist is `references/`, `scripts/`, `templates/`, `assets/`. No other top-level subdirs. Keep individual files small; the validator caps SKILL.md itself at 100k chars but does not cap reference files — still, keep references readable (≤ ~20k each).
 
-**Why scripts/ is allowed to be substantial here:** Hermes peer skills are usually procedure-only, but state-mutating CLI orchestration against a remote tenant *needs* idempotency code we don't want to re-derive in markdown each invocation. Compare `openclaw-migration/scripts/openclaw_to_hermes.py` (~143 KB).
+**Why scripts/ is allowed to be substantial here:** Hermes peer skills are usually procedure-only, but state-mutating CLI orchestration against a remote tenant *needs* idempotency code we don't want to re-derive in markdown on each invocation.
 
 ---
 
@@ -281,7 +280,7 @@ optional-skills/cloud-platforms/hermes-a365/
      - If yes, capture `appId`, mark T1=present.
      - If no, run `a365 setup app --tier=1 --name=<app-name>`.
   2. Same for T2 confidential client app: `a365 setup app --tier=2 --name=<app-name>-conf`.
-  3. Configure user-FIC: `a365 fic configure --app=<T2-appId>` per `validated-commands.md` §2.5.
+  3. Configure user-FIC: `a365 fic configure --app=<T2-appId>`.
 - **Required env after success** (written to `~/.hermes/.env`):
   - `A365_APP_ID` (T2)
   - `A365_APP_PASSWORD` (T2 secret — **only into OS keychain, never repo file**)
@@ -414,7 +413,7 @@ Pure diagnostic; never mutates.
 - Each step requires the corresponding A365 CLI cleanup subcommand.
 - `--confirm` required and must include the agent-slug literal: `hermes a365 cleanup my-agent --confirm=my-agent`.
 - Tenant license is **never** touched by this skill.
-- Local files: optionally archived to `~/.hermes/archive/a365/<slug>/<timestamp>/` (matches `openclaw-migration` archive pattern). On by default; `--no-archive` to skip.
+- Local files: optionally archived to `~/.hermes/archive/a365/<slug>/<timestamp>/`. On by default; `--no-archive` to skip.
 
 ---
 
@@ -440,7 +439,7 @@ Pure diagnostic; never mutates.
 
 ### 7.3 Files this skill never touches
 
-- `~/.openclaw/*` (out of scope; covered by `openclaw-migration`).
+- `~/.openclaw/*` (out of scope; OpenClaw configuration migration is a separate concern handled outside this skill).
 - Repo-tracked code or skills.
 - Tenant-wide M365 settings outside the registered app(s).
 
@@ -512,12 +511,12 @@ The skill is "done" when **all** of the following hold:
 
 ## 10. Open questions (for follow-up before implementation)
 
-1. **Hermes runtime contract for the activity bridge.** The bridge needs to invoke a Hermes agent and capture its response. What's the existing Hermes IPC surface? (Likely answered by reading `~/.hermes/hermes-agent/hermes_cli/` and `~/.hermes/hermes-agent/skills/autonomous-ai-agents/hermes-agent/SKILL.md` — but call it out so it's not assumed.)
+1. **Hermes runtime contract for the activity bridge.** The bridge needs to invoke a Hermes agent and capture its response. What is the existing Hermes IPC surface (CLI subprocess, local socket, in-process API)? Resolve by inspecting the harness' bundled CLI and the autonomous-agent reference skill before implementation.
 2. **Multi-tenant.** Is one Hermes install ever pointed at more than one Microsoft tenant? If yes, `~/.hermes/.env` is wrong — we need `~/.hermes/tenants/<tenant-id>/.env`. v0.1 assumes single-tenant; promote to multi-tenant in v0.2 if needed.
 3. **OS-keychain abstraction.** macOS Keychain via `security`, Linux via `secret-tool` (libsecret). Windows is out of scope for v0.1 — confirm.
-4. **Vendor pivot interaction.** v0.6 prep is moving the Hermes vendor stack from Anthropic to OpenAI/Codex. A365 doesn't care which model backend is in use — but confirm the activity bridge doesn't accidentally hard-wire a vendor (it shouldn't; it talks to Hermes, which talks to whatever).
+4. **Model-vendor neutrality.** A365 does not care which model backend the agent uses, and this skill must not couple to one. Confirm the activity bridge stays vendor-agnostic — it talks to Hermes; Hermes talks to whatever model is configured.
 5. **MCP server for `hermes-a365` itself.** Should `hermes-a365` *expose* an MCP server (so other agents can drive A365 via MCP) in addition to driving A365 itself? Out of scope for v0.1; revisit in v0.2.
-6. **Adaptive-card renderer choice.** Microsoft's `adaptivecards.io` reference renderers vs a Hermes-native renderer. v0.1 uses MS-supplied renderer via the bridge; templates ship Adaptive Card v1.6 schema.
+6. **Adaptive-card renderer choice.** Microsoft's `adaptivecards.io` reference renderers vs a Hermes-native renderer. v0.1 uses the MS-supplied renderer via the bridge; templates ship Adaptive Card v1.6 schema.
 7. **`atk` vs `a365` CLI variant detection.** Both ship as `a365` on PATH. The doctor needs a reliable disambiguation — likely `a365 --version` plus a binary-path check.
 
 ---
@@ -537,20 +536,19 @@ A separate `optional-skills/cloud-platforms/hermes-a365/tests/integration/` tree
 
 ### 11.3 Manual
 
-- Migration recipe: take an existing OpenClaw-on-A365 agent, run `openclaw-migration` followed by `hermes a365 instance create --reuse-blueprint=<existing>`. Verify the existing blueprint serves the new Hermes runtime without re-registration.
+- Re-target recipe: take an existing OpenClaw-on-A365 agent, port any Hermes-side state separately, then run `hermes a365 instance create --reuse-blueprint=<existing>`. Verify the existing blueprint serves the new Hermes runtime without re-registering the Entra app.
 - FIC expiry: artificially set `--fic-ttl=60s` (if A365 supports it; otherwise wait), observe that `hermes a365 status` warns at T-7d and errors at T-0.
 
 ---
 
-## 12. Prior-art alignment
+## 12. Conventions
 
-- **Migration skill (`openclaw-migration`)** is the conceptual sibling. Match its conventions:
-  - dry-run by default, `--apply` to mutate
-  - explicit conflict-resolution UX via `clarify`
-  - `~/.hermes/migration/<source>/<timestamp>/` for archives — for this skill, replace `migration/<source>` with `archive/a365`
-  - case-preserving brand rewriter pattern is irrelevant here (we don't rewrite text); skip.
-- **Hermes skill-authoring skill (`hermes-agent-skill-authoring`)** is the validator-of-record. Run the linter described in its body before merging.
-- **No** dependency on the other agent stacks A365 supports (MAF, OpenAI Agents SDK, Microsoft 365 Agents SDK). The skill talks to A365 via its CLI and to Hermes via the harness — that's it.
+- **Idempotent and dry-run-first.** Every state-mutating subcommand plans first; mutation requires explicit `--apply`. Re-running a successful subcommand is a no-op.
+- **Conflict resolution surfaces, never guesses.** When desired and actual state diverge, the skill presents the diff and the resolution choices (reconcile / overwrite / abort) — it does not silently overwrite.
+- **Archives at `~/.hermes/archive/a365/<slug>/<timestamp>/`** for any local files removed by `cleanup` (unless `--no-archive`).
+- **Validator-of-record:** the Hermes harness' bundled skill-authoring guide. Lint `SKILL.md` against it before contributing upstream.
+- **Stack-agnostic boundary.** The skill talks to A365 via the official `a365` CLI and to Hermes via the harness — nothing else. No dependency on or knowledge of the other agent stacks A365 supports (Microsoft Agent Framework, OpenAI Agents SDK, Microsoft 365 Agents SDK).
+- **Vendor-agnostic.** The activity bridge does not encode which model provider the Hermes agent uses; that's Hermes' concern.
 
 ---
 
