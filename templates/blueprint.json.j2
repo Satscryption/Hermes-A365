@@ -1,0 +1,19 @@
+{
+  "displayName": {{ display_name | tojson }},
+  "agentIdentity": {
+    "slug": {{ slug | tojson }},
+    "description": {{ description | tojson }},
+    "purpose": {{ purpose | tojson }}
+  },
+  "functions": {{ functions | tojson }},
+  "appRoles": {{ app_roles | tojson }},
+  "optionalClaims": {
+    "idToken": {{ optional_claims | tojson }}
+  },
+  "policies": {
+    "dlp": {{ dlp_policy | tojson }},
+    "externalAccess": {{ external_access_policy | tojson }},
+    "logging": {{ logging_policy | tojson }}
+  },
+  "workIqTools": {{ workiq_tools | tojson }}
+}

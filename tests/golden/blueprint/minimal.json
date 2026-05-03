@@ -1,0 +1,25 @@
+{
+  "agentIdentity": {
+    "description": "Summarises unread mail and surfaces commitments",
+    "purpose": "productivity",
+    "slug": "inbox-helper"
+  },
+  "appRoles": [
+    "User"
+  ],
+  "displayName": "inbox-helper",
+  "functions": [],
+  "optionalClaims": {
+    "idToken": [
+      "oid",
+      "tid",
+      "preferred_username"
+    ]
+  },
+  "policies": {
+    "dlp": "default-restricted",
+    "externalAccess": "tenant-only",
+    "logging": "verbose"
+  },
+  "workIqTools": []
+}

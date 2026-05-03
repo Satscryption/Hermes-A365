@@ -1,0 +1,39 @@
+[project]
+name = "hermes-a365"
+version = "0.1.0"
+description = "Integrate Hermes agents into the Microsoft 365 ecosystem using Microsoft Agent 365 (A365)."
+readme = "README.md"
+license = {text = "MIT"}
+authors = [
+  {name = "Sadiq Jaffer", email = "sadiq.jaffer@satscryption.io"},
+]
+requires-python = ">=3.11"
+dependencies = [
+  "jinja2>=3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+  "ruff>=0.5",
+]
+
+[tool.uv]
+# This skill is loaded from source by the Hermes harness; we don't build a wheel.
+# Mark the project as virtual so uv installs deps without trying to package it.
+package = false
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B011"]  # asserts are fine in tests
+
+[tool.pytest.ini_options]
+pythonpath = ["scripts"]
+testpaths = ["tests"]
+addopts = "-ra -q"
