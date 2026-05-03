@@ -1,0 +1,13 @@
+{# Admin consent URL for the A365 T2 confidential client.
+   Variables: tenant (str), app_id (str).
+   Builder: scripts/consent.py::render_consent_url.
+
+   Notes:
+   - Microsoft accepts both the v1 (`/adminconsent`) and v2 (`/v2.0/adminconsent`)
+     endpoints for delegated-permission admin consent. v0.1 uses v1 because
+     it doesn't require a `scope` parameter (the app's pre-configured delegated
+     scopes are consented to as a unit).
+   - No `state` or `redirect_uri` is included; the skill polls
+     `a365 query-entra --consent-status` rather than handling a redirect.
+#}
+https://login.microsoftonline.com/{{ tenant }}/adminconsent?client_id={{ app_id }}

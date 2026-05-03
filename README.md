@@ -62,6 +62,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** fourth slice — reconcilers (`deep_diff` in `_common.py`, `reconcile_app.py`, `reconcile_blueprint.py`) producing `create`/`noop`/`patch`/`abort` plans against captured `a365 query-entra` JSON.
 - **2026-05-03:** fifth slice — `status.py` orchestrating nine components (license, T1/T2 apps, blueprint, instance, channels, activity bridge, telemetry, FIC) into a single report; exit codes 0/1/2/3 per spec. `QuerySource` Protocol abstracts `a365 query-entra` so the command works end-to-end with or without a live `a365` CLI.
 - **2026-05-03:** sixth slice — Adaptive Card v1.6 templates (`greeting`, `confirmation`, `error`) under `templates/adaptive-cards/` plus `emit_card.py` builder with typed dataclass inputs. Golden-file tests verify JSON validity and round-trip stability.
+- **2026-05-03:** seventh slice — `license.py` (read-only recommendation per §6.1) and `consent.py` (admin-consent URL rendering + grant polling per §6.3) plus the `consent-url.txt.j2` template. The polling loop is fully testable via monkeypatched `time.sleep`/`time.monotonic`.
 
 ## Development
 
@@ -118,8 +119,10 @@ uv run python scripts/render_instance_env.py \
 | `reconcile_app.py`, `reconcile_blueprint.py` (idempotent diff/plan) | done |
 | `status.py` (per-component report; resolves SPEC §6.11) | done |
 | Adaptive Card templates + `emit_card.py` (greeting / confirmation / error) | done |
-| Consent URL template | TODO |
+| Consent URL template + `consent.py` (URL render + grant poll; §6.3) | done |
+| `license.py` (recommendation engine; §6.1) | done |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
+| `register.py`, `blueprint create`, `instance create`, `deploy`, `workiq`, `telemetry`, `fic rotate`, `cleanup` | TODO (will compose existing reconcilers + secrets + status helpers) |
 | `references/` content | TODO |
 | `SKILL.md` (drafted here, upstreamed later) | TODO |
 
@@ -163,6 +166,21 @@ Adaptive Card payloads can be emitted from the CLI for ad-hoc testing:
 uv run python scripts/emit_card.py greeting --command "Summarise mail" --command "List events"
 uv run python scripts/emit_card.py confirmation --action "Reply sent" --fact "Recipient=team@contoso.com"
 uv run python scripts/emit_card.py error --heading "FIC expired" --message "Rotate now"
+```
+
+License recommendation (read-only; never purchases):
+
+```bash
+uv run python scripts/license.py --users 12 --agents 3 --plan E5
+uv run python scripts/license.py --users 250 --agents 40 --plan E5 --bundled-security
+```
+
+Admin-consent URL rendering and grant polling:
+
+```bash
+uv run python scripts/consent.py --print-url-only        # just emit the URL
+uv run python scripts/consent.py --no-open               # render + poll, no browser
+uv run python scripts/consent.py --timeout 60            # custom poll timeout (seconds)
 ```
 
 ## License

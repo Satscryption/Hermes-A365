@@ -1,0 +1,15 @@
+A365 license recommendation
+===========================
+Users:    12
+Agents:   3
+M365:     E5
+
+Recommendation: Agent 365 add-on ($15/user/mo)
+  Reason:      users=12 < 25 or plan=E5 < E5
+  Monthly:     $180 (12 x $15)
+  Annual:      $2,160
+  Alternative: E7 → $14,256/yr
+
+Next step (manual; this command never purchases):
+  Open admin centre: https://admin.microsoft.com/Adminportal/Home#/catalog
+  Then re-run: python scripts/doctor.py
