@@ -66,6 +66,8 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** eighth slice — `register.py` (Entra T1+T2 app registration and user-FIC, per §6.2). Composes `reconcile_app` plans with a new `Mutator` protocol (default `A365CliMutator` shells out; tests inject a `FakeMutator`). Default dry-run; `--apply` executes. AADSTS500011 retries with backoff (mockable `sleep_fn`); AADSTS90094 surfaces a `consent` follow-up rather than failing. T2 client secret stored via the keychain wrapper (never to disk). `~/.hermes/.env` updated atomically (tmp + rename) with `A365_TENANT_ID`, `A365_APP_ID`, optional `A365_CLI_VARIANT`. `QuerySource` gained `query_app_by_name` to support name-based lookup.
 - **2026-05-03:** ninth slice — `blueprint_create.py` (register/patch an A365 agent blueprint, per §6.4). Composes `render_blueprint` and `reconcile_blueprint` with a new `Mutator.setup_blueprint` operation. Default dry-run renders to a tmp file and prints the plan + diff; `--apply` hands the tmp file to the CLI and atomically caches the rendered JSON at `~/.hermes/agents/<slug>/blueprint.json`. Server-assigned fields (`blueprintId`, `lastPatched`, `etag`, etc.) are stripped from the actual payload before diffing so noop plans aren't perturbed. Slug mismatches abort; `BlueprintCreateError` surfaces refusals.
 - **2026-05-03:** tenth slice — `instance_create.py` (per-agent runtime config + cloud instance registration, per §6.5). Inherits `A365_APP_ID`/`A365_TENANT_ID`/`A365_CLI_VARIANT`/`HERMES_OTLP_ENDPOINT` from `~/.hermes/.env`. Existing `AA_INSTANCE_ID` is preserved across re-runs (idempotency); business-hours fields from a prior run are also preserved unless overridden. Atomically writes `~/.hermes/agents/<slug>/.env` (still no `A365_APP_PASSWORD` per spec). New `Mutator.create_instance` op drives `a365 create-instance --blueprint=<slug> --instance=<UUID>`; cloud step is skipped if the instance is already registered. Plan distinguishes `create` (fresh local + cloud), `create-cloud-only` (local id exists but cloud missing), and `noop`.
+- **2026-05-03:** eleventh slice — `deploy.py` (channel deployment for Teams / Outlook / M365 Copilot, per §6.9). Reads `AA_INSTANCE_ID` from the agent .env, queries the instance's currently-bound channels (state == `ok`), and computes a set diff against the desired list. New `Mutator.deploy` op hands the desired absolute set to `a365 deploy --instance=<id> --channels=<list>`; A365 reconciles additions/removals server-side. Empty desired list = unbind all. Idempotent: same set → noop, no mutator call. Surfaces deep-links from the response when present.
+- **2026-05-03:** twelfth slice — `workiq.py` (toggle Work IQ MCP exposure, per §6.6). Config-only — no local MCP server runs. Reads the cached blueprint at `~/.hermes/agents/<slug>/blueprint.json`, reconstitutes `BlueprintInputs`, applies `--enable`/`--disable`/`--set` to the workiq tool list, and delegates to `blueprint_create`'s pipeline so the underlying reconciler decides create vs patch. `--set` is mutually exclusive with the additive flags; unknown tool names are rejected up-front against the `WORKIQ_TOOLS` constant.
 
 ## Development
 
@@ -127,8 +129,10 @@ uv run python scripts/render_instance_env.py \
 | `register.py` (Entra T1+T2 app + user-FIC; §6.2) | done |
 | `blueprint_create.py` (register/patch agent blueprint; §6.4) | done |
 | `instance_create.py` (per-agent .env + cloud instance; §6.5) | done |
+| `deploy.py` (channel set reconciliation; §6.9) | done |
+| `workiq.py` (toggle Work IQ MCP exposure; §6.6) | done |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
-| `deploy`, `workiq`, `telemetry`, `fic rotate`, `cleanup` | TODO (will compose existing reconcilers + secrets + status helpers) |
+| `telemetry`, `fic rotate`, `cleanup` | TODO (will compose existing reconcilers + secrets + status helpers) |
 | `references/` content | TODO |
 | `SKILL.md` (drafted here, upstreamed later) | TODO |
 
@@ -235,6 +239,32 @@ uv run python scripts/instance_create.py inbox-helper \
     --owner sadiq@contoso.com \
     --owner-aad-id 00000000-0000-0000-0000-000000000001 \
     --apply
+```
+
+Channel deployment (idempotent set reconciliation):
+
+```bash
+# Plan only — shows additions / removals vs current cloud state
+uv run python scripts/deploy.py inbox-helper --channels=teams,outlook
+
+# Execute the plan
+uv run python scripts/deploy.py inbox-helper --channels=teams,outlook --apply
+
+# Unbind everything
+uv run python scripts/deploy.py inbox-helper --channels="" --apply
+```
+
+Work IQ MCP exposure (drives blueprint reconciliation):
+
+```bash
+# Add tools (additive)
+uv run python scripts/workiq.py inbox-helper --enable=mail,calendar --apply
+
+# Remove tools
+uv run python scripts/workiq.py inbox-helper --disable=teams --apply
+
+# Replace the whole list
+uv run python scripts/workiq.py inbox-helper --set=mail,calendar --apply
 ```
 
 ## License
