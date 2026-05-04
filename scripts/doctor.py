@@ -1,18 +1,27 @@
 """hermes a365 doctor — read-only environment probe.
 
-Spec: SPEC.md §6.12. Pure diagnostic; never mutates. Emits structured JSON to
-stdout by default; pass ``--human`` for a coloured-marker rendering.
+v0.2 design: drops the ``atk``/``a365-dotnet`` variant split (only the
+.NET CLI ships at GA — verified 2026-05-04) and adds the prereqs the
+real CLI's own ``setup requirements`` enforces:
 
-Probes (in order):
-1. ``a365`` CLI — present, variant (``atk-npm`` vs ``a365-dotnet``), version
-2. ``az`` CLI — present, ``az account show`` succeeds
-3. Network reachability — ``login.microsoftonline.com``, ``graph.microsoft.com``,
-   and the tenant-specific A365 host if a tenant id is recorded locally
-4. OS keychain backend — macOS Security framework or Linux ``secret-tool``
-5. Local config — ``~/.hermes/.env`` and ``~/.hermes/config.yaml`` parseable
-6. Hermes harness — ``hermes --version`` responds
+- ``a365`` CLI present + version
+- ``az`` CLI present + signed in
+- ``pwsh`` (PowerShell 7+) on PATH — the CLI shells out to it for some
+  steps; missing pwsh causes ``setup requirements`` to fail.
+- Custom Entra client app (named ``Agent 365 CLI`` by Microsoft's
+  convention) discoverable via the signed-in ``az`` context.
+- Network reachability for ``login.microsoftonline.com`` and
+  ``graph.microsoft.com``.
+- OS keychain backend.
+- Local config (``~/.hermes/.env``).
+- Hermes harness version.
 
-Exit codes (matching ``hermes a365 status``):
+Frontier Preview Program enrollment is not auto-verifiable; doctor
+mentions it in prose. Deeper, auth-requiring checks (license posture,
+tenant-side Azure subscription role) are deferred to ``a365 setup
+requirements``, which the operator runs separately when bootstrapping.
+
+Exit codes:
 - 0 — all probes ``ok``
 - 1 — at least one ``warn``, no ``error``
 - 2 — at least one ``error``
@@ -37,13 +46,24 @@ _OK = "ok"
 _WARN = "warn"
 _ERROR = "error"
 
-_VARIANT_NPM = "atk-npm"
-_VARIANT_DOTNET = "a365-dotnet"
-_VARIANT_UNKNOWN = "unknown"
-
 _DEFAULT_NETWORK_HOSTS = ("login.microsoftonline.com", "graph.microsoft.com")
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
+
+# Microsoft's docs use this display name for the operator-managed custom
+# client app the A365 CLI runs as. Operators can name theirs differently
+# but the spec / docs default is this string; doctor reports a warning if
+# nothing matches, with the URL the operator follows to fix it.
+DEFAULT_CLIENT_APP_NAME = "Agent 365 CLI"
+CUSTOM_CLIENT_APP_DOCS = (
+    "https://learn.microsoft.com/microsoft-agent-365/developer/custom-client-app-registration"
+)
+FRONTIER_PROGRAM_URL = "https://adoption.microsoft.com/copilot/frontier-program/"
+
+
+# ---------------------------------------------------------------------------
+# Data model
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -55,61 +75,27 @@ class ProbeResult:
 
 
 # ---------------------------------------------------------------------------
-# Variant detection (§10 Q7)
-# ---------------------------------------------------------------------------
-
-
-def detect_a365_variant(binary_path: str | None, version_output: str | None) -> str:
-    """Detect whether the resolved ``a365`` is the npm ``atk`` or .NET variant.
-
-    Layered heuristic:
-    1. ``A365_CLI_VARIANT`` env var override (operator opt-out for any host)
-    2. ``--version`` output signature (most reliable when both ship)
-    3. Resolved binary path (last-ditch — varies by package manager)
-    4. ``unknown``
-    """
-    forced = os.environ.get("A365_CLI_VARIANT")
-    if forced in (_VARIANT_NPM, _VARIANT_DOTNET):
-        return forced
-
-    if version_output:
-        lower = version_output.lower()
-        if "atk" in lower or "node" in lower or "npm" in lower:
-            return _VARIANT_NPM
-        if "dotnet" in lower or ".net" in lower:
-            return _VARIANT_DOTNET
-
-    if binary_path:
-        path = binary_path.lower()
-        if "node_modules" in path or "/.npm/" in path or "npm/" in path:
-            return _VARIANT_NPM
-        if "dotnet" in path or "/.dotnet/" in path:
-            return _VARIANT_DOTNET
-
-    return _VARIANT_UNKNOWN
-
-
-# ---------------------------------------------------------------------------
 # Probes
 # ---------------------------------------------------------------------------
 
 
 def probe_a365_cli() -> ProbeResult:
+    """v0.2 only ships the .NET CLI; no variant detection."""
     binary = shutil.which("a365")
     if not binary:
         return ProbeResult(
             "a365_cli",
             _ERROR,
-            "a365 not found on PATH (install the A365 CLI — atk npm or .NET variant)",
+            "a365 not found on PATH (install via "
+            "`dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease`)",
         )
-    version = safe_run(["a365", "--version"]) or "unknown"
-    variant = detect_a365_variant(binary, version)
-    state: ProbeState = _OK if variant != _VARIANT_UNKNOWN else _WARN
+    version_text = safe_run([binary, "--version"], timeout=10.0) or ""
+    version_first = version_text.splitlines()[0] if version_text else "version unknown"
     return ProbeResult(
         "a365_cli",
-        state,
-        f"{variant} {version} at {binary}",
-        {"binary": binary, "variant": variant, "version": version},
+        _OK,
+        f"present at {binary}; {version_first}",
+        {"path": binary, "version_raw": version_text},
     )
 
 
@@ -118,164 +104,183 @@ def probe_az_cli() -> ProbeResult:
     if not binary:
         return ProbeResult(
             "az_cli",
-            _WARN,
-            "az not found on PATH (recommended for Entra reads beyond a365 query-entra)",
+            _ERROR,
+            "az not found on PATH (install Azure CLI ≥ 2.55.0)",
         )
-    account = safe_run(["az", "account", "show"], timeout=10.0)
-    if account:
-        # Extract tenant + name from JSON output without requiring json parse.
-        # The actual output is JSON; we just confirm non-empty success here.
+    signed_in = safe_run([binary, "account", "show", "--query", "user.name", "-o", "tsv"])
+    if not signed_in:
         return ProbeResult(
             "az_cli",
-            _OK,
-            f"present and signed in ({binary})",
-            {"binary": binary, "signed_in": True},
+            _WARN,
+            f"present at {binary}; not signed in (run `az login`)",
+            {"path": binary},
         )
     return ProbeResult(
         "az_cli",
-        _WARN,
-        f"present but not signed in (run `az login`) at {binary}",
-        {"binary": binary, "signed_in": False},
+        _OK,
+        f"present and signed in as {signed_in.strip()} ({binary})",
+        {"path": binary, "user": signed_in.strip()},
     )
 
 
-def probe_network(*, tenant_hint: str | None = None) -> ProbeResult:
-    """Probe TCP reachability of the public A365 / Graph endpoints.
-
-    ``tenant_hint`` is the tenant id or domain (e.g. ``contoso.onmicrosoft.com``)
-    used to construct the per-tenant A365 host; if absent, only the global hosts
-    are probed.
-    """
-    hosts = list(_DEFAULT_NETWORK_HOSTS)
-    if tenant_hint:
-        prefix = tenant_hint.split(".", 1)[0]
-        if prefix:
-            hosts.append(f"{prefix}.api.agent365.microsoft.com")
-
-    unreachable = [h for h in hosts if not tcp_reachable(h)]
-    if not unreachable:
+def probe_powershell() -> ProbeResult:
+    """PowerShell 7+ as ``pwsh`` — the A365 CLI shells out to it."""
+    binary = shutil.which("pwsh")
+    if not binary:
         return ProbeResult(
-            "network",
-            _OK,
-            f"{len(hosts)} hosts reachable",
-            {"hosts": hosts, "unreachable": []},
+            "powershell",
+            _ERROR,
+            "pwsh not found on PATH; install PowerShell 7+ "
+            "(https://learn.microsoft.com/powershell/scripting/install/installing-powershell)",
         )
-    if len(unreachable) == len(hosts):
+    version_raw = safe_run([binary, "-Command", "$PSVersionTable.PSVersion.ToString()"]) or ""
+    version = version_raw.strip() or "unknown"
+    if version != "unknown" and not version.startswith(("7.", "8.", "9.")):
+        return ProbeResult(
+            "powershell",
+            _WARN,
+            f"present at {binary}; version {version} (CLI requires 7+)",
+            {"path": binary, "version": version},
+        )
+    return ProbeResult(
+        "powershell",
+        _OK,
+        f"present at {binary}; version {version}",
+        {"path": binary, "version": version},
+    )
+
+
+def probe_custom_client_app(*, name: str = DEFAULT_CLIENT_APP_NAME) -> ProbeResult:
+    """Best-effort: ask az whether the operator-managed client app exists.
+
+    A miss isn't fatal — operators may have named the app differently —
+    but it's a warn so the operator can confirm. The CLI itself will
+    fail clearly later if the app doesn't exist or its permissions are
+    wrong (see ``a365 setup requirements`` for the authoritative check).
+    """
+    if not shutil.which("az"):
+        return ProbeResult(
+            "custom_client_app",
+            _WARN,
+            "az CLI not on PATH; cannot look up custom client app",
+        )
+    out = safe_run(
+        [
+            "az",
+            "ad",
+            "app",
+            "list",
+            "--display-name",
+            name,
+            "--query",
+            "[].appId",
+            "-o",
+            "tsv",
+        ],
+        timeout=15.0,
+    )
+    if out is None:
+        # `az ad app list` may also fail if not signed in — surface that.
+        return ProbeResult(
+            "custom_client_app",
+            _WARN,
+            f"could not query Entra for app {name!r} (az not signed in?)",
+            {"display_name": name},
+        )
+    out = out.strip()
+    if not out:
+        return ProbeResult(
+            "custom_client_app",
+            _WARN,
+            f"no Entra app named {name!r} in tenant; register one per {CUSTOM_CLIENT_APP_DOCS}",
+            {"display_name": name, "docs": CUSTOM_CLIENT_APP_DOCS},
+        )
+    app_id = out.splitlines()[0].strip()
+    return ProbeResult(
+        "custom_client_app",
+        _OK,
+        f"{name!r} exists (appId={app_id[:8]}…)",
+        {"display_name": name, "app_id": app_id},
+    )
+
+
+def probe_network(hosts: tuple[str, ...] = _DEFAULT_NETWORK_HOSTS) -> ProbeResult:
+    unreachable = [h for h in hosts if not tcp_reachable(h)]
+    if unreachable:
         return ProbeResult(
             "network",
             _ERROR,
-            f"none of {len(hosts)} hosts reachable: {unreachable}",
-            {"hosts": hosts, "unreachable": unreachable},
+            f"unreachable: {unreachable}",
+            {"checked": list(hosts), "unreachable": unreachable},
         )
     return ProbeResult(
         "network",
-        _WARN,
-        f"{len(unreachable)}/{len(hosts)} unreachable: {unreachable}",
-        {"hosts": hosts, "unreachable": unreachable},
+        _OK,
+        f"reachable: {list(hosts)}",
+        {"checked": list(hosts)},
     )
 
 
 def probe_keychain() -> ProbeResult:
     if sys.platform == "darwin":
-        result = safe_run(["security", "list-keychains"], timeout=3.0)
-        if result:
+        binary = shutil.which("security")
+        if not binary:
             return ProbeResult(
                 "keychain",
-                _OK,
-                "macOS Security framework available",
-                {"backend": "macos-security"},
+                _ERROR,
+                "macOS `security` not on PATH (Security framework wrapper)",
             )
-        return ProbeResult(
-            "keychain",
-            _ERROR,
-            "macOS `security` command not responding",
-            {"backend": "macos-security"},
-        )
+        return ProbeResult("keychain", _OK, f"macOS Security framework available ({binary})")
     if sys.platform.startswith("linux"):
         binary = shutil.which("secret-tool")
         if not binary:
             return ProbeResult(
                 "keychain",
                 _ERROR,
-                "secret-tool not found (install libsecret-tools / libsecret-1-0)",
-                {"backend": "libsecret"},
+                "Linux `secret-tool` not found (install libsecret-tools / libsecret-1-0)",
             )
-        return ProbeResult(
-            "keychain",
-            _OK,
-            f"libsecret available at {binary}",
-            {"backend": "libsecret", "binary": binary},
-        )
+        return ProbeResult("keychain", _OK, f"libsecret available ({binary})")
     return ProbeResult(
         "keychain",
-        _WARN,
-        f"unsupported platform: {sys.platform} (v0.1 supports macOS + Linux only)",
-        {"backend": None},
+        _ERROR,
+        f"unsupported platform: {sys.platform} (v0.1 supports macOS + Linux)",
     )
 
 
-def _resolve_hermes_home() -> Path:
-    raw = os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT
-    return Path(os.path.expanduser(raw))
-
-
 def probe_local_config() -> ProbeResult:
-    home = _resolve_hermes_home()
-    if not home.exists():
-        return ProbeResult(
-            "local_config",
-            _WARN,
-            f"{home} does not exist (skill not yet bootstrapped)",
-            {"hermes_home": str(home), "bootstrapped": False},
-        )
-
-    issues: list[str] = []
-    env_keys: list[str] = []
-    tenant_hint: str | None = None
-    config_present = False
-
+    raw = os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT
+    home = Path(os.path.expanduser(raw))
     env_file = home / ".env"
+    config_file = home / "config.yaml"
+
+    parts: list[str] = [str(home)]
+    state: ProbeState = _OK
+
     if env_file.exists():
         try:
             parsed = parse_env(env_file.read_text())
-            env_keys = sorted(parsed.keys())
-            tenant_hint = parsed.get("A365_TENANT_ID")
         except OSError as e:
-            issues.append(f".env unreadable: {e}")
-
-    config_file = home / "config.yaml"
-    if config_file.exists():
-        # We don't import a yaml parser as a hard dep; presence + readability
-        # is enough for v0.1.
-        try:
-            config_file.read_text()
-            config_present = True
-        except OSError as e:
-            issues.append(f"config.yaml unreadable: {e}")
-
-    if issues:
-        return ProbeResult(
-            "local_config",
-            _ERROR,
-            "; ".join(issues),
-            {"hermes_home": str(home)},
-        )
-
-    detail_parts = [str(home)]
-    if env_keys:
-        detail_parts.append(f".env: {len(env_keys)} keys")
+            return ProbeResult(
+                "local_config",
+                _ERROR,
+                f".env unreadable: {e}",
+                {"home": str(home)},
+            )
+        parts.append(f".env: {len(parsed)} keys")
     else:
-        detail_parts.append(".env: absent or empty")
-    detail_parts.append(f"config.yaml: {'present' if config_present else 'absent'}")
+        parts.append(".env: absent or empty")
+        state = _WARN
+
+    parts.append("config.yaml: " + ("present" if config_file.exists() else "absent"))
+
     return ProbeResult(
         "local_config",
-        _OK,
-        " | ".join(detail_parts),
+        state,
+        " | ".join(parts),
         {
-            "hermes_home": str(home),
-            "env_keys": env_keys,
-            "config_yaml_present": config_present,
-            "tenant_hint": tenant_hint,
+            "home": str(home),
+            "env_present": env_file.exists(),
+            "config_yaml_present": config_file.exists(),
         },
     )
 
@@ -286,76 +291,88 @@ def probe_hermes_harness() -> ProbeResult:
         return ProbeResult(
             "hermes_harness",
             _WARN,
-            "`hermes` not on PATH (skill may be invoked through a different entry point)",
-            {"binary": None},
+            "hermes not on PATH (skill loads, but harness CLI unavailable)",
         )
-    version = safe_run(["hermes", "--version"], timeout=5.0)
-    if not version:
-        return ProbeResult(
-            "hermes_harness",
-            _WARN,
-            f"`hermes --version` did not respond at {binary}",
-            {"binary": binary, "version": None},
-        )
-    # Some `--version` implementations print multi-line preambles; the first line
-    # is reliably the version banner. Keep the full output in `data` for callers
-    # that want it.
-    headline = version.splitlines()[0].strip()
+    out = safe_run([binary, "--version"], timeout=10.0) or ""
     return ProbeResult(
         "hermes_harness",
         _OK,
-        f"{headline} ({binary})",
-        {"binary": binary, "version": version, "headline": headline},
+        f"{out.splitlines()[0] if out else 'version unknown'} ({binary})",
+        {"path": binary, "version_raw": out},
     )
 
 
 # ---------------------------------------------------------------------------
-# Aggregation + rendering
+# Orchestration
 # ---------------------------------------------------------------------------
 
 
-def collect_probes(*, skip_network: bool = False) -> list[ProbeResult]:
-    """Run every probe and return the results in display order."""
-    results: list[ProbeResult] = []
-    results.append(probe_a365_cli())
-    results.append(probe_az_cli())
-    config_result = probe_local_config()
-    tenant_hint = config_result.data.get("tenant_hint")
-    if not skip_network:
-        results.append(probe_network(tenant_hint=tenant_hint))
-    results.append(probe_keychain())
-    results.append(config_result)
-    results.append(probe_hermes_harness())
-    return results
+@dataclass
+class DoctorReport:
+    probes: list[ProbeResult]
+
+    @property
+    def overall(self) -> ProbeState:
+        if any(p.state == _ERROR for p in self.probes):
+            return _ERROR
+        if any(p.state == _WARN for p in self.probes):
+            return _WARN
+        return _OK
 
 
-def aggregate_state(probes: list[ProbeResult]) -> tuple[ProbeState, int]:
-    """Collapse probe results into an overall state + exit code."""
-    if any(p.state == _ERROR for p in probes):
-        return _ERROR, 2
-    if any(p.state == _WARN for p in probes):
-        return _WARN, 1
-    return _OK, 0
+def overall_to_exit_code(o: ProbeState) -> int:
+    return {"ok": 0, "warn": 1, "error": 2}[o]
 
 
-def render_json(probes: list[ProbeResult]) -> str:
-    overall, _ = aggregate_state(probes)
-    payload = {
-        "overall": overall,
-        "probes": [asdict(p) for p in probes],
-    }
-    return json.dumps(payload, indent=2, sort_keys=True) + "\n"
+def run_all_probes(*, no_network: bool = False) -> DoctorReport:
+    probes: list[ProbeResult] = []
+    probes.append(probe_a365_cli())
+    probes.append(probe_az_cli())
+    probes.append(probe_powershell())
+    probes.append(probe_custom_client_app())
+    if not no_network:
+        probes.append(probe_network())
+    probes.append(probe_keychain())
+    probes.append(probe_local_config())
+    probes.append(probe_hermes_harness())
+    return DoctorReport(probes=probes)
 
 
-def render_human(probes: list[ProbeResult]) -> str:
-    """Render a compact, ASCII-only operator-friendly report."""
-    markers = {_OK: "[ ok ]", _WARN: "[warn]", _ERROR: "[FAIL]"}
+# ---------------------------------------------------------------------------
+# Rendering
+# ---------------------------------------------------------------------------
+
+
+def render_human(report: DoctorReport) -> str:
+    name_w = max((len(p.name) for p in report.probes), default=4)
+    name_w = max(name_w, len("probe"))
     lines = ["hermes a365 doctor", "-" * 30]
-    for p in probes:
-        lines.append(f"  {markers[p.state]}  {p.name:18s}  {p.detail}")
-    overall, _ = aggregate_state(probes)
-    lines.extend(["", f"overall: {overall}"])
+    for p in report.probes:
+        marker = {_OK: "[ ok ]", _WARN: "[WARN]", _ERROR: "[FAIL]"}[p.state]
+        lines.append(f"  {marker}  {p.name:<{name_w}}  {p.detail}")
+    lines.append("")
+    lines.append(f"overall: {report.overall}")
+    lines.append("")
+    lines.append(
+        "Frontier Preview Program enrollment is not auto-verifiable; "
+        f"verify your tenant at {FRONTIER_PROGRAM_URL}."
+    )
+    lines.append("Deeper auth-requiring checks: `a365 setup requirements`")
     return "\n".join(lines) + "\n"
+
+
+def render_json(report: DoctorReport) -> str:
+    return (
+        json.dumps(
+            {
+                "overall": report.overall,
+                "probes": [asdict(p) for p in report.probes],
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -365,23 +382,19 @@ def render_human(probes: list[ProbeResult]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="hermes a365 doctor — read-only environment probe."
+        description="hermes a365 doctor — read-only environment probe.",
     )
-    parser.add_argument("--human", action="store_true", help="human-readable rendering")
+    parser.add_argument("--human", action="store_true", help="formatted output for terminals")
     parser.add_argument(
         "--no-network",
         action="store_true",
-        help="skip TCP reachability probes (offline diagnostic)",
+        help="skip network reachability probes (offline diagnostic)",
     )
     args = parser.parse_args(argv)
 
-    probes = collect_probes(skip_network=args.no_network)
-    if args.human:
-        sys.stdout.write(render_human(probes))
-    else:
-        sys.stdout.write(render_json(probes))
-    _, code = aggregate_state(probes)
-    return code
+    report = run_all_probes(no_network=args.no_network)
+    sys.stdout.write(render_human(report) if args.human else render_json(report))
+    return overall_to_exit_code(report.overall)
 
 
 if __name__ == "__main__":

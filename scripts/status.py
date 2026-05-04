@@ -1,22 +1,38 @@
-"""hermes a365 status — orchestrate per-component status into a single report.
+"""hermes a365 status — per-component status report.
 
-Spec: SPEC.md §6.11. Aggregates state across nine components — license, T1
-app, T2 app, blueprint, instance, channels, activity bridge, telemetry, FIC —
-into one report with exit code semantics:
+v0.2 design: narrowed to the four components the verified GA CLI surface
+actually supports.
 
-- ``0`` — all components ``ok`` (skipped components don't fail the overall)
-- ``1`` — at least one ``warn`` or ``missing`` (partial)
+- ``local_config``     — parent ``~/.hermes/.env`` (and agent .env if a slug
+  is given) parseable + required keys present.
+- ``blueprint_scopes`` — ``a365 query-entra blueprint-scopes`` for the
+  agent's blueprint.
+- ``instance_scopes``  — ``a365 query-entra instance-scopes`` for the
+  agent's instance.
+- ``activity_bridge``  — local PID-file probe (only when agent_name given
+  AND ``bridge.pid`` exists). Activity bridge upstream work is still
+  TODO (SPEC §10 Q1); the probe stays so the future bridge can be
+  liveness-checked here.
+
+Components dropped vs v0.1:
+- ``license`` — A365 SKUs are queried via Microsoft Graph subscribedSkus,
+  not via a365 CLI. Future v0.3 may add a Graph-based component.
+- ``app (T1)`` / ``app (T2)`` — no per-tier app split in v0.2.
+- ``blueprint`` / ``instance`` — folded into the new ``*_scopes`` reads.
+- ``channels`` — channel deployment is operator-side (M365 Admin Centre)
+  and has no CLI query surface.
+- ``telemetry`` — ``a365 query-entra --telemetry`` does not exist.
+- ``fic`` — ``a365 query-entra --fic`` does not exist.
+
+Exit codes (unchanged from v0.1):
+- ``0`` — overall ``ok``
+- ``1`` — at least one ``warn`` / ``missing`` (partial)
 - ``2`` — at least one ``error`` (broken)
-- ``3`` — skill not yet bootstrapped (no ``~/.hermes/.env``)
+- ``3`` — not yet bootstrapped (parent .env absent)
 
-Local components (``local_config``, ``activity_bridge``) read the filesystem
-directly. Cloud components are sourced via the ``QuerySource`` protocol;
-``A365CliQuerySource`` shells out to ``a365 query-entra``. Tests substitute
-``FakeQuerySource``.
-
-The ``a365 query-entra`` JSON shapes are **speculative** — Microsoft does not
-publish them. Parsers are defensive (every ``payload.get(...)``); refinement
-happens once we test against a live tenant.
+The cloud reads gracefully degrade to ``skipped`` when ``a365`` isn't on
+PATH OR when the read returns nothing within the timeout (typically
+because the CLI is waiting on interactive auth).
 """
 
 from __future__ import annotations
@@ -60,9 +76,7 @@ class StatusComponent:
 
 @dataclass
 class StatusReport:
-    """A complete status snapshot. ``overall`` is derived, not stored."""
-
-    agent_slug: str | None
+    agent_name: str | None
     components: list[StatusComponent]
 
     @property
@@ -84,110 +98,72 @@ def overall_to_exit_code(o: OverallState) -> int:
 
 
 # ---------------------------------------------------------------------------
-# QuerySource — abstraction over `a365 query-entra` calls
+# QuerySource — the v0.2 query-entra surface
 # ---------------------------------------------------------------------------
 
 
 class QuerySource(Protocol):
-    """Each method returns parsed JSON on success, ``None`` on miss/failure."""
+    """Two methods, matching the GA ``a365 query-entra`` surface."""
 
     available: bool
 
-    def query_license(self) -> dict[str, Any] | None: ...
-    def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None: ...
-    def query_app_by_name(self, *, name: str) -> dict[str, Any] | None: ...
-    def query_consent(self, *, app_id: str) -> dict[str, Any] | None: ...
-    def query_blueprint(self, *, slug: str) -> dict[str, Any] | None: ...
-    def query_instance(self, *, instance_id: str) -> dict[str, Any] | None: ...
-    def query_telemetry(self, *, instance_id: str) -> dict[str, Any] | None: ...
-    def query_fic(self, *, app_id: str) -> dict[str, Any] | None: ...
+    def query_blueprint_scopes(
+        self, *, agent_name: str, tenant_id: str | None = None
+    ) -> str | None: ...
+
+    def query_instance_scopes(
+        self, *, agent_name: str, tenant_id: str | None = None
+    ) -> str | None: ...
 
 
 class _UnavailableQuerySource:
-    """Returned when ``a365`` CLI is not on PATH; every method returns None."""
-
     name = "unavailable"
     available = False
 
-    def query_license(self) -> dict[str, Any] | None:
+    def query_blueprint_scopes(
+        self, *, agent_name: str, tenant_id: str | None = None
+    ) -> str | None:
         return None
 
-    def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None:
-        return None
-
-    def query_app_by_name(self, *, name: str) -> dict[str, Any] | None:
-        return None
-
-    def query_consent(self, *, app_id: str) -> dict[str, Any] | None:
-        return None
-
-    def query_blueprint(self, *, slug: str) -> dict[str, Any] | None:
-        return None
-
-    def query_instance(self, *, instance_id: str) -> dict[str, Any] | None:
-        return None
-
-    def query_telemetry(self, *, instance_id: str) -> dict[str, Any] | None:
-        return None
-
-    def query_fic(self, *, app_id: str) -> dict[str, Any] | None:
+    def query_instance_scopes(self, *, agent_name: str, tenant_id: str | None = None) -> str | None:
         return None
 
 
 class A365CliQuerySource:
-    """Shells out to ``a365 query-entra`` for each query.
+    """Shells out to ``a365 query-entra`` and returns raw stdout text.
 
-    Each ``--<flag>`` shape below is **speculative** based on SPEC §3.3 / §6.x.
-    Refinement happens once we test against a live tenant.
+    The CLI emits human-readable text (no JSON option in v1.1.171), so
+    callers grep / pattern-match the returned string. ``None`` means the
+    call failed or timed out — typically because the CLI is waiting on
+    interactive auth (device-code flow on macOS).
     """
 
     name = "a365-cli"
 
-    def __init__(self) -> None:
+    def __init__(self, *, timeout: float = 10.0) -> None:
         self.available = shutil.which("a365") is not None
+        self._timeout = timeout
 
-    def _run(self, *flags: str) -> dict[str, Any] | None:
+    def _query_scopes(self, sub: str, *, agent_name: str, tenant_id: str | None) -> str | None:
         if not self.available:
             return None
-        out = safe_run(["a365", "query-entra", *flags], timeout=10.0)
-        if not out:
-            return None
-        try:
-            return json.loads(out)
-        except json.JSONDecodeError:
-            return None
+        argv = ["a365", "query-entra", sub, "--agent-name", agent_name]
+        if tenant_id:
+            argv.extend(["--tenant-id", tenant_id])
+        return safe_run(argv, timeout=self._timeout)
 
-    def query_license(self) -> dict[str, Any] | None:
-        return self._run("--license")
+    def query_blueprint_scopes(
+        self, *, agent_name: str, tenant_id: str | None = None
+    ) -> str | None:
+        return self._query_scopes("blueprint-scopes", agent_name=agent_name, tenant_id=tenant_id)
 
-    def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None:
-        return self._run("--by-app-id", app_id)
-
-    def query_app_by_name(self, *, name: str) -> dict[str, Any] | None:
-        return self._run("--by-name", name)
-
-    def query_consent(self, *, app_id: str) -> dict[str, Any] | None:
-        return self._run("--consent-status", "--app", app_id)
-
-    def query_blueprint(self, *, slug: str) -> dict[str, Any] | None:
-        return self._run("--blueprint", slug)
-
-    def query_instance(self, *, instance_id: str) -> dict[str, Any] | None:
-        return self._run("--instance", instance_id)
-
-    def query_telemetry(self, *, instance_id: str) -> dict[str, Any] | None:
-        return self._run("--telemetry", "--instance", instance_id)
-
-    def query_fic(self, *, app_id: str) -> dict[str, Any] | None:
-        return self._run("--fic", "--app", app_id)
+    def query_instance_scopes(self, *, agent_name: str, tenant_id: str | None = None) -> str | None:
+        return self._query_scopes("instance-scopes", agent_name=agent_name, tenant_id=tenant_id)
 
 
 def get_query_source() -> QuerySource:
-    """Return a CLI-backed QuerySource if available, else an unavailable stub."""
     cli = A365CliQuerySource()
-    if cli.available:
-        return cli
-    return _UnavailableQuerySource()
+    return cli if cli.available else _UnavailableQuerySource()
 
 
 # ---------------------------------------------------------------------------
@@ -200,14 +176,14 @@ def _resolve_hermes_home() -> Path:
     return Path(os.path.expanduser(raw))
 
 
-def gather_local_config(hermes_home: Path, agent_slug: str | None) -> StatusComponent:
-    """Read ``~/.hermes/.env`` and (if slug given) ``~/.hermes/agents/<slug>/.env``."""
+def gather_local_config(hermes_home: Path, agent_name: str | None) -> StatusComponent:
+    """Read ``~/.hermes/.env`` and (if name given) ``~/.hermes/agents/<name>/.env``."""
     env_file = hermes_home / ".env"
     if not env_file.exists():
         return StatusComponent(
             "local_config",
             _MISSING,
-            f"{env_file} does not exist; run `hermes a365 register` first",
+            f"{env_file} does not exist; run `hermes a365 register --apply` first",
             {"hermes_home": str(hermes_home)},
         )
     try:
@@ -234,17 +210,14 @@ def gather_local_config(hermes_home: Path, agent_slug: str | None) -> StatusComp
         "hermes_home": str(hermes_home),
         "tenant_id": env.get("A365_TENANT_ID"),
         "app_id": env.get("A365_APP_ID"),
-        "license_model": env.get("A365_LICENSE_MODEL"),
-        "cli_variant": env.get("A365_CLI_VARIANT"),
     }
     detail_parts = [
         f"tenant={env.get('A365_TENANT_ID')}",
         f"app_id={(env.get('A365_APP_ID') or '')[:8]}…",
     ]
 
-    # Optional per-agent .env
-    if agent_slug:
-        agent_env_file = hermes_home / "agents" / agent_slug / ".env"
+    if agent_name:
+        agent_env_file = hermes_home / "agents" / agent_name / ".env"
         if not agent_env_file.exists():
             return StatusComponent(
                 "local_config",
@@ -263,31 +236,29 @@ def gather_local_config(hermes_home: Path, agent_slug: str | None) -> StatusComp
             )
         data["agent_env"] = agent_env
         data["aa_instance_id"] = agent_env.get("AA_INSTANCE_ID")
-        detail_parts.append(f"agent={agent_slug} ({len(agent_env)} keys)")
+        detail_parts.append(f"agent={agent_name} ({len(agent_env)} keys)")
 
     return StatusComponent("local_config", _OK, " | ".join(detail_parts), data)
 
 
 def _process_alive(pid: int) -> bool:
-    """Return True iff the given pid is a live process visible to the caller."""
     try:
         os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        # Process exists but isn't ours — still alive
         return True
     return True
 
 
-def gather_activity_bridge(hermes_home: Path, agent_slug: str) -> StatusComponent:
-    """Inspect the activity-bridge PID file and probe the process."""
-    pid_file = hermes_home / "agents" / agent_slug / "bridge.pid"
+def gather_activity_bridge(hermes_home: Path, agent_name: str) -> StatusComponent:
+    """Inspect the activity-bridge PID file (if any)."""
+    pid_file = hermes_home / "agents" / agent_name / "bridge.pid"
     if not pid_file.exists():
         return StatusComponent(
             "activity_bridge",
             _MISSING,
-            "bridge.pid not found (bridge not started)",
+            "bridge.pid not found (bridge not started; SPEC §10 Q1 still TODO)",
             {"pid_file": str(pid_file)},
         )
     try:
@@ -320,219 +291,74 @@ def gather_activity_bridge(hermes_home: Path, agent_slug: str) -> StatusComponen
 # ---------------------------------------------------------------------------
 
 
-def _skipped(name: str) -> StatusComponent:
-    return StatusComponent(name, _SKIPPED, "a365 CLI unavailable")
+def _skipped(name: str, *, reason: str = "a365 CLI unavailable") -> StatusComponent:
+    return StatusComponent(name, _SKIPPED, reason)
 
 
-def gather_license(qs: QuerySource) -> StatusComponent:
+_CONSENTED_HINTS = ("consented", "granted", "ok")
+_NOT_CONSENTED_HINTS = ("not consented", "missing", "not granted", "consent required")
+
+
+def _classify_scopes_output(text: str) -> tuple[ComponentState, str]:
+    """Heuristic classifier over the CLI's human-readable scope output.
+
+    The exact phrasing isn't pinned in v1.1.171; we look for common
+    consent-state hints. When unclassifiable, default to ``ok`` with the
+    first line as detail — the operator can re-run with ``--verbose``.
+    """
+    lower = text.lower()
+    if any(hint in lower for hint in _NOT_CONSENTED_HINTS):
+        return (_WARN, "scopes present but at least one not consented")
+    if any(hint in lower for hint in _CONSENTED_HINTS):
+        return (_OK, "scopes consented")
+    # Unclassifiable but the CLI returned something — treat as warn so the
+    # operator notices and can run `--verbose` for detail.
+    first_line = text.strip().splitlines()[0] if text.strip() else ""
+    return (_WARN, first_line[:80] or "unclassifiable scope output")
+
+
+def gather_blueprint_scopes(
+    qs: QuerySource, *, agent_name: str | None, tenant_id: str | None
+) -> StatusComponent:
     if not qs.available:
-        return _skipped("license")
-    payload = qs.query_license()
-    if payload is None:
-        return StatusComponent("license", _MISSING, "no license assigned to tenant")
-    model = payload.get("model", "unknown")
-    used = payload.get("seats_used")
-    total = payload.get("seats_total")
-    detail = str(model)
-    if used is not None and total is not None:
-        detail += f", {used} of {total} seats used"
-    return StatusComponent("license", _OK, detail, payload)
+        return _skipped("blueprint_scopes")
+    if not agent_name:
+        return StatusComponent(
+            "blueprint_scopes",
+            _MISSING,
+            "no agent name given; pass <agent-name> to query",
+        )
+    text = qs.query_blueprint_scopes(agent_name=agent_name, tenant_id=tenant_id)
+    if text is None:
+        return StatusComponent(
+            "blueprint_scopes",
+            _SKIPPED,
+            "query-entra returned nothing (likely awaiting interactive auth)",
+        )
+    state, detail = _classify_scopes_output(text)
+    return StatusComponent("blueprint_scopes", state, detail, {"raw": text})
 
 
-def gather_t1_app(qs: QuerySource, *, app_id: str | None) -> StatusComponent:
-    """T1 (first-party) app status. ``app_id`` is captured during register."""
+def gather_instance_scopes(
+    qs: QuerySource, *, agent_name: str | None, tenant_id: str | None
+) -> StatusComponent:
     if not qs.available:
-        return _skipped("app (T1)")
-    if not app_id:
+        return _skipped("instance_scopes")
+    if not agent_name:
         return StatusComponent(
-            "app (T1)",
+            "instance_scopes",
             _MISSING,
-            "no T1 appId recorded locally; run register",
+            "no agent name given; pass <agent-name> to query",
         )
-    payload = qs.query_app_by_id(app_id=app_id)
-    if payload is None:
+    text = qs.query_instance_scopes(agent_name=agent_name, tenant_id=tenant_id)
+    if text is None:
         return StatusComponent(
-            "app (T1)",
-            _MISSING,
-            f"appId {app_id[:8]}… not found in tenant",
-            {"app_id": app_id},
+            "instance_scopes",
+            _SKIPPED,
+            "query-entra returned nothing (likely awaiting interactive auth)",
         )
-    return StatusComponent(
-        "app (T1)",
-        _OK,
-        f"appId={app_id[:8]}…",
-        {"app_id": app_id, "payload": payload},
-    )
-
-
-def gather_t2_app(qs: QuerySource, *, app_id: str) -> StatusComponent:
-    """T2 (confidential client) app status with consent state folded in."""
-    if not qs.available:
-        return _skipped("app (T2)")
-    if not app_id:
-        return StatusComponent(
-            "app (T2)",
-            _MISSING,
-            "no T2 appId recorded locally; run register",
-        )
-    app = qs.query_app_by_id(app_id=app_id)
-    if app is None:
-        return StatusComponent(
-            "app (T2)",
-            _MISSING,
-            f"appId {app_id[:8]}… not found in tenant",
-            {"app_id": app_id},
-        )
-    consent = qs.query_consent(app_id=app_id) or {}
-    granted = bool(consent.get("granted"))
-    granted_date = consent.get("granted_date") or consent.get("grantedAt")
-    if not granted:
-        return StatusComponent(
-            "app (T2)",
-            _WARN,
-            f"appId={app_id[:8]}…, consent=missing",
-            {"app_id": app_id, "consent": consent, "payload": app},
-        )
-    detail = f"appId={app_id[:8]}…, consent=granted"
-    if granted_date:
-        detail += f" {granted_date}"
-    return StatusComponent(
-        "app (T2)",
-        _OK,
-        detail,
-        {"app_id": app_id, "consent": consent, "payload": app},
-    )
-
-
-def gather_blueprint(qs: QuerySource, *, slug: str) -> StatusComponent:
-    if not qs.available:
-        return _skipped("blueprint")
-    payload = qs.query_blueprint(slug=slug)
-    if payload is None:
-        return StatusComponent(
-            "blueprint",
-            _MISSING,
-            f"blueprint {slug!r} not registered",
-            {"slug": slug},
-        )
-    last_patched = payload.get("last_patched") or payload.get("lastPatched")
-    detail = slug
-    if last_patched:
-        detail += f", last patched {last_patched}"
-    return StatusComponent("blueprint", _OK, detail, payload)
-
-
-def gather_instance(qs: QuerySource, *, instance_id: str | None) -> StatusComponent:
-    if not qs.available:
-        return _skipped("instance")
-    if not instance_id:
-        return StatusComponent(
-            "instance",
-            _MISSING,
-            "no AA_INSTANCE_ID in agent .env; run `hermes a365 instance create`",
-        )
-    payload = qs.query_instance(instance_id=instance_id)
-    if payload is None:
-        return StatusComponent(
-            "instance",
-            _MISSING,
-            f"instance {instance_id[:8]}… not found",
-            {"instance_id": instance_id},
-        )
-    return StatusComponent(
-        "instance",
-        _OK,
-        f"AA_INSTANCE_ID={instance_id[:8]}…",
-        {"instance_id": instance_id, "payload": payload},
-    )
-
-
-def gather_channels(qs: QuerySource, *, instance_id: str | None) -> StatusComponent:
-    if not qs.available:
-        return _skipped("channels")
-    if not instance_id:
-        return StatusComponent("channels", _MISSING, "no instance to query")
-    payload = qs.query_instance(instance_id=instance_id) or {}
-    channels = payload.get("channels", {}) or {}
-    if not channels:
-        return StatusComponent(
-            "channels",
-            _MISSING,
-            "no channels deployed",
-            {"instance_id": instance_id},
-        )
-    # Expected shape: {"teams": "ok", "outlook": "ok", "m365copilot": "missing"}
-    parts = [f"{name}={state}" for name, state in sorted(channels.items())]
-    state: ComponentState = _OK
-    if any(v != "ok" for v in channels.values()):
-        state = _WARN
-    return StatusComponent(
-        "channels",
-        state,
-        " ".join(parts),
-        {"instance_id": instance_id, "channels": channels},
-    )
-
-
-def gather_telemetry(qs: QuerySource, *, instance_id: str | None) -> StatusComponent:
-    if not qs.available:
-        return _skipped("telemetry")
-    if not instance_id:
-        return StatusComponent("telemetry", _MISSING, "no instance to query")
-    payload = qs.query_telemetry(instance_id=instance_id)
-    if payload is None:
-        return StatusComponent(
-            "telemetry",
-            _MISSING,
-            "no telemetry data available",
-            {"instance_id": instance_id},
-        )
-    last_span = payload.get("last_span") or payload.get("lastSpan")
-    sampler = payload.get("sampler", "")
-    if not last_span:
-        return StatusComponent(
-            "telemetry",
-            _WARN,
-            f"no spans seen yet (sampler={sampler})",
-            payload,
-        )
-    detail = f"last span {last_span}"
-    if sampler:
-        detail += f", sampler={sampler}"
-    return StatusComponent("telemetry", _OK, detail, payload)
-
-
-def gather_fic(qs: QuerySource, *, app_id: str | None) -> StatusComponent:
-    if not qs.available:
-        return _skipped("fic")
-    if not app_id:
-        return StatusComponent("fic", _MISSING, "no T2 appId recorded locally")
-    payload = qs.query_fic(app_id=app_id)
-    if payload is None:
-        return StatusComponent(
-            "fic",
-            _MISSING,
-            "no FIC configured",
-            {"app_id": app_id},
-        )
-    expires = payload.get("expires") or payload.get("expiresAt")
-    days_until = payload.get("days_until_expiry")
-    if expires is None:
-        return StatusComponent(
-            "fic",
-            _WARN,
-            "FIC present but no expiry recorded",
-            payload,
-        )
-    detail = f"expires {expires}"
-    state: ComponentState = _OK
-    if isinstance(days_until, int):
-        detail += f" ({days_until} days)"
-        if days_until <= 0:
-            state = _ERROR
-        elif days_until <= 7:
-            state = _WARN
-    return StatusComponent("fic", state, detail, payload)
+    state, detail = _classify_scopes_output(text)
+    return StatusComponent("instance_scopes", state, detail, {"raw": text})
 
 
 # ---------------------------------------------------------------------------
@@ -541,12 +367,13 @@ def gather_fic(qs: QuerySource, *, app_id: str | None) -> StatusComponent:
 
 
 def collect_status(
-    agent_slug: str | None,
+    agent_name: str | None,
     *,
     hermes_home: Path | None = None,
     query_source: QuerySource | None = None,
+    tenant_id: str | None = None,
 ) -> StatusReport:
-    """Build a full status report for a single agent (or skill-wide if slug=None)."""
+    """Build the full status report."""
     if hermes_home is None:
         hermes_home = _resolve_hermes_home()
     if query_source is None:
@@ -554,32 +381,30 @@ def collect_status(
 
     components: list[StatusComponent] = []
 
-    local = gather_local_config(hermes_home, agent_slug)
+    local = gather_local_config(hermes_home, agent_name)
     components.append(local)
 
+    # If we're not bootstrapped at all, skip the cloud probes — they'd
+    # all return missing/skipped anyway and the result is just noise.
     if local.state == _MISSING:
-        return StatusReport(agent_slug=None, components=components)
+        return StatusReport(agent_name=None, components=components)
 
-    tenant_id = local.data.get("tenant_id", "")
-    app_id_t2 = local.data.get("app_id", "")
-    aa_instance_id = local.data.get("aa_instance_id")
+    # Tenant id for cloud reads — prefer caller-supplied, fall back to
+    # the parent .env value, then to None (CLI auto-detects via az).
+    if tenant_id is None:
+        tenant_id = local.data.get("tenant_id") or None
 
-    # Tenant-wide
-    components.append(gather_license(query_source))
-    components.append(gather_t1_app(query_source, app_id=(tenant_id and app_id_t2) or None))
-    components.append(gather_t2_app(query_source, app_id=app_id_t2))
+    components.append(
+        gather_blueprint_scopes(query_source, agent_name=agent_name, tenant_id=tenant_id)
+    )
+    components.append(
+        gather_instance_scopes(query_source, agent_name=agent_name, tenant_id=tenant_id)
+    )
 
-    # Per-agent
-    if agent_slug:
-        components.append(gather_blueprint(query_source, slug=agent_slug))
-        components.append(gather_instance(query_source, instance_id=aa_instance_id))
-        components.append(gather_channels(query_source, instance_id=aa_instance_id))
-        components.append(gather_telemetry(query_source, instance_id=aa_instance_id))
-        components.append(gather_activity_bridge(hermes_home, agent_slug))
+    if agent_name:
+        components.append(gather_activity_bridge(hermes_home, agent_name))
 
-    components.append(gather_fic(query_source, app_id=app_id_t2))
-
-    return StatusReport(agent_slug=agent_slug, components=components)
+    return StatusReport(agent_name=agent_name, components=components)
 
 
 # ---------------------------------------------------------------------------
@@ -588,7 +413,6 @@ def collect_status(
 
 
 def render_human(report: StatusReport) -> str:
-    """Render the status report as a markdown-style aligned table."""
     if not report.components:
         return "(no components gathered)\n"
 
@@ -598,8 +422,8 @@ def render_human(report: StatusReport) -> str:
     state_w = max(state_w, len("State"))
 
     lines = []
-    if report.agent_slug:
-        lines.append(f"hermes a365 status — {report.agent_slug}")
+    if report.agent_name:
+        lines.append(f"hermes a365 status — {report.agent_name}")
     else:
         lines.append("hermes a365 status — (skill-wide)")
     lines.append("-" * 60)
@@ -611,13 +435,15 @@ def render_human(report: StatusReport) -> str:
     lines.append("")
     lines.append(f"overall: {report.overall}")
     if skipped:
-        lines.append(f"note: {skipped} component(s) skipped (a365 CLI unavailable)")
+        lines.append(
+            f"note: {skipped} component(s) skipped (a365 CLI unavailable or awaiting auth)"
+        )
     return "\n".join(lines) + "\n"
 
 
 def render_json(report: StatusReport) -> str:
     payload = {
-        "agent_slug": report.agent_slug,
+        "agent_name": report.agent_name,
         "overall": report.overall,
         "components": [asdict(c) for c in report.components],
     }
@@ -634,14 +460,15 @@ def main(argv: list[str] | None = None) -> int:
         description="hermes a365 status — per-component status report.",
     )
     parser.add_argument(
-        "agent_slug",
+        "agent_name",
         nargs="?",
-        help="agent to report on; omit for skill-wide status",
+        help="agent name to report on; omit for skill-wide status",
     )
+    parser.add_argument("--tenant-id", help="override tenant id used for cloud reads")
     parser.add_argument("--human", action="store_true", help="markdown-aligned output")
     args = parser.parse_args(argv)
 
-    report = collect_status(args.agent_slug)
+    report = collect_status(args.agent_name, tenant_id=args.tenant_id)
     sys.stdout.write(render_human(report) if args.human else render_json(report))
     return overall_to_exit_code(report.overall)
 

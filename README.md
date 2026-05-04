@@ -126,11 +126,12 @@ uv run python scripts/render_instance_env.py \
 **v0.2 redesign in progress.** v0.1 targeted a speculative CLI that
 diverged materially from Microsoft.Agents.A365.DevTools.Cli's GA surface
 (see [`references/a365-cli-reference.md`](references/a365-cli-reference.md)).
-Slice 18a — the foundation reset — has landed: new `mutator.py` (thin
-`run(argv)` wrapper around the real CLI), `a365_config.py` (read/write
-`a365.config.json`), and the obsolete v0.1 scripts that targeted
-non-existent verbs have been deleted. Subsequent slices rebuild the
-apply path on top.
+Slices 18a–18f have landed: foundation reset (`mutator.py` thin
+`run(argv)` wrapper + `a365_config.py`), apply-path rebuild (`register`,
+`instance_create`, `cleanup`, `publish`), and read-path rework
+(`doctor` + `status` against the real `query-entra` surface;
+`telemetry.py` dropped because `a365 query-entra --telemetry` does
+not exist).
 
 | Area | Status |
 |---|---|
@@ -143,12 +144,12 @@ apply path on top.
 | `render_instance_env.py` + template (per-agent runtime `.env`) | done |
 | `mutator.py` (v0.2 thin CLI wrapper + AADSTS handling) | **done (Slice 18a)** |
 | `a365_config.py` (`a365.config.json` round-trip) | **done (Slice 18a)** |
-| `doctor.py` (env probe) | done — needs Slice 18f rework for real CLI variant + PowerShell + custom-client-app prereqs |
-| `status.py` (per-component report; resolves SPEC §6.11) | done — needs Slice 18f rework around real `query-entra` surface |
-| `register.py` → setup orchestrator (`a365 setup blueprint` + `setup permissions {mcp,bot}`) | **TODO (Slice 18b)** |
-| `instance_create.py` → local runtime `.env` writer only | **TODO (Slice 18c)** |
-| `cleanup.py` rewrite around `cleanup blueprint/instance/azure` | **TODO (Slice 18d)** |
-| `publish.py` (manifest packaging via `a365 publish`) | **TODO (Slice 18e)** |
+| `register.py` → setup orchestrator (`a365 setup blueprint` + `setup permissions {mcp,bot}`) | **done (Slice 18b)** |
+| `instance_create.py` → local runtime `.env` writer only | **done (Slice 18c)** |
+| `cleanup.py` rewrite around `cleanup blueprint/instance/azure` | **done (Slice 18d)** |
+| `publish.py` (manifest packaging via `a365 publish`) | **done (Slice 18e)** |
+| `doctor.py` (env probe — real CLI variant + PowerShell + custom-client-app prereqs) | **done (Slice 18f)** |
+| `status.py` (per-component report against `query-entra`; resolves SPEC §6.11) | **done (Slice 18f)** |
 | `references/` content (CLI surface, error codes, etc.) | done |
 | `SKILL.md` 0.2.0 final | **TODO (Slice 18g)** |
 | `activity_bridge.py` | TODO (blocked on SPEC §10 Q1 — Hermes IPC contract) |
