@@ -11,22 +11,22 @@ Integrate Hermes agents into the Microsoft 365 ecosystem using Microsoft Agent 3
 ```
 .
 ├── SPEC.md           # Authoritative spec for the hermes-a365 skill
+├── SKILL.md          # Validator-compliant upstream contribution (per SPEC §3.1)
 ├── README.md         # This file
 ├── LICENSE           # MIT
 ├── .gitignore
 ├── pyproject.toml    # Python 3.11+, uv-managed, pytest + ruff dev deps
-├── references/       # Microsoft Learn pointers, BF activity shapes, blueprint property reference (TODO)
-├── scripts/          # Helpers — render_blueprint, render_instance_env (more TODO)
-│   └── _common.py    # Shared Jinja env + path helpers
+├── references/       # Dated snapshots: CLI, errors, blueprint props, OTel, BF, license
+├── scripts/          # Subcommand implementations (planner + applier per command)
+│   └── _common.py    # Shared Jinja env, deep_diff, parse_env, safe_run, tcp_reachable
 ├── templates/
 │   ├── blueprint.json.j2
 │   ├── instance.env.j2
-│   ├── consent-url.txt.j2          (TODO)
-│   └── adaptive-cards/             (TODO)
+│   ├── consent-url.txt.j2
+│   └── adaptive-cards/             # greeting / confirmation / error
 └── tests/
     ├── conftest.py
-    ├── test_render_blueprint.py
-    ├── test_render_instance_env.py
+    ├── test_*.py                   # one per scripts/ module
     └── golden/                     # Golden fixtures (regenerate with --update-golden)
 ```
 
@@ -142,8 +142,6 @@ uv run python scripts/render_instance_env.py \
 | `references/` content | done |
 | `SKILL.md` (drafted here, upstreamed later) | done |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
-| `references/` content | TODO |
-| `SKILL.md` (drafted here, upstreamed later) | TODO |
 
 The doctor can be run directly:
 
