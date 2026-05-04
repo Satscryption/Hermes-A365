@@ -71,6 +71,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** thirteenth slice — `telemetry.py` (read-only OTLP / span verifier, per §6.8). Three checks: `HERMES_OTLP_ENDPOINT` set in agent .env, `AA_INSTANCE_ID` recorded, last span seen via `QuerySource.query_telemetry`. JSON output by default, `--human` for a markdown table. Exit codes mirror `status` (0 ok / 1 partial / 2 broken). Span injection itself is the activity bridge's responsibility (§6.7); this command only verifies the pipeline.
 - **2026-05-04:** fourteenth slice — `fic_rotate.py` (rotate the user-FIC for the T2 confidential client, per §6.10). New `Mutator.fic_rotate` op wraps `a365 fic rotate --app=<T2-appId>`; the new client secret is written to the OS keychain via the existing `secrets` wrapper, replacing the entry written at `register` time. Default dry-run; `--apply` rotates. Surfaces an explicit reminder to restart the activity bridge after rotation.
 - **2026-05-04:** fifteenth slice — `cleanup.py` (per-agent destructive teardown, per §6.13). Order matters per spec: `deployment → instance → blueprint`. Apps (T1/T2) are deliberately *not* touched — they're tenant-wide infrastructure shared across every agent in the skill. Safety: `--confirm` is required and must be the literal agent slug; the plan is always printed (even without `--apply`) so the operator can audit before mutating. Defensive plan-building: each step is included only when the underlying state appears to exist; missing state turns into a recorded skip rather than an error. New `Mutator.cleanup(kind, identifier)` op covers the `a365 cleanup deployment/instance/blueprint/app` family. Local artefacts (`.env`, `blueprint.json`) are removed only after the cloud steps succeed; the empty agent dir is also reaped.
+- **2026-05-04:** sixteenth slice — `references/` content. Filled in seven dated-snapshot files: `README.md` (index), `a365-cli-reference.md` (variants, version pins, every CLI subcommand the skill calls + which module owns it), `error-codes.md` (AADSTS catalogue + delegated-scope drift table), `entra-blueprint-properties.md` (top-level + sub-property allowlist + the server-assigned-fields list that `blueprint_create` strips), `opentelemetry-config.md` (canonical event vocabulary, required span attributes, sampler), `activity-protocol-shapes.md` (forward-looking Bot Framework shape catalogue for the still-blocked activity bridge), `license-cost-table.md` (decision matrix matching `scripts/license.py`). Doctor handles drift detection; this folder is the snapshot, not the source of truth.
 
 ## Development
 
@@ -137,6 +138,7 @@ uv run python scripts/render_instance_env.py \
 | `telemetry.py` (OTLP / span verifier; §6.8) | done |
 | `fic_rotate.py` (rotate user-FIC + refresh keychain; §6.10) | done |
 | `cleanup.py` (per-agent destructive teardown; §6.13) | done |
+| `references/` content | done |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
 | `references/` content | TODO |
 | `SKILL.md` (drafted here, upstreamed later) | TODO |
