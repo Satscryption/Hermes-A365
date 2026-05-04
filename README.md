@@ -123,15 +123,16 @@ uv run python scripts/render_instance_env.py \
 
 ### What's implemented vs TODO
 
-**v0.2 redesign in progress.** v0.1 targeted a speculative CLI that
-diverged materially from Microsoft.Agents.A365.DevTools.Cli's GA surface
-(see [`references/a365-cli-reference.md`](references/a365-cli-reference.md)).
-Slices 18a–18f have landed: foundation reset (`mutator.py` thin
+**v0.2 redesign feature-complete (pending live tenant test).** v0.1
+targeted a speculative CLI that diverged materially from
+Microsoft.Agents.A365.DevTools.Cli's GA surface (see
+[`references/a365-cli-reference.md`](references/a365-cli-reference.md)).
+Slices 18a–18g have landed: foundation reset (`mutator.py` thin
 `run(argv)` wrapper + `a365_config.py`), apply-path rebuild (`register`,
-`instance_create`, `cleanup`, `publish`), and read-path rework
-(`doctor` + `status` against the real `query-entra` surface;
-`telemetry.py` dropped because `a365 query-entra --telemetry` does
-not exist).
+`instance_create`, `cleanup`, `publish`), read-path rework (`doctor` +
+`status` against the real `query-entra` surface; `telemetry.py` dropped
+because `a365 query-entra --telemetry` does not exist), and `SKILL.md`
+0.2.0 rewrite.
 
 | Area | Status |
 |---|---|
@@ -151,9 +152,9 @@ not exist).
 | `doctor.py` (env probe — real CLI variant + PowerShell + custom-client-app prereqs) | **done (Slice 18f)** |
 | `status.py` (per-component report against `query-entra`; resolves SPEC §6.11) | **done (Slice 18f)** |
 | `references/` content (CLI surface, error codes, etc.) | done |
-| `SKILL.md` 0.2.0 final | **TODO (Slice 18g)** |
+| `SKILL.md` 0.2.0 final (rewritten against the GA CLI surface) | **done (Slice 18g)** |
 | `activity_bridge.py` | TODO (blocked on SPEC §10 Q1 — Hermes IPC contract) |
-| Live integration test against an M365 tenant | TODO (Slice 18g — once apply path is rebuilt) |
+| Live integration test against an M365 tenant | TODO (operator-side; needs Frontier-Preview tenant + `pwsh` + `Agent 365 CLI` client app) |
 
 The doctor can be run directly:
 
