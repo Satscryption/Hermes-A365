@@ -4,7 +4,7 @@ Integrate Hermes agents into the Microsoft 365 ecosystem using Microsoft Agent 3
 
 ## Status
 
-**Early implementation.** The authoritative design lives in [`SPEC.md`](SPEC.md) (v1, 2026-05-03 — two days after A365 reached general availability on 2026-05-01). The first vertical slice — blueprint and per-agent `.env` rendering, with golden-file tests — is in place. Most subcommands and the Activity bridge are still TODO.
+**Feature-complete except activity bridge.** The authoritative design lives in [`SPEC.md`](SPEC.md) (v1, 2026-05-03 — two days after A365 reached general availability on 2026-05-01). All planned subcommands ship except `activity-bridge`, which is blocked on the §10 Q1 Hermes IPC contract. The validator-compliant [`SKILL.md`](SKILL.md) is drafted here and ready for upstream contribution into the Hermes harness per SPEC §3.1. Test suite: 393 passing, ruff-clean.
 
 ## Repo layout
 
@@ -72,6 +72,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-04:** fourteenth slice — `fic_rotate.py` (rotate the user-FIC for the T2 confidential client, per §6.10). New `Mutator.fic_rotate` op wraps `a365 fic rotate --app=<T2-appId>`; the new client secret is written to the OS keychain via the existing `secrets` wrapper, replacing the entry written at `register` time. Default dry-run; `--apply` rotates. Surfaces an explicit reminder to restart the activity bridge after rotation.
 - **2026-05-04:** fifteenth slice — `cleanup.py` (per-agent destructive teardown, per §6.13). Order matters per spec: `deployment → instance → blueprint`. Apps (T1/T2) are deliberately *not* touched — they're tenant-wide infrastructure shared across every agent in the skill. Safety: `--confirm` is required and must be the literal agent slug; the plan is always printed (even without `--apply`) so the operator can audit before mutating. Defensive plan-building: each step is included only when the underlying state appears to exist; missing state turns into a recorded skip rather than an error. New `Mutator.cleanup(kind, identifier)` op covers the `a365 cleanup deployment/instance/blueprint/app` family. Local artefacts (`.env`, `blueprint.json`) are removed only after the cloud steps succeed; the empty agent dir is also reaped.
 - **2026-05-04:** sixteenth slice — `references/` content. Filled in seven dated-snapshot files: `README.md` (index), `a365-cli-reference.md` (variants, version pins, every CLI subcommand the skill calls + which module owns it), `error-codes.md` (AADSTS catalogue + delegated-scope drift table), `entra-blueprint-properties.md` (top-level + sub-property allowlist + the server-assigned-fields list that `blueprint_create` strips), `opentelemetry-config.md` (canonical event vocabulary, required span attributes, sampler), `activity-protocol-shapes.md` (forward-looking Bot Framework shape catalogue for the still-blocked activity bridge), `license-cost-table.md` (decision matrix matching `scripts/license.py`). Doctor handles drift detection; this folder is the snapshot, not the source of truth.
+- **2026-05-04:** seventeenth slice — `SKILL.md` (the upstream contribution). Validator-compliant frontmatter per SPEC §3.2 (name, description, version 0.1.0, MIT, hermes tags, related-skills). Body follows §4 structure: Overview, When to Use, Prerequisites, Core procedures (one block per subcommand including the still-blocked activity-bridge), Conflict resolution, Common pitfalls, Verification checklist, One-shot recipes. ~14.9k chars — comfortably under the 15k target; capability detail beyond that lives in `references/`. This file is what gets contributed to `hermes-agent/optional-skills/cloud-platforms/hermes-a365/SKILL.md` per SPEC §3.1.
 
 ## Development
 
@@ -139,6 +140,7 @@ uv run python scripts/render_instance_env.py \
 | `fic_rotate.py` (rotate user-FIC + refresh keychain; §6.10) | done |
 | `cleanup.py` (per-agent destructive teardown; §6.13) | done |
 | `references/` content | done |
+| `SKILL.md` (drafted here, upstreamed later) | done |
 | `activity_bridge.py` | TODO (blocked on §10 Q1 — Hermes IPC contract) |
 | `references/` content | TODO |
 | `SKILL.md` (drafted here, upstreamed later) | TODO |
