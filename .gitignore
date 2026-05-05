@@ -5,6 +5,17 @@
 *.pem
 *.key
 
+# A365 CLI runtime config — `a365.config.json` is operator-edited; the
+# `*.generated.config.json` files emitted by `a365 setup blueprint`
+# contain the agent blueprint client secret in plaintext on platforms
+# where DPAPI is unavailable (macOS, Linux). Never commit.
+a365.config.json
+a365.generated.config.json
+*.generated.config.json
+# `a365 cleanup -y` writes timestamped backups of the above files.
+a365.config.backup-*.json
+a365.generated.config.backup-*.json
+
 # Python
 __pycache__/
 *.py[cod]

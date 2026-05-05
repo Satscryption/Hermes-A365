@@ -100,7 +100,7 @@ class Mutator(Protocol):
 
     available: bool
 
-    def run(self, argv: list[str], *, timeout: float = 60.0) -> RunResult: ...
+    def run(self, argv: list[str], *, timeout: float = 900.0) -> RunResult: ...
 
 
 # ---------------------------------------------------------------------------
@@ -133,7 +133,7 @@ class A365CliMutator:
                     os.environ["DOTNET_ROOT"] = candidate
                     break
 
-    def run(self, argv: list[str], *, timeout: float = 60.0) -> RunResult:
+    def run(self, argv: list[str], *, timeout: float = 900.0) -> RunResult:
         if not self.available:
             raise CliInvocationError(argv, -1, f"{A365_CLI_BINARY} not on PATH")
         proc = subprocess.run(
