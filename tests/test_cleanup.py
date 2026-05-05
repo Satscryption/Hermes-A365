@@ -647,6 +647,120 @@ class TestApplyCleanupOrphanInstance:
         assert result.orphan_instances_remaining == []
 
 
+class TestApplyCleanupAdditionalOrphanInstance:
+    """Slice 19h round-4 follow-up: the AI Teammate flow creates the
+    agentRegistry instance server-side, so the snapshot-from-config
+    path can't see it. ``--orphan-instance-id <guid>`` lets the
+    operator plumb the id in by hand."""
+
+    _AITEAMMATE_INSTANCE = "11111111-2222-3333-4444-555555555555"
+
+    def test_manual_id_surfaced_when_config_has_none(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            generated_config_path=tmp_path / "nope.json",
+            additional_orphan_instance_ids=(self._AITEAMMATE_INSTANCE,),
+        )
+        assert result.orphan_instance_ids == [self._AITEAMMATE_INSTANCE]
+        assert result.orphan_instances_remaining == [self._AITEAMMATE_INSTANCE]
+        assert any(
+            f"agentRegistry/agentInstances/{self._AITEAMMATE_INSTANCE}" in m
+            for m in result.messages
+        )
+
+    def test_manual_id_purged_with_az_rest_when_purge_on(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        mutator = FakeMutator()
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=tmp_path / "nope.json",
+            additional_orphan_instance_ids=(self._AITEAMMATE_INSTANCE,),
+        )
+        assert result.orphan_instances_purged == [self._AITEAMMATE_INSTANCE]
+        assert mutator.calls[-1] == [
+            "az",
+            "rest",
+            "--method",
+            "DELETE",
+            "--uri",
+            f"https://graph.microsoft.com/beta/agentRegistry/agentInstances/"
+            f"{self._AITEAMMATE_INSTANCE}",
+        ]
+
+    def test_snapshot_and_manual_ids_dedupe_when_same(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path, instance_id=_TEST_INSTANCE_ID)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        # Operator passes the same id that the snapshot will pick up.
+        # We must not surface or DELETE it twice.
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            generated_config_path=cfg_path,
+            additional_orphan_instance_ids=(_TEST_INSTANCE_ID.upper(),),
+        )
+        assert result.orphan_instance_ids == [_TEST_INSTANCE_ID]
+        assert result.orphan_instances_remaining == [_TEST_INSTANCE_ID]
+        # Only one recovery line.
+        recovery_lines = [
+            m for m in result.messages if "orphaned agentRegistry instance" in m
+        ]
+        assert len(recovery_lines) == 1
+
+    def test_snapshot_and_manual_ids_both_surface_when_different(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path, instance_id=_TEST_INSTANCE_ID)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            generated_config_path=cfg_path,
+            additional_orphan_instance_ids=(self._AITEAMMATE_INSTANCE,),
+        )
+        # Snapshot id first, manual id second — preserves insertion
+        # order so ops can correlate output to flag positions.
+        assert result.orphan_instance_ids == [
+            _TEST_INSTANCE_ID,
+            self._AITEAMMATE_INSTANCE,
+        ]
+
+    def test_blank_manual_id_ignored(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            generated_config_path=tmp_path / "nope.json",
+            additional_orphan_instance_ids=("", "   "),
+        )
+        assert result.orphan_instance_ids == []
+
+
 # ---------------------------------------------------------------------------
 # Sanity
 # ---------------------------------------------------------------------------

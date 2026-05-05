@@ -530,6 +530,23 @@ handle:
   The agentRegistry DELETE requires `AgentRegistry.ReadWrite.All`
   on the delegated `az` CLI token; on accounts without it the
   wrapper surfaces the failure and falls back to the recovery line.
+
+- **AI Teammate flow note (round-4 finding).** The
+  `publish --aiteammate` flow has Microsoft create the instance
+  server-side during admin-centre activation. The instance id
+  never reaches `a365.generated.config.json`, so the snapshot
+  path is blind to it. Pass it explicitly via
+  `--orphan-instance-id <guid>` (repeatable). The id can be read
+  from the Agent 365 admin centre Instances tab on the agent. Or
+  follow the recovery line the wrapper prints from the
+  blueprint-only path.
+
+  ```bash
+  uv run python scripts/cleanup.py --agent-name "<display-name>" \
+      --apply --confirm "<display-name>" --purge-orphans \
+      --orphan-instance-id <guid-from-admin-centre>
+  ```
+
 - Or copy the recovery line(s) the wrapper prints and run by hand.
 
 - [ ] `cleanup --apply` exits 0 (or 1 with only documented orphans —

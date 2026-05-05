@@ -301,6 +301,7 @@ def apply_cleanup_plan(
     hermes_home: Path,
     purge_orphans: bool = False,
     generated_config_path: Path | None = None,
+    additional_orphan_instance_ids: tuple[str, ...] = (),
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
 
@@ -318,12 +319,26 @@ def apply_cleanup_plan(
     ``a365.generated.config.json`` *before* the CLI wipes the local
     config, and surfaces the orphan agentRegistry entry (or
     ``--purge-orphans`` issues a Graph DELETE via ``az rest``).
+    ``additional_orphan_instance_ids`` (driven by
+    ``--orphan-instance-id``) plumbs in ids the operator knows about
+    but that aren't in the local config — the AI Teammate flow
+    creates the instance server-side via admin-centre activation, so
+    the snapshot path can't see those (round-4 walkthrough finding,
+    2026-05-05).
     """
     result = CleanupResult(plan=plan)
 
     if generated_config_path is None:
         generated_config_path = Path.cwd() / "a365.generated.config.json"
-    candidate_instance_id = _snapshot_agent_instance_id(generated_config_path)
+    snapshot_instance_id = _snapshot_agent_instance_id(generated_config_path)
+    # Dedupe + canonical-case the union of (snapshot, operator-supplied).
+    candidate_instance_ids: list[str] = []
+    if snapshot_instance_id is not None:
+        candidate_instance_ids.append(snapshot_instance_id.lower())
+    for oid in additional_orphan_instance_ids:
+        normalised = oid.strip().lower()
+        if normalised and normalised not in candidate_instance_ids:
+            candidate_instance_ids.append(normalised)
 
     for step in plan.steps:
         # Pre-feed `y\n` for the GA CLI's "Continue with X cleanup? (y/N):"
@@ -396,44 +411,41 @@ def apply_cleanup_plan(
     # ``agentRegistry/agentInstances/<id>`` registry record behind. The
     # operator's account typically lacks ``AgentRegistry.ReadWrite.All``
     # so the DELETE may 403 — surface a recovery hint either way.
-    if candidate_instance_id is not None:
-        result.orphan_instance_ids.append(candidate_instance_id)
+    for instance_id in candidate_instance_ids:
+        result.orphan_instance_ids.append(instance_id)
         recovery = (
             f"az rest --method DELETE --uri "
-            f"{_AGENT_INSTANCES_GRAPH_URL.format(instance_id=candidate_instance_id)}"
+            f"{_AGENT_INSTANCES_GRAPH_URL.format(instance_id=instance_id)}"
         )
         if not purge_orphans:
-            result.orphan_instances_remaining.append(candidate_instance_id)
+            result.orphan_instances_remaining.append(instance_id)
             result.messages.append(
                 f"[apply] orphaned agentRegistry instance: "
-                f"{candidate_instance_id}; recover with: {recovery}"
+                f"{instance_id}; recover with: {recovery}"
             )
-        else:
-            try:
-                mutator.run(
-                    [
-                        "az",
-                        "rest",
-                        "--method",
-                        "DELETE",
-                        "--uri",
-                        _AGENT_INSTANCES_GRAPH_URL.format(
-                            instance_id=candidate_instance_id
-                        ),
-                    ]
-                )
-            except CliInvocationError as e:
-                result.orphan_instances_remaining.append(candidate_instance_id)
-                result.messages.append(
-                    f"[apply] purge failed for instance "
-                    f"{candidate_instance_id}: {e}; recover with: {recovery}"
-                )
-            else:
-                result.orphan_instances_purged.append(candidate_instance_id)
-                result.messages.append(
-                    f"[apply] purged orphan agentRegistry instance "
-                    f"{candidate_instance_id}"
-                )
+            continue
+        try:
+            mutator.run(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "DELETE",
+                    "--uri",
+                    _AGENT_INSTANCES_GRAPH_URL.format(instance_id=instance_id),
+                ]
+            )
+        except CliInvocationError as e:
+            result.orphan_instances_remaining.append(instance_id)
+            result.messages.append(
+                f"[apply] purge failed for instance "
+                f"{instance_id}: {e}; recover with: {recovery}"
+            )
+            continue
+        result.orphan_instances_purged.append(instance_id)
+        result.messages.append(
+            f"[apply] purged orphan agentRegistry instance {instance_id}"
+        )
 
     return result
 
@@ -510,6 +522,20 @@ def main(argv: list[str] | None = None) -> int:
             "on the az CLI token for (2) to succeed."
         ),
     )
+    parser.add_argument(
+        "--orphan-instance-id",
+        action="append",
+        default=[],
+        metavar="GUID",
+        help=(
+            "agentRegistry instance id known to be orphaned. The "
+            "AI Teammate flow creates the instance server-side via "
+            "admin-centre activation (round-4 walkthrough finding), "
+            "so the snapshot-from-config path can't see the id; pass "
+            "it explicitly here. May be repeated. Combined with "
+            "`--purge-orphans` to issue the Graph DELETE."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -545,6 +571,7 @@ def main(argv: list[str] | None = None) -> int:
             mutator=get_mutator(),
             hermes_home=_resolve_hermes_home(),
             purge_orphans=args.purge_orphans,
+            additional_orphan_instance_ids=tuple(args.orphan_instance_id),
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
