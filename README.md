@@ -203,6 +203,8 @@ uv run python scripts/keychain.py {store|get|delete} --tenant <t> --app-id <id>
 
 ## Open work
 
+External issues filed:
+
 - **[Microsoft#402](https://github.com/microsoft/Agent365-devTools/issues/402)** —
   `setup permissions bot` silently drops two of three S2S app-role
   assignments. Filed 2026-05-05; awaiting Microsoft triage.
@@ -211,22 +213,27 @@ uv run python scripts/keychain.py {store|get|delete} --tenant <t> --app-id <id>
   (bug #18).
 - **[Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)** —
   upstream proposal to add `hermes-a365` as an official optional
-  skill. Filed 2026-05-05; awaiting NousResearch guidance on placement
-  + contribution shape.
-- **Activity bridge — streaming responses.** Required for M365 Copilot
-  substantive replies (per Microsoft's docs). Deferred from slice 19b's
-  MVP. Standard BF protocol (typing activities + `streaminfo`
-  entities); 2-min hard cap, 1 req/s throttle, 1:1 chats only.
-- **Activity bridge — proactive long-running pattern.** When agent
-  thinking exceeds the ~10–15s BF turn budget. Standard BF
-  `ConversationReference` capture + replay later via `serviceUrl`;
-  also deferred from 19b.
-- **Activity bridge — invoke action types.** Beyond the synchronous
-  Adaptive Card path: `signin/verifyState`, `task/{fetch,submit}`,
-  `composeExtension/*`. Add as use cases arrive.
-- **Round-3 walkthrough.** Live-tenant validation of `serve` mode
-  (Teams round-trip, `bridge.pid` lifecycle, JWT validation against
-  real BF JWKS).
+  skill. Filed 2026-05-05; awaiting NousResearch guidance.
+
+Open issues in this repo (run `gh issue list` for current state):
+
+- **[#1](../../issues/1)** — Tier 3 responder (Hermes-native). Blocked
+  on Hermes#20133 + SPEC §10 Q1.
+- **[#2](../../issues/2)** — Tier 2 responder (LLM-backed,
+  no Hermes coupling).
+- **[#3](../../issues/3)** — Activity bridge streaming responses.
+  Required for M365 Copilot substantive replies.
+- **[#4](../../issues/4)** — Proactive long-running reply pattern (>10s
+  agent thinking via captured `ConversationReference`).
+- **[#5](../../issues/5)** — Invoke action types beyond Adaptive Card
+  (`signin/verifyState`, `task/{fetch,submit}`, `composeExtension/*`).
+
+Operator action (not a code issue):
+
+- **Round-3 walkthrough.** Live-tenant validation of `serve` mode +
+  reference responder (Teams round-trip, `bridge.pid` lifecycle, JWT
+  validation against real BF JWKS). Runbook step 9c in
+  [`references/live-tenant-test.md`](references/live-tenant-test.md).
 
 ## Status meta
 
