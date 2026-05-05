@@ -3,12 +3,15 @@
 Polling tests monkeypatch ``time.sleep``/``time.monotonic`` so the suite
 remains hermetic and fast. URL rendering uses the real Jinja env against
 ``templates/consent-url.txt.j2``.
+
+Aligned with the v0.2 ``QuerySource`` protocol (slice 18k): polling
+goes through ``query_blueprint_scopes`` and the consent state is
+classified by the same heuristic ``status.py`` uses.
 """
 
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any
 
 import consent as consent_mod
 import pytest
@@ -25,17 +28,24 @@ from consent import (
 # Test double for QuerySource
 # ---------------------------------------------------------------------------
 
+# Output strings the v0.2 status._classify_scopes_output classifier reads
+# as ``ok`` / ``warn``. Pinned here so changes to the heuristic surface
+# as a test failure rather than silent drift.
+_OK_OUTPUT = "Blueprint scopes: all consented (granted)"
+_PENDING_OUTPUT = "Blueprint scopes: not consented yet"
+
 
 class _StubQuerySource:
-    """Minimal QuerySource — only ``query_consent`` is used by polling tests.
+    """Minimal QuerySource — only ``query_blueprint_scopes`` is used.
 
     ``responses`` is a list whose first len(responses)-1 elements are returned
-    in order; the last element is repeated forever.
+    in order; the last element is repeated forever. Each element is the raw
+    text the CLI would print (or ``None`` for "still awaiting auth").
     """
 
     def __init__(
         self,
-        responses: list[dict[str, Any] | None],
+        responses: list[str | None],
         *,
         available: bool = True,
     ) -> None:
@@ -43,28 +53,17 @@ class _StubQuerySource:
         self.available = available
         self.calls = 0
 
-    def query_consent(self, *, app_id: str) -> dict[str, Any] | None:
+    def query_blueprint_scopes(
+        self, *, agent_name: str, tenant_id: str | None = None
+    ) -> str | None:
         self.calls += 1
         idx = min(self.calls - 1, len(self.responses) - 1)
         return self.responses[idx]
 
-    # Stubs to satisfy the Protocol — never called in these tests.
-    def query_license(self) -> dict[str, Any] | None:
-        return None
-
-    def query_app_by_id(self, *, app_id: str) -> dict[str, Any] | None:
-        return None
-
-    def query_blueprint(self, *, slug: str) -> dict[str, Any] | None:
-        return None
-
-    def query_instance(self, *, instance_id: str) -> dict[str, Any] | None:
-        return None
-
-    def query_telemetry(self, *, instance_id: str) -> dict[str, Any] | None:
-        return None
-
-    def query_fic(self, *, app_id: str) -> dict[str, Any] | None:
+    def query_instance_scopes(
+        self, *, agent_name: str, tenant_id: str | None = None
+    ) -> str | None:
+        # Not exercised by consent.py; satisfies the protocol.
         return None
 
 
@@ -147,54 +146,73 @@ class TestPollForConsent:
     def test_unavailable_raises_runtime(self) -> None:
         qs = _StubQuerySource([], available=False)
         with pytest.raises(RuntimeError, match="unavailable"):
-            poll_for_consent(qs, app_id="x")
+            poll_for_consent(qs, agent_name="alpha")
 
     def test_invalid_interval(self) -> None:
-        qs = _StubQuerySource([{"granted": True}])
+        qs = _StubQuerySource([_OK_OUTPUT])
         with pytest.raises(ValueError, match="interval"):
-            poll_for_consent(qs, app_id="x", interval=0)
+            poll_for_consent(qs, agent_name="alpha", interval=0)
 
     def test_invalid_timeout(self) -> None:
-        qs = _StubQuerySource([{"granted": True}])
+        qs = _StubQuerySource([_OK_OUTPUT])
         with pytest.raises(ValueError, match="timeout"):
-            poll_for_consent(qs, app_id="x", timeout=0)
+            poll_for_consent(qs, agent_name="alpha", timeout=0)
 
     def test_granted_on_first_call_returns_true_no_sleep(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         sleeps = self._patch_time(monkeypatch)
-        qs = _StubQuerySource([{"granted": True}])
-        assert poll_for_consent(qs, app_id="x") is True
+        qs = _StubQuerySource([_OK_OUTPUT])
+        assert poll_for_consent(qs, agent_name="alpha") is True
         assert qs.calls == 1
         assert sleeps == []  # never slept
 
     def test_granted_on_third_call(self, monkeypatch: pytest.MonkeyPatch) -> None:
         sleeps = self._patch_time(monkeypatch)
-        qs = _StubQuerySource(
-            [
-                {"granted": False},
-                {"granted": False},
-                {"granted": True},
-            ]
+        qs = _StubQuerySource([_PENDING_OUTPUT, _PENDING_OUTPUT, _OK_OUTPUT])
+        assert (
+            poll_for_consent(qs, agent_name="alpha", interval=5, timeout=300) is True
         )
-        assert poll_for_consent(qs, app_id="x", interval=5, timeout=300) is True
         assert qs.calls == 3
         assert sleeps == [5, 5]  # slept twice between three queries
 
     def test_timeout_returns_false(self, monkeypatch: pytest.MonkeyPatch) -> None:
         self._patch_time(monkeypatch)
-        qs = _StubQuerySource([{"granted": False}])  # always pending
+        qs = _StubQuerySource([_PENDING_OUTPUT])  # always pending
         # Tight timeout: 5 seconds, interval 5 → at most one query and a final check.
-        assert poll_for_consent(qs, app_id="x", interval=5, timeout=5) is False
-        # At least one call to query_consent
+        assert poll_for_consent(qs, agent_name="alpha", interval=5, timeout=5) is False
+        # At least one call to query_blueprint_scopes
         assert qs.calls >= 1
 
-    def test_consent_with_no_payload_treated_as_pending(
+    def test_none_response_treated_as_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         self._patch_time(monkeypatch)
-        qs = _StubQuerySource([None, None, {"granted": True}])
-        assert poll_for_consent(qs, app_id="x", interval=1, timeout=100) is True
+        qs = _StubQuerySource([None, None, _OK_OUTPUT])
+        assert (
+            poll_for_consent(qs, agent_name="alpha", interval=1, timeout=100) is True
+        )
+
+    def test_tenant_id_threaded_through_to_query(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """tenant_id from the CLI flag should reach query_blueprint_scopes."""
+        self._patch_time(monkeypatch)
+
+        captured: list[str | None] = []
+
+        class _Capturing(_StubQuerySource):
+            def query_blueprint_scopes(
+                self, *, agent_name: str, tenant_id: str | None = None
+            ) -> str | None:
+                captured.append(tenant_id)
+                return super().query_blueprint_scopes(
+                    agent_name=agent_name, tenant_id=tenant_id
+                )
+
+        qs = _Capturing([_OK_OUTPUT])
+        poll_for_consent(qs, agent_name="alpha", tenant_id="t-123")
+        assert captured == ["t-123"]
 
     def test_default_interval_and_timeout_constants(self) -> None:
         # Sanity: spec says 5s / 5min defaults.
@@ -252,7 +270,7 @@ class TestCli:
             "get_query_source",
             lambda: _StubQuerySource([], available=False),
         )
-        rc = main(["--no-open"])
+        rc = main(["alpha", "--no-open"])
         assert rc == 1
         captured = capsys.readouterr()
         assert "Admin consent URL" in captured.out
@@ -269,10 +287,23 @@ class TestCli:
         monkeypatch.setattr(
             consent_mod,
             "get_query_source",
-            lambda: _StubQuerySource([{"granted": True}], available=True),
+            lambda: _StubQuerySource([_OK_OUTPUT], available=True),
         )
         # Disable browser launch to avoid env-dependent flakiness.
-        rc = main(["--no-open"])
+        rc = main(["alpha", "--no-open"])
         assert rc == 0
         out = capsys.readouterr().out
         assert "Consent granted" in out
+
+    def test_missing_agent_name_for_polling_exits_2(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        """Polling requires an agent_name; --print-url-only is the workaround."""
+        self._bootstrap_env(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        rc = main(["--no-open"])
+        assert rc == 2
+        assert "agent_name is required" in capsys.readouterr().err

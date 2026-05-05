@@ -198,15 +198,21 @@ Failure modes to watch:
 
 ## 4. consent — admin grant
 
-⚠️ **`consent.py` is currently broken** — it calls
-`qs.query_consent(app_id=...)`, a method that doesn't exist on the
-v0.2 `QuerySource` protocol (Slice 18f rewrote the protocol around
-`query_blueprint_scopes` / `query_instance_scopes` but didn't update
-`consent.py`). Fix queued for slice 18j.
+In v0.2, **admin consent for the blueprint app is already granted by
+`setup blueprint`** (the second device-code flow opens an admin-consent
+URL the operator approves). `consent.py` is now a thin verifier
+(slice 18k):
 
-In practice, **admin consent for the blueprint app is already granted
-by `setup blueprint`** (the second device-code flow opens an
-admin-consent URL the operator approves). Verify directly via Graph:
+```bash
+uv run python scripts/consent.py "<display-name>" --no-open --interval 5 --timeout 30
+```
+
+It polls `a365 query-entra blueprint-scopes` and exits 0 once the
+classifier sees a "consented / granted / ok" hint. To re-grant after
+revocation, drop `--no-open` so it opens the admin-consent URL in a
+browser first.
+
+For belt-and-braces verification, query Graph directly:
 
 ```bash
 SP_ID=$(az ad sp list --display-name "<display-name> Blueprint" --query "[0].id" -o tsv)
@@ -219,6 +225,8 @@ You should see `consentType: AllPrincipals` grants across Microsoft
 Graph (Mail/Chat/Files/Sites/etc.), Connectivity API, Agent 365
 Tools, Agent 365 Observability, and MCP Servers Metadata API.
 
+- [ ] `consent.py "<display-name>"` exits 0 (or skip if you've
+      verified directly via Graph).
 - [ ] Direct Graph query confirms `AllPrincipals` grants for the
       blueprint SP across the resources above.
 
@@ -418,7 +426,7 @@ fix; none requires architectural rework except the last.
 | 5 | `license.py` / SKILL.md / runbook | Earlier docs claimed `license` writes `A365_LICENSE_MODEL` to `~/.hermes/.env`. It doesn't. Either implement or drop the claim from docs. |
 | 6 | `license.py` SKU naming | Recommends "Agent 365 add-on" / "E7" — the actual GA SKU is `MICROSOFT_AGENT_365_TIER_3`. Update `references/license-cost-table.md` too. |
 | 7 | `register.py` rendered argv | Multi-word agent names render unquoted (`--agent-name Hermes Inbox Helper`). Fine for the actual subprocess call (passed as list), misleading if a user copy-pastes. |
-| 8 | `consent.py` | Calls `qs.query_consent(app_id=...)`, a method that doesn't exist on the v0.2 `QuerySource` protocol. Slice 18f rewrote `status.py` against the new protocol but missed `consent.py`. |
+| 8 | `consent.py` | ~~Calls `qs.query_consent(app_id=...)`, a method that doesn't exist on the v0.2 `QuerySource` protocol.~~ **Fixed in slice 18k** — polling now uses `query_blueprint_scopes` and shares the `_classify_scopes_output` heuristic with `status.py`. CLI takes a positional `agent_name` (omittable when `--print-url-only`). |
 | 9 | `instance_create.py` | Writes a leftover `A365_CLI_VARIANT` key (v0.1 artefact). |
 | 10 | `instance_create.py` | Dry-run renders a fresh `AA_INSTANCE_ID` that `--apply` discards in favour of its own. Surprising. |
 | 11 | `cleanup.py` wrapper | Composes `--yes` on each subcommand; the GA CLI only accepts `-y` on the parent `cleanup` verb. Apply path errors immediately. |
