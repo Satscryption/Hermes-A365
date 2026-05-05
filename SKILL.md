@@ -89,14 +89,11 @@ execute. Repeated invocation converges to the same state.
 
 ### `hermes a365 doctor`
 
-Read-only environment probe. Exits 0 = ok, 1 = warn, 2 = error. Probes:
-`a365` CLI present + version, `az` CLI signed in, `pwsh` on PATH, the
-custom `Agent 365 CLI` Entra app discoverable in the current tenant,
-network reachability (`login.microsoftonline.com`,
-`graph.microsoft.com`, tenant A365 host), keychain backend,
-`~/.hermes/.env` parseability, Hermes harness version. Frontier Preview
-enrollment is not auto-verifiable; doctor mentions it in prose. Run this
-first on any new machine, and again after any tenant-side change.
+Read-only environment probe. Exit 0/1/2. Probes: `a365`, `az` (signed
+in), `pwsh`, the `Agent 365 CLI` Entra app, network reachability
+(login.microsoftonline.com / graph.microsoft.com), keychain,
+`~/.hermes/.env`, Hermes harness. Frontier Preview enrollment is not
+auto-verifiable.
 
 ### `hermes a365 license --users <n> --agents <n> --plan <E3|E5|...>`
 
@@ -196,17 +193,22 @@ audit before any mutation.
 
 ### `hermes a365 activity-bridge`
 
-- `verify --slug <slug>` (slice 19a, **shipped**) — diagnostic that
-  validates the per-agent .env, the blueprint client secret (acquires
-  an OAuth token), Graph/AAD reachability, and OTLP DNS. Exit 0/1/2
-  for ok/warn/error; useful in CI / pre-deploy gates.
-- `serve` (slice 19b, **pending**) — long-running BF webhook adapter,
-  exposed via `cloudflared` / reverse proxy, forwarding activities to
-  an operator-defined `HERMES_BRIDGE_WEBHOOK`. Held back until the BF
-  subscription contract is verified against Microsoft's docs. Eventual
-  routing: `message` / `invoke` activities → operator's responder +
-  Adaptive Card builder. See
-  [`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md).
+- `verify --slug <slug>` — pre-deploy diagnostic (config + auth +
+  reachability). Exit 0/1/2.
+- `serve --slug <slug> --port 3978` — BF webhook adapter daemon.
+  JWT-validates inbound activities against the public BF JWKS,
+  forwards each to `HERMES_BRIDGE_WEBHOOK` per the
+  [webhook contract](references/webhook-contract.md), replies via
+  `serviceUrl` with bot MSA credentials. MVP: synchronous `message`
+  + `invoke`; streaming / proactive deferred.
+- `update-endpoint --agent-name <n> --url <https>` — wraps
+  `a365 setup blueprint --m365 --update-endpoint <url>` so operators
+  can pin the agent's messaging endpoint to a tunnel URL. Auto-recovers
+  from [duplicate-name error #140](https://github.com/microsoft/Agent365-devTools/issues/140).
+
+Topology: Teams → A365 BF → `<tunnel>/api/messages` → bridge → POST
+`<webhook>` → reply via `serviceUrl`. Activity-shape catalogue:
+[`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md).
 
 ## Conflict resolution
 

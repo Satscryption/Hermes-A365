@@ -1,4 +1,7 @@
-"""Tests for scripts/secrets.py.
+"""Tests for scripts/keychain.py (renamed from secrets.py in slice 19b
+to avoid shadowing the stdlib ``secrets`` module on the pythonpath —
+fastapi / starlette import ``from secrets import token_hex`` and were
+picking up our module before the stdlib).
 
 All tests use a ``FakeBackend`` or monkeypatched ``subprocess.run`` so the
 real keychain is never touched.
@@ -6,10 +9,12 @@ real keychain is never touched.
 
 from __future__ import annotations
 
-import secrets as secrets_mod
 import subprocess
 from dataclasses import dataclass, field
-from secrets import (
+
+import keychain as secrets_mod
+import pytest
+from keychain import (
     SERVICE,
     KeychainBackend,
     KeychainError,
@@ -22,8 +27,6 @@ from secrets import (
     main,
     store_secret,
 )
-
-import pytest
 
 # ---------------------------------------------------------------------------
 # Test double

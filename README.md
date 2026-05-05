@@ -62,7 +62,7 @@ See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that th
 - **2026-05-03:** `SPEC.md` revision 2 (glossary, diagrams, examples, troubleshooting, migration recipe, risks).
 - **2026-05-03:** first implementation slice — blueprint JSON and per-agent `.env` rendering with golden-file tests.
 - **2026-05-03:** second slice — `doctor.py` (read-only environment probe; resolves §10 Q7 — `atk` vs `a365` variant detection).
-- **2026-05-03:** third slice — `secrets.py` (OS-keychain wrapper; resolves §10 Q3 — macOS `security` and Linux `secret-tool`).
+- **2026-05-03:** third slice — `keychain.py` (OS-keychain wrapper; resolves §10 Q3 — macOS `security` and Linux `secret-tool`).
 - **2026-05-03:** fourth slice — reconcilers (`deep_diff` in `_common.py`, `reconcile_app.py`, `reconcile_blueprint.py`) producing `create`/`noop`/`patch`/`abort` plans against captured `a365 query-entra` JSON.
 - **2026-05-03:** fifth slice — `status.py` orchestrating nine components (license, T1/T2 apps, blueprint, instance, channels, activity bridge, telemetry, FIC) into a single report; exit codes 0/1/2/3 per spec. `QuerySource` Protocol abstracts `a365 query-entra` so the command works end-to-end with or without a live `a365` CLI.
 - **2026-05-03:** sixth slice — Adaptive Card v1.6 templates (`greeting`, `confirmation`, `error`) under `templates/adaptive-cards/` plus `emit_card.py` builder with typed dataclass inputs. Golden-file tests verify JSON validity and round-trip stability.
@@ -137,7 +137,7 @@ because `a365 query-entra --telemetry` does not exist), and `SKILL.md`
 | Area | Status |
 |---|---|
 | `_common.py` shared helpers (Jinja env, `safe_run`, `tcp_reachable`, `parse_env`, `deep_diff`) | done |
-| `secrets.py` (OS-keychain wrapper — resolves §10 Q3) | done |
+| `keychain.py` (OS-keychain wrapper — resolves §10 Q3) | done |
 | `reconcile_app.py`, `reconcile_blueprint.py` (idempotent diff/plan abstraction) | done |
 | Adaptive Card templates + `emit_card.py` (greeting / confirmation / error) | done |
 | `license.py` (recommendation engine; §6.1) | done |
@@ -169,14 +169,14 @@ The keychain wrapper too:
 
 ```bash
 # Store interactively (prompts for the secret, doesn't echo)
-uv run python scripts/secrets.py store --tenant contoso.onmicrosoft.com --app-id <appId>
+uv run python scripts/keychain.py store --tenant contoso.onmicrosoft.com --app-id <appId>
 
 # Or pipe from stdin
-echo -n "<secret>" | uv run python scripts/secrets.py store \
+echo -n "<secret>" | uv run python scripts/keychain.py store \
     --tenant contoso.onmicrosoft.com --app-id <appId> --secret -
 
-uv run python scripts/secrets.py get    --tenant contoso.onmicrosoft.com --app-id <appId>
-uv run python scripts/secrets.py delete --tenant contoso.onmicrosoft.com --app-id <appId>
+uv run python scripts/keychain.py get    --tenant contoso.onmicrosoft.com --app-id <appId>
+uv run python scripts/keychain.py delete --tenant contoso.onmicrosoft.com --app-id <appId>
 ```
 
 > **macOS note.** First time the script writes to the keychain, macOS will pop a UI dialog asking permission for `python` to access your login keychain. Click "Always Allow" to avoid further prompts. Non-interactive contexts (CI, headless SSH, some IDEs) may fail with `rc=36 User interaction is not allowed` — unlock the keychain first with `security unlock-keychain` if needed.

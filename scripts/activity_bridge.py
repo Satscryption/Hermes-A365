@@ -1,35 +1,49 @@
 """hermes a365 activity-bridge — Bot Framework adapter daemon for A365 agents.
 
-Two subcommands (only ``verify`` is implemented in slice 19a):
+Three subcommands:
 
-- ``verify``: one-shot diagnostic. Validates that the registered
-  blueprint's client secret can acquire an OAuth token, that
-  Microsoft Graph + the Connectivity API + the OTLP endpoint are
-  reachable, and that the per-agent config + generated-config files
-  parse cleanly. Useful for CI gates and pre-deploy smoke checks.
-- ``serve``: long-running daemon (slice 19b). FastAPI app on a local
-  port that operators expose via ``cloudflared`` / a reverse proxy.
-  Receives BF activities, forwards each one to a webhook the
-  operator configures (``HERMES_BRIDGE_WEBHOOK``), renders the
-  webhook's JSON response as an Adaptive Card, and replies via the
-  BF connector. Held back until the BF subscription / endpoint
-  contract is verified against Microsoft's docs.
+- ``verify`` (slice 19a): one-shot diagnostic. Validates the registered
+  blueprint's client secret can acquire an OAuth token, that AAD +
+  Graph are reachable, and that the per-agent config + generated-config
+  files parse cleanly. Useful for CI gates and pre-deploy smoke.
+- ``serve`` (slice 19b): long-running BF webhook adapter. FastAPI app
+  on a local port that operators expose via ``cloudflared`` / reverse
+  proxy. Receives BF activities (JWT-validated against the public
+  Bot Framework JWKS), forwards each one to ``HERMES_BRIDGE_WEBHOOK``
+  with our stable JSON envelope, renders the webhook's JSON response
+  as an Adaptive Card or plain text, and replies via the public BF
+  connector at ``api.botframework.com`` using the bot's MSA client
+  credentials (``botMsaAppId`` + ``agentBlueprintClientSecret`` from
+  ``a365.generated.config.json``).
+- ``update-endpoint`` (slice 19b): thin wrapper around
+  ``a365 setup blueprint --m365 --update-endpoint <url>`` so operators
+  can pin the agent's messaging endpoint to a tunnel URL with one
+  command. Includes the cleanup-then-recreate fallback for the known
+  duplicate-name error (Agent365-devTools issue #140).
 
-Per-agent state files (slice 19a writes none; slice 19b will):
+Per-agent state files (serve mode):
 
-    ~/.hermes/agents/<slug>/bridge.pid
-    ~/.hermes/agents/<slug>/bridge.log
+    ~/.hermes/agents/<slug>/bridge.pid    # daemon PID, removed on shutdown
+    ~/.hermes/agents/<slug>/bridge.log    # append-only operational log
 
-The blueprint client secret comes from ``a365.generated.config.json``
-(in cwd by default; ``--generated-config <path>`` overrides). On
-macOS / Linux the file is plaintext (DPAPI-only on Windows); slice
-18i gitignores it and slice 18x ``chmod 600``s the cleanup-emitted
-backups.
+Auth wiring (verified against Microsoft Learn 2026-05-05):
+
+- Inbound JWT validation uses Microsoft's public BF metadata at
+  ``https://login.botframework.com/v1/.well-known/openidconfiguration``.
+  Issuer ``https://api.botframework.com``, audience = bot's appId,
+  RS256, 5-min skew, ``serviceUrl`` claim must match the activity's.
+  JWKS cached for 24h.
+- Outbound replies acquire a token at
+  ``https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token``
+  with scope ``https://api.botframework.com/.default``. Token cached
+  until 5 min before expiry. POST to
+  ``{serviceUrl}/v3/conversations/{conv}/activities/{activity}``.
 
 CLI use::
 
     python scripts/activity_bridge.py verify --slug inbox-helper
-    python scripts/activity_bridge.py verify --slug inbox-helper --human
+    python scripts/activity_bridge.py serve  --slug inbox-helper --port 3978
+    python scripts/activity_bridge.py update-endpoint --slug X --url https://...
 """
 
 from __future__ import annotations
@@ -48,6 +62,27 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from _common import parse_env, tcp_reachable
+
+# Slice 19b — `serve` mode dependencies. Optional extras: operators
+# who only need `verify` can install without them. We bind the names
+# to ``None`` if missing so the verify path imports cleanly; serve
+# mode raises a helpful error at startup.
+try:
+    import httpx as _httpx
+    import jwt as _jwt
+    from fastapi import Body as _Body
+    from fastapi import FastAPI as _FastAPI
+    from fastapi import Header as _Header
+    from fastapi import HTTPException as _HTTPException
+    from fastapi.responses import JSONResponse as _JSONResponse
+except ImportError:  # pragma: no cover — exercised by integration tests
+    _httpx = None  # type: ignore[assignment]
+    _jwt = None  # type: ignore[assignment]
+    _Body = None  # type: ignore[assignment]
+    _FastAPI = None  # type: ignore[assignment]
+    _Header = None  # type: ignore[assignment]
+    _HTTPException = None  # type: ignore[assignment]
+    _JSONResponse = None  # type: ignore[assignment]
 
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
@@ -512,7 +547,55 @@ def main(argv: list[str] | None = None) -> int:
         "--human", action="store_true", help="formatted output (default: JSON)"
     )
 
-    # Slice 19b will register `serve` here.
+    serve = sub.add_parser(
+        "serve",
+        help="long-running BF webhook adapter (slice 19b)",
+    )
+    serve.add_argument("--slug", required=True)
+    serve.add_argument(
+        "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)"
+    )
+    serve.add_argument("--port", type=int, default=3978)
+    serve.add_argument(
+        "--webhook",
+        help=(
+            "operator's responder URL (default: HERMES_BRIDGE_WEBHOOK env var). "
+            "Bridge POSTs each inbound activity to this URL and renders the "
+            "response as a reply."
+        ),
+    )
+    serve.add_argument(
+        "--generated-config",
+        type=Path,
+        help="path to a365.generated.config.json (default: ./a365.generated.config.json)",
+    )
+    serve.add_argument(
+        "--no-jwt-validation",
+        action="store_true",
+        help=(
+            "DEV ONLY: skip Bot Framework JWT validation on inbound activities. "
+            "Useful when testing locally without going through real BF infra. "
+            "Never set this in production — incoming /api/messages will accept "
+            "unauthenticated requests."
+        ),
+    )
+
+    update_ep = sub.add_parser(
+        "update-endpoint",
+        help="re-point the agent's messaging endpoint at a tunnel URL",
+    )
+    update_ep.add_argument("--agent-name", required=True)
+    update_ep.add_argument(
+        "--url", required=True, help="HTTPS endpoint A365 should POST activities to"
+    )
+    update_ep.add_argument("--tenant-id")
+    update_ep.add_argument(
+        "--no-m365",
+        action="store_true",
+        help="omit --m365 (default behaviour passes --m365 so Teams routes through MCP)",
+    )
+    update_ep.add_argument("--apply", action="store_true")
+
     args = parser.parse_args(argv)
 
     if args.cmd == "verify":
@@ -529,8 +612,630 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write(render_human(report) if args.human else render_json(report))
         return _overall_to_exit_code(report.overall)
 
+    if args.cmd == "serve":
+        return cmd_serve(args)
+
+    if args.cmd == "update-endpoint":
+        return cmd_update_endpoint(args)
+
     parser.error(f"unknown command: {args.cmd}")
     return 2  # unreachable; argparse exits
+
+
+# ===========================================================================
+# Slice 19b — serve mode
+# ===========================================================================
+#
+# All serve-mode code is below this line. It depends on the optional
+# `bridge` extras (fastapi, uvicorn, httpx, pyjwt[crypto]); imports are
+# deferred so the verify path keeps working with no extras installed.
+
+# Bot Framework auth constants — verified against
+# https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
+BF_OPENID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openidconfiguration"
+BF_ISSUER = "https://api.botframework.com"
+BF_TOKEN_URL = "https://login.microsoftonline.com/botframework.com/oauth2/v2.0/token"
+BF_TOKEN_SCOPE = "https://api.botframework.com/.default"
+
+# JWKS cache TTL per Microsoft's published guidance (refresh at least daily).
+JWKS_CACHE_TTL_SECONDS = 24 * 3600
+
+# Refresh outbound token 5 min before expiry to avoid mid-flight 401s.
+TOKEN_REFRESH_SKEW_SECONDS = 300
+
+# Webhook envelope schema version — bumped when we make a breaking change.
+WEBHOOK_ENVELOPE_VERSION = "1"
+
+# Default 10s budget on the operator webhook so a stuck responder
+# doesn't tie up BF (which itself times out around 15s).
+DEFAULT_WEBHOOK_TIMEOUT_SECONDS = 10.0
+
+
+# ---------------------------------------------------------------------------
+# Bridge config (loaded once at serve start)
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class BridgeConfig:
+    """Runtime config the FastAPI handlers depend on.
+
+    Threading this through DI rather than reaching into module-level
+    globals keeps the test surface small.
+    """
+
+    slug: str
+    tenant_id: str
+    bot_app_id: str  # the bot's MSA app id (NOT the blueprint's appId)
+    bot_app_secret: str
+    webhook_url: str
+    log_path: Path
+    pid_path: Path
+    skip_jwt_validation: bool = False
+    webhook_timeout_seconds: float = DEFAULT_WEBHOOK_TIMEOUT_SECONDS
+
+
+def load_bridge_config(
+    *,
+    slug: str,
+    webhook_url: str | None,
+    hermes_home: Path,
+    generated_config_path: Path,
+    skip_jwt_validation: bool = False,
+) -> BridgeConfig:
+    """Resolve all runtime inputs needed to start the serve loop.
+
+    The bot identity (``botMsaAppId`` + secret) lives in
+    ``a365.generated.config.json``. The walkthrough confirmed that
+    field is ``null`` until ``a365 setup blueprint --m365`` has run —
+    we surface a clear error if so.
+    """
+    agent_env = load_agent_env(hermes_home, slug)
+    gen = load_generated_config(generated_config_path)
+
+    bot_app_id = gen.get("botMsaAppId") or ""
+    bot_secret = gen.get("agentBlueprintClientSecret") or ""
+    if not bot_app_id:
+        raise BridgeConfigError(
+            f"{generated_config_path} has no botMsaAppId; "
+            "re-run `a365 setup blueprint --m365 --update-endpoint <url>` "
+            "to provision a Teams-routing bot identity. The default blueprint "
+            "setup (without --m365) doesn't create one."
+        )
+    if not bot_secret:
+        raise BridgeConfigError(
+            f"{generated_config_path} has no agentBlueprintClientSecret; "
+            "re-run `hermes a365 register --apply`"
+        )
+
+    resolved_webhook = webhook_url or os.environ.get("HERMES_BRIDGE_WEBHOOK") or ""
+    if not resolved_webhook:
+        raise BridgeConfigError(
+            "HERMES_BRIDGE_WEBHOOK is not set and --webhook was not given. "
+            "Point this at the operator's responder URL "
+            "(see references/webhook-contract.md)."
+        )
+
+    agent_dir = hermes_home / "agents" / slug
+    return BridgeConfig(
+        slug=slug,
+        tenant_id=agent_env["A365_TENANT_ID"],
+        bot_app_id=bot_app_id,
+        bot_app_secret=bot_secret,
+        webhook_url=resolved_webhook,
+        log_path=agent_dir / "bridge.log",
+        pid_path=agent_dir / "bridge.pid",
+        skip_jwt_validation=skip_jwt_validation,
+    )
+
+
+# ---------------------------------------------------------------------------
+# JWKS / JWT validation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _JwksCache:
+    """Tiny TTL cache for the BF OpenID JWKS document."""
+
+    keys_by_kid: dict[str, Any] = field(default_factory=dict)
+    fetched_at: float = 0.0
+    ttl_seconds: float = JWKS_CACHE_TTL_SECONDS
+
+
+async def _fetch_bf_openid_keys(client: Any) -> dict[str, Any]:
+    """Fetch the BF JWKS via OpenID discovery. ``client`` is an httpx.AsyncClient.
+
+    Returns ``{kid: PyJWK}``. Pure function — caching is handled by the
+    caller so tests can substitute a fixed JWKS without touching the
+    cache structure.
+    """
+    if _jwt is None:
+        raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
+    config_resp = await client.get(BF_OPENID_CONFIG_URL, timeout=10.0)
+    config_resp.raise_for_status()
+    jwks_uri = config_resp.json()["jwks_uri"]
+    jwks_resp = await client.get(jwks_uri, timeout=10.0)
+    jwks_resp.raise_for_status()
+    keys: dict[str, Any] = {}
+    for jwk in jwks_resp.json().get("keys", []):
+        kid = jwk.get("kid")
+        if not kid:
+            continue
+        keys[kid] = _jwt.PyJWK(jwk)
+    return keys
+
+
+async def _ensure_jwks_loaded(
+    client: Any, cache: _JwksCache, *, now: float | None = None
+) -> dict[str, Any]:
+    import time as _time
+
+    cur = now if now is not None else _time.time()
+    if cache.keys_by_kid and (cur - cache.fetched_at) < cache.ttl_seconds:
+        return cache.keys_by_kid
+    cache.keys_by_kid = await _fetch_bf_openid_keys(client)
+    cache.fetched_at = cur
+    return cache.keys_by_kid
+
+
+class JwtValidationError(RuntimeError):
+    pass
+
+
+async def validate_inbound_jwt(
+    *,
+    token: str,
+    expected_app_id: str,
+    expected_service_url: str,
+    client: Any,
+    cache: _JwksCache,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Validate a Bot Framework inbound JWT and return its claims.
+
+    Raises :class:`JwtValidationError` on any failure with a short reason.
+    Caller dispatches HTTP 401/403 from there.
+    """
+    if _jwt is None:
+        raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
+    keys = await _ensure_jwks_loaded(client, cache, now=now)
+    try:
+        unverified_header = _jwt.get_unverified_header(token)
+    except _jwt.PyJWTError as e:
+        raise JwtValidationError(f"unverified header parse failed: {e}") from e
+    kid = unverified_header.get("kid")
+    if not kid or kid not in keys:
+        raise JwtValidationError(f"signing key (kid={kid!r}) not in JWKS")
+    try:
+        claims = _jwt.decode(
+            token,
+            key=keys[kid].key,
+            algorithms=["RS256"],
+            audience=expected_app_id,
+            issuer=BF_ISSUER,
+            leeway=300,
+        )
+    except _jwt.PyJWTError as e:
+        raise JwtValidationError(f"signature/aud/iss check failed: {e}") from e
+    if claims.get("serviceUrl") != expected_service_url:
+        raise JwtValidationError(
+            f"serviceUrl claim mismatch: token={claims.get('serviceUrl')!r}, "
+            f"activity={expected_service_url!r}"
+        )
+    return claims
+
+
+# ---------------------------------------------------------------------------
+# Outbound BF token cache
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class _BotTokenCache:
+    access_token: str = ""
+    expires_at: float = 0.0
+
+
+async def acquire_bot_token(
+    *,
+    client: Any,
+    cfg: BridgeConfig,
+    cache: _BotTokenCache,
+    now: float | None = None,
+) -> str:
+    import time as _time
+
+    cur = now if now is not None else _time.time()
+    if cache.access_token and (cur + TOKEN_REFRESH_SKEW_SECONDS) < cache.expires_at:
+        return cache.access_token
+
+    body = {
+        "grant_type": "client_credentials",
+        "client_id": cfg.bot_app_id,
+        "client_secret": cfg.bot_app_secret,
+        "scope": BF_TOKEN_SCOPE,
+    }
+    resp = await client.post(
+        BF_TOKEN_URL,
+        data=body,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        timeout=15.0,
+    )
+    resp.raise_for_status()
+    payload = resp.json()
+    cache.access_token = payload["access_token"]
+    cache.expires_at = cur + float(payload.get("expires_in", 3600))
+    return cache.access_token
+
+
+# ---------------------------------------------------------------------------
+# Webhook forwarding
+# ---------------------------------------------------------------------------
+
+
+def build_webhook_envelope(activity: dict[str, Any], cfg: BridgeConfig) -> dict[str, Any]:
+    """Wrap an inbound activity in our stable JSON envelope.
+
+    Schema is pinned at ``references/webhook-contract.md``. We pass the
+    activity through whole rather than picking fields — operators can
+    rely on getting whatever the BF protocol gives us.
+    """
+    return {
+        "version": WEBHOOK_ENVELOPE_VERSION,
+        "agent": {
+            "slug": cfg.slug,
+            "tenant_id": cfg.tenant_id,
+            "bot_app_id": cfg.bot_app_id,
+        },
+        "activity": activity,
+    }
+
+
+async def forward_to_webhook(
+    *, envelope: dict[str, Any], cfg: BridgeConfig, client: Any
+) -> dict[str, Any]:
+    """POST the envelope to the operator's responder. Returns the parsed
+    response. Raises ``RuntimeError`` on non-2xx so the caller can render
+    a fallback Adaptive Card."""
+    resp = await client.post(
+        cfg.webhook_url,
+        json=envelope,
+        timeout=cfg.webhook_timeout_seconds,
+    )
+    resp.raise_for_status()
+    if not resp.content:
+        return {}
+    return resp.json()
+
+
+# ---------------------------------------------------------------------------
+# Reply rendering
+# ---------------------------------------------------------------------------
+
+
+def render_reply_activity(
+    inbound: dict[str, Any], webhook_response: dict[str, Any]
+) -> dict[str, Any]:
+    """Build a BF reply Activity from the operator's webhook response.
+
+    Webhook response contract (see ``references/webhook-contract.md``):
+
+        { "text": "<plain text>", "card": { ... }, "metadata": { ... } }
+
+    Either ``text`` or ``card`` must be present (or both). For replies
+    the bridge stamps ``type=message``, mirrors the conversation /
+    recipient / from triple per BF reply convention, and forwards
+    optional attachments.
+    """
+    reply_text = webhook_response.get("text", "")
+    card = webhook_response.get("card")
+    attachments = []
+    if card:
+        attachments.append(
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": card,
+            }
+        )
+    reply: dict[str, Any] = {
+        "type": "message",
+        "from": inbound.get("recipient", {}),
+        "recipient": inbound.get("from", {}),
+        "conversation": inbound.get("conversation", {}),
+        "replyToId": inbound.get("id"),
+    }
+    if reply_text:
+        reply["text"] = reply_text
+    if attachments:
+        reply["attachments"] = attachments
+    return reply
+
+
+def render_error_card(message: str) -> dict[str, Any]:
+    """Adaptive Card we send when the operator's webhook errors out."""
+    return {
+        "type": "AdaptiveCard",
+        "version": "1.6",
+        "body": [
+            {
+                "type": "TextBlock",
+                "text": "The agent backend returned an error.",
+                "weight": "Bolder",
+                "color": "Attention",
+            },
+            {"type": "TextBlock", "text": message, "wrap": True},
+        ],
+        "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Send the reply via BF connector
+# ---------------------------------------------------------------------------
+
+
+async def send_reply(
+    *,
+    inbound: dict[str, Any],
+    reply: dict[str, Any],
+    cfg: BridgeConfig,
+    client: Any,
+    token_cache: _BotTokenCache,
+) -> Any:
+    service_url = inbound.get("serviceUrl", "").rstrip("/")
+    conv_id = inbound.get("conversation", {}).get("id", "")
+    activity_id = inbound.get("id", "")
+    if not service_url or not conv_id or not activity_id:
+        raise RuntimeError(
+            f"reply target incomplete: serviceUrl={service_url!r}, "
+            f"conversationId={conv_id!r}, activityId={activity_id!r}"
+        )
+    url = f"{service_url}/v3/conversations/{conv_id}/activities/{activity_id}"
+    token = await acquire_bot_token(client=client, cfg=cfg, cache=token_cache)
+    return await client.post(
+        url,
+        json=reply,
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=15.0,
+    )
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app factory
+# ---------------------------------------------------------------------------
+
+
+def make_app(
+    cfg: BridgeConfig,
+    *,
+    http_client: Any | None = None,
+    jwks_cache: _JwksCache | None = None,
+    token_cache: _BotTokenCache | None = None,
+) -> Any:
+    """Build the FastAPI app for the serve loop.
+
+    Dependencies are passed in for testability — callers (tests) inject
+    fakes; production passes ``None`` and we construct real ones.
+    """
+    if _FastAPI is None or _httpx is None:
+        raise BridgeConfigError(
+            "serve mode requires the bridge extras: `uv sync --extra bridge`"
+        )
+
+    if http_client is None:
+        http_client = _httpx.AsyncClient()
+    if jwks_cache is None:
+        jwks_cache = _JwksCache()
+    if token_cache is None:
+        token_cache = _BotTokenCache()
+
+    app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}")
+
+    @app.get("/healthz")
+    async def healthz() -> dict[str, Any]:
+        return {
+            "ok": True,
+            "slug": cfg.slug,
+            "bot_app_id": cfg.bot_app_id[:8] + "…",
+        }
+
+    @app.post("/api/messages")
+    async def messages(
+        activity: dict[str, Any] = _Body(...),  # noqa: B008 — FastAPI idiom
+        authorization: str | None = _Header(default=None),
+    ) -> Any:
+        service_url = activity.get("serviceUrl", "")
+
+        # JWT validation — the inbound `Authorization: Bearer <token>` header.
+        if not cfg.skip_jwt_validation:
+            if not authorization or not authorization.lower().startswith("bearer "):
+                raise _HTTPException(status_code=401, detail="missing bearer token")
+            token = authorization.split(None, 1)[1]
+            try:
+                await validate_inbound_jwt(
+                    token=token,
+                    expected_app_id=cfg.bot_app_id,
+                    expected_service_url=service_url,
+                    client=http_client,
+                    cache=jwks_cache,
+                )
+            except JwtValidationError as e:
+                raise _HTTPException(status_code=403, detail=str(e)) from e
+
+        activity_type = activity.get("type", "message")
+
+        # Channel-control activities — ack and bail.
+        if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
+            return _JSONResponse({"status": "acked"})
+
+        # Forward to operator webhook.
+        envelope = build_webhook_envelope(activity, cfg)
+        try:
+            webhook_resp = await forward_to_webhook(
+                envelope=envelope, cfg=cfg, client=http_client
+            )
+        except Exception as e:
+            error_reply = render_reply_activity(
+                activity,
+                {"text": "", "card": render_error_card(f"Webhook error: {e}")},
+            )
+            await send_reply(
+                inbound=activity,
+                reply=error_reply,
+                cfg=cfg,
+                client=http_client,
+                token_cache=token_cache,
+            )
+            return _JSONResponse({"status": "webhook_error"}, status_code=200)
+
+        # Invoke replies must be synchronous: return the invokeResponse body
+        # in this HTTP turn.
+        if activity_type == "invoke":
+            invoke_response = webhook_resp.get("invokeResponse") or {
+                "status": 200,
+                "body": webhook_resp,
+            }
+            return _JSONResponse(invoke_response)
+
+        # Standard message: render reply and send asynchronously via serviceUrl.
+        if not webhook_resp.get("text") and not webhook_resp.get("card"):
+            return _JSONResponse({"status": "no_reply"})
+        reply = render_reply_activity(activity, webhook_resp)
+        await send_reply(
+            inbound=activity,
+            reply=reply,
+            cfg=cfg,
+            client=http_client,
+            token_cache=token_cache,
+        )
+        return _JSONResponse({"status": "replied"})
+
+    return app
+
+
+# ---------------------------------------------------------------------------
+# PID file lifecycle
+# ---------------------------------------------------------------------------
+
+
+def write_pid_file(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(str(os.getpid()))
+    os.chmod(path, 0o600)
+
+
+def remove_pid_file(path: Path) -> None:
+    import contextlib
+
+    with contextlib.suppress(FileNotFoundError):
+        path.unlink()
+
+
+# ---------------------------------------------------------------------------
+# `serve` and `update-endpoint` CLI handlers
+# ---------------------------------------------------------------------------
+
+
+def cmd_serve(args: argparse.Namespace) -> int:
+    try:
+        cfg = load_bridge_config(
+            slug=args.slug,
+            webhook_url=args.webhook,
+            hermes_home=_resolve_hermes_home(),
+            generated_config_path=(
+                args.generated_config or Path.cwd() / "a365.generated.config.json"
+            ),
+            skip_jwt_validation=bool(args.no_jwt_validation),
+        )
+    except BridgeConfigError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    import uvicorn  # type: ignore[import-not-found]
+
+    write_pid_file(cfg.pid_path)
+    sys.stdout.write(
+        f"hermes a365 activity-bridge serving {cfg.slug} "
+        f"on http://{args.host}:{args.port}\n"
+        f"  webhook: {cfg.webhook_url}\n"
+        f"  pid:     {cfg.pid_path}\n"
+        f"  log:     {cfg.log_path}\n"
+        f"  jwt:     {'DISABLED — DEV ONLY' if cfg.skip_jwt_validation else 'enabled'}\n"
+    )
+    sys.stdout.flush()
+
+    app = make_app(cfg)
+    try:
+        uvicorn.run(app, host=args.host, port=args.port, log_level="info")
+    finally:
+        remove_pid_file(cfg.pid_path)
+    return 0
+
+
+def cmd_update_endpoint(args: argparse.Namespace) -> int:
+    """Wrap ``a365 setup blueprint --m365 --update-endpoint <url>``."""
+    if not args.url.startswith("https://"):
+        print(
+            f"ERROR: --url must be HTTPS (got {args.url!r}); BF requires TLS",
+            file=sys.stderr,
+        )
+        return 2
+
+    argv = ["a365", "setup", "blueprint", "--agent-name", args.agent_name]
+    if not args.no_m365:
+        argv.append("--m365")
+    argv.extend(["--update-endpoint", args.url])
+    if args.tenant_id:
+        argv.extend(["--tenant-id", args.tenant_id])
+
+    sys.stdout.write(f"[plan] $ {' '.join(argv)}\n")
+    if not args.apply:
+        sys.stdout.write("\nNo mutations. Re-run with --apply to execute.\n")
+        return 0
+
+    # Lazy import — keeps the verify path mutator-free.
+    from mutator import AADSTSError, CliInvocationError, get_mutator
+
+    mutator = get_mutator()
+    if not mutator.available:
+        print("ERROR: a365 CLI not on PATH", file=sys.stderr)
+        return 2
+    try:
+        mutator.run(argv)
+    except AADSTSError as e:
+        print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
+        return 2
+    except CliInvocationError as e:
+        # Issue #140 cleanup-then-recreate path.
+        if "already exists" in (e.output or ""):
+            sys.stdout.write(
+                "\n[recover] update-endpoint hit a duplicate-name error "
+                "(Agent365-devTools issue #140). Falling back to "
+                "cleanup --endpoint-only then re-applying.\n"
+            )
+            try:
+                mutator.run(
+                    [
+                        "a365",
+                        "cleanup",
+                        "blueprint",
+                        "--agent-name",
+                        args.agent_name,
+                        "--endpoint-only",
+                    ],
+                    stdin_input="y\n",
+                )
+                mutator.run(argv)
+            except (AADSTSError, CliInvocationError) as e2:
+                print(f"ERROR: fallback failed: {e2}", file=sys.stderr)
+                return 2
+        else:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+
+    sys.stdout.write("done.\n")
+    return 0
 
 
 if __name__ == "__main__":

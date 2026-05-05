@@ -19,7 +19,7 @@ exit. The Linux backend pipes the secret via stdin, which is preferred.
 
 Programmatic use::
 
-    from secrets import store_secret, get_secret, delete_secret
+    from keychain import store_secret, get_secret, delete_secret
     store_secret("contoso.onmicrosoft.com", "9e2d…", "shh")
     secret = get_secret("contoso.onmicrosoft.com", "9e2d…")
     delete_secret("contoso.onmicrosoft.com", "9e2d…")

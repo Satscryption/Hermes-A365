@@ -26,3 +26,4 @@ which references files were refreshed.
 | [`activity-protocol-shapes.md`](activity-protocol-shapes.md) | Bot Framework activity shapes (Teams/Outlook/Copilot) | §6.7, §14.1 |
 | [`license-cost-table.md`](license-cost-table.md) | A365 add-on / E7 pricing decision matrix | §6.1 |
 | [`live-tenant-test.md`](live-tenant-test.md) | End-to-end runbook against a Frontier-Preview tenant (operator-side) | — |
+| [`webhook-contract.md`](webhook-contract.md) | Stable JSON contract between `activity-bridge serve` and the operator's responder (slice 19b) | — |

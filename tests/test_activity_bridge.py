@@ -10,31 +10,49 @@ from __future__ import annotations
 
 import json
 import os
+import time as _time
 import urllib.error
 from io import BytesIO
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import httpx
+import jwt as _jwt
 import pytest
 from activity_bridge import (
+    BF_TOKEN_URL,
     GRAPH_RESOURCE,
     OBSERVABILITY_RESOURCE_APPID,
+    BridgeConfig,
     BridgeConfigError,
+    JwtValidationError,
     TokenAcquisitionError,
     VerifyReport,
+    _BotTokenCache,
+    _JwksCache,
+    acquire_bot_token,
     acquire_token,
+    build_webhook_envelope,
     load_agent_env,
+    load_bridge_config,
     load_generated_config,
     main,
+    make_app,
     probe_generated_config,
     probe_local_config,
     probe_otlp_endpoint,
     probe_token_acquisition,
+    render_error_card,
     render_human,
     render_json,
+    render_reply_activity,
     run_verify,
+    validate_inbound_jwt,
 )
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -470,3 +488,623 @@ def test_observability_resource_pinned() -> None:
     # `Agent365Observability` resource appId. Pin so a future
     # refactor surfaces the change here first.
     assert OBSERVABILITY_RESOURCE_APPID == "9b975845-388f-4429-889e-eab1ef63949c"
+
+
+# ===========================================================================
+# Slice 19b — serve mode
+# ===========================================================================
+#
+# Tests below cover the FastAPI app via TestClient with mocked HTTP
+# (httpx.MockTransport) for both inbound JWKS and outbound BF connector
+# / webhook calls. JWT validation is exercised against an ephemeral
+# RSA keypair we publish via a fake JWKS document.
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture
+def rsa_keypair() -> tuple[rsa.RSAPrivateKey, dict[str, Any]]:
+    """An ephemeral 2048-bit RSA key + matching JWKS entry."""
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub_numbers = priv.public_key().public_numbers()
+    import base64
+
+    def _b64u(n: int) -> str:
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+    jwk = {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "test-kid-1",
+        "n": _b64u(pub_numbers.n),
+        "e": _b64u(pub_numbers.e),
+    }
+    return priv, jwk
+
+
+def _make_token(
+    priv: rsa.RSAPrivateKey,
+    *,
+    aud: str,
+    iss: str = "https://api.botframework.com",
+    service_url: str = "https://smba.trafficmanager.net/teams/",
+    exp_offset: int = 600,
+    extra: dict[str, Any] | None = None,
+) -> str:
+    payload = {
+        "aud": aud,
+        "iss": iss,
+        "iat": int(_time.time()),
+        "exp": int(_time.time()) + exp_offset,
+        "serviceUrl": service_url,
+    }
+    if extra:
+        payload.update(extra)
+    pem = priv.private_bytes(
+        encoding=serialization.Encoding.PEM,
+        format=serialization.PrivateFormat.PKCS8,
+        encryption_algorithm=serialization.NoEncryption(),
+    )
+    return _jwt.encode(payload, pem, algorithm="RS256", headers={"kid": "test-kid-1"})
+
+
+def _jwks_transport(jwk: dict[str, Any]) -> httpx.MockTransport:
+    """httpx transport that serves a fixed JWKS at the BF discovery URLs."""
+    config = {
+        "issuer": "https://api.botframework.com",
+        "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+    }
+    keys = {"keys": [jwk]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/openidconfiguration"):
+            return httpx.Response(200, json=config)
+        if request.url.path.endswith("/keys"):
+            return httpx.Response(200, json=keys)
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+# ---------------------------------------------------------------------------
+# JWT validation
+# ---------------------------------------------------------------------------
+
+
+class TestValidateInboundJwt:
+    async def test_valid_token_returns_claims(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id", service_url="https://svc/")
+        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
+            claims = await validate_inbound_jwt(
+                token=token,
+                expected_app_id="bot-app-id",
+                expected_service_url="https://svc/",
+                client=client,
+                cache=_JwksCache(),
+            )
+        assert claims["aud"] == "bot-app-id"
+        assert claims["serviceUrl"] == "https://svc/"
+
+    async def test_wrong_audience_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="other-app")
+        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError):
+                await validate_inbound_jwt(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url="https://smba.trafficmanager.net/teams/",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_service_url_mismatch_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id", service_url="https://A/")
+        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError, match="serviceUrl claim mismatch"):
+                await validate_inbound_jwt(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url="https://B/",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_unknown_kid_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, _good_jwk = rsa_keypair
+        # Publish a different jwk so the kid in the token is unknown.
+        bad_jwk = {**_good_jwk, "kid": "different-kid"}
+        token = _make_token(priv, aud="bot-app-id")
+        async with httpx.AsyncClient(transport=_jwks_transport(bad_jwk)) as client:
+            with pytest.raises(JwtValidationError, match="not in JWKS"):
+                await validate_inbound_jwt(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url="https://smba.trafficmanager.net/teams/",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_jwks_cache_hits_on_second_call(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id")
+        request_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_count["n"] += 1
+            if request.url.path.endswith("/openidconfiguration"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "issuer": "https://api.botframework.com",
+                        "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+                    },
+                )
+            return httpx.Response(200, json={"keys": [jwk]})
+
+        cache = _JwksCache()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            for _ in range(3):
+                await validate_inbound_jwt(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url="https://smba.trafficmanager.net/teams/",
+                    client=client,
+                    cache=cache,
+                )
+        # First call hits both URLs (2 requests). Subsequent calls use the cache (0 each).
+        assert request_count["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# Outbound BF token cache
+# ---------------------------------------------------------------------------
+
+
+class TestAcquireBotToken:
+    async def test_first_call_fetches_token(self) -> None:
+        cfg = BridgeConfig(
+            slug="x",
+            tenant_id="t",
+            bot_app_id="bot",
+            bot_app_secret="sek",
+            webhook_url="http://hook",
+            log_path=Path("/tmp/x.log"),
+            pid_path=Path("/tmp/x.pid"),
+        )
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            assert req.url == BF_TOKEN_URL
+            assert b"client_id=bot" in req.content
+            assert b"scope=https%3A%2F%2Fapi.botframework.com%2F.default" in req.content
+            return httpx.Response(
+                200, json={"access_token": "tok-abc", "expires_in": 3600}
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cache = _BotTokenCache()
+            t = await acquire_bot_token(client=client, cfg=cfg, cache=cache)
+        assert t == "tok-abc"
+        assert cache.access_token == "tok-abc"
+
+    async def test_cached_token_reused(self) -> None:
+        cfg = BridgeConfig(
+            slug="x",
+            tenant_id="t",
+            bot_app_id="bot",
+            bot_app_secret="sek",
+            webhook_url="http://hook",
+            log_path=Path("/tmp/x.log"),
+            pid_path=Path("/tmp/x.pid"),
+        )
+        call_count = {"n": 0}
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            call_count["n"] += 1
+            return httpx.Response(
+                200, json={"access_token": "tok-abc", "expires_in": 3600}
+            )
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            cache = _BotTokenCache()
+            await acquire_bot_token(client=client, cfg=cfg, cache=cache)
+            await acquire_bot_token(client=client, cfg=cfg, cache=cache)
+            await acquire_bot_token(client=client, cfg=cfg, cache=cache)
+        assert call_count["n"] == 1
+
+
+# ---------------------------------------------------------------------------
+# Webhook envelope + reply rendering
+# ---------------------------------------------------------------------------
+
+
+def _cfg(webhook_url: str = "http://hook.test/responder") -> BridgeConfig:
+    return BridgeConfig(
+        slug="inbox-helper",
+        tenant_id="2699fca3-...",
+        bot_app_id="bot-app-id",
+        bot_app_secret="sek",
+        webhook_url=webhook_url,
+        log_path=Path("/tmp/x.log"),
+        pid_path=Path("/tmp/x.pid"),
+    )
+
+
+def _inbound_message_activity() -> dict[str, Any]:
+    return {
+        "type": "message",
+        "id": "1234",
+        "channelId": "msteams",
+        "serviceUrl": "https://smba.trafficmanager.net/teams/",
+        "conversation": {"id": "conv-1"},
+        "from": {"id": "user-1", "name": "Sadiq"},
+        "recipient": {"id": "bot-1", "name": "Inbox Helper"},
+        "text": "hi",
+    }
+
+
+class TestEnvelope:
+    def test_includes_agent_metadata(self) -> None:
+        env = build_webhook_envelope(_inbound_message_activity(), _cfg())
+        assert env["version"] == "1"
+        assert env["agent"]["slug"] == "inbox-helper"
+        assert env["agent"]["bot_app_id"] == "bot-app-id"
+        # Activity passed through verbatim — includes serviceUrl, channelId, etc.
+        assert env["activity"]["serviceUrl"].startswith("https://smba")
+        assert env["activity"]["text"] == "hi"
+
+
+class TestRenderReply:
+    def test_text_only_response(self) -> None:
+        reply = render_reply_activity(
+            _inbound_message_activity(), {"text": "hello back"}
+        )
+        assert reply["type"] == "message"
+        assert reply["text"] == "hello back"
+        # from/recipient must swap per BF reply convention.
+        assert reply["from"]["id"] == "bot-1"
+        assert reply["recipient"]["id"] == "user-1"
+        assert reply["replyToId"] == "1234"
+        assert "attachments" not in reply
+
+    def test_card_attached_with_correct_content_type(self) -> None:
+        card = {"type": "AdaptiveCard", "version": "1.6", "body": []}
+        reply = render_reply_activity(
+            _inbound_message_activity(), {"text": "see card", "card": card}
+        )
+        assert reply["attachments"][0] == {
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": card,
+        }
+
+    def test_error_card_shape(self) -> None:
+        card = render_error_card("oops")
+        assert card["type"] == "AdaptiveCard"
+        assert card["version"] == "1.6"
+        # Error message included verbatim.
+        assert any("oops" in (b.get("text") or "") for b in card["body"])
+
+
+# ---------------------------------------------------------------------------
+# load_bridge_config
+# ---------------------------------------------------------------------------
+
+
+class TestLoadBridgeConfig:
+    def test_missing_botMsaAppId_errors_with_actionable_hint(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_env(tmp_path)
+        # Generated config without botMsaAppId — the round-2 walkthrough's
+        # actual state. The error must point operators at the fix.
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "agentBlueprintId": "bp-id",
+                    "agentBlueprintClientSecret": "sek",
+                    "botMsaAppId": None,
+                }
+            )
+        )
+        with pytest.raises(BridgeConfigError, match="--m365"):
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="http://hook",
+                hermes_home=tmp_path,
+                generated_config_path=path,
+            )
+
+    def test_happy_path(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path)
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "agentBlueprintId": "bp-id",
+                    "agentBlueprintClientSecret": "sek",
+                    "botMsaAppId": "bot-app-id",
+                }
+            )
+        )
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="http://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.bot_app_id == "bot-app-id"
+        assert cfg.bot_app_secret == "sek"
+        assert cfg.webhook_url == "http://hook"
+
+    def test_falls_back_to_env_var_when_no_webhook_arg(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _seed_agent_env(tmp_path)
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "agentBlueprintId": "bp-id",
+                    "agentBlueprintClientSecret": "sek",
+                    "botMsaAppId": "bot",
+                }
+            )
+        )
+        monkeypatch.setenv("HERMES_BRIDGE_WEBHOOK", "http://from-env")
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url=None,
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.webhook_url == "http://from-env"
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app via TestClient
+# ---------------------------------------------------------------------------
+
+
+def _serve_handler_factory(
+    *,
+    webhook_response: dict[str, Any] | None = None,
+    webhook_status: int = 200,
+    capture: dict[str, Any] | None = None,
+    jwk: dict[str, Any] | None = None,
+) -> httpx.MockTransport:
+    """Build a transport that handles ALL outbound HTTP the bridge makes:
+    - operator's webhook (POST http://hook.test/responder)
+    - BF outbound calls (POST {serviceUrl}/v3/conversations/.../activities/...)
+    - AAD token endpoint
+    - BF JWKS discovery + keys (when jwk is provided, for JWT-validation tests)
+    """
+
+    if capture is None:
+        capture = {"webhook": [], "reply": [], "token": []}
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        url = str(req.url)
+        if url == BF_TOKEN_URL:
+            capture["token"].append(req.content)
+            return httpx.Response(
+                200, json={"access_token": "tok", "expires_in": 3600}
+            )
+        if url.startswith("http://hook.test/responder"):
+            capture["webhook"].append(json.loads(req.content))
+            if webhook_status != 200:
+                return httpx.Response(webhook_status, json={"error": "boom"})
+            return httpx.Response(200, json=webhook_response or {})
+        if "/v3/conversations/" in url:
+            capture["reply"].append({"url": url, "body": json.loads(req.content)})
+            return httpx.Response(200, json={})
+        # JWKS discovery + keys.
+        if url.endswith("/openidconfiguration"):
+            return httpx.Response(
+                200,
+                json={
+                    "issuer": "https://api.botframework.com",
+                    "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+                },
+            )
+        if url.endswith("/.well-known/keys"):
+            keys = [jwk] if jwk else []
+            return httpx.Response(200, json={"keys": keys})
+        return httpx.Response(404, text=f"unhandled {url}")
+
+    return httpx.MockTransport(handler)
+
+
+def _client_for(
+    cfg: BridgeConfig,
+    *,
+    capture: dict[str, Any],
+    webhook_response: dict[str, Any] | None = None,
+    webhook_status: int = 200,
+    jwk: dict[str, Any] | None = None,
+) -> TestClient:
+    transport = _serve_handler_factory(
+        webhook_response=webhook_response,
+        webhook_status=webhook_status,
+        capture=capture,
+        jwk=jwk,
+    )
+    http_client = httpx.AsyncClient(transport=transport)
+    app = make_app(cfg, http_client=http_client)
+    return TestClient(app)
+
+
+class TestServeApp:
+    def test_healthz(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(cfg, capture=capture) as client:
+            r = client.get("/healthz")
+        assert r.status_code == 200
+        assert r.json()["slug"] == "inbox-helper"
+
+    def test_message_forwards_to_webhook_and_replies(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True  # JWT path tested separately
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={"text": "hi back"},
+        ) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+        assert r.status_code == 200
+        assert r.json()["status"] == "replied"
+        # Webhook was called with the envelope.
+        assert capture["webhook"][0]["agent"]["slug"] == "inbox-helper"
+        assert capture["webhook"][0]["activity"]["text"] == "hi"
+        # Reply was POSTed to the right URL with the right body.
+        assert len(capture["reply"]) == 1
+        reply_url = capture["reply"][0]["url"]
+        assert "/v3/conversations/conv-1/activities/1234" in reply_url
+        assert capture["reply"][0]["body"]["text"] == "hi back"
+
+    def test_message_with_card_response(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        card = {"type": "AdaptiveCard", "version": "1.6", "body": []}
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={"text": "see card", "card": card},
+        ) as client:
+            client.post("/api/messages", json=_inbound_message_activity())
+        body = capture["reply"][0]["body"]
+        assert body["attachments"][0]["content"] == card
+
+    def test_invoke_returns_inline_response(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        invoke = {**_inbound_message_activity(), "type": "invoke", "name": "adaptiveCard/action"}
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={
+                "invokeResponse": {"status": 200, "body": {"text": "thanks"}}
+            },
+        ) as client:
+            r = client.post("/api/messages", json=invoke)
+        assert r.status_code == 200
+        # Invoke replies are SYNC: response body is the invokeResponse.
+        assert r.json() == {"status": 200, "body": {"text": "thanks"}}
+        # No serviceUrl reply for invoke.
+        assert capture["reply"] == []
+
+    def test_conversation_update_acked_no_webhook(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        update = {**_inbound_message_activity(), "type": "conversationUpdate"}
+        with _client_for(cfg, capture=capture) as client:
+            r = client.post("/api/messages", json=update)
+        assert r.status_code == 200
+        assert r.json()["status"] == "acked"
+        assert capture["webhook"] == []
+
+    def test_webhook_error_surfaces_error_card(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(cfg, capture=capture, webhook_status=500) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+        assert r.status_code == 200
+        assert r.json()["status"] == "webhook_error"
+        # An error card was sent back to the user via serviceUrl reply.
+        assert len(capture["reply"]) == 1
+        attachments = capture["reply"][0]["body"]["attachments"]
+        assert attachments[0]["content"]["type"] == "AdaptiveCard"
+
+    def test_jwt_missing_returns_401(self) -> None:
+        cfg = _cfg()  # JWT validation enabled
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(cfg, capture=capture) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+        assert r.status_code == 401
+
+    def test_jwt_invalid_returns_403(self) -> None:
+        cfg = _cfg()  # JWT validation enabled
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(cfg, capture=capture) as client:
+            r = client.post(
+                "/api/messages",
+                json=_inbound_message_activity(),
+                headers={"Authorization": "Bearer not-a-valid-jwt"},
+            )
+        assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# update-endpoint
+# ---------------------------------------------------------------------------
+
+
+class TestUpdateEndpointCli:
+    def test_dry_run_renders_argv_with_m365(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        rc = main(
+            [
+                "update-endpoint",
+                "--agent-name",
+                "Hermes Inbox Helper",
+                "--url",
+                "https://example.trycloudflare.com/api/messages",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "--m365" in out
+        assert "--update-endpoint https://example.trycloudflare.com/api/messages" in out
+
+    def test_no_m365_omits_flag(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(
+            [
+                "update-endpoint",
+                "--agent-name",
+                "X",
+                "--url",
+                "https://x.example/api/messages",
+                "--no-m365",
+            ]
+        )
+        assert rc == 0
+        out = capsys.readouterr().out
+        assert "--m365" not in out
+
+    def test_non_https_url_rejected(self, capsys: pytest.CaptureFixture[str]) -> None:
+        rc = main(
+            [
+                "update-endpoint",
+                "--agent-name",
+                "X",
+                "--url",
+                "http://insecure.example/api/messages",
+            ]
+        )
+        assert rc == 2
+        assert "must be HTTPS" in capsys.readouterr().err

@@ -311,7 +311,7 @@ optional-skills/cloud-platforms/hermes-a365/
 │   ├── reconcile_app.py                 # Diffs desired Entra app state vs actual
 │   ├── reconcile_blueprint.py           # Same for blueprint
 │   ├── status.py                        # Aggregates state for `hermes a365 status`
-│   └── secrets.py                       # OS-keychain wrapper (macOS Keychain, Linux Secret Service)
+│   └── keychain.py                      # OS-keychain wrapper (macOS Keychain, Linux Secret Service)
 ├── templates/
 │   ├── blueprint.json.j2                # Agent blueprint
 │   ├── instance.env.j2                  # Per-agent .env
