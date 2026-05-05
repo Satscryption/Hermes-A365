@@ -12,6 +12,8 @@ import json
 import os
 import time as _time
 import urllib.error
+import urllib.parse
+from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -21,18 +23,25 @@ import httpx
 import jwt as _jwt
 import pytest
 from activity_bridge import (
-    BF_TOKEN_URL,
+    APX_PRODUCTION_SCOPE,
+    FMI_TOKEN_SCOPE,
     GRAPH_RESOURCE,
     OBSERVABILITY_RESOURCE_APPID,
+    TENANT_TOKEN_URL_TEMPLATE,
     BridgeConfig,
     BridgeConfigError,
     JwtValidationError,
     TokenAcquisitionError,
     VerifyReport,
-    _BotTokenCache,
+    _agentic_ids_from_activity,
+    _FmiCache,
     _JwksCache,
-    acquire_bot_token,
+    _UserTokenCache,
+    acquire_outbound_token,
+    acquire_t1_token,
+    acquire_t2_token,
     acquire_token,
+    acquire_user_fic_token,
     build_webhook_envelope,
     load_agent_env,
     load_bridge_config,
@@ -321,18 +330,20 @@ class TestProbeTokenAcquisition:
         assert r.state == "error"
         assert "rotate" in r.detail
 
-    def test_no_role_grants_yields_warn_not_error(self) -> None:
-        # AADSTS7000218 is "the app has no permissions on this resource"
-        # — diagnostic-positive: the secret WORKS, just the scope is wrong.
+    def test_other_aadsts_yields_error_with_code(self) -> None:
+        # Slice 19e: this probe now targets Graph (which works for
+        # blueprint apps). Anything other than the secret-rejection
+        # codes is reported as a generic error so operators can look
+        # the AADSTS code up.
         with patch(
             "activity_bridge.acquire_token",
-            side_effect=TokenAcquisitionError("AADSTS7000218", "no role"),
+            side_effect=TokenAcquisitionError("AADSTS90002", "tenant not found"),
         ):
             r = probe_token_acquisition(
                 tenant_id="t", client_id="c", client_secret="s"
             )
-        assert r.state == "warn"
-        assert "secret valid but no role" in r.detail
+        assert r.state == "error"
+        assert "AADSTS90002" in r.detail
 
 
 class TestProbeOtlpEndpoint:
@@ -375,27 +386,43 @@ class TestRunVerify:
         assert "skipped" in token_probes[0].detail
 
     def test_full_happy_path(self, tmp_path: Path) -> None:
+        # Slice 19e: verify orchestration now includes fmi_exchange
+        # between token_acquisition and reachability. Mock the urllib
+        # call probe_fmi_exchange makes so this test stays hermetic.
         _seed_agent_env(tmp_path)
         gen_path = _seed_generated_config(tmp_path)
-        with (
-            patch(
-                "activity_bridge.acquire_token",
-                return_value={"token_type": "Bearer", "expires_in": 3599, "access_token": "x"},
-            ),
-            patch("activity_bridge.tcp_reachable", return_value=True),
-            patch("activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
-        ):
-            report = run_verify(
-                slug="inbox-helper",
-                hermes_home=tmp_path,
-                generated_config_path=gen_path,
-            )
+        ok_body = b'{"access_token": "T1", "token_type": "Bearer", "expires_in": 3599}'
+        urlopen_ctx = patch(
+            "activity_bridge.urllib.request.urlopen"
+        ).start()
+        urlopen_ctx.return_value.__enter__.return_value.read.return_value = ok_body
+        try:
+            with (
+                patch(
+                    "activity_bridge.acquire_token",
+                    return_value={
+                        "token_type": "Bearer",
+                        "expires_in": 3599,
+                        "access_token": "x",
+                    },
+                ),
+                patch("activity_bridge.tcp_reachable", return_value=True),
+                patch("activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
+            ):
+                report = run_verify(
+                    slug="inbox-helper",
+                    hermes_home=tmp_path,
+                    generated_config_path=gen_path,
+                )
+        finally:
+            patch.stopall()
         assert report.overall == "ok"
         names = [p.name for p in report.probes]
         assert names == [
             "local_config",
             "generated_config",
             "token_acquisition",
+            "fmi_exchange",
             "reachability",
             "otlp_endpoint",
         ]
@@ -438,24 +465,35 @@ class TestCli:
         _seed_agent_env(tmp_path)
         gen_path = _seed_generated_config(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
-        with (
-            patch(
-                "activity_bridge.acquire_token",
-                return_value={"token_type": "Bearer", "expires_in": 3599, "access_token": "x"},
-            ),
-            patch("activity_bridge.tcp_reachable", return_value=True),
-            patch("activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
-        ):
-            rc = main(
-                [
-                    "verify",
-                    "--slug",
-                    "inbox-helper",
-                    "--generated-config",
-                    str(gen_path),
-                    "--human",
-                ]
-            )
+        # Slice 19e: mock the urlopen call probe_fmi_exchange uses too.
+        ok_body = b'{"access_token": "T1", "token_type": "Bearer", "expires_in": 3599}'
+        urlopen_p = patch("activity_bridge.urllib.request.urlopen").start()
+        urlopen_p.return_value.__enter__.return_value.read.return_value = ok_body
+        try:
+            with (
+                patch(
+                    "activity_bridge.acquire_token",
+                    return_value={
+                        "token_type": "Bearer",
+                        "expires_in": 3599,
+                        "access_token": "x",
+                    },
+                ),
+                patch("activity_bridge.tcp_reachable", return_value=True),
+                patch("activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
+            ):
+                rc = main(
+                    [
+                        "verify",
+                        "--slug",
+                        "inbox-helper",
+                        "--generated-config",
+                        str(gen_path),
+                        "--human",
+                    ]
+                )
+        finally:
+            patch.stopall()
         assert rc == 0
         out = capsys.readouterr().out
         assert "overall: ok" in out
@@ -674,60 +712,189 @@ class TestValidateInboundJwt:
 
 
 # ---------------------------------------------------------------------------
-# Outbound BF token cache
+# Outbound auth — three-stage agentic-user-FIC chain (slice 19e)
 # ---------------------------------------------------------------------------
 
 
-class TestAcquireBotToken:
-    async def test_first_call_fetches_token(self) -> None:
-        cfg = BridgeConfig(
-            slug="x",
-            tenant_id="t",
-            bot_app_id="bot",
-            bot_app_secret="sek",
-            webhook_url="http://hook",
-            log_path=Path("/tmp/x.log"),
-            pid_path=Path("/tmp/x.pid"),
+def _agentic_token_handler(
+    *,
+    capture: list[dict[str, Any]] | None = None,
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Build an httpx mock handler that fakes all three stages of the
+    A365 agentic chain. Each request appends a small dict to
+    ``capture`` documenting (url, scope, grant_type) so tests can
+    assert the right things were posted in the right order.
+    """
+    if capture is None:
+        capture = []
+
+    def handler(req: httpx.Request) -> httpx.Response:
+        body = req.content.decode()
+        params: dict[str, str] = {}
+        for kv in body.split("&"):
+            k, _, v = kv.partition("=")
+            params[k] = urllib.parse.unquote_plus(v)
+        capture.append(
+            {
+                "url": str(req.url),
+                "grant_type": params.get("grant_type"),
+                "scope": params.get("scope"),
+                "fmi_path": params.get("fmi_path"),
+                "user_id": params.get("user_id"),
+            }
         )
-
-        def handler(req: httpx.Request) -> httpx.Response:
-            assert req.url == BF_TOKEN_URL
-            assert b"client_id=bot" in req.content
-            assert b"scope=https%3A%2F%2Fapi.botframework.com%2F.default" in req.content
+        # Each stage returns its own opaque "token". The next stage
+        # echoes it back as `client_assertion` / `user_federated_identity_credential`,
+        # so we can't tell the three apart from the response alone —
+        # the order of arrival is what tests assert on.
+        if params.get("fmi_path") and params.get("grant_type") == "client_credentials":
+            return httpx.Response(200, json={"access_token": "T1", "expires_in": 3600})
+        if (
+            params.get("grant_type") == "client_credentials"
+            and params.get("client_assertion")
+        ):
+            return httpx.Response(200, json={"access_token": "T2", "expires_in": 3600})
+        if params.get("grant_type") == "user_fic":
             return httpx.Response(
-                200, json={"access_token": "tok-abc", "expires_in": 3600}
+                200, json={"access_token": "FINAL", "expires_in": 3600}
             )
+        return httpx.Response(400, json={"error": "test_unhandled_token_request"})
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            cache = _BotTokenCache()
-            t = await acquire_bot_token(client=client, cfg=cfg, cache=cache)
-        assert t == "tok-abc"
-        assert cache.access_token == "tok-abc"
+    return handler
 
-    async def test_cached_token_reused(self) -> None:
-        cfg = BridgeConfig(
-            slug="x",
-            tenant_id="t",
-            bot_app_id="bot",
-            bot_app_secret="sek",
-            webhook_url="http://hook",
-            log_path=Path("/tmp/x.log"),
-            pid_path=Path("/tmp/x.pid"),
-        )
-        call_count = {"n": 0}
 
-        def handler(req: httpx.Request) -> httpx.Response:
-            call_count["n"] += 1
-            return httpx.Response(
-                200, json={"access_token": "tok-abc", "expires_in": 3600}
+class TestAgenticIdsFromActivity:
+    def test_extracts_all_three(self) -> None:
+        tenant, instance, user = _agentic_ids_from_activity(_inbound_message_activity())
+        assert tenant == "tenant-1"
+        assert instance == "blueprint-app-id"
+        assert user == "agentic-user-1"
+
+    def test_falls_back_to_conversation_tenant(self) -> None:
+        a = _inbound_message_activity()
+        a["recipient"].pop("tenantId")
+        # conversation.tenantId is the secondary source.
+        tenant, _, _ = _agentic_ids_from_activity(a)
+        assert tenant == "tenant-1"
+
+    def test_missing_fields_raise(self) -> None:
+        a = _inbound_message_activity()
+        a["recipient"].pop("agenticAppId")
+        with pytest.raises(RuntimeError, match="agentic identifiers"):
+            _agentic_ids_from_activity(a)
+
+
+class TestAcquireOutboundToken:
+    async def test_three_stage_chain_runs_in_order(self) -> None:
+        """First call exercises all three stages in order: T1 (FMI) →
+        T2 (instance assertion) → final (user_fic)."""
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            tok = await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(),
+                activity=_inbound_message_activity(),
+                fmi_cache=_FmiCache(),
+                user_cache=_UserTokenCache(),
             )
+        assert tok == "FINAL"
+        # Three POSTs in the right order, each at the tenant token endpoint.
+        assert [c["grant_type"] for c in capture] == [
+            "client_credentials",  # T1: blueprint impersonates instance via fmi_path
+            "client_credentials",  # T2: instance asserts itself via client_assertion
+            "user_fic",            # Final: user-context token at messaging scope
+        ]
+        # First request is FMI step — fmi_path present.
+        assert capture[0]["fmi_path"] == "blueprint-app-id"
+        assert capture[0]["scope"] == FMI_TOKEN_SCOPE
+        # Final request carries the agentic_user_id.
+        assert capture[2]["user_id"] == "agentic-user-1"
+        assert capture[2]["scope"] == APX_PRODUCTION_SCOPE
+        # All three POSTs hit the tenant-specific endpoint, not the BF one.
+        for c in capture:
+            assert c["url"] == TENANT_TOKEN_URL_TEMPLATE.format(tenant_id="tenant-1")
 
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            cache = _BotTokenCache()
-            await acquire_bot_token(client=client, cfg=cfg, cache=cache)
-            await acquire_bot_token(client=client, cfg=cfg, cache=cache)
-            await acquire_bot_token(client=client, cfg=cfg, cache=cache)
-        assert call_count["n"] == 1
+    async def test_caches_final_token_per_user(self) -> None:
+        """Same user, two calls — only one round of three POSTs."""
+        capture: list[dict[str, Any]] = []
+        fmi = _FmiCache()
+        user = _UserTokenCache()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(),
+                activity=_inbound_message_activity(),
+                fmi_cache=fmi,
+                user_cache=user,
+            )
+            await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(),
+                activity=_inbound_message_activity(),
+                fmi_cache=fmi,
+                user_cache=user,
+            )
+        assert len(capture) == 3  # not 6
+
+    async def test_distinct_users_share_t1_t2_but_mint_separate_finals(self) -> None:
+        """Two activities → same tenant + agent → shared FMI; per-user
+        final tokens. Should result in 3 + 1 POSTs (not 6, not 4)."""
+        capture: list[dict[str, Any]] = []
+        fmi = _FmiCache()
+        user = _UserTokenCache()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(),
+                activity=_inbound_message_activity(agentic_user_id="user-A"),
+                fmi_cache=fmi,
+                user_cache=user,
+            )
+            await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(),
+                activity=_inbound_message_activity(agentic_user_id="user-B"),
+                fmi_cache=fmi,
+                user_cache=user,
+            )
+        # 3 stages for user-A, just the final stage for user-B.
+        assert len(capture) == 4
+        assert capture[3]["grant_type"] == "user_fic"
+        assert capture[3]["user_id"] == "user-B"
+
+    async def test_individual_stages(self) -> None:
+        """Smoke: each stage helper drives a single POST with the right body."""
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            t1, _ = await acquire_t1_token(
+                client=client,
+                tenant_id="t",
+                blueprint_client_id="bp",
+                blueprint_client_secret="sek",
+                agent_app_instance_id="agent-1",
+            )
+            t2, _ = await acquire_t2_token(
+                client=client, tenant_id="t", agent_app_instance_id="agent-1", t1=t1
+            )
+            final, _ = await acquire_user_fic_token(
+                client=client,
+                tenant_id="t",
+                agent_app_instance_id="agent-1",
+                t1=t1,
+                t2=t2,
+                agentic_user_id="user-1",
+                scope=APX_PRODUCTION_SCOPE,
+            )
+        assert (t1, t2, final) == ("T1", "T2", "FINAL")
+        assert len(capture) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -738,24 +905,39 @@ class TestAcquireBotToken:
 def _cfg(webhook_url: str = "http://hook.test/responder") -> BridgeConfig:
     return BridgeConfig(
         slug="inbox-helper",
-        tenant_id="2699fca3-...",
-        bot_app_id="bot-app-id",
-        bot_app_secret="sek",
+        tenant_id="tenant-1",
+        blueprint_client_id="blueprint-app-id",
+        blueprint_client_secret="sek",
         webhook_url=webhook_url,
         log_path=Path("/tmp/x.log"),
         pid_path=Path("/tmp/x.pid"),
     )
 
 
-def _inbound_message_activity() -> dict[str, Any]:
+def _inbound_message_activity(
+    *, conv_id: str = "conv-1", agentic_user_id: str = "agentic-user-1"
+) -> dict[str, Any]:
+    """Inbound BF activity with the agentic recipient fields the bridge
+    needs to mint outbound tokens (slice 19e).
+
+    For A365 the blueprint Entra app *is* the agent identity, so
+    ``agenticAppId`` here matches the blueprint client id used in
+    ``_cfg``.
+    """
     return {
         "type": "message",
         "id": "1234",
         "channelId": "msteams",
         "serviceUrl": "https://smba.trafficmanager.net/teams/",
-        "conversation": {"id": "conv-1"},
+        "conversation": {"id": conv_id, "tenantId": "tenant-1"},
         "from": {"id": "user-1", "name": "Sadiq"},
-        "recipient": {"id": "bot-1", "name": "Inbox Helper"},
+        "recipient": {
+            "id": "bot-1",
+            "name": "Inbox Helper",
+            "tenantId": "tenant-1",
+            "agenticAppId": "blueprint-app-id",
+            "agenticUserId": agentic_user_id,
+        },
         "text": "hi",
     }
 
@@ -765,7 +947,7 @@ class TestEnvelope:
         env = build_webhook_envelope(_inbound_message_activity(), _cfg())
         assert env["version"] == "1"
         assert env["agent"]["slug"] == "inbox-helper"
-        assert env["agent"]["bot_app_id"] == "bot-app-id"
+        assert env["agent"]["blueprint_client_id"] == "blueprint-app-id"
         # Activity passed through verbatim — includes serviceUrl, channelId, etc.
         assert env["activity"]["serviceUrl"].startswith("https://smba")
         assert env["activity"]["text"] == "hi"
@@ -808,23 +990,22 @@ class TestRenderReply:
 
 
 class TestLoadBridgeConfig:
-    def test_missing_botMsaAppId_errors_with_actionable_hint(
+    def test_missing_secret_errors_with_actionable_hint(
         self, tmp_path: Path
     ) -> None:
+        """Slice 19e: secret missing usually means `a365 publish`
+        clobbered the local config. Error should point at the fix."""
         _seed_agent_env(tmp_path)
-        # Generated config without botMsaAppId — the round-2 walkthrough's
-        # actual state. The error must point operators at the fix.
         path = tmp_path / "a365.generated.config.json"
         path.write_text(
             json.dumps(
                 {
                     "agentBlueprintId": "bp-id",
-                    "agentBlueprintClientSecret": "sek",
-                    "botMsaAppId": None,
+                    "agentBlueprintClientSecret": None,
                 }
             )
         )
-        with pytest.raises(BridgeConfigError, match="--m365"):
+        with pytest.raises(BridgeConfigError, match="credential reset"):
             load_bridge_config(
                 slug="inbox-helper",
                 webhook_url="http://hook",
@@ -838,9 +1019,8 @@ class TestLoadBridgeConfig:
         path.write_text(
             json.dumps(
                 {
-                    "agentBlueprintId": "bp-id",
+                    "agentBlueprintId": "blueprint-app-id",
                     "agentBlueprintClientSecret": "sek",
-                    "botMsaAppId": "bot-app-id",
                 }
             )
         )
@@ -850,8 +1030,8 @@ class TestLoadBridgeConfig:
             hermes_home=tmp_path,
             generated_config_path=path,
         )
-        assert cfg.bot_app_id == "bot-app-id"
-        assert cfg.bot_app_secret == "sek"
+        assert cfg.blueprint_client_id == "blueprint-app-id"
+        assert cfg.blueprint_client_secret == "sek"
         assert cfg.webhook_url == "http://hook"
 
     def test_falls_back_to_env_var_when_no_webhook_arg(
@@ -864,7 +1044,6 @@ class TestLoadBridgeConfig:
                 {
                     "agentBlueprintId": "bp-id",
                     "agentBlueprintClientSecret": "sek",
-                    "botMsaAppId": "bot",
                 }
             )
         )
@@ -902,10 +1081,28 @@ def _serve_handler_factory(
 
     def handler(req: httpx.Request) -> httpx.Response:
         url = str(req.url)
-        if url == BF_TOKEN_URL:
-            capture["token"].append(req.content)
+        # Slice 19e: outbound auth is now the 3-stage agentic chain
+        # at the tenant token endpoint. We answer all stages
+        # generically — tests assert on capture["token"] for the
+        # request bodies.
+        if "/oauth2/v2.0/token" in url:
+            body = req.content.decode()
+            params: dict[str, str] = {}
+            for kv in body.split("&"):
+                k, _, v = kv.partition("=")
+                params[k] = urllib.parse.unquote_plus(v)
+            capture["token"].append(params)
+            grant = params.get("grant_type", "")
+            if params.get("fmi_path"):
+                return httpx.Response(
+                    200, json={"access_token": "T1", "expires_in": 3600}
+                )
+            if grant == "user_fic":
+                return httpx.Response(
+                    200, json={"access_token": "FINAL", "expires_in": 3600}
+                )
             return httpx.Response(
-                200, json={"access_token": "tok", "expires_in": 3600}
+                200, json={"access_token": "T2", "expires_in": 3600}
             )
         if url.startswith("http://hook.test/responder"):
             capture["webhook"].append(json.loads(req.content))

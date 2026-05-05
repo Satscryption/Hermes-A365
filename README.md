@@ -6,15 +6,13 @@ control plane that GA'd 2026-05-01.
 
 ## Status
 
-**v0.2 setup/lifecycle complete; runtime auth layer needs OBO refactor.**
-Setup, status, license, cleanup, `bridge verify` paths all work
-end-to-end against a live tenant. **`bridge serve` outbound auth is
-broken** for A365 blueprint apps as of round-3 walkthrough on
-2026-05-05 — Microsoft's `AADSTS82001` policy blocks
-`client_credentials` for "Agentic applications" on messaging
-resources. Tracked as [#6](https://github.com/satscryption/Hermes-A365/issues/6);
-fix is to refactor outbound auth to OBO. Until then, the bridge
-ships and verifies, but cannot send replies in production.
+**v0.2 functionally complete pending live-tenant validation of the
+agentic auth refactor.** Setup, status, license, cleanup, `bridge
+verify` paths all work end-to-end against a live tenant. `bridge
+serve` outbound auth was rewritten in slice 19e to use the canonical
+A365 three-stage `user_fic` chain (issue
+[#6](https://github.com/satscryption/Hermes-A365/issues/6) closed in
+code; live-tenant validation pending round-4 walkthrough).
 
 ```
                      ┌─────────────────────────────────────────────────┐
@@ -31,7 +29,7 @@ ships and verifies, but cannot send replies in production.
 | **Per-agent runtime config** (`instance create`) | Local-only `.env` writer; UUID generation deferred to apply-time; secret never on disk. |
 | **Manifest publish** (`publish`) | Branches between AI-Teammate (zip) and blueprint-only (Graph API instance registration); operator messaging is honest about which artefact each flow produces. |
 | **Cleanup** | Drives `cleanup azure → instance → blueprint`, pre-feeds `y\n` to defeat the GA CLI's prompts, leaves `chmod 600` on backup files. |
-| **Activity bridge** | `verify` (config + auth + reachability diagnostic) ships and works. `serve` (long-running BF webhook adapter) ships but the outbound auth is **broken for A365 blueprint apps** until the OBO refactor in [#6](https://github.com/satscryption/Hermes-A365/issues/6) lands. JWT-validated inbound, webhook forwarding, and reply rendering all work; `acquire_bot_token` does not. |
+| **Activity bridge** | `verify` (config + auth + reachability + FMI exchange) ships and works. `serve` (long-running BF webhook adapter) ships with the correct A365 three-stage `user_fic` outbound auth (slice 19e). Live-tenant validation pending round-4 walkthrough. |
 | **Live-tenant runbook** | [`references/live-tenant-test.md`](references/live-tenant-test.md). Walked round-2 successfully; round-3 (with the bridge) pending operator action. |
 
 **Known external blocker.** The GA `a365 setup permissions bot` only
@@ -222,10 +220,6 @@ External issues filed:
 
 Open issues in this repo (run `gh issue list` for current state):
 
-- **[#6](../../issues/6)** — **Bridge outbound auth needs OBO refactor.**
-  `AADSTS82001` blocks `client_credentials` for A365 blueprint apps
-  on messaging resources; canonical pattern is OBO. Highest priority —
-  this is the round-3 blocker.
 - **[#1](../../issues/1)** — Tier 3 responder (Hermes-native). Blocked
   on Hermes#20133 + SPEC §10 Q1.
 - **[#2](../../issues/2)** — Tier 2 responder (LLM-backed,
@@ -285,11 +279,21 @@ Slice timeline since v0.2 work began:
   messaging endpoint, and discovered Microsoft's `AADSTS82001` policy
   blocks the bridge's `client_credentials` outbound auth for A365
   blueprint apps on messaging resources. The bridge's wire is correct
-  but the auth model is wrong; OBO refactor needed. Filed as
+  but the auth model was wrong. Filed as
   [#6](https://github.com/satscryption/Hermes-A365/issues/6) (slice
   19d findings; CLI quirk that `a365 publish` clobbers
   `agentBlueprintClientSecret` from the local generated config also
-  documented in the issue). Tenant cleaned up post-walkthrough.
+  documented). Tenant cleaned up post-walkthrough.
+- **2026-05-05** — slice 19e: refactored bridge outbound auth from
+  `client_credentials` (broken for agentic apps) to the canonical
+  three-stage `user_fic` chain documented at
+  https://learn.microsoft.com/en-us/entra/agent-id/agent-user-oauth-flow.
+  T1 = blueprint impersonates agent identity via FMI; T2 = agent
+  identity asserts itself; final = user-context token at the
+  Messaging Bot API resource. Two-tier cache (T1/T2 shared across
+  users; final per-user). `bridge verify` gains an FMI exchange
+  probe; messaging-resource `client_credentials` probe dropped.
+  60 bridge tests passing.
 
 Older v0.1 slice history (1–17) lived in this README until 2026-05-05;
 it was a slice-by-slice trail that grew unwieldy. The canonical

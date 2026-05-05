@@ -388,31 +388,29 @@ in 19b.
 - [ ] `bridge verify` returns 0 (or 1 with only the documented
       AADSTS7000218 / OTLP-DNS warnings) against the fresh tenant.
 
-## 9c. activity-bridge serve + reference responder (slices 19b + 19c) — Teams round-trip
+## 9c. activity-bridge serve + reference responder (slices 19b + 19c + 19e) — Teams round-trip
 
-⚠️ **Currently blocked.** The 2026-05-05 round-3 walkthrough proved
-that the bridge's outbound reply path uses the wrong auth model for
-A365 blueprint apps. Microsoft's `AADSTS82001` policy blocks
-`client_credentials` for "Agentic applications" on every
-messaging-related resource (`api.botframework.com`, Messaging Bot
-API, Power Platform API). Graph still works for the same blueprint
-client, so verify-mode token acquisition succeeds; serve-mode replies
-do not. Tracked as
-[#6](https://github.com/satscryption/Hermes-A365/issues/6) — fix is
-to refactor `acquire_bot_token` from `client_credentials` to OBO,
-threading the inbound activity's JWT through as the `assertion`.
+Validates the full runtime path. Slice 19e (issue #6) replaced the
+broken `client_credentials` outbound auth with the canonical A365
+agentic three-stage `user_fic` chain — see
+`scripts/activity_bridge.py::acquire_outbound_token` for the
+implementation. This is the runtime walkthrough that round-2
+couldn't reach.
 
-Until #6 lands, the steps below will set up the bridge, accept
-inbound activities, validate JWTs, forward to the responder, get a
-response — and then fail at `send_reply` with `AADSTS82001` when it
-tries to acquire the BF token. The bridge's webhook contract,
-JWT validation, and reply rendering are all unaffected; only
-the auth is wrong.
+⚠️ **CLI quirk caught in round-3 — `a365 publish` clobbers the
+local secret.** If you run `register --apply` then `publish --apply`,
+`a365.generated.config.json` will lose
+`agentBlueprintClientSecret` (along with `botMsaAppId`, `botId`,
+`messagingEndpoint`). Two ways to recover:
 
-## (Original step 9c — kept for when #6 is fixed)
-
-Validates the full runtime path. This is the round-3 step the round-2
-walkthrough couldn't reach.
+1. Re-run `update-endpoint --apply` to restore the bot identity from
+   server state, then `az ad app credential reset --id
+   <agentBlueprintId> --append` to mint a new secret. Patch the
+   secret into `a365.generated.config.json` (the `agentBlueprintClientSecret`
+   key) and `chmod 600` the file.
+2. Or just `cleanup -y` and re-do register without ever calling
+   publish — `update-endpoint --apply` registers an agent identity
+   on its own.
 
 Prerequisites:
 
