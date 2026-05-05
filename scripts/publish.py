@@ -1,14 +1,22 @@
-"""hermes a365 publish — wrap ``a365 publish`` to package the agent manifest.
+"""hermes a365 publish — wrap ``a365 publish``.
 
-The real CLI's ``publish`` command updates manifest IDs and produces a
-zip file that the operator uploads to the Microsoft 365 Admin Centre.
-Channel deployment in v0.2 is **operator-side**: the CLI doesn't push to
-Teams / Outlook / Copilot — the admin signs in to the centre, uploads
-the zip, and approves the agent for users in the desired DLP scope.
+The GA CLI's ``publish`` does **two different things** depending on the
+agent flavour:
 
-This wrapper composes the right argv from operator inputs and surfaces
-the resulting package path + admin-centre URL hint. Default mode is
-dry-run; ``--apply`` runs ``a365 publish`` for real.
+- **AI Teammate** (``--aiteammate``): updates manifest IDs and emits a
+  zip the operator uploads to the M365 Admin Centre. Channel
+  deployment is operator-side after that.
+- **Blueprint-only** (default): calls the Agent Instance Graph API
+  (``POST /beta/agentRegistry/agentInstances``) to register the agent
+  instance. No zip; nothing to upload. The
+  resulting ``agentInstanceId`` lands in ``a365.generated.config.json``.
+
+The 2026-05-05 walkthrough caught the wrapper rendering the Admin
+Centre upload language for both flows, which misled operators in
+blueprint-only mode (slice 18t / bug #14 fixes that — the plan and
+post-apply messages now branch on ``aiteammate``).
+
+Default mode is dry-run; ``--apply`` runs ``a365 publish`` for real.
 """
 
 from __future__ import annotations
@@ -29,6 +37,13 @@ ADMIN_CENTRE_URL = "https://admin.microsoft.com/"
 _PACKAGE_PATH_RE = re.compile(
     r"(?:created package|wrote zip|package(?: created)?)[\s:]+(\S+\.zip)",
     re.IGNORECASE,
+)
+
+# Slice 18t (bug #14): blueprint-only flow registers an instance via
+# Graph and prints "Agent instance registered: <guid>" — extract the
+# id so the post-apply message is concrete.
+_INSTANCE_ID_RE = re.compile(
+    r"Agent instance registered:\s*([0-9a-fA-F-]{8,})",
 )
 
 
@@ -76,8 +91,14 @@ class PublishPlan:
             lines.append("  tenant: (auto-detect from `az account show`)")
         flavour = "AI Teammate" if self.inputs.aiteammate else "blueprint-only"
         lines.append(f"  flavour: {flavour}")
+        # Slice 18t (bug #14): be explicit about what this run will produce
+        # so operators know whether to wait for an admin-centre upload step.
+        if self.inputs.aiteammate:
+            lines.append("  output:  manifest zip for M365 Admin Centre upload")
+        else:
+            lines.append("  output:  Graph API instance registration (no zip)")
         if self.inputs.use_blueprint:
-            lines.append("  flow:    blueprint-based non-DW (Agent Instance Graph API)")
+            lines.append("  flow:    blueprint-based non-DW (explicit)")
         lines.append(f"  step:    {self.step.description}")
         # shlex.join (slice 18p, bug #7) keeps multi-word values quoted
         # so the printed line is shell-pasteable verbatim.
@@ -98,12 +119,18 @@ def _build_argv(inputs: PublishInputs) -> list[str]:
     return argv
 
 
+def _step_description(inputs: PublishInputs) -> str:
+    if inputs.aiteammate:
+        return "package the agent manifest for M365 Admin Centre upload"
+    return "register agent instance via Microsoft Graph (no zip emitted)"
+
+
 def build_publish_plan(inputs: PublishInputs) -> PublishPlan:
     return PublishPlan(
         inputs=inputs,
         step=PublishStep(
             argv=_build_argv(inputs),
-            description="package the agent manifest for M365 Admin Centre upload",
+            description=_step_description(inputs),
         ),
     )
 
@@ -117,7 +144,8 @@ def build_publish_plan(inputs: PublishInputs) -> PublishPlan:
 class PublishResult:
     plan: PublishPlan
     raw: RunResult
-    package_path: str | None  # parsed from CLI stdout if visible
+    package_path: str | None  # set on AI Teammate flow if a zip was produced
+    instance_id: str | None  # set on blueprint-only flow if registration succeeded
     messages: list[str] = field(default_factory=list)
 
 
@@ -127,23 +155,46 @@ def _extract_package_path(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+def _extract_instance_id(output: str) -> str | None:
+    """Grep for the registered instance id in blueprint-only flow output."""
+    match = _INSTANCE_ID_RE.search(output)
+    return match.group(1) if match else None
+
+
 def apply_publish_plan(
     plan: PublishPlan,
     *,
     mutator: Mutator,
 ) -> PublishResult:
-    """Run ``a365 publish`` and surface the produced package path."""
+    """Run ``a365 publish``; surface the produced artefact (zip or
+    registered instance) appropriate to the flow."""
     run = mutator.run(plan.step.argv, timeout=180.0)
-    package_path = _extract_package_path(run.combined)
-
+    package_path: str | None = None
+    instance_id: str | None = None
     messages: list[str] = [f"[apply] {plan.step.description} — done"]
-    if package_path:
-        messages.append(f"[apply] package: {package_path}")
-    messages.append(
-        f"[apply] next: upload the package to the M365 Admin Centre at {ADMIN_CENTRE_URL}"
-    )
 
-    return PublishResult(plan=plan, raw=run, package_path=package_path, messages=messages)
+    if plan.inputs.aiteammate:
+        package_path = _extract_package_path(run.combined)
+        if package_path:
+            messages.append(f"[apply] package: {package_path}")
+        messages.append(
+            f"[apply] next: upload the package to the M365 Admin Centre at {ADMIN_CENTRE_URL}"
+        )
+    else:
+        instance_id = _extract_instance_id(run.combined)
+        if instance_id:
+            messages.append(f"[apply] agent instance registered: {instance_id}")
+        messages.append(
+            "[apply] no upload needed — the instance is registered server-side via Graph"
+        )
+
+    return PublishResult(
+        plan=plan,
+        raw=run,
+        package_path=package_path,
+        instance_id=instance_id,
+        messages=messages,
+    )
 
 
 # ---------------------------------------------------------------------------

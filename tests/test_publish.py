@@ -110,7 +110,17 @@ class TestPlanRender:
 
     def test_human_aiteammate_flavour(self) -> None:
         plan = build_publish_plan(PublishInputs(agent_name="x", aiteammate=True))
-        assert "AI Teammate" in plan.render_human()
+        text = plan.render_human()
+        assert "AI Teammate" in text
+        # Slice 18t (bug #14): AI Teammate output line points at the zip.
+        assert "manifest zip for M365 Admin Centre upload" in text
+
+    def test_human_blueprint_only_output_line(self) -> None:
+        # Slice 18t (bug #14): blueprint-only output line is honest about
+        # the Graph-API flow — no zip, nothing to upload.
+        plan = build_publish_plan(PublishInputs(agent_name="x"))
+        text = plan.render_human()
+        assert "Graph API instance registration (no zip)" in text
 
     def test_human_use_blueprint_flow(self) -> None:
         plan = build_publish_plan(PublishInputs(agent_name="x", use_blueprint=True))
@@ -155,8 +165,9 @@ class TestApplyPublish:
         apply_publish_plan(plan, mutator=mutator)
         assert mutator.calls == [["a365", "publish", "--agent-name", "inbox-helper"]]
 
-    def test_surfaces_package_path_when_visible(self) -> None:
-        plan = build_publish_plan(PublishInputs(agent_name="x"))
+    def test_surfaces_package_path_when_visible_aiteammate(self) -> None:
+        # Slice 18t (bug #14): zip extraction only runs in AI Teammate flow.
+        plan = build_publish_plan(PublishInputs(agent_name="x", aiteammate=True))
         mutator = FakeMutator(
             scripted=[
                 RunResult(
@@ -170,15 +181,38 @@ class TestApplyPublish:
         result = apply_publish_plan(plan, mutator=mutator)
         assert isinstance(result, PublishResult)
         assert result.package_path == "/tmp/x.zip"
+        assert result.instance_id is None
         assert any("/tmp/x.zip" in m for m in result.messages)
 
-    def test_messages_always_include_admin_centre_url(self) -> None:
-        plan = build_publish_plan(PublishInputs(agent_name="x"))
+    def test_aiteammate_messages_include_admin_centre_url(self) -> None:
+        plan = build_publish_plan(PublishInputs(agent_name="x", aiteammate=True))
         result = apply_publish_plan(plan, mutator=FakeMutator())
         assert any(ADMIN_CENTRE_URL in m for m in result.messages)
 
+    def test_blueprint_only_extracts_instance_id(self) -> None:
+        # Slice 18t (bug #14): blueprint-only flow registers via Graph and
+        # prints "Agent instance registered: <guid>".
+        plan = build_publish_plan(PublishInputs(agent_name="x"))  # default = blueprint-only
+        mutator = FakeMutator(
+            scripted=[
+                RunResult(
+                    argv=["a365"],
+                    returncode=0,
+                    stdout="POST /beta/agentRegistry/agentInstances\n"
+                    "Agent instance registered: 8549283b-0e24-438c-993c-3bd1753a6c2b\n",
+                    stderr="",
+                )
+            ]
+        )
+        result = apply_publish_plan(plan, mutator=mutator)
+        assert result.instance_id == "8549283b-0e24-438c-993c-3bd1753a6c2b"
+        assert result.package_path is None
+        # Blueprint-only must NOT prompt the operator to upload anything.
+        assert not any(ADMIN_CENTRE_URL in m for m in result.messages)
+        assert any("no upload needed" in m for m in result.messages)
+
     def test_no_package_path_when_cli_silent(self) -> None:
-        plan = build_publish_plan(PublishInputs(agent_name="x"))
+        plan = build_publish_plan(PublishInputs(agent_name="x", aiteammate=True))
         result = apply_publish_plan(plan, mutator=FakeMutator())
         assert result.package_path is None
 
@@ -201,9 +235,16 @@ class TestApplyPublish:
 # ---------------------------------------------------------------------------
 
 
-def test_publish_plan_dataclass_basic() -> None:
+def test_publish_plan_dataclass_basic_blueprint_only() -> None:
+    # Slice 18t (bug #14): default flavour describes the Graph-API flow.
     plan = build_publish_plan(PublishInputs(agent_name="x"))
     assert isinstance(plan, PublishPlan)
+    assert "Graph" in plan.step.description
+    assert "no zip" in plan.step.description
+
+
+def test_publish_plan_dataclass_basic_aiteammate() -> None:
+    plan = build_publish_plan(PublishInputs(agent_name="x", aiteammate=True))
     assert plan.step.description.startswith("package")
 
 
