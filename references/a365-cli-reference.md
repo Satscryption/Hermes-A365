@@ -1,6 +1,6 @@
 # A365 CLI reference
 
-Snapshot date: 2026-05-04 (verified against installed CLI)
+Snapshot date: 2026-05-05 (verified against installed CLI v1.1.171)
 
 The CLI is **`Microsoft.Agents.A365.DevTools.Cli`** (binary name `a365`),
 distributed as a .NET tool from NuGet:
@@ -8,6 +8,15 @@ distributed as a .NET tool from NuGet:
 ```
 dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease
 ```
+
+Verified GA version: **1.1.171** (`a365 --version` output:
+`1.1.171+11c378141d`). Min supported: 1.0.0.
+
+macOS dotnet-host gotcha: `brew install dotnet` doesn't set
+`DOTNET_ROOT`, so the freshly-installed `a365` errors with
+"You must install .NET to run this application." Fix by exporting
+`DOTNET_ROOT="$(brew --prefix dotnet)/libexec"` (and adding
+`~/.dotnet/tools` to `PATH` so the binary resolves).
 
 - Source: <https://github.com/microsoft/Agent365-devTools>
 - NuGet: <https://www.nuget.org/packages/Microsoft.Agents.A365.DevTools.Cli>
@@ -141,7 +150,10 @@ flow), `-v / --verbose`.
 ## Hard prerequisites the CLI checks for (verified via `setup requirements`)
 
 1. **PowerShell 7+ on PATH** as `pwsh`. The CLI shells out for several
-   operations. (macOS users: `brew install --cask powershell`.)
+   operations. macOS install: `brew install powershell` (the formula).
+   The older `brew install --cask powershell` recipe is deprecated as
+   of 2026-05 — the cask was renamed to `powershell@preview` and
+   marked as failing macOS Gatekeeper; use the formula instead.
 2. **Tenant enrolled in the Microsoft Frontier Preview Program.** The
    CLI cannot verify automatically and only warns; setup will fail at
    later steps if not enrolled. Enrollment URL:

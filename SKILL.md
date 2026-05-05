@@ -154,9 +154,9 @@ metadata.
 Inherits `A365_APP_ID`, `A365_TENANT_ID`, `HERMES_OTLP_ENDPOINT` from
 `~/.hermes/.env`. An existing `AA_INSTANCE_ID` is preserved across
 re-runs; business-hours fields from a prior run are also preserved
-unless explicitly overridden. The blueprint's confidential-client
-secret is never written here — runtime consumers fetch it from the OS
-keychain (`hermes-a365.<tenant>.<appId>`).
+unless explicitly overridden. The per-agent .env never contains the
+blueprint client secret — see pitfall #7 below for where the secret
+actually lives.
 
 ### `hermes a365 publish --agent-name <name> [--aiteammate] [--use-blueprint] [--tenant-id <id>]`
 
@@ -205,12 +205,10 @@ band). `--confirm` must equal `--agent-name`. The plan is always printed
 
 ### `hermes a365 activity-bridge`
 
-**Status: TODO**, blocked on the Hermes IPC contract (§10 Q1). When
-unblocked the bridge will authenticate as the blueprint's confidential
-client (secret from the keychain), subscribe to BF activities for the
-instance, and route `message` activities to the local Hermes agent plus
-`invoke` activities to the Adaptive Card builder under
-`templates/adaptive-cards/`. Activity-shape catalogue:
+**Status: TODO**, blocked on SPEC §10 Q1. When unblocked the bridge
+authenticates as the blueprint client, subscribes to BF activities for
+the instance, and routes `message` / `invoke` activities to the local
+Hermes agent + the Adaptive Card builder. See
 [`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md).
 
 ## Conflict resolution
@@ -249,9 +247,11 @@ instance, and route `message` activities to the local Hermes agent plus
    preserves the existing id. Don't manually edit the per-agent .env to
    "reset" it without first running `cleanup` — the cloud instance will
    linger.
-7. **Per-agent secret never on disk.** The blueprint's confidential-
-   client secret lives in the OS keychain only
-   (`hermes-a365.<tenant>.<appId>`). The runtime .env never contains it.
+7. **Blueprint client secret on disk in plaintext (macOS / Linux).**
+   `a365 setup blueprint` writes the secret to
+   `a365.generated.config.json` — DPAPI-encrypted on Windows,
+   plaintext elsewhere. That file and the `cleanup -y`-emitted
+   `*.backup-*.json` are gitignored; treat both as keychain-grade.
 
 ## Verification checklist
 
