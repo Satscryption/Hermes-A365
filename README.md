@@ -1,263 +1,252 @@
 # Hermes-A365
 
-Integrate Hermes agents into the Microsoft 365 ecosystem using Microsoft Agent 365 (A365).
+Integrate Hermes agents into the Microsoft 365 ecosystem using
+**Microsoft Agent 365** (A365), the governance / identity / observability
+control plane that GA'd 2026-05-01.
 
 ## Status
 
-**Design-stage v0.1 — apply-side needs rebuild for v0.2.** The authoritative design lives in [`SPEC.md`](SPEC.md) (v1, 2026-05-03 — two days after A365 reached general availability on 2026-05-01). All planner-side scripts ship and unit tests pass (393, ruff-clean). The validator-compliant [`SKILL.md`](SKILL.md) is drafted and harness-loadable.
+**v0.2 functionally complete.** Setup, lifecycle, and runtime layers are
+all in place; one open external defect (a Microsoft CLI bug) and one
+deferred runtime feature (BF response streaming) remain. Live-tenant
+walkthrough completed end-to-end through the wrappers on 2026-05-05.
 
-**However**, on 2026-05-04 we installed the real `Microsoft.Agents.A365.DevTools.Cli` and discovered that the spec's command surface (drafted from public docs that pre-dated GA) does not match the GA reality. Verified divergences are catalogued in [`references/a365-cli-reference.md`](references/a365-cli-reference.md) — most notably: there's no `setup app --tier=N`, no `fic configure/rotate`, no `create-instance`, no `deploy --channels=…`, no per-kind `cleanup app/deployment`, and the `query-entra` flag set is much smaller than assumed. The operator must also pre-register a custom Entra client app *before* the CLI works (reverse of what `register.py` does today).
+```
+                     ┌─────────────────────────────────────────────────┐
+                     │ All wrappers drive the real a365 CLI v1.1.171   │
+                     │ Tests: 444 passing, ruff clean                  │
+                     └─────────────────────────────────────────────────┘
+```
 
-The planner architecture — reconcilers, status report, doctor, secrets, render helpers, local artefact handling — survives the redesign. The `Mutator` protocol and most of the apply-path scripts (`register.py`, `blueprint_create.py`, `instance_create.py`, `deploy.py`, `fic_rotate.py`, `cleanup.py`) need to be re-implemented around the real command set as v0.2 work. Activity-bridge work remains blocked on SPEC §10 Q1 (Hermes IPC contract).
+| Layer | What's there |
+|---|---|
+| **Doctor / status** | Read-only env probes; status reports against `a365 query-entra`. |
+| **License recommender** | Read-only; surfaces the actual `subscribedSkus` partNumbers. |
+| **Setup orchestrator** (`register`) | Drives `setup blueprint` + `setup permissions {mcp, bot}` end-to-end with line-streamed output (device-code prompts visible in real time). |
+| **Per-agent runtime config** (`instance create`) | Local-only `.env` writer; UUID generation deferred to apply-time; secret never on disk. |
+| **Manifest publish** (`publish`) | Branches between AI-Teammate (zip) and blueprint-only (Graph API instance registration); operator messaging is honest about which artefact each flow produces. |
+| **Cleanup** | Drives `cleanup azure → instance → blueprint`, pre-feeds `y\n` to defeat the GA CLI's prompts, leaves `chmod 600` on backup files. |
+| **Activity bridge** | Two subcommands shipped: `verify` (config + auth + reachability diagnostic) and `serve` (long-running BF webhook adapter, JWT-validated, replies via `serviceUrl`, forwards to an operator-defined `HERMES_BRIDGE_WEBHOOK`). MVP scope; streaming + proactive long-running deferred. |
+| **Live-tenant runbook** | [`references/live-tenant-test.md`](references/live-tenant-test.md). Walked round-2 successfully; round-3 (with the bridge) pending operator action. |
+
+**Known external blocker.** The GA `a365 setup permissions bot` only
+ever assigns the `Agent365Observability` S2S app role to the blueprint
+SP, despite claiming "permissions configured successfully" in its
+output. `Messaging Bot API` and `Power Platform API` S2S grants
+silently skip. Reproducible; needs filing with Microsoft. See bug #18 in
+[`references/live-tenant-test.md`](references/live-tenant-test.md).
+
+## What is A365?
+
+[**Microsoft Agent 365**](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/)
+is a governance / identity / observability control plane for AI agents
+that GA'd 2026-05-01. It is **not** an agent framework — it bolts on top
+of whichever agent stack you use (Microsoft Agent Framework, Microsoft
+365 Agents SDK, OpenAI Agents SDK, OpenClaw, Claude Code SDK, etc.) and
+adds:
+
+- Entra-backed agent identity (delegated permissions only)
+- Tenant licensing (Agent 365 Tier 3 / Microsoft 365 E7)
+- Agent blueprints, registered via `a365 setup blueprint`
+- MCP-mediated access to Microsoft 365 data ("Work IQ" tools)
+- Bot Framework Activity protocol for messaging + Adaptive Card invokes
+- OpenTelemetry observability surfaced in admin centre
+- Teams / Outlook / Microsoft 365 Copilot channel adapters
+
+`hermes-a365` is the Hermes-side skill that drives these from inside
+the Hermes harness.
+
+## Repo split
+
+This repo holds the **design artefacts** — spec, references, scripts,
+templates, and the bridge daemon. The eventual upstream `SKILL.md` is
+contributed into the Hermes Agent harness at
+`hermes-agent/optional-skills/cloud-platforms/hermes-a365/SKILL.md`,
+pulling these artefacts in at contribution time. See
+[`SPEC.md` §3.1](SPEC.md) for the full rationale.
 
 ## Repo layout
 
 ```
 .
-├── SPEC.md           # Authoritative spec for the hermes-a365 skill
-├── SKILL.md          # Validator-compliant upstream contribution (per SPEC §3.1)
-├── README.md         # This file
-├── LICENSE           # MIT
-├── .gitignore
-├── pyproject.toml    # Python 3.11+, uv-managed, pytest + ruff dev deps
-├── references/       # Dated snapshots: CLI, errors, blueprint props, OTel, BF, license
-├── scripts/          # Subcommand implementations (planner + applier per command)
-│   └── _common.py    # Shared Jinja env, deep_diff, parse_env, safe_run, tcp_reachable
+├── SPEC.md                  # Authoritative design spec
+├── SKILL.md                 # Validator-compliant upstream contribution
+├── README.md                # This file
+├── LICENSE                  # MIT
+├── pyproject.toml           # Python 3.11+; uv-managed; optional [bridge] extras
+├── references/              # Dated snapshots + operator runbooks
+│   ├── a365-cli-reference.md
+│   ├── activity-protocol-shapes.md
+│   ├── entra-blueprint-properties.md
+│   ├── error-codes.md
+│   ├── license-cost-table.md
+│   ├── live-tenant-test.md      # End-to-end runbook (operator-side)
+│   ├── opentelemetry-config.md
+│   ├── README.md                # Index
+│   └── webhook-contract.md      # Bridge → responder JSON contract
+├── scripts/                 # One module per subcommand + shared helpers
+│   ├── _common.py               # parse_env, slugify, safe_run, jinja_env, deep_diff
+│   ├── a365_config.py           # a365.config.json round-trip
+│   ├── activity_bridge.py       # verify + serve + update-endpoint
+│   ├── cleanup.py
+│   ├── consent.py
+│   ├── doctor.py
+│   ├── emit_card.py
+│   ├── instance_create.py
+│   ├── keychain.py              # OS-keychain wrapper (macOS + Linux)
+│   ├── license.py
+│   ├── mutator.py               # Line-streamed subprocess driver + AADSTS handling
+│   ├── publish.py
+│   ├── reconcile_app.py
+│   ├── reconcile_blueprint.py
+│   ├── register.py
+│   ├── render_instance_env.py
+│   └── status.py
 ├── templates/
 │   ├── blueprint.json.j2
-│   ├── instance.env.j2
 │   ├── consent-url.txt.j2
-│   └── adaptive-cards/             # greeting / confirmation / error
-└── tests/
+│   ├── instance.env.j2
+│   └── adaptive-cards/          # greeting / confirmation / error
+└── tests/                   # 444 tests (pytest + ruff clean)
     ├── conftest.py
-    ├── test_*.py                   # one per scripts/ module
-    └── golden/                     # Golden fixtures (regenerate with --update-golden)
+    ├── golden/
+    └── test_*.py
 ```
 
-## Repo split
+## Quick start
 
-This repo holds the **design artefacts** — spec, references, scripts, templates. The eventual Hermes `SKILL.md` is **contributed upstream** into the Hermes Agent harness at `hermes-agent/optional-skills/cloud-platforms/hermes-a365/SKILL.md`, pulling these artefacts in at contribution time. See [`SPEC.md` §3.1 and §13](SPEC.md) for the full rationale.
+The canonical end-to-end walkthrough is
+[`references/live-tenant-test.md`](references/live-tenant-test.md). At a
+glance, against a Frontier-Preview-enrolled M365 tenant where you hold
+Global Admin and a `MICROSOFT_AGENT_365_TIER_3` license:
 
-## What is A365?
+```bash
+# 0. Install
+git clone https://github.com/satscryption/Hermes-A365.git
+cd Hermes-A365
+uv sync --extra bridge      # `bridge` is optional; only needed for serve mode
 
-[**Microsoft Agent 365**](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/) is a governance / identity / observability control plane for AI agents that GA'd 2026-05-01. It is **not** an agent framework — it bolts on top of whichever agent stack you use (Microsoft Agent Framework, Microsoft 365 Agents SDK, OpenAI Agents SDK, OpenClaw, Claude Code SDK, etc.) and adds:
+# 1. Pre-deploy diagnostic
+uv run python scripts/doctor.py --human                    # exit 0/1/2
 
-- Entra-backed agent identity (delegated permissions only)
-- Tenant licensing (\$15/user/mo add-on, or M365 E7 \$99/user/mo)
-- Agent blueprints, registered via `a365 setup blueprint`
-- MCP-mediated access to Microsoft 365 data (Mail, Calendar, SharePoint, Teams) — "Work IQ tools"
-- Bot Framework Activity protocol for notifications and Adaptive Card invokes
-- OpenTelemetry observability surfaced in admin center
-- Teams / Outlook / Microsoft 365 Copilot channel adapters
+# 2. Decide a license model (read-only, never purchases)
+uv run python scripts/license.py --users 12 --agents 3 --plan E5
 
-`hermes-a365` is the Hermes-side skill that drives these from inside the Hermes harness.
+# 3. Register the blueprint + MCP/Bot permissions
+uv run python scripts/register.py --agent-name "Inbox Helper" --apply
 
-## Open questions
+# 4. (Verify admin consent — granted automatically by setup blueprint)
+uv run python scripts/consent.py "Inbox Helper" --no-open
 
-See [`SPEC.md` §10](SPEC.md). Highest-priority: the Hermes IPC contract that the Activity bridge will use to invoke the local agent.
+# 5. Per-agent runtime config
+uv run python scripts/instance_create.py inbox-helper \
+    --owner sadiq@contoso.com --owner-aad-id <oid> --apply
+
+# 6. Register the agent instance via Graph (no zip for blueprint-only)
+uv run python scripts/publish.py --agent-name "Inbox Helper" --apply
+
+# 7. Re-point the messaging endpoint at your tunnel + run the bridge
+uv run python scripts/activity_bridge.py update-endpoint \
+    --agent-name "Inbox Helper" \
+    --url https://<tunnel>.trycloudflare.com/api/messages --apply
+HERMES_BRIDGE_WEBHOOK=https://my-responder/respond \
+    uv run python scripts/activity_bridge.py serve --slug inbox-helper
+
+# 9. Status sanity (any time)
+uv run python scripts/status.py inbox-helper --human
+
+# 10. Tear down
+uv run python scripts/cleanup.py --agent-name "Inbox Helper" \
+    --slug inbox-helper --apply --confirm "Inbox Helper"
+```
+
+## Subcommand reference
+
+```bash
+# === Read-only diagnostics ===
+uv run python scripts/doctor.py [--human|--no-network]
+uv run python scripts/license.py --users <n> --agents <n> --plan E3|E5|E7 [--bundled-security]
+uv run python scripts/status.py [<slug>] [--human]
+uv run python scripts/activity_bridge.py verify --slug <slug> [--human]
+
+# === Apply-path orchestrators ===
+uv run python scripts/register.py --agent-name "<display>" [--m365] [--aiteammate] [--no-endpoint] [--apply]
+uv run python scripts/instance_create.py <slug> --owner <email> --owner-aad-id <oid> [--apply]
+uv run python scripts/publish.py --agent-name "<display>" [--aiteammate] [--apply]
+uv run python scripts/cleanup.py --agent-name "<display>" [--slug <slug>] [--kinds=...] --apply --confirm "<display>"
+
+# === Activity bridge (slice 19) ===
+uv run python scripts/activity_bridge.py verify --slug <slug>
+uv run python scripts/activity_bridge.py serve --slug <slug> --port 3978
+uv run python scripts/activity_bridge.py update-endpoint --agent-name "<display>" --url <https://...> [--apply]
+
+# === Templates / utilities ===
+uv run python scripts/consent.py "<agent-name>" [--no-open] [--timeout 60]
+uv run python scripts/emit_card.py greeting --command "..." [--command "..."]
+uv run python scripts/keychain.py {store|get|delete} --tenant <t> --app-id <id>
+```
+
+> **macOS note for `keychain.py`.** First write to the login keychain
+> pops a UI dialog. Click "Always Allow" to avoid further prompts. CI
+> / headless contexts may fail with `rc=36 User interaction is not
+> allowed` — `security unlock-keychain` first.
+
+## Open work
+
+- **Bug #18** — `setup permissions bot` silently drops two of three S2S
+  app-role assignments. Reproducible. Operator-action runbook in
+  [`references/live-tenant-test.md`](references/live-tenant-test.md).
+  Needs filing with Microsoft.
+- **Activity bridge — streaming responses.** Required for M365 Copilot
+  substantive replies (per Microsoft's docs). Deferred from slice 19b's
+  MVP. Standard BF protocol (typing activities + `streaminfo`
+  entities); 2-min hard cap, 1 req/s throttle, 1:1 chats only.
+- **Activity bridge — proactive long-running pattern.** When agent
+  thinking exceeds the ~10–15s BF turn budget. Standard BF
+  `ConversationReference` capture + replay later via `serviceUrl`;
+  also deferred from 19b.
+- **Activity bridge — invoke action types.** Beyond the synchronous
+  Adaptive Card path: `signin/verifyState`, `task/{fetch,submit}`,
+  `composeExtension/*`. Add as use cases arrive.
+- **Round-3 walkthrough.** Live-tenant validation of `serve` mode
+  (Teams round-trip, `bridge.pid` lifecycle, JWT validation against
+  real BF JWKS).
 
 ## Status meta
 
-- **2026-05-03:** repo created, `SPEC.md` v1 draft committed.
-- **2026-05-03:** `SPEC.md` revision 2 (glossary, diagrams, examples, troubleshooting, migration recipe, risks).
-- **2026-05-03:** first implementation slice — blueprint JSON and per-agent `.env` rendering with golden-file tests.
-- **2026-05-03:** second slice — `doctor.py` (read-only environment probe; resolves §10 Q7 — `atk` vs `a365` variant detection).
-- **2026-05-03:** third slice — `keychain.py` (OS-keychain wrapper; resolves §10 Q3 — macOS `security` and Linux `secret-tool`).
-- **2026-05-03:** fourth slice — reconcilers (`deep_diff` in `_common.py`, `reconcile_app.py`, `reconcile_blueprint.py`) producing `create`/`noop`/`patch`/`abort` plans against captured `a365 query-entra` JSON.
-- **2026-05-03:** fifth slice — `status.py` orchestrating nine components (license, T1/T2 apps, blueprint, instance, channels, activity bridge, telemetry, FIC) into a single report; exit codes 0/1/2/3 per spec. `QuerySource` Protocol abstracts `a365 query-entra` so the command works end-to-end with or without a live `a365` CLI.
-- **2026-05-03:** sixth slice — Adaptive Card v1.6 templates (`greeting`, `confirmation`, `error`) under `templates/adaptive-cards/` plus `emit_card.py` builder with typed dataclass inputs. Golden-file tests verify JSON validity and round-trip stability.
-- **2026-05-03:** seventh slice — `license.py` (read-only recommendation per §6.1) and `consent.py` (admin-consent URL rendering + grant polling per §6.3) plus the `consent-url.txt.j2` template. The polling loop is fully testable via monkeypatched `time.sleep`/`time.monotonic`.
-- **2026-05-03:** eighth slice — `register.py` (Entra T1+T2 app registration and user-FIC, per §6.2). Composes `reconcile_app` plans with a new `Mutator` protocol (default `A365CliMutator` shells out; tests inject a `FakeMutator`). Default dry-run; `--apply` executes. AADSTS500011 retries with backoff (mockable `sleep_fn`); AADSTS90094 surfaces a `consent` follow-up rather than failing. T2 client secret stored via the keychain wrapper (never to disk). `~/.hermes/.env` updated atomically (tmp + rename) with `A365_TENANT_ID`, `A365_APP_ID`, optional `A365_CLI_VARIANT`. `QuerySource` gained `query_app_by_name` to support name-based lookup.
-- **2026-05-03:** ninth slice — `blueprint_create.py` (register/patch an A365 agent blueprint, per §6.4). Composes `render_blueprint` and `reconcile_blueprint` with a new `Mutator.setup_blueprint` operation. Default dry-run renders to a tmp file and prints the plan + diff; `--apply` hands the tmp file to the CLI and atomically caches the rendered JSON at `~/.hermes/agents/<slug>/blueprint.json`. Server-assigned fields (`blueprintId`, `lastPatched`, `etag`, etc.) are stripped from the actual payload before diffing so noop plans aren't perturbed. Slug mismatches abort; `BlueprintCreateError` surfaces refusals.
-- **2026-05-03:** tenth slice — `instance_create.py` (per-agent runtime config + cloud instance registration, per §6.5). Inherits `A365_APP_ID`/`A365_TENANT_ID`/`A365_CLI_VARIANT`/`HERMES_OTLP_ENDPOINT` from `~/.hermes/.env`. Existing `AA_INSTANCE_ID` is preserved across re-runs (idempotency); business-hours fields from a prior run are also preserved unless overridden. Atomically writes `~/.hermes/agents/<slug>/.env` (still no `A365_APP_PASSWORD` per spec). New `Mutator.create_instance` op drives `a365 create-instance --blueprint=<slug> --instance=<UUID>`; cloud step is skipped if the instance is already registered. Plan distinguishes `create` (fresh local + cloud), `create-cloud-only` (local id exists but cloud missing), and `noop`.
-- **2026-05-03:** eleventh slice — `deploy.py` (channel deployment for Teams / Outlook / M365 Copilot, per §6.9). Reads `AA_INSTANCE_ID` from the agent .env, queries the instance's currently-bound channels (state == `ok`), and computes a set diff against the desired list. New `Mutator.deploy` op hands the desired absolute set to `a365 deploy --instance=<id> --channels=<list>`; A365 reconciles additions/removals server-side. Empty desired list = unbind all. Idempotent: same set → noop, no mutator call. Surfaces deep-links from the response when present.
-- **2026-05-03:** twelfth slice — `workiq.py` (toggle Work IQ MCP exposure, per §6.6). Config-only — no local MCP server runs. Reads the cached blueprint at `~/.hermes/agents/<slug>/blueprint.json`, reconstitutes `BlueprintInputs`, applies `--enable`/`--disable`/`--set` to the workiq tool list, and delegates to `blueprint_create`'s pipeline so the underlying reconciler decides create vs patch. `--set` is mutually exclusive with the additive flags; unknown tool names are rejected up-front against the `WORKIQ_TOOLS` constant.
-- **2026-05-03:** thirteenth slice — `telemetry.py` (read-only OTLP / span verifier, per §6.8). Three checks: `HERMES_OTLP_ENDPOINT` set in agent .env, `AA_INSTANCE_ID` recorded, last span seen via `QuerySource.query_telemetry`. JSON output by default, `--human` for a markdown table. Exit codes mirror `status` (0 ok / 1 partial / 2 broken). Span injection itself is the activity bridge's responsibility (§6.7); this command only verifies the pipeline.
-- **2026-05-04:** fourteenth slice — `fic_rotate.py` (rotate the user-FIC for the T2 confidential client, per §6.10). New `Mutator.fic_rotate` op wraps `a365 fic rotate --app=<T2-appId>`; the new client secret is written to the OS keychain via the existing `secrets` wrapper, replacing the entry written at `register` time. Default dry-run; `--apply` rotates. Surfaces an explicit reminder to restart the activity bridge after rotation.
-- **2026-05-04:** fifteenth slice — `cleanup.py` (per-agent destructive teardown, per §6.13). Order matters per spec: `deployment → instance → blueprint`. Apps (T1/T2) are deliberately *not* touched — they're tenant-wide infrastructure shared across every agent in the skill. Safety: `--confirm` is required and must be the literal agent slug; the plan is always printed (even without `--apply`) so the operator can audit before mutating. Defensive plan-building: each step is included only when the underlying state appears to exist; missing state turns into a recorded skip rather than an error. New `Mutator.cleanup(kind, identifier)` op covers the `a365 cleanup deployment/instance/blueprint/app` family. Local artefacts (`.env`, `blueprint.json`) are removed only after the cloud steps succeed; the empty agent dir is also reaped.
-- **2026-05-04:** sixteenth slice — `references/` content. Filled in seven dated-snapshot files: `README.md` (index), `a365-cli-reference.md` (variants, version pins, every CLI subcommand the skill calls + which module owns it), `error-codes.md` (AADSTS catalogue + delegated-scope drift table), `entra-blueprint-properties.md` (top-level + sub-property allowlist + the server-assigned-fields list that `blueprint_create` strips), `opentelemetry-config.md` (canonical event vocabulary, required span attributes, sampler), `activity-protocol-shapes.md` (forward-looking Bot Framework shape catalogue for the still-blocked activity bridge), `license-cost-table.md` (decision matrix matching `scripts/license.py`). Doctor handles drift detection; this folder is the snapshot, not the source of truth.
-- **2026-05-04:** seventeenth slice — `SKILL.md` (the upstream contribution). Validator-compliant frontmatter per SPEC §3.2 (name, description, version 0.1.0, MIT, hermes tags, related-skills). Body follows §4 structure: Overview, When to Use, Prerequisites, Core procedures (one block per subcommand including the still-blocked activity-bridge), Conflict resolution, Common pitfalls, Verification checklist, One-shot recipes. ~14.9k chars — comfortably under the 15k target; capability detail beyond that lives in `references/`. This file is what gets contributed to `hermes-agent/optional-skills/cloud-platforms/hermes-a365/SKILL.md` per SPEC §3.1.
+Slice timeline since v0.2 work began:
 
-## Development
+- **2026-05-04** — slices 18a–18g landed: foundation reset
+  (`mutator.py` thin run-argv wrapper + `a365_config.py`), apply-path
+  rebuild (`register`, `instance_create`, `cleanup`, `publish`),
+  read-path rework (`doctor` + `status` against the GA `query-entra`
+  surface), `SKILL.md` 0.2.0. v0.1 subcommands that targeted
+  non-existent CLI verbs (`deploy`, `workiq`, `telemetry`,
+  `fic_rotate`, `blueprint_create`) deleted.
+- **2026-05-04** — slice 18h: live-tenant runbook
+  ([`references/live-tenant-test.md`](references/live-tenant-test.md)).
+- **2026-05-05** — round-2 walkthrough surfaced 18 wrapper bugs and CLI
+  realities. Slices 18i–18u fixed all 17 in code/docs; #18 is a
+  Microsoft CLI defect.
+- **2026-05-05** — slices 18v–18x: scope-classifier hint corrections
+  against the verified GA output (`Inheritable Scopes:` /
+  `Successfully retrieved`), `Mutator` `stdin_input` kwarg so cleanup
+  can answer the CLI's prompt that `-y` doesn't actually suppress, and
+  file-permission hardening (0600 on per-agent .env + `chmod 600` on
+  the cleanup-emitted `*.backup-*.json` files that hold the secret).
+- **2026-05-05** — slices 19a–19b: activity bridge `verify` mode
+  (config + auth + reachability diagnostic), then `serve` mode (BF
+  webhook adapter — JWT validation, webhook forwarding, Adaptive Card
+  reply rendering, `serviceUrl` POST-back) plus the
+  [`references/webhook-contract.md`](references/webhook-contract.md)
+  contract for operator-defined responders. Validation against
+  Microsoft Learn before coding: 8 GO, 2 CAUTION, 0 NO-GO on the
+  10 protocol assumptions.
 
-This repo is a [uv](https://docs.astral.sh/uv/)-managed Python project. Python 3.11+.
-
-### One-time setup
-
-```bash
-uv sync --extra dev
-```
-
-That installs runtime deps (`jinja2`) and dev deps (`pytest`, `ruff`).
-
-### Common commands
-
-```bash
-# Run the test suite
-uv run pytest
-
-# Regenerate golden fixtures after intentionally changing the rendering
-uv run pytest --update-golden
-
-# Lint and format
-uv run ruff check .
-uv run ruff format .
-
-# Render a blueprint from the CLI (dry stdout output)
-uv run python scripts/render_blueprint.py \
-    --slug inbox-helper \
-    --description "Summarises unread mail" \
-    --purpose productivity \
-    --workiq mail,calendar
-
-# Render a per-agent .env from the CLI
-uv run python scripts/render_instance_env.py \
-    --agent-identity inbox-helper \
-    --owner sadiq@contoso.com \
-    --owner-aad-id 00000000-0000-0000-0000-000000000001 \
-    --a365-app-id 00000000-0000-0000-0000-00000000aaa1 \
-    --a365-tenant-id contoso.onmicrosoft.com \
-    --a365-cli-variant a365-dotnet \
-    --hermes-otlp-endpoint https://contoso.otel.agent365.microsoft.com
-```
-
-### What's implemented vs TODO
-
-**v0.2 redesign feature-complete (pending live tenant test).** v0.1
-targeted a speculative CLI that diverged materially from
-Microsoft.Agents.A365.DevTools.Cli's GA surface (see
-[`references/a365-cli-reference.md`](references/a365-cli-reference.md)).
-Slices 18a–18g have landed: foundation reset (`mutator.py` thin
-`run(argv)` wrapper + `a365_config.py`), apply-path rebuild (`register`,
-`instance_create`, `cleanup`, `publish`), read-path rework (`doctor` +
-`status` against the real `query-entra` surface; `telemetry.py` dropped
-because `a365 query-entra --telemetry` does not exist), and `SKILL.md`
-0.2.0 rewrite.
-
-| Area | Status |
-|---|---|
-| `_common.py` shared helpers (Jinja env, `safe_run`, `tcp_reachable`, `parse_env`, `deep_diff`) | done |
-| `keychain.py` (OS-keychain wrapper — resolves §10 Q3) | done |
-| `reconcile_app.py`, `reconcile_blueprint.py` (idempotent diff/plan abstraction) | done |
-| Adaptive Card templates + `emit_card.py` (greeting / confirmation / error) | done |
-| `license.py` (recommendation engine; §6.1) | done |
-| Consent URL template + `consent.py` (URL render + grant poll; §6.3) | done |
-| `render_instance_env.py` + template (per-agent runtime `.env`) | done |
-| `mutator.py` (v0.2 thin CLI wrapper + AADSTS handling) | **done (Slice 18a)** |
-| `a365_config.py` (`a365.config.json` round-trip) | **done (Slice 18a)** |
-| `register.py` → setup orchestrator (`a365 setup blueprint` + `setup permissions {mcp,bot}`) | **done (Slice 18b)** |
-| `instance_create.py` → local runtime `.env` writer only | **done (Slice 18c)** |
-| `cleanup.py` rewrite around `cleanup blueprint/instance/azure` | **done (Slice 18d)** |
-| `publish.py` (manifest packaging via `a365 publish`) | **done (Slice 18e)** |
-| `doctor.py` (env probe — real CLI variant + PowerShell + custom-client-app prereqs) | **done (Slice 18f)** |
-| `status.py` (per-component report against `query-entra`; resolves SPEC §6.11) | **done (Slice 18f)** |
-| `references/` content (CLI surface, error codes, etc.) | done |
-| `SKILL.md` 0.2.0 final (rewritten against the GA CLI surface) | **done (Slice 18g)** |
-| `activity_bridge.py` | TODO (blocked on SPEC §10 Q1 — Hermes IPC contract) |
-| Live integration test against an M365 tenant | runbook in [`references/live-tenant-test.md`](references/live-tenant-test.md); operator-side execution still pending |
-
-The doctor can be run directly:
-
-```bash
-uv run python scripts/doctor.py --human            # operator-friendly output
-uv run python scripts/doctor.py                    # JSON to stdout
-uv run python scripts/doctor.py --no-network       # offline diagnostic
-echo $?                                            # 0=ok, 1=warn, 2=error
-```
-
-The keychain wrapper too:
-
-```bash
-# Store interactively (prompts for the secret, doesn't echo)
-uv run python scripts/keychain.py store --tenant contoso.onmicrosoft.com --app-id <appId>
-
-# Or pipe from stdin
-echo -n "<secret>" | uv run python scripts/keychain.py store \
-    --tenant contoso.onmicrosoft.com --app-id <appId> --secret -
-
-uv run python scripts/keychain.py get    --tenant contoso.onmicrosoft.com --app-id <appId>
-uv run python scripts/keychain.py delete --tenant contoso.onmicrosoft.com --app-id <appId>
-```
-
-> **macOS note.** First time the script writes to the keychain, macOS will pop a UI dialog asking permission for `python` to access your login keychain. Click "Always Allow" to avoid further prompts. Non-interactive contexts (CI, headless SSH, some IDEs) may fail with `rc=36 User interaction is not allowed` — unlock the keychain first with `security unlock-keychain` if needed.
-
-The status command works whether or not the `a365` CLI is installed (cloud components get marked `skipped` rather than failing):
-
-```bash
-uv run python scripts/status.py --human                    # markdown table
-uv run python scripts/status.py inbox-helper --human       # for a specific agent
-uv run python scripts/status.py                            # JSON to stdout
-echo $?                                                    # 0=ok, 1=partial, 2=broken, 3=uninitialized
-```
-
-Adaptive Card payloads can be emitted from the CLI for ad-hoc testing:
-
-```bash
-uv run python scripts/emit_card.py greeting --command "Summarise mail" --command "List events"
-uv run python scripts/emit_card.py confirmation --action "Reply sent" --fact "Recipient=team@contoso.com"
-uv run python scripts/emit_card.py error --heading "FIC expired" --message "Rotate now"
-```
-
-License recommendation (read-only; never purchases):
-
-```bash
-uv run python scripts/license.py --users 12 --agents 3 --plan E5
-uv run python scripts/license.py --users 250 --agents 40 --plan E5 --bundled-security
-```
-
-Admin-consent URL rendering and grant polling:
-
-```bash
-uv run python scripts/consent.py --print-url-only        # just emit the URL
-uv run python scripts/consent.py --no-open               # render + poll, no browser
-uv run python scripts/consent.py --timeout 60            # custom poll timeout (seconds)
-```
-
-> **v0.2 in progress.** The apply-path scripts (`register.py`,
-> `instance_create.py`, `cleanup.py`, plus the new `publish.py`) are
-> being rebuilt against the real `a365` CLI surface. v0.1 commands that
-> targeted non-existent CLI verbs (`deploy.py`, `fic_rotate.py`,
-> `blueprint_create.py`, `workiq.py`, `render_blueprint.py`) have been
-> deleted. Usage examples for the rebuilt commands will return as each
-> sub-slice lands.
-
-Work IQ MCP exposure (drives blueprint reconciliation):
-
-```bash
-# Add tools (additive)
-uv run python scripts/workiq.py inbox-helper --enable=mail,calendar --apply
-
-# Remove tools
-uv run python scripts/workiq.py inbox-helper --disable=teams --apply
-
-# Replace the whole list
-uv run python scripts/workiq.py inbox-helper --set=mail,calendar --apply
-```
-
-Telemetry verifier (read-only):
-
-```bash
-uv run python scripts/telemetry.py inbox-helper --human    # markdown table
-uv run python scripts/telemetry.py inbox-helper            # JSON
-echo $?                                                    # 0=ok, 1=partial, 2=broken
-```
-
-User-FIC rotation (refreshes the T2 client secret in the OS keychain):
-
-```bash
-uv run python scripts/fic_rotate.py             # plan only
-uv run python scripts/fic_rotate.py --apply     # rotate
-```
-
-Per-agent cleanup (destructive — apps are *not* removed):
-
-```bash
-# Plan only — always prints what would be removed
-uv run python scripts/cleanup.py inbox-helper
-
-# Execute the plan — --confirm must equal the agent slug
-uv run python scripts/cleanup.py inbox-helper --apply --confirm=inbox-helper
-```
+Older v0.1 slice history (1–17) lived in this README until 2026-05-05;
+it was a slice-by-slice trail that grew unwieldy. The canonical
+per-slice detail now lives in the commit log; salient findings are
+captured in the relevant `references/*.md` snapshots.
 
 ## License
 
