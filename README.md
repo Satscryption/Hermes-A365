@@ -228,8 +228,6 @@ Open issues in this repo (run `gh issue list` for current state):
 
 - **[#1](../../issues/1)** — Tier 3 responder (Hermes-native). Blocked
   on Hermes#20133 + SPEC §10 Q1.
-- **[#2](../../issues/2)** — Tier 2 responder (LLM-backed,
-  no Hermes coupling).
 - **[#3](../../issues/3)** — Activity bridge streaming responses.
   Required for M365 Copilot substantive replies.
 - **[#4](../../issues/4)** — Proactive long-running reply pattern (>10s
