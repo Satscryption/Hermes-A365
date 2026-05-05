@@ -565,21 +565,32 @@ def rsa_keypair() -> tuple[rsa.RSAPrivateKey, dict[str, Any]]:
     return priv, jwk
 
 
+# Slice 19f: tokens are AAD-v2 (issuer = login.microsoftonline.com/<tid>/v2.0,
+# `azp` claim names the calling Microsoft SP, no `serviceUrl` claim).
+TEST_TENANT_ID = "11111111-1111-1111-1111-111111111111"
+TEST_AAD_ISSUER = f"https://login.microsoftonline.com/{TEST_TENANT_ID}/v2.0"
+TEST_APX_AZP = "5a807f24-c9de-44ee-a3a7-329e88a00ffc"  # Messaging Bot API SP
+
+
 def _make_token(
     priv: rsa.RSAPrivateKey,
     *,
     aud: str,
-    iss: str = "https://api.botframework.com",
-    service_url: str = "https://smba.trafficmanager.net/teams/",
+    iss: str = TEST_AAD_ISSUER,
+    azp: str = TEST_APX_AZP,
     exp_offset: int = 600,
     extra: dict[str, Any] | None = None,
 ) -> str:
     payload = {
         "aud": aud,
         "iss": iss,
+        "azp": azp,
+        "azpacr": "2",
+        "tid": TEST_TENANT_ID,
+        "ver": "2.0",
         "iat": int(_time.time()),
+        "nbf": int(_time.time()),
         "exp": int(_time.time()) + exp_offset,
-        "serviceUrl": service_url,
     }
     if extra:
         payload.update(extra)
@@ -592,15 +603,17 @@ def _make_token(
 
 
 def _jwks_transport(jwk: dict[str, Any]) -> httpx.MockTransport:
-    """httpx transport that serves a fixed JWKS at the BF discovery URLs."""
+    """httpx transport that serves a fixed JWKS at the AAD-v2 discovery URLs."""
     config = {
-        "issuer": "https://api.botframework.com",
-        "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+        "issuer": TEST_AAD_ISSUER,
+        "jwks_uri": (
+            f"https://login.microsoftonline.com/{TEST_TENANT_ID}/discovery/v2.0/keys"
+        ),
     }
     keys = {"keys": [jwk]}
 
     def handler(request: httpx.Request) -> httpx.Response:
-        if request.url.path.endswith("/openidconfiguration"):
+        if request.url.path.endswith("openid-configuration"):
             return httpx.Response(200, json=config)
         if request.url.path.endswith("/keys"):
             return httpx.Response(200, json=keys)
@@ -619,17 +632,18 @@ class TestValidateInboundJwt:
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
         priv, jwk = rsa_keypair
-        token = _make_token(priv, aud="bot-app-id", service_url="https://svc/")
+        token = _make_token(priv, aud="bot-app-id")
         async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
             claims = await validate_inbound_jwt(
                 token=token,
+                tenant_id=TEST_TENANT_ID,
                 expected_app_id="bot-app-id",
-                expected_service_url="https://svc/",
                 client=client,
                 cache=_JwksCache(),
             )
         assert claims["aud"] == "bot-app-id"
-        assert claims["serviceUrl"] == "https://svc/"
+        assert claims["azp"] == TEST_APX_AZP
+        assert claims["iss"] == TEST_AAD_ISSUER
 
     async def test_wrong_audience_rejected(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
@@ -640,23 +654,65 @@ class TestValidateInboundJwt:
             with pytest.raises(JwtValidationError):
                 await validate_inbound_jwt(
                     token=token,
+                    tenant_id=TEST_TENANT_ID,
                     expected_app_id="bot-app-id",
-                    expected_service_url="https://smba.trafficmanager.net/teams/",
                     client=client,
                     cache=_JwksCache(),
                 )
 
-    async def test_service_url_mismatch_rejected(
+    async def test_wrong_tenant_in_issuer_rejected(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
+        """A token whose `iss` names a different tenant than the bridge
+        is configured for must 403, even if the signing key happens to
+        be reachable. Slice 19f."""
         priv, jwk = rsa_keypair
-        token = _make_token(priv, aud="bot-app-id", service_url="https://A/")
+        # Token claims it was issued by *our* tenant…
+        token = _make_token(priv, aud="bot-app-id")
+        # …but the bridge is configured for a different one.
         async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
-            with pytest.raises(JwtValidationError, match="serviceUrl claim mismatch"):
+            with pytest.raises(JwtValidationError):
                 await validate_inbound_jwt(
                     token=token,
+                    tenant_id="22222222-2222-2222-2222-222222222222",
                     expected_app_id="bot-app-id",
-                    expected_service_url="https://B/",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_azp_not_in_allowlist_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        """A valid AAD-v2 token issued by a different Microsoft SP than
+        we accept (`azp` mismatch) must 403. Replaces the pre-19f
+        serviceUrl claim check. Slice 19f."""
+        priv, jwk = rsa_keypair
+        # Some other tenant SP that happens to know our app id.
+        token = _make_token(priv, aud="bot-app-id", azp="cafebabe-dead-beef-cafe-babecafebabe")
+        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError, match="azp"):
+                await validate_inbound_jwt(
+                    token=token,
+                    tenant_id=TEST_TENANT_ID,
+                    expected_app_id="bot-app-id",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_empty_azp_allowlist_refuses_all(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        """An empty allowlist is a config bug — the validator must not
+        silently accept every otherwise-valid token. Slice 19f."""
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id")
+        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError, match="azp allowlist is empty"):
+                await validate_inbound_jwt(
+                    token=token,
+                    tenant_id=TEST_TENANT_ID,
+                    expected_app_id="bot-app-id",
+                    azp_allowlist=(),
                     client=client,
                     cache=_JwksCache(),
                 )
@@ -672,8 +728,8 @@ class TestValidateInboundJwt:
             with pytest.raises(JwtValidationError, match="not in JWKS"):
                 await validate_inbound_jwt(
                     token=token,
+                    tenant_id=TEST_TENANT_ID,
                     expected_app_id="bot-app-id",
-                    expected_service_url="https://smba.trafficmanager.net/teams/",
                     client=client,
                     cache=_JwksCache(),
                 )
@@ -687,12 +743,15 @@ class TestValidateInboundJwt:
 
         def handler(request: httpx.Request) -> httpx.Response:
             request_count["n"] += 1
-            if request.url.path.endswith("/openidconfiguration"):
+            if request.url.path.endswith("openid-configuration"):
                 return httpx.Response(
                     200,
                     json={
-                        "issuer": "https://api.botframework.com",
-                        "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+                        "issuer": TEST_AAD_ISSUER,
+                        "jwks_uri": (
+                            f"https://login.microsoftonline.com/"
+                            f"{TEST_TENANT_ID}/discovery/v2.0/keys"
+                        ),
                     },
                 )
             return httpx.Response(200, json={"keys": [jwk]})
@@ -702,8 +761,8 @@ class TestValidateInboundJwt:
             for _ in range(3):
                 await validate_inbound_jwt(
                     token=token,
+                    tenant_id=TEST_TENANT_ID,
                     expected_app_id="bot-app-id",
-                    expected_service_url="https://smba.trafficmanager.net/teams/",
                     client=client,
                     cache=cache,
                 )
@@ -1073,7 +1132,7 @@ def _serve_handler_factory(
     - operator's webhook (POST http://hook.test/responder)
     - BF outbound calls (POST {serviceUrl}/v3/conversations/.../activities/...)
     - AAD token endpoint
-    - BF JWKS discovery + keys (when jwk is provided, for JWT-validation tests)
+    - AAD-v2 JWKS discovery + keys (when jwk is provided, for JWT-validation tests)
     """
 
     if capture is None:
@@ -1112,16 +1171,19 @@ def _serve_handler_factory(
         if "/v3/conversations/" in url:
             capture["reply"].append({"url": url, "body": json.loads(req.content)})
             return httpx.Response(200, json={})
-        # JWKS discovery + keys.
-        if url.endswith("/openidconfiguration"):
+        # AAD-v2 JWKS discovery + keys (slice 19f).
+        if url.endswith("openid-configuration"):
             return httpx.Response(
                 200,
                 json={
-                    "issuer": "https://api.botframework.com",
-                    "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+                    "issuer": TEST_AAD_ISSUER,
+                    "jwks_uri": (
+                        f"https://login.microsoftonline.com/"
+                        f"{TEST_TENANT_ID}/discovery/v2.0/keys"
+                    ),
                 },
             )
-        if url.endswith("/.well-known/keys"):
+        if url.endswith("/discovery/v2.0/keys"):
             keys = [jwk] if jwk else []
             return httpx.Response(200, json={"keys": keys})
         return httpx.Response(404, text=f"unhandled {url}")

@@ -712,10 +712,22 @@ def main(argv: list[str] | None = None) -> int:
 # `bridge` extras (fastapi, uvicorn, httpx, pyjwt[crypto]); imports are
 # deferred so the verify path keeps working with no extras installed.
 
-# Bot Framework auth constants — verified against
-# https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
-BF_OPENID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openidconfiguration"
-BF_ISSUER = "https://api.botframework.com"
+# A365 inbound auth — AAD v2.0 tokens (slice 19f, 2026-05-05).
+# A365 / MCP Platform issues AAD-v2 tokens directly to the bot
+# endpoint, not classic Bot Framework tokens. The pre-19f validator
+# expected `iss = https://api.botframework.com` and a BF JWKS, which
+# 403'd every real activity. Real captured token (round-3 walkthrough)
+# carried:
+#   iss = https://login.microsoftonline.com/<tid>/v2.0
+#   aud = <blueprint app id>
+#   azp = 5a807f24-c9de-44ee-a3a7-329e88a00ffc  (Messaging Bot API SP)
+#   ver = 2.0
+# Discovery / JWKS now come from the AAD v2.0 OIDC document for the
+# bridge's configured tenant.
+AAD_V2_OPENID_CONFIG_URL_TEMPLATE = (
+    "https://login.microsoftonline.com/{tenant_id}/v2.0/.well-known/openid-configuration"
+)
+AAD_V2_ISSUER_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}/v2.0"
 
 # A365 outbound auth — three-stage `user_fic` chain. Discovered during the
 # 2026-05-05 round-3 walkthrough (issue #6) when the standard BF
@@ -727,7 +739,12 @@ BF_ISSUER = "https://api.botframework.com"
 # microsoft-agents-authentication-msal:MsalAuth.get_agentic_user_token.
 TENANT_TOKEN_URL_TEMPLATE = "https://login.microsoftonline.com/{tenant_id}/oauth2/v2.0/token"
 FMI_TOKEN_SCOPE = "api://AzureADTokenExchange/.default"
-APX_PRODUCTION_SCOPE = "5a807f24-c9de-44ee-a3a7-329e88a00ffc/.default"  # Messaging Bot API
+APX_PRODUCTION_APP_ID = "5a807f24-c9de-44ee-a3a7-329e88a00ffc"  # Messaging Bot API SP
+APX_PRODUCTION_SCOPE = f"{APX_PRODUCTION_APP_ID}/.default"
+# Default allowlist for inbound `azp` (slice 19f). Treat the same SP we
+# get outbound tokens *for* as the only sender we accept inbound *from*.
+# Other A365 services may join this list as we observe them.
+DEFAULT_INBOUND_AZP_ALLOWLIST: tuple[str, ...] = (APX_PRODUCTION_APP_ID,)
 USER_FIC_GRANT = "user_fic"
 JWT_BEARER_ASSERTION_TYPE = (
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
@@ -775,6 +792,8 @@ class BridgeConfig:
     pid_path: Path
     skip_jwt_validation: bool = False
     webhook_timeout_seconds: float = DEFAULT_WEBHOOK_TIMEOUT_SECONDS
+    # Slice 19f: SPs allowed in the `azp` claim of inbound JWTs.
+    inbound_azp_allowlist: tuple[str, ...] = DEFAULT_INBOUND_AZP_ALLOWLIST
 
 
 def load_bridge_config(
@@ -848,16 +867,22 @@ class _JwksCache:
     ttl_seconds: float = JWKS_CACHE_TTL_SECONDS
 
 
-async def _fetch_bf_openid_keys(client: Any) -> dict[str, Any]:
-    """Fetch the BF JWKS via OpenID discovery. ``client`` is an httpx.AsyncClient.
+async def _fetch_aad_v2_keys(client: Any, *, tenant_id: str) -> dict[str, Any]:
+    """Fetch the AAD v2.0 tenant JWKS via OpenID discovery.
 
     Returns ``{kid: PyJWK}``. Pure function — caching is handled by the
     caller so tests can substitute a fixed JWKS without touching the
     cache structure.
+
+    Slice 19f: replaced the pre-19f BF discovery URL after a real
+    A365 / MCP Platform inbound token was captured (round-3
+    walkthrough, 2026-05-05) and shown to be AAD-v2-issued, not
+    BF-issued.
     """
     if _jwt is None:
         raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
-    config_resp = await client.get(BF_OPENID_CONFIG_URL, timeout=10.0)
+    config_url = AAD_V2_OPENID_CONFIG_URL_TEMPLATE.format(tenant_id=tenant_id)
+    config_resp = await client.get(config_url, timeout=10.0)
     config_resp.raise_for_status()
     jwks_uri = config_resp.json()["jwks_uri"]
     jwks_resp = await client.get(jwks_uri, timeout=10.0)
@@ -872,14 +897,18 @@ async def _fetch_bf_openid_keys(client: Any) -> dict[str, Any]:
 
 
 async def _ensure_jwks_loaded(
-    client: Any, cache: _JwksCache, *, now: float | None = None
+    client: Any,
+    cache: _JwksCache,
+    *,
+    tenant_id: str,
+    now: float | None = None,
 ) -> dict[str, Any]:
     import time as _time
 
     cur = now if now is not None else _time.time()
     if cache.keys_by_kid and (cur - cache.fetched_at) < cache.ttl_seconds:
         return cache.keys_by_kid
-    cache.keys_by_kid = await _fetch_bf_openid_keys(client)
+    cache.keys_by_kid = await _fetch_aad_v2_keys(client, tenant_id=tenant_id)
     cache.fetched_at = cur
     return cache.keys_by_kid
 
@@ -891,20 +920,36 @@ class JwtValidationError(RuntimeError):
 async def validate_inbound_jwt(
     *,
     token: str,
+    tenant_id: str,
     expected_app_id: str,
-    expected_service_url: str,
+    azp_allowlist: tuple[str, ...] = DEFAULT_INBOUND_AZP_ALLOWLIST,
     client: Any,
     cache: _JwksCache,
     now: float | None = None,
 ) -> dict[str, Any]:
-    """Validate a Bot Framework inbound JWT and return its claims.
+    """Validate an A365 / MCP-Platform inbound JWT and return its claims.
+
+    Slice 19f rewrite. The A365 platform issues AAD-v2 tokens directly
+    to the bot endpoint:
+
+    - ``iss`` = ``https://login.microsoftonline.com/<tenant_id>/v2.0``
+    - ``aud`` = the bot's blueprint Entra app id
+    - ``azp`` = the calling Microsoft service principal (e.g.
+      ``5a807f24-…`` for the Messaging Bot API)
+    - ``ver`` = ``2.0``
+
+    The pre-19f validator's ``serviceUrl`` claim check is gone — A365
+    tokens don't carry that claim (it's BF-specific). In its place we
+    validate ``azp`` against an allowlist so a stray AAD-v2 token from
+    any other Microsoft service (or a different tenant SP that happens
+    to be granted our scope) cannot impersonate the platform.
 
     Raises :class:`JwtValidationError` on any failure with a short reason.
     Caller dispatches HTTP 401/403 from there.
     """
     if _jwt is None:
         raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
-    keys = await _ensure_jwks_loaded(client, cache, now=now)
+    keys = await _ensure_jwks_loaded(client, cache, tenant_id=tenant_id, now=now)
     try:
         unverified_header = _jwt.get_unverified_header(token)
     except _jwt.PyJWTError as e:
@@ -912,21 +957,27 @@ async def validate_inbound_jwt(
     kid = unverified_header.get("kid")
     if not kid or kid not in keys:
         raise JwtValidationError(f"signing key (kid={kid!r}) not in JWKS")
+    expected_issuer = AAD_V2_ISSUER_TEMPLATE.format(tenant_id=tenant_id)
     try:
         claims = _jwt.decode(
             token,
             key=keys[kid].key,
             algorithms=["RS256"],
             audience=expected_app_id,
-            issuer=BF_ISSUER,
+            issuer=expected_issuer,
             leeway=300,
         )
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"signature/aud/iss check failed: {e}") from e
-    if claims.get("serviceUrl") != expected_service_url:
+    azp = claims.get("azp")
+    if not azp_allowlist:
         raise JwtValidationError(
-            f"serviceUrl claim mismatch: token={claims.get('serviceUrl')!r}, "
-            f"activity={expected_service_url!r}"
+            "azp allowlist is empty — refusing to accept any inbound token. "
+            "This is a config bug; populate inbound_azp_allowlist."
+        )
+    if azp not in azp_allowlist:
+        raise JwtValidationError(
+            f"azp {azp!r} not in allowlist {list(azp_allowlist)!r}"
         )
     return claims
 
@@ -1348,9 +1399,9 @@ def make_app(
         activity: dict[str, Any] = _Body(...),  # noqa: B008 — FastAPI idiom
         authorization: str | None = _Header(default=None),
     ) -> Any:
-        service_url = activity.get("serviceUrl", "")
-
         # JWT validation — the inbound `Authorization: Bearer <token>` header.
+        # Slice 19f: AAD-v2 issuer + JWKS for the bridge's tenant; azp
+        # allowlist replaces the BF-specific serviceUrl claim check.
         if not cfg.skip_jwt_validation:
             if not authorization or not authorization.lower().startswith("bearer "):
                 raise _HTTPException(status_code=401, detail="missing bearer token")
@@ -1358,8 +1409,9 @@ def make_app(
             try:
                 await validate_inbound_jwt(
                     token=token,
+                    tenant_id=cfg.tenant_id,
                     expected_app_id=cfg.blueprint_client_id,
-                    expected_service_url=service_url,
+                    azp_allowlist=cfg.inbound_azp_allowlist,
                     client=http_client,
                     cache=jwks_cache,
                 )
