@@ -500,8 +500,30 @@ secret. If you've cloned to a fresh checkout, double-check
 hit before running `git add`. Operators can `rm` the backups
 manually once they've audited what cleanup did.
 
-- [ ] `cleanup --apply` exits 0.
+⚠️ **Orphan agentic users (slice 19g).** If the agent was published as
+an AI Teammate (`publish --aiteammate --apply`) and activated for a
+user, the GA CLI's `cleanup blueprint` step calls a Graph DELETE on a
+non-existent `/beta/agentUsers/<id>` segment, logs the failure, and
+leaves the per-user agentic Entra user orphaned. The wrapper now
+parses both the inline `Failed to delete agentic user <guid>` and the
+final `Orphaned agentic user: <guid>` lines, surfaces them with a
+ready-to-paste recovery line, and exits **1** if any orphan remains.
+Two ways to handle:
+
+- Re-run with `--purge-orphans`, which calls
+  `az ad user delete --id <id>` for each orphan after the CLI steps:
+  ```bash
+  uv run python scripts/cleanup.py --agent-name "<display-name>" \
+      --tenant-id <tenant-id> --apply --confirm "<display-name>" \
+      --purge-orphans
+  ```
+- Or copy the recovery line the wrapper prints and run it by hand.
+
+- [ ] `cleanup --apply` exits 0 (or 1 with only a documented orphan
+      agentic user — re-run with `--purge-orphans` to make it 0).
 - [ ] Blueprint app + service principal removed from Entra Portal.
+- [ ] No `Orphaned agentic user:` entries remain in the wrapper's
+      end-of-run summary.
 - [ ] `~/.hermes/agents/<slug>/` removed locally.
 - [ ] Tenant-wide infra (`Agent 365 CLI` client app, license, Frontier
       Preview enrollment) is **untouched** — verify in the Admin Centre.

@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import shlex
 import sys
 from dataclasses import dataclass, field
@@ -213,12 +214,43 @@ def build_cleanup_plan(
 # ---------------------------------------------------------------------------
 
 
+# Slice 19g: GA CLI v1.1.171.4547 hits Graph DELETE on a non-existent
+# `/beta/agentUsers/<id>` segment when tearing down a published AI
+# Teammate agent (round-3 walkthrough, 2026-05-05). The CLI logs both
+# an inline failure and a final summary line; we accept either form so
+# we still catch orphans if Microsoft tweaks one of the strings.
+_ORPHAN_USER_RE = re.compile(
+    r"(?:Failed to delete agentic user|Orphaned agentic user:)\s+"
+    r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})",
+    re.IGNORECASE,
+)
+
+
+def _parse_orphan_user_ids(stdout: str) -> list[str]:
+    """Extract agentic-user object IDs the CLI couldn't delete.
+
+    The agentic user is a regular Entra user reachable via
+    `/beta/users/<id>`, so ``az ad user delete --id <id>`` cleans it up
+    (driven by ``--purge-orphans``).
+    """
+    seen: list[str] = []
+    for match in _ORPHAN_USER_RE.finditer(stdout):
+        oid = match.group(1).lower()
+        if oid not in seen:
+            seen.append(oid)
+    return seen
+
+
 @dataclass
 class CleanupResult:
     plan: CleanupPlan
     completed: list[CleanupKind] = field(default_factory=list)
     local_paths_removed: list[Path] = field(default_factory=list)
     messages: list[str] = field(default_factory=list)
+    # Slice 19g: orphan agentic users surfaced from CLI output.
+    orphan_user_ids: list[str] = field(default_factory=list)
+    orphans_purged: list[str] = field(default_factory=list)
+    orphans_remaining: list[str] = field(default_factory=list)
 
 
 def apply_cleanup_plan(
@@ -226,11 +258,19 @@ def apply_cleanup_plan(
     *,
     mutator: Mutator,
     hermes_home: Path,
+    purge_orphans: bool = False,
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
 
     Any AADSTS / CliInvocationError aborts the run — local files stay on
     disk so a re-run can pick up where we left off.
+
+    Slice 19g: parses orphan agentic-user IDs from each CLI step's
+    stdout. With ``purge_orphans=True`` the wrapper additionally runs
+    ``az ad user delete --id <id>`` for each orphan after the CLI
+    steps complete. Off by default — keeps cleanup pure-CLI in the
+    happy case so we're not silently using a different identity than
+    the CLI.
     """
     result = CleanupResult(plan=plan)
 
@@ -238,9 +278,12 @@ def apply_cleanup_plan(
         # Pre-feed `y\n` for the GA CLI's "Continue with X cleanup? (y/N):"
         # prompt that `-y` on the parent verb doesn't actually suppress
         # for subcommands. Slice 18w (corrects the gap left by 18l).
-        mutator.run(step.argv, stdin_input="y\n")
+        run = mutator.run(step.argv, stdin_input="y\n")
         result.completed.append(step.kind)
         result.messages.append(f"[apply] {step.kind}: {step.description} — done")
+        for oid in _parse_orphan_user_ids(run.stdout):
+            if oid not in result.orphan_user_ids:
+                result.orphan_user_ids.append(oid)
 
     for path in plan.local_paths:
         try:
@@ -271,6 +314,31 @@ def apply_cleanup_plan(
         except OSError:
             # Don't fail cleanup over a chmod that didn't take.
             continue
+
+    # Slice 19g: optionally purge orphan agentic users via az ad user
+    # delete. The CLI's own delete path (`/beta/agentUsers/<id>`) 404s
+    # — likely a Microsoft GA CLI defect — so the wrapper has to do the
+    # cleanup itself when asked. Off by default; opt-in with
+    # ``--purge-orphans`` so the CLI invocation set stays auditable.
+    for oid in result.orphan_user_ids:
+        if not purge_orphans:
+            result.orphans_remaining.append(oid)
+            result.messages.append(
+                f"[apply] orphaned agentic user: {oid}; "
+                f"recover with: az ad user delete --id {oid}"
+            )
+            continue
+        try:
+            mutator.run(["az", "ad", "user", "delete", "--id", oid])
+        except CliInvocationError as e:
+            result.orphans_remaining.append(oid)
+            result.messages.append(
+                f"[apply] purge failed for {oid}: {e}; "
+                f"recover with: az ad user delete --id {oid}"
+            )
+            continue
+        result.orphans_purged.append(oid)
+        result.messages.append(f"[apply] purged orphan agentic user {oid}")
 
     return result
 
@@ -333,6 +401,17 @@ def main(argv: list[str] | None = None) -> int:
         help="must equal --agent-name for the apply path to proceed",
     )
     parser.add_argument("--apply", action="store_true", help="execute the plan; default is dry-run")
+    # Slice 19g
+    parser.add_argument(
+        "--purge-orphans",
+        action="store_true",
+        help=(
+            "after the CLI cleanup steps, run `az ad user delete --id <id>` "
+            "for each agentic user the GA CLI failed to delete (its delete "
+            "path `/beta/agentUsers/<id>` 404s). Off by default — surface "
+            "the orphans only and exit 1 instead."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -363,7 +442,12 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     try:
-        result = apply_cleanup_plan(plan, mutator=get_mutator(), hermes_home=_resolve_hermes_home())
+        result = apply_cleanup_plan(
+            plan,
+            mutator=get_mutator(),
+            hermes_home=_resolve_hermes_home(),
+            purge_orphans=args.purge_orphans,
+        )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
         return 2
@@ -372,6 +456,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     sys.stdout.write("\n" + "\n".join(result.messages) + "\ndone.\n")
+    # Slice 19g: exit 1 (partial) if we know an agentic user was left
+    # behind — CI / scripted teardown should notice.
+    if result.orphans_remaining:
+        return 1
     return 0
 
 

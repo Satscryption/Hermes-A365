@@ -349,6 +349,154 @@ class TestApplyCleanup:
 
 
 # ---------------------------------------------------------------------------
+# Slice 19g — orphan agentic-user surfacing + --purge-orphans
+# ---------------------------------------------------------------------------
+
+
+# Excerpt from a real round-3 walkthrough (2026-05-05) — the GA CLI's
+# delete path `/beta/agentUsers/<id>` 404s and the agentic user is left
+# orphaned. We accept either the inline failure line or the final
+# summary line.
+_REAL_ORPHAN_OUTPUT = (
+    "Deleting agentic user: b8dab9ca-afa7-48aa-bb22-520eeabcd4f7\n"
+    "ERROR: Graph DELETE https://graph.microsoft.com/beta/agentUsers/"
+    "b8dab9ca-afa7-48aa-bb22-520eeabcd4f7 failed 400: "
+    "Resource not found for the segment 'agentUsers'.\n"
+    "ERROR: Failed to delete agentic user: b8dab9ca-afa7-48aa-bb22-520eeabcd4f7\n"
+    "Failed to delete agentic user b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"
+    " -- will continue\n"
+    "Blueprint cleanup encountered warnings.\n"
+    "The following resources could not be deleted and remain orphaned in Entra ID:\n"
+    "  Orphaned agentic user: b8dab9ca-afa7-48aa-bb22-520eeabcd4f7\n"
+)
+
+
+def _scripted_run(stdout: str = "") -> RunResult:
+    return RunResult(argv=[], returncode=0, stdout=stdout, stderr="")
+
+
+class TestOrphanParser:
+    def test_extracts_guid_from_real_output(self) -> None:
+        from cleanup import _parse_orphan_user_ids
+
+        ids = _parse_orphan_user_ids(_REAL_ORPHAN_OUTPUT)
+        assert ids == ["b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"]
+
+    def test_dedupes_repeats_within_single_step(self) -> None:
+        from cleanup import _parse_orphan_user_ids
+
+        # Same GUID hits both the inline 'Failed to delete' line and the
+        # final 'Orphaned agentic user:' summary — count it once.
+        assert len(_parse_orphan_user_ids(_REAL_ORPHAN_OUTPUT)) == 1
+
+    def test_clean_output_yields_no_ids(self) -> None:
+        from cleanup import _parse_orphan_user_ids
+
+        assert _parse_orphan_user_ids("Cleanup successful.\n") == []
+
+
+class TestApplyCleanupOrphans:
+    def test_orphan_surfaced_with_recovery_hint_and_no_purge_by_default(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        # azure: clean, instance: clean, blueprint: leaves an orphan.
+        mutator = FakeMutator(
+            scripted=[
+                _scripted_run(""),
+                _scripted_run(""),
+                _scripted_run(_REAL_ORPHAN_OUTPUT),
+            ]
+        )
+        result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+        assert result.orphan_user_ids == ["b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"]
+        assert result.orphans_purged == []
+        assert result.orphans_remaining == ["b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"]
+        # The recovery line is the "ready-to-paste" affordance — anyone
+        # tailing logs should see exactly what to run.
+        assert any(
+            "az ad user delete --id b8dab9ca-afa7-48aa-bb22-520eeabcd4f7" in m
+            for m in result.messages
+        )
+        # No `az ad user delete` was actually invoked — purge was off.
+        assert not any(c[:3] == ["az", "ad", "user"] for c in mutator.calls)
+
+    def test_purge_orphans_runs_az_user_delete_and_clears_remaining(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        # 3 cleanup steps + 1 az purge call.
+        mutator = FakeMutator(
+            scripted=[
+                _scripted_run(""),
+                _scripted_run(""),
+                _scripted_run(_REAL_ORPHAN_OUTPUT),
+                _scripted_run(""),  # az ad user delete success
+            ]
+        )
+        result = apply_cleanup_plan(
+            plan, mutator=mutator, hermes_home=tmp_path, purge_orphans=True
+        )
+
+        assert result.orphans_purged == ["b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"]
+        assert result.orphans_remaining == []
+        # The 4th call is `az ad user delete --id <guid>`.
+        assert mutator.calls[-1] == [
+            "az",
+            "ad",
+            "user",
+            "delete",
+            "--id",
+            "b8dab9ca-afa7-48aa-bb22-520eeabcd4f7",
+        ]
+
+    def test_purge_orphans_failure_keeps_orphan_in_remaining(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        mutator = FakeMutator(
+            scripted=[
+                _scripted_run(""),
+                _scripted_run(""),
+                _scripted_run(_REAL_ORPHAN_OUTPUT),
+                CliInvocationError(["az"], 1, "user delete failed"),
+            ]
+        )
+        result = apply_cleanup_plan(
+            plan, mutator=mutator, hermes_home=tmp_path, purge_orphans=True
+        )
+
+        assert result.orphans_purged == []
+        assert result.orphans_remaining == ["b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"]
+        assert any("purge failed" in m for m in result.messages)
+        # Recovery line still emitted so the operator can retry by hand.
+        assert any(
+            "az ad user delete --id b8dab9ca-afa7-48aa-bb22-520eeabcd4f7" in m
+            for m in result.messages
+        )
+
+    def test_clean_run_records_no_orphans(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
+        assert result.orphan_user_ids == []
+        assert result.orphans_purged == []
+        assert result.orphans_remaining == []
+
+
+# ---------------------------------------------------------------------------
 # Sanity
 # ---------------------------------------------------------------------------
 

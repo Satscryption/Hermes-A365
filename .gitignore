@@ -15,6 +15,10 @@ a365.generated.config.json
 # `a365 cleanup -y` writes timestamped backups of the above files.
 a365.config.backup-*.json
 a365.generated.config.backup-*.json
+# `a365 publish --aiteammate` extracts manifest templates + zips them
+# under ./manifest/ as a build artefact (slice 19g, walkthrough finding).
+# Regenerated each publish — keep it out of git.
+manifest/
 
 # Python
 __pycache__/
