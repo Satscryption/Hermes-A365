@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -494,6 +495,156 @@ class TestApplyCleanupOrphans:
         assert result.orphan_user_ids == []
         assert result.orphans_purged == []
         assert result.orphans_remaining == []
+
+
+# ---------------------------------------------------------------------------
+# Slice 19h — orphan agentRegistry/agentInstances surfacing + purge
+# ---------------------------------------------------------------------------
+
+
+_TEST_INSTANCE_ID = "62433e08-c737-47d5-a53f-5b2f5bcd40ce"
+
+
+def _seed_generated_config(
+    cwd: Path, *, instance_id: str | None = _TEST_INSTANCE_ID
+) -> Path:
+    path = cwd / "a365.generated.config.json"
+    payload: dict[str, str] = {
+        "agentBlueprintId": "blueprint-app-id",
+        "agentBlueprintClientSecret": "redacted",
+    }
+    if instance_id is not None:
+        payload["agentInstanceId"] = instance_id
+    path.write_text(json.dumps(payload))
+    return path
+
+
+class TestSnapshotAgentInstanceId:
+    def test_returns_id_when_present(self, tmp_path: Path) -> None:
+        from cleanup import _snapshot_agent_instance_id
+
+        cfg = _seed_generated_config(tmp_path)
+        assert _snapshot_agent_instance_id(cfg) == _TEST_INSTANCE_ID
+
+    def test_returns_none_when_file_missing(self, tmp_path: Path) -> None:
+        from cleanup import _snapshot_agent_instance_id
+
+        assert _snapshot_agent_instance_id(tmp_path / "nope.json") is None
+
+    def test_returns_none_when_id_empty(self, tmp_path: Path) -> None:
+        from cleanup import _snapshot_agent_instance_id
+
+        cfg = _seed_generated_config(tmp_path, instance_id="")
+        assert _snapshot_agent_instance_id(cfg) is None
+
+    def test_returns_none_on_invalid_json(self, tmp_path: Path) -> None:
+        from cleanup import _snapshot_agent_instance_id
+
+        cfg = tmp_path / "a365.generated.config.json"
+        cfg.write_text("{not valid json")
+        assert _snapshot_agent_instance_id(cfg) is None
+
+
+class TestApplyCleanupOrphanInstance:
+    def test_orphan_instance_surfaced_with_recovery_hint(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            generated_config_path=cfg_path,
+        )
+
+        assert result.orphan_instance_ids == [_TEST_INSTANCE_ID]
+        assert result.orphan_instances_purged == []
+        assert result.orphan_instances_remaining == [_TEST_INSTANCE_ID]
+        # Recovery hint is the exact `az rest` line a human can paste.
+        assert any(
+            f"az rest --method DELETE --uri https://graph.microsoft.com/beta/"
+            f"agentRegistry/agentInstances/{_TEST_INSTANCE_ID}"
+            in m
+            for m in result.messages
+        )
+
+    def test_purge_orphans_runs_az_rest_delete(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        # 3 cleanup steps + 1 az rest DELETE.
+        mutator = FakeMutator()
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=cfg_path,
+        )
+
+        assert result.orphan_instances_purged == [_TEST_INSTANCE_ID]
+        assert result.orphan_instances_remaining == []
+        assert mutator.calls[-1] == [
+            "az",
+            "rest",
+            "--method",
+            "DELETE",
+            "--uri",
+            f"https://graph.microsoft.com/beta/agentRegistry/agentInstances/"
+            f"{_TEST_INSTANCE_ID}",
+        ]
+
+    def test_purge_failure_keeps_orphan_in_remaining(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        # The az rest call is the 4th invocation (after the 3 cleanup
+        # steps). Only it raises — common in the field on accounts that
+        # lack AgentRegistry.ReadWrite.All on the delegated token.
+        mutator = FakeMutator(
+            scripted=[
+                RunResult(argv=[], returncode=0, stdout="", stderr=""),
+                RunResult(argv=[], returncode=0, stdout="", stderr=""),
+                RunResult(argv=[], returncode=0, stdout="", stderr=""),
+                CliInvocationError(["az"], 3, "Insufficient privileges"),
+            ]
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=cfg_path,
+        )
+
+        assert result.orphan_instances_purged == []
+        assert result.orphan_instances_remaining == [_TEST_INSTANCE_ID]
+        assert any("purge failed for instance" in m for m in result.messages)
+
+    def test_no_generated_config_means_no_orphan_instance(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        # No generated config → nothing to snapshot → no orphan claimed.
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            generated_config_path=tmp_path / "nope.json",
+        )
+        assert result.orphan_instance_ids == []
+        assert result.orphan_instances_remaining == []
 
 
 # ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ skip the CLI's own confirmation prompt — our gate is ``--confirm``.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shlex
@@ -241,6 +242,39 @@ def _parse_orphan_user_ids(stdout: str) -> list[str]:
     return seen
 
 
+# Slice 19h: GA CLI v1.1.171.4547 deletes the blueprint app + agent
+# identity SP but leaves the `agentRegistry/agentInstances/<id>`
+# registry entry orphaned (round-3 walkthrough finding, 2026-05-05).
+# Tenant-wide instance count drifts up by one per cleanup. Snapshot
+# the id from `a365.generated.config.json` *before* running the CLI
+# steps (the CLI wipes the local config as part of cleanup), and
+# surface — or DELETE via `az rest` — afterwards.
+_AGENT_INSTANCES_GRAPH_URL = (
+    "https://graph.microsoft.com/beta/agentRegistry/agentInstances/{instance_id}"
+)
+
+
+def _snapshot_agent_instance_id(generated_config_path: Path) -> str | None:
+    """Read ``agentInstanceId`` from the generated config, if any.
+
+    Returns ``None`` when the file is missing, unreadable, or carries
+    no instance id. Cleanup proceeds either way — we just don't have
+    an orphan to chase down.
+    """
+    try:
+        raw = generated_config_path.read_text()
+    except OSError:
+        return None
+    try:
+        gen = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    instance_id = gen.get("agentInstanceId") if isinstance(gen, dict) else None
+    if isinstance(instance_id, str) and instance_id.strip():
+        return instance_id.strip()
+    return None
+
+
 @dataclass
 class CleanupResult:
     plan: CleanupPlan
@@ -251,6 +285,13 @@ class CleanupResult:
     orphan_user_ids: list[str] = field(default_factory=list)
     orphans_purged: list[str] = field(default_factory=list)
     orphans_remaining: list[str] = field(default_factory=list)
+    # Slice 19h: orphan agentRegistry/agentInstances entries snapshotted
+    # from the generated config before the CLI wipes it. Distinct from
+    # orphan_user_ids because the cleanup mechanism differs (Graph
+    # DELETE via `az rest`, not `az ad user delete`).
+    orphan_instance_ids: list[str] = field(default_factory=list)
+    orphan_instances_purged: list[str] = field(default_factory=list)
+    orphan_instances_remaining: list[str] = field(default_factory=list)
 
 
 def apply_cleanup_plan(
@@ -259,6 +300,7 @@ def apply_cleanup_plan(
     mutator: Mutator,
     hermes_home: Path,
     purge_orphans: bool = False,
+    generated_config_path: Path | None = None,
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
 
@@ -271,8 +313,17 @@ def apply_cleanup_plan(
     steps complete. Off by default — keeps cleanup pure-CLI in the
     happy case so we're not silently using a different identity than
     the CLI.
+
+    Slice 19h: also snapshots ``agentInstanceId`` from
+    ``a365.generated.config.json`` *before* the CLI wipes the local
+    config, and surfaces the orphan agentRegistry entry (or
+    ``--purge-orphans`` issues a Graph DELETE via ``az rest``).
     """
     result = CleanupResult(plan=plan)
+
+    if generated_config_path is None:
+        generated_config_path = Path.cwd() / "a365.generated.config.json"
+    candidate_instance_id = _snapshot_agent_instance_id(generated_config_path)
 
     for step in plan.steps:
         # Pre-feed `y\n` for the GA CLI's "Continue with X cleanup? (y/N):"
@@ -340,6 +391,50 @@ def apply_cleanup_plan(
         result.orphans_purged.append(oid)
         result.messages.append(f"[apply] purged orphan agentic user {oid}")
 
+    # Slice 19h: orphan agentRegistry entry. ``cleanup blueprint`` deletes
+    # the Entra app + agent identity SP but leaves the
+    # ``agentRegistry/agentInstances/<id>`` registry record behind. The
+    # operator's account typically lacks ``AgentRegistry.ReadWrite.All``
+    # so the DELETE may 403 — surface a recovery hint either way.
+    if candidate_instance_id is not None:
+        result.orphan_instance_ids.append(candidate_instance_id)
+        recovery = (
+            f"az rest --method DELETE --uri "
+            f"{_AGENT_INSTANCES_GRAPH_URL.format(instance_id=candidate_instance_id)}"
+        )
+        if not purge_orphans:
+            result.orphan_instances_remaining.append(candidate_instance_id)
+            result.messages.append(
+                f"[apply] orphaned agentRegistry instance: "
+                f"{candidate_instance_id}; recover with: {recovery}"
+            )
+        else:
+            try:
+                mutator.run(
+                    [
+                        "az",
+                        "rest",
+                        "--method",
+                        "DELETE",
+                        "--uri",
+                        _AGENT_INSTANCES_GRAPH_URL.format(
+                            instance_id=candidate_instance_id
+                        ),
+                    ]
+                )
+            except CliInvocationError as e:
+                result.orphan_instances_remaining.append(candidate_instance_id)
+                result.messages.append(
+                    f"[apply] purge failed for instance "
+                    f"{candidate_instance_id}: {e}; recover with: {recovery}"
+                )
+            else:
+                result.orphan_instances_purged.append(candidate_instance_id)
+                result.messages.append(
+                    f"[apply] purged orphan agentRegistry instance "
+                    f"{candidate_instance_id}"
+                )
+
     return result
 
 
@@ -406,10 +501,13 @@ def main(argv: list[str] | None = None) -> int:
         "--purge-orphans",
         action="store_true",
         help=(
-            "after the CLI cleanup steps, run `az ad user delete --id <id>` "
-            "for each agentic user the GA CLI failed to delete (its delete "
-            "path `/beta/agentUsers/<id>` 404s). Off by default — surface "
-            "the orphans only and exit 1 instead."
+            "after the CLI cleanup steps, also (1) run `az ad user delete "
+            "--id <id>` for each agentic user the GA CLI failed to delete "
+            "(its delete path `/beta/agentUsers/<id>` 404s), and (2) issue "
+            "a Graph DELETE on the orphaned agentRegistry instance the CLI "
+            "leaves behind (slice 19h). Off by default — surface orphans "
+            "only and exit 1 instead. Requires AgentRegistry.ReadWrite.All "
+            "on the az CLI token for (2) to succeed."
         ),
     )
     args = parser.parse_args(argv)
@@ -456,9 +554,10 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     sys.stdout.write("\n" + "\n".join(result.messages) + "\ndone.\n")
-    # Slice 19g: exit 1 (partial) if we know an agentic user was left
-    # behind — CI / scripted teardown should notice.
-    if result.orphans_remaining:
+    # Exit 1 (partial) if any orphan was left behind — CI / scripted
+    # teardown should notice. Slice 19g (agentic users) and 19h
+    # (agentRegistry instances) both feed this.
+    if result.orphans_remaining or result.orphan_instances_remaining:
         return 1
     return 0
 
