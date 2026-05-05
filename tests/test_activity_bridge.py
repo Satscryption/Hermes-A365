@@ -33,8 +33,10 @@ from activity_bridge import (
     JwtValidationError,
     TokenAcquisitionError,
     VerifyReport,
+    _activity_delivery_id,
     _agentic_ids_from_activity,
     _FmiCache,
+    _IdempotencyCache,
     _JwksCache,
     _UserTokenCache,
     acquire_outbound_token,
@@ -1315,6 +1317,108 @@ class TestServeApp:
                 headers={"Authorization": "Bearer not-a-valid-jwt"},
             )
         assert r.status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# Slice 19i — inbound idempotency
+# ---------------------------------------------------------------------------
+
+
+class TestActivityDeliveryId:
+    def test_extracts_conv_and_activity_id(self) -> None:
+        a = _inbound_message_activity()
+        assert _activity_delivery_id(a) == "conv-1:1234"
+
+    def test_missing_conversation_returns_none(self) -> None:
+        a = _inbound_message_activity()
+        a.pop("conversation")
+        assert _activity_delivery_id(a) is None
+
+    def test_missing_activity_id_returns_none(self) -> None:
+        a = _inbound_message_activity()
+        a.pop("id")
+        assert _activity_delivery_id(a) is None
+
+    def test_non_dict_conversation_returns_none(self) -> None:
+        a = _inbound_message_activity()
+        a["conversation"] = "not-a-dict"
+        assert _activity_delivery_id(a) is None
+
+
+class TestIdempotencyCache:
+    def test_first_call_records_and_returns_false(self) -> None:
+        cache = _IdempotencyCache()
+        assert cache.is_duplicate("conv-1:abc", now=100.0) is False
+        assert "conv-1:abc" in cache.seen
+
+    def test_second_call_within_ttl_returns_true(self) -> None:
+        cache = _IdempotencyCache(ttl_seconds=60.0)
+        cache.is_duplicate("k", now=100.0)
+        assert cache.is_duplicate("k", now=130.0) is True
+
+    def test_call_after_ttl_returns_false(self) -> None:
+        cache = _IdempotencyCache(ttl_seconds=60.0)
+        cache.is_duplicate("k", now=100.0)
+        # 60s exactly is the boundary; pyjwt-style strict-less-than means
+        # ttl must elapse, not just match.
+        assert cache.is_duplicate("k", now=160.0) is False
+
+    def test_prune_drops_expired_entries_on_check(self) -> None:
+        cache = _IdempotencyCache(ttl_seconds=60.0)
+        cache.is_duplicate("old", now=100.0)
+        cache.is_duplicate("fresh", now=190.0)
+        # Time has moved well past the old entry's TTL by the third call.
+        cache.is_duplicate("probe", now=200.0)
+        assert "old" not in cache.seen
+        assert "fresh" in cache.seen
+        assert "probe" in cache.seen
+
+
+class TestServeAppDedupe:
+    def test_duplicate_delivery_short_circuits_webhook(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(
+            cfg, capture=capture, webhook_response={"text": "hi back"}
+        ) as client:
+            r1 = client.post("/api/messages", json=_inbound_message_activity())
+            r2 = client.post("/api/messages", json=_inbound_message_activity())
+        assert r1.status_code == 200
+        assert r1.json()["status"] == "replied"
+        assert r2.status_code == 200
+        assert r2.json()["status"] == "duplicate"
+        # Webhook + reply only fired once across both POSTs.
+        assert len(capture["webhook"]) == 1
+        assert len(capture["reply"]) == 1
+
+    def test_distinct_activities_both_processed(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        a1 = _inbound_message_activity()
+        a2 = {**_inbound_message_activity(), "id": "5678"}
+        with _client_for(
+            cfg, capture=capture, webhook_response={"text": "echo"}
+        ) as client:
+            client.post("/api/messages", json=a1)
+            client.post("/api/messages", json=a2)
+        assert len(capture["webhook"]) == 2
+
+    def test_activity_without_id_is_not_deduped(self) -> None:
+        """Channel-control activities can lack an `id` — better to over-
+        deliver them than silently drop the second one."""
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        a = {**_inbound_message_activity(), "type": "conversationUpdate"}
+        a.pop("id")
+        with _client_for(cfg, capture=capture) as client:
+            r1 = client.post("/api/messages", json=a)
+            r2 = client.post("/api/messages", json=a)
+        # Both ack — neither short-circuits as a duplicate.
+        assert r1.json()["status"] == "acked"
+        assert r2.json()["status"] == "acked"
 
 
 # ---------------------------------------------------------------------------

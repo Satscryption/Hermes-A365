@@ -753,6 +753,12 @@ JWT_BEARER_ASSERTION_TYPE = (
 # JWKS cache TTL per Microsoft's published guidance (refresh at least daily).
 JWKS_CACHE_TTL_SECONDS = 24 * 3600
 
+# Slice 19i: how long the bridge remembers a delivered (conversationId,
+# activityId) pair to short-circuit BF / A365 retries. 1h matches the
+# upper bound on Microsoft's connector retry window we've observed in
+# the wild. Configurable via ``BridgeConfig.idempotency_ttl_seconds``.
+DEFAULT_IDEMPOTENCY_TTL_SECONDS = 3600.0
+
 # Refresh outbound token 5 min before expiry to avoid mid-flight 401s.
 TOKEN_REFRESH_SKEW_SECONDS = 300
 
@@ -794,6 +800,8 @@ class BridgeConfig:
     webhook_timeout_seconds: float = DEFAULT_WEBHOOK_TIMEOUT_SECONDS
     # Slice 19f: SPs allowed in the `azp` claim of inbound JWTs.
     inbound_azp_allowlist: tuple[str, ...] = DEFAULT_INBOUND_AZP_ALLOWLIST
+    # Slice 19i: TTL for in-memory dedupe of inbound activities.
+    idempotency_ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
 
 
 def load_bridge_config(
@@ -865,6 +873,57 @@ class _JwksCache:
     keys_by_kid: dict[str, Any] = field(default_factory=dict)
     fetched_at: float = 0.0
     ttl_seconds: float = JWKS_CACHE_TTL_SECONDS
+
+
+# Slice 19i: in-memory dedupe of inbound BF / A365 activity deliveries.
+# BF's connector retries on 5xx and slow ACK; without dedupe we forward
+# the same user message to the operator webhook multiple times. Pattern
+# adapted from NousResearch/hermes-agent#10037.
+@dataclass
+class _IdempotencyCache:
+    """TTL-keyed dedupe of ``conversationId:activityId`` pairs."""
+
+    seen: dict[str, float] = field(default_factory=dict)
+    ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
+
+    def is_duplicate(self, delivery_id: str, *, now: float | None = None) -> bool:
+        """Return True if ``delivery_id`` was seen within the TTL.
+
+        Side effect: records ``delivery_id`` as seen on first call and
+        prunes expired entries opportunistically. Pure-function callers
+        should use :meth:`peek` instead.
+        """
+        import time as _time
+
+        cur = now if now is not None else _time.time()
+        # Prune-on-check keeps the dict bounded even on long-running
+        # bridges with many short conversations.
+        self.seen = {
+            key: seen_at
+            for key, seen_at in self.seen.items()
+            if cur - seen_at < self.ttl_seconds
+        }
+        if delivery_id in self.seen:
+            return True
+        self.seen[delivery_id] = cur
+        return False
+
+
+def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
+    """Compose the dedupe key from an inbound activity.
+
+    Returns ``None`` when either id is missing — channel-control
+    activities (``conversationUpdate``, ``typing``) sometimes lack
+    ``id``, and we'd rather always-deliver them than risk dropping
+    legitimate traffic.
+    """
+    conv = (activity.get("conversation") or {}).get("id") if isinstance(
+        activity.get("conversation"), dict
+    ) else None
+    activity_id = activity.get("id")
+    if not conv or not activity_id:
+        return None
+    return f"{conv}:{activity_id}"
 
 
 async def _fetch_aad_v2_keys(client: Any, *, tenant_id: str) -> dict[str, Any]:
@@ -1364,6 +1423,7 @@ def make_app(
     jwks_cache: _JwksCache | None = None,
     fmi_cache: _FmiCache | None = None,
     user_cache: _UserTokenCache | None = None,
+    idempotency_cache: _IdempotencyCache | None = None,
 ) -> Any:
     """Build the FastAPI app for the serve loop.
 
@@ -1383,6 +1443,8 @@ def make_app(
         fmi_cache = _FmiCache()
     if user_cache is None:
         user_cache = _UserTokenCache()
+    if idempotency_cache is None:
+        idempotency_cache = _IdempotencyCache(ttl_seconds=cfg.idempotency_ttl_seconds)
 
     app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}")
 
@@ -1417,6 +1479,14 @@ def make_app(
                 )
             except JwtValidationError as e:
                 raise _HTTPException(status_code=403, detail=str(e)) from e
+
+        # Slice 19i: dedupe by (conversationId, activityId) so connector
+        # retries don't double-fire the operator webhook. Channel-control
+        # activities that lack `id` skip dedupe — better to always-deliver
+        # them than to drop legitimate traffic on a missing id.
+        delivery_id = _activity_delivery_id(activity)
+        if delivery_id is not None and idempotency_cache.is_duplicate(delivery_id):
+            return _JSONResponse({"status": "duplicate"})
 
         activity_type = activity.get("type", "message")
 
