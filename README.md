@@ -33,8 +33,16 @@ walkthrough completed end-to-end through the wrappers on 2026-05-05.
 ever assigns the `Agent365Observability` S2S app role to the blueprint
 SP, despite claiming "permissions configured successfully" in its
 output. `Messaging Bot API` and `Power Platform API` S2S grants
-silently skip. Reproducible; needs filing with Microsoft. See bug #18 in
+silently skip. Reproducible. Filed with Microsoft as
+[Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402);
+operator-side reproduction lives in bug #18 of
 [`references/live-tenant-test.md`](references/live-tenant-test.md).
+
+**Upstream contribution.** Proposal to add `hermes-a365` as an official
+optional skill is open at
+[NousResearch/hermes-agent#20133](https://github.com/NousResearch/hermes-agent/issues/20133).
+Awaiting upstream guidance on placement (light-touch link-stub vs full
+vendoring under `optional-skills/cloud-platforms/`).
 
 ## What is A365?
 
@@ -74,6 +82,8 @@ pulling these artefacts in at contribution time. See
 ├── README.md                # This file
 ├── LICENSE                  # MIT
 ├── pyproject.toml           # Python 3.11+; uv-managed; optional [bridge] extras
+├── docs/
+│   └── submissions/         # Archived drafts of upstream issues we've filed
 ├── references/              # Dated snapshots + operator runbooks
 │   ├── a365-cli-reference.md
 │   ├── activity-protocol-shapes.md
@@ -193,10 +203,16 @@ uv run python scripts/keychain.py {store|get|delete} --tenant <t> --app-id <id>
 
 ## Open work
 
-- **Bug #18** — `setup permissions bot` silently drops two of three S2S
-  app-role assignments. Reproducible. Operator-action runbook in
-  [`references/live-tenant-test.md`](references/live-tenant-test.md).
-  Needs filing with Microsoft.
+- **[Microsoft#402](https://github.com/microsoft/Agent365-devTools/issues/402)** —
+  `setup permissions bot` silently drops two of three S2S app-role
+  assignments. Filed 2026-05-05; awaiting Microsoft triage.
+  Operator-side reproduction in
+  [`references/live-tenant-test.md`](references/live-tenant-test.md)
+  (bug #18).
+- **[Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)** —
+  upstream proposal to add `hermes-a365` as an official optional
+  skill. Filed 2026-05-05; awaiting NousResearch guidance on placement
+  + contribution shape.
 - **Activity bridge — streaming responses.** Required for M365 Copilot
   substantive replies (per Microsoft's docs). Deferred from slice 19b's
   MVP. Standard BF protocol (typing activities + `streaminfo`
@@ -242,6 +258,12 @@ Slice timeline since v0.2 work began:
   contract for operator-defined responders. Validation against
   Microsoft Learn before coding: 8 GO, 2 CAUTION, 0 NO-GO on the
   10 protocol assumptions.
+- **2026-05-05** — two upstream submissions filed:
+  [Microsoft#402](https://github.com/microsoft/Agent365-devTools/issues/402)
+  for the bot-permissions S2S defect, and
+  [Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)
+  proposing `hermes-a365` as an official optional skill. Drafts
+  archived under [`docs/submissions/`](docs/submissions/).
 
 Older v0.1 slice history (1–17) lived in this README until 2026-05-05;
 it was a slice-by-slice trail that grew unwieldy. The canonical
