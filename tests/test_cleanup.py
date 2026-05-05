@@ -224,6 +224,14 @@ class TestPlanRender:
         assert "$ a365 cleanup -y azure" in text
         assert ".env" in text
 
+    def test_human_shell_quotes_multi_word_agent_name(self, tmp_path: Path) -> None:
+        """Slice 18p (bug #7): printed `$` line must be shell-pasteable."""
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="Hermes Inbox Helper"), hermes_home=tmp_path
+        )
+        text = plan.render_human()
+        assert "--agent-name 'Hermes Inbox Helper'" in text
+
     def test_human_says_none_when_no_local_files(self, tmp_path: Path) -> None:
         plan = build_cleanup_plan(CleanupInputs(agent_name="ghost"), hermes_home=tmp_path)
         assert "(none)" in plan.render_human()

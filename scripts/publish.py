@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import re
+import shlex
 import sys
 from dataclasses import dataclass, field
 
@@ -78,7 +79,9 @@ class PublishPlan:
         if self.inputs.use_blueprint:
             lines.append("  flow:    blueprint-based non-DW (Agent Instance Graph API)")
         lines.append(f"  step:    {self.step.description}")
-        lines.append(f"           $ {' '.join(self.step.argv)}")
+        # shlex.join (slice 18p, bug #7) keeps multi-word values quoted
+        # so the printed line is shell-pasteable verbatim.
+        lines.append(f"           $ {shlex.join(self.step.argv)}")
         return "\n".join(lines)
 
 

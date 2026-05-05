@@ -158,6 +158,17 @@ class TestPlanRender:
         plan = build_register_plan(RegisterInputs(agent_name="x", tenant_id="foo"))
         assert "tenant: foo" in plan.render_human()
 
+    def test_human_shell_quotes_multi_word_agent_name(self) -> None:
+        """Slice 18p (bug #7): operators copy-pasting the printed `$` line
+        need a working shell command. ``Hermes Inbox Helper`` must come
+        out as one quoted argument."""
+        plan = build_register_plan(RegisterInputs(agent_name="Hermes Inbox Helper"))
+        text = plan.render_human()
+        # `shlex.join` typically quotes with single quotes on POSIX.
+        assert "--agent-name 'Hermes Inbox Helper'" in text
+        # Negative: the broken form is gone.
+        assert "--agent-name Hermes Inbox Helper " not in text
+
 
 # ---------------------------------------------------------------------------
 # apply_register_plan — happy path

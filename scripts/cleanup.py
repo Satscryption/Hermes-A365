@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import shlex
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -142,7 +143,9 @@ class CleanupPlan:
         else:
             for s in self.steps:
                 lines.append(f"    - {s.kind:<10} {s.description}")
-                lines.append(f"      $ {' '.join(s.argv)}")
+                # shlex.join (slice 18p, bug #7) keeps multi-word values
+                # like `--agent-name "Hermes Inbox Helper"` quoted.
+                lines.append(f"      $ {shlex.join(s.argv)}")
         lines.append("  local files to remove (after cloud cleanup succeeds):")
         if not self.local_paths:
             lines.append("    (none)")

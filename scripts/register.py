@@ -39,6 +39,7 @@ See ``references/a365-cli-reference.md`` for the verified command surface.
 from __future__ import annotations
 
 import argparse
+import shlex
 import sys
 import time
 from collections.abc import Callable
@@ -142,7 +143,10 @@ class RegisterPlan:
         lines.append("  steps (in order):")
         for s in self.steps:
             lines.append(f"    - {s.name:<18} {s.description}")
-            lines.append(f"      $ {' '.join(s.argv)}")
+            # shlex.join (slice 18p, bug #7) keeps multi-word values like
+            # `--agent-name "Hermes Inbox Helper"` quoted so an operator
+            # who copy-pastes the line gets a working shell command.
+            lines.append(f"      $ {shlex.join(s.argv)}")
         return "\n".join(lines)
 
 
