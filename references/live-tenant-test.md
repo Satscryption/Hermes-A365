@@ -185,12 +185,16 @@ Failure modes to watch:
 - **`pwsh` not found** — `a365 setup` errors out citing
   `setup requirements`. Fix the prereq and re-run.
 - **"Admin consent has not been granted... non-admin user"** during
-  `setup permissions bot` — confusing CLI message that fires even
-  when you ARE Global Admin. Observed during the 2026-05-05
-  walkthrough: only the `Observability API` S2S app role assignment
-  was confirmed; `Messaging Bot API` and `Power Platform API` may
-  silently skip. If the bot test message later fails, this is the
-  first place to check.
+  `setup permissions bot` — cosmetic CLI message that fires even when
+  you ARE Global Admin. Microsoft confirmed (microsoft/Agent365-devTools#402,
+  2026-05-05) the line is misleading: it triggers on a
+  consent-not-yet-granted state for `AppRoleAssignment.ReadWrite.All`,
+  not on a role check, and the PowerShell fallback acquires the token
+  interactively a moment later. If the run still exits 0, the
+  operation completed correctly. The `appRoleAssignments` post-run
+  query will show only `Observability API` — that is also intended
+  (Messaging Bot API and Power Platform API use OAuth2 delegated
+  grants only, not S2S).
 
 - [ ] `setup blueprint` exits 0; blueprint app + SP visible in Entra.
 - [ ] `setup permissions mcp` exits 0.
@@ -372,11 +376,12 @@ documented). Five probes:
   the blueprint client secret + appId; warns if perms looser than
   0600 (slice 18i / 18x policy).
 - `token_acquisition` — runs an actual `client_credentials` POST to
-  AAD against the `Agent365Observability` resource (the one S2S
-  role our blueprint definitely has — bug #18 caveat). On
-  AADSTS7000218 (no role on resource) it warns rather than errors:
-  the secret works, just the scope permission is missing — useful
-  diagnostic, not a blocker.
+  AAD against the `Agent365Observability` resource — the only S2S
+  role the GA CLI assigns by design (Microsoft confirmed at
+  microsoft/Agent365-devTools#402; Messaging Bot / Power Platform
+  use delegated OAuth2 only). On AADSTS7000218 (no role on resource)
+  it warns rather than errors: the secret works, just the scope
+  permission is missing — useful diagnostic, not a blocker.
 - `reachability` — TCP probes against
   `login.microsoftonline.com` + `graph.microsoft.com`.
 - `otlp_endpoint` — DNS lookup on the configured OTLP endpoint.
@@ -595,4 +600,4 @@ fix; none requires architectural rework except the last.
 | 15 | SKILL.md / runbook | ~~Claim "T2 client secret lives only in the keychain".~~ **Doc-fixed in slice 18s** — SKILL.md pitfall #7 now describes the macOS / Linux plaintext-on-disk reality and the gitignored backup-file risk. |
 | 16 | `references/a365-cli-reference.md:144` | ~~`brew install --cask powershell` is deprecated.~~ **Doc-fixed in slice 18s** — references doc now says `brew install powershell` (the formula) and notes the cask was renamed to `powershell@preview` and flagged for Gatekeeper failures. Snapshot also gained the macOS `DOTNET_ROOT` gotcha that bit the walkthrough. |
 | 17 | `mutator.py` (architectural) | `subprocess.run(capture_output=True)` blocks until completion, so device-code prompts and admin-consent flows from `a365 setup *` are invisible. Slice 18i bumped the timeout to 900 s as a stop-gap. The proper fix is line-streamed output via `Popen` with `stdout=PIPE` and a reader thread. |
-| 18 | `setup permissions bot` interaction | **Deferred — needs operator action.** During the walkthrough, `setup permissions bot` printed "Admin consent has not been granted... non-admin user" mid-flight even though Sadiq was Global Admin, and only `Observability API` S2S was confirmed in the output. To diagnose, re-do the walkthrough up to step 3, then `az rest --method GET --url "https://graph.microsoft.com/v1.0/servicePrincipals/<blueprint-sp-id>/appRoleAssignments" --query "value[].{resource:resourceDisplayName, role:appRoleId}" -o table` to see which app-role assignments actually exist on the blueprint SP. Expected (per the CLI's own output): `Messaging Bot API`, `Observability API`, `Power Platform API`. If only `Observability API` shows up, the CLI is silently dropping the other two — file with Microsoft. |
+| 18 | `setup permissions bot` interaction | **Resolved upstream — intended behaviour with cosmetic logging gap.** Filed with Microsoft as [microsoft/Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402); reply on 2026-05-05 from @sellakumaran clarifies: (a) the blueprint SP is **supposed to** receive only the `Agent365Observability` S2S app-role assignment — Messaging Bot API and Power Platform API are configured via delegated OAuth2 grants only, the misleading `Configuring S2S app role assignments...` header will be reworded; (b) the mid-run "non-admin user" message is a real bug but cosmetic — fires on `AppRoleAssignment.ReadWrite.All` consent state, not a role check, and the PowerShell fallback acquires the token interactively, so a run that exits 0 completed correctly; (c) the unconditional `Bot API permissions configured successfully` log will be gated on the actual S2S outcome. All three fixes ship in the next CLI release. **Do not** manually `POST /servicePrincipals/<sp>/appRoleAssignments` for Messaging Bot / Power Platform — that would grant privileges the system doesn't intend. Operator-side query (informational only): `az rest --method GET --url "https://graph.microsoft.com/v1.0/servicePrincipals/<blueprint-sp-id>/appRoleAssignments" --query "value[].{resource:resourceDisplayName, role:appRoleId}" -o table` — expect exactly one row (`Agent365Observability`). |

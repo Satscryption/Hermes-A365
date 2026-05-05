@@ -87,14 +87,17 @@ except ImportError:  # pragma: no cover — exercised by integration tests
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
 
-# Resource appIds for token acquisition. The 2026-05-05 walkthrough
-# confirmed our blueprint has the ``Agent365Observability`` S2S
-# app-role assignment (bug #18 — only this one was set, even though
-# the CLI claimed bot+power-platform also got configured). Probing
-# this resource validates the secret + the one S2S grant we know
-# exists. ``client_credentials`` to other resources may legitimately
-# fail with ``AADSTS7000218`` (no app role) — that's still positive
-# evidence the secret itself works.
+# Resource appIds for token acquisition. The blueprint SP only ever
+# gets one S2S app-role assignment (``Agent365Observability``) — this
+# is intended behaviour per Microsoft's 2026-05-05 reply on
+# microsoft/Agent365-devTools#402, NOT a CLI defect. The Messaging
+# Bot API and Power Platform API resources are configured via
+# delegated OAuth2 grants only. Probing Observability with
+# ``client_credentials`` validates the secret + the only S2S grant
+# the GA CLI assigns. ``client_credentials`` to other resources is
+# expected to fail with ``AADSTS7000218`` (no app role) — that's
+# still positive evidence the secret works, not a missing-grant
+# signal.
 OBSERVABILITY_RESOURCE_APPID = "9b975845-388f-4429-889e-eab1ef63949c"
 GRAPH_RESOURCE = "https://graph.microsoft.com"
 

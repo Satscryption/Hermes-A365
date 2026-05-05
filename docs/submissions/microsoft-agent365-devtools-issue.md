@@ -6,6 +6,39 @@
 
 ---
 
+## Update 2026-05-05 — Microsoft response
+
+Same-day reply from @sellakumaran (Microsoft contributor) clarifies the
+behaviour described below is **partially intended** and partially a real
+but cosmetic bug. Body preserved as-filed for archival accuracy.
+
+- **The "two missing S2S grants" are not missing — they are by design.**
+  The blueprint SP is supposed to receive only the
+  `Agent365Observability` S2S app-role assignment. Messaging Bot API
+  and Power Platform API are configured via delegated OAuth2 grants
+  only. The misleading bit is the `Configuring S2S app role
+  assignments...` header plus the unconditional success log; both will
+  be reworded.
+- **The mid-run "non-admin user" line is a real bug.** Microsoft
+  confirms it triggers on a consent-not-yet-granted state for
+  `AppRoleAssignment.ReadWrite.All`, not on a role check; the
+  PowerShell fallback acquires the token interactively, which is why
+  exit 0 follows. The wording will be replaced with a role-neutral
+  message.
+- **`Bot API permissions configured successfully` will be gated** on
+  the actual S2S outcome going forward (warning + retry instruction
+  on failure rather than a false positive).
+
+All three fixes ship in the next CLI release.
+
+**RETRACTION:** the "Workaround" section below recommends manually
+assigning the missing app roles via Microsoft Graph
+(`POST /servicePrincipals/<sp>/appRoleAssignments`) — **do not follow
+this**. The roles are not missing; doing this would grant privileges
+the system does not intend to grant.
+
+---
+
 ## Title
 
 `setup permissions bot` silently drops two of three S2S app-role assignments

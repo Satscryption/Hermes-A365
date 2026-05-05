@@ -32,14 +32,18 @@ code; live-tenant validation pending round-4 walkthrough).
 | **Activity bridge** | `verify` (config + auth + reachability + FMI exchange) ships and works. `serve` (long-running BF webhook adapter) ships with the correct A365 three-stage `user_fic` outbound auth (slice 19e). Live-tenant validation pending round-4 walkthrough. |
 | **Live-tenant runbook** | [`references/live-tenant-test.md`](references/live-tenant-test.md). Walked round-2 successfully; round-3 (with the bridge) pending operator action. |
 
-**Known external blocker.** The GA `a365 setup permissions bot` only
-ever assigns the `Agent365Observability` S2S app role to the blueprint
-SP, despite claiming "permissions configured successfully" in its
-output. `Messaging Bot API` and `Power Platform API` S2S grants
-silently skip. Reproducible. Filed with Microsoft as
-[Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402);
-operator-side reproduction lives in bug #18 of
-[`references/live-tenant-test.md`](references/live-tenant-test.md).
+**Cosmetic CLI logging gap (no operator impact).** The GA `a365 setup
+permissions bot` emits a `Configuring S2S app role assignments...`
+header followed by a single S2S grant for `Agent365Observability`,
+which initially looked like "two of three grants silently dropped".
+Filed as [Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402);
+Microsoft's 2026-05-05 reply confirms the Observability-only S2S
+assignment is intended (Messaging Bot API and Power Platform API use
+delegated OAuth2 grants only), and that the misleading header,
+mid-run "non-admin user" line, and unconditional success log will be
+fixed in the next CLI release. No wrapper-side work needed; runbook
+entry #18 in [`references/live-tenant-test.md`](references/live-tenant-test.md)
+captures the upstream resolution.
 
 **Upstream contribution.** Proposal to add `hermes-a365` as an official
 optional skill is open at
@@ -209,9 +213,11 @@ uv run python scripts/keychain.py {store|get|delete} --tenant <t> --app-id <id>
 External issues filed:
 
 - **[Microsoft#402](https://github.com/microsoft/Agent365-devTools/issues/402)** —
-  `setup permissions bot` silently drops two of three S2S app-role
-  assignments. Filed 2026-05-05; awaiting Microsoft triage.
-  Operator-side reproduction in
+  `setup permissions bot` cosmetic logging gap. Filed 2026-05-05;
+  Microsoft replied same day confirming Observability-only S2S
+  assignment is intended (the other two resources use delegated
+  OAuth2 only) — three message/log fixes queued for the next CLI
+  release. Resolution captured in
   [`references/live-tenant-test.md`](references/live-tenant-test.md)
   (bug #18).
 - **[Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)** —
@@ -252,8 +258,10 @@ Slice timeline since v0.2 work began:
 - **2026-05-04** — slice 18h: live-tenant runbook
   ([`references/live-tenant-test.md`](references/live-tenant-test.md)).
 - **2026-05-05** — round-2 walkthrough surfaced 18 wrapper bugs and CLI
-  realities. Slices 18i–18u fixed all 17 in code/docs; #18 is a
-  Microsoft CLI defect.
+  realities. Slices 18i–18u fixed all 17 in code/docs; #18 was filed
+  as Microsoft#402 and confirmed by Microsoft same-day to be intended
+  behaviour with a cosmetic logging gap (slice 19k aligned the
+  wrapper docs and code comments).
 - **2026-05-05** — slices 18v–18x: scope-classifier hint corrections
   against the verified GA output (`Inheritable Scopes:` /
   `Successfully retrieved`), `Mutator` `stdin_input` kwarg so cleanup
