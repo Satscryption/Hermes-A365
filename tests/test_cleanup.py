@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -285,6 +286,34 @@ class TestApplyCleanup:
         result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
         assert result.completed == ["blueprint"]
         assert [argv[3] for argv in mutator.calls] == ["blueprint"]
+
+    def test_chmods_secret_bearing_backups_to_600(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Slice 18x: `a365 cleanup -y` writes `*.backup-*.json` files
+        with default umask (644). The `a365.generated.config.backup-*`
+        copy carries the blueprint client secret in plaintext on
+        macOS / Linux — tighten to 0600 after cleanup runs."""
+        _seed_agent_dir(tmp_path)
+        # Cleanup uses Path.cwd() to find the backups; chdir into a
+        # tempdir so we don't see anything from the real repo.
+        monkeypatch.chdir(tmp_path)
+        gen_backup = tmp_path / "a365.generated.config.backup-20260101-000000.json"
+        gen_backup.write_text('{"agentBlueprintClientSecret": "redacted"}\n')
+        cfg_backup = tmp_path / "a365.config.backup-20260101-000000.json"
+        cfg_backup.write_text("{}\n")
+        # Both start world-readable (default umask).
+        os.chmod(gen_backup, 0o644)
+        os.chmod(cfg_backup, 0o644)
+
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
+
+        assert (gen_backup.stat().st_mode & 0o777) == 0o600
+        assert (cfg_backup.stat().st_mode & 0o777) == 0o600
+        assert any("chmod 600" in m for m in result.messages)
 
     def test_aadsts_error_propagates_and_local_files_remain(self, tmp_path: Path) -> None:
         _seed_agent_dir(tmp_path)

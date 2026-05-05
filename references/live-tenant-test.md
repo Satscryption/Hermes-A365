@@ -388,9 +388,13 @@ the per-agent local artefacts under `~/.hermes/agents/<slug>/`.
 ⚠️ **Backup files contain the secret.** The
 `a365.generated.config.backup-*.json` file the cleanup leaves behind
 holds the same plaintext client secret as the original. Slice 18i
-gitignored both backup patterns; if you've cloned to a fresh checkout,
-double-check `git check-ignore -v a365.generated.config.backup-*.json`
-returns a hit before running `git add`.
+gitignored both backup patterns; slice 18x further `chmod 600`s every
+`a365.{,generated.}config.backup-*.json` in cwd at the end of an
+apply run so a stray multi-user-machine incident doesn't leak the
+secret. If you've cloned to a fresh checkout, double-check
+`git check-ignore -v a365.generated.config.backup-*.json` returns a
+hit before running `git add`. Operators can `rm` the backups
+manually once they've audited what cleanup did.
 
 - [ ] `cleanup --apply` exits 0.
 - [ ] Blueprint app + service principal removed from Entra Portal.

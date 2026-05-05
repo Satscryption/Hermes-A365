@@ -256,6 +256,22 @@ def apply_cleanup_plan(
         agent_dir.rmdir()
         result.messages.append(f"[apply] removed empty dir {agent_dir}")
 
+    # Slice 18x: `a365 cleanup -y` defensively backs the generated config
+    # (which contains the blueprint client secret in plaintext on macOS /
+    # Linux) into `*.backup-<timestamp>.json` before deleting the
+    # original. The CLI writes those backups with default umask (644 —
+    # world-readable). Tighten to 0600 so a stray operator-machine
+    # incident doesn't leak the secret. Operators can still delete them
+    # manually; we don't auto-delete because they have audit value.
+    cwd = Path.cwd()
+    for backup in sorted(cwd.glob("a365.*config.backup-*.json")):
+        try:
+            os.chmod(backup, 0o600)
+            result.messages.append(f"[apply] chmod 600 {backup}")
+        except OSError:
+            # Don't fail cleanup over a chmod that didn't take.
+            continue
+
     return result
 
 

@@ -193,6 +193,20 @@ class TestWriteTextAtomic:
         assert target.read_text() == "K=V\n"
         assert not (tmp_path / "a" / "b" / "c.env.tmp").exists()
 
+    def test_default_mode_is_owner_only(self, tmp_path: Path) -> None:
+        """Slice 18x: defensive 0600 default. Output files (currently the
+        per-agent .env, future activity-bridge config) shouldn't inherit
+        world-readable umask defaults."""
+        target = tmp_path / "secret.env"
+        write_text_atomic(target, "K=V\n")
+        # Mask off the file-type bits and check just the perm bits.
+        assert (target.stat().st_mode & 0o777) == 0o600
+
+    def test_explicit_mode_override(self, tmp_path: Path) -> None:
+        target = tmp_path / "shared.env"
+        write_text_atomic(target, "K=V\n", mode=0o644)
+        assert (target.stat().st_mode & 0o777) == 0o644
+
 
 # ---------------------------------------------------------------------------
 # apply_instance_plan

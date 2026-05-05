@@ -81,11 +81,19 @@ def _load_existing_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:
     return parse_env(path.read_text())
 
 
-def write_text_atomic(path: Path, text: str) -> None:
-    """Write ``text`` to ``path`` via tmp + rename. Creates parents."""
+def write_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
+    """Write ``text`` to ``path`` via tmp + rename. Creates parents.
+
+    ``mode`` defaults to 0o600 (slice 18x — owner-only) so we don't leak
+    operator metadata (email, AAD object id, instance id, OTLP endpoint)
+    via world-readable umask defaults. The agent .env doesn't contain
+    secrets by design, but tightening it here also protects any future
+    secret-bearing file the activity bridge writes.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.write_text(text)
+    os.chmod(tmp, mode)
     os.replace(tmp, path)
 
 
