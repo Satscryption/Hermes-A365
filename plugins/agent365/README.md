@@ -15,15 +15,34 @@ plugins/agent365/
   README.md           # this file
 ```
 
-## Status — slice 19m
+## Status — slices 19m + 19n
 
-This is the **registration skeleton only**. Every method on
-`Agent365Adapter` that touches the network is a stub that logs a
-`TODO 19n` warning and either no-ops or returns `SendResult(success=True)`.
-The runtime logic (FastAPI webhook, JWT validation, idempotency dedupe,
-serviceUrl gate, outbound user-FIC chain) lives in
-`scripts/activity_bridge.py` today and gets ported under
-`Agent365Adapter` in slice 19n.
+The plugin now runs the bridge end-to-end:
+
+- **Inbound** (`/api/messages` route) — JWT validation (slice 19f),
+  idempotency dedupe (slice 19i), serviceUrl host-suffix gate
+  (slice 19j), then `MessageEvent` dispatch via
+  `self.handle_message(event)`.
+- **Outbound** (`Agent365Adapter.send`) — looks up the cached inbound
+  for the target chat, mints an outbound user-FIC bearer
+  (slice 19e), and POSTs the reply via `serviceUrl`.
+- **Lifecycle** — `connect()` builds the FastAPI app and runs uvicorn
+  in a background task; `disconnect()` shuts uvicorn cleanly and
+  closes the httpx client.
+
+Bridge helpers (`validate_inbound_jwt`, `_IdempotencyCache`,
+`_is_trusted_service_url`, `acquire_outbound_token`, `send_reply`,
+…) are imported from `scripts/activity_bridge.py` rather than
+copy-pasted; that module remains the single source of truth and
+keeps working as a standalone `serve` entrypoint.
+
+Still TODO:
+- `send_typing` — currently a no-op.
+- `send_image` — placeholder until the Adaptive Card image renderer
+  lands.
+- Durable session table (slice 19o) — replaces the in-memory
+  `_chat_contexts` dict so proactive sends (`#4`) and longer-lived
+  conversations work without a recent inbound.
 
 Tracking issue: [#1 — Activity bridge — Hermes gateway platform plugin](https://github.com/satscryption/Hermes-A365/issues/1).
 
@@ -60,9 +79,9 @@ Required env vars (already populated by the wrapper's
 
 | slice | scope | status |
 |---|---|---|
-| **19m** | skeleton — `PLUGIN.yaml`, adapter class, `register(ctx)` | ✅ this commit |
-| 19n | port the FastAPI webhook + bridge runtime under `Agent365Adapter`; map inbound → `handle_message(event)`, outbound → `send()` | next |
-| 19o | session table — BF `conversation.id` → Hermes session; conversation memory across turns | |
+| 19m | skeleton — `PLUGIN.yaml`, adapter class, `register(ctx)` | ✅ |
+| **19n** | port the FastAPI webhook + bridge runtime under `Agent365Adapter`; map inbound → `handle_message(event)`, outbound → `send()` | ✅ |
+| 19o | durable session table — BF `conversation.id` → Hermes session; conversation memory across turns; surfaces `send_typing` and `send_image` | next |
 | 19p | round-N walkthrough validation against satscryption.io | |
 
 ## Reference

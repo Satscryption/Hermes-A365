@@ -1,16 +1,11 @@
-"""Tests for plugins/agent365 — slice 19m skeleton.
+"""Tests for plugins/agent365 — slices 19m skeleton + 19n runtime port.
 
-The plugin imports ``gateway.platforms.base`` and ``gateway.config``
-from the Hermes harness at module level. These aren't installed in
-this repo's venv (the harness lives at ``~/.hermes/hermes-agent/``),
-so we install minimal stubs into ``sys.modules`` *before* importing
-the plugin module — same trick upstream Hermes uses for its own
-unit tests of platform plugins.
-
-Slice 19m proves the registration plumbing is right; slice 19n's
-tests exercise the actual runtime. We deliberately don't test
-real connect/send semantics here — those methods are documented
-stubs.
+The plugin imports ``gateway.platforms.base``, ``gateway.config``, and
+``gateway.session`` from the Hermes harness at module level. Those
+aren't installed in this repo's venv (the harness lives at
+``~/.hermes/hermes-agent/``), so we install minimal stubs into
+``sys.modules`` *before* importing the plugin module — same trick
+upstream Hermes uses for its own unit tests of platform plugins.
 """
 
 from __future__ import annotations
@@ -19,14 +14,15 @@ import importlib
 import sys
 import types
 from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 # ---------------------------------------------------------------------------
-# Stub harness modules. Installed once at module import; removed in
-# the final cleanup fixture so other test modules don't see them.
+# Stub harness modules. Installed once at module import.
 # ---------------------------------------------------------------------------
 
 
@@ -34,27 +30,23 @@ import pytest
 class _StubSendResult:
     success: bool
     message_id: Any = None
+    error: str | None = None
 
 
-class _StubBasePlatformAdapter:
-    def __init__(self, config: Any, platform: Any) -> None:
-        self.config = config
-        self.platform = platform
-        self._running = False
-
-    def _mark_connected(self) -> None:
-        self._running = True
-
-    def _mark_disconnected(self) -> None:
-        self._running = False
+class _StubMessageType(Enum):
+    TEXT = "text"
+    PHOTO = "photo"
+    DOCUMENT = "document"
 
 
+@dataclass
 class _StubMessageEvent:
-    pass
-
-
-class _StubMessageType:
-    pass
+    text: str
+    message_type: Any = None
+    source: Any = None
+    raw_message: Any = None
+    message_id: str | None = None
+    timestamp: Any = None
 
 
 class _StubPlatform:
@@ -80,6 +72,52 @@ class _StubPlatformConfig:
     extra: dict[str, Any] = field(default_factory=dict)
 
 
+@dataclass
+class _StubSessionSource:
+    platform: Any
+    chat_id: str
+    chat_name: str | None = None
+    chat_type: str = "dm"
+    user_id: str | None = None
+    user_name: str | None = None
+    thread_id: str | None = None
+    chat_topic: str | None = None
+    user_id_alt: str | None = None
+    chat_id_alt: str | None = None
+    is_bot: bool = False
+    guild_id: str | None = None
+    parent_chat_id: str | None = None
+    message_id: str | None = None
+
+
+class _StubBasePlatformAdapter:
+    """Just enough of BasePlatformAdapter for the adapter tests.
+
+    Stores any event passed to ``handle_message`` on
+    ``self._handled_events`` so route tests can assert dispatch
+    happened with the right shape.
+    """
+
+    def __init__(self, config: Any, platform: Any) -> None:
+        self.config = config
+        self.platform = platform
+        self._running = False
+        self._fatal: tuple[str, str, bool] | None = None
+        self._handled_events: list[Any] = []
+
+    def _mark_connected(self) -> None:
+        self._running = True
+
+    def _mark_disconnected(self) -> None:
+        self._running = False
+
+    def _set_fatal_error(self, code: str, message: str, *, retryable: bool) -> None:
+        self._fatal = (code, message, retryable)
+
+    async def handle_message(self, event: Any) -> None:
+        self._handled_events.append(event)
+
+
 def _install_gateway_stubs() -> None:
     if "gateway.platforms.base" in sys.modules:
         return
@@ -87,6 +125,7 @@ def _install_gateway_stubs() -> None:
     platforms = types.ModuleType("gateway.platforms")
     base = types.ModuleType("gateway.platforms.base")
     config = types.ModuleType("gateway.config")
+    session = types.ModuleType("gateway.session")
 
     base.BasePlatformAdapter = _StubBasePlatformAdapter
     base.SendResult = _StubSendResult
@@ -94,22 +133,20 @@ def _install_gateway_stubs() -> None:
     base.MessageType = _StubMessageType
     config.Platform = _StubPlatform
     config.PlatformConfig = _StubPlatformConfig
+    session.SessionSource = _StubSessionSource
 
     sys.modules["gateway"] = gateway
     sys.modules["gateway.platforms"] = platforms
     sys.modules["gateway.platforms.base"] = base
     sys.modules["gateway.config"] = config
+    sys.modules["gateway.session"] = session
 
 
 _install_gateway_stubs()
 
-
-# Make the plugins/ directory importable. We append rather than insert
-# so a real Hermes install on the path still wins.
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 sys.path.append(str(_REPO_ROOT))
 
-# Now safe to import the plugin.
 agent365 = importlib.import_module("plugins.agent365")
 adapter_mod = importlib.import_module("plugins.agent365.adapter")
 
@@ -132,7 +169,43 @@ class _FakeCtx:
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Test helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_adapter(monkeypatch: pytest.MonkeyPatch, **extra_overrides: Any) -> Any:
+    """Build an Agent365Adapter with sensible defaults for route tests."""
+    monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
+    monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
+    extra = {"slug": "test-agent", "port": 0}
+    extra.update(extra_overrides)
+    cfg = _StubPlatformConfig(extra=extra)
+    return adapter_mod.Agent365Adapter(cfg)
+
+
+def _make_inbound(
+    *,
+    text: str = "hello",
+    conv_id: str = "conv-1",
+    activity_id: str = "act-1",
+    service_url: str = "https://smba.trafficmanager.net/amer/x/",
+) -> dict[str, Any]:
+    """Synthesise a BF activity in the shape the bridge sees from A365."""
+    return {
+        "type": "message",
+        "id": activity_id,
+        "channelId": "msteams",
+        "serviceUrl": service_url,
+        "conversation": {"id": conv_id, "conversationType": "personal"},
+        "from": {"id": "user-1", "name": "Sadiq"},
+        "recipient": {"id": "agent-1", "name": "Inbox Helper"},
+        "text": text,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Manifest + register (carried over from 19m)
 # ---------------------------------------------------------------------------
 
 
@@ -140,9 +213,6 @@ class TestPluginManifest:
     def test_plugin_yaml_present_and_parseable(self) -> None:
         path = _REPO_ROOT / "plugins" / "agent365" / "PLUGIN.yaml"
         assert path.exists()
-        # Don't add a yaml dependency just for this — the loader is the
-        # authoritative parser. Smoke-check that the keys we depend on
-        # are textually present.
         text = path.read_text()
         for key in ("name:", "version:", "description:", "requires_env:"):
             assert key in text, f"PLUGIN.yaml missing {key!r}"
@@ -161,10 +231,7 @@ class TestRegister:
         kwargs = ctx.platforms[0]
         assert kwargs["name"] == "agent365"
         assert kwargs["label"] == "Microsoft Agent 365"
-        # The factory must be callable; we don't invoke it here.
         assert callable(kwargs["adapter_factory"])
-        # Plugin loader uses these env-name strings to wire authorization
-        # without requiring core changes.
         assert kwargs["allowed_users_env"] == "A365_ALLOWED_USERS"
         assert kwargs["allow_all_env"] == "A365_ALLOW_ALL_USERS"
         assert kwargs["required_env"] == ["A365_TENANT_ID", "A365_APP_ID"]
@@ -179,8 +246,6 @@ class TestRegister:
     def test_max_message_length_is_set(self) -> None:
         ctx = _FakeCtx()
         adapter_mod.register(ctx)
-        # Smart-chunking gate. 0 would mean "no chunking" — A365 does
-        # have a practical limit, so this must be non-zero.
         assert ctx.platforms[0]["max_message_length"] > 0
 
     def test_platform_hint_mentions_a365(self) -> None:
@@ -192,9 +257,8 @@ class TestRegister:
 
 class TestCheckRequirements:
     def test_returns_true_when_extras_installed(self) -> None:
-        # The bridge extras (httpx, fastapi, jwt) ARE installed in this
-        # repo's dev venv (used by the existing bridge tests). So the
-        # probe should report True.
+        # Bridge extras (httpx, fastapi, jwt, uvicorn) are in the dev
+        # venv per the existing bridge tests.
         assert adapter_mod.check_requirements() is True
 
 
@@ -224,22 +288,31 @@ class TestValidateConfig:
         assert adapter_mod.validate_config(cfg) is False
 
 
+# ---------------------------------------------------------------------------
+# Adapter construction (env / extra plumbing)
+# ---------------------------------------------------------------------------
+
+
 class TestAdapterConstruction:
     def test_init_pulls_slug_and_port_from_extra(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
-        monkeypatch.delenv("HERMES_BRIDGE_PORT", raising=False)
-        monkeypatch.delenv("A365_TENANT_ID", raising=False)
-        monkeypatch.delenv("A365_APP_ID", raising=False)
-        monkeypatch.delenv("HERMES_BRIDGE_WEBHOOK", raising=False)
+        for k in (
+            "AGENT_IDENTITY",
+            "HERMES_BRIDGE_PORT",
+            "A365_TENANT_ID",
+            "A365_APP_ID",
+            "HERMES_BRIDGE_WEBHOOK",
+            "A365_BLUEPRINT_CLIENT_SECRET",
+        ):
+            monkeypatch.delenv(k, raising=False)
         cfg = _StubPlatformConfig(
             extra={
                 "slug": "inbox-helper",
                 "port": 3978,
                 "tenant_id": "tenant-1",
                 "app_id": "app-1",
-                "webhook_url": "http://hook",
+                "blueprint_client_secret": "extra-secret",
             }
         )
         a = adapter_mod.Agent365Adapter(cfg)
@@ -247,58 +320,265 @@ class TestAdapterConstruction:
         assert a.port == 3978
         assert a.tenant_id == "tenant-1"
         assert a.blueprint_app_id == "app-1"
-        assert a.webhook_url == "http://hook"
-        # Platform identity is preserved via the stub Platform class.
+        assert a.blueprint_client_secret == "extra-secret"
         assert a.platform.value == "agent365"
 
     def test_env_vars_override_extra(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("HERMES_BRIDGE_PORT", "4000")
         monkeypatch.setenv("A365_TENANT_ID", "env-tenant")
         monkeypatch.setenv("A365_APP_ID", "env-app")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "env-secret")
         cfg = _StubPlatformConfig(
-            extra={"port": 3978, "tenant_id": "ignored", "app_id": "ignored"}
+            extra={
+                "port": 3978,
+                "tenant_id": "ignored",
+                "app_id": "ignored",
+                "blueprint_client_secret": "ignored",
+            }
         )
         a = adapter_mod.Agent365Adapter(cfg)
         assert a.port == 4000
         assert a.tenant_id == "env-tenant"
         assert a.blueprint_app_id == "env-app"
+        assert a.blueprint_client_secret == "env-secret"
 
-    @pytest.mark.asyncio
-    async def test_connect_disconnect_marks_running_state(
-        self, monkeypatch: pytest.MonkeyPatch
+    def test_secret_loaded_from_generated_config_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cfg_path = tmp_path / "a365.generated.config.json"
+        cfg_path.write_text('{"agentBlueprintClientSecret": "from-disk"}')
+        monkeypatch.setenv("A365_TENANT_ID", "t")
+        monkeypatch.setenv("A365_APP_ID", "a")
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        cfg = _StubPlatformConfig(
+            extra={"generated_config_path": str(cfg_path)}
+        )
+        a = adapter_mod.Agent365Adapter(cfg)
+        # Lazy-loaded only when the bridge config is built.
+        assert a.blueprint_client_secret == ""
+        assert a._ensure_secret() == "from-disk"
+        assert a.blueprint_client_secret == "from-disk"
+
+    def test_make_bridge_config_raises_without_secret(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         monkeypatch.setenv("A365_TENANT_ID", "t")
         monkeypatch.setenv("A365_APP_ID", "a")
-        cfg = _StubPlatformConfig(extra={"slug": "x", "port": 3978})
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        # Generated config exists but has no secret.
+        cfg_path = tmp_path / "a365.generated.config.json"
+        cfg_path.write_text("{}")
+        cfg = _StubPlatformConfig(
+            extra={"generated_config_path": str(cfg_path)}
+        )
         a = adapter_mod.Agent365Adapter(cfg)
-        ok = await a.connect()
-        assert ok is True
-        assert a._running is True
-        await a.disconnect()
-        assert a._running is False
+        with pytest.raises(RuntimeError, match="missing"):
+            a._make_bridge_config()
 
-    @pytest.mark.asyncio
-    async def test_send_returns_successful_stub(
+
+# ---------------------------------------------------------------------------
+# /api/messages route — drive via FastAPI TestClient.
+# ---------------------------------------------------------------------------
+
+
+class TestMessagesRoute:
+    def test_untrusted_service_url_returns_403(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("A365_TENANT_ID", "t")
-        monkeypatch.setenv("A365_APP_ID", "a")
-        cfg = _StubPlatformConfig(extra={})
-        a = adapter_mod.Agent365Adapter(cfg)
-        result = await a.send(chat_id="conv-1", content="hi", metadata={})
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        client = TestClient(a.build_app())
+        body = _make_inbound(service_url="https://attacker.example/")
+        r = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer x"},
+        )
+        assert r.status_code == 403
+        assert "untrusted serviceUrl" in r.json()["detail"]
+        assert a._handled_events == []
+
+    def test_missing_authorization_returns_401(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        client = TestClient(a.build_app())
+        r = client.post("/api/messages", json=_make_inbound())
+        assert r.status_code == 401
+
+    def test_valid_jwt_dispatches_message_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Patch the bridge's validator + http client so we can drive
+        the route end-to-end without a real Microsoft JWKS / token."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        # Patch validate_inbound_jwt to always succeed.
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        a._http_client = MagicMock()  # never actually called in the JWT path
+
+        client = TestClient(a.build_app())
+        body = _make_inbound(text="hello there", conv_id="conv-X", activity_id="aaa")
+        r = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "dispatched"
+        # MessageEvent landed in handle_message.
+        assert len(a._handled_events) == 1
+        evt = a._handled_events[0]
+        assert evt.text == "hello there"
+        assert evt.source.chat_id == "conv-X"
+        assert evt.source.chat_type == "dm"  # personal → dm mapping
+        assert evt.source.user_id == "user-1"
+        assert evt.source.user_name == "Sadiq"
+        # Cached for outbound lookup.
+        assert "conv-X" in a._chat_contexts
+        assert a._chat_contexts["conv-X"]["id"] == "aaa"
+
+    def test_duplicate_delivery_short_circuits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        a._http_client = MagicMock()
+        client = TestClient(a.build_app())
+        body = _make_inbound()
+        headers = {"Authorization": "Bearer pretend"}
+        r1 = client.post("/api/messages", json=body, headers=headers)
+        r2 = client.post("/api/messages", json=body, headers=headers)
+        assert r1.json()["status"] == "dispatched"
+        assert r2.json()["status"] == "duplicate"
+        # Only one dispatch despite two POSTs.
+        assert len(a._handled_events) == 1
+
+    def test_conversation_update_acked_no_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        a._http_client = MagicMock()
+        client = TestClient(a.build_app())
+        body = {**_make_inbound(), "type": "conversationUpdate"}
+        r = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "acked"
+        assert a._handled_events == []
+
+
+# ---------------------------------------------------------------------------
+# send() — outbound via cached inbound + send_reply
+# ---------------------------------------------------------------------------
+
+
+class TestSend:
+    @pytest.mark.asyncio
+    async def test_send_with_no_cached_inbound_returns_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        result = await a.send(chat_id="missing", content="hi")
+        assert result.success is False
+        assert "no cached inbound" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_send_with_cached_inbound_invokes_send_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._chat_contexts["conv-1"] = _make_inbound()
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        result = await a.send(chat_id="conv-1", content="hi back")
         assert result.success is True
+        assert send_reply_mock.await_count == 1
+        kwargs = send_reply_mock.await_args.kwargs
+        assert kwargs["inbound"]["id"] == "act-1"
+        # Reply activity carries our text.
+        assert kwargs["reply"]["text"] == "hi back"
+        # Reply mirrors BF reply convention.
+        assert kwargs["reply"]["replyToId"] == "act-1"
 
     @pytest.mark.asyncio
-    async def test_get_chat_info_shape(
+    async def test_send_reply_failure_surfaces_in_send_result(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setenv("A365_TENANT_ID", "t")
-        monkeypatch.setenv("A365_APP_ID", "a")
-        cfg = _StubPlatformConfig(extra={})
-        a = adapter_mod.Agent365Adapter(cfg)
-        info = await a.get_chat_info("conv-42")
-        # ADDING_A_PLATFORM.md:31-46 mandates the {name, type, chat_id}
-        # contract — slice 19o will replace the placeholder name with a
-        # session-table lookup.
-        assert set(info.keys()) >= {"name", "type", "chat_id"}
-        assert info["chat_id"] == "conv-42"
+        a = _make_adapter(monkeypatch)
+        a._chat_contexts["conv-1"] = _make_inbound()
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        boom = AsyncMock(side_effect=RuntimeError("token mint failed"))
+        monkeypatch.setattr(bridge, "send_reply", boom)
+
+        result = await a.send(chat_id="conv-1", content="x")
+        assert result.success is False
+        assert "token mint failed" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# get_chat_info — pulls metadata from cached inbound
+# ---------------------------------------------------------------------------
+
+
+class TestGetChatInfo:
+    @pytest.mark.asyncio
+    async def test_returns_default_shape_when_no_cache(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        info = await a.get_chat_info("unknown")
+        assert info == {"name": "unknown", "type": "personal", "chat_id": "unknown"}
+
+    @pytest.mark.asyncio
+    async def test_resolves_name_and_type_from_cache(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        cached = _make_inbound(conv_id="conv-G")
+        cached["conversation"]["conversationType"] = "groupChat"
+        cached["conversation"]["name"] = "team-room"
+        a._chat_contexts["conv-G"] = cached
+        info = await a.get_chat_info("conv-G")
+        assert info["name"] == "team-room"
+        assert info["type"] == "group"
+        assert info["chat_id"] == "conv-G"
