@@ -1,0 +1,17 @@
+name: agent365
+version: 0.1.0
+description: >
+  Microsoft Agent 365 gateway adapter for Hermes Agent.
+  Receives BF-shaped activities from A365 / MCP Platform on a local
+  webhook endpoint (operator exposes via cloudflared / reverse
+  proxy), validates inbound JWTs as AAD-v2 against the configured
+  tenant, and posts replies back via the agentic three-stage
+  user-FIC token chain. Surfaces include Microsoft Teams 1:1 chat
+  (the validated round-4 path), with M365 Copilot Chat and Outlook
+  surfaces extensible via the `agents` channel.
+author: Satscryption
+requires_env:
+  - A365_TENANT_ID
+  - A365_APP_ID
+  - AA_INSTANCE_ID
+  - HERMES_BRIDGE_PORT
