@@ -779,27 +779,44 @@ handle:
       --tenant-id <tenant-id> --apply --confirm "<display-name>" \
       --purge-orphans
   ```
-  The agentRegistry DELETE requires `AgentRegistry.ReadWrite.All`
-  on the delegated `az` CLI token; on accounts without it the
-  wrapper surfaces the failure and falls back to the recovery line.
+  The agentRegistry DELETE requires **`AgentInstance.ReadWrite.All`**
+  on the calling app (NOT `AgentRegistry.ReadWrite.All` — that
+  scope doesn't exist on Microsoft Graph). The az CLI's first-party
+  app token doesn't carry it, so blueprint-only-flow orphans 403
+  by default; on accounts that have granted it to the
+  `Agent 365 CLI` app + run via MSAL device-code, the wrapper's
+  DELETE works for blueprint-only-flow instances.
 
-- **AI Teammate flow note (round-4 finding).** The
-  `publish --aiteammate` flow has Microsoft create the instance
-  server-side during admin-centre activation. The instance id
-  never reaches `a365.generated.config.json`, so the snapshot
-  path is blind to it. Pass it explicitly via
-  `--orphan-instance-id <guid>` (repeatable). The id can be read
-  from the Agent 365 admin centre Instances tab on the agent. Or
-  follow the recovery line the wrapper prints from the
-  blueprint-only path.
+- **AI Teammate flow reality (re-confirmed across rounds 3, 4, 5 —
+  stable across walkthroughs).** AI Teammate-flow instances
+  (`originatingStore: "Microsoft Agent Store"` + `managedBy:
+  9b975845-…`) **always 403 on Graph DELETE regardless of scope** —
+  not even `AgentInstance.ReadWrite.All` granted to the
+  `Agent 365 CLI` app clears them. Microsoft gates store-managed
+  deletes behind a different authorization rule that isn't
+  operator-exposed as a delegated scope at all. The
+  `--orphan-instance-id` flag is therefore a no-op for AI-Teammate
+  registrations; passing the GUID just produces a documented 403
+  recovery-line in the wrapper output. **Don't waste time trying
+  alternate scopes.**
 
-  ```bash
-  uv run python scripts/cleanup.py --agent-name "<display-name>" \
-      --apply --confirm "<display-name>" --purge-orphans \
-      --orphan-instance-id <guid-from-admin-centre>
-  ```
+  Canonical path for store-managed instances: **M365 Admin Centre
+  → Agents → All agents → click the agent → Instance tab →
+  select instance → Delete**. Per
+  [Microsoft Learn: Manage agent instances](https://learn.microsoft.com/en-us/microsoft-365/admin/manage/manage-agent-instances).
+  30-day soft-delete with audit retention.
 
-- Or copy the recovery line(s) the wrapper prints and run by hand.
+  Then on the agent's main pane → **Block** (per
+  [Microsoft Learn: agent-actions](https://learn.microsoft.com/en-us/microsoft-365/admin/manage/agent-actions)).
+  Microsoft doesn't expose Delete for custom-uploaded AI Teammates;
+  blocking is as clean as the registry entry gets.
+
+  Doing only Block leaves an inert orphan in
+  `agentRegistry/agentInstances`. Doing both Instance Delete + Block
+  drops the orphan to baseline.
+
+- Or copy the recovery line(s) the wrapper prints and run by hand
+  (only useful for blueprint-only-flow orphans).
 
 - [ ] `cleanup --apply` exits 0 (or 1 with only documented orphans —
       re-run with `--purge-orphans` to make it 0).
