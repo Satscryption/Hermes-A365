@@ -576,14 +576,42 @@ class TestShouldDispatch:
         assert adapter_mod._should_dispatch(body) is False
 
     def test_agents_channel_message_from_system_acks(self) -> None:
-        # Synthetic email-template render activities arrive on
-        # `agents` channel as `type=message` from `from.id=system`.
+        # Synthetic lifecycle render activities arrive on `agents`
+        # channel as `type=message` from `from.id=system`.
         body = {
             **_make_inbound(),
             "channelId": "agents",
             "from": {"id": "system", "name": "System"},
         }
         assert adapter_mod._should_dispatch(body) is False
+
+    def test_agents_channel_message_from_no_reply_acks(self) -> None:
+        # The exact shape that slipped through the original `system`-only
+        # filter during the §9d round-5 walkthrough — Teams ships these
+        # email-template render activities (a "you have a new Copilot
+        # notification" HTML blob) on the `agents` channel from a
+        # no-reply mail address. Captured in conversations.json
+        # post-walkthrough.
+        body = {
+            **_make_inbound(),
+            "channelId": "agents",
+            "from": {
+                "id": "no-reply@teams.mail.microsoft",
+                "name": "Microsoft Teams",
+            },
+        }
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_msteams_channel_no_reply_still_dispatches(self) -> None:
+        # The no-reply filter is gated on `channelId=agents` —
+        # we never want to drop a real msteams message just because
+        # it happens to share a sender prefix.
+        body = {
+            **_make_inbound(),
+            "from": {"id": "no-reply@teams.mail.microsoft", "name": "x"},
+        }
+        # channelId stays "msteams" via _make_inbound's default.
+        assert adapter_mod._should_dispatch(body) is True
 
     def test_agents_channel_message_from_real_user_dispatches(self) -> None:
         # If a real user message ever lands on the `agents` channel

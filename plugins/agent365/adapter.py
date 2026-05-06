@@ -138,6 +138,11 @@ def _should_dispatch(activity: dict[str, Any]) -> bool:
     ``False`` for BF channel-control + synthetic ``agents``-channel
     probes. Pure-function so the route stays small and tests can
     exercise the matrix without spinning up a TestClient.
+
+    The ``agents``-channel synthetic-sender filter was extended after
+    the §9d round-5 walkthrough caught the email-template render
+    activity slipping through under the literal ``"system"`` filter
+    (real ``from.id`` is ``no-reply@teams.mail.microsoft``).
     """
     activity_type = str(activity.get("type") or "message")
     if activity_type in _CHANNEL_CONTROL_TYPES:
@@ -150,7 +155,12 @@ def _should_dispatch(activity: dict[str, Any]) -> bool:
         sender_id = ""
         if isinstance(sender, dict):
             sender_id = str(sender.get("id") or "")
-        if sender_id == "system":
+        # ``system`` is the literal Microsoft uses for lifecycle
+        # event senders. ``no-reply@…`` covers the email-template
+        # render activities Teams ships when an unread Copilot
+        # notification arrives. Both classes are synthetic and
+        # waste agent turns; real Teams users never use either id.
+        if sender_id == "system" or sender_id.startswith("no-reply@"):
             return False
     return True
 
