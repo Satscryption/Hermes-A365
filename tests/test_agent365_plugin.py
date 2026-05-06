@@ -538,6 +538,154 @@ class TestMessagesRoute:
 
 
 # ---------------------------------------------------------------------------
+# Slice 19q — filter agents-channel synthetic events
+# ---------------------------------------------------------------------------
+
+
+class TestShouldDispatch:
+    """Pure-function classifier for which inbound activities reach
+    ``handle_message``. Round-5 §9d walkthrough surfaced
+    ``agents``-channel onboarding probes spamming the agent loop —
+    these tests pin the matrix."""
+
+    def test_real_msteams_message_dispatches(self) -> None:
+        assert adapter_mod._should_dispatch(_make_inbound()) is True
+
+    def test_conversation_update_acks(self) -> None:
+        body = {**_make_inbound(), "type": "conversationUpdate"}
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_typing_acks(self) -> None:
+        body = {**_make_inbound(), "type": "typing"}
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_end_of_conversation_acks(self) -> None:
+        body = {**_make_inbound(), "type": "endOfConversation"}
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_agents_channel_event_acks(self) -> None:
+        # The exact shape Microsoft sends for `agentLifecycle` probes
+        # during the AI Teammate activation flow.
+        body = {
+            **_make_inbound(),
+            "channelId": "agents",
+            "type": "event",
+            "name": "agentLifecycle",
+            "from": {"id": "system", "name": "System"},
+        }
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_agents_channel_message_from_system_acks(self) -> None:
+        # Synthetic email-template render activities arrive on
+        # `agents` channel as `type=message` from `from.id=system`.
+        body = {
+            **_make_inbound(),
+            "channelId": "agents",
+            "from": {"id": "system", "name": "System"},
+        }
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_agents_channel_message_from_real_user_dispatches(self) -> None:
+        # If a real user message ever lands on the `agents` channel
+        # (e.g., a future Copilot Chat path), don't drop it on the
+        # floor. ``from.id=system`` is the load-bearing filter.
+        body = {
+            **_make_inbound(),
+            "channelId": "agents",
+            "from": {"id": "user-1", "name": "Sadiq"},
+        }
+        assert adapter_mod._should_dispatch(body) is True
+
+    def test_missing_from_field_does_not_crash(self) -> None:
+        body = {**_make_inbound(), "channelId": "agents"}
+        body.pop("from", None)
+        # No `from.id=system`, so we treat it as user-routable.
+        assert adapter_mod._should_dispatch(body) is True
+
+
+class TestServeAppAgentsChannelFilter:
+    """Route-level coverage for the slice 19q filter — same shape
+    as ``test_conversation_update_acked_no_dispatch`` from 19n."""
+
+    @staticmethod
+    def _client(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+        from fastapi.testclient import TestClient
+
+        # Isolated registry path — keeps tests from contaminating
+        # ~/.hermes/agents/test-agent/ across runs.
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "convs.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        a._http_client = MagicMock()
+        return a, TestClient(a.build_app())
+
+    def test_agents_event_acked_no_dispatch_no_registry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a, client = self._client(monkeypatch, tmp_path)
+        body = {
+            **_make_inbound(),
+            "channelId": "agents",
+            "type": "event",
+            "name": "agentLifecycle",
+        }
+        r = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "acked"
+        # No agent turn wasted on the synthetic event.
+        assert a._handled_events == []
+        # Registry semantics: synthetic events do NOT churn
+        # `last_inbound_activity_id` — that field tracks user-replyable
+        # messages only.
+        assert len(a._conversations) == 0
+
+    def test_agents_message_from_system_acked_no_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a, client = self._client(monkeypatch, tmp_path)
+        body = {
+            **_make_inbound(),
+            "channelId": "agents",
+            "from": {"id": "system", "name": "System"},
+        }
+        r = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "acked"
+        assert a._handled_events == []
+        assert len(a._conversations) == 0
+
+    def test_real_user_msteams_message_still_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Regression check for the happy path.
+        a, client = self._client(monkeypatch, tmp_path)
+        r = client.post(
+            "/api/messages",
+            json=_make_inbound(),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "dispatched"
+        assert len(a._handled_events) == 1
+        assert "conv-1" in a._conversations
+
+
+# ---------------------------------------------------------------------------
 # send() — outbound via cached inbound + send_reply
 # ---------------------------------------------------------------------------
 

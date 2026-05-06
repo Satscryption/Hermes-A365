@@ -109,6 +109,52 @@ if _SCRIPTS_DIR.is_dir() and str(_SCRIPTS_DIR) not in sys.path:
 _DEFAULT_PORT = 3978
 
 
+# Slice 19q (round-5 walkthrough finding, 2026-05-06): the BF connector
+# delivers a handful of activities that aren't user messages and
+# shouldn't reach the Hermes agent loop:
+#
+# - Classic channel-control activities (``conversationUpdate``,
+#   ``typing``, ``endOfConversation``).
+# - ``agents``-channel synthetic events Microsoft sends as part of the
+#   AI Teammate onboarding / lifecycle flow. These carry a
+#   conversation_id but the conversation isn't a chat — calling
+#   ``send_typing`` against it 404s on the BF connector with
+#   ``ServiceError``. Two observed shapes:
+#     * ``type=event``, often with ``name=agentLifecycle``.
+#     * ``type=message``, ``from.id=system`` (synthetic email-template
+#       render activities).
+#
+# Routing any of these to ``handle_message`` wastes an agent turn,
+# emits an empty Adaptive Card reply, and triggers the typing-pulse
+# 404 spam. Ack-and-bail at the route level instead.
+_CHANNEL_CONTROL_TYPES: frozenset[str] = frozenset(
+    {"conversationUpdate", "typing", "endOfConversation"}
+)
+
+
+def _should_dispatch(activity: dict[str, Any]) -> bool:
+    """Return ``True`` for activities the agent loop should reason about.
+
+    ``False`` for BF channel-control + synthetic ``agents``-channel
+    probes. Pure-function so the route stays small and tests can
+    exercise the matrix without spinning up a TestClient.
+    """
+    activity_type = str(activity.get("type") or "message")
+    if activity_type in _CHANNEL_CONTROL_TYPES:
+        return False
+    channel_id = str(activity.get("channelId") or "")
+    if channel_id == "agents":
+        if activity_type == "event":
+            return False
+        sender = activity.get("from")
+        sender_id = ""
+        if isinstance(sender, dict):
+            sender_id = str(sender.get("id") or "")
+        if sender_id == "system":
+            return False
+    return True
+
+
 def _import_bridge() -> Any:
     """Import the bridge module on demand. Returns the module object."""
     import activity_bridge  # type: ignore[import-not-found]
@@ -315,10 +361,11 @@ class Agent365Adapter(BasePlatformAdapter):
             ):
                 return JSONResponse({"status": "duplicate"})
 
-            activity_type = activity.get("type", "message")
-            if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
-                # Channel-control flows — ack and bail. Not interesting
-                # to the agent loop.
+            # Slice 19q — channel-control + synthetic agents-channel
+            # probes ack-and-bail before the registry upsert. They're
+            # transient or aren't user messages, so persisting them in
+            # the registry would just churn ``last_inbound_activity_id``.
+            if not _should_dispatch(activity):
                 return JSONResponse({"status": "acked"})
 
             # Slice 19o — upsert into the durable registry. ``send()``,
