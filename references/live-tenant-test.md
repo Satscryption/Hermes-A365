@@ -477,10 +477,69 @@ the underlying A365 auth + JWT + serviceUrl plumbing without
 Hermes in the path. Once §9c is green, the only remaining variable
 in §9d is the harness wiring.
 
-Prerequisites — same as §9c (cloudflared tunnel up, blueprint
-provisioned, `botMsaAppId` populated, AI Teammate published +
-activated for your user). The Hermes harness must be installed at
-`~/.hermes/hermes-agent/` per the standard install.
+### Prerequisites
+
+A complete checklist — three buckets, all required before you start
+the actual walkthrough at §9d.1.
+
+**Tenant + local toolchain** (one-time, same as the rest of this
+runbook):
+
+- [ ] Steps **§0 through §7** of this runbook all complete:
+  doctor green, license recommendation rendered, blueprint
+  registered (`register --apply`), admin consent granted, per-agent
+  `.env` written by `instance create --apply`, `publish --aiteammate
+  --apply` zip uploaded via Admin Centre and activated for your
+  user. §1's `What you need before starting` callout at the top of
+  this file lists the underlying prereqs (Frontier Preview, Tier 3
+  license, `Agent 365 CLI` Entra app, `a365` CLI, `az` CLI, pwsh,
+  dotnet, etc.). If any of these are red, §9d will fail in
+  hard-to-diagnose ways.
+- [ ] `cloudflared` installed (`brew install cloudflared`).
+
+**Bridge runtime** (this is what gets ported under the plugin):
+
+- [ ] Bridge extras installed: `uv sync --extra bridge` from the
+  repo root (pulls in `fastapi`, `uvicorn[standard]`, `httpx`,
+  `pyjwt[crypto]`).
+- [ ] §9b (`activity_bridge verify`) and §9c (bridge-standalone
+  Teams round-trip) both green at least once recently. §9d adds
+  the harness on top of these — you don't want to be debugging
+  three layers at once.
+
+**Hermes harness** (the layer §9d adds):
+
+- [ ] Hermes harness installed at `~/.hermes/hermes-agent/` per its
+  standard install.
+- [ ] `hermes` CLI on PATH (`hermes --version` reports a build).
+- [ ] You can run `hermes gateway run` against the harness without
+  any platform enabled and it stays up cleanly. (If the harness
+  itself is broken, §9d won't help — fix that first.)
+- [ ] These env vars **exported in the shell that runs `hermes
+  gateway run`** (the gateway process reads its own environ; the
+  per-agent `.env` at `~/.hermes/agents/<slug>/.env` is read by the
+  bridge but not auto-sourced by Hermes):
+
+  ```bash
+  export A365_TENANT_ID="$(az account show --query tenantId -o tsv)"
+  export A365_APP_ID=<blueprint-app-id>          # from a365.generated.config.json
+  export A365_BLUEPRINT_CLIENT_SECRET=<secret>   # same file; or set extra.generated_config_path in config.yaml
+  export AA_INSTANCE_ID=<instance-id>            # from a365.generated.config.json
+  ```
+
+  As a shortcut while iterating, source the per-agent .env into
+  the gateway shell:
+
+  ```bash
+  set -a; source ~/.hermes/agents/inbox-helper/.env; set +a
+  ```
+
+  (the `set -a` flag exports every variable assigned in the file).
+  Pair it with an explicit `export A365_BLUEPRINT_CLIENT_SECRET=…`
+  since the agent .env doesn't carry the secret by design.
+
+If any of these are still red, stop here and fix before §9d.1 —
+the runbook below assumes they're all green.
 
 ### 9d.1 — Install the plugin into Hermes' plugin path
 
