@@ -443,9 +443,12 @@ class TestMessagesRoute:
         assert evt.source.chat_type == "dm"  # personal → dm mapping
         assert evt.source.user_id == "user-1"
         assert evt.source.user_name == "Sadiq"
-        # Cached for outbound lookup.
-        assert "conv-X" in a._chat_contexts
-        assert a._chat_contexts["conv-X"]["id"] == "aaa"
+        # Cached for outbound lookup via the durable registry (slice 19o).
+        assert "conv-X" in a._conversations
+        ref = a._conversations.get("conv-X")
+        assert ref is not None
+        assert ref.last_inbound_activity_id == "aaa"
+        assert ref.raw["id"] == "aaa"
 
     def test_duplicate_delivery_short_circuits(
         self, monkeypatch: pytest.MonkeyPatch
@@ -515,7 +518,9 @@ class TestSend:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._chat_contexts["conv-1"] = _make_inbound()
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -540,7 +545,9 @@ class TestSend:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._chat_contexts["conv-1"] = _make_inbound()
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -577,8 +584,319 @@ class TestGetChatInfo:
         cached = _make_inbound(conv_id="conv-G")
         cached["conversation"]["conversationType"] = "groupChat"
         cached["conversation"]["name"] = "team-room"
-        a._chat_contexts["conv-G"] = cached
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(cached))
         info = await a.get_chat_info("conv-G")
         assert info["name"] == "team-room"
         assert info["type"] == "group"
         assert info["chat_id"] == "conv-G"
+
+
+# ---------------------------------------------------------------------------
+# Slice 19o — durable session table
+# ---------------------------------------------------------------------------
+
+
+class TestConversationRef:
+    def test_from_activity_extracts_required_fields(self) -> None:
+        ref = adapter_mod.ConversationRef.from_activity(_make_inbound())
+        assert ref is not None
+        assert ref.conversation_id == "conv-1"
+        assert ref.service_url.startswith("https://smba.trafficmanager.net/")
+        assert ref.chat_type == "personal"
+        assert ref.user_id == "user-1"
+        assert ref.user_name == "Sadiq"
+        assert ref.last_inbound_activity_id == "act-1"
+        assert ref.raw["id"] == "act-1"
+
+    def test_from_activity_returns_none_without_conversation_id(self) -> None:
+        bad = _make_inbound()
+        bad["conversation"] = {}
+        assert adapter_mod.ConversationRef.from_activity(bad) is None
+
+    def test_round_trip_through_dict(self) -> None:
+        ref = adapter_mod.ConversationRef.from_activity(_make_inbound())
+        round_tripped = adapter_mod.ConversationRef.from_dict(ref.to_dict())
+        assert round_tripped == ref
+
+    def test_from_dict_tolerates_extra_keys(self) -> None:
+        # Future-schema fields shouldn't break round-trip; they land in
+        # `raw` so we don't lose them.
+        payload = adapter_mod.ConversationRef.from_activity(
+            _make_inbound()
+        ).to_dict()
+        payload["future_field_we_dont_know_about"] = "ok"
+        ref = adapter_mod.ConversationRef.from_dict(payload)
+        assert ref.conversation_id == "conv-1"
+
+
+class TestConversationRegistry:
+    def test_upsert_merges_and_preserves_existing_fields(self) -> None:
+        from plugins.agent365.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(ConversationRef(
+            conversation_id="conv-X",
+            service_url="https://svc.trafficmanager.net/",
+            chat_name="original",
+        ))
+        # Second upsert with empty chat_name must not wipe the existing one.
+        reg.upsert(ConversationRef(
+            conversation_id="conv-X",
+            service_url="https://svc.trafficmanager.net/",
+            chat_name=None,
+            last_inbound_activity_id="act-2",
+        ))
+        ref = reg.get("conv-X")
+        assert ref is not None
+        assert ref.chat_name == "original"
+        assert ref.last_inbound_activity_id == "act-2"
+
+    def test_load_missing_file_returns_empty(self, tmp_path: Path) -> None:
+        from plugins.agent365.conversations import ConversationRegistry
+
+        reg = ConversationRegistry.load(tmp_path / "nope.json")
+        assert len(reg) == 0
+
+    def test_load_unparseable_returns_empty(self, tmp_path: Path) -> None:
+        from plugins.agent365.conversations import ConversationRegistry
+
+        path = tmp_path / "convs.json"
+        path.write_text("not json {{{")
+        reg = ConversationRegistry.load(path)
+        assert len(reg) == 0
+
+    def test_save_and_load_round_trip(self, tmp_path: Path) -> None:
+        from plugins.agent365.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        ref = ConversationRef.from_activity(_make_inbound(conv_id="conv-A"))
+        reg.upsert(ref)
+        path = tmp_path / "convs.json"
+        reg.save(path)
+
+        # File on disk is well-formed JSON.
+        import json
+
+        payload = json.loads(path.read_text())
+        assert payload["schema"] == ConversationRegistry.SCHEMA_VERSION
+        assert len(payload["conversations"]) == 1
+
+        # Round-trips back into a registry.
+        reloaded = ConversationRegistry.load(path)
+        assert "conv-A" in reloaded
+        assert reloaded.get("conv-A").user_name == "Sadiq"
+
+    def test_save_is_atomic_with_no_tmpfile_residue(self, tmp_path: Path) -> None:
+        """Atomic write means no leftover .tmp files after a successful save."""
+        from plugins.agent365.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(ConversationRef(conversation_id="x", service_url="https://x/"))
+        path = tmp_path / "convs.json"
+        reg.save(path)
+        leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".")]
+        assert leftovers == []
+
+
+class TestAdapterPersistsRegistry:
+    def test_inbound_writes_registry_to_disk(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        conv_path = tmp_path / "convs.json"
+        a = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x"}),
+        )
+        a._http_client = MagicMock()
+        client = TestClient(a.build_app())
+        client.post(
+            "/api/messages",
+            json=_make_inbound(conv_id="conv-D", activity_id="act-Z"),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert conv_path.exists()
+        # Reload independently to confirm durability.
+        from plugins.agent365.conversations import ConversationRegistry
+
+        reloaded = ConversationRegistry.load(conv_path)
+        ref = reloaded.get("conv-D")
+        assert ref is not None
+        assert ref.last_inbound_activity_id == "act-Z"
+
+    def test_constructor_loads_existing_registry(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from plugins.agent365.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        conv_path = tmp_path / "convs.json"
+        seed = ConversationRegistry()
+        seed.upsert(
+            ConversationRef(
+                conversation_id="conv-survived",
+                service_url="https://smba.trafficmanager.net/",
+                chat_name="across-restart",
+            )
+        )
+        seed.save(conv_path)
+
+        a = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        ref = a._conversations.get("conv-survived")
+        assert ref is not None
+        assert ref.chat_name == "across-restart"
+
+
+# ---------------------------------------------------------------------------
+# Slice 19o — send_typing + send_image
+# ---------------------------------------------------------------------------
+
+
+class TestSendTyping:
+    @pytest.mark.asyncio
+    async def test_no_op_when_no_cached_inbound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        # Should swallow silently — gateway typing pulse must not throw.
+        await a.send_typing("missing")
+
+    @pytest.mark.asyncio
+    async def test_posts_typing_activity_to_conversation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-T", activity_id="t1")
+            )
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        # Mock the token mint + the actual POST.
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-xyz"),
+        )
+        post_mock = AsyncMock(
+            return_value=MagicMock(status_code=200, text="")
+        )
+        a._http_client.post = post_mock
+
+        await a.send_typing("conv-T")
+        assert post_mock.await_count == 1
+        url = post_mock.await_args.kwargs.get("url") or post_mock.await_args.args[0]
+        assert "/v3/conversations/conv-T/activities" in url
+        # No activity-id suffix on a typing post — different from
+        # replyToActivity, intentionally.
+        assert "/activities/" not in url
+        body = post_mock.await_args.kwargs["json"]
+        assert body["type"] == "typing"
+        assert body["conversation"]["id"] == "conv-T"
+        # Auth header carries our minted bearer.
+        headers = post_mock.await_args.kwargs["headers"]
+        assert headers["Authorization"] == "Bearer bearer-xyz"
+
+    @pytest.mark.asyncio
+    async def test_typing_failure_swallowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(side_effect=RuntimeError("token mint failed")),
+        )
+        # Must not raise — gateway typing pulse runs in a hot path.
+        await a.send_typing("conv-1")
+
+
+class TestSendImage:
+    @pytest.mark.asyncio
+    async def test_renders_adaptive_card_with_image_and_caption(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        result = await a.send_image(
+            "conv-1",
+            "https://example.test/cat.jpg",
+            caption="my cat",
+        )
+        assert result.success is True
+        kwargs = send_reply_mock.await_args.kwargs
+        attachments = kwargs["reply"]["attachments"]
+        assert len(attachments) == 1
+        card = attachments[0]["content"]
+        assert card["type"] == "AdaptiveCard"
+        body = card["body"]
+        # First element is the Image, second is the TextBlock caption.
+        assert body[0]["type"] == "Image"
+        assert body[0]["url"] == "https://example.test/cat.jpg"
+        assert body[1]["type"] == "TextBlock"
+        assert body[1]["text"] == "my cat"
+
+    @pytest.mark.asyncio
+    async def test_no_caption_omits_textblock(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        result = await a.send_image("conv-1", "https://example.test/x.png")
+        assert result.success is True
+
+    @pytest.mark.asyncio
+    async def test_no_cached_inbound_returns_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        result = await a.send_image("missing", "https://example.test/x.png")
+        assert result.success is False
+        assert "no cached inbound" in (result.error or "")

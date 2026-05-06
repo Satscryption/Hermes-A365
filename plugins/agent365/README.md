@@ -15,17 +15,30 @@ plugins/agent365/
   README.md           # this file
 ```
 
-## Status — slices 19m + 19n
+## Status — slices 19m + 19n + 19o
 
 The plugin now runs the bridge end-to-end:
 
 - **Inbound** (`/api/messages` route) — JWT validation (slice 19f),
   idempotency dedupe (slice 19i), serviceUrl host-suffix gate
   (slice 19j), then `MessageEvent` dispatch via
-  `self.handle_message(event)`.
+  `self.handle_message(event)`. Each accepted activity is
+  upserted into the durable conversation registry (slice 19o).
 - **Outbound** (`Agent365Adapter.send`) — looks up the cached inbound
-  for the target chat, mints an outbound user-FIC bearer
-  (slice 19e), and POSTs the reply via `serviceUrl`.
+  for the target chat from the registry, mints an outbound user-FIC
+  bearer (slice 19e), and POSTs the reply via `serviceUrl`.
+- **Typing** (`send_typing`) — POSTs a BF `typing` activity to the
+  conversation; renders as the trailing-dots indicator on Teams 1:1.
+  Best-effort — failures swallow silently so the gateway's typing
+  pulse loop can't crash on a transient.
+- **Image** (`send_image`) — builds an Adaptive Card with an `Image`
+  element + optional caption `TextBlock`; routes through the same
+  outbound POST path as `send`.
+- **Durable session table** — `~/.hermes/agents/<slug>/conversations.json`
+  persists `(conversation_id → {service_url, chat_type, chat_name,
+  user info, last activity id, raw inbound})` so the adapter can
+  resume conversations across uvicorn restarts and queue proactive
+  sends (#4) against rooms it hasn't seen this run.
 - **Lifecycle** — `connect()` builds the FastAPI app and runs uvicorn
   in a background task; `disconnect()` shuts uvicorn cleanly and
   closes the httpx client.
@@ -37,12 +50,11 @@ copy-pasted; that module remains the single source of truth and
 keeps working as a standalone `serve` entrypoint.
 
 Still TODO:
-- `send_typing` — currently a no-op.
-- `send_image` — placeholder until the Adaptive Card image renderer
-  lands.
-- Durable session table (slice 19o) — replaces the in-memory
-  `_chat_contexts` dict so proactive sends (`#4`) and longer-lived
-  conversations work without a recent inbound.
+- `send_document`, `send_voice`, `send_video`, `send_animation` —
+  default no-op stubs from `BasePlatformAdapter` are fine for now.
+- Group / channel surfaces — registry has the right schema
+  (`team_id`, `channel_id` queued), but Teams 1:1 is the validated
+  path so far.
 
 Tracking issue: [#1 — Activity bridge — Hermes gateway platform plugin](https://github.com/satscryption/Hermes-A365/issues/1).
 
@@ -80,9 +92,9 @@ Required env vars (already populated by the wrapper's
 | slice | scope | status |
 |---|---|---|
 | 19m | skeleton — `PLUGIN.yaml`, adapter class, `register(ctx)` | ✅ |
-| **19n** | port the FastAPI webhook + bridge runtime under `Agent365Adapter`; map inbound → `handle_message(event)`, outbound → `send()` | ✅ |
-| 19o | durable session table — BF `conversation.id` → Hermes session; conversation memory across turns; surfaces `send_typing` and `send_image` | next |
-| 19p | round-N walkthrough validation against satscryption.io | |
+| 19n | port the FastAPI webhook + bridge runtime under `Agent365Adapter`; map inbound → `handle_message(event)`, outbound → `send()` | ✅ |
+| **19o** | durable session table (`conversations.json`) + `send_typing` + `send_image` | ✅ |
+| 19p | round-N walkthrough validation against satscryption.io | next |
 
 ## Reference
 

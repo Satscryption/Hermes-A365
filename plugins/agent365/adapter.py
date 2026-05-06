@@ -86,6 +86,9 @@ from gateway.platforms.base import (  # noqa: E402
 )
 from gateway.session import SessionSource  # noqa: E402
 
+# Plugin-local imports — these don't depend on the Hermes harness.
+from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
+
 # ---------------------------------------------------------------------------
 # Make scripts/ importable so we can reuse the bridge helpers.
 # When the plugin is symlinked from <repo>/plugins/agent365 → ~/.hermes/
@@ -157,11 +160,24 @@ class Agent365Adapter(BasePlatformAdapter):
             or (Path.cwd() / "a365.generated.config.json")
         )
 
-        # Slice 19n state. ``_chat_contexts`` keeps the most recent
-        # inbound activity per chat_id so ``send()`` can reach the
-        # serviceUrl + conversation + activity_id without a full
-        # session table (slice 19o ships the durable version).
-        self._chat_contexts: dict[str, dict[str, Any]] = {}
+        # Slice 19o — durable conversation registry keyed on
+        # `conversation.id`. Persists to
+        # `~/.hermes/agents/<slug>/conversations.json` so proactive
+        # sends and longer conversations work across uvicorn restarts.
+        self._conversations_path: Path = Path(
+            extra.get("conversations_path")
+            or os.getenv("A365_CONVERSATIONS_PATH")
+            or (
+                Path.home()
+                / ".hermes"
+                / "agents"
+                / (self.slug or "default")
+                / "conversations.json"
+            )
+        )
+        self._conversations: ConversationRegistry = ConversationRegistry.load(
+            self._conversations_path
+        )
 
         # Lazily-built runtime objects (populated in connect()).
         self._http_client: Any = None
@@ -305,11 +321,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 # to the agent loop.
                 return JSONResponse({"status": "acked"})
 
-            # Stash for outbound lookup. ``send()`` reads serviceUrl /
-            # conversation.id / id from this dict.
-            chat_id = (activity.get("conversation") or {}).get("id") or ""
-            if chat_id:
-                self._chat_contexts[chat_id] = activity
+            # Slice 19o — upsert into the durable registry. ``send()``,
+            # ``send_typing()``, and ``send_image()`` all look up by
+            # ``conversation.id`` here.
+            ref = ConversationRef.from_activity(activity)
+            if ref is not None:
+                self._conversations.upsert(ref)
+                self._persist_conversations()
 
             # Build event + dispatch through Hermes' loop.
             event = self._activity_to_event(activity)
@@ -442,6 +460,29 @@ class Agent365Adapter(BasePlatformAdapter):
 
     # ── Outbound ──────────────────────────────────────────────────────────
 
+    def _persist_conversations(self) -> None:
+        """Best-effort save of the registry. Persistence failures are
+        logged but never block message processing — the in-memory
+        copy still works for this run."""
+        try:
+            self._conversations.save(self._conversations_path)
+        except OSError as e:
+            logger.warning(
+                "agent365 conversations: save failed for %s: %s",
+                self._conversations_path,
+                e,
+            )
+
+    def _cached_inbound_for(self, chat_id: str) -> dict[str, Any] | None:
+        """Return the most recent inbound activity for ``chat_id``,
+        sourced from the registry's ``raw`` field. Slice 19o's
+        registry is the only authoritative source; legacy callers
+        should not reach into ``_chat_contexts`` (gone)."""
+        ref = self._conversations.get(chat_id)
+        if ref is None or not ref.raw:
+            return None
+        return ref.raw
+
     async def send(
         self,
         chat_id: str,
@@ -451,14 +492,13 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """Render `content` as a reply Activity and POST via serviceUrl.
 
-        Looks up the most recent inbound activity for `chat_id` from
-        ``self._chat_contexts`` to recover serviceUrl / conversation /
-        activity-id. If no inbound has been seen for this chat (e.g.
-        proactive cron delivery), returns a failure SendResult — that
-        flow is #4's territory and lands in slice 19o+'s session table.
+        Looks up the most recent inbound activity for ``chat_id`` in the
+        durable registry (slice 19o). When the registry has no entry
+        for this chat — e.g. a proactive cron delivery against a
+        conversation we've never seen — returns a failure SendResult.
         """
         bridge = _import_bridge()
-        inbound = self._chat_contexts.get(chat_id)
+        inbound = self._cached_inbound_for(chat_id)
         if not inbound:
             msg = f"no cached inbound for chat_id={chat_id!r} — cannot reply"
             logger.error("agent365 send: %s", msg)
@@ -484,12 +524,62 @@ class Agent365Adapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
+    async def _post_activity(
+        self, *, inbound: dict[str, Any], activity: dict[str, Any]
+    ) -> None:
+        """POST a fresh activity (not a reply) to the inbound's
+        serviceUrl. Used by ``send_typing``. Reuses ``send_reply``'s
+        outbound user-FIC token chain via the bridge module."""
+        bridge = _import_bridge()
+        if self._http_client is None or self._bridge_cfg is None:
+            raise RuntimeError("agent365: adapter not connected")
+        service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
+        conv_id = (inbound.get("conversation") or {}).get("id")
+        if not service_url or not conv_id:
+            raise RuntimeError(
+                "agent365 _post_activity: serviceUrl / conversation.id missing"
+            )
+        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+        token = await bridge.acquire_outbound_token(
+            client=self._http_client,
+            cfg=self._bridge_cfg,
+            activity=inbound,
+            fmi_cache=self._fmi_cache,
+            user_cache=self._user_cache,
+        )
+        resp = await self._http_client.post(
+            url,
+            json=activity,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+        if resp.status_code >= 300:
+            raise RuntimeError(
+                f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}"
+            )
+
     async def send_typing(
         self, chat_id: str, metadata: dict[str, Any] | None = None
     ) -> None:
-        """TODO 19o: send a BF `typing` activity to the same conversation.
-        For now this is a no-op so the gateway's typing-indicator pulse
-        doesn't error out."""
+        """Send a BF ``typing`` activity to the conversation. Renders
+        as the trailing-dots indicator on Teams 1:1 chats."""
+        inbound = self._cached_inbound_for(chat_id)
+        if not inbound:
+            # No-op: the gateway pulses typing periodically; without
+            # a cached inbound we have nowhere to post.
+            return None
+        typing_activity = {
+            "type": "typing",
+            "from": inbound.get("recipient") or {},
+            "recipient": inbound.get("from") or {},
+            "conversation": inbound.get("conversation") or {},
+        }
+        try:
+            await self._post_activity(inbound=inbound, activity=typing_activity)
+        except Exception as e:
+            # Typing failures are best-effort — never raise into the
+            # gateway's pulse loop.
+            logger.warning("agent365 send_typing failed for %s: %s", chat_id, e)
         return None
 
     async def send_image(
@@ -499,32 +589,58 @@ class Agent365Adapter(BasePlatformAdapter):
         caption: str = "",
         metadata: dict[str, Any] | None = None,
     ) -> SendResult:
-        """TODO 19o: render an Adaptive Card with an Image element +
-        caption, reuse send()'s outbound POST."""
-        logger.warning(
-            "agent365 send_image() is a 19m stub — slice 19o adds the "
-            "Adaptive Card image renderer. chat_id=%s url=%s",
-            chat_id,
-            image_url,
-        )
-        return SendResult(success=True, message_id=None)
+        """Render an Adaptive Card with an Image element + optional
+        caption, route through send()'s outbound POST path."""
+        bridge = _import_bridge()
+        inbound = self._cached_inbound_for(chat_id)
+        if not inbound:
+            msg = f"agent365 send_image: no cached inbound for {chat_id!r}"
+            logger.error(msg)
+            return SendResult(success=False, error=msg)
+        if self._http_client is None or self._bridge_cfg is None:
+            msg = "agent365 send_image: adapter not connected"
+            logger.error(msg)
+            return SendResult(success=False, error=msg)
+
+        body: list[dict[str, Any]] = [{"type": "Image", "url": image_url}]
+        if caption:
+            body.append({"type": "TextBlock", "text": caption, "wrap": True})
+        card = {
+            "type": "AdaptiveCard",
+            "version": "1.6",
+            "body": body,
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+        }
+        reply = bridge.render_reply_activity(inbound, {"text": "", "card": card})
+        try:
+            await bridge.send_reply(
+                inbound=inbound,
+                reply=reply,
+                cfg=self._bridge_cfg,
+                client=self._http_client,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+            )
+        except Exception as e:
+            logger.error("agent365 send_image failed: %s", e)
+            return SendResult(success=False, error=str(e))
+        return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
-        """Return chat metadata. Slice 19o resolves the display name
-        via the cached inbound activity's `conversation.name`."""
-        cached = self._chat_contexts.get(chat_id)
-        chat_type = "personal"
-        chat_name = chat_id
-        if cached:
-            conv = cached.get("conversation") or {}
-            conv_type = str(conv.get("conversationType") or "personal")
-            chat_type = (
-                "personal"
-                if conv_type == "personal"
-                else ("group" if conv_type == "groupChat" else "channel")
-            )
-            chat_name = str(conv.get("name") or chat_id)
-        return {"name": chat_name, "type": chat_type, "chat_id": chat_id}
+        """Return chat metadata sourced from the durable registry."""
+        ref = self._conversations.get(chat_id)
+        if ref is None:
+            return {"name": chat_id, "type": "personal", "chat_id": chat_id}
+        chat_type = (
+            "personal"
+            if ref.chat_type == "personal"
+            else ("group" if ref.chat_type == "groupChat" else "channel")
+        )
+        return {
+            "name": ref.chat_name or chat_id,
+            "type": chat_type,
+            "chat_id": chat_id,
+        }
 
 
 # ---------------------------------------------------------------------------
