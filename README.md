@@ -6,18 +6,19 @@ control plane that GA'd 2026-05-01.
 
 ## Status
 
-**v0.2 functionally complete pending live-tenant validation of the
-agentic auth refactor.** Setup, status, license, cleanup, `bridge
-verify` paths all work end-to-end against a live tenant. `bridge
-serve` outbound auth was rewritten in slice 19e to use the canonical
-A365 three-stage `user_fic` chain (issue
-[#6](https://github.com/satscryption/Hermes-A365/issues/6) closed in
-code; live-tenant validation pending round-4 walkthrough).
+**v0.2 validated end-to-end against the satscryption.io tenant via the
+Hermes plugin path.** Round-5 §9d walkthrough on 2026-05-06 drove a
+real Teams DM through `Agent365Adapter.handle_message` into the
+Hermes agent loop and a reply landed back in Teams via the agentic
+user-FIC outbound chain. Restart-durability check passed —
+`conversations.json` registry hydrated and the same chat picked up
+without a fresh inbound. **Issue
+[#1](https://github.com/satscryption/Hermes-A365/issues/1) closed.**
 
 ```
                      ┌─────────────────────────────────────────────────┐
                      │ All wrappers drive the real a365 CLI v1.1.171   │
-                     │ Tests: 444 passing, ruff clean                  │
+                     │ Tests: 579 passing, ruff clean                  │
                      └─────────────────────────────────────────────────┘
 ```
 
@@ -28,9 +29,11 @@ code; live-tenant validation pending round-4 walkthrough).
 | **Setup orchestrator** (`register`) | Drives `setup blueprint` + `setup permissions {mcp, bot}` end-to-end with line-streamed output (device-code prompts visible in real time). |
 | **Per-agent runtime config** (`instance create`) | Local-only `.env` writer; UUID generation deferred to apply-time; secret never on disk. |
 | **Manifest publish** (`publish`) | Branches between AI-Teammate (zip) and blueprint-only (Graph API instance registration); operator messaging is honest about which artefact each flow produces. |
-| **Cleanup** | Drives `cleanup azure → instance → blueprint`, pre-feeds `y\n` to defeat the GA CLI's prompts, leaves `chmod 600` on backup files. |
-| **Activity bridge** | `verify` (config + auth + reachability + FMI exchange) ships and works. `serve` (long-running BF webhook adapter) ships with the correct A365 three-stage `user_fic` outbound auth (slice 19e). Live-tenant validation pending round-4 walkthrough. |
-| **Live-tenant runbook** | [`references/live-tenant-test.md`](references/live-tenant-test.md). Walked round-2 successfully; round-3 (with the bridge) pending operator action. |
+| **Cleanup** | Drives `cleanup azure → instance → blueprint`, pre-feeds `y\n` to defeat the GA CLI's prompts, leaves `chmod 600` on backup files. `--purge-orphans` clears agentic users + agentRegistry instances the GA CLI fails to delete; `--orphan-instance-id` plumbs in ids the AI-Teammate flow creates server-side. |
+| **Activity bridge — standalone** | `verify` (config + auth + reachability + FMI exchange) and `serve` (long-running BF webhook adapter) both validated end-to-end on the satscryption tenant in round-3+ walkthroughs. AAD-v2 inbound JWT, idempotency dedupe, serviceUrl gate, agentic user-FIC outbound. |
+| **Activity bridge — Hermes plugin** | `plugins/agent365/` ships the same runtime as a `BasePlatformAdapter` subclass, registered via the upstream Hermes plugin loader. Inbound dispatches via `handle_message(event)`, outbound via `send(chat_id, content)`. Durable session table (`~/.hermes/agents/<slug>/conversations.json`) for restart durability + proactive-send precondition. Round-5 §9d validated 2026-05-06. |
+| **Live-tenant runbook** | [`references/live-tenant-test.md`](references/live-tenant-test.md). §9b verify, §9c bridge-standalone, §9d Hermes-plugin paths all documented + round-walked. |
+| **M365 surface coverage** | [`references/m365-surface-coverage.md`](references/m365-surface-coverage.md) maps every M365 / Agent 365 / Copilot surface where the plugin could appear, with adapter coverage status. Validated: Teams 1:1. Architecturally covered: Teams group / channel / mobile, M365 Copilot Chat, Outlook chat, partner messaging channels. Out of scope: declarative agents, Office Add-ins, Loop components (different runtime layer). |
 
 **Cosmetic CLI logging gap (no operator impact).** The GA `a365 setup
 permissions bot` emits a `Configuring S2S app role assignments...`
@@ -48,8 +51,13 @@ captures the upstream resolution.
 **Upstream contribution.** Proposal to add `hermes-a365` as an official
 optional skill is open at
 [NousResearch/hermes-agent#20133](https://github.com/NousResearch/hermes-agent/issues/20133).
-Awaiting upstream guidance on placement (light-touch link-stub vs full
-vendoring under `optional-skills/cloud-platforms/`).
+Reframed during slice 19l after inspecting the bundled harness — the
+SPEC §10 Q1 IPC-contract question turned out to be a non-question
+(Hermes already documents the gateway-platform-plugin contract). The
+upstream issue is now a "going plugin-path; sanity-check?" check-in
+rather than an open design ask. Plugin layout under
+[`plugins/agent365/`](plugins/agent365/) follows
+`gateway/platforms/ADDING_A_PLATFORM.md` exactly.
 
 ## What is A365?
 
@@ -97,18 +105,20 @@ pulling these artefacts in at contribution time. See
 │   ├── entra-blueprint-properties.md
 │   ├── error-codes.md
 │   ├── license-cost-table.md
-│   ├── live-tenant-test.md      # End-to-end runbook (operator-side)
+│   ├── live-tenant-test.md          # End-to-end runbook (operator-side)
+│   ├── m365-surface-coverage.md     # Surface matrix per slice 19t
 │   ├── opentelemetry-config.md
-│   ├── README.md                # Index
-│   └── webhook-contract.md      # Bridge → responder JSON contract
+│   ├── README.md                    # Index
+│   └── webhook-contract.md          # Bridge → responder JSON contract
 ├── scripts/                 # One module per subcommand + shared helpers
 │   ├── _common.py               # parse_env, slugify, safe_run, jinja_env, deep_diff
 │   ├── a365_config.py           # a365.config.json round-trip
-│   ├── activity_bridge.py       # verify + serve + update-endpoint
+│   ├── activity_bridge.py       # verify + serve + update-endpoint (standalone)
 │   ├── cleanup.py
 │   ├── consent.py
 │   ├── doctor.py
 │   ├── emit_card.py
+│   ├── hermes_responder.py      # Reference responder (slice 19c)
 │   ├── instance_create.py
 │   ├── keychain.py              # OS-keychain wrapper (macOS + Linux)
 │   ├── license.py
@@ -119,12 +129,18 @@ pulling these artefacts in at contribution time. See
 │   ├── register.py
 │   ├── render_instance_env.py
 │   └── status.py
+├── plugins/agent365/        # Hermes gateway platform plugin (slice 19m–19q)
+│   ├── plugin.yaml              # Manifest (loader globs lowercase)
+│   ├── __init__.py
+│   ├── adapter.py               # Agent365Adapter(BasePlatformAdapter)
+│   ├── conversations.py         # ConversationRef + ConversationRegistry
+│   └── README.md
 ├── templates/
 │   ├── blueprint.json.j2
 │   ├── consent-url.txt.j2
 │   ├── instance.env.j2
 │   └── adaptive-cards/          # greeting / confirmation / error
-└── tests/                   # 444 tests (pytest + ruff clean)
+└── tests/                   # 579 tests (pytest + ruff clean)
     ├── conftest.py
     ├── golden/
     └── test_*.py
@@ -162,12 +178,20 @@ uv run python scripts/instance_create.py inbox-helper \
 # 6. Register the agent instance via Graph (no zip for blueprint-only)
 uv run python scripts/publish.py --agent-name "Inbox Helper" --apply
 
-# 7. Re-point the messaging endpoint at your tunnel + run the bridge
+# 7. Re-point the messaging endpoint at your tunnel
 uv run python scripts/activity_bridge.py update-endpoint \
     --agent-name "Inbox Helper" \
     --url https://<tunnel>.trycloudflare.com/api/messages --apply
+
+# 8a. Bridge-standalone path (debug / no Hermes harness involved)
 HERMES_BRIDGE_WEBHOOK=https://my-responder/respond \
     uv run python scripts/activity_bridge.py serve --slug inbox-helper
+
+# 8b. Hermes plugin path (production: the agent loop runs)
+ln -sfn "$PWD/plugins/agent365" ~/.hermes/plugins/agent365
+# add gateway.platforms.agent365 + plugins.enabled to ~/.hermes/config.yaml
+# export A365_TENANT_ID, A365_APP_ID, A365_BLUEPRINT_CLIENT_SECRET, AA_INSTANCE_ID
+hermes gateway run
 
 # 9. Status sanity (any time)
 uv run python scripts/status.py inbox-helper --human
@@ -222,93 +246,107 @@ External issues filed:
   (bug #18).
 - **[Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)** —
   upstream proposal to add `hermes-a365` as an official optional
-  skill. Filed 2026-05-05; awaiting NousResearch guidance.
+  skill. Filed 2026-05-05. Reframed in slice 19l after the SPEC §10
+  Q1 contract turned out to already exist in the harness; awaiting
+  NousResearch guidance on naming + placement.
 
 Open issues in this repo (run `gh issue list` for current state):
 
-- **[#1](../../issues/1)** — Hermes gateway platform plugin
-  (`agent365`). The activity bridge becomes a `BasePlatformAdapter`,
-  registered via `~/.hermes/plugins/agent365/plugin.yaml`. SPEC §10
-  Q1 resolved 2026-05-05 by inspecting the bundled harness — Hermes
-  ships a documented platform-plugin contract (`gateway/platforms/ADDING_A_PLATFORM.md`),
-  so the plugin path is unblocked even before Hermes#20133 lands.
+**Active build tracks:**
+
 - **[#3](../../issues/3)** — Activity bridge streaming responses.
-  Required for M365 Copilot substantive replies.
-- **[#4](../../issues/4)** — Proactive long-running reply pattern (>10s
-  agent thinking via captured `ConversationReference`).
-- **[#5](../../issues/5)** — Invoke action types beyond Adaptive Card
-  (`signin/verifyState`, `task/{fetch,submit}`, `composeExtension/*`).
+  **Hard prerequisite for #16** (M365 Copilot Chat surface validation
+  per slice 19u) — Copilot Chat enforces a ~15s non-streaming reply
+  timeout.
+- **[#4](../../issues/4)** — Proactive long-running reply pattern.
+  Surface-agnostic. Slice 19o registry (`ConversationRef` +
+  `conversations.json`) is the **already-shipped** prerequisite;
+  what's missing is the Hermes-side trigger.
 
-Operator action (not a code issue):
+**Surface-validation walkthroughs:**
 
-- **Round-3 walkthrough.** Live-tenant validation of `serve` mode +
-  reference responder (Teams round-trip, `bridge.pid` lifecycle, JWT
-  validation against real BF JWKS). Runbook step 9c in
-  [`references/live-tenant-test.md`](references/live-tenant-test.md).
+- **[#16](../../issues/16)** — Slice 19u: validate M365 Copilot Chat
+  surface (gates on #3).
+- **[#17](../../issues/17)** — Slice 19v: validate Teams group +
+  channel surfaces (architecturally covered, just needs a live walk).
+
+**Adapter quality / operator UX:**
+
+- **[#13](../../issues/13)** — Slice 19r: `interactive_setup()` for
+  `hermes gateway setup` wizard. Surface-agnostic.
+- **[#14](../../issues/14)** — Slice 19s: surface + auto-recover the
+  GA CLI's client-secret persistence regression (hit on three
+  consecutive walkthroughs).
+- **[#18](../../issues/18)** — Slice 19w: handle invoke activities
+  (`task/{fetch,submit}` for Outlook compose-action,
+  `composeExtension/*` for Teams compose, `signin/verifyState` for
+  OAuth tools). Umbrella with per-name children. Supersedes the
+  older #5.
+
+**Recent closures (round-5 deliverables):**
+
+- ~~#1~~ — Hermes gateway platform plugin. **Closed 2026-05-06** after
+  §9d round-5 walkthrough validated the plugin path end-to-end.
+  Slices 19m / 19n / 19o / 19o-followup / 19p delivered.
+- ~~#5~~ — Invoke action types. **Closed 2026-05-06** as superseded
+  by #18 (per-name split).
+- ~~#6~~ — Outbound auth refactor. **Closed 2026-05-05** by slice 19e
+  (agentic three-stage user-FIC chain).
+- ~~#7~~ — AAD-v2 inbound JWT validator. **Closed 2026-05-05** by
+  slice 19f.
+- ~~#8 / #9 / #10 / #11~~ — orphan agentic-user purge / orphan
+  agentRegistry surface / inbound idempotency / serviceUrl host
+  allowlist. **Closed 2026-05-05** by slices 19g / 19h / 19i / 19j.
+- ~~#12~~ — Filter agents-channel synthetic events. **Closed
+  2026-05-06** by slice 19q + follow-up.
+- ~~#15~~ — M365 surface coverage audit. **Closed 2026-05-06** by
+  slice 19t (`references/m365-surface-coverage.md` + 3 child issues).
 
 ## Status meta
 
-Slice timeline since v0.2 work began:
+Slice timeline at week-grain (per-slice detail is in the commit log):
 
-- **2026-05-04** — slices 18a–18g landed: foundation reset
-  (`mutator.py` thin run-argv wrapper + `a365_config.py`), apply-path
-  rebuild (`register`, `instance_create`, `cleanup`, `publish`),
-  read-path rework (`doctor` + `status` against the GA `query-entra`
-  surface), `SKILL.md` 0.2.0. v0.1 subcommands that targeted
-  non-existent CLI verbs (`deploy`, `workiq`, `telemetry`,
-  `fic_rotate`, `blueprint_create`) deleted.
-- **2026-05-04** — slice 18h: live-tenant runbook
-  ([`references/live-tenant-test.md`](references/live-tenant-test.md)).
-- **2026-05-05** — round-2 walkthrough surfaced 18 wrapper bugs and CLI
-  realities. Slices 18i–18u fixed all 17 in code/docs; #18 was filed
-  as Microsoft#402 and confirmed by Microsoft same-day to be intended
-  behaviour with a cosmetic logging gap (slice 19k aligned the
-  wrapper docs and code comments).
-- **2026-05-05** — slices 18v–18x: scope-classifier hint corrections
-  against the verified GA output (`Inheritable Scopes:` /
-  `Successfully retrieved`), `Mutator` `stdin_input` kwarg so cleanup
-  can answer the CLI's prompt that `-y` doesn't actually suppress, and
-  file-permission hardening (0600 on per-agent .env + `chmod 600` on
-  the cleanup-emitted `*.backup-*.json` files that hold the secret).
-- **2026-05-05** — slices 19a–19b: activity bridge `verify` mode
-  (config + auth + reachability diagnostic), then `serve` mode (BF
-  webhook adapter — JWT validation, webhook forwarding, Adaptive Card
-  reply rendering, `serviceUrl` POST-back) plus the
-  [`references/webhook-contract.md`](references/webhook-contract.md)
-  contract for operator-defined responders. Validation against
-  Microsoft Learn before coding: 8 GO, 2 CAUTION, 0 NO-GO on the
-  10 protocol assumptions.
-- **2026-05-05** — two upstream submissions filed:
+- **2026-05-04** — v0.2 foundation: slices 18a–18g land
+  (`mutator.py` + `a365_config.py` + apply-path rebuild for
+  `register` / `instance_create` / `cleanup` / `publish` + read-path
+  rework against `query-entra`). Live-tenant runbook 18h.
+- **2026-05-05** — round-2 walkthrough surfaces 18 wrapper bugs;
+  slices 18i–18x fix all 17 in-code/docs. Bug #18 filed upstream as
   [Microsoft#402](https://github.com/microsoft/Agent365-devTools/issues/402)
-  for the bot-permissions S2S defect, and
-  [Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)
-  proposing `hermes-a365` as an official optional skill. Drafts
-  archived under [`docs/submissions/`](docs/submissions/).
-- **2026-05-05** — round-3 walkthrough: provisioned a fresh blueprint,
-  ran update-endpoint to register a `cloudflared` tunnel as the
-  messaging endpoint, and discovered Microsoft's `AADSTS82001` policy
-  blocks the bridge's `client_credentials` outbound auth for A365
-  blueprint apps on messaging resources. The bridge's wire is correct
-  but the auth model was wrong. Filed as
-  [#6](https://github.com/satscryption/Hermes-A365/issues/6) (slice
-  19d findings; CLI quirk that `a365 publish` clobbers
-  `agentBlueprintClientSecret` from the local generated config also
-  documented). Tenant cleaned up post-walkthrough.
-- **2026-05-05** — slice 19e: refactored bridge outbound auth from
-  `client_credentials` (broken for agentic apps) to the canonical
-  three-stage `user_fic` chain documented at
-  https://learn.microsoft.com/en-us/entra/agent-id/agent-user-oauth-flow.
-  T1 = blueprint impersonates agent identity via FMI; T2 = agent
-  identity asserts itself; final = user-context token at the
-  Messaging Bot API resource. Two-tier cache (T1/T2 shared across
-  users; final per-user). `bridge verify` gains an FMI exchange
-  probe; messaging-resource `client_credentials` probe dropped.
-  60 bridge tests passing.
-
-Older v0.1 slice history (1–17) lived in this README until 2026-05-05;
-it was a slice-by-slice trail that grew unwieldy. The canonical
-per-slice detail now lives in the commit log; salient findings are
-captured in the relevant `references/*.md` snapshots.
+  and resolved same-day as cosmetic-logging-only.
+- **2026-05-05** — slices 19a–19c: bridge `verify` + `serve` +
+  reference responder; round-3 walkthrough exposes the
+  AADSTS82001 outbound-auth defect on agentic apps. Slice 19e
+  refactors outbound to the canonical
+  [agentic three-stage user-FIC chain](https://learn.microsoft.com/en-us/entra/agent-id/agent-user-oauth-flow).
+- **2026-05-05** — round-3 + round-4 walkthroughs end-to-end:
+  inbound AAD-v2 JWT (19f, [#7](https://github.com/satscryption/Hermes-A365/issues/7)),
+  orphan agentic-user purge (19g, [#8](https://github.com/satscryption/Hermes-A365/issues/8)),
+  inbound idempotency (19i, [#10](https://github.com/satscryption/Hermes-A365/issues/10)),
+  orphan agentRegistry surface + `--orphan-instance-id` flag
+  (19h + round-4, [#9](https://github.com/satscryption/Hermes-A365/issues/9)),
+  serviceUrl host allowlist (19j,
+  [#11](https://github.com/satscryption/Hermes-A365/issues/11)).
+  Microsoft#402 framing realignment (19k); SPEC §10 Q1 resolution
+  via the upstream Hermes plugin contract (19l). Bridge-standalone
+  Teams round-trip with JWT-on validated end-to-end.
+- **2026-05-06** — Hermes plugin path: slice 19m skeleton, 19n
+  bridge-runtime port, 19o durable session table + `send_typing` /
+  `send_image`, 19o follow-up (lowercase `plugin.yaml` + 1-arg
+  `is_connected`). §9d runbook drafted with explicit prerequisites
+  checklist.
+- **2026-05-06** — round-5 §9d walkthrough validates the **Hermes
+  plugin path end-to-end**: agent loads through `hermes gateway
+  run`, Teams DM dispatches via `handle_message`, agent reasons,
+  reply lands; gateway-restart durability check passes.
+  [#1](https://github.com/satscryption/Hermes-A365/issues/1) closed.
+- **2026-05-06** — slice 19q filters `agents`-channel synthetic
+  events from the agent loop (eliminates onboarding-typing 404
+  spam). Slice 19t M365 surface coverage audit produces
+  [`references/m365-surface-coverage.md`](references/m365-surface-coverage.md)
+  + child issues [#16](https://github.com/satscryption/Hermes-A365/issues/16)
+  / [#17](https://github.com/satscryption/Hermes-A365/issues/17) /
+  [#18](https://github.com/satscryption/Hermes-A365/issues/18).
 
 ## License
 
