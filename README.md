@@ -104,6 +104,7 @@ pulling these artefacts in at contribution time. See
 │   ├── activity-protocol-shapes.md
 │   ├── entra-blueprint-properties.md
 │   ├── error-codes.md
+│   ├── exposing-the-bot-endpoint.md # Tunnel/reverse-proxy options (non-prescriptive)
 │   ├── license-cost-table.md
 │   ├── live-tenant-test.md          # End-to-end runbook (operator-side)
 │   ├── m365-surface-coverage.md     # Surface matrix per slice 19t
@@ -178,10 +179,15 @@ uv run python scripts/instance_create.py inbox-helper \
 # 6. Register the agent instance via Graph (no zip for blueprint-only)
 uv run python scripts/publish.py --agent-name "Inbox Helper" --apply
 
-# 7. Re-point the messaging endpoint at your tunnel
+# 7. Re-point the messaging endpoint at whatever public HTTPS URL
+#    fronts your local port 3978. The skill is tunnel-agnostic —
+#    Cloudflare quick-tunnel example shown for expedience; see
+#    references/exposing-the-bot-endpoint.md for named tunnels,
+#    Microsoft devtunnels, ngrok, Azure App Service, custom
+#    reverse-proxy alternatives.
 uv run python scripts/activity_bridge.py update-endpoint \
     --agent-name "Inbox Helper" \
-    --url https://<tunnel>.trycloudflare.com/api/messages --apply
+    --url https://<your-public-host>/api/messages --apply
 
 # 8a. Bridge-standalone path (debug / no Hermes harness involved)
 HERMES_BRIDGE_WEBHOOK=https://my-responder/respond \

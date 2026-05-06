@@ -431,12 +431,22 @@ Prerequisites:
   This passes `--m365` under the hood (provisioning the bot
   identity + populating `botMsaAppId`) and pins the messaging
   endpoint to your tunnel.
-- `cloudflared` installed locally (`brew install cloudflared`).
+- A way to expose `localhost:3978` to A365's connector as an
+  HTTPS URL. The walkthrough below uses **Cloudflare quick
+  tunnel** (`cloudflared`) for expedience — substitute any of the
+  options in
+  [`references/exposing-the-bot-endpoint.md`](exposing-the-bot-endpoint.md)
+  for non-walkthrough deployments. The skill is tunnel-agnostic;
+  `update-endpoint --apply` takes whatever URL you produce.
 
-Stand up three processes:
+Stand up three processes (substitute your tunnel/proxy of choice
+for the `cloudflared` line if you're not following the walkthrough
+literally):
 
 ```bash
 # 1. Tunnel — exposes the bridge port to A365's BF infra.
+#    Quick tunnel (no account / no setup) shown here. For a
+#    stable URL or production use, see references/exposing-the-bot-endpoint.md.
 cloudflared tunnel --url http://localhost:3978 &
 # Take the trycloudflare.com URL it prints.
 
@@ -624,11 +634,15 @@ exporting the env var in the gateway's process, or setting
 ### 9d.4 — Re-point messaging endpoint at the gateway tunnel
 
 The bridge under §9c was bound to its own tunnel. Hermes' uvicorn
-takes that role now. Re-run `update-endpoint` against the new
-tunnel URL:
+takes that role now. Re-run `update-endpoint` against whatever
+public-reachable URL you point at the gateway port. The walkthrough
+example uses Cloudflare quick-tunnel for expedience; see
+[`references/exposing-the-bot-endpoint.md`](exposing-the-bot-endpoint.md)
+for stable-URL alternatives.
 
 ```bash
-# 1. Tunnel — same shape as §9c, but exposes Hermes' uvicorn this time.
+# 1. Tunnel — quick-tunnel example. Substitute named-cloudflared,
+#    devtunnels, ngrok, or your reverse proxy as appropriate.
 cloudflared tunnel --url http://localhost:3978 &
 # 2. Re-point.
 uv run python scripts/activity_bridge.py update-endpoint \
