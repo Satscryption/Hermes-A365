@@ -553,6 +553,8 @@ ERROR invalid --users: must be a non-negative integer
 
 ### 6.2 Entra app registration (`hermes a365 register`)
 
+> **v0.2 update (2026-05-07).** The v0.1 T1+T2 split below never matched the GA CLI's surface — `register` now drives `a365 setup blueprint` + `setup permissions {mcp,bot}` end-to-end (slice 18j line-streamed device-code prompts). `--auto-recover-secret` (slice 19s, opt-in) detects and patches around the GA CLI's `agentBlueprintClientSecret` persistence regression on macOS/Linux: after `setup blueprint` claims success the CLI may leave the field `null` on disk despite the credential existing on the Entra app side; the wrapper warns by default and runs `az ad app credential reset --append` + patches the generated config + `chmod 0600` when the flag is set. Filed upstream as [microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408); reproduces in CLI 1.1.171 → 1.1.174.
+
 - **State machine:**
   1. `a365 query-entra --by-name <app-name>` — does T1 first-party app exist?
      - If yes, capture `appId`, mark T1=present.

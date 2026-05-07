@@ -247,9 +247,17 @@ External issues filed:
   Microsoft replied same day confirming Observability-only S2S
   assignment is intended (the other two resources use delegated
   OAuth2 only) — three message/log fixes queued for the next CLI
-  release. Resolution captured in
+  release. **Fixes shipped in 1.1.174 (verified 2026-05-07).**
+  Resolution captured in
   [`references/live-tenant-test.md`](references/live-tenant-test.md)
   (bug #18).
+- **[Microsoft#408](https://github.com/microsoft/Agent365-devTools/issues/408)** —
+  `setup blueprint`: `agentBlueprintClientSecret` persists as `null`
+  on macOS despite successful credential creation. Filed 2026-05-07
+  after round-6 walkthrough confirmed the regression is still
+  present in CLI 1.1.174 (reproduces 100% across rounds 3, 4, 5, 6
+  spanning 1.1.171 → 1.1.174). Wrapper-side coverage shipped in
+  slice 19s — see closure of [#14](../../issues/14) below.
 - **[Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)** —
   upstream proposal to add `hermes-a365` as an official optional
   skill. Filed 2026-05-05. Reframed in slice 19l after the SPEC §10
@@ -280,9 +288,6 @@ Open issues in this repo (run `gh issue list` for current state):
 
 - **[#13](../../issues/13)** — Slice 19r: `interactive_setup()` for
   `hermes gateway setup` wizard. Surface-agnostic.
-- **[#14](../../issues/14)** — Slice 19s: surface + auto-recover the
-  GA CLI's client-secret persistence regression (hit on three
-  consecutive walkthroughs).
 - **[#18](../../issues/18)** — Slice 19w: handle invoke activities
   (BF wire-protocol). Foundation slices 19w-a (typed dispatch +
   `InvokeContext` + response builders) and 19w-b (generalised
@@ -326,8 +331,18 @@ explicit triggers that would re-prioritise it.
   cost justifies the build. Sibling of #18; depends on #18
   foundation slices (19w-a + 19w-b).
 
-**Recent closures (round-5 deliverables):**
+**Recent closures:**
 
+- ~~#14~~ — GA CLI client-secret persistence regression. **Closed
+  2026-05-07** after slice 19s shipped layer 1 (detection +
+  `--auto-recover-secret` flag) and round-6 walkthrough validated
+  end-to-end against CLI 1.1.174. Layer 2 filed upstream as
+  [Microsoft#408](https://github.com/microsoft/Agent365-devTools/issues/408).
+  Live-found bug fixed during validation: `_run_streaming` (slice
+  18j) merges stderr into stdout, so `az -o json` output begins
+  with a credential-protection `WARNING:` line that broke the
+  initial `json.loads` parser; fixed via `_extract_first_json_object`
+  using `JSONDecoder.raw_decode` from the first `{`.
 - ~~#1~~ — Hermes gateway platform plugin. **Closed 2026-05-06** after
   §9d round-5 walkthrough validated the plugin path end-to-end.
   Slices 19m / 19n / 19o / 19o-followup / 19p delivered.
@@ -390,6 +405,20 @@ Slice timeline at week-grain (per-slice detail is in the commit log):
   + child issues [#16](https://github.com/satscryption/Hermes-A365/issues/16)
   / [#17](https://github.com/satscryption/Hermes-A365/issues/17) /
   [#18](https://github.com/satscryption/Hermes-A365/issues/18).
+- **2026-05-07** — README narrows
+  [#18](https://github.com/satscryption/Hermes-A365/issues/18) scope
+  to BF wire-protocol foundation + per-name handlers, splits Work IQ
+  V2 amplifier work to new
+  [#21](https://github.com/satscryption/Hermes-A365/issues/21).
+  Slice 19s ships layer 1 of
+  [#14](https://github.com/satscryption/Hermes-A365/issues/14) —
+  detection + `--auto-recover-secret` for the GA CLI's
+  `agentBlueprintClientSecret` persistence regression. Round-6
+  validation walkthrough against CLI 1.1.174 confirms the regression
+  is still present (filed upstream as
+  [Microsoft#408](https://github.com/microsoft/Agent365-devTools/issues/408))
+  and validates layer 1 end-to-end (one live-found JSON-parser bug
+  fixed in commit `4b1a2e8`). #14 closed.
 
 ## License
 
