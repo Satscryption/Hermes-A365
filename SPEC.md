@@ -430,7 +430,7 @@ sequenceDiagram
   Cli->>En: create T1 first-party app
   Sk->>Cli: a365 setup app --tier=2 --name=X-conf
   Cli->>En: create T2 confidential client
-  Sk->>Cli: a365 fic configure --app=<T2>
+  Sk->>Cli: a365 fic configure --app=&lt;T2&gt;
   Cli->>En: configure user-FIC
   Sk-->>U: appId(T1), appId(T2), tenant_id; secret → keychain
 
@@ -443,23 +443,23 @@ sequenceDiagram
   end
   Sk-->>U: consent=granted
 
-  U->>Sk: hermes a365 blueprint create <slug> --apply
+  U->>Sk: hermes a365 blueprint create &lt;slug&gt; --apply
   Sk->>Sk: render templates/blueprint.json.j2
-  Sk->>Cli: a365 setup blueprint --file=<path>
+  Sk->>Cli: a365 setup blueprint --file=&lt;path&gt;
   Cli->>Bp: register / patch blueprint
   Sk-->>U: blueprint=registered
 
-  U->>Sk: hermes a365 instance create <slug> --apply
-  Sk->>Cli: a365 create-instance --blueprint=<slug>
+  U->>Sk: hermes a365 instance create &lt;slug&gt; --apply
+  Sk->>Cli: a365 create-instance --blueprint=&lt;slug&gt;
   Cli->>En: bind owner + AA_INSTANCE_ID
-  Sk-->>U: ~/.hermes/agents/<slug>/.env written
+  Sk-->>U: ~/.hermes/agents/&lt;slug&gt;/.env written
 
-  U->>Sk: hermes a365 deploy <slug> --channels=teams --apply
-  Sk->>Cli: a365 deploy --instance=<id> --channels=teams
+  U->>Sk: hermes a365 deploy &lt;slug&gt; --channels=teams --apply
+  Sk->>Cli: a365 deploy --instance=&lt;id&gt; --channels=teams
   Cli->>Bf: bind channel(s)
   Sk-->>U: deep-link(s), channels=teams=ok
 
-  U->>Sk: hermes a365 activity-bridge start <slug> --detach
+  U->>Sk: hermes a365 activity-bridge start &lt;slug&gt; --detach
   Sk->>Bf: subscribe to instance channel
   Sk-->>U: pid=… , log path
 ```
@@ -486,7 +486,7 @@ sequenceDiagram
   alt Plain reply
     Br->>Bf: message activity (text or simple card)
   else Actionable card
-    Br->>Br: render templates/adaptive-cards/<name>.json.j2
+    Br->>Br: render templates/adaptive-cards/&lt;name&gt;.json.j2
     Br->>Bf: invoke activity (adaptiveCard/action)
   end
   Bf-->>T: render in Teams
