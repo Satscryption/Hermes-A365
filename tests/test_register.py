@@ -568,6 +568,70 @@ class TestAutoRecoverSecret:
         assert on_disk["agentBlueprintClientSecret"] is None
         assert any("no `.password`" in m for m in outcome.messages)
 
+    def test_recovers_when_az_stdout_has_warning_preamble(self, tmp_path: Path) -> None:
+        """Live regression caught 2026-05-07 round-6 §9d-style walkthrough.
+
+        ``az`` writes a credential-protection ``WARNING:`` line to stderr
+        whenever ``-o json`` returns a password. The mutator's
+        ``_run_streaming`` (slice 18j) merges stderr into stdout, so
+        ``run.stdout`` is::
+
+            WARNING: The output includes credentials that you must protect...
+            {"appId":"...","password":"...","tenant":"..."}
+
+        The first cut of ``auto_recover_secret`` did
+        ``json.loads(run.stdout)`` on the raw stream, raised
+        ``JSONDecodeError`` on the WARNING line, and silently fell
+        through to "no .password". Pin the working extractor here.
+        """
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        live_az_output = (
+            "WARNING: The output includes credentials that you must protect. "
+            "Be sure that you do not include these credentials in your code "
+            "or check the credentials into your source control. For more "
+            "information, see https://aka.ms/azadsp-cli\n"
+            '{\n'
+            '  "appId": "bp-app-id",\n'
+            '  "password": "RV88Q~MOCK-SECRET",\n'
+            '  "tenant": "tenant-id"\n'
+            '}\n'
+        )
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=live_az_output, stderr="")]
+        )
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert outcome.recovered is True, outcome.messages
+        on_disk = json.loads(path.read_text())
+        assert on_disk["agentBlueprintClientSecret"] == "RV88Q~MOCK-SECRET"
+
+    def test_recovers_when_az_stdout_has_trailing_diagnostics(
+        self, tmp_path: Path
+    ) -> None:
+        """Belt-and-braces: the JSON object is consumed even when other
+        diagnostic lines follow it. ``json.JSONDecoder.raw_decode`` is
+        tolerant of trailing content; ``json.loads`` is not."""
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        out = (
+            '{"appId":"bp-app-id","password":"FRESH-SECRET","tenant":"t"}\n'
+            "Note: credential will be appended to existing list.\n"
+        )
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=out, stderr="")]
+        )
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert outcome.recovered is True
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == "FRESH-SECRET"
+
     def test_failure_when_az_returns_unparseable_json(self, tmp_path: Path) -> None:
         path = _write_generated(
             tmp_path,

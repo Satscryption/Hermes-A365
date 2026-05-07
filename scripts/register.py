@@ -375,6 +375,29 @@ def detect_missing_secret(generated_config_path: Path) -> tuple[bool, str | None
     return is_missing, bp_id
 
 
+def _extract_first_json_object(text: str) -> dict[str, Any] | None:
+    """Find the first balanced JSON object in ``text`` and parse it.
+
+    The mutator's :func:`_run_streaming` merges stderr into stdout, so
+    `az -o json` output is preceded by a one-line credential-protection
+    ``WARNING:`` and can be followed by other diagnostic lines. We
+    can't ``json.loads`` the raw stream — locate the first ``{`` and
+    let :class:`json.JSONDecoder` consume just the object. Returns
+    ``None`` when nothing parsable is found.
+    """
+    if not text:
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        obj, _ = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return obj if isinstance(obj, dict) else None
+
+
 def _build_recovery_argv(
     blueprint_app_id: str, display_name: str, *, years: int = 2
 ) -> list[str]:
@@ -434,10 +457,7 @@ def auto_recover_secret(
         )
         return outcome
 
-    try:
-        payload = json.loads(run.stdout) if run.stdout.strip() else {}
-    except json.JSONDecodeError:
-        payload = {}
+    payload = _extract_first_json_object(run.stdout) or {}
     new_secret = payload.get("password") if isinstance(payload, dict) else None
     if not isinstance(new_secret, str) or not new_secret:
         outcome.messages.append(
