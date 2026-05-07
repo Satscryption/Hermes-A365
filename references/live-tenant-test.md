@@ -141,66 +141,103 @@ never writes to `~/.hermes/.env`.
 
 ## 3. register — `setup blueprint` + `setup permissions {mcp,bot}`
 
-⚠️ **Major caveat:** the v0.2 `register.py` wrapper currently can't
-drive the apply path end-to-end on a real tenant. The `Mutator` uses
-`subprocess.run(capture_output=True)`, which buffers stdout — so when
-the underlying `a365 setup blueprint` emits a device-code prompt for
-its MSAL write-scope auth, the operator never sees it and the
-subprocess hangs until the timeout. Slice 18i bumped the timeout from
-60 s → 900 s, but the real fix is line-streaming output. Until then,
-**run the three steps directly** as below; the wrapper's dry-run is
-still useful for reviewing the planned argv.
-
-Dry-run via the wrapper to review the plan:
+The v0.2 `register.py` wrapper drives the three apply steps
+end-to-end. Slice 18j replaced `subprocess.run(capture_output=True)`
+with `_run_streaming` (line-buffered Popen + `select.select`
+deadline + stderr→stdout merge), so device-code prompts surface in
+real time. Use the wrapper directly:
 
 ```bash
-uv run python scripts/register.py --agent-name "<display-name>" --tenant-id <tenant-id>
+uv run python scripts/register.py \
+    --agent-name "<display-name>" \
+    --m365 \
+    --apply
 ```
 
-Then run each step **directly** through the CLI so you can see prompts:
+(Drop `--m365` for blueprint-only flow without messaging endpoint
+registration. Add `--tenant-id <id>` to skip the `az account show`
+auto-detect.)
+
+Behind the flag: `register --apply` runs `a365 setup blueprint
+[--m365]`, then `setup permissions mcp`, then `setup permissions bot`,
+in order. Each step may emit its own device-code prompt — see the
+"device-code volume" caveat below. The wrapper streams every prompt
+to stdout the moment the CLI prints it.
+
+**Use `--auto-recover-secret` to auto-handle the
+`agentBlueprintClientSecret` persistence regression** (see "Failure
+modes" below): when set, after a successful apply the wrapper detects
+the broken state and runs `az ad app credential reset --append` +
+patches the generated config + tightens to mode `0600`. Off by
+default; without the flag the wrapper prints a paste-ready recovery
+hint and exits 0.
 
 ```bash
-a365 setup blueprint     --agent-name "<display-name>" --tenant-id <tenant-id> --no-endpoint
-a365 setup permissions mcp --agent-name "<display-name>" --tenant-id <tenant-id>
-a365 setup permissions bot --agent-name "<display-name>" --tenant-id <tenant-id>
+uv run python scripts/register.py \
+    --agent-name "<display-name>" \
+    --m365 \
+    --auto-recover-secret \
+    --apply
 ```
 
-The first call (`setup blueprint`) emits a fresh device-code prompt
-for write-scope MSAL bootstrap (separate from the `setup requirements`
-auth from step 1) and a follow-up admin-consent browser flow. Subsequent
-calls in the same machine reuse the persistent MSAL token cache.
-
-**Pass criterion:** all three steps complete with exit 0. After
-`setup blueprint`, `a365.config.json` (operator config) gains the
-derived `<display-name> Blueprint` / `<display-name> Identity` names,
-and **`a365.generated.config.json`** (gitignored) gains the blueprint
-appId, SP id, and the **client secret in plaintext** (DPAPI not
-available on macOS / Linux). Treat that file as keychain-equivalent
-sensitivity.
+After `setup blueprint`, `a365.config.json` (operator config) gains
+the derived `<display-name> Blueprint` / `<display-name> Identity`
+names, and **`a365.generated.config.json`** (gitignored) gains the
+blueprint appId, SP id, and the **client secret in plaintext** (DPAPI
+is Windows-only). Treat that file as keychain-equivalent sensitivity.
 
 Failure modes to watch:
 
+- **`agentBlueprintClientSecret: null` on disk despite "Client secret
+  created successfully!"** — GA CLI persistence regression on
+  macOS / Linux. Reproduces 100% across rounds 3–6 (CLI 1.1.171
+  through 1.1.174). The credential really is minted on the Entra app
+  side; only the local persistence is broken. Filed upstream as
+  [microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408).
+  The wrapper's layer-1 detection (slice 19s) catches this and
+  surfaces a paste-ready recovery line; pass `--auto-recover-secret`
+  to fix it inline. If the warning fires post-apply, the on-disk
+  secret is null and downstream commands (`update-endpoint`,
+  bridge runtime) won't work without recovery.
+- **Device-code volume on macOS 26** — `Failed to register persistent
+  token cache. Authentication prompts may be repeated.` and `Browser
+  authentication is not supported on this platform: macOS 26.4.1`
+  combine to give one device-code prompt per Entra-side mutation
+  (~10–12 prompts per `register --apply`). On Windows / Linux the
+  persistent MSAL cache holds and you get 1–2 prompts total. Not
+  yet filed upstream as a separate issue.
 - **AADSTS500011** (license not yet propagated) — wait 5–30 min after
-  assigning Tier 3 and re-run.
+  assigning Tier 3 and re-run. The wrapper retries this code 3× with
+  30 s backoff automatically.
 - **`pwsh` not found** — `a365 setup` errors out citing
   `setup requirements`. Fix the prereq and re-run.
 - **"Admin consent has not been granted... non-admin user"** during
   `setup permissions bot` — cosmetic CLI message that fires even when
-  you ARE Global Admin. Microsoft confirmed (microsoft/Agent365-devTools#402,
+  you ARE Global Admin. Microsoft confirmed
+  ([microsoft/Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402),
   2026-05-05) the line is misleading: it triggers on a
   consent-not-yet-granted state for `AppRoleAssignment.ReadWrite.All`,
   not on a role check, and the PowerShell fallback acquires the token
-  interactively a moment later. If the run still exits 0, the
-  operation completed correctly. The `appRoleAssignments` post-run
-  query will show only `Observability API` — that is also intended
-  (Messaging Bot API and Power Platform API use OAuth2 delegated
-  grants only, not S2S).
+  interactively a moment later. **Fixes shipped in 1.1.174** —
+  message rephrased to "An administrator must grant tenant-wide
+  consent to proceed". If the run still exits 0, the operation
+  completed correctly. The `appRoleAssignments` post-run query will
+  show only `Observability API` — that is also intended (Messaging
+  Bot API and Power Platform API use OAuth2 delegated grants only,
+  not S2S).
 
-- [ ] `setup blueprint` exits 0; blueprint app + SP visible in Entra.
-- [ ] `setup permissions mcp` exits 0.
-- [ ] `setup permissions bot` exits 0 (with the S2S caveat above).
+- [ ] `register --apply` exits 0 (drives `setup blueprint` →
+      `setup permissions mcp` → `setup permissions bot` in order).
+- [ ] Each step shows `[apply] <step>: <description> — done` in the
+      wrapper's summary block.
 - [ ] `a365.generated.config.json` exists and is **gitignored** (verify
       with `git check-ignore -v a365.generated.config.json`).
+- [ ] `agentBlueprintClientSecret` is populated in
+      `a365.generated.config.json`. If null, the wrapper's layer-1
+      `[warn]` line should have fired pointing at Microsoft#408 with
+      a paste-ready recovery. Re-run with `--auto-recover-secret` or
+      paste the suggested `az ad app credential reset --append`
+      command, then patch the field manually.
 
 ## 4. consent — admin grant
 
