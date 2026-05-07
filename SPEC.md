@@ -1,12 +1,21 @@
 # `hermes-a365` — Skill Specification
 
-**Status:** Draft v1 — 2026-05-03
+**Status:** Draft v1 — 2026-05-03 (v0.2 reality-check annotations 2026-05-07)
 **Author:** Sadiq Jaffer (drafted with Claude)
 **Target:** Hermes Agent harness (`~/.hermes/hermes-agent/`)
 **Source repo:** <https://github.com/satscryption/Hermes-A365>
 **Replaces / parallels:** the existing OpenClaw integration with Microsoft Agent 365 (the `SidU/openclaw-a365` Bot Framework channel plugin and surrounding tooling)
 
 > **Repo split note.** This spec, the reference material under `references/`, the prototype scripts under `scripts/`, and the templates under `templates/` are developed in the standalone repo `satscryption/Hermes-A365` so design and iteration can move at their own cadence. The final `SKILL.md` is **contributed upstream** to `hermes-agent/optional-skills/cloud-platforms/hermes-a365/SKILL.md` (see §3.1) and pulls in the artefacts from this repo at upstream-contribution time. Until that happens, this repo is the authoritative working tree.
+
+> **v0.2 reality-check (2026-05-07).** This document is the original v0.1 design draft. v0.1 was scrapped 2026-05-04 because it targeted a speculative CLI surface that diverged from what Microsoft shipped at GA. v0.2 was rebuilt against the real `a365` (.NET) CLI v1.1.171, and the activity bridge has since become a Hermes gateway platform plugin (§10 Q1 resolution). The sections below carry inline **v0.2 update** banners on the parts that are obsolete, renamed, or never shipped. For the **current** state of the wrapper (subcommands actually implemented, plugin layout, runbook, open issues), the authoritative sources are now:
+>
+> - **`README.md`** — current subcommand inventory, status, open-work tracks
+> - **`references/live-tenant-test.md`** — the §9 walkthrough as actually walked through five rounds against satscryption.io
+> - **`references/m365-surface-coverage.md`** — adapter coverage matrix per M365 surface
+> - **`plugins/agent365/`** — the gateway plugin shape (closed #1)
+>
+> A full v2 rewrite is deferred; treat this draft as **historical with annotations** rather than an authoritative design doc.
 
 ---
 
@@ -25,7 +34,7 @@ Concise definitions for terms used throughout this spec. Where a term has a Micr
 | **App registration (T1)** | A multi-tenant first-party Entra app. Identifies the agent's "shape" rather than a specific deployment. Cannot be modified after creation in some tenants. |
 | **App registration (T2)** | A confidential-client Entra app paired with the T1 first-party app. Holds the client secret used by the runtime; FICs can be issued against it. |
 | **AADSTS** | Error-code prefix used by Entra ID (Azure AD) — `AADSTS<N>` codes denote authentication / consent / token issues. |
-| **`atk`** | The npm-distributed variant of the A365 CLI. Ships as `a365` on PATH; behavioural near-twin of the .NET variant. |
+| **`atk`** | The npm-distributed variant of the A365 CLI. Ships as `a365` on PATH; behavioural near-twin of the .NET variant. **v0.2 update (2026-05-07): the npm `atk` variant did not ship at GA. Only the .NET `a365` CLI exists; `A365_CLI_VARIANT` is dead.** |
 | **Bot Framework Activity protocol** | The Microsoft-standardised conversation-event protocol used to ferry messages between channels (Teams, Outlook, etc.) and bots. A365 uses it as its notification surface. |
 | **Channel (BF sense)** | A first-class consumer surface bound to an agent — Teams, Outlook, Microsoft 365 Copilot. Distinct from "Slack channel" usage. |
 | **Confidential client** | An Entra app that can hold a secret (server-side). T2 in this spec. |
@@ -165,27 +174,32 @@ metadata:
 
 ### 3.3 CLI surface
 
+> **v0.2 update (2026-05-07).** The shipped subcommand surface differs from this table: `deploy` / `workiq` / `telemetry verify` / `fic rotate` were never implemented (the underlying CLI verbs don't exist at GA), `blueprint create` folded into `register`, and `publish` was added (branches AI-Teammate manifest zip vs blueprint-only Graph instance registration). The activity bridge is now also exposed as a Hermes gateway plugin (`plugins/agent365/`) — see §10 Q1 resolution. Inline annotations on each row below; current inventory is in `README.md`.
+
 A single dispatch entry, `hermes a365 <subcommand>`, exposed via the harness' standard skill→CLI bridge. Subcommands:
 
 | Subcommand | Purpose |
 |---|---|
-| `hermes a365 doctor` | Read-only environment check: `a365` CLI present, `atk` npm vs `.NET` variant detected, `az` CLI available, network reachable, current tenant, current license posture |
+| `hermes a365 doctor` | Read-only environment check: `a365` CLI present, ~~`atk` npm vs~~ `.NET` variant detected, `az` CLI available, network reachable, current tenant, current license posture |
 | `hermes a365 license` | Recommend license model based on agent count + user count; emits a markdown comparison; never purchases |
-| `hermes a365 register [--app-name --tenant]` | Idempotent Entra T1 + T2 registration; reconciles against `a365 query-entra` |
+| `hermes a365 register [--app-name --tenant]` | Idempotent Entra T1 + T2 registration; reconciles against `a365 query-entra`. **v0.2: also drives `setup blueprint` + `setup permissions {mcp, bot}` end-to-end via line-streamed subprocess (slice 18j) — i.e., absorbed `blueprint create`.** |
 | `hermes a365 consent` | Emits admin-consent URL, polls until grant detected |
-| `hermes a365 blueprint create <agent-slug>` | Renders blueprint JSON from template, `a365 setup blueprint` |
-| `hermes a365 instance create <agent-slug> [--owner --owner-aad-id]` | Writes `~/.hermes/agents/<slug>/.env`, registers agent instance, sets up FIC |
-| `hermes a365 deploy <agent-slug> [--channels=teams,outlook,m365copilot]` | Wraps `a365 deploy` |
-| `hermes a365 activity-bridge start <agent-slug>` | Runs the Hermes-side Bot Framework Activity bridge as a foreground or detached process |
-| `hermes a365 workiq <agent-slug> [--enable mail,calendar,...]` | Toggles MCP-mediated Work IQ tools |
-| `hermes a365 telemetry verify <agent-slug>` | Confirms OTLP endpoint, sampling, last span seen |
-| `hermes a365 fic rotate <agent-slug>` | User-FIC token rotation |
-| `hermes a365 status [<agent-slug>]` | All-up status: license, app, blueprint, instance, deployment, last activity |
-| `hermes a365 cleanup <agent-slug> --confirm` | Destructive: deletes blueprint, instance, app — never tenant licenses |
+| ~~`hermes a365 blueprint create <agent-slug>`~~ | ~~Renders blueprint JSON from template, `a365 setup blueprint`.~~ **v0.2: folded into `register`.** |
+| `hermes a365 instance create <agent-slug> [--owner --owner-aad-id]` | Writes `~/.hermes/agents/<slug>/.env`, registers agent instance ~~, sets up FIC~~. **v0.2: per-call agentic three-stage user-FIC chain (slice 19e), no per-instance FIC setup.** |
+| `hermes a365 publish <agent-slug> [--aiteammate \| --blueprint-only]` | **v0.2 added.** Branches between AI-Teammate (emits manifest zip for M365 Admin Centre upload) and blueprint-only (Graph API instance registration). |
+| ~~`hermes a365 deploy <agent-slug> [--channels=teams,outlook,m365copilot]`~~ | ~~Wraps `a365 deploy`.~~ **v0.2: never shipped — `a365 deploy` doesn't exist at GA. Channel binding happens via `publish` (AI-Teammate path) or admin-centre activation.** |
+| `hermes a365 activity-bridge {verify,serve,update-endpoint}` | Hermes-side BF webhook adapter. **v0.2: ~~`start`/`stop`/PID-file model~~ replaced by `verify` (config + auth + reachability + FMI exchange) and `serve` (long-running webhook receiver). Validated default is now the gateway plugin path — operator runs `hermes gateway run`, not `activity-bridge serve`. See §10 Q1.** |
+| ~~`hermes a365 workiq <agent-slug> [--enable mail,calendar,...]`~~ | ~~Toggles MCP-mediated Work IQ tools.~~ **v0.2: never shipped — Work IQ exposure is configured at blueprint registration via `setup permissions mcp`, not a separate wrapper subcommand.** |
+| ~~`hermes a365 telemetry verify <agent-slug>`~~ | ~~Confirms OTLP endpoint, sampling, last span seen.~~ **v0.2: never shipped — OTLP wiring is aspirational (see §6.8).** |
+| ~~`hermes a365 fic rotate <agent-slug>`~~ | ~~User-FIC token rotation.~~ **v0.2: never shipped — there is no rotation cadence; user-FIC is per-call agentic three-stage chain (slice 19e). Entire §6.10 is obsolete.** |
+| `hermes a365 status [<agent-slug>]` | All-up status: license, app, blueprint, instance, ~~deployment~~ publish artefact, last activity |
+| `hermes a365 cleanup <agent-slug> --confirm` | Destructive: deletes blueprint, instance, app — never tenant licenses. **v0.2: order is `cleanup azure → instance → blueprint`; pre-feeds `y\n` to defeat GA CLI prompts; adds `--purge-orphans` (orphan agentic users + agentRegistry, slice 19g/h) and `--orphan-instance-id` (plumbs in store-managed instance ids the AI-Teammate flow creates server-side). AI-Teammate flow caveats documented in `references/live-tenant-test.md` §10.** |
 
 **Default posture:** every state-mutating subcommand defaults to `--dry-run` unless `--apply` is passed.
 
 #### 3.3.1 Quick examples
+
+> **v0.2 update (2026-05-07).** The example below uses v0.1 verbs (`blueprint create`, `deploy`, `activity-bridge start`) that don't exist in the shipped wrapper. For the current bootstrap path, see `README.md` "Quick start" and `references/live-tenant-test.md` §9b–§9d (verify, bridge-standalone, Hermes-plugin paths — all round-walked).
 
 The following sketch shows the full bootstrap path; full per-subcommand examples (with sample output, dry-run posture, and common error cases) are in §6.
 
@@ -290,6 +304,8 @@ Numbered list, drawn from operator experience and Microsoft Learn:
 ---
 
 ## 5. File layout
+
+> **v0.2 update (2026-05-07).** The actual layout has drifted: `scripts/` now also holds `_common.py`, `a365_config.py`, `cleanup.py`, `consent.py`, `hermes_responder.py`, `instance_create.py`, `license.py`, `mutator.py`, `publish.py`, `register.py`; `render_blueprint.py` was never split out (rendering happens inline in `register.py`); `keychain.py` is still present and unchanged in name. A new top-level `plugins/agent365/` (adapter.py, conversations.py, plugin.yaml) hosts the Hermes gateway plugin (closed #1). `references/` now also has `webhook-contract.md`, `live-tenant-test.md`, `m365-surface-coverage.md`, `exposing-the-bot-endpoint.md`; `license-comparison.md` was renamed `license-cost-table.md`; `work-iq-tools.md` was never written (Work IQ is configured at blueprint registration, not via a separate wrapper). For the current tree, run `tree -L 2` or read `README.md` "Repo layout".
 
 ```
 optional-skills/cloud-platforms/hermes-a365/
@@ -653,6 +669,8 @@ ERROR a365 setup app failed
 
 ### 6.4 Agent blueprint (`hermes a365 blueprint create`)
 
+> **v0.2 update (2026-05-07).** This subcommand was folded into `register`, which drives `setup blueprint` + `setup permissions {mcp, bot}` end-to-end with line-streamed device-code prompts (slice 18j). The dry-run/diff/PATCH model below is roughly preserved but lives inside `register.py` now. Examples below show v0.1 verbs.
+
 - Inputs: `agent-slug`, `description`, `purpose`, `functions[]`, `app-roles[]`, `optional-claims[]`, `dlp-policy`, `external-access-policy`, `logging-policy`.
 - Render with `templates/blueprint.json.j2`. Microsoft does not publish a JSON Schema for blueprints — properties listed in prose at <https://learn.microsoft.com/en-us/microsoft-agent-365/developer/registration>. Author by example; surface unknown properties as warnings via `references/entra-blueprint-properties.md`.
 - Run `a365 setup blueprint --file=<path>`.
@@ -733,12 +751,21 @@ ERROR refusing to apply with unknown property; pass --allow-unknown to override.
 
 ### 6.6 Work IQ MCP exposure (`hermes a365 workiq`)
 
+> **v0.2 update (2026-05-07).** Never shipped as a separate subcommand. Work IQ exposure is configured at blueprint registration time via `setup permissions mcp`, driven through `register`. There is no per-blueprint runtime toggle in the wrapper.
+
 - Toggle which MCP-mediated M365 data sources the blueprint can call: `mail`, `calendar`, `sharepoint`, `teams`, `tasks`, `people`. Each maps to an A365-managed MCP server.
 - Stored in blueprint; changes go through `hermes a365 blueprint create` reconciliation.
 - Verify by listing exposed tools in admin center: surface link from skill output.
 - **No** local MCP server is run — A365 manages them. This subcommand is config-only.
 
 ### 6.7 Activity bridge (`hermes a365 activity-bridge`)
+
+> **v0.2 update (2026-05-07).** Two big shifts since this section was written:
+>
+> 1. **Wire model.** BF is webhook **push**, not poll/subscribe. Subcommands are `verify` (config + auth + reachability + FMI exchange), `serve` (long-running webhook receiver), `update-endpoint` (rewrites the BF channel `serviceUrl` to the operator's tunnel/proxy). The `start --detach` / `stop` / PID-file workflow described below was never built that way.
+> 2. **Plugin path is the validated default.** Per the §10 Q1 resolution, the bridge runtime is also exposed as a Hermes gateway platform plugin at `plugins/agent365/` (closed #1, validated round-5 on 2026-05-06). Operators run `hermes gateway run` against the configured platform; inbound dispatches via `Agent365Adapter.handle_message(event)` and outbound via `send(chat_id, content)`. The standalone `serve` mode still works but the plugin path is now the prescribed runbook in `references/live-tenant-test.md` §9d.
+>
+> Slice 19o added the durable session table at `~/.hermes/agents/<slug>/conversations.json` (restart-durability + #4 proactive-send precondition), not mentioned below. The `bridge.pid` / `bridge.log` files in §6.7 examples are not artefacts of the shipped wrapper.
 
 This is the analogue of the `SidU/openclaw-a365` Bot Framework channel plugin.
 
@@ -795,6 +822,8 @@ $ hermes a365 activity-bridge start inbox-helper
 
 ### 6.8 OpenTelemetry (`hermes a365 telemetry`)
 
+> **v0.2 update (2026-05-07).** Aspirational. No `telemetry verify` subcommand was built; no OTLP wiring shipped. The wrapper does not inject Hermes spans into A365 traces. Revisit if/when an operator needs end-to-end observability in admin centre.
+
 - A365 auto-instruments registered agents: spans, metrics, and a small canonical event vocabulary (agent.received, agent.responded, agent.tool_invoked, agent.error).
 - This skill's job:
   - Confirm `HERMES_OTLP_ENDPOINT` is set in the per-agent .env.
@@ -803,6 +832,8 @@ $ hermes a365 activity-bridge start inbox-helper
 - Span schema doc: `references/opentelemetry-config.md`.
 
 ### 6.9 Channel deployment (`hermes a365 deploy`)
+
+> **v0.2 update (2026-05-07).** Never shipped — `a365 deploy` does not exist in the GA CLI surface. Channel binding happens via `publish` (AI-Teammate path emits a manifest zip uploaded through M365 Admin Centre; blueprint-only path registers an instance via Graph). Per-user channel activation is an admin-centre action, not a wrapper subcommand. See `references/live-tenant-test.md` §9c for the AI-Teammate surfacing reality, and `references/m365-surface-coverage.md` for adapter coverage per surface.
 
 - Wraps `a365 deploy --instance=<id> --channels=<list>`.
 - Channels supported: `teams`, `outlook`, `m365copilot`.
@@ -854,6 +885,8 @@ ERROR channel "m365copilot" requires Microsoft 365 Copilot license
 ```
 
 ### 6.10 Federated identity rotation (`hermes a365 fic rotate`)
+
+> **v0.2 update (2026-05-07).** Never shipped — `a365 fic rotate` does not exist in the GA CLI, and the runtime model changed: the user-FIC is acquired per-call via the agentic three-stage chain (slice 19e, closes #6), so there is no rotation cadence to manage. Entire subsection is obsolete.
 
 - Runs `a365 fic rotate --app=<T2-appId>`.
 - Re-issues user-FIC token, updates OS keychain.
@@ -928,6 +961,8 @@ Read-only, fast. Checks:
 Pure diagnostic; never mutates.
 
 ### 6.13 Cleanup (`hermes a365 cleanup`)
+
+> **v0.2 update (2026-05-07).** Shipped order is `cleanup azure → instance → blueprint` (no T1/T2 split — `publish` does not create a T1 first-party app on the operator's side). Slice 18w added `stdin_input` to pre-feed `y\n` since the GA CLI's `-y` flag doesn't actually skip subcommand prompts. Slices 19g/19h added `--purge-orphans` (clears orphan agentic users + agentRegistry entries the GA CLI fails to delete) and `--orphan-instance-id` (plumbs in store-managed instance ids the AI-Teammate flow creates server-side). **AI-Teammate-flow caveat (confirmed three walkthroughs):** Graph DELETE on store-managed instances always 403s regardless of scope; canonical cleanup is M365 Admin Centre → Agents → Instance tab → Delete + agent main pane → Block. See `references/live-tenant-test.md` §10 for the detail.
 
 - Order matters: deployment → instance → blueprint → app (T2) → app (T1).
 - Each step requires the corresponding A365 CLI cleanup subcommand.
@@ -1025,6 +1060,8 @@ State is derived (not stored) by `scripts/status.py` — never persist a state v
 ---
 
 ## 9. Verification & acceptance criteria
+
+> **v0.2 update (2026-05-07).** Items 2 + 5 + 6 reference subcommands that don't exist (`blueprint create`, `deploy`, `telemetry verify`, `fic rotate`). The actual round-walked acceptance path lives in `references/live-tenant-test.md` (§9b verify, §9c bridge-standalone, §9d Hermes-plugin paths) — round-5 walked 2026-05-06 against satscryption.io closed #1 end-to-end.
 
 The skill is "done" when **all** of the following hold:
 
@@ -1272,7 +1309,7 @@ The skill is a thin orchestrator over Microsoft-controlled surfaces; its long-te
 | Dependency / risk | Failure mode | Mitigation |
 |---|---|---|
 | **`a365` CLI (`atk` npm and .NET variants)** | Subcommand renamed, flag dropped, output JSON shape changes. | Pin tested versions in `references/a365-cli-reference.md` (§7.4); `doctor` warns on drift; integration tests catch shape drift before release. |
-| **Two CLI variants drift apart** | A subcommand exists in `.NET` only (or vice versa); skill silently fails on the other variant. | The skill records `A365_CLI_VARIANT` and routes commands accordingly; integration tests run on both variants. |
+| ~~**Two CLI variants drift apart**~~ | ~~A subcommand exists in `.NET` only (or vice versa); skill silently fails on the other variant.~~ | ~~The skill records `A365_CLI_VARIANT` and routes commands accordingly; integration tests run on both variants.~~ **v0.2: moot — only the .NET variant shipped at GA.** |
 | **A365 scope catalog evolves** (e.g., scope rename) | `register` or `consent` requests an obsolete scope → `AADSTS65001`. | Doctor cross-checks live `query-entra --scopes` against `references/error-codes.md`; CI snapshot bumps trigger a release. |
 | **Agent blueprint schema additions** | Microsoft adds a property the skill doesn't render → blueprint missing capabilities silently. | Annual review of `references/entra-blueprint-properties.md`; warn loudly when `query-entra` returns properties the template never produced. |
 | **A365 retirement of pre-1.0 behaviour** | Behaviour observed during preview was relied upon and is removed at GA milestones. | Skill targets GA (≥ 1.0.0) only; preview behaviours are not encoded. |
