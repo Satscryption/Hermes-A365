@@ -289,6 +289,27 @@ Open issues in this repo (run `gh issue list` for current state):
   OAuth tools). Umbrella with per-name children. Supersedes the
   older #5.
 
+**Deferred (pending operator demand):**
+
+These are architecturally-sound future moves that we will not pick up
+until a concrete operator pain point surfaces — designing them in a
+vacuum risks getting the API surface wrong. Each issue body lists the
+explicit triggers that would re-prioritise it.
+
+- **[#19](../../issues/19)** — Pluggable secrets provider. Replace
+  `scripts/keychain.py`'s OS-keychain shim with a `SecretsProvider`
+  interface so operators can plug Vault / AWS Secrets Manager /
+  Azure Key Vault / 1Password / etc. behind it. Defer until the
+  first non-OS-keychain ask, or until Hermes ships its own
+  abstraction we should consume rather than parallel.
+- **[#20](../../issues/20)** — Split `activity-bridge` into BF-wire
+  library + reference runtimes. The standalone `serve` and the
+  `Agent365Adapter` plugin are already thin wrappers around mostly
+  library-shaped logic (`_activity_to_event`, JWT validator,
+  idempotency cache, FIC chain). Defer the formal split until a
+  third runtime (e.g., embed in operator's FastAPI app, serverless
+  function) is concretely needed.
+
 **Recent closures (round-5 deliverables):**
 
 - ~~#1~~ — Hermes gateway platform plugin. **Closed 2026-05-06** after
