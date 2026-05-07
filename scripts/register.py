@@ -39,6 +39,9 @@ See ``references/a365-cli-reference.md`` for the verified command surface.
 from __future__ import annotations
 
 import argparse
+import datetime as _dt
+import json
+import os
 import shlex
 import sys
 import time
@@ -68,16 +71,23 @@ __all__ = [
     "RegisterInputs",
     "RegisterPlan",
     "RegisterStep",
+    "SecretRecoveryOutcome",
     "apply_register_plan",
+    "auto_recover_secret",
     "build_register_plan",
+    "default_recovery_display_name",
+    "detect_missing_secret",
     "get_mutator",
     "main",
+    "report_missing_secret_warning",
 ]
 
 DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_SECONDS = 30.0
 
 VALID_AUTH_MODES: frozenset[str] = frozenset({"obo", "s2s", "both"})
+
+GENERATED_CONFIG_FILENAME = "a365.generated.config.json"
 
 
 # ---------------------------------------------------------------------------
@@ -310,6 +320,185 @@ def update_config_for_agent(
 
 
 # ---------------------------------------------------------------------------
+# Slice 19s — surface + auto-recover the GA CLI client-secret persistence
+# regression (#14). After `a365 setup blueprint` runs, the CLI logs
+# "Secret stored in generated config" but `agentBlueprintClientSecret`
+# can be `null` on disk. Hit on rounds 3, 4, and §9d round-5 of the
+# walkthrough. Recovery shape is `az ad app credential reset --append`
+# + patch + chmod 0600.
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class SecretRecoveryOutcome:
+    """Outcome of the missing-secret detection + recovery pass."""
+
+    detected: bool  # True when CLI claimed success but secret is null/empty
+    recovered: bool  # True when --auto-recover-secret succeeded end-to-end
+    blueprint_app_id: str | None = None
+    messages: list[str] = field(default_factory=list)
+
+
+def _read_generated_config_dict(path: Path) -> dict[str, Any] | None:
+    """Read ``a365.generated.config.json`` as a raw dict.
+
+    Distinct from :func:`a365_config.read` (which models the *input*
+    config); the generated config carries server-assigned fields like
+    ``agentBlueprintClientSecret`` we don't want to round-trip through
+    a typed schema. Returns ``None`` on missing / unreadable / non-dict.
+    """
+    if not path.exists():
+        return None
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def detect_missing_secret(generated_config_path: Path) -> tuple[bool, str | None]:
+    """Detect the "CLI claimed to write secret but didn't" state.
+
+    Returns ``(is_missing, blueprint_app_id)``. The detection requires
+    ``agentBlueprintId`` to be populated (so we know the credential
+    exists on the Entra app side) AND ``agentBlueprintClientSecret`` to
+    be null / empty / missing on disk. Any other shape is "no signal".
+    """
+    data = _read_generated_config_dict(generated_config_path)
+    if not data:
+        return False, None
+    bp_id = data.get("agentBlueprintId")
+    if not isinstance(bp_id, str) or not bp_id:
+        return False, None
+    secret = data.get("agentBlueprintClientSecret")
+    is_missing = not (isinstance(secret, str) and secret)
+    return is_missing, bp_id
+
+
+def _build_recovery_argv(
+    blueprint_app_id: str, display_name: str, *, years: int = 2
+) -> list[str]:
+    """The exact `az ad app credential reset` argv we run + suggest."""
+    return [
+        "az",
+        "ad",
+        "app",
+        "credential",
+        "reset",
+        "--id",
+        blueprint_app_id,
+        "--append",
+        "--display-name",
+        display_name,
+        "--years",
+        str(years),
+        "-o",
+        "json",
+    ]
+
+
+def default_recovery_display_name(now: _dt.datetime | None = None) -> str:
+    """Timestamped display name for the appended credential."""
+    when = now or _dt.datetime.now()
+    return f"hermes-bridge-recovery-{when.strftime('%Y%m%dT%H%M%S')}"
+
+
+def auto_recover_secret(
+    generated_config_path: Path,
+    blueprint_app_id: str,
+    *,
+    mutator: Mutator,
+    display_name: str,
+) -> SecretRecoveryOutcome:
+    """Mint a fresh credential via az + patch into the generated config.
+
+    Caller must have already confirmed the missing-secret state via
+    :func:`detect_missing_secret`. On success the file is rewritten
+    atomically and chmodded to ``0o600``. Failures (az invocation
+    error, az output without ``.password``, file not on disk) leave
+    the generated config untouched and return an outcome with
+    ``recovered=False`` plus a paste-ready recovery hint.
+    """
+    argv = _build_recovery_argv(blueprint_app_id, display_name)
+    paste_cmd = shlex.join(argv)
+    outcome = SecretRecoveryOutcome(
+        detected=True, recovered=False, blueprint_app_id=blueprint_app_id
+    )
+
+    try:
+        run = mutator.run(argv)
+    except CliInvocationError as e:
+        outcome.messages.append(
+            f"[recover] `az ad app credential reset` failed: {e}; "
+            f"recover by hand: {paste_cmd}"
+        )
+        return outcome
+
+    try:
+        payload = json.loads(run.stdout) if run.stdout.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    new_secret = payload.get("password") if isinstance(payload, dict) else None
+    if not isinstance(new_secret, str) or not new_secret:
+        outcome.messages.append(
+            f"[recover] `az` returned no `.password` field; "
+            f"recover by hand: {paste_cmd}"
+        )
+        return outcome
+
+    data = _read_generated_config_dict(generated_config_path)
+    if data is None:
+        outcome.messages.append(
+            f"[recover] {generated_config_path} disappeared between "
+            f"detection and recover; secret minted but not persisted. "
+            f"Paste manually: {paste_cmd}"
+        )
+        return outcome
+
+    data["agentBlueprintClientSecret"] = new_secret
+    tmp = generated_config_path.with_suffix(generated_config_path.suffix + ".tmp")
+    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
+    os.replace(tmp, generated_config_path)
+    os.chmod(generated_config_path, 0o600)
+
+    outcome.recovered = True
+    outcome.messages.append(
+        f"[recover] minted fresh credential on app {blueprint_app_id}; "
+        f"agentBlueprintClientSecret patched into "
+        f"{generated_config_path.name} (mode 0600)."
+    )
+    return outcome
+
+
+def report_missing_secret_warning(
+    blueprint_app_id: str, generated_config_path: Path
+) -> str:
+    """Operator-facing warning when detection fires without auto-recovery.
+
+    Carries the exact paste-ready commands, mirroring the operator tone
+    of the slice 19g/h orphan recovery hints.
+    """
+    display_name = default_recovery_display_name()
+    az_cmd = shlex.join(_build_recovery_argv(blueprint_app_id, display_name))
+    patch_hint = (
+        f'    python3 -c "import json,os,pathlib,sys;'
+        f"p=pathlib.Path(sys.argv[1]);"
+        f"d=json.loads(p.read_text());"
+        f"d[\\'agentBlueprintClientSecret\\']=sys.argv[2];"
+        f"p.write_text(json.dumps(d,indent=2,sort_keys=True)+chr(10));"
+        f'os.chmod(p, 0o600)" {generated_config_path} <paste-password>'
+    )
+    return (
+        f"[warn] CLI minted a credential on app {blueprint_app_id} but "
+        f"did not persist it locally — known regression (#14).\n"
+        f"  recover (mint + paste manually):\n"
+        f"    {az_cmd}\n"
+        f"{patch_hint}\n"
+        f"  or re-run with --auto-recover-secret to do this automatically."
+    )
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -382,6 +571,17 @@ def main(argv: list[str] | None = None) -> int:
         default=DEFAULT_BACKOFF_SECONDS,
         help=f"backoff between retries in seconds (default {DEFAULT_BACKOFF_SECONDS:g})",
     )
+    parser.add_argument(
+        "--auto-recover-secret",
+        action="store_true",
+        help=(
+            "if `a365 setup blueprint` claims to write a client secret "
+            "but `agentBlueprintClientSecret` is null on disk (#14), "
+            "automatically run `az ad app credential reset --append` "
+            "and patch the generated config. Off by default; without "
+            "the flag the wrapper just prints a paste-ready hint."
+        ),
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -425,6 +625,27 @@ def main(argv: list[str] | None = None) -> int:
         return 2
 
     sys.stdout.write("\n" + "\n".join(result.messages) + "\n")
+
+    # Slice 19s — surface (and optionally recover) the missing-secret state.
+    # Only meaningful if blueprint actually ran; if the apply deferred at
+    # the consent step before blueprint, there's no secret to check yet.
+    if "blueprint" in result.completed:
+        generated_path = Path(GENERATED_CONFIG_FILENAME)
+        is_missing, bp_id = detect_missing_secret(generated_path)
+        if is_missing and bp_id:
+            if args.auto_recover_secret:
+                outcome = auto_recover_secret(
+                    generated_path,
+                    bp_id,
+                    mutator=get_mutator(),
+                    display_name=default_recovery_display_name(),
+                )
+                sys.stdout.write("\n" + "\n".join(outcome.messages) + "\n")
+            else:
+                sys.stdout.write(
+                    "\n" + report_missing_secret_warning(bp_id, generated_path) + "\n"
+                )
+
     if result.consent_deferred:
         sys.stdout.write(
             "\nNext: run `hermes a365 consent`, grant admin consent, then re-run "

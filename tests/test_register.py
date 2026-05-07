@@ -22,8 +22,13 @@ from register import (
     RegisterInputs,
     RegisterPlan,
     RegisterStep,
+    SecretRecoveryOutcome,
     apply_register_plan,
+    auto_recover_secret,
     build_register_plan,
+    default_recovery_display_name,
+    detect_missing_secret,
+    report_missing_secret_warning,
     update_config_for_agent,
 )
 
@@ -368,3 +373,287 @@ def test_register_step_is_a_dataclass() -> None:
     step = RegisterStep(name="x", argv=["a"], description="d")
     assert step.name == "x"
     assert step.description == "d"
+
+
+# ---------------------------------------------------------------------------
+# Slice 19s (#14) — missing-secret detection + auto-recover
+# ---------------------------------------------------------------------------
+
+
+def _write_generated(tmp_path: Path, payload: dict[str, object]) -> Path:
+    p = tmp_path / "a365.generated.config.json"
+    p.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+    return p
+
+
+class TestDetectMissingSecret:
+    """The bug shape: `agentBlueprintId` populated, secret null/empty.
+
+    These cases pin the detection contract — the whole layer 1 fix
+    hangs on getting this matrix right.
+    """
+
+    def test_detected_when_id_set_and_secret_null(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        is_missing, bp_id = detect_missing_secret(path)
+        assert is_missing is True
+        assert bp_id == "bp-app-id"
+
+    def test_detected_when_id_set_and_secret_empty_string(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": ""},
+        )
+        is_missing, bp_id = detect_missing_secret(path)
+        assert is_missing is True
+        assert bp_id == "bp-app-id"
+
+    def test_detected_when_id_set_and_secret_key_missing(self, tmp_path: Path) -> None:
+        path = _write_generated(tmp_path, {"agentBlueprintId": "bp-app-id"})
+        is_missing, bp_id = detect_missing_secret(path)
+        assert is_missing is True
+        assert bp_id == "bp-app-id"
+
+    def test_not_detected_when_secret_populated(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": "real"},
+        )
+        is_missing, _bp_id = detect_missing_secret(path)
+        assert is_missing is False
+
+    def test_not_detected_when_blueprint_id_missing(self, tmp_path: Path) -> None:
+        # No ``agentBlueprintId`` means ``setup blueprint`` never ran (or
+        # the file is from a previous run state); we can't recover what
+        # we can't address by id, so treat as no-signal.
+        path = _write_generated(tmp_path, {"agentBlueprintClientSecret": None})
+        is_missing, bp_id = detect_missing_secret(path)
+        assert is_missing is False
+        assert bp_id is None
+
+    def test_not_detected_when_file_missing(self, tmp_path: Path) -> None:
+        path = tmp_path / "nope.json"
+        is_missing, bp_id = detect_missing_secret(path)
+        assert is_missing is False
+        assert bp_id is None
+
+    def test_not_detected_when_file_unreadable_json(self, tmp_path: Path) -> None:
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text("{not valid json")
+        is_missing, _bp_id = detect_missing_secret(path)
+        assert is_missing is False
+
+    def test_not_detected_when_top_level_is_array(self, tmp_path: Path) -> None:
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text("[]")
+        is_missing, _bp_id = detect_missing_secret(path)
+        assert is_missing is False
+
+
+class TestAutoRecoverSecret:
+    """Auto-recover runs ``az ad app credential reset --append`` then
+    patches the generated config. Cases here pin the argv shape, the
+    JSON parsing of az output, the file mode, and the failure paths."""
+
+    _AZ_OK_PAYLOAD = json.dumps(
+        {
+            "appId": "bp-app-id",
+            "password": "FRESH-SECRET-VALUE",
+            "tenant": "contoso.onmicrosoft.com",
+            "keyId": "key-uuid",
+        }
+    )
+
+    def test_argv_shape_includes_append_and_id(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
+        )
+        auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert mutator.calls, "az should have been invoked"
+        argv = mutator.calls[0]
+        assert argv[:5] == ["az", "ad", "app", "credential", "reset"]
+        assert "--append" in argv
+        assert "--id" in argv and argv[argv.index("--id") + 1] == "bp-app-id"
+        assert "--display-name" in argv
+        assert argv[argv.index("--display-name") + 1] == "recovery-test"
+        assert "-o" in argv and argv[argv.index("-o") + 1] == "json"
+
+    def test_patches_secret_into_generated_config(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
+        )
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert outcome.recovered is True
+        on_disk = json.loads(path.read_text())
+        assert on_disk["agentBlueprintClientSecret"] == "FRESH-SECRET-VALUE"
+
+    def test_chmods_file_to_0600(self, tmp_path: Path) -> None:
+        # The file likely starts at the test runner's umask default,
+        # which on most CI runners is ``0o644``. Auto-recover must
+        # tighten it because the secret lives plaintext on macOS/Linux
+        # (no DPAPI).
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        path.chmod(0o644)
+        assert (path.stat().st_mode & 0o777) == 0o644
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
+        )
+        auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_preserves_other_fields(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {
+                "agentBlueprintId": "bp-app-id",
+                "agentBlueprintClientSecret": None,
+                "agentBlueprintObjectId": "obj-id",
+                "botMsaAppId": "bot-app-id",
+                "messagingEndpoint": "https://example.test/api/messages",
+            },
+        )
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
+        )
+        auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        on_disk = json.loads(path.read_text())
+        assert on_disk["agentBlueprintObjectId"] == "obj-id"
+        assert on_disk["botMsaAppId"] == "bot-app-id"
+        assert on_disk["messagingEndpoint"] == "https://example.test/api/messages"
+        assert on_disk["agentBlueprintClientSecret"] == "FRESH-SECRET-VALUE"
+
+    def test_failure_when_az_returns_no_password(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        mutator = FakeMutator(
+            scripted=[
+                RunResult(
+                    argv=[],
+                    returncode=0,
+                    stdout=json.dumps({"appId": "bp-app-id", "tenant": "t"}),
+                    stderr="",
+                )
+            ]
+        )
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert outcome.recovered is False
+        # Original null preserved — we don't blank the file on partial failure.
+        on_disk = json.loads(path.read_text())
+        assert on_disk["agentBlueprintClientSecret"] is None
+        assert any("no `.password`" in m for m in outcome.messages)
+
+    def test_failure_when_az_returns_unparseable_json(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        mutator = FakeMutator(
+            scripted=[
+                RunResult(argv=[], returncode=0, stdout="not json at all", stderr="")
+            ]
+        )
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert outcome.recovered is False
+        on_disk = json.loads(path.read_text())
+        assert on_disk["agentBlueprintClientSecret"] is None
+
+    def test_failure_when_az_invocation_errors(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        mutator = FakeMutator(
+            scripted=[CliInvocationError(["az"], 1, "permission denied")]
+        )
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert outcome.recovered is False
+        assert outcome.detected is True
+        assert any("recover by hand" in m for m in outcome.messages)
+
+    def test_outcome_carries_app_id(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
+        )
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert isinstance(outcome, SecretRecoveryOutcome)
+        assert outcome.blueprint_app_id == "bp-app-id"
+
+
+class TestReportMissingSecretWarning:
+    def test_includes_az_credential_reset_append(self, tmp_path: Path) -> None:
+        path = tmp_path / "a365.generated.config.json"
+        msg = report_missing_secret_warning("bp-app-id", path)
+        assert "az ad app credential reset" in msg
+        assert "--append" in msg
+        assert "--id bp-app-id" in msg
+
+    def test_mentions_issue_14(self, tmp_path: Path) -> None:
+        msg = report_missing_secret_warning(
+            "bp-app-id", tmp_path / "a365.generated.config.json"
+        )
+        assert "#14" in msg
+
+    def test_mentions_auto_recover_flag(self, tmp_path: Path) -> None:
+        msg = report_missing_secret_warning(
+            "bp-app-id", tmp_path / "a365.generated.config.json"
+        )
+        assert "--auto-recover-secret" in msg
+
+    def test_includes_config_path_in_patch_hint(self, tmp_path: Path) -> None:
+        path = tmp_path / "a365.generated.config.json"
+        msg = report_missing_secret_warning("bp-app-id", path)
+        assert str(path) in msg
+
+
+class TestRecoveryDisplayName:
+    def test_default_uses_now(self) -> None:
+        # Two calls in quick succession produce names with the same
+        # second-resolution timestamp; we just want non-empty + the
+        # ``hermes-bridge-recovery-`` prefix.
+        name = default_recovery_display_name()
+        assert name.startswith("hermes-bridge-recovery-")
+        assert len(name) > len("hermes-bridge-recovery-")
+
+    def test_explicit_now_is_used(self) -> None:
+        import datetime as _dt
+
+        when = _dt.datetime(2026, 5, 7, 14, 30, 0)
+        assert default_recovery_display_name(when) == (
+            "hermes-bridge-recovery-20260507T143000"
+        )
