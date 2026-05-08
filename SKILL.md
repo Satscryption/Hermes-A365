@@ -1,7 +1,7 @@
 ---
 name: hermes-a365
-description: Use when registering or operating a Hermes-driven agent under Microsoft Agent 365 governance — covers `a365 setup blueprint`, `setup permissions {mcp,bot}`, per-agent runtime config, manifest packaging via `a365 publish`, environment doctor, status reporting against `query-entra`, and destructive cleanup.
-version: 0.2.0
+description: Use when registering or operating a Hermes-driven agent under Microsoft Agent 365 governance — covers `a365 setup blueprint`, `setup permissions {mcp,bot}`, per-agent runtime config, manifest packaging via `a365 publish`, environment doctor, status reporting against `query-entra`, the Bot Framework activity bridge that backs the Hermes `agent365` gateway platform, and destructive cleanup.
+version: 0.1.0
 author: Hermes Agent
 license: MIT
 metadata:
@@ -31,10 +31,13 @@ Microsoft 365 Copilot. This skill drives those capabilities from inside
 the Hermes harness so a Hermes agent can appear as a first-class A365
 agent without re-implementing any of the governance surface.
 
-The v0.2 surface is built directly on the GA `Microsoft.Agents.A365.DevTools.Cli`
+The wrapper is built directly on the GA `Microsoft.Agents.A365.DevTools.Cli`
 verbs documented in [`references/a365-cli-reference.md`](references/a365-cli-reference.md).
-The skill composes them into idempotent plan/apply flows and fills the
-gaps (license decision, admin consent grant, runtime `.env` generation).
+The skill composes them into idempotent plan/apply flows, fills the
+gaps the CLI doesn't cover (license decision, admin consent grant,
+runtime `.env` generation), and ships a Bot Framework activity bridge
++ Hermes gateway platform plugin (`agent365`) that round-trips messages
+between A365 and the Hermes agent loop.
 
 ## When to Use
 
@@ -43,7 +46,7 @@ Use when the user wants to:
 - Stand up a brand-new A365-governed Hermes agent on a clean Microsoft
   tenant.
 - Package an existing Hermes agent's manifest for upload to the M365
-  Admin Centre (channel deployment is operator-side in v0.2).
+  Admin Centre (channel deployment is operator-side).
 - Verify environment / config / scope posture before or after a change.
 - Tear down an agent's Azure App Service, instance identity, and
   blueprint app cleanly.
@@ -64,8 +67,8 @@ Don't use when:
   or **Agent Administrator** role and is enrolled in Microsoft's
   Frontier Preview Program.
 - The A365 CLI on PATH: `Microsoft.Agents.A365.DevTools.Cli` (.NET tool,
-  ships as `a365`), ≥ 1.0.0. The npm `atk` variant referenced in v0.1
-  drafts did not ship at GA; only the .NET tool is supported.
+  ships as `a365`), ≥ 1.1.171. Only the .NET tool ships at GA — the
+  npm `atk` variant referenced in pre-GA documentation never landed.
 - `az` CLI ≥ 2.55.0, signed into the target tenant. Many `a365`
   subcommands shell out to `az` for Entra reads.
 - **PowerShell 7+ (`pwsh`) on PATH.** The CLI invokes `pwsh` for some
@@ -79,8 +82,12 @@ Don't use when:
 - A tenant license: either the **Agent 365 add-on** ($15/user/month) or
   **Microsoft 365 E7** ($99/user/month). The skill never purchases — it
   recommends; see [`references/license-cost-table.md`](references/license-cost-table.md).
-- A Hermes harness with this skill available under
-  `optional-skills/cloud-platforms/hermes-a365/`.
+- A Hermes harness with this repo's `plugins/agent365/` reachable from
+  `~/.hermes/plugins/agent365/` (symlink the directory rather than
+  copying — the bridge helpers under `<repo>/scripts/` are imported
+  via the symlink's resolved path), and `plugins.enabled` plus a
+  `gateway.platforms.agent365` block configured in `~/.hermes/config.yaml`.
+  The README quickstart walks through this end-to-end.
 
 ## Core procedures
 
@@ -156,8 +163,8 @@ actually lives.
 ### `hermes a365 publish --agent-name <name> [--aiteammate] [--use-blueprint] [--tenant-id <id>]`
 
 Wraps `a365 publish` to package the agent manifest into the zip the
-operator uploads to the M365 Admin Centre. Channel deployment in v0.2
-is **operator-side**: the admin signs in to the centre, uploads the
+operator uploads to the M365 Admin Centre. Channel deployment is
+**operator-side**: the admin signs in to the centre, uploads the
 zip, and approves the agent for users in the desired DLP scope. The
 wrapper surfaces the resulting package path plus an admin-centre URL
 hint.
@@ -174,12 +181,11 @@ components only:
 - `instance_scopes`  — `a365 query-entra instance-scopes` for the
   agent's instance.
 - `activity_bridge`  — local PID-file probe (only when a slug is given
-  AND `bridge.pid` exists). Activity bridge upstream work is still
-  TODO; the probe stays so the future bridge can be liveness-checked.
+  AND `bridge.pid` exists). When the bridge is running this row reports
+  `ok`; absent pidfile is `missing` (bridge not currently running) and
+  a stale or unreadable pidfile is `error`.
 
-Components dropped vs v0.1 (no CLI surface): license, per-tier app,
-channels, telemetry, FIC. Exit codes: `0` ok, `1` partial, `2` broken,
-`3` skill not yet bootstrapped.
+Exit codes: `0` ok, `1` partial, `2` broken, `3` skill not yet bootstrapped.
 
 ### `hermes a365 cleanup --agent-name <name> [--kinds=...] --confirm=<name> --apply`
 
@@ -193,22 +199,38 @@ audit before any mutation.
 
 ### `hermes a365 activity-bridge`
 
-- `verify --slug <slug>` — pre-deploy diagnostic (config + auth +
+The Bot Framework adapter daemon. Two main modes are available either
+as a standalone process (operator launches it) or as the runtime that
+backs the `agent365` Hermes gateway platform plugin (the gateway
+loads it in-process when an agent has the `agent365` platform enabled).
+
+- `verify --slug <slug>` — one-shot diagnostic (config + auth +
   reachability). Exit 0/1/2.
 - `serve --slug <slug> --port 3978` — BF webhook adapter daemon.
-  JWT-validates inbound activities against the public BF JWKS,
-  forwards each to `HERMES_BRIDGE_WEBHOOK` per the
-  [webhook contract](references/webhook-contract.md), replies via
-  `serviceUrl` with bot MSA credentials. MVP: synchronous `message`
-  + `invoke`; streaming / proactive deferred.
+  Validates inbound activities as **AAD-v2** (A365 / MCP Platform
+  issues AAD-v2 tokens directly to bot endpoints, not classic BF
+  tokens), dedupes BF retries, gates `serviceUrl` against the
+  Microsoft host suffix, and replies through the **agentic three-stage
+  user-FIC token chain** (BF S2S → agent FMI → user FIC). Outbound
+  goes via `replyToActivity` against the cached inbound `serviceUrl`.
 - `update-endpoint --agent-name <n> --url <https>` — wraps
   `a365 setup blueprint --m365 --update-endpoint <url>` so operators
   can pin the agent's messaging endpoint to a tunnel URL. Auto-recovers
   from [duplicate-name error #140](https://github.com/microsoft/Agent365-devTools/issues/140).
 
-Topology: Teams → A365 BF → `<tunnel>/api/messages` → bridge → POST
-`<webhook>` → reply via `serviceUrl`. Activity-shape catalogue:
-[`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md).
+Topology: Teams (or other M365 surface) → A365 BF → `<tunnel>/api/messages`
+→ bridge → Hermes agent loop → reply via `serviceUrl`. Activity-shape
+catalogue: [`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md);
+operator-side network exposure options:
+[`references/exposing-the-bot-endpoint.md`](references/exposing-the-bot-endpoint.md).
+
+**Surfaces that work today:** Teams 1:1 chat (validated end-to-end
+across rounds 3–5). Teams group / channel paths are architecturally
+covered (`_activity_to_event` maps `chat_type`) but unwalked. M365
+Copilot Chat needs streaming (#3) and proactive replies (#4) before
+it ships; Outlook compose-action needs invoke handling (#18). See
+[`references/m365-surface-coverage.md`](references/m365-surface-coverage.md)
+for the per-surface matrix.
 
 ## Conflict resolution
 
@@ -223,10 +245,8 @@ Topology: Teams → A365 BF → `<tunnel>/api/messages` → bridge → POST
 
 ## Common pitfalls
 
-1. **Channel deployment is operator-side.** v0.2 has no `deploy` verb.
+1. **Channel deployment is operator-side.** There is no `deploy` verb.
    `publish` produces the zip; the M365 admin uploads and approves it.
-   Anything that targeted a `hermes a365 deploy` command in older docs
-   is gone.
 2. **Delegated permissions, not application permissions.** A365
    explicitly requires delegated permissions. Pasting an application-
    permission consent URL silently breaks at runtime.
@@ -273,13 +293,15 @@ Topology: Teams → A365 BF → `<tunnel>/api/messages` → bridge → POST
 hermes a365 doctor                                                     # health check
 hermes a365 license --users <n> --agents <n> --plan E5                 # decide license
 hermes a365 register --agent-name "<Display Name>"                     # plan
-hermes a365 register --agent-name "<Display Name>" --apply
+hermes a365 register --agent-name "<Display Name>" --apply --auto-recover-secret
 hermes a365 consent                                                    # in-browser grant
 hermes a365 instance create <slug> --owner <email> --owner-aad-id <oid> --apply
-hermes a365 publish --agent-name "<Display Name>" --apply              # produce zip
+hermes a365 publish --agent-name "<Display Name>" --aiteammate --apply # produce zip
 # Operator: upload the zip in the M365 Admin Centre and approve for users.
-# When activity-bridge ships:
-# hermes a365 activity-bridge start <slug> --detach
+hermes a365 activity-bridge verify --slug <slug>                       # bridge preflight
+# Run the gateway with the agent365 platform configured (loads the
+# bridge in-process via plugins/agent365):
+hermes gateway run --profile <slug>
 hermes a365 status <slug>                                              # final verification
 ```
 
