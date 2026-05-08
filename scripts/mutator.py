@@ -1,14 +1,10 @@
 """Thin wrapper over the real Microsoft.Agents.A365.DevTools.Cli (binary ``a365``).
 
-v0.2 design: instead of one named protocol method per CLI verb (the v0.1
-``setup_app`` / ``fic_configure`` / ``setup_blueprint(file_path=…)`` /
-``create_instance`` / ``deploy`` / ``cleanup(kind, …)`` set, all of which
-targeted speculative CLI shapes that don't exist in the GA build), the
-:class:`Mutator` here exposes a single :meth:`Mutator.run` that takes an
-``argv`` list. Per-script appliers build the argv themselves and parse
-the captured output. This is closer to how the real CLI is invoked,
-keeps the protocol stable as the CLI's flag set evolves, and makes
-test fakes trivial (record argv, return scripted output).
+The :class:`Mutator` exposes a single :meth:`Mutator.run` that takes
+an ``argv`` list. Per-script appliers build the argv themselves and
+parse the captured output. This is closer to how the real CLI is
+invoked, keeps the protocol stable as the CLI's flag set evolves,
+and makes test fakes trivial (record argv, return scripted output).
 
 See ``references/a365-cli-reference.md`` for the verified command
 surface (CLI v1.1.171, .NET only — no npm variant).

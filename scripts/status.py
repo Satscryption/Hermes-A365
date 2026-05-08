@@ -1,7 +1,7 @@
 """hermes a365 status — per-component status report.
 
-v0.2 design: narrowed to the four components the verified GA CLI surface
-actually supports.
+Narrowed to the four components the verified GA CLI surface actually
+supports.
 
 - ``local_config``     — parent ``~/.hermes/.env`` (and agent .env if a slug
   is given) parseable + required keys present.

@@ -12,6 +12,11 @@ dependencies = [
   "jinja2>=3.1",
 ]
 
+[project.urls]
+Homepage = "https://github.com/satscryption/Hermes-A365"
+Issues = "https://github.com/satscryption/Hermes-A365/issues"
+Documentation = "https://github.com/satscryption/Hermes-A365#readme"
+
 [project.optional-dependencies]
 # Slice 19b — `activity_bridge.py serve` mode pulls in a small webserver
 # stack. Optional so operators who only run setup/cleanup wrappers can

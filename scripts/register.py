@@ -1,7 +1,7 @@
 """hermes a365 register — orchestrate `a365 setup blueprint` + permissions.
 
-v0.2 design: this command composes the three real CLI steps the operator
-needs to bootstrap an Agent 365 blueprint, in order:
+Composes the three real CLI steps the operator needs to bootstrap an
+Agent 365 blueprint, in order:
 
 1. ``a365 setup blueprint --agent-name <name>`` — registers the Entra app
    that backs the blueprint.

@@ -1,11 +1,10 @@
 """hermes a365 instance create — write the per-agent runtime .env file.
 
-v0.2 design: pure local config-file writer. No cloud step. The
-server-side agent identity is created by ``a365 setup blueprint``
-(driven by ``hermes a365 register``); this command only produces the
-``.env`` file that runtime consumers (the future activity bridge,
-telemetry pipeline, etc.) read for slug / owner / OTLP endpoint /
-business-hours metadata.
+Pure local config-file writer. No cloud step. The server-side agent
+identity is created by ``a365 setup blueprint`` (driven by
+``hermes a365 register``); this command only produces the ``.env``
+file that runtime consumers (the activity bridge, telemetry pipeline,
+etc.) read for slug / owner / OTLP endpoint / business-hours metadata.
 
 Inherits required values (``A365_APP_ID``, ``A365_TENANT_ID``,
 ``HERMES_OTLP_ENDPOINT``) from ``~/.hermes/.env``. An existing

@@ -27,3 +27,5 @@ which references files were refreshed.
 | [`license-cost-table.md`](license-cost-table.md) | A365 add-on / E7 pricing decision matrix | §6.1 |
 | [`live-tenant-test.md`](live-tenant-test.md) | End-to-end runbook against a Frontier-Preview tenant (operator-side) | — |
 | [`webhook-contract.md`](webhook-contract.md) | Stable JSON contract between `activity-bridge serve` and the operator's responder (slice 19b) | — |
+| [`exposing-the-bot-endpoint.md`](exposing-the-bot-endpoint.md) | Operator-side options for exposing the local bridge to Microsoft (cloudflared / devtunnels / ngrok / reverse-proxy) | — |
+| [`m365-surface-coverage.md`](m365-surface-coverage.md) | Per-surface coverage matrix for the `agent365` plugin (Teams 1:1, group/channel, Copilot Chat, Outlook) | — |

@@ -1,8 +1,8 @@
 """hermes a365 doctor — read-only environment probe.
 
-v0.2 design: drops the ``atk``/``a365-dotnet`` variant split (only the
-.NET CLI ships at GA — verified 2026-05-04) and adds the prereqs the
-real CLI's own ``setup requirements`` enforces:
+Targets the .NET ``a365`` CLI (the only variant that ships at GA —
+verified 2026-05-04) and checks the prereqs the real CLI's own
+``setup requirements`` enforces:
 
 - ``a365`` CLI present + version
 - ``az`` CLI present + signed in

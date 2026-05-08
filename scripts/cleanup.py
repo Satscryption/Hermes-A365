@@ -1,7 +1,7 @@
 """hermes a365 cleanup — destructive teardown of an A365 agent.
 
-v0.2 design: drives the real ``a365 cleanup`` subcommands. The CLI ships
-three granular kinds plus a bare ``cleanup`` that does everything:
+Drives the real ``a365 cleanup`` subcommands. The CLI ships three
+granular kinds plus a bare ``cleanup`` that does everything:
 
 - ``a365 cleanup blueprint``  — Entra blueprint app + service principal
 - ``a365 cleanup instance``   — agent instance identity + user
