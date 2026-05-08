@@ -16,6 +16,8 @@
 a365.config.json*
 a365.generated.config.json*
 *.generated.config.json*
+# Newcomers seed `a365.config.json` from this template — keep it tracked.
+!a365.config.json.example
 # `a365 cleanup -y` writes timestamped backups of the above files.
 a365.config.backup-*.json
 a365.generated.config.backup-*.json

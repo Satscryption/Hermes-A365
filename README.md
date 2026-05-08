@@ -6,58 +6,112 @@ control plane that GA'd 2026-05-01.
 
 ## Status
 
-**v0.2 validated end-to-end against the satscryption.io tenant via the
-Hermes plugin path.** Round-5 §9d walkthrough on 2026-05-06 drove a
-real Teams DM through `Agent365Adapter.handle_message` into the
-Hermes agent loop and a reply landed back in Teams via the agentic
-user-FIC outbound chain. Restart-durability check passed —
-`conversations.json` registry hydrated and the same chat picked up
-without a fresh inbound. **Issue
-[#1](https://github.com/satscryption/Hermes-A365/issues/1) closed.**
+**v0.1.0** — first operator-targeted tag. Validated end-to-end against
+a Frontier-Preview-enrolled M365 tenant on Microsoft Teams 1:1 chat
+(rounds 3 → 5, last walked 2026-05-06 against CLI **1.1.171**). The
+secret-null regression-recovery path was re-walked round-6 against
+**1.1.174** (2026-05-07) — full end-to-end on 1.1.174 is not yet
+re-walked. **624 tests passing, ruff clean.** See [CHANGELOG.md](CHANGELOG.md)
+for the full release notes.
 
-```
-                     ┌─────────────────────────────────────────────────┐
-                     │ All wrappers drive the real a365 CLI v1.1.171   │
-                     │ Tests: 579 passing, ruff clean                  │
-                     └─────────────────────────────────────────────────┘
-```
+## What works today
 
-| Layer | What's there |
-|---|---|
-| **Doctor / status** | Read-only env probes; status reports against `a365 query-entra`. |
-| **License recommender** | Read-only; surfaces the actual `subscribedSkus` partNumbers. |
-| **Setup orchestrator** (`register`) | Drives `setup blueprint` + `setup permissions {mcp, bot}` end-to-end with line-streamed output (device-code prompts visible in real time). |
-| **Per-agent runtime config** (`instance create`) | Local-only `.env` writer; UUID generation deferred to apply-time; secret never on disk. |
-| **Manifest publish** (`publish`) | Branches between AI-Teammate (zip) and blueprint-only (Graph API instance registration); operator messaging is honest about which artefact each flow produces. |
-| **Cleanup** | Drives `cleanup azure → instance → blueprint`, pre-feeds `y\n` to defeat the GA CLI's prompts, leaves `chmod 600` on backup files. `--purge-orphans` clears agentic users + agentRegistry instances the GA CLI fails to delete; `--orphan-instance-id` plumbs in ids the AI-Teammate flow creates server-side. |
-| **Activity bridge — standalone** | `verify` (config + auth + reachability + FMI exchange) and `serve` (long-running BF webhook adapter) both validated end-to-end on the satscryption tenant in round-3+ walkthroughs. AAD-v2 inbound JWT, idempotency dedupe, serviceUrl gate, agentic user-FIC outbound. |
-| **Activity bridge — Hermes plugin** | `plugins/agent365/` ships the same runtime as a `BasePlatformAdapter` subclass, registered via the upstream Hermes plugin loader. Inbound dispatches via `handle_message(event)`, outbound via `send(chat_id, content)`. Durable session table (`~/.hermes/agents/<slug>/conversations.json`) for restart durability + proactive-send precondition. Round-5 §9d validated 2026-05-06. |
-| **Live-tenant runbook** | [`references/live-tenant-test.md`](references/live-tenant-test.md). §9b verify, §9c bridge-standalone, §9d Hermes-plugin paths all documented + round-walked. |
-| **M365 surface coverage** | [`references/m365-surface-coverage.md`](references/m365-surface-coverage.md) maps every M365 / Agent 365 / Copilot surface where the plugin could appear, with adapter coverage status. Validated: Teams 1:1. Architecturally covered: Teams group / channel / mobile, M365 Copilot Chat, Outlook chat, partner messaging channels. Out of scope: declarative agents, Office Add-ins, Loop components (different runtime layer). |
+Lift of the per-surface matrix from
+[`references/m365-surface-coverage.md`](references/m365-surface-coverage.md).
+Legend: ✅ validated end-to-end · 🟢 architecturally covered, walk
+pending · 🟡 needs new code · 🔴 different runtime; would be a
+separate plugin · ⚪ out of scope.
 
-**Cosmetic CLI logging gap (no operator impact).** The GA `a365 setup
-permissions bot` emits a `Configuring S2S app role assignments...`
-header followed by a single S2S grant for `Agent365Observability`,
-which initially looked like "two of three grants silently dropped".
-Filed as [Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402);
-Microsoft's 2026-05-05 reply confirms the Observability-only S2S
-assignment is intended (Messaging Bot API and Power Platform API use
-delegated OAuth2 grants only), and that the misleading header,
-mid-run "non-admin user" line, and unconditional success log will be
-fixed in the next CLI release. No wrapper-side work needed; runbook
-entry #18 in [`references/live-tenant-test.md`](references/live-tenant-test.md)
-captures the upstream resolution.
+| Surface | Status | Gating |
+|---|---|---|
+| **Microsoft Teams 1:1 chat** | ✅ | round-5 §9d walkthrough 2026-05-06 |
+| Teams group chat | 🟢 | adapter maps `chat_type=group`; live walk #17 |
+| Teams team channels (incl. threading) | 🟢 | minor `thread_id` extension; live walk #17 |
+| Mobile Teams | 🟢 | identical wire shape; not separately walked |
+| M365 Copilot Chat (standalone web app) | 🟡 | needs **#3 streaming** — Copilot Chat enforces a non-streaming reply timeout |
+| Outlook compose-action (`task/fetch` / `task/submit`) | 🟡 | needs **#18 invoke handlers** |
+| Teams compose extensions / Microsoft Search invokes | 🟡 | needs **#18 invoke handlers** |
+| Cron / proactive sends (any surface) | 🟡 | needs **#4 proactive** — `ConversationRef` registry already shipped |
+| Direct Line / web-chat / SharePoint embedded | 🟡 | bypasses A365 user-FIC; would need a separate auth path |
+| Slack / Telegram / WhatsApp / Twilio / Line / Kik / GroupMe | 🟢 | external-channel `chat_type` mapping; not a primary scope |
+| Word / Excel / PowerPoint Copilot side-panel (declarative) | 🔴 | declarative agents are a different runtime — Microsoft hosts the orchestrator |
+| Office Add-ins / Loop components / OneNote agent | 🔴 | different SDKs; would be separate complementary packages |
 
-**Upstream contribution.** Proposal to add `hermes-a365` as an official
-optional skill is open at
-[NousResearch/hermes-agent#20133](https://github.com/NousResearch/hermes-agent/issues/20133).
-Reframed during slice 19l after inspecting the bundled harness — the
-SPEC §10 Q1 IPC-contract question turned out to be a non-question
-(Hermes already documents the gateway-platform-plugin contract). The
-upstream issue is now a "going plugin-path; sanity-check?" check-in
-rather than an open design ask. Plugin layout under
-[`plugins/agent365/`](plugins/agent365/) follows
-`gateway/platforms/ADDING_A_PLATFORM.md` exactly.
+## Known limitations
+
+`v0.1.0` ships the operator wrapper, the read path, and the Bot
+Framework activity bridge that backs the Hermes `agent365` gateway
+platform. Several surfaces and operator ergonomics are explicitly
+**not** in this tag:
+
+- **M365 Copilot Chat streaming** is not implemented
+  ([#3](https://github.com/satscryption/Hermes-A365/issues/3)).
+  `Agent365Adapter.edit_message` is a no-op and `REQUIRES_EDIT_FINALIZE`
+  is unset. Copilot Chat surface (#16) is gated on this.
+- **Proactive replies for >10 s agent thinking** are not implemented
+  ([#4](https://github.com/satscryption/Hermes-A365/issues/4)). `send()`
+  still requires a cached inbound; cron-driven sends do not work yet.
+- **`hermes gateway setup` wizard** is not yet shipped
+  ([#13](https://github.com/satscryption/Hermes-A365/issues/13)).
+  Operators must hand-edit `~/.hermes/config.yaml` and `~/.hermes/.env`
+  per the [Operator setup](#operator-setup) section below.
+- **Invoke activities** (Outlook compose-action, Teams compose
+  extensions, search, signin/verifyState) are tracked under
+  [#18](https://github.com/satscryption/Hermes-A365/issues/18); umbrella
+  not yet implemented.
+- **Plaintext on-disk secret on macOS / Linux.** DPAPI is Windows-only;
+  on macOS / Linux the GA CLI writes the agent blueprint client secret
+  to `a365.generated.config.json` in plaintext. See [Security model](#security-model).
+- **End-to-end re-walk on CLI 1.1.174** has not yet been done. Round-6
+  validated only the `register --apply` regression-recovery flow against
+  1.1.174; round-5 (1.1.171) is the last full E2E walkthrough.
+- **macOS 26 device-code prompt volume.** On macOS 26.x the GA `a365`
+  CLI falls back to device-code per Entra-side mutation, so `register
+  --apply --m365` hits ~10–12 prompts instead of 1–2. Documented in
+  `references/live-tenant-test.md` §3.
+- **AI Teammate-flow `agentRegistry` entries cannot be deleted by
+  operators** (only "blocked" via the M365 Admin Centre). Microsoft
+  platform limitation, not a wrapper bug.
+- **Pluggable secrets / activity-bridge library split / Work IQ V2
+  amplifiers** — tracked as deferred (#19, #20, #21); architecturally
+  sound, picked up when concrete operator demand surfaces.
+
+Three issues filed upstream during the validation walkthroughs:
+[microsoft/Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402)
+(cosmetic logging — fixed in 1.1.174),
+[microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408)
+(`agentBlueprintClientSecret` null-on-disk regression — wrapper-side
+detection + `--auto-recover-secret` ships in this release), and
+[NousResearch/hermes-agent#20133](https://github.com/NousResearch/hermes-agent/issues/20133)
+(upstream skill-contribution check-in).
+
+## Security model
+
+**The agent blueprint client secret is the most sensitive artefact
+this skill handles.** Where it lives + how to keep it that way:
+
+- **Windows operators**: `a365 setup blueprint` writes the secret
+  to `a365.generated.config.json` and protects it via DPAPI. The
+  `agentBlueprintClientSecretProtected` flag in the file is `true`.
+- **macOS / Linux operators**: DPAPI is Windows-only. The GA CLI
+  writes the secret in plaintext (`agentBlueprintClientSecretProtected:
+  false`). The wrapper tightens the file mode to `0600` after
+  `register --apply`, and the keychain shim in `scripts/keychain.py`
+  mirrors the secret into the OS keychain (macOS Keychain or libsecret)
+  when available.
+- **Source control**: the `.gitignore` blocks `a365.config.json*`,
+  `*.generated.config.json*`, `a365.config.backup-*.json`, and
+  `a365.generated.config.backup-*.json` (and any operator-suffixed
+  variants like `…json.r5-cleared`). Don't override these.
+- **Per-agent `.env` at `~/.hermes/agents/<slug>/.env`** never carries
+  the secret — only tenant id, app id, and runtime metadata. Source it
+  into the gateway shell + export `A365_BLUEPRINT_CLIENT_SECRET`
+  separately (see [Operator setup](#operator-setup)).
+- **`microsoft/Agent365-devTools#408`** — the GA CLI sometimes drops
+  the secret entirely (writes `agentBlueprintClientSecret: null` to
+  disk despite reporting success). `register --apply --auto-recover-secret`
+  detects this and runs `az ad app credential reset --append` to mint
+  a fresh secret in-place. Use the flag whenever you're not on Windows.
 
 ## What is A365?
 
@@ -98,6 +152,7 @@ v0.1 design draft is archived at
 ├── SKILL.md                 # Validator-compliant upstream contribution
 ├── LICENSE                  # MIT
 ├── pyproject.toml           # Python 3.11+; uv-managed; optional [bridge] extras
+├── a365.config.json.example # Seed copy for new tenant setup
 ├── docs/
 │   ├── historical/          # Archived design drafts (e.g. SPEC-v0.1-draft.md)
 │   └── submissions/         # Archived drafts of upstream issues we've filed
@@ -132,10 +187,11 @@ v0.1 design draft is archived at
 │   ├── register.py
 │   ├── render_instance_env.py
 │   └── status.py
-├── plugins/agent365/        # Hermes gateway platform plugin (slice 19m–19q)
+├── plugins/agent365/        # Hermes gateway platform plugin
 │   ├── plugin.yaml              # Manifest (loader globs lowercase)
-│   ├── __init__.py
+│   ├── __init__.py              # register(ctx): platform + CLI subcommand
 │   ├── adapter.py               # Agent365Adapter(BasePlatformAdapter)
+│   ├── cli.py                   # `hermes a365 <verb>` argparse tree
 │   ├── conversations.py         # ConversationRef + ConversationRegistry
 │   └── README.md
 ├── templates/
@@ -143,11 +199,30 @@ v0.1 design draft is archived at
 │   ├── consent-url.txt.j2
 │   ├── instance.env.j2
 │   └── adaptive-cards/          # greeting / confirmation / error
-└── tests/                   # 579 tests (pytest + ruff clean)
+└── tests/                   # 624 tests (pytest + ruff clean)
     ├── conftest.py
     ├── golden/
     └── test_*.py
 ```
+
+## Install
+
+`hermes-a365` is a [virtual project](https://docs.astral.sh/uv/concepts/projects/init/#applications-vs-libraries)
+in `pyproject.toml` (`[tool.uv] package = false`) — it's distributed
+as a **clone-and-`uv sync`** package, not via PyPI. You'll need it
+checked out alongside (or symlinked into) a working Hermes harness.
+
+```bash
+git clone https://github.com/satscryption/Hermes-A365.git
+cd Hermes-A365
+uv sync --extra bridge      # `bridge` extras are needed for `activity-bridge serve`
+                            # and the Hermes plugin runtime; omit for setup-only ops
+```
+
+Once Hermes is on your machine ([`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent)),
+the [Operator setup](#operator-setup) section below shows how to make
+`hermes a365 <verb>` and the `agent365` gateway platform available
+inside the harness.
 
 ## Quick start
 
@@ -156,89 +231,169 @@ The canonical end-to-end walkthrough is
 glance, against a Frontier-Preview-enrolled M365 tenant where you hold
 Global Admin and a `MICROSOFT_AGENT_365_TIER_3` license:
 
+> **Budget time before you start.** On macOS 26.x the GA `a365` CLI
+> falls back to device-code per Entra mutation, so `register --apply
+> --m365 --aiteammate` typically hits **10–12 device-code prompts** in
+> a row (each on a fresh tab) before it returns. On Linux / Windows
+> the prompt count is 1–2. If you can run the apply path from Linux,
+> do.
+
 ```bash
-# 0. Install
-git clone https://github.com/satscryption/Hermes-A365.git
-cd Hermes-A365
-uv sync --extra bridge      # `bridge` is optional; only needed for serve mode
+# 0. Seed the per-tenant config from the example. The wrapper auto-fills
+#    most fields at apply time; the example documents the shape.
+cp a365.config.json.example a365.config.json
 
 # 1. Pre-deploy diagnostic
-uv run python scripts/doctor.py --human                    # exit 0/1/2
+hermes a365 doctor --human                                # exit 0/1/2
 
 # 2. Decide a license model (read-only, never purchases)
-uv run python scripts/license.py --users 12 --agents 3 --plan E5
+hermes a365 license --users 12 --agents 3 --plan E5
 
-# 3. Register the blueprint + MCP/Bot permissions
-uv run python scripts/register.py --agent-name "Inbox Helper" --apply
+# 3. Register the blueprint + MCP/Bot permissions.
+#    --m365 routes Teams via MCP Platform; --aiteammate creates the
+#    agentic Entra user. --auto-recover-secret patches the GA CLI's
+#    macOS / Linux secret-null regression (Microsoft#408) in place.
+hermes a365 register --agent-name "Inbox Helper" \
+    --m365 --aiteammate --apply --auto-recover-secret
 
-# 4. (Verify admin consent — granted automatically by setup blueprint)
-uv run python scripts/consent.py "Inbox Helper" --no-open
+# 4. (Verify admin consent — usually granted automatically by setup blueprint;
+#     poll explicitly if `register` reported a deferred consent step)
+hermes a365 consent "Inbox Helper" --no-open
 
-# 5. Per-agent runtime config
-uv run python scripts/instance_create.py inbox-helper \
+# 5. Per-agent runtime config (writes ~/.hermes/agents/<slug>/.env)
+hermes a365 instance create inbox-helper \
     --owner sadiq@contoso.com --owner-aad-id <oid> --apply
 
-# 6. Register the agent instance via Graph (no zip for blueprint-only)
-uv run python scripts/publish.py --agent-name "Inbox Helper" --apply
+# 6. Package the AI Teammate manifest zip for admin-centre upload
+hermes a365 publish --agent-name "Inbox Helper" --aiteammate --apply
 
-# 7. Re-point the messaging endpoint at whatever public HTTPS URL
+# 7. Operator: in M365 Admin Centre → Agents → All agents → Upload
+#    custom agent, upload the zip emitted by step 6, then activate
+#    the agent for each target user under Agent 365 admin centre.
+
+# 8. Re-point the messaging endpoint at whatever public HTTPS URL
 #    fronts your local port 3978. The skill is tunnel-agnostic —
-#    Cloudflare quick-tunnel example shown for expedience; see
-#    references/exposing-the-bot-endpoint.md for named tunnels,
-#    Microsoft devtunnels, ngrok, Azure App Service, custom
-#    reverse-proxy alternatives.
-uv run python scripts/activity_bridge.py update-endpoint \
+#    cloudflared / devtunnels / ngrok / Azure App Service / custom
+#    reverse-proxy all work. See references/exposing-the-bot-endpoint.md.
+hermes a365 activity-bridge update-endpoint \
     --agent-name "Inbox Helper" \
     --url https://<your-public-host>/api/messages --apply
 
-# 8a. Bridge-standalone path (debug / no Hermes harness involved)
+# 9a. Standalone bridge (debug / no Hermes harness involved)
 HERMES_BRIDGE_WEBHOOK=https://my-responder/respond \
-    uv run python scripts/activity_bridge.py serve --slug inbox-helper
+    hermes a365 activity-bridge serve --slug inbox-helper
 
-# 8b. Hermes plugin path (production: the agent loop runs)
-ln -sfn "$PWD/plugins/agent365" ~/.hermes/plugins/agent365
-# add gateway.platforms.agent365 + plugins.enabled to ~/.hermes/config.yaml
-# export A365_TENANT_ID, A365_APP_ID, A365_BLUEPRINT_CLIENT_SECRET, AA_INSTANCE_ID
-hermes gateway run
+# 9b. Hermes plugin path (production: agent loop runs in the gateway)
+hermes gateway run --profile inbox-helper
 
-# 9. Status sanity (any time)
-uv run python scripts/status.py inbox-helper --human
+# 10. Status sanity (any time)
+hermes a365 status inbox-helper --human
 
-# 10. Tear down
-uv run python scripts/cleanup.py --agent-name "Inbox Helper" \
+# 11. Tear down
+hermes a365 cleanup --agent-name "Inbox Helper" \
     --slug inbox-helper --apply --confirm "Inbox Helper"
 ```
 
+> **Running the scripts directly.** Every `hermes a365 <verb>`
+> resolves to `scripts/<verb>.py`. For development, `uv run python
+> scripts/<verb>.py [...]` is equivalent and may be more convenient
+> when iterating without a configured Hermes harness.
+
+## Operator setup
+
+Until `hermes gateway setup`'s wizard ships
+([#13](https://github.com/satscryption/Hermes-A365/issues/13)), the
+`agent365` plugin needs three manual steps before `hermes gateway
+run` will load it:
+
+**1. Symlink the plugin into Hermes's plugin tree.** A copy will not
+work — the bridge helpers under `<repo>/scripts/` are imported via
+the symlink's resolved path. (Vendoring `scripts/` into the plugin is
+queued for whenever this ships standalone.)
+
+```bash
+ln -sfn "$PWD/plugins/agent365" ~/.hermes/plugins/agent365
+```
+
+**2. Configure the gateway in `~/.hermes/config.yaml`.** Add the
+plugin to `plugins.enabled` and a `gateway.platforms.agent365` block
+that points at the per-agent `.env` `instance create` writes:
+
+```yaml
+plugins:
+  enabled:
+    - agent365
+
+gateway:
+  platforms:
+    agent365:
+      enabled: true
+      extra:
+        slug: inbox-helper
+        port: 3978
+        host: 127.0.0.1
+        # Path the adapter reads to pick up the blueprint client secret
+        # when neither the env var nor a keychain entry is available.
+        generated_config_path: /absolute/path/to/Hermes-A365/a365.generated.config.json
+```
+
+**3. Make the runtime env vars visible to the gateway.** Source the
+per-agent `.env` into the gateway's process shell so the adapter
+inherits `A365_TENANT_ID`, `A365_APP_ID`, and `AA_INSTANCE_ID`. The
+per-agent `.env` does **not** carry the secret, so export
+`A365_BLUEPRINT_CLIENT_SECRET` separately:
+
+```bash
+set -a; . ~/.hermes/agents/inbox-helper/.env; set +a
+export A365_BLUEPRINT_CLIENT_SECRET="$(cat ~/.hermes-secrets/inbox-helper.txt)"
+# For testing, allow all signed-in users to reach the agent. Real
+# operators should set A365_ALLOWED_USERS=<csv-of-emails> instead.
+export A365_ALLOW_ALL_USERS=true
+```
+
+After all three steps, `hermes gateway run` should load `agent365`
+during plugin discovery and surface it in `hermes a365 status
+<slug>`'s `activity_bridge` row as `ok`.
+
 ## Subcommand reference
+
+For exhaustive flags on any verb, run `hermes a365 <verb> --help`
+(or `uv run python scripts/<verb>.py --help` outside a Hermes
+harness). The shape:
 
 ```bash
 # === Read-only diagnostics ===
-uv run python scripts/doctor.py [--human|--no-network]
-uv run python scripts/license.py --users <n> --agents <n> --plan E3|E5|E7 [--bundled-security]
-uv run python scripts/status.py [<slug>] [--human]
-uv run python scripts/activity_bridge.py verify --slug <slug> [--human]
+hermes a365 doctor [--human|--no-network]
+hermes a365 license --users <n> --agents <n> --plan E3|E5|E7 [--bundled-security]
+hermes a365 status [<slug>] [--human]
+hermes a365 activity-bridge verify --slug <slug> [--human]
 
 # === Apply-path orchestrators ===
-uv run python scripts/register.py --agent-name "<display>" [--m365] [--aiteammate] [--no-endpoint] [--apply]
-uv run python scripts/instance_create.py <slug> --owner <email> --owner-aad-id <oid> [--apply]
-uv run python scripts/publish.py --agent-name "<display>" [--aiteammate] [--apply]
-uv run python scripts/cleanup.py --agent-name "<display>" [--slug <slug>] [--kinds=...] --apply --confirm "<display>"
+hermes a365 register --agent-name "<display>" [--m365] [--aiteammate] \
+    [--no-endpoint] [--auto-recover-secret] [--apply]
+hermes a365 consent "<agent-name>" [--no-open] [--timeout 60]
+hermes a365 instance create <slug> --owner <email> --owner-aad-id <oid> [--apply]
+hermes a365 publish --agent-name "<display>" [--aiteammate] [--apply]
+hermes a365 cleanup --agent-name "<display>" [--slug <slug>] [--kinds=...] \
+    [--purge-orphans] [--orphan-instance-id <guid>] --apply --confirm "<display>"
 
-# === Activity bridge (slice 19) ===
-uv run python scripts/activity_bridge.py verify --slug <slug>
-uv run python scripts/activity_bridge.py serve --slug <slug> --port 3978
-uv run python scripts/activity_bridge.py update-endpoint --agent-name "<display>" --url <https://...> [--apply]
-
-# === Templates / utilities ===
-uv run python scripts/consent.py "<agent-name>" [--no-open] [--timeout 60]
-uv run python scripts/emit_card.py greeting --command "..." [--command "..."]
-uv run python scripts/keychain.py {store|get|delete} --tenant <t> --app-id <id>
+# === Activity bridge ===
+hermes a365 activity-bridge verify --slug <slug>
+hermes a365 activity-bridge serve --slug <slug> --port 3978
+hermes a365 activity-bridge update-endpoint --agent-name "<display>" \
+    --url <https://...> [--apply]
 ```
 
-> **macOS note for `keychain.py`.** First write to the login keychain
-> pops a UI dialog. Click "Always Allow" to avoid further prompts. CI
-> / headless contexts may fail with `rc=36 User interaction is not
-> allowed` — `security unlock-keychain` first.
+The internal helpers under `scripts/` (`emit_card.py`, `keychain.py`,
+`reconcile_app.py`, `reconcile_blueprint.py`, `render_instance_env.py`,
+`hermes_responder.py`) are not surfaced as `hermes a365 <verb>`
+subcommands; they're libraries the orchestrators import. Run them via
+`uv run python scripts/<x>.py` if you need to.
+
+> **macOS note for the keychain shim.** First write to the login
+> keychain pops a UI dialog. Click "Always Allow" to avoid further
+> prompts. CI / headless contexts may fail with `rc=36 User
+> interaction is not allowed` — `security unlock-keychain` first.
 
 ## Open work
 

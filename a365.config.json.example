@@ -1,0 +1,21 @@
+{
+  "_comment": "Copy this file to a365.config.json and fill in tenant-specific fields before running `hermes a365 register --apply`. The wrapper auto-derives agentBlueprintDisplayName / agentIdentityDisplayName from --agent-name; override here only if your tenant naming convention differs. Fields the wrapper or GA CLI populate at apply time (clientAppId, environment, agentUser*) are left empty.",
+
+  "agentBlueprintDisplayName": "",
+  "agentDescription": "",
+  "agentIdentityDisplayName": "",
+  "agentUserDisplayName": "",
+  "agentUserPrincipalName": "",
+  "agentUserUsageLocation": "US",
+  "appServicePlanName": "",
+  "appServicePlanSku": "B1",
+  "clientAppId": "",
+  "deploymentProjectPath": "",
+  "environment": "",
+  "location": "westus",
+  "managerEmail": "",
+  "resourceGroup": "",
+  "subscriptionId": "",
+  "tenantId": "",
+  "webAppName": ""
+}
