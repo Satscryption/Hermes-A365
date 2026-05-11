@@ -67,9 +67,9 @@ Auth wiring (validated end-to-end against the satscryption tenant
 
 CLI use::
 
-    python scripts/activity_bridge.py verify --slug inbox-helper
-    python scripts/activity_bridge.py serve  --slug inbox-helper --port 3978
-    python scripts/activity_bridge.py update-endpoint --slug X --url https://...
+    hermes-a365 activity-bridge verify --slug inbox-helper
+    hermes-a365 activity-bridge serve  --slug inbox-helper --port 3978
+    hermes-a365 activity-bridge update-endpoint --slug X --url https://...
 """
 
 from __future__ import annotations

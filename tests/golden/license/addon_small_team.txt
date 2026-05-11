@@ -12,4 +12,4 @@ Recommendation: Agent 365 add-on — `MICROSOFT_AGENT_365_TIER_3` ($15/user/mo)
 
 Next step (manual; this command never purchases):
   Open admin centre: https://admin.microsoft.com/Adminportal/Home#/catalog
-  Then re-run: python scripts/doctor.py
+  Then re-run: hermes-a365 doctor

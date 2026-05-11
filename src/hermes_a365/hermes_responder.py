@@ -25,15 +25,15 @@ contract by example.
 
 CLI use::
 
-    python scripts/hermes_responder.py serve --port 9090 --mode echo
-    python scripts/hermes_responder.py serve --mode greeting --slug inbox-helper
-    python scripts/hermes_responder.py serve --mode canned \\
+    python -m hermes_a365.hermes_responder serve --port 9090 --mode echo
+    python -m hermes_a365.hermes_responder serve --mode greeting --slug inbox-helper
+    python -m hermes_a365.hermes_responder serve --mode canned \\
         --canned-response-file ./responses.json --debug-endpoints
 
 Wire to the bridge via the operator's environment::
 
     HERMES_BRIDGE_WEBHOOK=http://127.0.0.1:9090/respond \\
-        uv run python scripts/activity_bridge.py serve --slug inbox-helper
+        hermes-a365 activity-bridge serve --slug inbox-helper
 """
 
 from __future__ import annotations

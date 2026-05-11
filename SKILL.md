@@ -1,7 +1,7 @@
 ---
 name: hermes-a365
 description: Use when registering or operating a Hermes-driven agent under Microsoft Agent 365 governance — covers `a365 setup blueprint`, `setup permissions {mcp,bot}`, per-agent runtime config, manifest packaging via `a365 publish`, environment doctor, status reporting against `query-entra`, the Bot Framework activity bridge that backs the Hermes `agent365` gateway platform, and destructive cleanup.
-version: 0.1.1
+version: 0.1.2
 author: Hermes Agent
 license: MIT
 metadata:

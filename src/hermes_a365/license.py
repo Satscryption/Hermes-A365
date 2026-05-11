@@ -167,7 +167,7 @@ def render_human(inputs: LicenseInputs, rec: LicenseRecommendation) -> str:
     lines.append("")
     lines.append("Next step (manual; this command never purchases):")
     lines.append(f"  Open admin centre: {ADMIN_CENTER_CATALOG_URL}")
-    lines.append("  Then re-run: python scripts/doctor.py")
+    lines.append("  Then re-run: hermes-a365 doctor")
     return "\n".join(lines) + "\n"
 
 

@@ -3,7 +3,7 @@
 Slice 19n ports the bridge runtime under ``Agent365Adapter``: the
 FastAPI ``/api/messages`` route, JWT validation, idempotency dedupe,
 serviceUrl host-suffix gate, and outbound user-FIC chain that have
-been baking in ``scripts/activity_bridge.py`` since slices 19a-19j
+been baking in ``hermes_a365.activity_bridge`` since slices 19a-19j
 now live behind Hermes' ``BasePlatformAdapter`` lifecycle.
 
 Inbound flow::
@@ -25,7 +25,7 @@ Outbound flow::
         → POST {serviceUrl}/v3/conversations/{conv}/activities/{activity}
 
 The plugin imports the existing bridge helpers from
-``scripts/activity_bridge.py`` rather than copy-pasting ~600 lines —
+``hermes_a365.activity_bridge`` rather than copy-pasting ~600 lines —
 that module is the single source of truth for the inbound validation
 + outbound auth machinery, and stays intact for the legacy ``serve``
 entry point operators may still be running.

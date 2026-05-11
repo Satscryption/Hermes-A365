@@ -25,10 +25,10 @@ verifying current state without re-running setup.
 
 CLI use::
 
-    python scripts/consent.py "<agent-name>"                  # full flow
-    python scripts/consent.py "<agent-name>" --no-open        # don't launch browser
-    python scripts/consent.py "<agent-name>" --print-url-only # just emit the URL
-    python scripts/consent.py "<agent-name>" --timeout 60     # custom poll timeout
+    hermes-a365 consent "<agent-name>"                  # full flow
+    hermes-a365 consent "<agent-name>" --no-open        # don't launch browser
+    hermes-a365 consent "<agent-name>" --print-url-only # just emit the URL
+    hermes-a365 consent "<agent-name>" --timeout 60     # custom poll timeout
 """
 
 from __future__ import annotations

@@ -6,6 +6,23 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.1.2] — 2026-05-11
+
+Cosmetic patch surfaced by the first round-7 read-only walkthrough
+against `satscryption.io` from a real PyPI install.
+
+### Fixed
+
+- `hermes-a365 license`'s "Next step" footer recommended `python
+  scripts/doctor.py`; now correctly points at `hermes-a365 doctor`
+  (`src/hermes_a365/license.py:170`).
+- Module docstring "CLI use" examples across `activity_bridge.py`,
+  `consent.py`, `hermes_responder.py`, `license.py`, and the plugin
+  README/`adapter.py` doc-comments now reference `hermes-a365 <verb>`
+  / `python -m hermes_a365.<x>` / `hermes_a365.activity_bridge` instead
+  of the retired `python scripts/<x>.py` / `scripts/activity_bridge.py`
+  paths. No behavioural change.
+
 ## [0.1.1] — 2026-05-11
 
 Repackaging-only release: `hermes-a365` is now `pip install`-able from
