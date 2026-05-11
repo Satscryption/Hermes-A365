@@ -155,6 +155,111 @@ def _extract_package_path(output: str) -> str | None:
     return match.group(1) if match else None
 
 
+# Slice 19r-c (round-8 walkthrough finding, 2026-05-11): the GA CLI
+# emits manifests with ``name.short = "<agent-name> Blueprint"`` even
+# when ``<agent-name>`` itself would push the total past 30 characters.
+# M365 Admin Centre rejects upload at the manifest validation step
+# without surfacing the schema-specific reason in its UI; operators
+# see only a generic "Upload failed" toast. The CLI's "Customize
+# before packaging" output flags this as a warning but still produces
+# the zip.
+#
+# We post-process the emitted zip to bring ``name.short`` under 30
+# chars. Strategy, in order:
+#   1. If it ends with " Blueprint" — strip the suffix.
+#   2. Else truncate at the last word boundary that fits in 30 chars.
+# ``name.full`` is left untouched (it has a 100-char cap which the CLI
+# emit reliably respects).
+_NAME_SHORT_MAX = 30
+
+
+def _truncate_name_short(value: str) -> str:
+    """Return ``value`` shortened to ``<=30`` chars at a sensible boundary.
+
+    Pure function so tests can exercise both branches without zip I/O.
+    """
+    if len(value) <= _NAME_SHORT_MAX:
+        return value
+    if value.endswith(" Blueprint"):
+        stripped = value[: -len(" Blueprint")].rstrip()
+        if 1 <= len(stripped) <= _NAME_SHORT_MAX:
+            return stripped
+    words = value.split(" ")
+    out_words: list[str] = []
+    out_len = 0
+    for w in words:
+        candidate_len = out_len + len(w) + (1 if out_words else 0)
+        if candidate_len > _NAME_SHORT_MAX:
+            break
+        out_words.append(w)
+        out_len = candidate_len
+    if out_words:
+        return " ".join(out_words)
+    return value[:_NAME_SHORT_MAX].rstrip()
+
+
+def _patch_manifest_name_short(zip_path: str) -> tuple[str, str] | None:
+    """If ``manifest.json`` in *zip_path* has ``name.short`` > 30 chars,
+    rewrite it in-place via a re-zip and return ``(old, new)``. Returns
+    ``None`` when no patch was needed or when something prevented the
+    patch (e.g. missing zip file). Best-effort: any I/O failure leaves
+    the original zip untouched and reports ``None``.
+    """
+    import json
+    import tempfile
+    import zipfile
+    from pathlib import Path
+
+    zp = Path(zip_path)
+    if not zp.is_file():
+        return None
+
+    try:
+        with zipfile.ZipFile(zp, "r") as zf:
+            names = zf.namelist()
+            if "manifest.json" not in names:
+                return None
+            with zf.open("manifest.json") as fh:
+                manifest = json.load(fh)
+            other_files = {n: zf.read(n) for n in names if n != "manifest.json"}
+    except (OSError, zipfile.BadZipFile, json.JSONDecodeError):
+        return None
+
+    name_block = manifest.get("name") if isinstance(manifest.get("name"), dict) else None
+    if not name_block:
+        return None
+    short = str(name_block.get("short") or "")
+    if len(short) <= _NAME_SHORT_MAX:
+        return None
+    new_short = _truncate_name_short(short)
+    if new_short == short or not new_short:
+        return None
+
+    name_block["short"] = new_short
+    new_manifest = json.dumps(manifest, indent=2).encode("utf-8")
+
+    # Re-zip via a temp file in the same dir, then atomic-rename. Keeps
+    # the original on disk if anything fails mid-flight.
+    try:
+        with tempfile.NamedTemporaryFile(
+            dir=str(zp.parent), prefix=zp.name + ".", suffix=".tmp", delete=False
+        ) as tmp:
+            tmp_path = Path(tmp.name)
+        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", new_manifest)
+            for name, blob in other_files.items():
+                zf.writestr(name, blob)
+        tmp_path.replace(zp)
+    except OSError:
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            tmp_path.unlink(missing_ok=True)  # type: ignore[name-defined]
+        return None
+
+    return (short, new_short)
+
+
 def _extract_instance_id(output: str) -> str | None:
     """Grep for the registered instance id in blueprint-only flow output."""
     match = _INSTANCE_ID_RE.search(output)
@@ -176,6 +281,16 @@ def apply_publish_plan(
     if plan.inputs.aiteammate:
         package_path = _extract_package_path(run.combined)
         if package_path:
+            # Slice 19r-c: post-process the emitted zip to keep
+            # name.short ≤ 30 chars (Admin Centre rejects > 30).
+            patched = _patch_manifest_name_short(package_path)
+            if patched is not None:
+                old, new = patched
+                messages.append(
+                    f"[apply] truncated name.short: "
+                    f"{old!r} ({len(old)} chars) → {new!r} ({len(new)} chars) "
+                    "to satisfy the 30-char Admin Centre cap"
+                )
             messages.append(f"[apply] package: {package_path}")
         messages.append(
             f"[apply] next: upload the package to the M365 Admin Centre at {ADMIN_CENTRE_URL}"

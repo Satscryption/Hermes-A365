@@ -258,3 +258,186 @@ def test_publish_plan_dataclass_basic_aiteammate() -> None:
 def test_admin_centre_url_pinned() -> None:
     # Pin the URL we surface to the operator after a successful publish.
     assert ADMIN_CENTRE_URL == "https://admin.microsoft.com/"
+
+
+# ---------------------------------------------------------------------------
+# Slice 19r-c: name.short auto-truncation
+# ---------------------------------------------------------------------------
+
+
+class TestTruncateNameShort:
+    """Pure-function tests for the truncation strategy."""
+
+    def test_short_value_returned_unchanged(self) -> None:
+        from hermes_a365.publish import _truncate_name_short
+
+        assert _truncate_name_short("Inbox Helper") == "Inbox Helper"
+
+    def test_exact_30_chars_returned_unchanged(self) -> None:
+        from hermes_a365.publish import _truncate_name_short
+
+        v = "A" * 30
+        assert _truncate_name_short(v) == v
+
+    def test_blueprint_suffix_stripped_when_over_30(self) -> None:
+        # The common case surfaced in round-8: agent name + " Blueprint"
+        # pushes over 30 chars; dropping the suffix brings it back.
+        from hermes_a365.publish import _truncate_name_short
+
+        v = "Hermes Inbox Helper R8 Blueprint"  # 32 chars
+        assert _truncate_name_short(v) == "Hermes Inbox Helper R8"
+
+    def test_blueprint_suffix_not_stripped_if_result_too_short(self) -> None:
+        # If stripping " Blueprint" leaves an empty / 0-len result,
+        # fall back to word-boundary truncation.
+        from hermes_a365.publish import _truncate_name_short
+
+        v = " Blueprint" * 4  # very long, but stripping one occurrence is fine
+        out = _truncate_name_short(v)
+        assert 1 <= len(out) <= 30
+
+    def test_word_boundary_truncation_when_no_blueprint_suffix(self) -> None:
+        from hermes_a365.publish import _truncate_name_short
+
+        # 39 chars, no " Blueprint" suffix → word-boundary truncation
+        v = "Production Customer Support Assistant 1"
+        out = _truncate_name_short(v)
+        assert len(out) <= 30
+        # Doesn't cut mid-word
+        assert not out.endswith(" ")
+        for word in out.split(" "):
+            assert word in v.split(" ")
+
+    def test_single_long_word_hard_truncated(self) -> None:
+        # Pathological case: one 50-char word with no spaces. Falls back
+        # to slice + rstrip.
+        from hermes_a365.publish import _truncate_name_short
+
+        v = "X" * 50
+        out = _truncate_name_short(v)
+        assert len(out) <= 30
+
+
+class TestPatchManifestNameShort:
+    """Integration tests for the zip-rewrite path."""
+
+    def _make_zip(self, tmp_path, manifest: dict, extra_files: dict | None = None):
+        import json
+        import zipfile
+
+        zp = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(zp, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+            for name, blob in (extra_files or {}).items():
+                zf.writestr(name, blob)
+        return zp
+
+    def test_returns_none_when_name_short_already_ok(self, tmp_path):
+        from hermes_a365.publish import _patch_manifest_name_short
+
+        zp = self._make_zip(tmp_path, {"name": {"short": "Inbox Helper", "full": "Full"}})
+        assert _patch_manifest_name_short(str(zp)) is None
+
+    def test_patches_blueprint_suffix(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import _patch_manifest_name_short
+
+        zp = self._make_zip(
+            tmp_path,
+            {"name": {"short": "Hermes Inbox Helper R8 Blueprint", "full": "X"}},
+            extra_files={"icon.png": b"png-bytes"},
+        )
+        result = _patch_manifest_name_short(str(zp))
+        assert result is not None
+        old, new = result
+        assert old == "Hermes Inbox Helper R8 Blueprint"
+        assert new == "Hermes Inbox Helper R8"
+        # Re-zip preserves other files
+        with zipfile.ZipFile(zp) as zf:
+            assert set(zf.namelist()) == {"manifest.json", "icon.png"}
+            assert zf.read("icon.png") == b"png-bytes"
+            m = json.loads(zf.read("manifest.json"))
+            assert m["name"]["short"] == "Hermes Inbox Helper R8"
+            assert m["name"]["full"] == "X"  # unchanged
+
+    def test_returns_none_when_zip_missing(self, tmp_path):
+        from hermes_a365.publish import _patch_manifest_name_short
+
+        assert _patch_manifest_name_short(str(tmp_path / "nope.zip")) is None
+
+    def test_returns_none_when_no_manifest_json(self, tmp_path):
+        import zipfile
+
+        from hermes_a365.publish import _patch_manifest_name_short
+
+        zp = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.writestr("other.json", b"{}")
+        assert _patch_manifest_name_short(str(zp)) is None
+
+    def test_returns_none_on_bad_json(self, tmp_path):
+        import zipfile
+
+        from hermes_a365.publish import _patch_manifest_name_short
+
+        zp = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.writestr("manifest.json", b"not-json")
+        assert _patch_manifest_name_short(str(zp)) is None
+
+
+class TestApplyPublishPlanIntegration:
+    """Slice 19r-c: apply_publish_plan calls truncation when applicable."""
+
+    def test_apply_emits_truncation_message_when_patched(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+
+        # Build a real-shaped zip the FakeMutator will "produce".
+        zp = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.writestr(
+                "manifest.json",
+                json.dumps(
+                    {"name": {"short": "Hermes Inbox Helper R8 Blueprint", "full": "X"}},
+                ),
+            )
+        fm = FakeMutator(
+            scripted=[
+                RunResult(argv=[], returncode=0, stdout=f"Package created: {zp}", stderr="")
+            ]
+        )
+        plan = build_publish_plan(PublishInputs(agent_name="X", aiteammate=True))
+        result = apply_publish_plan(plan, mutator=fm)
+        assert result.package_path == str(zp)
+        # The truncation message is in messages
+        assert any("truncated name.short" in m for m in result.messages)
+        # Zip on disk has the patched name
+        with zipfile.ZipFile(zp) as zf:
+            m = json.loads(zf.read("manifest.json"))
+            assert m["name"]["short"] == "Hermes Inbox Helper R8"
+
+    def test_apply_skips_truncation_message_when_not_needed(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+
+        zp = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.writestr(
+                "manifest.json",
+                json.dumps({"name": {"short": "Short Name", "full": "X"}}),
+            )
+        fm = FakeMutator(
+            scripted=[
+                RunResult(argv=[], returncode=0, stdout=f"Package created: {zp}", stderr="")
+            ]
+        )
+        plan = build_publish_plan(PublishInputs(agent_name="X", aiteammate=True))
+        result = apply_publish_plan(plan, mutator=fm)
+        assert not any("truncated name.short" in m for m in result.messages)
