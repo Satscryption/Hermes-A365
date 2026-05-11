@@ -1689,6 +1689,324 @@ class TestEditMessage:
         assert body["recipient"]["id"] == "user-id-789"
 
 
+class TestSendStreamStart:
+    """Slice 19s-bis: send() participates in the same BF stream as
+    edit_message when in a streaming context (personal chat, no active
+    stream for the conversation)."""
+
+    @pytest.mark.asyncio
+    async def test_send_starts_stream_in_personal_chat_with_no_active_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-S1")  # personal by default
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-stream"),
+        )
+        # send_reply MUST NOT be called when the streaming path is taken.
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        # 201 with stream id → success.
+        post_mock = AsyncMock(return_value=MagicMock(
+            status_code=201, text="",
+            json=lambda: {"id": "bf-stream-from-send"},
+        ))
+        a._http_client.post = post_mock
+
+        result = await a.send(
+            chat_id="conv-S1", content="Hello", reply_to="inbound-id-1",
+        )
+        assert result.success is True
+        # The returned message_id is the BF stream id (Hermes will pass
+        # this to subsequent edit_message calls).
+        assert result.message_id == "bf-stream-from-send"
+        # Activity shape: typing + streaminfo + streamSequence:1 + no streamId.
+        assert post_mock.await_count == 1
+        body = post_mock.await_args.kwargs["json"]
+        assert body["type"] == "typing"
+        assert body["text"] == "Hello"
+        entity = body["entities"][0]
+        assert entity["type"] == "streaminfo"
+        assert entity["streamType"] == "streaming"
+        assert entity["streamSequence"] == 1
+        assert "streamId" not in entity
+        # State registered for both lookup paths.
+        assert "bf-stream-from-send" in a._streams
+        assert a._active_stream_by_chat["conv-S1"] == "bf-stream-from-send"
+        # send_reply NOT called — we took the streaming path.
+        assert send_reply_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_subsequent_edit_message_continues_the_send_started_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The full streaming flow: send() opens the stream, edit_message
+        # continues it without starting a new stream. Single growing bubble.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-S2")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_outbound_token",
+            AsyncMock(return_value="bearer-stream"),
+        )
+        # send_reply must NOT be called.
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-S2"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = AsyncMock(side_effect=responses)
+        a._http_client.post = post_mock
+        monkeypatch.setattr("asyncio.sleep", AsyncMock())
+
+        r1 = await a.send(chat_id="conv-S2", content="A", reply_to="inbound-id-1")
+        r2 = await a.edit_message("conv-S2", r1.message_id, "A B", finalize=False)
+        r3 = await a.edit_message("conv-S2", r1.message_id, "A B C", finalize=True)
+
+        assert r1.success and r2.success and r3.success
+        assert post_mock.await_count == 3
+        # All three POSTs share the same streamId on entries 2+ and have
+        # monotonic streamSequence on the non-final ones; final omits.
+        body1 = post_mock.await_args_list[0].kwargs["json"]
+        body2 = post_mock.await_args_list[1].kwargs["json"]
+        body3 = post_mock.await_args_list[2].kwargs["json"]
+        assert "streamId" not in body1["entities"][0]
+        assert body1["entities"][0]["streamSequence"] == 1
+        assert body2["entities"][0]["streamId"] == "bf-S2"
+        assert body2["entities"][0]["streamSequence"] == 2
+        assert body3["entities"][0]["streamId"] == "bf-S2"
+        assert body3["entities"][0]["streamType"] == "final"
+        assert body3["type"] == "message"  # type swap on final
+        assert "streamSequence" not in body3["entities"][0]
+        # State cleaned up after finalize.
+        assert "bf-S2" not in a._streams
+        assert "conv-S2" not in a._active_stream_by_chat
+        # send_reply NEVER called — single growing bubble path.
+        assert send_reply_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_send_with_no_reply_to_falls_back_to_non_streaming(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Slice 19s-bis correction: ``reply_to is None`` indicates
+        # commentary / tool-progress / one-shot replies — none of which
+        # are followed by ``edit_message``. Starting a stream for them
+        # produces a typing-activity that never closes (stuck "thinking"
+        # bubble). Only stream-consumer first-chunks pass
+        # ``reply_to=event_message_id``.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-C")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        # The stream-start path's POST must NOT be reached.
+        a._http_client.post = AsyncMock()
+
+        result = await a.send(
+            chat_id="conv-C", content="Using browser tool…", reply_to=None,
+        )
+        assert result.success is True
+        assert send_reply_mock.await_count == 1
+        # No stream registered; no streaming POST issued.
+        assert "conv-C" not in a._active_stream_by_chat
+        assert a._http_client.post.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_send_auto_finalizes_stale_stream_when_one_is_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Slice 19s-bis follow-up: Hermes' stream consumer occasionally
+        # starts a new segment without finalizing the previous stream
+        # (segment break, commentary handoff, interim_assistant_messages).
+        # When ``send()`` fires with an active stream in the conversation,
+        # we POST a synthetic ``streamType=final`` for the stale stream
+        # to close it on the user's surface before deciding what to do
+        # with the new send.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-X")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        # Pre-populate an active stream (the stale one).
+        a._active_stream_by_chat["conv-X"] = "stale-stream"
+        a._streams["stale-stream"] = {
+            "bf_stream_id": "bf-stale-id",
+            "sequence": 5,
+            "last_emit_ts": 0.0,
+        }
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_outbound_token",
+            AsyncMock(return_value="bearer-x"),
+        )
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        # The auto-finalize POST returns 202. The reply_to=None path
+        # then falls back to non-streaming send_reply (no further POST).
+        a._http_client.post = AsyncMock(
+            return_value=MagicMock(status_code=202, text="", json=lambda: {}),
+        )
+
+        result = await a.send(chat_id="conv-X", content="next segment", reply_to=None)
+        assert result.success is True
+
+        # Auto-finalize fired (one POST) — close the stale stream first.
+        assert a._http_client.post.await_count == 1
+        body = a._http_client.post.await_args.kwargs["json"]
+        assert body["type"] == "message"
+        assert body["entities"][0]["streamId"] == "bf-stale-id"
+        assert body["entities"][0]["streamType"] == "final"
+        assert "streamSequence" not in body["entities"][0]
+        # Stale stream state cleared.
+        assert "stale-stream" not in a._streams
+        assert "conv-X" not in a._active_stream_by_chat
+        # Stale message id marked as recently finalized so post-finalize
+        # follow-up edit_message calls (Hermes' double-finalize quirk)
+        # no-op as success rather than POSTing malformed activities.
+        assert "stale-stream" in a._recently_finalized
+        # New send took the non-streaming fallback path (reply_to=None).
+        assert send_reply_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_to_non_streaming_when_chat_is_not_personal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Group/channel chats: never stream (BF streaming is DM-only).
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        # Stream-start POST shouldn't fire at all; this AsyncMock catches it
+        # if our gate is wrong.
+        a._http_client.post = AsyncMock()
+
+        result = await a.send(chat_id="conv-G", content="hi group")
+        assert result.success is True
+        assert send_reply_mock.await_count == 1
+        # No active stream registered for the group chat.
+        assert "conv-G" not in a._active_stream_by_chat
+        # No direct POST to _send_stream_start.
+        assert a._http_client.post.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_when_stream_start_returns_non_201(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Stream start returns 4xx → fall through to non-streaming.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-F")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_outbound_token",
+            AsyncMock(return_value="bearer-fail"),
+        )
+        a._http_client.post = AsyncMock(return_value=MagicMock(
+            status_code=503, text="upstream busy",
+            json=lambda: {},
+        ))
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        result = await a.send(chat_id="conv-F", content="hi")
+        assert result.success is True
+        # Non-streaming send_reply was called as fallback.
+        assert send_reply_mock.await_count == 1
+        # Active-stream slot stays empty so a retry can attempt streaming again.
+        assert "conv-F" not in a._active_stream_by_chat
+
+    @pytest.mark.asyncio
+    async def test_send_falls_back_when_stream_start_returns_201_without_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Defensive: 201 with empty/missing id can't be used as streamId.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-N")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_outbound_token",
+            AsyncMock(return_value="bearer-x"),
+        )
+        a._http_client.post = AsyncMock(return_value=MagicMock(
+            status_code=201, text="", json=lambda: {},
+        ))
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        result = await a.send(chat_id="conv-N", content="hi")
+        assert result.success is True
+        assert send_reply_mock.await_count == 1
+        assert "conv-N" not in a._active_stream_by_chat
+
+    def test_drop_stream_state_clears_both_maps(self, monkeypatch) -> None:
+        a = _make_adapter(monkeypatch)
+        a._streams["m1"] = {"bf_stream_id": "m1", "sequence": 3, "last_emit_ts": 0.0}
+        a._active_stream_by_chat["c1"] = "m1"
+        a._drop_stream_state("c1", "m1")
+        assert "m1" not in a._streams
+        assert "c1" not in a._active_stream_by_chat
+
+    def test_drop_stream_state_only_clears_chat_slot_when_id_matches(
+        self, monkeypatch
+    ) -> None:
+        # Defensive: if a different stream is active in the chat slot,
+        # don't clobber it.
+        a = _make_adapter(monkeypatch)
+        a._streams["m1"] = {"bf_stream_id": "m1", "sequence": 3, "last_emit_ts": 0.0}
+        a._active_stream_by_chat["c1"] = "different-stream"
+        a._drop_stream_state("c1", "m1")
+        assert "m1" not in a._streams
+        # Different stream wasn't cleared.
+        assert a._active_stream_by_chat["c1"] == "different-stream"
+
+
 
 
 

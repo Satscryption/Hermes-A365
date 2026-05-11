@@ -94,6 +94,31 @@ from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 
 _DEFAULT_PORT = 3978
 
+# Slice 19s-bis: Hermes' stream consumer appends a "cursor" character
+# (default " ▉" from ``gateway/config.py::DEFAULT_STREAMING_CURSOR``)
+# to intermediate streaming chunks so the user sees an animated
+# in-progress indicator. BF's "Request streamed content should contain
+# the previously streamed content" rule requires each chunk to start
+# with the prior chunk's text — and a trailing cursor on chunk N puts
+# a glyph at a position that chunk N+1 fills with real text, breaking
+# the prefix match. Microsoft rejects with 403 ContentStreamNotAllowed.
+#
+# We strip the cursor before POSTing. Listed defensively rather than
+# imported so the plugin stays importable in pytest contexts that
+# don't pull in the Hermes harness.
+_STREAMING_CURSORS_TO_STRIP: tuple[str, ...] = (" ▉", "▉")
+
+
+def _strip_streaming_cursor(text: str) -> str:
+    """Remove a trailing cursor glyph that Hermes' stream consumer
+    appends to intermediate chunks. Idempotent + no-op when text
+    doesn't end with one."""
+    for cursor in _STREAMING_CURSORS_TO_STRIP:
+        if cursor and text.endswith(cursor):
+            return text[: -len(cursor)]
+    return text
+
+
 # Slice 19s — BF streaming-response protocol pacing.
 #
 # Microsoft's documented hard throttle is 1 req/s, but the official
@@ -258,6 +283,31 @@ class Agent365Adapter(BasePlatformAdapter):
         # captures the BF-side ``streamId`` from the 201 response. Entries
         # are dropped on ``finalize=True`` or terminal 403.
         self._streams: dict[str, dict[str, Any]] = {}
+
+        # Slice 19s-bis — at most one active BF stream per conversation
+        # (Microsoft's "one streaming sequence per user turn" rule from the
+        # custom-engine-agents doc). Maps chat_id → message_id key into
+        # ``self._streams``. ``send()`` consults this to decide whether to
+        # start a stream or emit a non-streaming reply. Cleared on finalize
+        # or terminal 403.
+        self._active_stream_by_chat: dict[str, str] = {}
+
+        # Slice 19s-bis follow-up — Hermes' stream consumer can call
+        # ``edit_message`` more than once with the same ``message_id``
+        # after a legitimate ``finalize=True`` succeeds (e.g. an
+        # ``_already_sent``/``_final_response_sent`` ordering quirk
+        # double-finalises the same stream). After we drop stream state
+        # on the legitimate close, those follow-ups arrive with
+        # ``is_first=True`` and POST malformed activities:
+        # ``streamType=final`` without ``streamId`` → 400 BadSyntax, or
+        # ``streamSequence>1`` without ``streamId`` → 400. Both leave a
+        # stuck "thinking" bubble on the user's surface.
+        #
+        # We track recently-finalized message_ids so duplicate calls
+        # no-op (return success). 5-minute TTL is plenty (a BF stream
+        # can't outlive 2 minutes; 5 covers slow-clock skew).
+        self._recently_finalized: dict[str, float] = {}
+        self._recently_finalized_ttl_sec = 300.0
 
     @property
     def name(self) -> str:
@@ -566,6 +616,22 @@ class Agent365Adapter(BasePlatformAdapter):
         durable registry (slice 19o). When the registry has no entry
         for this chat — e.g. a proactive cron delivery against a
         conversation we've never seen — returns a failure SendResult.
+
+        Slice 19s-bis: in personal chats with no active stream for the
+        conversation, ``send()`` emits a BF streaming-start activity
+        (typing + streaminfo + streamSequence:1) and captures the
+        returned ``streamId``. Subsequent ``edit_message`` calls
+        continue that same stream rather than creating a separate one.
+        This satisfies Microsoft's "one streaming sequence per user
+        turn" rule (custom-engine-agents doc) and gives a single
+        growing bubble per Hermes segment.
+
+        Fallback to a non-streaming ``message`` activity when:
+        - The conversation already has an active stream (tool progress
+          or content streaming claimed it first; only one stream
+          per turn is allowed).
+        - ``chat_type != "personal"`` (BF streaming is DM-only).
+        - The streaming-start POST itself fails.
         """
         bridge = _import_bridge()
         inbound = self._cached_inbound_for(chat_id)
@@ -578,6 +644,46 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = "agent365 send: adapter not connected"
             logger.error(msg)
             return SendResult(success=False, error=msg)
+
+        # Slice 19s-bis: try streaming-start only when in a streaming
+        # context. ``reply_to`` is the signal — Hermes' stream consumer's
+        # first-chunk-send passes ``reply_to=event_message_id`` (the
+        # inbound activity id, see ``stream_consumer.py:1233``).
+        # Commentary (interim_assistant_messages), tool-progress, and
+        # ``base.py:_send_with_retry`` all default to ``reply_to=None`` —
+        # those are one-shot messages, not streams. Starting a BF stream
+        # for them creates a "typing" activity that never closes,
+        # leaving the user's surface stuck in the streaming indicator
+        # until Microsoft's 2-min cap fires.
+        conv = inbound.get("conversation") or {}
+        chat_type = str(conv.get("conversationType") or "")
+
+        # Slice 19s-bis follow-up — Hermes' stream consumer occasionally
+        # starts a fresh segment (segment break, interim_assistant_messages,
+        # commentary handoff) without first calling
+        # ``edit_message(finalize=True)`` on the previous stream's
+        # message_id. The old stream stays open in our state and as a
+        # typing indicator on the user's surface until BF's 2-min cap
+        # fires. We auto-close any stale stream when a new ``send()``
+        # arrives for the same conversation.
+        if chat_id in self._active_stream_by_chat:
+            stale_msg_id = self._active_stream_by_chat[chat_id]
+            await self._auto_finalize_stale_stream(
+                chat_id=chat_id, message_id=stale_msg_id, inbound=inbound,
+            )
+
+        if (
+            chat_type == "personal"
+            and reply_to is not None
+            and chat_id not in self._active_stream_by_chat
+        ):
+            stream_result = await self._send_stream_start(
+                chat_id=chat_id, content=content, inbound=inbound
+            )
+            if stream_result is not None:
+                return stream_result
+            # Stream start failed (logged inside _send_stream_start);
+            # fall through to non-streaming reply.
 
         reply = bridge.render_reply_activity(inbound, {"text": content})
         try:
@@ -593,6 +699,102 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.error("agent365 send_reply failed: %s", e)
             return SendResult(success=False, error=str(e))
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
+
+    async def _send_stream_start(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        inbound: dict[str, Any],
+    ) -> SendResult | None:
+        """Slice 19s-bis: open a new BF stream from ``send()``.
+
+        Returns the captured ``bf_stream_id`` as ``SendResult.message_id``
+        so subsequent ``edit_message`` calls — which Hermes drives with
+        whatever ``message_id`` we return — find the stream state by the
+        same key in ``self._streams``.
+
+        Returns ``None`` on stream-start failure so ``send()`` can fall
+        back to a non-streaming activity rather than dropping the reply.
+        """
+        bridge = _import_bridge()
+        conv = inbound.get("conversation") or {}
+        service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
+        conv_id = conv.get("id")
+        if not service_url or not conv_id:
+            return None
+
+        activity = {
+            "type": "typing",
+            # Strip the streaming cursor — see _strip_streaming_cursor
+            # docstring for why this matters for BF's prefix-match rule.
+            "text": _strip_streaming_cursor(content),
+            "from": inbound.get("recipient") or {},
+            "recipient": inbound.get("from") or {},
+            "conversation": conv,
+            "entities": [
+                {
+                    "type": "streaminfo",
+                    "streamType": "streaming",
+                    "streamSequence": 1,
+                }
+            ],
+        }
+        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+        try:
+            token = await bridge.acquire_outbound_token(
+                client=self._http_client,
+                cfg=self._bridge_cfg,
+                activity=inbound,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+            )
+            resp = await self._http_client.post(
+                url,
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.warning(
+                "agent365 stream-start POST failed; falling back to "
+                "non-streaming send: %s",
+                e,
+            )
+            return None
+
+        if resp.status_code != 201:
+            logger.warning(
+                "agent365 stream-start expected 201, got %s; "
+                "falling back to non-streaming send",
+                resp.status_code,
+            )
+            return None
+
+        try:
+            bf_stream_id = (resp.json() or {}).get("id")
+        except Exception:
+            bf_stream_id = None
+        if not bf_stream_id:
+            logger.warning(
+                "agent365 stream-start 201 without id; falling back"
+            )
+            return None
+        bf_stream_id = str(bf_stream_id)
+
+        loop = asyncio.get_event_loop()
+        clean_content = _strip_streaming_cursor(content)
+        self._streams[bf_stream_id] = {
+            "bf_stream_id": bf_stream_id,
+            "sequence": 1,
+            "last_emit_ts": loop.time(),
+            # Track last-sent content so auto-finalize-stale-stream has
+            # something non-empty to POST as the close (BF rejects
+            # empty-text final activities with 400 BadSyntax).
+            "last_content": clean_content,
+        }
+        self._active_stream_by_chat[chat_id] = bf_stream_id
+        return SendResult(success=True, message_id=bf_stream_id)
 
     async def _post_activity(
         self, *, inbound: dict[str, Any], activity: dict[str, Any]
@@ -756,6 +958,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 error="agent365 edit_message: adapter not connected",
             )
 
+        # Slice 19s-bis follow-up — drop a recently-finalized message_id
+        # follow-up call as a successful no-op. See ``_recently_finalized``
+        # docstring for the Hermes stream-consumer quirk this guards.
+        loop_now = asyncio.get_event_loop().time()
+        self._prune_recently_finalized(loop_now)
+        if message_id in self._recently_finalized:
+            return SendResult(success=True, message_id="")
+
         state = self._streams.get(message_id)
         is_first = state is None
         if state is None:
@@ -783,9 +993,19 @@ class Agent365Adapter(BasePlatformAdapter):
             entity["streamType"] = "streaming"
             entity["streamSequence"] = state["sequence"]
 
+        clean_content = _strip_streaming_cursor(content)
+        # Track last-sent content for auto-finalize-stale-stream (slice
+        # 19s-bis follow-up). BF requires non-empty text on the final
+        # activity; if we end up auto-closing this stream because
+        # Hermes never called finalize, we'll reuse this.
+        state["last_content"] = clean_content
         activity: dict[str, Any] = {
             "type": "message" if finalize else "typing",
-            "text": content,
+            # Strip the streaming cursor — Hermes appends one for visual
+            # feedback, but BF's prefix-match rule rejects activities
+            # whose text doesn't start with the previously streamed
+            # chunk. See _strip_streaming_cursor.
+            "text": clean_content,
             "from": inbound.get("recipient") or {},
             "recipient": inbound.get("from") or {},
             "conversation": conv,
@@ -835,7 +1055,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     "without id: %s",
                     resp.text[:200],
                 )
-                self._streams.pop(message_id, None)
+                self._drop_stream_state(chat_id, message_id)
                 return SendResult(
                     success=False,
                     error="streaming start returned no id",
@@ -843,7 +1063,8 @@ class Agent365Adapter(BasePlatformAdapter):
             state["bf_stream_id"] = str(stream_id)
             if finalize:
                 # First + finalize is degenerate but legal — drop state.
-                self._streams.pop(message_id, None)
+                self._drop_stream_state(chat_id, message_id)
+                self._recently_finalized[message_id] = loop_now
             return SendResult(success=True, message_id=state["bf_stream_id"])
 
         if 200 <= resp.status_code < 300:
@@ -859,7 +1080,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     state["sequence"],
                 )
             if finalize:
-                self._streams.pop(message_id, None)
+                self._drop_stream_state(chat_id, message_id)
+                self._recently_finalized[message_id] = loop_now
             return SendResult(success=True, message_id=state.get("bf_stream_id") or "")
 
         if resp.status_code == 403:
@@ -867,7 +1089,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # starts cleanly. Map common Microsoft messages to short
             # error tags Hermes can surface to operators.
             err_msg = self._extract_error_message(resp)
-            self._streams.pop(message_id, None)
+            self._drop_stream_state(chat_id, message_id)
             short = err_msg
             low = err_msg.lower()
             if "exceeded streaming time" in low:
@@ -889,6 +1111,109 @@ class Agent365Adapter(BasePlatformAdapter):
             error=f"agent365 edit_message HTTP {resp.status_code}: "
                   f"{resp.text[:200] if hasattr(resp, 'text') else ''}",
         )
+
+    async def _auto_finalize_stale_stream(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        inbound: dict[str, Any],
+    ) -> None:
+        """Emit a synthetic ``streamType=final`` POST to close a stream
+        that Hermes' consumer abandoned without calling
+        ``edit_message(finalize=True)``. Best-effort: any failure here
+        leaves the stream in its prior state; the next ``send()`` /
+        finalize will retry or BF will eventually time out at 2 min.
+
+        Slice 19s-bis follow-up — observed when Hermes segments at
+        ``interim_assistant_messages`` boundaries: the consumer flips to
+        a new ``_message_id`` without firing finalize=True for the old
+        one, leaving stream A as a stuck typing indicator while stream B
+        opens beside it.
+        """
+        state = self._streams.get(message_id)
+        if state is None or not state.get("bf_stream_id"):
+            # Nothing to close, or never received a stream id from
+            # Microsoft (stream-start failed). Just drop the slot.
+            self._drop_stream_state(chat_id, message_id)
+            return
+
+        bf_stream_id = state["bf_stream_id"]
+        conv = inbound.get("conversation") or {}
+        service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
+        conv_id = conv.get("id")
+        if not service_url or not conv_id:
+            self._drop_stream_state(chat_id, message_id)
+            return
+
+        # BF rejects final activities with empty text (400 BadSyntax).
+        # Use the last content we streamed for this stream; fall back to
+        # a single space if nothing was tracked. The text content is
+        # what becomes the visible bubble's final state, so this is
+        # also what the user reads.
+        final_text = state.get("last_content") or " "
+        activity = {
+            "type": "message",
+            "text": final_text,
+            "from": inbound.get("recipient") or {},
+            "recipient": inbound.get("from") or {},
+            "conversation": conv,
+            "entities": [
+                {
+                    "type": "streaminfo",
+                    "streamId": bf_stream_id,
+                    "streamType": "final",
+                }
+            ],
+        }
+        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+        try:
+            bridge = _import_bridge()
+            token = await bridge.acquire_outbound_token(
+                client=self._http_client,
+                cfg=self._bridge_cfg,
+                activity=inbound,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+            )
+            resp = await self._http_client.post(
+                url,
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+            logger.info(
+                "agent365 auto-finalize stale stream %s: status=%s",
+                bf_stream_id, resp.status_code,
+            )
+        except Exception as e:
+            logger.warning(
+                "agent365 auto-finalize stale stream %s failed: %s",
+                bf_stream_id, e,
+            )
+        finally:
+            self._drop_stream_state(chat_id, message_id)
+            loop_now = asyncio.get_event_loop().time()
+            self._recently_finalized[message_id] = loop_now
+
+    def _prune_recently_finalized(self, now: float) -> None:
+        """Drop ``_recently_finalized`` entries older than the TTL."""
+        cutoff = now - self._recently_finalized_ttl_sec
+        stale = [k for k, ts in self._recently_finalized.items() if ts < cutoff]
+        for k in stale:
+            self._recently_finalized.pop(k, None)
+
+    def _drop_stream_state(self, chat_id: str, message_id: str) -> None:
+        """Slice 19s-bis: clear both ``self._streams[message_id]`` and the
+        chat's active-stream slot. Called on finalize success and terminal
+        errors so the next ``send()`` for the same conversation starts a
+        fresh stream cleanly."""
+        self._streams.pop(message_id, None)
+        # Only clear the chat-level slot if it points at the same id we're
+        # cleaning up — protects against tool-progress streams clobbering
+        # a content stream's slot (or vice versa).
+        if self._active_stream_by_chat.get(chat_id) == message_id:
+            self._active_stream_by_chat.pop(chat_id, None)
 
     @staticmethod
     def _extract_error_message(resp: Any) -> str:
