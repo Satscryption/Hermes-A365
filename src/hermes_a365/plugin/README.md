@@ -1,17 +1,18 @@
 # `agent365` — Hermes gateway platform plugin
 
 Hermes-side entry point for the A365 / Microsoft Teams integration. This
-directory is the *plugin shape* — a third-party install that drops into
-`~/.hermes/plugins/agent365/` and registers with the Hermes plugin loader
-on gateway startup. No core Hermes changes required.
+subpackage is discovered by the Hermes plugin loader via its
+`hermes_agent.plugins` entry point (declared in the top-level
+`pyproject.toml`); no manual drop into `~/.hermes/plugins/` is needed.
 
 ## Layout
 
 ```
-plugins/agent365/
+hermes_a365/plugin/
   plugin.yaml         # plugin manifest (loader globs for this lowercase form)
   __init__.py         # re-exports register()
   adapter.py          # Agent365Adapter(BasePlatformAdapter) + register(ctx)
+  cli.py              # `hermes a365 <verb>` argparse tree
   conversations.py    # ConversationRef + ConversationRegistry (slice 19o)
   README.md           # this file
 ```
@@ -51,9 +52,10 @@ The plugin now runs the bridge end-to-end:
 
 Bridge helpers (`validate_inbound_jwt`, `_IdempotencyCache`,
 `_is_trusted_service_url`, `acquire_outbound_token`, `send_reply`,
-…) are imported from `scripts/activity_bridge.py` rather than
+…) are imported from `hermes_a365.activity_bridge` rather than
 copy-pasted; that module remains the single source of truth and
-keeps working as a standalone `serve` entrypoint.
+keeps working as the standalone `hermes-a365 activity-bridge serve`
+entry point.
 
 Still TODO:
 - `send_document`, `send_voice`, `send_video`, `send_animation` —
@@ -66,11 +68,11 @@ Tracking issue: [#1 — Activity bridge — Hermes gateway platform plugin](http
 
 ## Install (development)
 
-While iterating on slices 19m–19p, symlink this directory into the
-Hermes plugin path so the harness picks it up:
+For local development against an unpublished checkout, install the
+package editable into the Hermes venv:
 
 ```bash
-ln -s "$PWD/plugins/agent365" ~/.hermes/plugins/agent365
+~/.hermes/hermes-agent/venv/bin/pip install -e ".[bridge]"
 ```
 
 Then enable the platform in `~/.hermes/config.yaml`:
@@ -107,4 +109,4 @@ Required env vars (already populated by the wrapper's
 - Upstream contract: `gateway/platforms/ADDING_A_PLATFORM.md` in
   `NousResearch/hermes-agent`.
 - Reference plugin: `plugins/platforms/irc/` in the same repo.
-- Existing bridge (source for the 19n port): `scripts/activity_bridge.py`.
+- Bridge module (source for the 19n port): `hermes_a365.activity_bridge`.

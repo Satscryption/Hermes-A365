@@ -1,4 +1,4 @@
-"""Tests for scripts/hermes_responder.py — slice 19c (Tier-1 responder).
+"""Tests for hermes_a365.hermes_responder — slice 19c (Tier-1 responder).
 
 Covers each mode (echo / greeting / canned), `invoke` activity
 handling, the conversation store cap, the optional history endpoint,
@@ -14,7 +14,8 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from hermes_responder import (
+
+from hermes_a365.hermes_responder import (
     DEFAULT_HISTORY_MAX,
     ConversationStore,
     ResponderConfig,

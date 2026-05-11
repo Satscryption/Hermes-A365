@@ -38,7 +38,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from _common import parse_env, safe_run, tcp_reachable
+from ._common import parse_env, safe_run, tcp_reachable
 
 ProbeState = Literal["ok", "warn", "error"]
 

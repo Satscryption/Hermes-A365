@@ -1,4 +1,4 @@
-"""Tests for the shared helpers in scripts/_common.py.
+"""Tests for the shared helpers in hermes_a365._common.
 
 Coverage focus:
 - ``deep_diff`` — used by reconcilers, so its semantics matter.
@@ -16,7 +16,8 @@ from __future__ import annotations
 import sys
 
 import pytest
-from _common import deep_diff, render_diff_human, safe_run, slugify
+
+from hermes_a365._common import deep_diff, render_diff_human, safe_run, slugify
 
 
 class TestSlugify:

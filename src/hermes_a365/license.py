@@ -9,13 +9,13 @@ a tenant admin can complete the purchase.
 
 Programmatic use::
 
-    from license import LicenseInputs, recommend, render_human
+    from hermes_a365.license import LicenseInputs, recommend, render_human
     rec = recommend(LicenseInputs(users=12, agents=3, plan="E5"))
 
 CLI use::
 
-    python scripts/license.py --users 12 --agents 3 --plan E5
-    python scripts/license.py --users 250 --agents 40 --plan E5 --bundled-security
+    python -m hermes_a365.license --users 12 --agents 3 --plan E5
+    python -m hermes_a365.license --users 250 --agents 40 --plan E5 --bundled-security
 """
 
 from __future__ import annotations

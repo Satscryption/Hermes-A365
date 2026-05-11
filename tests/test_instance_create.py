@@ -1,4 +1,4 @@
-"""Tests for scripts/instance_create.py — v0.2 local-only runtime .env writer."""
+"""Tests for hermes_a365.instance_create — v0.2 local-only runtime .env writer."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Any
 
 import pytest
-from instance_create import (
+
+from hermes_a365.instance_create import (
     InstanceCreateError,
     InstanceCreateInputs,
     InstanceCreateResult,

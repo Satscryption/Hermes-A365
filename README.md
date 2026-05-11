@@ -96,7 +96,7 @@ this skill handles.** Where it lives + how to keep it that way:
 - **macOS / Linux operators**: DPAPI is Windows-only. The GA CLI
   writes the secret in plaintext (`agentBlueprintClientSecretProtected:
   false`). The wrapper tightens the file mode to `0600` after
-  `register --apply`, and the keychain shim in `scripts/keychain.py`
+  `register --apply`, and the keychain shim in `hermes_a365.keychain`
   mirrors the secret into the OS keychain (macOS Keychain or libsecret)
   when available.
 - **Source control**: the `.gitignore` blocks `a365.config.json*`,
@@ -168,11 +168,13 @@ v0.1 design draft is archived at
 │   ├── opentelemetry-config.md
 │   ├── README.md                    # Index
 │   └── webhook-contract.md          # Bridge → responder JSON contract
-├── scripts/                 # One module per subcommand + shared helpers
+├── src/hermes_a365/         # The installed package
+│   ├── __init__.py
 │   ├── _common.py               # parse_env, slugify, safe_run, jinja_env, deep_diff
 │   ├── a365_config.py           # a365.config.json round-trip
 │   ├── activity_bridge.py       # verify + serve + update-endpoint (standalone)
 │   ├── cleanup.py
+│   ├── cli.py                   # `hermes-a365 <verb>` console entry point
 │   ├── consent.py
 │   ├── doctor.py
 │   ├── emit_card.py
@@ -186,19 +188,20 @@ v0.1 design draft is archived at
 │   ├── reconcile_blueprint.py
 │   ├── register.py
 │   ├── render_instance_env.py
-│   └── status.py
-├── plugins/agent365/        # Hermes gateway platform plugin
-│   ├── plugin.yaml              # Manifest (loader globs lowercase)
-│   ├── __init__.py              # register(ctx): platform + CLI subcommand
-│   ├── adapter.py               # Agent365Adapter(BasePlatformAdapter)
-│   ├── cli.py                   # `hermes a365 <verb>` argparse tree
-│   ├── conversations.py         # ConversationRef + ConversationRegistry
-│   └── README.md
-├── templates/
-│   ├── blueprint.json.j2
-│   ├── consent-url.txt.j2
-│   ├── instance.env.j2
-│   └── adaptive-cards/          # greeting / confirmation / error
+│   ├── status.py
+│   ├── plugin/                  # Hermes gateway platform plugin
+│   │   ├── plugin.yaml              # Manifest (loader globs lowercase)
+│   │   ├── __init__.py              # register(ctx): platform + CLI subcommand
+│   │   ├── adapter.py               # Agent365Adapter(BasePlatformAdapter)
+│   │   ├── cli.py                   # `hermes a365 <verb>` argparse tree
+│   │   ├── conversations.py         # ConversationRef + ConversationRegistry
+│   │   └── README.md
+│   └── _data/                   # Packaged Jinja templates (importlib.resources)
+│       └── templates/
+│           ├── blueprint.json.j2
+│           ├── consent-url.txt.j2
+│           ├── instance.env.j2
+│           └── adaptive-cards/      # greeting / confirmation / error
 └── tests/                   # 624 tests (pytest + ruff clean)
     ├── conftest.py
     ├── golden/
@@ -207,22 +210,40 @@ v0.1 design draft is archived at
 
 ## Install
 
-`hermes-a365` is a [virtual project](https://docs.astral.sh/uv/concepts/projects/init/#applications-vs-libraries)
-in `pyproject.toml` (`[tool.uv] package = false`) — it's distributed
-as a **clone-and-`uv sync`** package, not via PyPI. You'll need it
-checked out alongside (or symlinked into) a working Hermes harness.
+`hermes-a365` ships as a PyPI package. There are two install paths,
+depending on what you want:
+
+**Standalone CLI** — for operators who just need to drive `register` /
+`cleanup` / `doctor` / `status` / `activity-bridge serve` outside a
+Hermes harness:
+
+```bash
+pipx install 'hermes-a365[bridge]'   # `bridge` extras only needed for `activity-bridge serve`
+hermes-a365 doctor --human
+```
+
+**Gateway plugin** — installs the package into the Hermes venv so the
+plugin loader auto-discovers `agent365` via the
+`hermes_agent.plugins` entry point. No `~/.hermes/plugins/agent365/`
+directory required:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/pip install 'hermes-a365[bridge]'
+hermes plugins list                # `agent365` should appear with source=entrypoint
+```
+
+**Local development** (from a checkout):
 
 ```bash
 git clone https://github.com/satscryption/Hermes-A365.git
 cd Hermes-A365
-uv sync --extra bridge      # `bridge` extras are needed for `activity-bridge serve`
-                            # and the Hermes plugin runtime; omit for setup-only ops
+uv sync --all-extras
+uv run pytest
 ```
 
-Once Hermes is on your machine ([`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent)),
-the [Operator setup](#operator-setup) section below shows how to make
-`hermes a365 <verb>` and the `agent365` gateway platform available
-inside the harness.
+Once Hermes is on your machine ([`NousResearch/hermes-agent`](https://github.com/NousResearch/hermes-agent))
+and the plugin install above is done, the [Operator setup](#operator-setup)
+section below covers the two remaining manual config edits.
 
 ## Quick start
 
@@ -294,28 +315,21 @@ hermes a365 cleanup --agent-name "Inbox Helper" \
     --slug inbox-helper --apply --confirm "Inbox Helper"
 ```
 
-> **Running the scripts directly.** Every `hermes a365 <verb>`
-> resolves to `scripts/<verb>.py`. For development, `uv run python
-> scripts/<verb>.py [...]` is equivalent and may be more convenient
-> when iterating without a configured Hermes harness.
+> **Running the CLI standalone.** Every `hermes a365 <verb>` mirrors
+> `hermes-a365 <verb>` exactly — same flags, same behaviour. The
+> `hermes-a365` script comes with `pipx install hermes-a365` and is
+> handy when iterating without a configured Hermes harness.
 
 ## Operator setup
 
-Until `hermes gateway setup`'s wizard ships
-([#13](https://github.com/satscryption/Hermes-A365/issues/13)), the
-`agent365` plugin needs three manual steps before `hermes gateway
-run` will load it:
+After the gateway-plugin pip install above (`~/.hermes/hermes-agent/venv/bin/pip
+install 'hermes-a365[bridge]'`), the plugin is auto-discovered via its
+`hermes_agent.plugins` entry point. Until `hermes gateway setup`'s wizard
+ships ([#13](https://github.com/satscryption/Hermes-A365/issues/13)), two
+manual config edits are still needed before `hermes gateway run` will route
+inbound activities at the adapter:
 
-**1. Symlink the plugin into Hermes's plugin tree.** A copy will not
-work — the bridge helpers under `<repo>/scripts/` are imported via
-the symlink's resolved path. (Vendoring `scripts/` into the plugin is
-queued for whenever this ships standalone.)
-
-```bash
-ln -sfn "$PWD/plugins/agent365" ~/.hermes/plugins/agent365
-```
-
-**2. Configure the gateway in `~/.hermes/config.yaml`.** Add the
+**1. Configure the gateway in `~/.hermes/config.yaml`.** Add the
 plugin to `plugins.enabled` and a `gateway.platforms.agent365` block
 that points at the per-agent `.env` `instance create` writes:
 
@@ -337,7 +351,7 @@ gateway:
         generated_config_path: /absolute/path/to/Hermes-A365/a365.generated.config.json
 ```
 
-**3. Make the runtime env vars visible to the gateway.** Source the
+**2. Make the runtime env vars visible to the gateway.** Source the
 per-agent `.env` into the gateway's process shell so the adapter
 inherits `A365_TENANT_ID`, `A365_APP_ID`, and `AA_INSTANCE_ID`. The
 per-agent `.env` does **not** carry the secret, so export
@@ -351,15 +365,14 @@ export A365_BLUEPRINT_CLIENT_SECRET="$(cat ~/.hermes-secrets/inbox-helper.txt)"
 export A365_ALLOW_ALL_USERS=true
 ```
 
-After all three steps, `hermes gateway run` should load `agent365`
+After both edits, `hermes gateway run` should load `agent365`
 during plugin discovery and surface it in `hermes a365 status
 <slug>`'s `activity_bridge` row as `ok`.
 
 ## Subcommand reference
 
 For exhaustive flags on any verb, run `hermes a365 <verb> --help`
-(or `uv run python scripts/<verb>.py --help` outside a Hermes
-harness). The shape:
+(or `hermes-a365 <verb> --help` outside a Hermes harness). The shape:
 
 ```bash
 # === Read-only diagnostics ===
@@ -384,11 +397,11 @@ hermes a365 activity-bridge update-endpoint --agent-name "<display>" \
     --url <https://...> [--apply]
 ```
 
-The internal helpers under `scripts/` (`emit_card.py`, `keychain.py`,
-`reconcile_app.py`, `reconcile_blueprint.py`, `render_instance_env.py`,
-`hermes_responder.py`) are not surfaced as `hermes a365 <verb>`
-subcommands; they're libraries the orchestrators import. Run them via
-`uv run python scripts/<x>.py` if you need to.
+The internal helpers (`emit_card`, `keychain`, `reconcile_app`,
+`reconcile_blueprint`, `render_instance_env`, `hermes_responder`) are
+not surfaced as `hermes a365 <verb>` subcommands; they're libraries
+the orchestrators import. Run them as `python -m hermes_a365.<x>` if
+you need to.
 
 > **macOS note for the keychain shim.** First write to the login
 > keychain pops a UI dialog. Click "Always Allow" to avoid further
@@ -464,7 +477,7 @@ vacuum risks getting the API surface wrong. Each issue body lists the
 explicit triggers that would re-prioritise it.
 
 - **[#19](../../issues/19)** — Pluggable secrets provider. Replace
-  `scripts/keychain.py`'s OS-keychain shim with a `SecretsProvider`
+  `hermes_a365.keychain`'s OS-keychain shim with a `SecretsProvider`
   interface so operators can plug Vault / AWS Secrets Manager /
   Azure Key Vault / 1Password / etc. behind it. Defer until the
   first non-OS-keychain ask, or until Hermes ships its own

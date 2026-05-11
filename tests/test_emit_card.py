@@ -1,4 +1,4 @@
-"""Tests for scripts/emit_card.py and the adaptive-cards/ templates."""
+"""Tests for hermes_a365.emit_card and the adaptive-cards/ templates."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import json
 from pathlib import Path
 
 import pytest
-from emit_card import (
+
+from hermes_a365.emit_card import (
     ADAPTIVE_CARDS_SCHEMA,
     ADAPTIVE_CARDS_VERSION,
     ConfirmationInputs,

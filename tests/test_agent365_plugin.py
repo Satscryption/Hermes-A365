@@ -1,4 +1,4 @@
-"""Tests for plugins/agent365 — slices 19m skeleton + 19n runtime port.
+"""Tests for hermes_a365.plugin — slices 19m skeleton + 19n runtime port.
 
 The plugin imports ``gateway.platforms.base``, ``gateway.config``, and
 ``gateway.session`` from the Hermes harness at module level. Those
@@ -144,11 +144,8 @@ def _install_gateway_stubs() -> None:
 
 _install_gateway_stubs()
 
-_REPO_ROOT = Path(__file__).resolve().parent.parent
-sys.path.append(str(_REPO_ROOT))
-
-agent365 = importlib.import_module("plugins.agent365")
-adapter_mod = importlib.import_module("plugins.agent365.adapter")
+agent365 = importlib.import_module("hermes_a365.plugin")
+adapter_mod = importlib.import_module("hermes_a365.plugin.adapter")
 
 
 # ---------------------------------------------------------------------------
@@ -215,10 +212,11 @@ def _make_inbound(
 
 class TestPluginManifest:
     def test_plugin_yaml_present_and_parseable(self) -> None:
-        # Lowercase filename matches the harness loader's glob
-        # (`hermes_cli/plugins.py`); uppercase `PLUGIN.yaml` from the
-        # docs example is silently skipped by discovery.
-        path = _REPO_ROOT / "plugins" / "agent365" / "plugin.yaml"
+        # Bundled as package data; resolves under either an editable
+        # install or an installed wheel.
+        from importlib import resources
+
+        path = Path(str(resources.files("hermes_a365.plugin").joinpath("plugin.yaml")))
         assert path.exists()
         text = path.read_text()
         for key in ("name:", "version:", "description:", "requires_env:"):
@@ -226,12 +224,13 @@ class TestPluginManifest:
         assert "name: agent365" in text
 
     def test_uppercase_manifest_not_present(self) -> None:
-        # Regression guard: the harness loader globs for lowercase
-        # `plugin.yaml`. macOS APFS is case-insensitive by default
+        # Regression guard: macOS APFS is case-insensitive by default
         # so Path.exists() can't distinguish — list the directory
         # and check the actual on-disk name. On Linux the loader is
         # case-sensitive and an uppercase variant would be skipped.
-        plugin_dir = _REPO_ROOT / "plugins" / "agent365"
+        from importlib import resources
+
+        plugin_dir = Path(str(resources.files("hermes_a365.plugin")))
         names = {p.name for p in plugin_dir.iterdir()}
         assert "plugin.yaml" in names
         assert "PLUGIN.yaml" not in names, (
@@ -853,7 +852,7 @@ class TestConversationRef:
 
 class TestConversationRegistry:
     def test_upsert_merges_and_preserves_existing_fields(self) -> None:
-        from plugins.agent365.conversations import (
+        from hermes_a365.plugin.conversations import (
             ConversationRef,
             ConversationRegistry,
         )
@@ -877,13 +876,13 @@ class TestConversationRegistry:
         assert ref.last_inbound_activity_id == "act-2"
 
     def test_load_missing_file_returns_empty(self, tmp_path: Path) -> None:
-        from plugins.agent365.conversations import ConversationRegistry
+        from hermes_a365.plugin.conversations import ConversationRegistry
 
         reg = ConversationRegistry.load(tmp_path / "nope.json")
         assert len(reg) == 0
 
     def test_load_unparseable_returns_empty(self, tmp_path: Path) -> None:
-        from plugins.agent365.conversations import ConversationRegistry
+        from hermes_a365.plugin.conversations import ConversationRegistry
 
         path = tmp_path / "convs.json"
         path.write_text("not json {{{")
@@ -891,7 +890,7 @@ class TestConversationRegistry:
         assert len(reg) == 0
 
     def test_save_and_load_round_trip(self, tmp_path: Path) -> None:
-        from plugins.agent365.conversations import (
+        from hermes_a365.plugin.conversations import (
             ConversationRef,
             ConversationRegistry,
         )
@@ -916,7 +915,7 @@ class TestConversationRegistry:
 
     def test_save_is_atomic_with_no_tmpfile_residue(self, tmp_path: Path) -> None:
         """Atomic write means no leftover .tmp files after a successful save."""
-        from plugins.agent365.conversations import (
+        from hermes_a365.plugin.conversations import (
             ConversationRef,
             ConversationRegistry,
         )
@@ -952,7 +951,7 @@ class TestAdapterPersistsRegistry:
         )
         assert conv_path.exists()
         # Reload independently to confirm durability.
-        from plugins.agent365.conversations import ConversationRegistry
+        from hermes_a365.plugin.conversations import ConversationRegistry
 
         reloaded = ConversationRegistry.load(conv_path)
         ref = reloaded.get("conv-D")
@@ -962,7 +961,7 @@ class TestAdapterPersistsRegistry:
     def test_constructor_loads_existing_registry(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
-        from plugins.agent365.conversations import (
+        from hermes_a365.plugin.conversations import (
             ConversationRef,
             ConversationRegistry,
         )
@@ -1129,7 +1128,7 @@ class TestSendImage:
 # ---------------------------------------------------------------------------
 
 
-cli_mod = importlib.import_module("plugins.agent365.cli")
+cli_mod = importlib.import_module("hermes_a365.plugin.cli")
 
 
 def _build_a365_parser():
@@ -1208,7 +1207,7 @@ class TestRegisterCliDispatch:
     def test_doctor_dispatch_routes_to_doctor_run(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import doctor as _doctor
+        import hermes_a365.doctor as _doctor
 
         captured: dict[str, Any] = {}
 
@@ -1227,7 +1226,7 @@ class TestRegisterCliDispatch:
     def test_status_dispatch_carries_agent_name(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import status as _status
+        import hermes_a365.status as _status
 
         captured: dict[str, Any] = {}
 
@@ -1246,7 +1245,7 @@ class TestRegisterCliDispatch:
     def test_cleanup_dispatch_carries_required_flags(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import cleanup as _cleanup
+        import hermes_a365.cleanup as _cleanup
 
         captured: dict[str, Any] = {}
 
@@ -1278,7 +1277,7 @@ class TestRegisterCliDispatch:
     def test_register_dispatch_carries_apply_and_recover_flags(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import register as _register
+        import hermes_a365.register as _register
 
         captured: dict[str, Any] = {}
 
@@ -1307,7 +1306,7 @@ class TestRegisterCliDispatch:
     def test_instance_create_dispatch_routes_to_instance_create_run(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import instance_create as _instance_create
+        import hermes_a365.instance_create as _instance_create
 
         captured: dict[str, Any] = {}
 
@@ -1337,7 +1336,7 @@ class TestRegisterCliDispatch:
     def test_activity_bridge_verify_routes_to_bridge_run(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import activity_bridge as _activity_bridge
+        import hermes_a365.activity_bridge as _activity_bridge
 
         captured: dict[str, Any] = {}
 

@@ -85,7 +85,7 @@ inbound activity:
 The bridge persists the reference for proactive messages (e.g. agent
 reaches out first) at `~/.hermes/agents/<slug>/conversations.json`,
 mode 0600. Implemented in slice 19o (`ConversationRegistry`); see
-`plugins/agent365/conversations.py` for the schema.
+`hermes_a365.plugin.conversations` for the schema.
 
 ## Open snapshots
 

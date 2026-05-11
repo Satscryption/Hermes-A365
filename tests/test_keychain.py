@@ -1,4 +1,4 @@
-"""Tests for scripts/keychain.py (renamed from secrets.py in slice 19b
+"""Tests for hermes_a365.keychain (renamed from secrets.py in slice 19b
 to avoid shadowing the stdlib ``secrets`` module on the pythonpath —
 fastapi / starlette import ``from secrets import token_hex`` and were
 picking up our module before the stdlib).
@@ -12,9 +12,10 @@ from __future__ import annotations
 import subprocess
 from dataclasses import dataclass, field
 
-import keychain as secrets_mod
 import pytest
-from keychain import (
+
+import hermes_a365.keychain as secrets_mod
+from hermes_a365.keychain import (
     SERVICE,
     KeychainBackend,
     KeychainError,

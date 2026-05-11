@@ -65,7 +65,6 @@ import asyncio
 import json
 import logging
 import os
-import sys
 import time
 from datetime import datetime
 from pathlib import Path
@@ -89,22 +88,9 @@ from gateway.session import SessionSource  # noqa: E402
 # Plugin-local imports — these don't depend on the Hermes harness.
 from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 
-# ---------------------------------------------------------------------------
-# Make scripts/ importable so we can reuse the bridge helpers.
-# When the plugin is symlinked from <repo>/plugins/agent365 → ~/.hermes/
-# /plugins/agent365, the symlink resolves to the repo path and scripts/
-# is a sibling. Standalone-installed plugins (without scripts/ next to
-# them) won't load these helpers; vendoring the bridge module into the
-# plugin is queued for whenever this ships outside a checkout.
-# ---------------------------------------------------------------------------
-
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
-if _SCRIPTS_DIR.is_dir() and str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
-
-# Bridge helpers — imported lazily inside methods so missing extras /
-# missing scripts dir at import time produce a clear runtime error
-# rather than blowing up at gateway-load time.
+# Bridge helpers are imported lazily inside methods so missing optional
+# extras (e.g. fastapi for `activity-bridge serve`) produce a clear runtime
+# error rather than blowing up at gateway-load time.
 
 _DEFAULT_PORT = 3978
 
@@ -167,7 +153,7 @@ def _should_dispatch(activity: dict[str, Any]) -> bool:
 
 def _import_bridge() -> Any:
     """Import the bridge module on demand. Returns the module object."""
-    import activity_bridge  # type: ignore[import-not-found]
+    from hermes_a365 import activity_bridge
 
     return activity_bridge
 

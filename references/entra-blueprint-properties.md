@@ -50,7 +50,7 @@ them before handing the actual to `reconcile_blueprint`:
 - `etag`
 
 When Microsoft adds a new server-assigned field, add it to
-`_SERVER_ASSIGNED_FIELDS` in `scripts/blueprint_create.py` so it doesn't
+`_SERVER_ASSIGNED_FIELDS` in `hermes_a365.blueprint_create` so it doesn't
 trigger a phantom patch.
 
 ## Reconciliation semantics

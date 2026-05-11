@@ -1,9 +1,10 @@
-"""Tests for scripts/reconcile_blueprint.py."""
+"""Tests for hermes_a365.reconcile_blueprint."""
 
 from __future__ import annotations
 
 import pytest
-from reconcile_blueprint import BlueprintPlan, reconcile_blueprint
+
+from hermes_a365.reconcile_blueprint import BlueprintPlan, reconcile_blueprint
 
 
 def _blueprint(slug: str = "inbox-helper", **overrides: object) -> dict[str, object]:

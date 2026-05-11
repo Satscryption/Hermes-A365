@@ -1,0 +1,40 @@
+name: Publish to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-publish:
+    runs-on: ubuntu-latest
+    # Uses PyPI Trusted Publisher (OIDC) — no PYPI_API_TOKEN secret.
+    # One-time setup: register the project on pypi.org and add this
+    # repo + workflow as a Trusted Publisher under "Manage > Publishing".
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install build tooling
+        run: python -m pip install --upgrade build
+
+      - name: Build sdist + wheel
+        run: python -m build
+
+      - name: Sanity-check artefacts
+        run: |
+          ls -la dist/
+          python -c "import zipfile, glob; w = glob.glob('dist/*.whl')[0]; names = zipfile.ZipFile(w).namelist(); print('\n'.join(names))" \
+            | grep -E "(plugin\.yaml|_data/templates/.+\.j2)" \
+            && echo "Package data present ✓" \
+            || (echo "Missing package data in wheel!" && exit 1)
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1

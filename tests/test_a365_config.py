@@ -1,11 +1,11 @@
-"""Tests for scripts/a365_config.py — read/write/merge of a365.config.json."""
+"""Tests for hermes_a365.a365_config — read/write/merge of a365.config.json."""
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
 
-from a365_config import (
+from hermes_a365.a365_config import (
     CONFIG_FILENAME,
     A365Config,
     merge,

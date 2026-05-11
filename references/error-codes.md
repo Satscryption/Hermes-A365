@@ -4,7 +4,7 @@ Snapshot date: 2026-05-04
 
 Catalogue of AADSTS / A365 / Bot Framework error codes the skill detects,
 the surface that emits each one, and the recovery posture. The
-`scripts/register.py::AADSTSError` exception captures any `AADSTS<code>`
+`hermes_a365.register::AADSTSError` exception captures any `AADSTS<code>`
 token in CLI stderr; specific codes get specific handling in the apply
 loops.
 
@@ -31,7 +31,7 @@ call is the spec §9.1 troubleshooting table:
 ## A365-specific delegated scopes (drift-tracked)
 
 Microsoft has signalled that A365 scope names may evolve during the GA
-window. The doctor (`scripts/doctor.py`) calls `a365 query-entra --scopes`
+window. The doctor (`hermes_a365.doctor`) calls `a365 query-entra --scopes`
 and compares against the snapshot below. When drift is detected, the
 **live** name is authoritative; update this file and bump the snapshot.
 
@@ -58,7 +58,7 @@ permissions.
 ## Bot Framework activity errors
 
 The activity bridge (slices 19a–19o, see
-`scripts/activity_bridge.py` + `plugins/agent365/`) handles BF-side
+`hermes_a365.activity_bridge` + `hermes_a365.plugin`) handles BF-side
 errors distinct from AADSTS. Catalogue captured during round-N
 walkthroughs to date:
 
@@ -72,7 +72,7 @@ walkthroughs to date:
   rejects the token; check the issuer / audience claim shape.
 - `403 Forbidden` on `serviceUrl` POST — host suffix not in the
   allowlist (slice 19j); see `_TRUSTED_SERVICE_URL_HOST_SUFFIXES` in
-  `scripts/activity_bridge.py`.
+  `hermes_a365.activity_bridge`.
 
 Live-tenant rounds 1–6 only validated happy paths; the error shapes
 above are documented from BF spec / live miss observations.

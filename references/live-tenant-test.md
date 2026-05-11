@@ -92,7 +92,7 @@ root.
 ## 1. doctor — environment readiness
 
 ```bash
-uv run python scripts/doctor.py --human
+hermes-a365 doctor --human
 echo "exit=$?"
 ```
 
@@ -134,7 +134,7 @@ device-code prompt on first run for cached-token bootstrap.
 ## 2. license — recommendation only (no purchase)
 
 ```bash
-uv run python scripts/license.py --users 5 --agents 1 --plan E5
+hermes-a365 license --users 5 --agents 1 --plan E5
 ```
 
 **Pass criterion:** prints a recommendation and exits 0. The
@@ -155,7 +155,7 @@ deadline + stderr→stdout merge), so device-code prompts surface in
 real time. Use the wrapper directly:
 
 ```bash
-uv run python scripts/register.py \
+hermes-a365 register \
     --agent-name "<display-name>" \
     --m365 \
     --apply
@@ -180,7 +180,7 @@ default; without the flag the wrapper prints a paste-ready recovery
 hint and exits 0.
 
 ```bash
-uv run python scripts/register.py \
+hermes-a365 register \
     --agent-name "<display-name>" \
     --m365 \
     --auto-recover-secret \
@@ -254,7 +254,7 @@ URL the operator approves). `consent.py` is now a thin verifier
 (slice 18k):
 
 ```bash
-uv run python scripts/consent.py "<display-name>" --no-open --interval 5 --timeout 30
+hermes-a365 consent "<display-name>" --no-open --interval 5 --timeout 30
 ```
 
 It polls `a365 query-entra blueprint-scopes` and exits 0 once the
@@ -285,7 +285,7 @@ Tools, Agent 365 Observability, and MCP Servers Metadata API.
 Dry-run:
 
 ```bash
-uv run python scripts/instance_create.py <slug> \
+hermes-a365 instance create <slug> \
     --owner <owner-email> \
     --owner-aad-id <owner-aad-id>
 ```
@@ -293,7 +293,7 @@ uv run python scripts/instance_create.py <slug> \
 Apply:
 
 ```bash
-uv run python scripts/instance_create.py <slug> \
+hermes-a365 instance create <slug> \
     --owner <owner-email> \
     --owner-aad-id <owner-aad-id> \
     --apply
@@ -334,8 +334,8 @@ admin-centre prompt for blueprint-only).
 Dry-run, then apply:
 
 ```bash
-uv run python scripts/publish.py --agent-name "<display-name>" --tenant-id <tenant-id>
-uv run python scripts/publish.py --agent-name "<display-name>" --tenant-id <tenant-id> --apply
+hermes-a365 publish --agent-name "<display-name>" --tenant-id <tenant-id>
+hermes-a365 publish --agent-name "<display-name>" --tenant-id <tenant-id> --apply
 ```
 
 Add `--aiteammate` for the AI Teammate flow.
@@ -406,7 +406,7 @@ agent response; that's the §9c / §9d acceptance gate, not §8's.
 ## 9. status — sanity check against `query-entra`
 
 ```bash
-uv run python scripts/status.py <slug> --human
+hermes-a365 status <slug> --human
 echo "exit=$?"
 ```
 
@@ -432,7 +432,7 @@ rather than the CLI's "Querying Entra ID for…" progress preamble.
 ## 9b. activity-bridge verify (slice 19a) — runtime config sanity
 
 ```bash
-uv run python scripts/activity_bridge.py verify --slug <slug> --human
+hermes-a365 activity-bridge verify --slug <slug> --human
 echo "exit=$?"
 ```
 
@@ -469,7 +469,7 @@ in 19b.
 Validates the full runtime path. Slice 19e (issue #6) replaced the
 broken `client_credentials` outbound auth with the canonical A365
 agentic three-stage `user_fic` chain — see
-`scripts/activity_bridge.py::acquire_outbound_token` for the
+`hermes_a365.activity_bridge::acquire_outbound_token` for the
 implementation. This is the runtime walkthrough that round-2
 couldn't reach.
 
@@ -500,7 +500,7 @@ Prerequisites:
   default `setup blueprint` (without `--m365`) leaves it `null`. Run
 
   ```bash
-  uv run python scripts/activity_bridge.py update-endpoint \
+  hermes-a365 activity-bridge update-endpoint \
       --agent-name "<display-name>" \
       --url https://<tunnel>.trycloudflare.com/api/messages --apply
   ```
@@ -528,12 +528,12 @@ cloudflared tunnel --url http://localhost:3978 &
 # Take the trycloudflare.com URL it prints.
 
 # 2. Reference responder.
-uv run python scripts/hermes_responder.py serve \
+python -m hermes_a365.hermes_responder serve \
     --port 9090 --mode greeting --slug inbox-helper &
 
 # 3. Bridge.
 HERMES_BRIDGE_WEBHOOK=http://127.0.0.1:9090/respond \
-    uv run python scripts/activity_bridge.py serve \
+    hermes-a365 activity-bridge serve \
         --slug inbox-helper --port 3978 &
 ```
 
@@ -628,24 +628,27 @@ runbook):
 If any of these are still red, stop here and fix before §9d.1 —
 the runbook below assumes they're all green.
 
-### 9d.1 — Install the plugin into Hermes' plugin path
+### 9d.1 — Install the plugin into Hermes' venv
 
-For development, symlink rather than copy so edits land immediately:
+Install the package into the Hermes venv so the plugin loader
+auto-discovers it via the `hermes_agent.plugins` entry point —
+no `~/.hermes/plugins/agent365/` directory required:
 
 ```bash
-mkdir -p ~/.hermes/plugins
-ln -sfn "$PWD/plugins/agent365" ~/.hermes/plugins/agent365
-ls -l ~/.hermes/plugins/agent365   # confirm symlink resolves
+~/.hermes/hermes-agent/venv/bin/pip install 'hermes-a365[bridge]'
+hermes plugins list                # `agent365` should appear with source=entrypoint
 ```
 
-The plugin auto-discovers `scripts/activity_bridge.py` via a
-sys.path append at module load (relative to the symlink target),
-so the bridge helpers (`validate_inbound_jwt`, `send_reply`,
-`acquire_outbound_token`, the caches) are reused — not vendored.
-Plain copies of the plugin directory without `scripts/` as a
-sibling won't load; that's tracked as a follow-up
-(vendor-the-bridge-into-the-plugin) for whenever this ships outside
-a dev checkout.
+For dev work against an unpublished checkout, use an editable install
+into the same venv instead:
+
+```bash
+~/.hermes/hermes-agent/venv/bin/pip install -e ".[bridge]"
+```
+
+The plugin imports `hermes_a365.activity_bridge` directly — no
+sys.path tricks, no symlinks. Edits to the package land immediately
+under `pip install -e`; otherwise reinstall after every change.
 
 ### 9d.2 — Wire the platform into Hermes config.yaml
 
@@ -682,7 +685,7 @@ hermes gateway run
 (Or whatever the canonical run command is in your harness install
 — check `hermes --help`.) The gateway should:
 
-1. Discover the plugin at `~/.hermes/plugins/agent365`.
+1. Discover the plugin via the `hermes_agent.plugins` entry-point scan.
 2. Call `register(ctx)` → `ctx.register_platform(name="agent365", …)`.
 3. Construct `Agent365Adapter(cfg)` via the registered factory.
 4. Call `connect()` — uvicorn binds `127.0.0.1:3978`,
@@ -722,7 +725,7 @@ for stable-URL alternatives.
 #    devtunnels, ngrok, or your reverse proxy as appropriate.
 cloudflared tunnel --url http://localhost:3978 &
 # 2. Re-point.
-uv run python scripts/activity_bridge.py update-endpoint \
+hermes-a365 activity-bridge update-endpoint \
     --agent-name "Hermes Inbox Helper" \
     --url https://<tunnel>.trycloudflare.com/api/messages --apply
 ```
@@ -810,7 +813,7 @@ end-to-end.
 Dry-run first to review the plan and verify the resolved local slug:
 
 ```bash
-uv run python scripts/cleanup.py --agent-name "<display-name>" --tenant-id <tenant-id>
+hermes-a365 cleanup --agent-name "<display-name>" --tenant-id <tenant-id>
 ```
 
 The plan output prints `local slug: <slug>` and renders each step as
@@ -821,7 +824,7 @@ they diverge, pass `--slug <your-slug>` to override.
 Apply:
 
 ```bash
-uv run python scripts/cleanup.py --agent-name "<display-name>" \
+hermes-a365 cleanup --agent-name "<display-name>" \
     --tenant-id <tenant-id> --apply --confirm "<display-name>"
 ```
 
@@ -866,7 +869,7 @@ handle:
   `az rest --method DELETE --uri …/agentInstances/<id>` for each
   orphan registry entry after the CLI steps:
   ```bash
-  uv run python scripts/cleanup.py --agent-name "<display-name>" \
+  hermes-a365 cleanup --agent-name "<display-name>" \
       --tenant-id <tenant-id> --apply --confirm "<display-name>" \
       --purge-orphans
   ```

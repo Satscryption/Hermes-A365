@@ -40,8 +40,8 @@ import time
 import webbrowser
 from pathlib import Path
 
-from _common import jinja_env, parse_env
-from status import QuerySource, _classify_scopes_output, get_query_source
+from ._common import jinja_env, parse_env
+from .status import QuerySource, _classify_scopes_output, get_query_source
 
 DEFAULT_POLL_INTERVAL_SECONDS = 5.0
 DEFAULT_TIMEOUT_SECONDS = 300.0

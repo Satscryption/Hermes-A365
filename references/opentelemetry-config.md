@@ -52,7 +52,7 @@ A365 ships with `parent_based(root=traceidratio(0.1))` by default; the
 activity bridge MUST respect the parent decision so traces span the
 A365 ingress + Hermes runtime + outbound channel post.
 
-The `telemetry` verifier (`scripts/telemetry.py`) surfaces the live
+The `telemetry` verifier (`hermes_a365.telemetry`) surfaces the live
 sampler from `query-entra --telemetry`; if it differs from the spec
 default, that's a tenant policy choice, not drift.
 

@@ -62,7 +62,7 @@ except ImportError:  # pragma: no cover
     _HTTPException = None  # type: ignore[assignment]
     _JSONResponse = None  # type: ignore[assignment]
 
-from emit_card import GreetingInputs, emit_greeting
+from .emit_card import GreetingInputs, emit_greeting
 
 DEFAULT_PORT = 9090
 DEFAULT_HOST = "127.0.0.1"

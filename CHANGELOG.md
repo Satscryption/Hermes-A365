@@ -6,7 +6,40 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-Tracking work on `main` since `v0.1.0`.
+## [0.1.1] — 2026-05-11
+
+Repackaging-only release: `hermes-a365` is now `pip install`-able from
+PyPI. No behavioural changes; the apply paths, read paths, and Bot
+Framework activity bridge are identical to `v0.1.0`.
+
+### Changed
+
+- **Distribution.** Source tree moved to a real `src/hermes_a365/`
+  layout. `[tool.uv] package = false` is gone; the wheel is built via
+  `hatchling` and published to PyPI. Two install paths now supported:
+  - **Standalone CLI:** `pipx install 'hermes-a365[bridge]'` exposes a
+    `hermes-a365 <verb>` console script for operators who drive the
+    wrappers without spinning up a Hermes gateway.
+  - **Gateway plugin:** `~/.hermes/hermes-agent/venv/bin/pip install
+    'hermes-a365[bridge]'`. The Hermes plugin loader auto-discovers
+    `agent365` via the `hermes_agent.plugins` entry point — no
+    `~/.hermes/plugins/agent365/` directory, no symlink.
+- **Imports.** Every module is now `hermes_a365.<x>`. The
+  symlink-walking `Path(__file__).resolve().parent.parent.parent /
+  "scripts"` trick in the plugin (`plugins/agent365/{adapter,cli}.py`)
+  is retired; the plugin imports `from hermes_a365 import
+  activity_bridge` directly.
+- **Templates.** `templates/` is now packaged as `hermes_a365._data/
+  templates/` and resolved via `importlib.resources` so lookups work
+  for both editable installs and wheels.
+- **Tests.** Bare imports (`from a365_config import …`) rewritten to
+  `from hermes_a365.a365_config import …`. `tests/conftest.py` no
+  longer pokes `scripts/` onto `sys.path`. 624 tests still passing.
+- **Docs.** README, SKILL.md, and the `references/` runbooks updated
+  to drop the symlink instructions and the `uv run python scripts/<x>.py`
+  invocation style in favour of `pipx install` + `hermes-a365 <verb>`
+  (or `python -m hermes_a365.<x>` for the modules that aren't surfaced
+  as CLI subcommands).
 
 ## [0.1.0] — 2026-05-08
 

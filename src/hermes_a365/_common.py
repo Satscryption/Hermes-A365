@@ -1,11 +1,8 @@
-"""Shared helpers for hermes-a365 scripts.
+"""Shared helpers for hermes_a365 modules.
 
-Path conventions:
-- Repo root contains ``scripts/``, ``templates/``, ``references/`` as siblings.
-- When running from the installed Hermes skill location
-  (``~/.hermes/hermes-agent/optional-skills/cloud-platforms/hermes-a365/``)
-  the layout is the same.
-- ``skill_root()`` resolves to the parent of this file's ``scripts/`` directory.
+Packaged Jinja templates live under ``hermes_a365/_data/templates/`` and are
+resolved via :func:`templates_dir`, which uses ``importlib.resources`` so the
+lookup works for both editable installs and wheels.
 """
 
 from __future__ import annotations
@@ -13,18 +10,15 @@ from __future__ import annotations
 import re
 import socket
 import subprocess
+from importlib import resources
 from pathlib import Path
 
 import jinja2
 
 
-def skill_root() -> Path:
-    """Return the directory that contains scripts/, templates/, references/."""
-    return Path(__file__).resolve().parent.parent
-
-
 def templates_dir() -> Path:
-    return skill_root() / "templates"
+    """Filesystem path to the packaged ``_data/templates/`` directory."""
+    return Path(str(resources.files("hermes_a365._data").joinpath("templates")))
 
 
 def safe_run(argv: list[str], *, timeout: float = 5.0) -> str | None:

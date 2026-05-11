@@ -1,4 +1,4 @@
-"""Tests for scripts/cleanup.py — v0.2 around the real CLI cleanup subs."""
+"""Tests for hermes_a365.cleanup — v0.2 around the real CLI cleanup subs."""
 
 from __future__ import annotations
 
@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from cleanup import (
+
+from hermes_a365.cleanup import (
     CLEANUP_KINDS,
     CleanupError,
     CleanupInputs,
@@ -18,7 +19,7 @@ from cleanup import (
     apply_cleanup_plan,
     build_cleanup_plan,
 )
-from mutator import AADSTSError, CliInvocationError, RunResult
+from hermes_a365.mutator import AADSTSError, CliInvocationError, RunResult
 
 # ---------------------------------------------------------------------------
 # FakeMutator (records argv lists)
@@ -378,20 +379,20 @@ def _scripted_run(stdout: str = "") -> RunResult:
 
 class TestOrphanParser:
     def test_extracts_guid_from_real_output(self) -> None:
-        from cleanup import _parse_orphan_user_ids
+        from hermes_a365.cleanup import _parse_orphan_user_ids
 
         ids = _parse_orphan_user_ids(_REAL_ORPHAN_OUTPUT)
         assert ids == ["b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"]
 
     def test_dedupes_repeats_within_single_step(self) -> None:
-        from cleanup import _parse_orphan_user_ids
+        from hermes_a365.cleanup import _parse_orphan_user_ids
 
         # Same GUID hits both the inline 'Failed to delete' line and the
         # final 'Orphaned agentic user:' summary — count it once.
         assert len(_parse_orphan_user_ids(_REAL_ORPHAN_OUTPUT)) == 1
 
     def test_clean_output_yields_no_ids(self) -> None:
-        from cleanup import _parse_orphan_user_ids
+        from hermes_a365.cleanup import _parse_orphan_user_ids
 
         assert _parse_orphan_user_ids("Cleanup successful.\n") == []
 
@@ -521,24 +522,24 @@ def _seed_generated_config(
 
 class TestSnapshotAgentInstanceId:
     def test_returns_id_when_present(self, tmp_path: Path) -> None:
-        from cleanup import _snapshot_agent_instance_id
+        from hermes_a365.cleanup import _snapshot_agent_instance_id
 
         cfg = _seed_generated_config(tmp_path)
         assert _snapshot_agent_instance_id(cfg) == _TEST_INSTANCE_ID
 
     def test_returns_none_when_file_missing(self, tmp_path: Path) -> None:
-        from cleanup import _snapshot_agent_instance_id
+        from hermes_a365.cleanup import _snapshot_agent_instance_id
 
         assert _snapshot_agent_instance_id(tmp_path / "nope.json") is None
 
     def test_returns_none_when_id_empty(self, tmp_path: Path) -> None:
-        from cleanup import _snapshot_agent_instance_id
+        from hermes_a365.cleanup import _snapshot_agent_instance_id
 
         cfg = _seed_generated_config(tmp_path, instance_id="")
         assert _snapshot_agent_instance_id(cfg) is None
 
     def test_returns_none_on_invalid_json(self, tmp_path: Path) -> None:
-        from cleanup import _snapshot_agent_instance_id
+        from hermes_a365.cleanup import _snapshot_agent_instance_id
 
         cfg = tmp_path / "a365.generated.config.json"
         cfg.write_text("{not valid json")

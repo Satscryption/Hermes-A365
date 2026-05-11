@@ -50,8 +50,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from a365_config import A365Config, merge, read, write_atomic
-from mutator import (
+from .a365_config import A365Config, merge, read, write_atomic
+from .mutator import (
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
     AADSTSError,

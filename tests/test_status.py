@@ -1,4 +1,4 @@
-"""Tests for scripts/status.py — v0.2 narrowed component set."""
+"""Tests for hermes_a365.status — v0.2 narrowed component set."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from status import (
+
+from hermes_a365.status import (
     A365CliQuerySource,
     QuerySource,
     StatusComponent,

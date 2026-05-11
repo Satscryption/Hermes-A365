@@ -1,9 +1,9 @@
 """CLI commands for the agent365 plugin.
 
-Wires ``hermes a365 <subcommand>`` against the wrapper scripts under
-``<repo>/scripts/``. Each subcommand re-uses the script's own
-``build_parser`` + ``run`` surface, so ``hermes a365 doctor --help``
-shows exactly the same flags as ``python scripts/doctor.py --help``.
+Wires ``hermes a365 <subcommand>`` against the ``hermes_a365`` package
+modules. Each subcommand re-uses the module's own ``build_parser`` +
+``run`` surface, so ``hermes a365 doctor --help`` shows exactly the same
+flags as ``hermes-a365 doctor --help``.
 
   doctor           — read-only environment probe
   license          — license model recommendation
@@ -20,15 +20,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from pathlib import Path
-
-# Make ``<repo>/scripts/`` importable — same pattern as adapter.py.
-# When the plugin is symlinked from ``<repo>/plugins/agent365`` into
-# ``~/.hermes/plugins/agent365``, the symlink resolves to the repo
-# path and scripts/ is a sibling.
-_SCRIPTS_DIR = Path(__file__).resolve().parent.parent.parent / "scripts"
-if _SCRIPTS_DIR.is_dir() and str(_SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(_SCRIPTS_DIR))
 
 
 def register_cli(subparser: argparse.ArgumentParser) -> None:
@@ -37,17 +28,17 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     Called by the Hermes plugin loader at gateway / CLI startup via
     ``ctx.register_cli_command(name="a365", setup_fn=register_cli, ...)``.
     """
-    # Imports are deferred until register_cli runs so plugin-load time
-    # doesn't pay for them when the operator never invokes the CLI.
-    import activity_bridge as _activity_bridge
-    import cleanup as _cleanup
-    import consent as _consent
-    import doctor as _doctor
-    import instance_create as _instance_create
-    import license as _license
-    import publish as _publish
-    import register as _register
-    import status as _status
+    # Deferred imports so plugin-load time doesn't pay for them when
+    # the operator never invokes the CLI.
+    from hermes_a365 import activity_bridge as _activity_bridge
+    from hermes_a365 import cleanup as _cleanup
+    from hermes_a365 import consent as _consent
+    from hermes_a365 import doctor as _doctor
+    from hermes_a365 import instance_create as _instance_create
+    from hermes_a365 import license as _license
+    from hermes_a365 import publish as _publish
+    from hermes_a365 import register as _register
+    from hermes_a365 import status as _status
 
     subs = subparser.add_subparsers(dest="a365_command")
 
@@ -108,42 +99,42 @@ _USAGE = (
 
 
 def a365_command(args: argparse.Namespace) -> int:
-    """Dispatch ``hermes a365 <verb>`` to the matching script's ``run``."""
+    """Dispatch ``hermes a365 <verb>`` to the matching module's ``run``."""
     sub = getattr(args, "a365_command", None)
     if not sub:
         print(_USAGE)
         return 2
 
     if sub == "doctor":
-        import doctor as _doctor
+        from hermes_a365 import doctor as _doctor
         return _doctor.run(args)
     if sub == "license":
-        import license as _license
+        from hermes_a365 import license as _license
         return _license.run(args)
     if sub == "register":
-        import register as _register
+        from hermes_a365 import register as _register
         return _register.run(args)
     if sub == "consent":
-        import consent as _consent
+        from hermes_a365 import consent as _consent
         return _consent.run(args)
     if sub == "instance":
         instance_sub = getattr(args, "instance_command", None)
         if instance_sub == "create":
-            import instance_create as _instance_create
+            from hermes_a365 import instance_create as _instance_create
             return _instance_create.run(args)
         print("usage: hermes a365 instance {create}")
         return 2
     if sub == "publish":
-        import publish as _publish
+        from hermes_a365 import publish as _publish
         return _publish.run(args)
     if sub == "status":
-        import status as _status
+        from hermes_a365 import status as _status
         return _status.run(args)
     if sub == "cleanup":
-        import cleanup as _cleanup
+        from hermes_a365 import cleanup as _cleanup
         return _cleanup.run(args)
     if sub == "activity-bridge":
-        import activity_bridge as _activity_bridge
+        from hermes_a365 import activity_bridge as _activity_bridge
         return _activity_bridge.run(args)
 
     print(f"unknown subcommand: {sub}", file=sys.stderr)

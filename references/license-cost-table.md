@@ -15,7 +15,7 @@ recommendation without ever purchasing.
 | Agent 365 add-on | `MICROSOFT_AGENT_365_TIER_3` (verified) | $15 / user / month | A365 governance + identity | Add-on to any M365 plan; no Copilot, no Defender, no Purview. The Graph `subscribedSkus` API exposes this as `MICROSOFT_AGENT_365_TIER_3`; tier numbering may differ in other regions. |
 | Microsoft 365 E7 | (TBD — not seen in test tenant) | $99 / user / month | M365 + A365 + Copilot + Defender + Purview | Full enterprise bundle; cheapest path when adopting Copilot anyway. |
 
-## Decision rule (encoded in `scripts/license.py`)
+## Decision rule (encoded in `hermes_a365.license`)
 
 | Users | M365 plan | Recommendation |
 |---|---|---|

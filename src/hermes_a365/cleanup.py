@@ -36,8 +36,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from _common import slugify
-from mutator import AADSTSError, CliInvocationError, Mutator, get_mutator
+from ._common import slugify
+from .mutator import AADSTSError, CliInvocationError, Mutator, get_mutator
 
 CleanupKind = Literal["azure", "instance", "blueprint"]
 CLEANUP_KINDS: tuple[CleanupKind, ...] = ("azure", "instance", "blueprint")

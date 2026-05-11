@@ -48,7 +48,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
-from _common import parse_env, safe_run, slugify
+from ._common import parse_env, safe_run, slugify
 
 ComponentState = Literal["ok", "warn", "error", "missing", "skipped"]
 OverallState = Literal["ok", "partial", "broken", "uninitialized"]

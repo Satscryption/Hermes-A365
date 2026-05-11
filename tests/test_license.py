@@ -1,11 +1,12 @@
-"""Tests for scripts/license.py — pure functions, no I/O."""
+"""Tests for hermes_a365.license — pure functions, no I/O."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
 import pytest
-from license import (
+
+from hermes_a365.license import (
     ADDON_THRESHOLD_USERS,
     ADMIN_CENTER_CATALOG_URL,
     PRICE_ADDON_PER_USER_MONTHLY,

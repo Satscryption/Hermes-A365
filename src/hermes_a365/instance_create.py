@@ -26,8 +26,8 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from _common import parse_env
-from render_instance_env import InstanceEnvInputs, render_instance_env
+from ._common import parse_env
+from .render_instance_env import InstanceEnvInputs, render_instance_env
 
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"

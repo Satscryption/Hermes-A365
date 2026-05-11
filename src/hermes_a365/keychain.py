@@ -21,17 +21,17 @@ exit. The Linux backend pipes the secret via stdin, which is preferred.
 
 Programmatic use::
 
-    from keychain import store_secret, get_secret, delete_secret
+    from hermes_a365.keychain import store_secret, get_secret, delete_secret
     store_secret("contoso.onmicrosoft.com", "9e2d…", "shh")
     secret = get_secret("contoso.onmicrosoft.com", "9e2d…")
     delete_secret("contoso.onmicrosoft.com", "9e2d…")
 
 CLI use::
 
-    python scripts/secrets.py store --tenant=… --app-id=… --secret -   # stdin
-    python scripts/secrets.py store --tenant=… --app-id=…              # interactive prompt
-    python scripts/secrets.py get    --tenant=… --app-id=…
-    python scripts/secrets.py delete --tenant=… --app-id=…
+    python -m hermes_a365.keychain store --tenant=… --app-id=… --secret -   # stdin
+    python -m hermes_a365.keychain store --tenant=… --app-id=…              # interactive prompt
+    python -m hermes_a365.keychain get    --tenant=… --app-id=…
+    python -m hermes_a365.keychain delete --tenant=… --app-id=…
 """
 
 from __future__ import annotations

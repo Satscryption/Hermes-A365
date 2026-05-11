@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
-from _common import deep_diff, render_diff_human
+from ._common import deep_diff, render_diff_human
 
 PlanAction = Literal["create", "noop", "patch", "abort"]
 

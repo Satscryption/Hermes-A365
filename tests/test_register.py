@@ -1,4 +1,4 @@
-"""Tests for scripts/register.py — the v0.2 setup-orchestrator."""
+"""Tests for hermes_a365.register — the v0.2 setup-orchestrator."""
 
 from __future__ import annotations
 
@@ -7,15 +7,16 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
-from a365_config import CONFIG_FILENAME
-from mutator import (
+
+from hermes_a365.a365_config import CONFIG_FILENAME
+from hermes_a365.mutator import (
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
     AADSTSError,
     CliInvocationError,
     RunResult,
 )
-from register import (
+from hermes_a365.register import (
     DEFAULT_BACKOFF_SECONDS,
     DEFAULT_RETRIES,
     ApplyResult,

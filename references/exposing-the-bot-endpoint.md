@@ -3,8 +3,8 @@
 **Snapshot:** 2026-05-06.
 
 This is a non-prescriptive reference. The Hermes-A365 skill is
-infrastructure-agnostic: the plugin (`plugins/agent365/`) and the
-bridge (`scripts/activity_bridge.py serve`) both listen on
+infrastructure-agnostic: the plugin (`hermes_a365.plugin`) and the
+bridge (`hermes_a365.activity_bridge serve`) both listen on
 `localhost:<port>`. *How* that port becomes a publicly reachable
 HTTPS URL is the operator's choice, driven by the deployment
 environment, security posture, and operational constraints — not

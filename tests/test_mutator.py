@@ -1,4 +1,4 @@
-"""Tests for scripts/mutator.py — the v0.2 thin CLI wrapper."""
+"""Tests for hermes_a365.mutator — the v0.2 thin CLI wrapper."""
 
 from __future__ import annotations
 
@@ -6,7 +6,8 @@ import sys
 from unittest.mock import patch
 
 import pytest
-from mutator import (
+
+from hermes_a365.mutator import (
     A365_CLI_BINARY,
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
@@ -60,7 +61,7 @@ class TestA365CliMutatorRun:
     def test_success_returns_run_result(self) -> None:
         m = A365CliMutator()
         m.available = True  # bypass PATH check
-        with patch("mutator._run_streaming", return_value=(0, "ok\n")):
+        with patch("hermes_a365.mutator._run_streaming", return_value=(0, "ok\n")):
             result = m.run(["a365", "setup", "blueprint", "--agent-name", "x"])
         assert isinstance(result, RunResult)
         assert result.returncode == 0
@@ -87,7 +88,7 @@ class TestAADSTSExtraction:
         m.available = True
         bad = "ERROR AADSTS500011: tenant license has not propagated yet"
         with (
-            patch("mutator._run_streaming", return_value=(2, bad)),
+            patch("hermes_a365.mutator._run_streaming", return_value=(2, bad)),
             pytest.raises(AADSTSError) as excinfo,
         ):
             m.run(["a365", "setup", "blueprint"])
@@ -98,7 +99,7 @@ class TestAADSTSExtraction:
         m.available = True
         bad = "Some chatter\nAADSTS90094: admin consent required"
         with (
-            patch("mutator._run_streaming", return_value=(1, bad)),
+            patch("hermes_a365.mutator._run_streaming", return_value=(1, bad)),
             pytest.raises(AADSTSError) as excinfo,
         ):
             m.run(["a365", "setup", "permissions", "bot"])
@@ -108,7 +109,7 @@ class TestAADSTSExtraction:
         m = A365CliMutator()
         m.available = True
         with (
-            patch("mutator._run_streaming", return_value=(7, "weird crash")),
+            patch("hermes_a365.mutator._run_streaming", return_value=(7, "weird crash")),
             pytest.raises(CliInvocationError) as excinfo,
         ):
             m.run(["a365", "setup", "blueprint"])
@@ -122,7 +123,7 @@ class TestAADSTSExtraction:
         """
         m = A365CliMutator()
         m.available = True
-        with patch("mutator._run_streaming") as runner:
+        with patch("hermes_a365.mutator._run_streaming") as runner:
             runner.return_value = (0, "")
             m.run(["a365", "cleanup", "azure", "--agent-name", "x"], stdin_input="y\n")
         assert runner.call_args.kwargs["stdin_input"] == "y\n"

@@ -1,4 +1,4 @@
-"""Tests for scripts/doctor.py — v0.2 with verified-real prereqs."""
+"""Tests for hermes_a365.doctor — v0.2 with verified-real prereqs."""
 
 from __future__ import annotations
 
@@ -7,7 +7,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 import pytest
-from doctor import (
+
+from hermes_a365.doctor import (
     CUSTOM_CLIENT_APP_DOCS,
     DEFAULT_CLIENT_APP_NAME,
     FRONTIER_PROGRAM_URL,
@@ -34,7 +35,7 @@ from doctor import (
 
 class TestProbeA365Cli:
     def test_missing_binary_returns_error(self) -> None:
-        with patch("doctor.shutil.which", return_value=None):
+        with patch("hermes_a365.doctor.shutil.which", return_value=None):
             r = probe_a365_cli()
         assert r.state == "error"
         assert "a365 not found" in r.detail
@@ -42,9 +43,9 @@ class TestProbeA365Cli:
 
     def test_present_returns_ok_with_version(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
             patch(
-                "doctor.safe_run",
+                "hermes_a365.doctor.safe_run",
                 return_value="Agent 365 Developer Tools CLI v1.1.171",
             ),
         ):
@@ -60,14 +61,14 @@ class TestProbeA365Cli:
 
 class TestProbeAzCli:
     def test_missing_returns_error(self) -> None:
-        with patch("doctor.shutil.which", return_value=None):
+        with patch("hermes_a365.doctor.shutil.which", return_value=None):
             r = probe_az_cli()
         assert r.state == "error"
 
     def test_present_but_signed_out_warns(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("doctor.safe_run", return_value=None),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch("hermes_a365.doctor.safe_run", return_value=None),
         ):
             r = probe_az_cli()
         assert r.state == "warn"
@@ -75,8 +76,8 @@ class TestProbeAzCli:
 
     def test_present_and_signed_in_ok(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("doctor.safe_run", return_value="alice@contoso.com\n"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch("hermes_a365.doctor.safe_run", return_value="alice@contoso.com\n"),
         ):
             r = probe_az_cli()
         assert r.state == "ok"
@@ -90,15 +91,15 @@ class TestProbeAzCli:
 
 class TestProbePowerShell:
     def test_missing_pwsh_errors(self) -> None:
-        with patch("doctor.shutil.which", return_value=None):
+        with patch("hermes_a365.doctor.shutil.which", return_value=None):
             r = probe_powershell()
         assert r.state == "error"
         assert "pwsh" in r.detail
 
     def test_v7_ok(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/local/bin/pwsh"),
-            patch("doctor.safe_run", return_value="7.4.1"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/local/bin/pwsh"),
+            patch("hermes_a365.doctor.safe_run", return_value="7.4.1"),
         ):
             r = probe_powershell()
         assert r.state == "ok"
@@ -106,8 +107,8 @@ class TestProbePowerShell:
 
     def test_pre_v7_warns(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/local/bin/pwsh"),
-            patch("doctor.safe_run", return_value="5.1.22621"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/local/bin/pwsh"),
+            patch("hermes_a365.doctor.safe_run", return_value="5.1.22621"),
         ):
             r = probe_powershell()
         assert r.state == "warn"
@@ -121,14 +122,17 @@ class TestProbePowerShell:
 
 class TestProbeCustomClientApp:
     def test_az_missing_warns(self) -> None:
-        with patch("doctor.shutil.which", return_value=None):
+        with patch("hermes_a365.doctor.shutil.which", return_value=None):
             r = probe_custom_client_app()
         assert r.state == "warn"
 
     def test_app_present_ok(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("doctor.safe_run", return_value="11111111-2222-3333-4444-555555555555"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value="11111111-2222-3333-4444-555555555555",
+            ),
         ):
             r = probe_custom_client_app()
         assert r.state == "ok"
@@ -136,8 +140,8 @@ class TestProbeCustomClientApp:
 
     def test_app_absent_warns(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("doctor.safe_run", return_value=""),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch("hermes_a365.doctor.safe_run", return_value=""),
         ):
             r = probe_custom_client_app()
         assert r.state == "warn"
@@ -146,8 +150,8 @@ class TestProbeCustomClientApp:
 
     def test_az_query_failure_warns(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("doctor.safe_run", return_value=None),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch("hermes_a365.doctor.safe_run", return_value=None),
         ):
             r = probe_custom_client_app()
         assert r.state == "warn"
@@ -169,8 +173,8 @@ class TestProbeCustomClientApp:
             return "11111111-2222-3333-4444-555555555555"
 
         with (
-            patch("doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("doctor.safe_run", side_effect=fake_safe_run),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch("hermes_a365.doctor.safe_run", side_effect=fake_safe_run),
         ):
             r = probe_custom_client_app()
         assert r.state == "ok"
@@ -189,8 +193,8 @@ class TestProbeCustomClientApp:
             return "11111111-2222-3333-4444-555555555555"
 
         with (
-            patch("doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("doctor.safe_run", side_effect=fake_safe_run),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch("hermes_a365.doctor.safe_run", side_effect=fake_safe_run),
         ):
             probe_custom_client_app(name="From-Arg")
         assert "From-Arg" in captured[0]
@@ -205,8 +209,8 @@ class TestProbeCustomClientApp:
 class TestProbeKeychain:
     def test_macos_security_present_ok(self) -> None:
         with (
-            patch("doctor.sys.platform", "darwin"),
-            patch("doctor.shutil.which", return_value="/usr/bin/security"),
+            patch("hermes_a365.doctor.sys.platform", "darwin"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/security"),
         ):
             r = probe_keychain()
         assert r.state == "ok"
@@ -214,15 +218,15 @@ class TestProbeKeychain:
 
     def test_linux_secret_tool_present_ok(self) -> None:
         with (
-            patch("doctor.sys.platform", "linux"),
-            patch("doctor.shutil.which", return_value="/usr/bin/secret-tool"),
+            patch("hermes_a365.doctor.sys.platform", "linux"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/secret-tool"),
         ):
             r = probe_keychain()
         assert r.state == "ok"
         assert "libsecret" in r.detail
 
     def test_unsupported_platform_errors(self) -> None:
-        with patch("doctor.sys.platform", "win32"):
+        with patch("hermes_a365.doctor.sys.platform", "win32"):
             r = probe_keychain()
         assert r.state == "error"
         assert "unsupported" in r.detail
@@ -235,12 +239,12 @@ class TestProbeKeychain:
 
 class TestProbeNetwork:
     def test_all_reachable_ok(self) -> None:
-        with patch("doctor.tcp_reachable", return_value=True):
+        with patch("hermes_a365.doctor.tcp_reachable", return_value=True):
             r = probe_network(("a", "b"))
         assert r.state == "ok"
 
     def test_some_unreachable_errors(self) -> None:
-        with patch("doctor.tcp_reachable", side_effect=[True, False]):
+        with patch("hermes_a365.doctor.tcp_reachable", side_effect=[True, False]):
             r = probe_network(("a", "b"))
         assert r.state == "error"
         assert r.data["unreachable"] == ["b"]
@@ -273,14 +277,14 @@ class TestProbeLocalConfig:
 
 class TestProbeHermesHarness:
     def test_missing_warns(self) -> None:
-        with patch("doctor.shutil.which", return_value=None):
+        with patch("hermes_a365.doctor.shutil.which", return_value=None):
             r = probe_hermes_harness()
         assert r.state == "warn"
 
     def test_present_ok(self) -> None:
         with (
-            patch("doctor.shutil.which", return_value="/usr/local/bin/hermes"),
-            patch("doctor.safe_run", return_value="Hermes Agent v0.12.0\n"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/local/bin/hermes"),
+            patch("hermes_a365.doctor.safe_run", return_value="Hermes Agent v0.12.0\n"),
         ):
             r = probe_hermes_harness()
         assert r.state == "ok"

@@ -1,4 +1,4 @@
-"""Tests for scripts/activity_bridge.py — slice 19a (verify mode).
+"""Tests for hermes_a365.activity_bridge — slice 19a (verify mode).
 
 Covers config loading, the AAD token request shape (mocked), the
 probes individually, and the verify orchestration end-to-end.
@@ -22,7 +22,11 @@ from unittest.mock import patch
 import httpx
 import jwt as _jwt
 import pytest
-from activity_bridge import (
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric import rsa
+from fastapi.testclient import TestClient
+
+from hermes_a365.activity_bridge import (
     APX_PRODUCTION_SCOPE,
     DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES,
     FMI_TOKEN_SCOPE,
@@ -63,9 +67,6 @@ from activity_bridge import (
     run_verify,
     validate_inbound_jwt,
 )
-from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
-from fastapi.testclient import TestClient
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -176,7 +177,7 @@ class TestAcquireToken:
             "access_token": "eyJ0eXAi…",
         }
         # Stub urlopen to return our payload.
-        with patch("activity_bridge.urllib.request.urlopen") as urlopen:
+        with patch("hermes_a365.activity_bridge.urllib.request.urlopen") as urlopen:
             urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(
                 sample
             ).encode("utf-8")
@@ -207,7 +208,7 @@ class TestAcquireToken:
 
             return _Ctx()
 
-        with patch("activity_bridge.urllib.request.urlopen", side_effect=fake_urlopen):
+        with patch("hermes_a365.activity_bridge.urllib.request.urlopen", side_effect=fake_urlopen):
             acquire_token(
                 tenant_id="t-123",
                 client_id="appid-abc",
@@ -235,7 +236,7 @@ class TestAcquireToken:
             ),
         }
         with patch(
-            "activity_bridge.urllib.request.urlopen",
+            "hermes_a365.activity_bridge.urllib.request.urlopen",
             side_effect=_aad_http_error(401, body),
         ), pytest.raises(TokenAcquisitionError) as excinfo:
             acquire_token(tenant_id="t", client_id="c", client_secret="s")
@@ -244,7 +245,7 @@ class TestAcquireToken:
 
     def test_non_aadsts_error_falls_back_to_error_field(self) -> None:
         with patch(
-            "activity_bridge.urllib.request.urlopen",
+            "hermes_a365.activity_bridge.urllib.request.urlopen",
             side_effect=_aad_http_error(400, {"error": "bad_request", "error_description": "bad"}),
         ), pytest.raises(TokenAcquisitionError) as excinfo:
             acquire_token(tenant_id="t", client_id="c", client_secret="s")
@@ -252,7 +253,7 @@ class TestAcquireToken:
 
     def test_url_error_surfaces_as_network_error(self) -> None:
         with patch(
-            "activity_bridge.urllib.request.urlopen",
+            "hermes_a365.activity_bridge.urllib.request.urlopen",
             side_effect=urllib.error.URLError("name resolution failed"),
         ), pytest.raises(TokenAcquisitionError) as excinfo:
             acquire_token(tenant_id="t", client_id="c", client_secret="s")
@@ -314,7 +315,7 @@ class TestProbeGeneratedConfig:
 class TestProbeTokenAcquisition:
     def test_ok_on_successful_token(self) -> None:
         with patch(
-            "activity_bridge.acquire_token",
+            "hermes_a365.activity_bridge.acquire_token",
             return_value={"token_type": "Bearer", "expires_in": 3599, "access_token": "x"},
         ):
             r = probe_token_acquisition(
@@ -325,7 +326,7 @@ class TestProbeTokenAcquisition:
 
     def test_invalid_secret_yields_error(self) -> None:
         with patch(
-            "activity_bridge.acquire_token",
+            "hermes_a365.activity_bridge.acquire_token",
             side_effect=TokenAcquisitionError("AADSTS7000215", "invalid secret"),
         ):
             r = probe_token_acquisition(
@@ -340,7 +341,7 @@ class TestProbeTokenAcquisition:
         # codes is reported as a generic error so operators can look
         # the AADSTS code up.
         with patch(
-            "activity_bridge.acquire_token",
+            "hermes_a365.activity_bridge.acquire_token",
             side_effect=TokenAcquisitionError("AADSTS90002", "tenant not found"),
         ):
             r = probe_token_acquisition(
@@ -364,13 +365,16 @@ class TestProbeOtlpEndpoint:
         assert "no host" in r.detail
 
     def test_dns_lookup_failure_yields_warn(self) -> None:
-        with patch("activity_bridge.socket.gethostbyname", side_effect=OSError("no DNS")):
+        with patch(
+            "hermes_a365.activity_bridge.socket.gethostbyname",
+            side_effect=OSError("no DNS"),
+        ):
             r = probe_otlp_endpoint("https://otel.example.invalid/")
         assert r.state == "warn"
         assert "DNS" in r.detail
 
     def test_dns_resolves_yields_ok(self) -> None:
-        with patch("activity_bridge.socket.gethostbyname", return_value="1.2.3.4"):
+        with patch("hermes_a365.activity_bridge.socket.gethostbyname", return_value="1.2.3.4"):
             r = probe_otlp_endpoint("https://otel.example.com/")
         assert r.state == "ok"
 
@@ -397,21 +401,21 @@ class TestRunVerify:
         gen_path = _seed_generated_config(tmp_path)
         ok_body = b'{"access_token": "T1", "token_type": "Bearer", "expires_in": 3599}'
         urlopen_ctx = patch(
-            "activity_bridge.urllib.request.urlopen"
+            "hermes_a365.activity_bridge.urllib.request.urlopen"
         ).start()
         urlopen_ctx.return_value.__enter__.return_value.read.return_value = ok_body
         try:
             with (
                 patch(
-                    "activity_bridge.acquire_token",
+                    "hermes_a365.activity_bridge.acquire_token",
                     return_value={
                         "token_type": "Bearer",
                         "expires_in": 3599,
                         "access_token": "x",
                     },
                 ),
-                patch("activity_bridge.tcp_reachable", return_value=True),
-                patch("activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
+                patch("hermes_a365.activity_bridge.tcp_reachable", return_value=True),
+                patch("hermes_a365.activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
             ):
                 report = run_verify(
                     slug="inbox-helper",
@@ -439,7 +443,7 @@ class TestRunVerify:
 
 class TestRender:
     def _green_report(self) -> VerifyReport:
-        from activity_bridge import ProbeResult
+        from hermes_a365.activity_bridge import ProbeResult
 
         return VerifyReport(
             slug="x",
@@ -471,20 +475,20 @@ class TestCli:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         # Slice 19e: mock the urlopen call probe_fmi_exchange uses too.
         ok_body = b'{"access_token": "T1", "token_type": "Bearer", "expires_in": 3599}'
-        urlopen_p = patch("activity_bridge.urllib.request.urlopen").start()
+        urlopen_p = patch("hermes_a365.activity_bridge.urllib.request.urlopen").start()
         urlopen_p.return_value.__enter__.return_value.read.return_value = ok_body
         try:
             with (
                 patch(
-                    "activity_bridge.acquire_token",
+                    "hermes_a365.activity_bridge.acquire_token",
                     return_value={
                         "token_type": "Bearer",
                         "expires_in": 3599,
                         "access_token": "x",
                     },
                 ),
-                patch("activity_bridge.tcp_reachable", return_value=True),
-                patch("activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
+                patch("hermes_a365.activity_bridge.tcp_reachable", return_value=True),
+                patch("hermes_a365.activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
             ):
                 rc = main(
                     [

@@ -1,18 +1,18 @@
-"""scripts/emit_card.py — build Adaptive Card v1.6 payloads.
+"""hermes_a365.emit_card — build Adaptive Card v1.6 payloads.
 
 Renders one of three Adaptive Card templates (``greeting`` /
 ``confirmation`` / ``error``) for the activity bridge to post
 back to A365 channels (Teams, Outlook, M365 Copilot) when responding to
 ``message`` or ``invoke`` (``adaptiveCard/action``) activities.
 
-Each template lives in ``templates/adaptive-cards/<kind>.json.j2``; the body
-shape is inline so operators can tweak the card layout without touching
+Each template lives in ``_data/templates/adaptive-cards/<kind>.json.j2``; the
+body shape is inline so operators can tweak the card layout without touching
 Python. Builders here are typed dataclasses so the activity bridge gets
 compile-time-ish validation of card inputs.
 
 Programmatic use::
 
-    from emit_card import (
+    from hermes_a365.emit_card import (
         GreetingInputs, ConfirmationInputs, ErrorInputs,
         emit_greeting, emit_confirmation, emit_error,
     )
@@ -20,9 +20,9 @@ Programmatic use::
 
 CLI use::
 
-    python scripts/emit_card.py greeting --heading "Hi" --command "summarise mail"
-    python scripts/emit_card.py confirmation --action "Reply sent" --fact "thread=42"
-    python scripts/emit_card.py error --heading "FIC expired" --message "..."
+    python -m hermes_a365.emit_card greeting --heading "Hi" --command "summarise mail"
+    python -m hermes_a365.emit_card confirmation --action "Reply sent" --fact "thread=42"
+    python -m hermes_a365.emit_card error --heading "FIC expired" --message "..."
 """
 
 from __future__ import annotations
@@ -33,7 +33,7 @@ import sys
 from dataclasses import dataclass
 from typing import Any
 
-from _common import jinja_env
+from ._common import jinja_env
 
 # Card envelope constants — surfaced for activity-bridge tests.
 ADAPTIVE_CARDS_SCHEMA = "http://adaptivecards.io/schemas/adaptive-card.json"

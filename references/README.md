@@ -6,7 +6,7 @@ Entra error codes, blueprint properties, OpenTelemetry vocabulary, Bot
 Framework activity shapes, license catalog) — *not* a source of truth.
 `live-tenant-test.md` is the operator runbook for end-to-end validation.
 
-The doctor (`scripts/doctor.py`) and individual subcommands cross-check
+The doctor (`hermes_a365.doctor`) and individual subcommands cross-check
 the live surface against these snapshots and warn on drift. When drift
 is detected, the live surface is authoritative; update the corresponding
 file here and bump the snapshot date.

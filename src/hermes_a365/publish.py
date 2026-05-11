@@ -27,7 +27,7 @@ import shlex
 import sys
 from dataclasses import dataclass, field
 
-from mutator import AADSTSError, CliInvocationError, Mutator, RunResult, get_mutator
+from .mutator import AADSTSError, CliInvocationError, Mutator, RunResult, get_mutator
 
 ADMIN_CENTRE_URL = "https://admin.microsoft.com/"
 

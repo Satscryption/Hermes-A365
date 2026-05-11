@@ -3,7 +3,8 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
-from render_instance_env import InstanceEnvInputs, render_instance_env
+
+from hermes_a365.render_instance_env import InstanceEnvInputs, render_instance_env
 
 GOLDEN_DIR = Path(__file__).parent / "golden" / "instance_env"
 

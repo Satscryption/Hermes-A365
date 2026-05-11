@@ -1,7 +1,7 @@
 ---
 name: hermes-a365
 description: Use when registering or operating a Hermes-driven agent under Microsoft Agent 365 governance — covers `a365 setup blueprint`, `setup permissions {mcp,bot}`, per-agent runtime config, manifest packaging via `a365 publish`, environment doctor, status reporting against `query-entra`, the Bot Framework activity bridge that backs the Hermes `agent365` gateway platform, and destructive cleanup.
-version: 0.1.0
+version: 0.1.1
 author: Hermes Agent
 license: MIT
 metadata:
@@ -82,12 +82,13 @@ Don't use when:
 - A tenant license: either the **Agent 365 add-on** ($15/user/month) or
   **Microsoft 365 E7** ($99/user/month). The skill never purchases — it
   recommends; see [`references/license-cost-table.md`](references/license-cost-table.md).
-- A Hermes harness with this repo's `plugins/agent365/` reachable from
-  `~/.hermes/plugins/agent365/` (symlink the directory rather than
-  copying — the bridge helpers under `<repo>/scripts/` are imported
-  via the symlink's resolved path), and `plugins.enabled` plus a
-  `gateway.platforms.agent365` block configured in `~/.hermes/config.yaml`.
-  The README quickstart walks through this end-to-end.
+- A Hermes harness with `hermes-a365` installed into its venv
+  (`~/.hermes/hermes-agent/venv/bin/pip install 'hermes-a365[bridge]'`)
+  so the plugin loader auto-discovers `agent365` via the
+  `hermes_agent.plugins` entry point, plus `plugins.enabled` and a
+  `gateway.platforms.agent365` block configured in
+  `~/.hermes/config.yaml`. The README quickstart walks through this
+  end-to-end.
 
 ## Core procedures
 
@@ -300,7 +301,7 @@ hermes a365 publish --agent-name "<Display Name>" --aiteammate --apply # produce
 # Operator: upload the zip in the M365 Admin Centre and approve for users.
 hermes a365 activity-bridge verify --slug <slug>                       # bridge preflight
 # Run the gateway with the agent365 platform configured (loads the
-# bridge in-process via plugins/agent365):
+# bridge in-process via the entry-point-discovered plugin):
 hermes gateway run --profile <slug>
 hermes a365 status <slug>                                              # final verification
 ```
@@ -331,9 +332,11 @@ touched.
 
 ---
 
-Subcommand implementations live under `scripts/`; each is a thin CLI
-over a planner + applier pair parameterised by a `Mutator` protocol so
-the apply path is unit-testable without the live A365 CLI. Templates
-under `templates/`, dated reference snapshots under `references/`.
-For per-subcommand flags see `hermes a365 <verb> --help`; the original
-v0.1 design draft is archived at `docs/historical/SPEC-v0.1-draft.md`.
+Subcommand implementations live under `src/hermes_a365/`; each is a
+thin CLI over a planner + applier pair parameterised by a `Mutator`
+protocol so the apply path is unit-testable without the live A365 CLI.
+Packaged Jinja templates resolve via `importlib.resources` against
+`hermes_a365._data.templates`; dated reference snapshots live under
+`references/`. For per-subcommand flags see `hermes a365 <verb> --help`;
+the original v0.1 design draft is archived at
+`docs/historical/SPEC-v0.1-draft.md`.

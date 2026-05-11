@@ -8,7 +8,7 @@ from ``a365.generated.config.json`` per slice 18i's gitignore).
 
 Programmatic use::
 
-    from render_instance_env import InstanceEnvInputs, render_instance_env
+    from hermes_a365.render_instance_env import InstanceEnvInputs, render_instance_env
     text = render_instance_env(InstanceEnvInputs(
         agent_identity="inbox-helper",
         owner="sadiq@contoso.com",
@@ -21,7 +21,7 @@ Programmatic use::
 
 CLI use::
 
-    python scripts/render_instance_env.py \\
+    python -m hermes_a365.render_instance_env \\
         --agent-identity inbox-helper \\
         --owner sadiq@contoso.com \\
         --owner-aad-id <oid> \\
@@ -37,7 +37,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 
-from _common import jinja_env
+from ._common import jinja_env
 
 
 @dataclass

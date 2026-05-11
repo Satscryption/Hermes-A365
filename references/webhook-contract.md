@@ -146,20 +146,20 @@ bump the version.
 ## Reference responder (slice 19c)
 
 A working demo / smoke-test responder ships at
-`scripts/hermes_responder.py`. Three modes:
+`hermes_a365.hermes_responder`. Three modes:
 
 ```bash
 # Echo mode (default) — replies "You said: <text>"
-uv run python scripts/hermes_responder.py serve --port 9090
+python -m hermes_a365.hermes_responder serve --port 9090
 
 # Greeting mode — Adaptive Card on first message in a conversation,
 # echo on subsequent. Useful for screencaps.
-uv run python scripts/hermes_responder.py serve --mode greeting
+python -m hermes_a365.hermes_responder serve --mode greeting
 
 # Canned mode — read response from JSON file, hot-reloaded per
 # request so operators iterate without restarting.
 echo '{"text": "Hello from canned"}' > responses.json
-uv run python scripts/hermes_responder.py serve --mode canned \
+python -m hermes_a365.hermes_responder serve --mode canned \
     --canned-response-file ./responses.json
 ```
 

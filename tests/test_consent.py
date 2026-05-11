@@ -1,4 +1,4 @@
-"""Tests for scripts/consent.py.
+"""Tests for hermes_a365.consent.
 
 Polling tests monkeypatch ``time.sleep``/``time.monotonic`` so the suite
 remains hermetic and fast. URL rendering uses the real Jinja env against
@@ -13,9 +13,10 @@ from __future__ import annotations
 
 from pathlib import Path
 
-import consent as consent_mod
 import pytest
-from consent import (
+
+import hermes_a365.consent as consent_mod
+from hermes_a365.consent import (
     DEFAULT_POLL_INTERVAL_SECONDS,
     DEFAULT_TIMEOUT_SECONDS,
     load_tenant_and_app,

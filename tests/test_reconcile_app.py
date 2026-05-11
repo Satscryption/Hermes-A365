@@ -1,9 +1,10 @@
-"""Tests for scripts/reconcile_app.py."""
+"""Tests for hermes_a365.reconcile_app."""
 
 from __future__ import annotations
 
 import pytest
-from reconcile_app import (
+
+from hermes_a365.reconcile_app import (
     ActualAppRegistration,
     AppPlan,
     DesiredAppRegistration,

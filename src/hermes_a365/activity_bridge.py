@@ -87,7 +87,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from _common import parse_env, tcp_reachable
+from ._common import parse_env, tcp_reachable
 
 # Slice 19b — `serve` mode dependencies. Optional extras: operators
 # who only need `verify` can install without them. We bind the names
@@ -1728,7 +1728,7 @@ def cmd_update_endpoint(args: argparse.Namespace) -> int:
         return 0
 
     # Lazy import — keeps the verify path mutator-free.
-    from mutator import AADSTSError, CliInvocationError, get_mutator
+    from .mutator import AADSTSError, CliInvocationError, get_mutator
 
     mutator = get_mutator()
     if not mutator.available:

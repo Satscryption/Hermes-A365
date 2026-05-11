@@ -1,6 +1,10 @@
+[build-system]
+requires = ["hatchling>=1.25"]
+build-backend = "hatchling.build"
+
 [project]
 name = "hermes-a365"
-version = "0.1.0"
+version = "0.1.1"
 description = "Integrate Hermes agents into the Microsoft 365 ecosystem using Microsoft Agent 365 (A365)."
 readme = "README.md"
 license = {text = "MIT"}
@@ -17,8 +21,20 @@ Homepage = "https://github.com/satscryption/Hermes-A365"
 Issues = "https://github.com/satscryption/Hermes-A365/issues"
 Documentation = "https://github.com/satscryption/Hermes-A365#readme"
 
+[project.scripts]
+hermes-a365 = "hermes_a365.cli:main"
+
+# Auto-discovered by the Hermes plugin loader's entry-point scan
+# (see ``hermes_cli/plugins.py`` — ``ENTRY_POINTS_GROUP =
+# "hermes_agent.plugins"``). When this package is installed into the
+# Hermes venv (``~/.hermes/hermes-agent/venv/bin/pip install hermes-a365``)
+# the ``agent365`` adapter + ``hermes a365 <verb>`` CLI surface light up
+# without operators having to drop anything in ``~/.hermes/plugins/``.
+[project.entry-points."hermes_agent.plugins"]
+agent365 = "hermes_a365.plugin"
+
 [project.optional-dependencies]
-# Slice 19b — `activity_bridge.py serve` mode pulls in a small webserver
+# Slice 19b — `activity_bridge serve` mode pulls in a small webserver
 # stack. Optional so operators who only run setup/cleanup wrappers can
 # install with no extras.
 bridge = [
@@ -38,10 +54,19 @@ dev = [
   "uvicorn>=0.30",
 ]
 
-[tool.uv]
-# This skill is loaded from source by the Hermes harness; we don't build a wheel.
-# Mark the project as virtual so uv installs deps without trying to package it.
-package = false
+[tool.hatch.build.targets.wheel]
+packages = ["src/hermes_a365"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "src/hermes_a365",
+  "tests",
+  "README.md",
+  "SKILL.md",
+  "CHANGELOG.md",
+  "LICENSE",
+  "pyproject.toml",
+]
 
 [tool.ruff]
 line-length = 100
@@ -54,7 +79,6 @@ select = ["E", "F", "I", "B", "UP", "SIM", "RUF"]
 "tests/*" = ["B011"]  # asserts are fine in tests
 
 [tool.pytest.ini_options]
-pythonpath = ["scripts"]
 testpaths = ["tests"]
 addopts = "-ra -q"
 asyncio_mode = "auto"

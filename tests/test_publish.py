@@ -1,12 +1,13 @@
-"""Tests for scripts/publish.py — wraps `a365 publish`."""
+"""Tests for hermes_a365.publish — wraps `a365 publish`."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, field
 
 import pytest
-from mutator import AADSTSError, CliInvocationError, RunResult
-from publish import (
+
+from hermes_a365.mutator import AADSTSError, CliInvocationError, RunResult
+from hermes_a365.publish import (
     ADMIN_CENTRE_URL,
     PublishInputs,
     PublishPlan,
