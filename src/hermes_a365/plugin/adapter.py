@@ -727,6 +727,266 @@ def is_connected(config: Any) -> bool:
     return validate_config(config)
 
 
+def interactive_setup() -> None:
+    """``hermes gateway setup --platform agent365`` wizard.
+
+    Assumes ``hermes a365 register --apply --m365 --aiteammate`` has
+    already been run (the blueprint Entra app + permissions are set
+    up). This wizard wires the platform side: bootstraps env vars in
+    ``~/.hermes/.env``, ensures ``agent365`` is in ``plugins.enabled``
+    in ``~/.hermes/config.yaml``, and writes the
+    ``gateway.platforms.agent365`` block.
+
+    Idempotent — re-running detects existing values and prompts
+    update-vs-keep.
+
+    Lazy-imports the ``hermes_cli.setup`` / ``hermes_cli.plugins_cmd``
+    helpers so the plugin module stays importable in non-CLI contexts
+    (gateway runtime, ``pytest`` without the harness).
+    """
+    import json
+    import subprocess
+    from pathlib import Path
+
+    from hermes_cli.setup import (
+        get_env_value,
+        print_header,
+        print_info,
+        print_success,
+        print_warning,
+        prompt,
+        prompt_yes_no,
+        save_env_value,
+    )
+
+    print_header("Microsoft Agent 365")
+
+    existing_tenant = get_env_value("A365_TENANT_ID")
+    existing_app = get_env_value("A365_APP_ID")
+    if existing_tenant and existing_app:
+        print_info(
+            f"agent365: already configured (tenant={existing_tenant[:8]}…, "
+            f"app={existing_app[:8]}…)"
+        )
+        if not prompt_yes_no("Reconfigure agent365?", False):
+            return
+
+    print_info(
+        "Wires Agent 365 into Hermes. Assumes `hermes a365 register --apply` has "
+        "already created the blueprint + minted the client secret."
+    )
+    print_info(
+        "Tunnel exposing localhost:3978 to public HTTPS is operator-territory "
+        "(cloudflared / devtunnels / etc.); set up before `hermes gateway run`."
+    )
+    print()
+
+    # 1. Generated config — required, drives detected defaults below.
+    default_generated = str(Path.home() / "a365.generated.config.json")
+    generated_path = prompt(
+        "Path to a365.generated.config.json (emitted by `hermes a365 register`)",
+        default=get_env_value("A365_GENERATED_CONFIG_PATH") or default_generated,
+    )
+    if not generated_path or not Path(generated_path).is_file():
+        print_warning(
+            f"{generated_path or '(blank)'} not found — "
+            "run `hermes a365 register --apply` first, then re-run this wizard."
+        )
+        return
+    save_env_value("A365_GENERATED_CONFIG_PATH", generated_path)
+
+    try:
+        with open(generated_path) as f:
+            gen = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        print_warning(f"Couldn't parse {generated_path}: {e}")
+        return
+
+    detected_app = str(gen.get("agentBlueprintId") or "")
+    detected_secret = str(gen.get("agentBlueprintClientSecret") or "")
+    detected_endpoint = str(gen.get("messagingEndpoint") or "")
+
+    # 2. Tenant id — prefer az context.
+    detected_tenant = ""
+    try:
+        result = subprocess.run(
+            ["az", "account", "show", "--query", "tenantId", "-o", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        if result.returncode == 0:
+            detected_tenant = result.stdout.strip()
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+    tenant = prompt(
+        "Tenant id (GUID)",
+        default=existing_tenant or detected_tenant,
+    )
+    if not tenant:
+        print_warning("Tenant id required — skipping.")
+        return
+    save_env_value("A365_TENANT_ID", tenant)
+
+    # 3. Blueprint app id — drift-check against detected.
+    app = prompt(
+        "Blueprint Entra app id (GUID)",
+        default=existing_app or detected_app,
+    )
+    if not app:
+        print_warning("App id required — skipping.")
+        return
+    save_env_value("A365_APP_ID", app)
+    if existing_app and detected_app and existing_app != detected_app and app == detected_app:
+        print_info(
+            f"⚠️  Refreshed A365_APP_ID: {existing_app[:8]}… → {detected_app[:8]}… "
+            "(now matches the latest register output; previous value was stale)."
+        )
+
+    # 4. Slug — default to single per-agent dir if there's only one.
+    agents_dir = Path.home() / ".hermes" / "agents"
+    slug_options = (
+        sorted(d.name for d in agents_dir.iterdir() if d.is_dir())
+        if agents_dir.is_dir()
+        else []
+    )
+    existing_slug = get_env_value("AGENT_IDENTITY")
+    if slug_options:
+        print_info(f"Existing per-agent dirs: {', '.join(slug_options)}")
+    slug = prompt(
+        "Agent slug (per-agent dir under ~/.hermes/agents/)",
+        default=existing_slug or (slug_options[0] if len(slug_options) == 1 else ""),
+    )
+    if slug:
+        save_env_value("AGENT_IDENTITY", slug)
+
+    # 5. Bridge port.
+    port_raw = prompt(
+        "Bridge port",
+        default=get_env_value("HERMES_BRIDGE_PORT") or "3978",
+    )
+    port = 3978
+    if port_raw:
+        try:
+            port = int(port_raw)
+            save_env_value("HERMES_BRIDGE_PORT", str(port))
+        except ValueError:
+            print_warning(f"Invalid port {port_raw!r} — keeping 3978")
+
+    # 6. Blueprint client secret bootstrap.
+    print()
+    print_info("🔑 Blueprint client secret")
+    if detected_secret:
+        if prompt_yes_no(
+            f"Use secret from {generated_path}? "
+            "(writes plaintext to ~/.hermes/.env — keychain-only is slice #19)",
+            True,
+        ):
+            save_env_value("A365_BLUEPRINT_CLIENT_SECRET", detected_secret)
+            print_success("Secret bootstrap saved to ~/.hermes/.env")
+        else:
+            print_info(
+                "Skipped. Export A365_BLUEPRINT_CLIENT_SECRET in the gateway "
+                "shell manually before `hermes gateway run`."
+            )
+    else:
+        print_warning(
+            "agentBlueprintClientSecret is null in generated config — "
+            "likely Microsoft#408 on this CLI release. Re-run "
+            "`hermes a365 register --apply --auto-recover-secret`."
+        )
+        manual_secret = prompt(
+            "Or paste the 40-char client secret now (skipped if blank)",
+            password=True,
+        )
+        if manual_secret:
+            save_env_value("A365_BLUEPRINT_CLIENT_SECRET", manual_secret)
+
+    # 7. Allow-all toggle.
+    print()
+    print_info("🔒 Access control")
+    print_info(
+        "Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user."
+    )
+    print_info(
+        "Production: set A365_ALLOWED_USERS=<csv-of-emails-or-oids> instead."
+    )
+    allow_all = prompt_yes_no(
+        "Allow all users (testing only)?",
+        get_env_value("A365_ALLOW_ALL_USERS") == "true",
+    )
+    if allow_all:
+        save_env_value("A365_ALLOW_ALL_USERS", "true")
+        save_env_value("A365_ALLOWED_USERS", "")
+        print_warning(
+            "⚠️  Open access — any signed-in tenant user can DM the bot."
+        )
+    else:
+        save_env_value("A365_ALLOW_ALL_USERS", "false")
+        allowed = prompt(
+            "Allowed users (comma-separated emails/oids; blank = deny everyone)",
+            default=get_env_value("A365_ALLOWED_USERS") or "",
+        )
+        save_env_value(
+            "A365_ALLOWED_USERS",
+            allowed.replace(" ", "") if allowed else "",
+        )
+
+    # 8. Patch ~/.hermes/config.yaml — plugins.enabled + platform stanza.
+    #
+    # We import the private helpers from ``hermes_cli.plugins_cmd`` because
+    # ``hermes plugins enable agent365`` exits non-zero for entry-point-
+    # discovered plugins (``_plugin_exists`` in v0.13.0 only checks bundled
+    # + user dirs; entry-point check is the same gap as the
+    # ``hermes plugins list`` filter). Going under the CLI here keeps the
+    # wizard one-shot; once upstream Hermes folds entry-point discovery into
+    # ``_plugin_exists``, we can switch to invoking the CLI cleanly.
+    from hermes_cli.config import load_config, save_config
+    from hermes_cli.plugins_cmd import _get_enabled_set, _save_enabled_set
+
+    enabled = _get_enabled_set()
+    if "agent365" not in enabled:
+        enabled.add("agent365")
+        _save_enabled_set(enabled)
+        print_success("Added agent365 to plugins.enabled in ~/.hermes/config.yaml")
+
+    config = load_config()
+    gateway = config.setdefault("gateway", {})
+    platforms = gateway.setdefault("platforms", {})
+    block = platforms.setdefault("agent365", {})
+    block["enabled"] = True
+    extra = block.setdefault("extra", {})
+    if slug:
+        extra["slug"] = slug
+    extra["port"] = port
+    extra.setdefault("host", "127.0.0.1")
+    extra["generated_config_path"] = generated_path
+    save_config(config)
+    print_success("Wrote gateway.platforms.agent365 stanza")
+
+    print()
+    print_success("Agent 365 configuration saved.")
+    print_info("Next steps:")
+    if detected_endpoint:
+        print_info(
+            f"  - Messaging endpoint already set: {detected_endpoint}. "
+            "If your tunnel URL has changed, re-run "
+            "`hermes a365 activity-bridge update-endpoint --url <new> --apply`."
+        )
+    else:
+        print_info(
+            "  - Start your tunnel (cloudflared / devtunnels / ngrok / etc.) "
+            "and run `hermes a365 activity-bridge update-endpoint "
+            "--agent-name '<display>' --url https://<tunnel>/api/messages --apply`."
+        )
+    print_info(
+        "  - Source the per-agent .env into the gateway shell, export "
+        "A365_BLUEPRINT_CLIENT_SECRET, then `hermes gateway run`."
+    )
+
+
 def register(ctx: Any) -> None:
     """Plugin entry point — invoked by the Hermes plugin system at
     gateway startup."""
@@ -737,8 +997,9 @@ def register(ctx: Any) -> None:
         check_fn=check_requirements,
         validate_config=validate_config,
         is_connected=is_connected,
+        setup_fn=interactive_setup,
         required_env=["A365_TENANT_ID", "A365_APP_ID"],
-        install_hint="uv sync --extra bridge",
+        install_hint="pip install 'hermes-a365[bridge]'",
         allowed_users_env="A365_ALLOWED_USERS",
         allow_all_env="A365_ALLOW_ALL_USERS",
         max_message_length=4000,

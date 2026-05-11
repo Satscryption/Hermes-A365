@@ -276,6 +276,23 @@ class TestRegister:
         hint = ctx.platforms[0]["platform_hint"].lower()
         assert "agent 365" in hint or "a365" in hint
 
+    def test_setup_fn_is_wired(self) -> None:
+        # Slice 19r-a: setup_fn must point at interactive_setup so
+        # `hermes gateway setup --platform agent365` finds the wizard.
+        ctx = _FakeCtx()
+        adapter_mod.register(ctx)
+        kwargs = ctx.platforms[0]
+        assert kwargs.get("setup_fn") is adapter_mod.interactive_setup
+        assert callable(kwargs["setup_fn"])
+
+    def test_interactive_setup_signature_is_no_args(self) -> None:
+        # Hermes' setup harness calls setup_fn() with no arguments
+        # (per gateway/platforms/irc/adapter.py reference).
+        import inspect
+
+        sig = inspect.signature(adapter_mod.interactive_setup)
+        assert len(sig.parameters) == 0
+
 
 class TestCheckRequirements:
     def test_returns_true_when_extras_installed(self) -> None:
