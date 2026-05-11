@@ -94,6 +94,17 @@ from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 
 _DEFAULT_PORT = 3978
 
+# Slice 19s — BF streaming-response protocol pacing.
+#
+# Microsoft's documented hard throttle is 1 req/s, but the official
+# guidance ("Buffer the tokens from the model for 1.5 to two seconds
+# to ensure a smooth streaming process") recommends 1.5-2 s. We aim
+# for the recommended pacing; this is the minimum gap between
+# ``edit_message`` POSTs against the same stream.
+#
+# Reference: https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
+_STREAMING_MIN_GAP_SEC = 1.5
+
 
 # Slice 19q (round-5 walkthrough finding, 2026-05-06): the BF connector
 # delivers a handful of activities that aren't user messages and
@@ -171,6 +182,14 @@ class Agent365Adapter(BasePlatformAdapter):
     # longer reasoning.
     MAX_MESSAGE_LENGTH = 4000
 
+    # Slice 19s — Microsoft's BF streaming requires an explicit
+    # ``endStream()`` (i.e. a final activity with
+    # ``streamType=final``); the surface treats the message as
+    # still-streaming otherwise. The flag tells Hermes' stream
+    # consumer to route the final ``edit_message(finalize=True)``
+    # through even when content is unchanged.
+    REQUIRES_EDIT_FINALIZE: bool = True
+
     def __init__(self, config: PlatformConfig, **_kwargs: Any) -> None:
         super().__init__(config=config, platform=Platform("agent365"))
 
@@ -231,6 +250,14 @@ class Agent365Adapter(BasePlatformAdapter):
         self._app: Any = None
         self._uvicorn_server: Any = None
         self._uvicorn_task: asyncio.Task | None = None
+
+        # Slice 19s — per-stream state for BF streaming-response protocol.
+        # Keyed on the Hermes-side ``message_id`` (the activity id returned
+        # by ``send()``). Values: ``{"bf_stream_id", "sequence", "last_emit_ts"}``.
+        # Each ``edit_message`` call increments ``sequence``; the first call
+        # captures the BF-side ``streamId`` from the 201 response. Entries
+        # are dropped on ``finalize=True`` or terminal 403.
+        self._streams: dict[str, dict[str, Any]] = {}
 
     @property
     def name(self) -> str:
@@ -668,6 +695,235 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.error("agent365 send_image failed: %s", e)
             return SendResult(success=False, error=str(e))
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
+
+    # ── Slice 19s — BF streaming response protocol ────────────────────────
+
+    async def edit_message(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool = False,
+    ) -> SendResult:
+        """Emit a Bot Framework streaming activity for this stream.
+
+        Each call POSTs a *new* activity to the conversation's
+        ``/activities`` endpoint — BF streaming activities are new
+        POSTs, not PUTs against the original message. The first call
+        for a given ``message_id`` starts a new stream
+        (``streamSequence: 1``, no ``streamId``); the 201 response
+        carries the BF-side ``streamId`` we use on every subsequent
+        call. ``finalize=True`` swaps the activity ``type`` from
+        ``typing`` to ``message``, sets ``streamType=final``, and
+        omits ``streamSequence`` per the Microsoft spec.
+
+        Returns ``SendResult(success=False, ...)`` and falls back to
+        ``send()`` on:
+        - non-personal chat types (BF streaming is DM-only),
+        - missing cached inbound (proactive sends with no prior turn),
+        - terminal 403 ``ContentStreamNotAllowed`` (2-min timeout,
+          stop-button cancel, oversize message),
+        - non-2xx HTTP responses.
+
+        Soft path (``202 ContentStreamSequenceOrderPreConditionFailed``):
+        out-of-order requests get dropped server-side; we log and
+        return success since the most recent sequence wins anyway.
+
+        References:
+        - https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
+        - https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/overview-custom-engine-agent
+        """
+        inbound = self._cached_inbound_for(chat_id)
+        if not inbound:
+            return SendResult(
+                success=False,
+                error=f"agent365 edit_message: no cached inbound for chat_id={chat_id!r}",
+            )
+
+        # DM-only: BF streaming-ux doc:
+        # "Streaming bot message is available only for one-on-one chats."
+        conv = inbound.get("conversation") or {}
+        if str(conv.get("conversationType") or "") != "personal":
+            return SendResult(
+                success=False,
+                error="streaming requires personal chat",
+            )
+
+        if self._http_client is None or self._bridge_cfg is None:
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: adapter not connected",
+            )
+
+        state = self._streams.get(message_id)
+        is_first = state is None
+        if state is None:
+            state = {"bf_stream_id": None, "sequence": 0, "last_emit_ts": 0.0}
+            self._streams[message_id] = state
+
+        # Throttle — Microsoft recommends 1.5-2 s pacing even though the
+        # hard limit is 1 req/s. Adapter-side rather than relying on the
+        # stream consumer's per-tick edit interval.
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        elapsed = now - state["last_emit_ts"]
+        if elapsed < _STREAMING_MIN_GAP_SEC and state["last_emit_ts"] > 0.0:
+            await asyncio.sleep(_STREAMING_MIN_GAP_SEC - elapsed)
+
+        state["sequence"] += 1
+        entity: dict[str, Any] = {"type": "streaminfo"}
+        if state["bf_stream_id"]:
+            entity["streamId"] = state["bf_stream_id"]
+        if finalize:
+            entity["streamType"] = "final"
+            # streamSequence MUST NOT be set on the final activity per
+            # Microsoft's REST API spec.
+        else:
+            entity["streamType"] = "streaming"
+            entity["streamSequence"] = state["sequence"]
+
+        activity: dict[str, Any] = {
+            "type": "message" if finalize else "typing",
+            "text": content,
+            "from": inbound.get("recipient") or {},
+            "recipient": inbound.get("from") or {},
+            "conversation": conv,
+            "entities": [entity],
+        }
+
+        bridge = _import_bridge()
+        service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
+        conv_id = conv.get("id")
+        if not service_url or not conv_id:
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: serviceUrl or conversation.id missing",
+            )
+        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+
+        try:
+            token = await bridge.acquire_outbound_token(
+                client=self._http_client,
+                cfg=self._bridge_cfg,
+                activity=inbound,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+            )
+            resp = await self._http_client.post(
+                url,
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            )
+        except Exception as e:
+            logger.warning("agent365 edit_message POST failed: %s", e)
+            return SendResult(success=False, error=str(e))
+
+        state["last_emit_ts"] = loop.time()
+
+        # First request → 201 with {"id": "<streamId>"}. Capture for
+        # subsequent calls and as the message_id returned to Hermes.
+        if is_first and resp.status_code == 201:
+            try:
+                stream_id = (resp.json() or {}).get("id")
+            except Exception:
+                stream_id = None
+            if not stream_id:
+                logger.warning(
+                    "agent365 edit_message: first streaming POST 201 "
+                    "without id: %s",
+                    resp.text[:200],
+                )
+                self._streams.pop(message_id, None)
+                return SendResult(
+                    success=False,
+                    error="streaming start returned no id",
+                )
+            state["bf_stream_id"] = str(stream_id)
+            if finalize:
+                # First + finalize is degenerate but legal — drop state.
+                self._streams.pop(message_id, None)
+            return SendResult(success=True, message_id=state["bf_stream_id"])
+
+        if 200 <= resp.status_code < 300:
+            # 202 is the happy path for subsequent calls. The body may
+            # contain a ContentStreamSequenceOrderPreConditionFailed
+            # signal (out-of-order); we log it and keep going since the
+            # most-recent sequence wins server-side anyway.
+            err_code = self._maybe_extract_error_code(resp)
+            if err_code == "ContentStreamSequenceOrderPreConditionFailed":
+                logger.debug(
+                    "agent365 edit_message: stream sequence %d arrived "
+                    "out-of-order; server-side dedup retains the latest",
+                    state["sequence"],
+                )
+            if finalize:
+                self._streams.pop(message_id, None)
+            return SendResult(success=True, message_id=state.get("bf_stream_id") or "")
+
+        if resp.status_code == 403:
+            # Terminal — fall back. Drop stream state so the next call
+            # starts cleanly. Map common Microsoft messages to short
+            # error tags Hermes can surface to operators.
+            err_msg = self._extract_error_message(resp)
+            self._streams.pop(message_id, None)
+            short = err_msg
+            low = err_msg.lower()
+            if "exceeded streaming time" in low:
+                short = "streaming timeout"
+            elif "canceled by user" in low:
+                short = "streaming canceled by user"
+            elif "message size too large" in low:
+                short = "streaming message too large"
+            elif "already completed" in low:
+                short = "streaming already completed"
+            return SendResult(success=False, error=short)
+
+        if resp.status_code == 429:
+            return SendResult(success=False, error="streaming rate limited")
+
+        # Other non-2xx codes — surface for diagnosis.
+        return SendResult(
+            success=False,
+            error=f"agent365 edit_message HTTP {resp.status_code}: "
+                  f"{resp.text[:200] if hasattr(resp, 'text') else ''}",
+        )
+
+    @staticmethod
+    def _extract_error_message(resp: Any) -> str:
+        """Best-effort extraction of Microsoft's error message text."""
+        try:
+            body = resp.json() or {}
+            err = body.get("error") or {}
+            if isinstance(err, dict):
+                msg = err.get("message")
+                if isinstance(msg, str):
+                    return msg
+            return str(body)[:200]
+        except Exception:
+            try:
+                return resp.text[:200]
+            except Exception:
+                return ""
+
+    @staticmethod
+    def _maybe_extract_error_code(resp: Any) -> str | None:
+        """Return Microsoft's error code from a 2xx response body, if any.
+
+        202 responses can carry a ``ContentStreamSequenceOrderPreConditionFailed``
+        soft-error code in the body. Pure 2xx ``{}`` returns ``None``.
+        """
+        try:
+            body = resp.json() or {}
+        except Exception:
+            return None
+        err = body.get("error") or {}
+        if isinstance(err, dict):
+            code = err.get("code")
+            if isinstance(code, str):
+                return code
+        return None
 
     async def get_chat_info(self, chat_id: str) -> dict[str, Any]:
         """Return chat metadata sourced from the durable registry."""

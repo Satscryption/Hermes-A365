@@ -1334,6 +1334,364 @@ def _build_a365_parser():
     return parent
 
 
+class TestEditMessage:
+    """Slice 19s — BF streaming-response protocol via edit_message."""
+
+    @staticmethod
+    def _wire_adapter(
+        a: Any,
+        *,
+        inbound: dict[str, Any],
+        post_responses: list[Any] | Any | None = None,
+    ) -> Any:
+        """Register the inbound + stub the http client + token mint.
+
+        ``post_responses`` may be a single response, a list (one per
+        successive POST), or ``None`` (defaults to a 202 OK).
+        """
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        if post_responses is None:
+            post_responses = MagicMock(status_code=202, text="", json=lambda: {})
+        if not isinstance(post_responses, list):
+            post_responses = [post_responses]
+
+        post_mock = AsyncMock(side_effect=post_responses)
+        a._http_client.post = post_mock
+        return post_mock
+
+    @staticmethod
+    def _patch_token_mint(monkeypatch: pytest.MonkeyPatch) -> None:
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-test"),
+        )
+
+    @staticmethod
+    def _no_sleep(monkeypatch: pytest.MonkeyPatch) -> AsyncMock:
+        """Replace asyncio.sleep with a recorder so throttle tests
+        observe the requested duration without actually waiting."""
+        sleep_mock = AsyncMock()
+        monkeypatch.setattr("asyncio.sleep", sleep_mock)
+        return sleep_mock
+
+    def test_class_sets_requires_edit_finalize(self) -> None:
+        # endStream() is mandatory in BF streaming-ux; the flag tells
+        # Hermes' stream consumer to route the final edit through even
+        # if content didn't change.
+        assert adapter_mod.Agent365Adapter.REQUIRES_EDIT_FINALIZE is True
+
+    @pytest.mark.asyncio
+    async def test_refuses_non_personal_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # BF streaming-ux: "Streaming bot message is available only
+        # for one-on-one chats." Group/channel must hard-fail so
+        # Hermes falls back to send().
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+
+        r = await a.edit_message("conv-G", "msg-1", "hi", finalize=False)
+        assert r.success is False
+        assert "personal chat" in (r.error or "").lower()
+        # No POST should have been issued.
+        assert a._http_client.post.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_first_call_starts_stream_with_sequence_one_no_streamid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-S")
+        first_resp = MagicMock(
+            status_code=201, text="",
+            json=lambda: {"id": "bf-stream-abc"},
+        )
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=first_resp)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        r = await a.edit_message("conv-S", "hermes-msg-1", "Hi", finalize=False)
+        assert r.success is True
+        assert r.message_id == "bf-stream-abc"
+
+        body = post_mock.await_args.kwargs["json"]
+        assert body["type"] == "typing"  # intermediate
+        assert body["text"] == "Hi"
+        entity = body["entities"][0]
+        assert entity["type"] == "streaminfo"
+        assert entity["streamType"] == "streaming"
+        assert entity["streamSequence"] == 1
+        # First request must NOT include streamId.
+        assert "streamId" not in entity
+        # State now tracks the BF-side stream id.
+        assert a._streams["hermes-msg-1"]["bf_stream_id"] == "bf-stream-abc"
+
+    @pytest.mark.asyncio
+    async def test_subsequent_calls_include_streamid_and_monotonic_sequence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-S")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-stream-xyz"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-S", "m1", "A", finalize=False)
+        await a.edit_message("conv-S", "m1", "A B", finalize=False)
+        r3 = await a.edit_message("conv-S", "m1", "A B C", finalize=False)
+
+        assert r3.success is True
+        assert post_mock.await_count == 3
+        # Sequence 2 and 3 carry the captured streamId.
+        body2 = post_mock.await_args_list[1].kwargs["json"]
+        body3 = post_mock.await_args_list[2].kwargs["json"]
+        assert body2["entities"][0]["streamId"] == "bf-stream-xyz"
+        assert body2["entities"][0]["streamSequence"] == 2
+        assert body3["entities"][0]["streamId"] == "bf-stream-xyz"
+        assert body3["entities"][0]["streamSequence"] == 3
+
+    @pytest.mark.asyncio
+    async def test_finalize_swaps_type_to_message_and_omits_sequence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-F")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-fin"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-F", "m1", "Hi", finalize=False)
+        await a.edit_message("conv-F", "m1", "Hi, done.", finalize=True)
+
+        final_body = post_mock.await_args_list[1].kwargs["json"]
+        # Final activity: type=message (NOT typing).
+        assert final_body["type"] == "message"
+        entity = final_body["entities"][0]
+        # streamType=final on the close.
+        assert entity["streamType"] == "final"
+        # streamSequence MUST NOT be set on the final activity per
+        # Microsoft's REST API spec.
+        assert "streamSequence" not in entity
+        # streamId carries through.
+        assert entity["streamId"] == "bf-fin"
+        # State is dropped after finalize=True so a future stream on
+        # the same message_id starts cleanly.
+        assert "m1" not in a._streams
+
+    @pytest.mark.asyncio
+    async def test_no_inbound_returns_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        r = await a.edit_message("missing-conv", "m1", "x")
+        assert r.success is False
+        assert "no cached inbound" in (r.error or "")
+
+    @pytest.mark.asyncio
+    async def test_disconnected_adapter_returns_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        # _http_client / _bridge_cfg deliberately left None.
+        r = await a.edit_message("conv-1", "m1", "x")
+        assert r.success is False
+        assert "not connected" in (r.error or "")
+
+    @pytest.mark.asyncio
+    async def test_throttles_intermediate_chunks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-T")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-t"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        sleep_mock = self._no_sleep(monkeypatch)
+
+        # Two back-to-back edits.
+        await a.edit_message("conv-T", "m1", "A", finalize=False)
+        await a.edit_message("conv-T", "m1", "A B", finalize=False)
+
+        # The throttle should have kicked in on the second call.
+        # First call: state["last_emit_ts"] = 0.0, so no sleep.
+        # Second call: state["last_emit_ts"] is recent → sleep close to MIN_GAP.
+        sleeps = [c.args[0] for c in sleep_mock.await_args_list if c.args]
+        # At least one sleep should be at or near the MIN_GAP threshold.
+        assert any(
+            0.0 < s <= adapter_mod._STREAMING_MIN_GAP_SEC + 0.01 for s in sleeps
+        ), f"expected a throttle sleep, got {sleeps!r}"
+
+    @pytest.mark.asyncio
+    async def test_403_content_stream_timeout_returns_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Microsoft sends 403 ContentStreamNotAllowed with
+        # "exceeded streaming time" after the 2-min cap.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-X")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-x"})
+        timeout_resp = MagicMock(
+            status_code=403,
+            text="",
+            json=lambda: {
+                "error": {
+                    "code": "ContentStreamNotAllowed",
+                    "message": "Content stream finished due to exceeded streaming time.",
+                }
+            },
+        )
+        self._wire_adapter(a, inbound=inbound, post_responses=[first, timeout_resp])
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-X", "m1", "A", finalize=False)
+        r = await a.edit_message("conv-X", "m1", "A B", finalize=False)
+        assert r.success is False
+        assert r.error == "streaming timeout"
+        # State dropped on terminal 403.
+        assert "m1" not in a._streams
+
+    @pytest.mark.asyncio
+    async def test_403_stop_button_returns_terminal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-Y")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-y"})
+        stop_resp = MagicMock(
+            status_code=403,
+            text="",
+            json=lambda: {
+                "error": {
+                    "code": "ContentStreamNotAllowed",
+                    "message": "Content stream was canceled by user.",
+                }
+            },
+        )
+        self._wire_adapter(a, inbound=inbound, post_responses=[first, stop_resp])
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-Y", "m1", "A")
+        r = await a.edit_message("conv-Y", "m1", "A B")
+        assert r.success is False
+        assert r.error == "streaming canceled by user"
+
+    @pytest.mark.asyncio
+    async def test_429_returns_rate_limit_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-R")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-r"})
+        rate_resp = MagicMock(status_code=429, text="", json=lambda: {})
+        self._wire_adapter(a, inbound=inbound, post_responses=[first, rate_resp])
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-R", "m1", "A")
+        r = await a.edit_message("conv-R", "m1", "A B")
+        assert r.success is False
+        assert "rate limited" in (r.error or "")
+
+    @pytest.mark.asyncio
+    async def test_202_sequence_order_failed_is_soft_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Out-of-order 202 ContentStreamSequenceOrderPreConditionFailed —
+        # treated as soft success since the server keeps the most-recent
+        # sequence anyway. We log + continue.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-O")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-o"})
+        ooo = MagicMock(
+            status_code=202,
+            text="",
+            json=lambda: {
+                "error": {
+                    "code": "ContentStreamSequenceOrderPreConditionFailed",
+                    "message": "PreCondition failed.",
+                }
+            },
+        )
+        self._wire_adapter(a, inbound=inbound, post_responses=[first, ooo])
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-O", "m1", "A")
+        r = await a.edit_message("conv-O", "m1", "A B")
+        assert r.success is True
+
+    @pytest.mark.asyncio
+    async def test_first_201_without_id_is_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Defensive: if Microsoft returns 201 but no id (shouldn't
+        # happen per spec, but the spec docs are sometimes wrong),
+        # we surface a failure so Hermes falls back.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-N")
+        bad_resp = MagicMock(status_code=201, text="", json=lambda: {})
+        self._wire_adapter(a, inbound=inbound, post_responses=bad_resp)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        r = await a.edit_message("conv-N", "m1", "x")
+        assert r.success is False
+        assert "no id" in (r.error or "").lower()
+        # State cleaned up.
+        assert "m1" not in a._streams
+
+    @pytest.mark.asyncio
+    async def test_activity_swaps_from_and_recipient_correctly(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Outbound: bot is the sender, user is the recipient — the
+        # swap mirrors send_typing's pattern (slice 19o).
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-A")
+        # Custom from/recipient values to verify the swap.
+        inbound["from"] = {"id": "user-id-789", "name": "Alice"}
+        inbound["recipient"] = {"id": "bot-id-123", "name": "InboxBot"}
+        resp = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-a"})
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=resp)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-A", "m1", "x")
+        body = post_mock.await_args.kwargs["json"]
+        assert body["from"]["id"] == "bot-id-123"
+        assert body["recipient"]["id"] == "user-id-789"
+
+
+
+
+
 class TestPluginRegisterCli:
     def test_register_calls_ctx_register_cli_command(self) -> None:
         ctx = _FakeCtx()
