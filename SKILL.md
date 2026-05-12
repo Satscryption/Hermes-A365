@@ -198,14 +198,46 @@ unless explicitly overridden. The per-agent .env never contains the
 blueprint client secret — see pitfall #7 below for where the secret
 actually lives.
 
-### `hermes a365 publish --agent-name <name> [--aiteammate] [--use-blueprint] [--tenant-id <id>]`
+### `hermes a365 publish --agent-name <name> [--aiteammate] [--copilot-chat] [--bot-id <guid>] [--use-blueprint] [--tenant-id <id>]`
 
-Wraps `a365 publish` to package the agent manifest into the zip the
-operator uploads to the M365 Admin Centre. Channel deployment is
-**operator-side**: the admin signs in to the centre, uploads the
-zip, and approves the agent for users in the desired DLP scope. The
-wrapper surfaces the resulting package path plus an admin-centre URL
-hint.
+Wraps `a365 publish` to package the agent manifest into a zip the
+operator uploads to the relevant admin surface. The output mode
+follows the M365-ecosystem path:
+
+- **`--aiteammate`** (Path A) — emits an AI Teammate manifest
+  (`agenticUserTemplates`, `manifestVersion: devPreview`). Upload at
+  **M365 Admin Centre → Agents → Upload custom agent**, then activate
+  per-user under Agent 365 admin centre. Surfaces in Teams 1:1
+  "Built for your org".
+- **`--copilot-chat`** (Path B, slice 19u-a in v0.4.0) — emits a
+  **Custom Engine Agent** manifest (`manifestVersion: "1.21"`,
+  `bots` + `copilotAgents.customEngineAgents` blocks). Upload at
+  **Teams Admin Center → Manage apps → Upload + assign per-user
+  policy**. Surfaces in M365 Copilot Chat's agents picker + Copilot
+  side-panels. Implementation post-processes the GA CLI's AI
+  Teammate zip in-place (or to a sibling `.copilot-chat.zip` when
+  combined with `--aiteammate`).
+- **`--aiteammate --copilot-chat`** — emits both side by side
+  (Copilot Chat zip lands at `<original>.copilot-chat.zip`).
+- **`--bot-id <guid>`** — overrides the `botId` written into the
+  Custom Engine Agent manifest. Default extraction order:
+  `webApplicationInfo.id` → `bots[0].botId` → manifest top-level
+  `id` (the GA CLI 1.1.174+ AI Teammate emit only populates the
+  last).
+- **No surface flag** — default `a365 publish` behaviour (registers
+  the agent instance via Graph; no zip).
+
+The wrapper surfaces the resulting package path(s) plus the right
+admin-surface URL hint for each path. The `name.short` 30-char
+auto-truncate (slice 19r-c) applies to both flavours. Channel
+deployment is **operator-side** in all cases.
+
+> **Path B additionally requires Azure Bot Service registration**
+> of the blueprint Entra app with the Microsoft Teams channel
+> enabled — otherwise Microsoft's routing layer won't forward
+> Copilot Chat activities to `/api/messages` regardless of manifest
+> shape. See `references/m365-surface-coverage.md` for the
+> prerequisite detail.
 
 ### `hermes a365 status [<slug>]`
 
