@@ -341,6 +341,13 @@ class TestDetectDrift:
             env="A365_APP_ID=11111111-bbbb-bbbb-bbbb-bbbbbbbbbbbb\n",
             generated={"agentBlueprintId": "11111111-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
         )
+        # Seed the XDG symlink so slice 19r-bis (#25)'s drift check
+        # doesn't surface xdg_symlink_missing here.
+        xdg_dir = home / ".config" / "a365"
+        xdg_dir.mkdir(parents=True)
+        (xdg_dir / "a365.generated.config.json").symlink_to(
+            home / "a365.generated.config.json"
+        )
         drift = adapter_mod._detect_drift(home=home, config={})
         assert [d["key"] for d in drift] == []
 
@@ -465,6 +472,160 @@ class TestDetectDrift:
         drift = adapter_mod._detect_drift(home=home, config=cfg)
         keys = [d["key"] for d in drift]
         assert len(set(keys)) == len(keys)
+
+
+class TestEnsureXdgGeneratedConfigSymlink:
+    """Slice 19r-bis (#25): GA CLI XDG-path symlink helper."""
+
+    def _make_home_with_xdg_root(self, tmp_path: Path) -> Path:
+        (tmp_path / ".config").mkdir()
+        return tmp_path
+
+    def test_noop_when_target_is_xdg_path(self, tmp_path: Path) -> None:
+        home = self._make_home_with_xdg_root(tmp_path)
+        xdg_dir = home / ".config" / "a365"
+        xdg_dir.mkdir()
+        target = xdg_dir / "a365.generated.config.json"
+        target.write_text("{}")
+        result = adapter_mod._ensure_xdg_generated_config_symlink(target, home=home)
+        assert result["status"] == "noop"
+        # Still a regular file, no symlink overlay.
+        assert target.is_file() and not target.is_symlink()
+
+    def test_creates_symlink_when_xdg_path_missing(self, tmp_path: Path) -> None:
+        home = self._make_home_with_xdg_root(tmp_path)
+        target = home / "a365.generated.config.json"
+        target.write_text("{}")
+        result = adapter_mod._ensure_xdg_generated_config_symlink(target, home=home)
+        xdg = home / ".config" / "a365" / "a365.generated.config.json"
+        assert result["status"] == "created"
+        assert xdg.is_symlink()
+        assert xdg.resolve() == target.resolve()
+
+    def test_noop_when_correct_symlink_exists(self, tmp_path: Path) -> None:
+        home = self._make_home_with_xdg_root(tmp_path)
+        target = home / "a365.generated.config.json"
+        target.write_text("{}")
+        xdg_dir = home / ".config" / "a365"
+        xdg_dir.mkdir()
+        xdg = xdg_dir / "a365.generated.config.json"
+        xdg.symlink_to(target)
+        result = adapter_mod._ensure_xdg_generated_config_symlink(target, home=home)
+        assert result["status"] == "noop"
+        assert xdg.is_symlink()
+        assert xdg.resolve() == target.resolve()
+
+    def test_repairs_symlink_pointing_at_wrong_target(self, tmp_path: Path) -> None:
+        home = self._make_home_with_xdg_root(tmp_path)
+        wrong = home / "wrong-target.json"
+        wrong.write_text("{}")
+        right = home / "a365.generated.config.json"
+        right.write_text("{}")
+        xdg_dir = home / ".config" / "a365"
+        xdg_dir.mkdir()
+        xdg = xdg_dir / "a365.generated.config.json"
+        xdg.symlink_to(wrong)
+        result = adapter_mod._ensure_xdg_generated_config_symlink(right, home=home)
+        assert result["status"] == "repaired"
+        assert xdg.is_symlink()
+        assert xdg.resolve() == right.resolve()
+
+    def test_skipped_when_xdg_path_is_real_file(self, tmp_path: Path) -> None:
+        home = self._make_home_with_xdg_root(tmp_path)
+        target = home / "a365.generated.config.json"
+        target.write_text("{}")
+        xdg_dir = home / ".config" / "a365"
+        xdg_dir.mkdir()
+        xdg = xdg_dir / "a365.generated.config.json"
+        # Operator-seeded real file — wizard must not clobber.
+        xdg.write_text('{"operator": "data"}')
+        result = adapter_mod._ensure_xdg_generated_config_symlink(target, home=home)
+        assert result["status"] == "skipped_real_file"
+        assert not xdg.is_symlink()
+        assert xdg.read_text() == '{"operator": "data"}'
+
+    def test_creates_xdg_parent_dir(self, tmp_path: Path) -> None:
+        # ~/.config/a365 doesn't exist yet — helper should create it.
+        home = tmp_path  # no .config/a365 setup
+        target = home / "a365.generated.config.json"
+        target.write_text("{}")
+        result = adapter_mod._ensure_xdg_generated_config_symlink(target, home=home)
+        assert result["status"] == "created"
+        assert (home / ".config" / "a365").is_dir()
+
+
+class TestDetectDriftXdgSymlink:
+    """Slice 19r-bis (#25): _detect_drift surfaces XDG-symlink gaps."""
+
+    def _make_home(
+        self,
+        tmp_path: Path,
+        *,
+        generated_at: str = "a365.generated.config.json",
+    ) -> Path:
+        (tmp_path / ".hermes").mkdir()
+        (tmp_path / ".hermes" / ".env").write_text("")
+        (tmp_path / ".hermes" / "agents").mkdir()
+        (tmp_path / generated_at).write_text('{"agentBlueprintId": "x"}')
+        return tmp_path
+
+    def test_xdg_symlink_missing_detected(self, tmp_path: Path) -> None:
+        home = self._make_home(tmp_path)
+        # No ~/.config/a365/ at all.
+        drift = adapter_mod._detect_drift(home=home, config={})
+        keys = [d["key"] for d in drift]
+        assert "xdg_symlink_missing" in keys
+
+    def test_xdg_symlink_wrong_target_detected(self, tmp_path: Path) -> None:
+        home = self._make_home(tmp_path)
+        # XDG symlink points at a stale generated config.
+        other = tmp_path / "other-generated.json"
+        other.write_text('{"agentBlueprintId": "stale"}')
+        xdg_dir = home / ".config" / "a365"
+        xdg_dir.mkdir(parents=True)
+        xdg = xdg_dir / "a365.generated.config.json"
+        xdg.symlink_to(other)
+        drift = adapter_mod._detect_drift(home=home, config={})
+        keys = [d["key"] for d in drift]
+        assert "xdg_symlink_wrong_target" in keys
+
+    def test_no_drift_when_xdg_symlink_correct(self, tmp_path: Path) -> None:
+        home = self._make_home(tmp_path)
+        xdg_dir = home / ".config" / "a365"
+        xdg_dir.mkdir(parents=True)
+        xdg = xdg_dir / "a365.generated.config.json"
+        xdg.symlink_to(home / "a365.generated.config.json")
+        drift = adapter_mod._detect_drift(home=home, config={})
+        keys = [d["key"] for d in drift]
+        assert "xdg_symlink_missing" not in keys
+        assert "xdg_symlink_wrong_target" not in keys
+
+    def test_no_drift_when_generated_is_xdg_itself(self, tmp_path: Path) -> None:
+        # Operator keeps the generated config directly at the XDG path.
+        (tmp_path / ".hermes").mkdir()
+        (tmp_path / ".hermes" / ".env").write_text(
+            f"A365_GENERATED_CONFIG_PATH={tmp_path}/.config/a365/a365.generated.config.json\n"
+        )
+        (tmp_path / ".hermes" / "agents").mkdir()
+        xdg_dir = tmp_path / ".config" / "a365"
+        xdg_dir.mkdir(parents=True)
+        (xdg_dir / "a365.generated.config.json").write_text(
+            '{"agentBlueprintId": "x"}'
+        )
+        drift = adapter_mod._detect_drift(home=tmp_path, config={})
+        keys = [d["key"] for d in drift]
+        assert "xdg_symlink_missing" not in keys
+        assert "xdg_symlink_wrong_target" not in keys
+
+    def test_xdg_drift_fixer_repairs_symlink(self, tmp_path: Path) -> None:
+        home = self._make_home(tmp_path)
+        drift = adapter_mod._detect_drift(home=home, config={})
+        item = next(d for d in drift if d["key"] == "xdg_symlink_missing")
+        assert callable(item["fixer"])
+        item["fixer"]()
+        xdg = home / ".config" / "a365" / "a365.generated.config.json"
+        assert xdg.is_symlink()
+        assert xdg.resolve() == (home / "a365.generated.config.json").resolve()
 
 
 class TestCheckRequirements:

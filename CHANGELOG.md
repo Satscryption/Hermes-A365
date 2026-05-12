@@ -6,6 +6,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-05-12
+
+Feature release: Custom Engine Agent publish path for M365 Copilot
+Chat + M365 ecosystem positioning reframe + setup wizard hardening
+pass. **Slices:** 19u-a (#24), 19r-bis (#25), 19r-a-bis (#22).
+
 ### Added
 
 - **Slice 19u-a (#24):** `hermes a365 publish --copilot-chat` emits a
@@ -24,6 +30,59 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   walkthrough). Unblocks the emitter for #16 (Copilot Chat live
   walkthrough).
 
+- **Slice 19r-bis (#25):** Setup wizard now creates / repairs the
+  XDG symlink at `~/.config/a365/a365.generated.config.json`
+  pointing at the operator's chosen
+  `A365_GENERATED_CONFIG_PATH`. The GA `a365` CLI hard-codes the
+  XDG path and does not honour the env var; without the symlink,
+  `a365 publish` fails with `agentBlueprintId missing`. The
+  helper is idempotent: it creates when missing, repairs when
+  pointing at a wrong target, no-ops when correct, and refuses
+  to clobber a non-symlink file at the XDG path. `_detect_drift`
+  surfaces `xdg_symlink_missing` and `xdg_symlink_wrong_target`
+  with an auto-fixer attached. Surfaced during the 2026-05-12
+  live walkthrough.
+
+- **Slice 19r-a-bis (#22):** Setup wizard polish.
+  - Slug prompt: when there are multiple per-agent dirs and no
+    `AGENT_IDENTITY` env, use `prompt_choice` instead of a
+    freeform prompt that could silently drop the slug on Enter.
+    When there are no per-agent dirs, re-prompt on blank up to
+    3 times before giving up — previously dropped slug silently.
+  - `~/.hermes/config.yaml` write now skipped when the stanza
+    hasn't changed (previously emitted ~270-line YAML
+    normalisation diffs per wizard run from `hermes_cli.config.save_config`
+    expanding implicit-default keys).
+
+### Changed
+
+- **Positioning reframe (commit `e33dd7f`, 2026-05-12):**
+  Hermes-A365 now positions explicitly as the **M365 Copilot
+  ecosystem path** for Hermes agents, distinct from Hermes'
+  sibling classic-Bot-Framework Teams adapter
+  (`plugins/platforms/teams/`, shipped Hermes v2026.4.30; PRs
+  `NousResearch/hermes-agent#10037` and `#13767`). Two value
+  props:
+  - **Path A (AI Teammate / M365 agentic user):** agent appears
+    in the M365 tenant directory + "Built for your org" picker
+    + agentic-user audit trails. Teams 1:1 with M365-native
+    identity. No Azure subscription required. Already validated
+    end-to-end through round-8 (2026-05-11) with streaming.
+  - **Path B (Custom Engine Agent + Azure Bot Service):**
+    agent appears in M365 Copilot Chat's agents picker + Word /
+    Excel / PowerPoint / Outlook Copilot side-panels. Requires
+    Azure subscription for Bot Service registration. Emitter
+    shipped in this release; live surfacing test deferred
+    (#16).
+
+  Reframe updates `README.md`, `SKILL.md`,
+  `references/m365-surface-coverage.md`, and
+  `references/live-tenant-test.md`. Upstream check-in
+  `NousResearch/hermes-agent#20133` updated with the
+  non-overlap clarification. `#17` (Teams group + channel
+  walkthrough) closed as sibling-plugin lane. `#18` scope
+  narrowed via comment to Path B-relevant invokes only.
+
 ### Documented
 
 - **Custom Engine Agent surfacing prerequisite (slice 19u-a, live
@@ -37,8 +96,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   agent stays AI-Teammate-shaped (instance creation → Teams
   notification only). The AI Teammate path bypasses this because
   M365's agentic user infrastructure routes Teams 1:1 traffic
-  without Azure. Updated `references/m365-surface-coverage.md` with
-  the prerequisite. #16 deferred pending Azure subscription.
+  without Azure. #16 deferred pending Azure subscription.
+
+- **Playbook scope callout** (commit `1772729`): clear Path A vs
+  Path B framing at the top of `references/live-tenant-test.md`.
+  Existing AZ operations untouched (all Path A; remain correct).
+  Path B-specific Azure Bot Service registration steps deferred
+  until #16 walks green.
 
 ## [0.3.0] — 2026-05-11
 

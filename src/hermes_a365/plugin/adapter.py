@@ -1315,6 +1315,113 @@ def is_connected(config: Any) -> bool:
 _AGENT365_CLI_APP_ID = "58bfafcb-cfd6-4b3f-ba3b-a9e5848ac061"
 
 
+# Slice 19r-bis (#25): the GA `a365` CLI reads its generated config from
+# the XDG-standard location ``~/.config/a365/a365.generated.config.json``
+# and does NOT honour our ``A365_GENERATED_CONFIG_PATH`` env var. When
+# the operator chooses a non-XDG path, we ensure the CLI can still find
+# the config by maintaining a symlink at the XDG location. Surfaced
+# during the 2026-05-12 walkthrough as a setup-wizard gap.
+
+
+def _xdg_generated_config_path(home: Path | None = None) -> Path:
+    """Return the GA CLI's expected XDG path for the generated config."""
+    base = home if home is not None else Path.home()
+    return base / ".config" / "a365" / "a365.generated.config.json"
+
+
+def _ensure_xdg_generated_config_symlink(
+    target: Path,
+    *,
+    home: Path | None = None,
+) -> dict[str, Any]:
+    """Ensure the GA CLI can find the generated config at the XDG path.
+
+    Returns a status dict::
+
+        {"status": "noop|created|repaired|skipped_real_file|error",
+         "xdg_path": str,
+         "target": str,
+         "message": str}
+
+    Idempotent. Never clobbers an operator-owned real file at the XDG
+    path — if a non-symlink exists there, returns ``skipped_real_file``
+    with a clear message.
+    """
+    xdg_path = _xdg_generated_config_path(home)
+    target_abs = target.resolve() if target.exists() else target.absolute()
+    out: dict[str, Any] = {
+        "status": "error",
+        "xdg_path": str(xdg_path),
+        "target": str(target_abs),
+        "message": "",
+    }
+
+    # If the operator already keeps the generated config at the XDG
+    # path directly, nothing to do.
+    if target_abs == xdg_path.absolute():
+        out["status"] = "noop"
+        out["message"] = (
+            f"Generated config already at XDG path {xdg_path}; no symlink needed."
+        )
+        return out
+
+    # Ensure parent dir exists.
+    try:
+        xdg_path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        out["message"] = f"Couldn't create {xdg_path.parent}: {e}"
+        return out
+
+    if xdg_path.is_symlink():
+        try:
+            current = xdg_path.readlink()
+        except OSError as e:
+            out["message"] = f"Couldn't read existing symlink {xdg_path}: {e}"
+            return out
+        current_abs = current if current.is_absolute() else xdg_path.parent / current
+        if current_abs.resolve() == target_abs:
+            out["status"] = "noop"
+            out["message"] = (
+                f"XDG symlink already points at {target_abs}; no change."
+            )
+            return out
+        # Wrong target — repair.
+        try:
+            xdg_path.unlink()
+            xdg_path.symlink_to(target_abs)
+        except OSError as e:
+            out["message"] = f"Couldn't repair symlink {xdg_path}: {e}"
+            return out
+        out["status"] = "repaired"
+        out["message"] = (
+            f"Repaired XDG symlink {xdg_path} → {target_abs} "
+            f"(was pointing at {current_abs})."
+        )
+        return out
+
+    if xdg_path.exists():
+        # Non-symlink file or directory — don't clobber.
+        out["status"] = "skipped_real_file"
+        out["message"] = (
+            f"{xdg_path} is a real file/dir, not a symlink — leaving alone. "
+            "Manually remove or back it up if you want the wizard to link "
+            f"to {target_abs}."
+        )
+        return out
+
+    # Doesn't exist — create.
+    try:
+        xdg_path.symlink_to(target_abs)
+    except OSError as e:
+        out["message"] = f"Couldn't create symlink {xdg_path}: {e}"
+        return out
+    out["status"] = "created"
+    out["message"] = (
+        f"Created XDG symlink {xdg_path} → {target_abs} so the GA `a365` CLI can find it."
+    )
+    return out
+
+
 def _detect_drift(
     *,
     home: Path | None = None,
@@ -1485,6 +1592,55 @@ def _detect_drift(
             }
         )
 
+    # Slice 19r-bis (#25). 5. XDG symlink for the generated config.
+    #    The GA `a365` CLI reads ~/.config/a365/a365.generated.config.json
+    #    and does NOT honour A365_GENERATED_CONFIG_PATH. If our generated
+    #    config lives elsewhere, the XDG path must symlink to it or
+    #    `a365 publish` fails with "agentBlueprintId missing".
+    target_path = _Path(generated_path_hint)
+    xdg_path = _xdg_generated_config_path(home_dir)
+    if (
+        target_path.is_file()
+        and target_path.resolve() != xdg_path.absolute()
+    ):
+        def _fix_xdg() -> None:
+            _ensure_xdg_generated_config_symlink(target_path, home=home_dir)
+
+        if not xdg_path.exists() and not xdg_path.is_symlink():
+            drift.append(
+                {
+                    "key": "xdg_symlink_missing",
+                    "message": (
+                        f"GA `a365` CLI expects {xdg_path} but it's missing; "
+                        f"your generated config lives at {target_path}. "
+                        "`a365 publish` will fail with 'agentBlueprintId missing'."
+                    ),
+                    "fixer": _fix_xdg,
+                }
+            )
+        elif xdg_path.is_symlink():
+            try:
+                current = xdg_path.readlink()
+                current_abs = (
+                    current if current.is_absolute() else xdg_path.parent / current
+                )
+                if current_abs.resolve() != target_path.resolve():
+                    drift.append(
+                        {
+                            "key": "xdg_symlink_wrong_target",
+                            "message": (
+                                f"{xdg_path} symlinks to {current_abs} but your generated "
+                                f"config lives at {target_path}. The GA CLI may read stale data."
+                            ),
+                            "fixer": _fix_xdg,
+                        }
+                    )
+            except OSError:
+                pass
+        # If xdg_path is a real (non-symlink) file, we don't flag drift
+        # — the operator may have deliberately seeded it. Surface in
+        # doctor instead if needed.
+
     # 4. generated_config_path in config.yaml stanza is unreachable
     #    or has an empty blueprint id. Indicates the stanza was
     #    written before the file was emitted (or pointed at a
@@ -1551,6 +1707,7 @@ def interactive_setup() -> None:
         print_success,
         print_warning,
         prompt,
+        prompt_choice,
         prompt_yes_no,
         save_env_value,
     )
@@ -1620,6 +1777,23 @@ def interactive_setup() -> None:
         return
     save_env_value("A365_GENERATED_CONFIG_PATH", generated_path)
 
+    # Slice 19r-bis (#25): ensure the GA `a365` CLI can find the
+    # generated config at its XDG-standard location.
+    xdg_result = _ensure_xdg_generated_config_symlink(Path(generated_path))
+    if xdg_result["status"] == "created":
+        print_success(xdg_result["message"])
+    elif xdg_result["status"] == "repaired":
+        print_info(xdg_result["message"])
+    elif xdg_result["status"] == "skipped_real_file":
+        print_warning(xdg_result["message"])
+    elif xdg_result["status"] == "error":
+        print_warning(
+            f"Couldn't ensure XDG symlink: {xdg_result['message']}. "
+            f"`a365 publish` may fail unless you manually `ln -s "
+            f"{generated_path} {xdg_result['xdg_path']}`."
+        )
+    # status == "noop" is silent — no action needed.
+
     try:
         with open(generated_path) as f:
             gen = json.load(f)
@@ -1670,7 +1844,13 @@ def interactive_setup() -> None:
             "(now matches the latest register output; previous value was stale)."
         )
 
-    # 4. Slug — default to single per-agent dir if there's only one.
+    # 4. Slug — slice 19r-a-bis (#22):
+    #    - 1 dir: default to it (existing behaviour).
+    #    - >1 dirs without an existing AGENT_IDENTITY: present a
+    #      prompt_choice to avoid silently dropping the slug if the
+    #      operator hits Enter on a freeform prompt.
+    #    - 0 dirs: prompt freeform but re-prompt on blank (up to 3
+    #      tries) to avoid silently writing an empty stanza.
     agents_dir = Path.home() / ".hermes" / "agents"
     slug_options = (
         sorted(d.name for d in agents_dir.iterdir() if d.is_dir())
@@ -1680,10 +1860,43 @@ def interactive_setup() -> None:
     existing_slug = get_env_value("AGENT_IDENTITY")
     if slug_options:
         print_info(f"Existing per-agent dirs: {', '.join(slug_options)}")
-    slug = prompt(
-        "Agent slug (per-agent dir under ~/.hermes/agents/)",
-        default=existing_slug or (slug_options[0] if len(slug_options) == 1 else ""),
-    )
+
+    slug = ""
+    if len(slug_options) > 1 and not existing_slug:
+        default_idx = 0
+        try:
+            idx = prompt_choice(
+                "Agent slug (per-agent dir under ~/.hermes/agents/)",
+                slug_options,
+                default=default_idx,
+            )
+            slug = slug_options[idx]
+        except (IndexError, ValueError):
+            slug = slug_options[0]
+    elif len(slug_options) == 0 and not existing_slug:
+        for _attempt in range(3):
+            slug = prompt(
+                "Agent slug (per-agent dir under ~/.hermes/agents/) — required",
+                default="",
+            )
+            if slug:
+                break
+            print_warning(
+                "Slug is required; an empty value would leave the gateway "
+                "platform stanza without a slug, breaking conversation lookup."
+            )
+        if not slug:
+            print_warning(
+                "Skipping slug after 3 blank attempts. Re-run the wizard "
+                "after creating a per-agent dir or setting AGENT_IDENTITY."
+            )
+            return
+    else:
+        slug = prompt(
+            "Agent slug (per-agent dir under ~/.hermes/agents/)",
+            default=existing_slug or (slug_options[0] if len(slug_options) == 1 else ""),
+        )
+
     if slug:
         save_env_value("AGENT_IDENTITY", slug)
 
@@ -1777,7 +1990,15 @@ def interactive_setup() -> None:
         _save_enabled_set(enabled)
         print_success("Added agent365 to plugins.enabled in ~/.hermes/config.yaml")
 
+    # Slice 19r-a-bis (#22): only call save_config when the stanza
+    # actually changes. hermes_cli.config.save_config expands every
+    # implicit-default key on round-trip (~270-line diff per run);
+    # skipping the write when nothing meaningful changed keeps
+    # ~/.hermes/config.yaml git-reviewable.
+    import copy as _copy
+
     config = load_config()
+    pre_snapshot = _copy.deepcopy(config)
     gateway = config.setdefault("gateway", {})
     platforms = gateway.setdefault("platforms", {})
     block = platforms.setdefault("agent365", {})
@@ -1788,8 +2009,13 @@ def interactive_setup() -> None:
     extra["port"] = port
     extra.setdefault("host", "127.0.0.1")
     extra["generated_config_path"] = generated_path
-    save_config(config)
-    print_success("Wrote gateway.platforms.agent365 stanza")
+    if config != pre_snapshot:
+        save_config(config)
+        print_success("Wrote gateway.platforms.agent365 stanza")
+    else:
+        print_info(
+            "gateway.platforms.agent365 stanza unchanged — skipping config.yaml write."
+        )
 
     print()
     print_success("Agent 365 configuration saved.")

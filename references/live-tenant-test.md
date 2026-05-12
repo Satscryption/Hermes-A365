@@ -696,26 +696,36 @@ under `pip install -e`; otherwise reinstall after every change.
 hermes gateway setup --platform agent365
 ```
 
-The wizard (slice 19r-a..b, shipped in v0.2.0) walks the operator
-through:
+The wizard (slice 19r-a..b shipped in v0.2.0; 19r-bis hardening in
+v0.4.0) walks the operator through:
 
 - Path to `a365.generated.config.json` (default `~/a365.generated.config.json`).
+- **XDG symlink** — the GA `a365` CLI reads
+  `~/.config/a365/a365.generated.config.json` and does **not** honour
+  `A365_GENERATED_CONFIG_PATH`. When the generated config lives
+  elsewhere, the wizard creates/repairs a symlink at the XDG path
+  pointing at it (slice 19r-bis, [#25](https://github.com/satscryption/Hermes-A365/issues/25)).
+  Without this, `a365 publish` fails with `agentBlueprintId missing`.
 - Tenant id (default from `az account show`).
 - Blueprint Entra app id (default from the generated config; drift-warns
   if `~/.hermes/.env::A365_APP_ID` is stale).
-- Agent slug (default to the single per-agent dir, or pick from the list).
+- Agent slug (default to the single per-agent dir, or pick from the
+  list when there are several; required-with-re-prompt when there are
+  none — slice 19r-a-bis).
 - Bridge port (default 3978).
 - Client secret bootstrap (reads from generated config; flags
   Microsoft#408 if it's null).
 - Allow-all toggle (testing) vs `A365_ALLOWED_USERS=<csv>` (production).
 
 The wizard patches `~/.hermes/.env` (env vars) and `~/.hermes/config.yaml`
-(`plugins.enabled` + `gateway.platforms.agent365` block) atomically.
-Re-runnable: detects existing values and offers update-vs-keep. A
-drift-detection pass runs first — surfaces stale `A365_APP_ID`,
-orphan slugs, missing `tenantId`/`clientAppId` in `~/a365.config.json`,
-or unreachable `generated_config_path`, with auto-fixers where
-possible.
+(`plugins.enabled` + `gateway.platforms.agent365` block). The
+`config.yaml` write is now skipped when the stanza hasn't actually
+changed (slice 19r-a-bis — was emitting ~270-line normalisation diffs
+per run). Re-runnable: detects existing values and offers
+update-vs-keep. A drift-detection pass runs first — surfaces stale
+`A365_APP_ID`, orphan slugs, missing `tenantId`/`clientAppId` in
+`~/a365.config.json`, unreachable `generated_config_path`, **and
+missing/wrong-target XDG symlinks** — with auto-fixers where possible.
 
 If you'd rather hand-edit (e.g. for one-off automation), the resulting
 config.yaml block is:
@@ -738,6 +748,15 @@ gateway:
 …paired with `A365_TENANT_ID`, `A365_APP_ID`, `A365_BLUEPRINT_CLIENT_SECRET`,
 and either `A365_ALLOW_ALL_USERS=true` or `A365_ALLOWED_USERS=<csv>`
 in `~/.hermes/.env`.
+
+**Hand-edit operators also need the XDG symlink** (the wizard handles
+this automatically). If your generated config lives at
+`~/a365.generated.config.json`:
+
+```bash
+mkdir -p ~/.config/a365
+ln -s ~/a365.generated.config.json ~/.config/a365/a365.generated.config.json
+```
 
 ### 9d.3 — Start the Hermes gateway
 
