@@ -17,9 +17,28 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   Combine with `--aiteammate` to emit both zips side-by-side (the
   Copilot Chat zip lands at `<original>.copilot-chat.zip`); the
   `name.short` 30-char truncation (slice 19r-c) applies to both.
-  `--bot-id` overrides botId extraction (default reads
-  `webApplicationInfo.id` from the emitted manifest). Unblocks #16
-  (Copilot Chat live walkthrough).
+  `--bot-id` overrides botId extraction (default falls through
+  `webApplicationInfo.id` → `bots[0].botId` → top-level `id` from
+  the emitted manifest; the GA CLI 1.1.174+ AI Teammate emit only
+  populates top-level `id`, surfaced during the 2026-05-12 live
+  walkthrough). Unblocks the emitter for #16 (Copilot Chat live
+  walkthrough).
+
+### Documented
+
+- **Custom Engine Agent surfacing prerequisite (slice 19u-a, live
+  walkthrough finding 2026-05-12):** the Copilot Chat surface
+  additionally requires an **Azure subscription** so the blueprint
+  Entra app can be registered as an Azure Bot Service resource with
+  the Microsoft Teams channel enabled. Without Bot Service
+  registration the 1.21 manifest uploads to the Teams App Catalog
+  successfully but Microsoft's routing layer doesn't forward
+  Copilot Chat activities to our `/api/messages` endpoint — the
+  agent stays AI-Teammate-shaped (instance creation → Teams
+  notification only). The AI Teammate path bypasses this because
+  M365's agentic user infrastructure routes Teams 1:1 traffic
+  without Azure. Updated `references/m365-surface-coverage.md` with
+  the prerequisite. #16 deferred pending Azure subscription.
 
 ## [0.3.0] — 2026-05-11
 

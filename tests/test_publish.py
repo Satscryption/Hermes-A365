@@ -617,6 +617,27 @@ class TestExtractBotIdFromManifest:
 
         assert _extract_bot_id_from_manifest({"webApplicationInfo": {"id": 42}}) is None
 
+    def test_top_level_id_fallback(self) -> None:
+        # GA CLI 1.1.174+ AI Teammate emit has the bot/app id only at
+        # the manifest's top-level ``id`` field (no webApplicationInfo,
+        # no bots block). Live walkthrough 2026-05-12 surfaced this.
+        from hermes_a365.publish import _extract_bot_id_from_manifest
+
+        m = {
+            "id": "2e5e2dea-af3c-4707-a6f9-f2a0ee551a7a",
+            "agenticUserTemplates": [{"id": "x", "file": "y.json"}],
+        }
+        assert (
+            _extract_bot_id_from_manifest(m)
+            == "2e5e2dea-af3c-4707-a6f9-f2a0ee551a7a"
+        )
+
+    def test_web_application_info_preferred_over_top_level_id(self) -> None:
+        from hermes_a365.publish import _extract_bot_id_from_manifest
+
+        m = {"id": "top-level", "webApplicationInfo": {"id": "wai"}}
+        assert _extract_bot_id_from_manifest(m) == "wai"
+
 
 class TestPatchManifestToCopilotChat:
     """Integration tests for the zip-rewrite path."""

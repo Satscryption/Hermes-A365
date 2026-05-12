@@ -345,7 +345,19 @@ def _transform_manifest_to_copilot_chat(
 
 
 def _extract_bot_id_from_manifest(manifest: dict) -> str | None:
-    """Best-effort grab of the bot/app id from an AI Teammate manifest."""
+    """Best-effort grab of the bot/app id from an AI Teammate manifest.
+
+    Order:
+    1. ``webApplicationInfo.id`` — Custom Engine Agent / classic bot
+       manifests carry this. Not present in current GA-CLI AI Teammate
+       emit (1.1.174+).
+    2. ``bots[0].botId`` — present in Custom Engine Agent manifests we
+       may be re-processing. Not present in AI Teammate emits.
+    3. ``id`` (top-level) — the Teams manifest's app identifier. In
+       Hermes-A365's deployment pattern, the blueprint Entra app is
+       both the Teams app id and the bot identity, so this is the
+       canonical fallback for AI-Teammate-emitted manifests.
+    """
     wai = manifest.get("webApplicationInfo")
     if isinstance(wai, dict):
         bot_id = wai.get("id")
@@ -358,6 +370,9 @@ def _extract_bot_id_from_manifest(manifest: dict) -> str | None:
             bid = first.get("botId")
             if isinstance(bid, str) and bid:
                 return bid
+    top_id = manifest.get("id")
+    if isinstance(top_id, str) and top_id:
+        return top_id
     return None
 
 

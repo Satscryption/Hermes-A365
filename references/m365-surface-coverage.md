@@ -48,7 +48,7 @@ Legend:
 | Teams meetings (in-call agent) | BF activity | `msteams` | meeting-scoped conversation; meeting-specific events (`participantsAdded`, `meetingStart`) | same | 🟢 | #5 (extra event types) | `_should_dispatch` may need additional filters |
 | Teams compose extensions ("@Hermes search …") | BF activity | `msteams` | invoke activities `composeExtension/*` | same | 🟡 | **#5** | invokes return SYNC payload, not async reply |
 | Mobile Teams | BF activity | `msteams` | same as desktop | same | 🟢 | — | identical wire shape |
-| M365 Copilot Chat (standalone web app) | BF activity | likely `msteams` (per agents SDK) or `copilot` | persistent conversation; entry point that surfaces in Word/Excel/PowerPoint/Outlook side-panels too | same | 🟡 | **#16** (live test); emitter shipped slice 19u-a | The wire protocol matches (#3 streaming shipped 2026-05-11). Custom Engine Agent emitter (`hermes a365 publish --copilot-chat`) shipped 2026-05-12 (slice 19u-a): post-processes the GA CLI's AI Teammate zip into a `manifestVersion: "1.21"` + `bots` + `copilotAgents.customEngineAgents` shape. Live Teams Admin Center upload + Copilot Chat round-trip is the remaining gate on #16. Diagnosed during 19s-bis walkthrough 2026-05-11. |
+| M365 Copilot Chat (standalone web app) | BF activity | likely `msteams` (per agents SDK) or `copilot` | persistent conversation; entry point that surfaces in Word/Excel/PowerPoint/Outlook side-panels too | same | 🟡 | **Azure subscription** (Bot Service registration); emitter shipped slice 19u-a | The wire protocol matches (#3 streaming shipped 2026-05-11). Custom Engine Agent emitter (`hermes a365 publish --copilot-chat`) shipped 2026-05-12 (slice 19u-a): post-processes the GA CLI's AI Teammate zip into a `manifestVersion: "1.21"` + `bots` + `copilotAgents.customEngineAgents` shape, with a fresh manifest.id to avoid Teams App Catalog duplicate-id conflict against the AI Teammate registration. **Surfacing in Copilot Chat additionally requires an Azure subscription + Azure Bot Service resource with Microsoft Teams channel enabled** — confirmed during 2026-05-12 live walkthrough. #16 deferred-pending-Azure-subscription. Diagnosed during 19s-bis walkthrough 2026-05-11. |
 | Outlook — chat-style invocation | BF activity | `emailoffice365` or `msteams` (TBC) | conversation per email thread | same | 🟢 | — | reach via Copilot Chat side-panel inside Outlook |
 | Outlook — compose-action panels | BF activity (invoke) | as Outlook | `task/fetch` / `task/submit` invokes | same | 🟡 | **#5** | each invoke returns a `taskInfo` envelope synchronously, not via `serviceUrl` |
 | Outlook — email-only flow (agent receives + sends real email) | BF activity | `emailoffice365` | one-off activities; reply via outbound email channel | same (likely) | 🟡 | **#5**, possibly #3 | low-priority unless email-driven workflows become a use case |
@@ -77,7 +77,7 @@ streaming) is identical for both; only the registration manifest
 | Flow | Wrapper command | Manifest type | `manifestVersion` | Admin upload | Surfaces it lights up |
 |---|---|---|---|---|---|
 | **AI Teammate** | `hermes a365 publish --aiteammate --apply` | `agenticUserTemplates` shape | `devPreview` | M365 Admin Centre → Agents → Upload custom agent → Agent 365 admin centre per-user activation | Teams 1:1 ("Built for your org" list); shows up under the user's agentic identity |
-| **Custom Engine Agent** | `hermes a365 publish --copilot-chat --apply` (emitter shipped slice 19u-a, live test pending #16) | `bots` + `copilotAgents.customEngineAgents` blocks | `1.21+` | Teams Admin Center → Manage apps → Upload + assign per-user policy | M365 Copilot Chat (standalone web + side-panels in Word/Excel/PowerPoint/Outlook), Teams as a classic bot |
+| **Custom Engine Agent** | `hermes a365 publish --copilot-chat --apply` (emitter shipped slice 19u-a) | `bots` + `copilotAgents.customEngineAgents` blocks | `1.21+` | Teams Admin Center → Manage apps → Upload + assign per-user policy | M365 Copilot Chat (standalone web + side-panels in Word/Excel/PowerPoint/Outlook), Teams as a classic bot. **Hard prerequisite:** Azure subscription + Azure Bot Service registration (Microsoft Teams channel enabled) using the blueprint Entra app id. Without Bot Service registration, the agent enters the catalog but doesn't route in Copilot Chat — surfaced during the 2026-05-12 live walkthrough on the satscryption tenant which has no Azure subscription. AI Teammate path bypasses this because M365's agentic user infrastructure routes Teams 1:1 traffic without Azure Bot Service. |
 
 Reasoning for keeping both: AI Teammates surface as agentic users
 (distinct identity in the user's tenant directory) which is the
@@ -94,8 +94,17 @@ Per Microsoft's [Custom Engine Agents overview](https://learn.microsoft.com/en-u
 
 — meaning the `devPreview` AI Teammate manifest is structurally
 incompatible with Copilot Chat surfacing. Emitter shipped 2026-05-12
-in slice 19u-a (`hermes a365 publish --copilot-chat`); live test in
-#16 remains the surfacing gate.
+in slice 19u-a (`hermes a365 publish --copilot-chat`). Live
+walkthrough 2026-05-12 surfaced an additional hard prerequisite:
+the Custom Engine Agent route requires an **Azure subscription** so
+the blueprint Entra app can be registered as an Azure Bot Service
+resource with the Microsoft Teams channel enabled. Without that,
+the manifest uploads and lands in the Teams App Catalog but
+Microsoft's routing layer doesn't forward Copilot Chat activities
+to our `/api/messages` endpoint. The AI Teammate path bypasses this
+because M365's agentic user infrastructure handles Teams 1:1
+routing without Azure Bot Service. #16 deferred pending Azure
+subscription decision.
 
 ## Surfaces we explicitly do NOT cover
 
