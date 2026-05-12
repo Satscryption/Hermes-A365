@@ -5,9 +5,49 @@ Agent 365 tenant. Walk top-to-bottom on first run; expect ~30–45 minutes
 including the M365 Admin Centre approval step (longer if the tenant is
 on macOS 26 — see §3's device-code-volume failure mode).
 
-**Snapshot:** 2026-05-07 (rounds 1–6 incorporated). Tracks the current
-`main` branch; specific slices are referenced inline where they
-matter to operator behaviour.
+**Snapshot:** 2026-05-12 (rounds 1–8 incorporated + slice 19u-a
+walkthrough). Tracks the current `main` branch; specific slices are
+referenced inline where they matter to operator behaviour.
+
+> ## Scope: Path A (AI Teammate) only
+>
+> Hermes-A365 has two M365-ecosystem paths (see
+> [`references/m365-surface-coverage.md`](m365-surface-coverage.md)
+> for the positioning). **This playbook covers Path A end-to-end:**
+>
+> - Register the blueprint Entra app + service principal.
+> - Publish the AI Teammate manifest (`agenticUserTemplates`,
+>   `manifestVersion: devPreview`) for M365 Admin Centre upload.
+> - Activate the agentic user per-user, then validate Teams 1:1
+>   round-trip (including BF streaming).
+> - Cleanup back to a clean tenant.
+>
+> Path A requires only an M365 tenant, Frontier Preview enrollment,
+> and a Tier 3 / E7 licence — **no Azure subscription**.
+>
+> **Path B (Custom Engine Agent + Azure Bot Service)** — for
+> Copilot Chat agents picker and Word/Excel/PowerPoint/Outlook
+> side-panel surfacing — is **not yet walked**. The emitter
+> (`hermes a365 publish --copilot-chat`) shipped 2026-05-12
+> (slice 19u-a), but the additional Azure-side prerequisites
+> (provision Azure subscription, register the blueprint app as
+> an Azure Bot Service resource, enable the Microsoft Teams
+> channel) surfaced during the 2026-05-12 walkthrough and
+> haven't been validated end-to-end yet. The Path B steps will
+> be added to this playbook (or split out into a sibling
+> playbook) when [#16](https://github.com/satscryption/Hermes-A365/issues/16)
+> walks green. Until then, follow Microsoft's
+> [Custom Engine Agents deployment guide](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/create-deploy-agents-sdk)
+> for the Azure Bot Service half; everything from §0 to §6 of this
+> playbook still applies to Path B's blueprint registration
+> (Path B reuses Path A's Entra app + service principal as the
+> bot identity).
+>
+> Note: if you only want generic Teams chat (DM / channels / group
+> / threading / file attachments) and don't need M365 directory
+> identity or Copilot Chat reach, **use Hermes' sibling Teams
+> adapter** at `plugins/platforms/teams/adapter.py` instead —
+> classic Bot Framework, no A365 / agentic user setup needed.
 
 > **Round history:** rounds 1–6 ran against this tenant between
 > 2026-05-05 and 2026-05-07. Each round surfaced a discrete bug
