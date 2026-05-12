@@ -1,9 +1,10 @@
-# Live tenant integration test — Hermes-A365 v0.2
+# Live tenant integration test — Hermes-A365 v0.4
 
-End-to-end runbook for verifying the v0.2 skill against a real Microsoft
-Agent 365 tenant. Walk top-to-bottom on first run; expect ~30–45 minutes
-including the M365 Admin Centre approval step (longer if the tenant is
-on macOS 26 — see §3's device-code-volume failure mode).
+End-to-end runbook for verifying Hermes-A365 (v0.4.0 at time of last
+refresh) against a real Microsoft Agent 365 tenant. Walk top-to-bottom
+on first run; expect ~30–45 minutes including the M365 Admin Centre
+approval step (longer if the tenant is on macOS 26 — see §3's
+device-code-volume failure mode).
 
 **Snapshot:** 2026-05-12 (rounds 1–8 incorporated + slice 19u-a
 walkthrough). Tracks the current `main` branch; specific slices are
@@ -188,8 +189,8 @@ never writes to `~/.hermes/.env`.
 
 ## 3. register — `setup blueprint` + `setup permissions {mcp,bot}`
 
-The v0.2 `register.py` wrapper drives the three apply steps
-end-to-end. Slice 18j replaced `subprocess.run(capture_output=True)`
+The `register.py` wrapper drives the three apply steps end-to-end.
+Slice 18j replaced `subprocess.run(capture_output=True)`
 with `_run_streaming` (line-buffered Popen + `select.select`
 deadline + stderr→stdout merge), so device-code prompts surface in
 real time. Use the wrapper directly:
@@ -288,9 +289,9 @@ Failure modes to watch:
 
 ## 4. consent — admin grant
 
-In v0.2, **admin consent for the blueprint app is already granted by
+**Admin consent for the blueprint app is already granted by
 `setup blueprint`** (the second device-code flow opens an admin-consent
-URL the operator approves). `consent.py` is now a thin verifier
+URL the operator approves). `consent.py` is a thin verifier
 (slice 18k):
 
 ```bash
@@ -356,7 +357,7 @@ would discard.
 
 ## 6. publish — register agent instance via Graph
 
-`a365 publish` has two modes:
+`a365 publish` has two modes the wrapper exposes for Path A:
 
 - **Blueprint-only (default, no `--aiteammate`)** — `POST`s to
   `/beta/agentRegistry/agentInstances` to register the instance and
@@ -364,6 +365,18 @@ would discard.
   `a365.generated.config.json`. No manifest zip.
 - **AI Teammate (`--aiteammate`)** — emits a manifest zip the operator
   uploads via M365 Admin Centre (see §7).
+
+> **Path B note (v0.4.0, slice 19u-a, `#24` closed):**
+> `hermes-a365 publish --copilot-chat` (optionally combined with
+> `--aiteammate`) post-processes the emitted zip into a Custom
+> Engine Agent manifest (`manifestVersion: "1.21"` + `bots[]` +
+> `copilotAgents.customEngineAgents`) for Teams Admin Center
+> upload + Copilot Chat surfacing. **Out of scope for this
+> playbook** — Path B additionally needs Azure subscription +
+> Azure Bot Service registration of the blueprint Entra app
+> (`#16`). See the scope callout at the top of this file. The
+> emitter itself is shipped and tested; the live walkthrough is
+> deferred until Azure provisioning lands.
 
 The wrapper distinguishes these (slice 18t): plan output prints
 `output: Graph API instance registration (no zip)` vs `manifest zip
@@ -829,8 +842,15 @@ Acceptance gates — Hermes side:
       `agent365`: `Agent365Adapter.handle_message(...)` fires.
 - [ ] The agent loop runs (look for tool-call lines if your
       `~/.hermes/skills/` set has any wired) and produces a reply.
-- [ ] The reply hits Teams within ~10 s. (Longer-running turns
-      need the proactive pattern — that's #4, not in scope here.)
+- [ ] The reply hits Teams within ~10 s. (Sustained turns >10 s
+      surface progress via the BF streaming protocol — slices 19s
+      + 19s-bis, `#3` closed. Cron-driven / unsolicited outbound
+      from a fresh agent state still needs the proactive pattern,
+      that's `#4`, not in scope here.)
+- [ ] For replies > ~2 s of agent thinking, the Teams bubble
+      grows incrementally rather than appearing all at once — BF
+      streaming via `Agent365Adapter.edit_message` is in the path
+      (slices 19s + 19s-bis).
 - [ ] `~/.hermes/agents/inbox-helper/conversations.json` was
       written — open it and confirm the conversation id from your
       Teams thread is present with `last_inbound_activity_id`
@@ -1004,8 +1024,9 @@ handle:
 
 ## Roll-up
 
-If every checkbox above is ticked, the v0.2 skill is verified
-end-to-end against your tenant. Open issues observed during the run
+If every checkbox above is ticked, Path A is verified end-to-end
+against your tenant (Hermes-A365 v0.4.0 at last refresh). Open issues
+observed during the run
 (unexpected error codes, CLI behaviour mismatches with
 `references/a365-cli-reference.md`, retry counts that needed bumping)
 should land in the repo as a follow-up slice — these are the highest-
