@@ -1071,6 +1071,215 @@ class TestServeAppAgentsChannelFilter:
 
 
 # ---------------------------------------------------------------------------
+# Slice 19x-a (#4): _build_proactive_target_spec — pure registry read
+# ---------------------------------------------------------------------------
+
+
+class TestBuildProactiveTargetSpec:
+    """Pure-function target-spec builder for cron-driven proactive sends."""
+
+    def _seed_path_a_inbound(
+        self,
+        *,
+        conv_id: str = "conv-proactive",
+        service_url: str = "https://smba.trafficmanager.net/amer/x/",
+        tenant_id: str = "11111111-2222-3333-4444-555555555555",
+        agentic_app_id: str = "aa-app-id",
+        agentic_user_id: str = "aa-user-id",
+    ) -> dict[str, Any]:
+        return {
+            "type": "message",
+            "id": "act-most-recent",
+            "channelId": "msteams",
+            "serviceUrl": service_url,
+            "conversation": {
+                "id": conv_id,
+                "conversationType": "personal",
+                "tenantId": tenant_id,
+            },
+            "from": {"id": "user-1", "name": "Sadiq"},
+            "recipient": {
+                "id": "agent-1",
+                "name": "Inbox Helper",
+                "tenantId": tenant_id,
+                "agenticAppId": agentic_app_id,
+                "agenticUserId": agentic_user_id,
+            },
+            "text": "hello",
+        }
+
+    def test_returns_none_when_chat_not_in_registry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        assert a._build_proactive_target_spec("never-seen") is None
+
+    def test_returns_none_when_ref_has_no_raw(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Registry entries can carry just metadata when persisted with
+        # raw stripped — that's still un-routable for proactive.
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            ConversationRef(
+                conversation_id="raw-stripped",
+                service_url="https://smba.trafficmanager.net/",
+                chat_type="personal",
+                # raw deliberately empty
+            )
+        )
+        assert a._build_proactive_target_spec("raw-stripped") is None
+
+    def test_path_a_inbound_produces_complete_spec(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        inbound = self._seed_path_a_inbound()
+        a._conversations.upsert(ConversationRef.from_activity(inbound))
+
+        spec = a._build_proactive_target_spec("conv-proactive")
+        assert spec is not None
+        assert spec["service_url"] == "https://smba.trafficmanager.net/amer/x/"
+        assert spec["conversation_id"] == "conv-proactive"
+        assert spec["channel_id"] == "msteams"
+        assert spec["chat_type"] == "personal"
+        assert spec["tenant_id"] == "11111111-2222-3333-4444-555555555555"
+        assert spec["agentic_app_id"] == "aa-app-id"
+        assert spec["agentic_user_id"] == "aa-user-id"
+        assert spec["path"] == "A"
+        # Outbound sender = inbound recipient (the agentic user).
+        assert spec["from"]["id"] == "agent-1"
+        assert spec["from"]["agenticAppId"] == "aa-app-id"
+        # Outbound recipient = inbound sender (the user we're posting to).
+        assert spec["recipient"]["id"] == "user-1"
+        assert spec["recipient"]["name"] == "Sadiq"
+
+    def test_path_tag_unknown_when_agentic_fields_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Path B (Custom Engine Agent) or sibling-shape inbound has no
+        # agenticAppId / agenticUserId on the recipient — tag accordingly
+        # so the send-side can hit the deferred-error path rather than
+        # silently 401.
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        inbound = self._seed_path_a_inbound()
+        inbound["recipient"].pop("agenticAppId")
+        inbound["recipient"].pop("agenticUserId")
+        a._conversations.upsert(ConversationRef.from_activity(inbound))
+
+        spec = a._build_proactive_target_spec("conv-proactive")
+        assert spec is not None
+        assert spec["path"] == "unknown"
+        assert spec["agentic_app_id"] == ""
+        assert spec["agentic_user_id"] == ""
+
+    def test_path_tag_unknown_when_only_one_agentic_field_present(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A malformed inbound with only one of the two agentic fields
+        # is also untrustworthy for Path A token minting.
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        inbound = self._seed_path_a_inbound()
+        inbound["recipient"].pop("agenticUserId")
+        a._conversations.upsert(ConversationRef.from_activity(inbound))
+
+        spec = a._build_proactive_target_spec("conv-proactive")
+        assert spec is not None
+        assert spec["path"] == "unknown"
+
+    def test_tenant_id_falls_back_through_conversation_then_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        # Recipient lacks tenantId, conversation has it.
+        inbound = self._seed_path_a_inbound()
+        inbound["recipient"].pop("tenantId")
+        # Keep conversation.tenantId.
+        a._conversations.upsert(ConversationRef.from_activity(inbound))
+        spec = a._build_proactive_target_spec("conv-proactive")
+        assert spec is not None
+        assert spec["tenant_id"] == "11111111-2222-3333-4444-555555555555"
+
+    def test_channel_id_default_when_missing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        inbound = self._seed_path_a_inbound()
+        inbound.pop("channelId")
+        a._conversations.upsert(ConversationRef.from_activity(inbound))
+        spec = a._build_proactive_target_spec("conv-proactive")
+        assert spec is not None
+        assert spec["channel_id"] == "msteams"
+
+    def test_chat_type_propagated_from_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        inbound = self._seed_path_a_inbound()
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(ConversationRef.from_activity(inbound))
+        spec = a._build_proactive_target_spec("conv-proactive")
+        assert spec is not None
+        assert spec["chat_type"] == "groupChat"
+
+    def test_handles_non_dict_recipient_and_from_gracefully(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Defensive: malformed cached inbound where recipient/from
+        # aren't dicts. Should still return a spec (empty dicts), not
+        # crash.
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        ref = ConversationRef(
+            conversation_id="malformed",
+            service_url="https://x/",
+            chat_type="personal",
+            raw={
+                "conversation": {"id": "malformed"},
+                "from": "not-a-dict",
+                "recipient": ["also", "not", "a", "dict"],
+            },
+        )
+        a._conversations.upsert(ref)
+        spec = a._build_proactive_target_spec("malformed")
+        assert spec is not None
+        assert spec["from"] == {}
+        assert spec["recipient"] == {}
+        assert spec["path"] == "unknown"
+
+    def test_does_not_mutate_registry_or_raw(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Pure function — caller can't observe state changes.
+        import copy as _copy
+
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch)
+        inbound = self._seed_path_a_inbound()
+        a._conversations.upsert(ConversationRef.from_activity(inbound))
+        snapshot = _copy.deepcopy(a._conversations.get("conv-proactive"))
+        _ = a._build_proactive_target_spec("conv-proactive")
+        after = a._conversations.get("conv-proactive")
+        assert after.to_dict() == snapshot.to_dict()
+
+
+# ---------------------------------------------------------------------------
 # send() — outbound via cached inbound + send_reply
 # ---------------------------------------------------------------------------
 

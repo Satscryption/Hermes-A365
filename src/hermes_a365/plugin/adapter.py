@@ -603,6 +603,73 @@ class Agent365Adapter(BasePlatformAdapter):
             return None
         return ref.raw
 
+    def _build_proactive_target_spec(self, chat_id: str) -> dict[str, Any] | None:
+        """Slice 19x-a (#4): pure-function read over the registry.
+
+        Returns the minimal target spec needed to construct an outbound
+        Activity + mint the outbound token chain for a chat the gateway
+        hasn't necessarily seen this lifetime. Returns ``None`` when the
+        registry has no entry for ``chat_id``.
+
+        Shape::
+
+            {
+                "service_url": str,
+                "conversation_id": str,
+                "channel_id": str,           # default "msteams" if missing
+                "chat_type": str,             # personal / groupChat / channel
+                "tenant_id": str,
+                "agentic_app_id": str,        # empty when not a Path A inbound
+                "agentic_user_id": str,       # empty when not a Path A inbound
+                "from": dict,                 # outbound sender (= inbound recipient)
+                "recipient": dict,            # outbound recipient (= inbound sender)
+                "path": "A" | "unknown",      # convenience tag for callers
+            }
+
+        Path-tagging rule: an entry is **Path A** when the cached
+        inbound's ``recipient`` carries both ``agenticAppId`` and
+        ``agenticUserId`` (the Microsoft A365 agentic-user routing
+        signal). Anything else is tagged ``"unknown"`` because Path B
+        (Custom Engine Agent via Azure Bot Service) uses a different
+        token chain that slice 19x-b deliberately doesn't ship — the
+        send-side fallback surfaces a deferred-error rather than 401.
+
+        Pure: no network, no token minting, no state mutation. Safe
+        to call from sync contexts.
+        """
+        ref = self._conversations.get(chat_id)
+        if ref is None or not ref.raw:
+            return None
+
+        raw = ref.raw
+        recipient_inbound = raw.get("recipient") if isinstance(raw.get("recipient"), dict) else {}
+        sender_inbound = raw.get("from") if isinstance(raw.get("from"), dict) else {}
+        conversation = raw.get("conversation") if isinstance(raw.get("conversation"), dict) else {}
+
+        agentic_app_id = str(recipient_inbound.get("agenticAppId") or "")
+        agentic_user_id = str(recipient_inbound.get("agenticUserId") or "")
+        tenant_id = (
+            str(recipient_inbound.get("tenantId") or "")
+            or str(conversation.get("tenantId") or "")
+            or (ref.tenant_id or "")
+        )
+        path_tag = "A" if (agentic_app_id and agentic_user_id) else "unknown"
+
+        return {
+            "service_url": ref.service_url,
+            "conversation_id": ref.conversation_id,
+            "channel_id": str(raw.get("channelId") or "msteams"),
+            "chat_type": ref.chat_type,
+            "tenant_id": tenant_id,
+            "agentic_app_id": agentic_app_id,
+            "agentic_user_id": agentic_user_id,
+            # In a reply, the inbound's recipient becomes the outbound
+            # sender (the agentic user identity) and vice-versa.
+            "from": dict(recipient_inbound),
+            "recipient": dict(sender_inbound),
+            "path": path_tag,
+        }
+
     async def send(
         self,
         chat_id: str,
