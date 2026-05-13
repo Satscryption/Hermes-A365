@@ -1,7 +1,7 @@
 ---
 name: hermes-a365
 description: Use when integrating a Hermes agent into the Microsoft 365 ecosystem — agent-as-tenant-directory-identity (AI Teammate / agentic user) or Copilot Chat surfacing (Custom Engine Agent + Azure Bot Service). Distinct from Hermes' sibling Teams adapter (`plugins/platforms/teams/`) which covers classic Bot-Framework Teams chat. Wraps the GA `Microsoft.Agents.A365.DevTools.Cli` verbs, ships the BF activity bridge that backs the `agent365` gateway platform, and emits both AI Teammate and Custom Engine Agent manifests.
-version: 0.5.1
+version: 0.5.2
 author: Hermes Agent
 license: MIT
 metadata:
@@ -300,12 +300,23 @@ operator-side network exposure options:
   across rounds 3 → 8, with BF streaming protocol round-trip
   on round-8 (2026-05-11, v0.3.0). Agent appears in "Built for
   your org" picker.
+- **Path A cron-driven proactive sends** — shipped in v0.5.0 +
+  v0.5.1 (slices 19x-a..e, closes #4 and #27). Wire-validated
+  against the live tenant 2026-05-13. `Agent365Adapter.send()`
+  routes through `sendToConversation` (no `replyToId`) when the
+  current gateway lifetime hasn't captured an inbound for
+  `chat_id`; mints the agentic three-stage user-FIC chain against
+  a target-spec built from the persisted `ConversationRegistry`.
+  `prune_old_entries` + `pin` / `unpin` / `mark_used` mutators
+  let operators manage the registry without restarting.
 - **Path B (Custom Engine Agent) manifest emitter** — shipped
   2026-05-12 (slice 19u-a, `hermes a365 publish --copilot-chat`);
   manifest validated by Teams App Catalog upload. **Live Copilot
   Chat surfacing requires Azure Bot Service registration of the
   blueprint Entra app**, deferred pending Azure subscription
-  decision (#16).
+  decision (#16). Path B proactive (BF S2S outbound) is also
+  gated on #16 — `_send_proactive` refuses Path B target specs
+  with a clear deferred-error.
 
 Sibling-plugin lane (Teams group chat / channels / threading /
 file attachments / compose-extension invokes) is **out of scope

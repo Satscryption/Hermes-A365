@@ -138,10 +138,18 @@ bump the version.
 - For multi-agent setups, route on `agent.slug` (passed in our
   envelope, not in the BF activity).
 - For long-running agent thinking that exceeds the 10 s webhook
-  budget: the responder should return `{"text": "Thinking..."}`
-  immediately and then push the real reply via a separate proactive
-  pattern. Streaming + proactive replies are not yet implemented in
-  the bridge (slice 19b ships synchronous only).
+  budget: the bridge now handles this in two ways depending on
+  context. **In-turn streaming** (BF `edit_message` via the
+  `streaminfo` entity, slices 19s + 19s-bis, v0.3.0, `#3` closed) —
+  the Teams bubble grows incrementally as the agent emits content;
+  no work required from the responder beyond returning incremental
+  text. **Cron-driven proactive sends** (slices 19x-a..e, v0.5.0 +
+  v0.5.1, `#4` + `#27` closed) — call
+  `await adapter.send(chat_id, content)` from Hermes' cron tools;
+  the adapter routes via `sendToConversation` for any chat the
+  current gateway lifetime hasn't yet captured an inbound for.
+  Path B proactive (BF S2S outbound via Azure Bot Service) is
+  gated on `#16`.
 
 ## Reference responder (slice 19c)
 

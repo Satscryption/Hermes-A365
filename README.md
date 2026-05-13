@@ -47,21 +47,34 @@ reasoning behind the split.
 
 ## Status
 
-**v0.4.0** (released 2026-05-12) bundles slice 19u-a (Custom Engine
-Agent emitter for Path B), the M365-ecosystem positioning reframe,
-and the setup-wizard hardening pass (XDG symlink + slug + YAML diff
-noise). 720 tests passing, ruff clean. See
-[CHANGELOG.md](CHANGELOG.md) for the full release notes.
+**v0.5.1** (released 2026-05-13). Path A active development is
+feature-complete for the current scope:
+
+- **v0.5.0 / v0.5.1** bundle slices 19x-a..e — proactive long-running
+  reply pattern (closes [#4](https://github.com/satscryption/Hermes-A365/issues/4))
+  + the v0.5.1 fix for the proactive-path production gate (closes
+  [#27](https://github.com/satscryption/Hermes-A365/issues/27)).
+  Wire-validated against the live satscryption tenant; cron-driven
+  sends to chats the gateway hasn't seen this lifetime route
+  correctly via `sendToConversation`.
+- **v0.4.x** (2026-05-12) shipped the Custom Engine Agent emitter for
+  Path B (slice 19u-a, closes [#24](https://github.com/satscryption/Hermes-A365/issues/24)),
+  the M365-ecosystem positioning reframe, and the setup-wizard
+  hardening pass (XDG symlink + slug + YAML diff noise).
+- **v0.3.0** (2026-05-11) closed [#3](https://github.com/satscryption/Hermes-A365/issues/3)
+  with BF streaming-response protocol (slices 19s + 19s-bis).
+
+**773 tests passing, ruff clean.** See [CHANGELOG.md](CHANGELOG.md)
+for the full per-release notes.
 
 Path A (AI Teammate) validated end-to-end against the satscryption
 M365 tenant rounds 3 → 8, including full BF streaming protocol
-round-trip on 2026-05-11 (closes [#3](https://github.com/satscryption/Hermes-A365/issues/3)).
+round-trip on 2026-05-11 and v0.5.0 proactive soak on 2026-05-13.
 
 Path B (Custom Engine Agent) emitter shipped + manifest shape
-validated by Teams App Catalog upload 2026-05-12; live Copilot
-Chat round-trip deferred pending Azure subscription provisioning
+validated by Teams App Catalog upload 2026-05-12; **live Copilot
+Chat round-trip deferred pending Azure subscription provisioning**
 (see [#16](https://github.com/satscryption/Hermes-A365/issues/16)).
-v0.5.0 reserved for that walkthrough.
 
 ## What works today
 
@@ -82,7 +95,7 @@ Legend: ✅ shipped + validated · 🟡 shipped, validation deferred ·
 | Microsoft Search invocation | Hermes-A365 Path B + #18 | 🟡 needs Azure + invoke handlers |
 | Outlook compose-action (`task/fetch` / `task/submit`) | Path B (Copilot fabric) or sibling adapter | 🟡 / 🔵 |
 | Teams compose extensions (`composeExtension/*`) | Sibling Teams adapter | 🔵 use sibling |
-| Cron / proactive sends on M365 surfaces | Hermes-A365 + #4 | 🟡 `ConversationRef` registry shipped, agent-side trigger pending |
+| Cron / proactive sends on M365 surfaces (Path A) | Hermes-A365 | ✅ shipped in v0.5.0 / v0.5.1 (slices 19x-a..e, #4 closed) |
 | Word / Excel / PowerPoint as declarative Copilot agents | Separate skill | 🔴 different runtime |
 | Office Add-ins / Loop / OneNote | Separate skills | 🔴 different SDKs |
 | Web chat / Direct Line / SharePoint Embedded | Separate Direct Line skill | 🔴 bypasses M365 |
@@ -90,10 +103,11 @@ Legend: ✅ shipped + validated · 🟡 shipped, validation deferred ·
 
 ## Known limitations
 
-v0.4.0 ships the operator wrapper, read path, Bot Framework activity
+v0.5.1 ships the operator wrapper, read path, Bot Framework activity
 bridge, BF streaming protocol, hardened setup wizard (with XDG-symlink
-auto-repair), and the Custom Engine Agent emitter for Path B.
-Outstanding gaps:
+auto-repair), the Custom Engine Agent emitter for Path B, and the
+Path A proactive long-running reply pattern (cron-driven
+`sendToConversation`). Outstanding gaps:
 
 - **Path B (Copilot Chat) needs Azure subscription.** Custom Engine
   Agent surfacing in Copilot Chat requires registering the blueprint
@@ -105,10 +119,11 @@ Outstanding gaps:
   (instance creation → Teams notification only).
   [#16](https://github.com/satscryption/Hermes-A365/issues/16) tracks
   the live walkthrough once Azure is provisioned.
-- **Proactive replies for >10 s agent thinking** are not implemented
-  ([#4](https://github.com/satscryption/Hermes-A365/issues/4)). `send()`
-  still requires a cached inbound; cron-driven sends do not work yet.
-  Applies to both paths.
+- **Path B proactive sends** — `_send_proactive` refuses Path B
+  target specs with a clear deferred-error referencing #16. Will
+  light up once Azure Bot Service registration is in place; the
+  outbound token chain for Path B is BF S2S (`Bot.Connector`
+  audience) vs Path A's agentic three-stage user-FIC.
 - **Invoke activities (Path B)** — Outlook compose-action
   (`task/fetch` / `task/submit`), Microsoft Search invocation, and
   OAuth invoke (`signin/verifyState`) for tools inside Copilot Chat
@@ -261,7 +276,7 @@ v0.1 design draft is archived at
 │           ├── consent-url.txt.j2
 │           ├── instance.env.j2
 │           └── adaptive-cards/      # greeting / confirmation / error
-└── tests/                   # 720 tests (pytest + ruff clean)
+└── tests/                   # 773 tests (pytest + ruff clean)
     ├── conftest.py
     ├── golden/
     └── test_*.py
@@ -520,13 +535,11 @@ Issues are tagged with `priority:next` / `priority:ready` /
 labels — `gh issue list --label "priority:ready"` surfaces the
 working set.
 
-**Ready to work** (no external blockers):
-
-- **[#4](../../issues/4)** — Proactive long-running reply pattern.
-  Surface-agnostic; applies to both paths and the sibling Teams
-  adapter independently. Slice 19o registry (`ConversationRef` +
-  `conversations.json`) is the already-shipped prerequisite;
-  what's missing is the Hermes-side trigger. `priority:ready`.
+The Path A active-development front is currently **empty** —
+every open issue is either gated on Azure (#16 / #18), conditional
+on operator signal (#26), or deferred-pending-demand
+(#19 / #20 / #21). New Path A work would surface from concrete
+operator pain.
 
 **Conditional on operator signal:**
 
@@ -591,6 +604,25 @@ explicit triggers that would re-prioritise it.
 
 **Recent closures:**
 
+- ~~#27~~ — `send()` proactive fall-through unreachable in
+  production. **Closed 2026-05-13** in v0.5.1 (slice 19x-e).
+  Surfaced during the v0.5.0 soak: the registry persists `raw`
+  to disk, so `_cached_inbound_for` returned the persisted value
+  on every gateway restart and `send()` never fell through to
+  `_send_proactive`. Fixed by gating on a per-lifetime
+  `set[str]` of chat_ids the `/api/messages` route has captured
+  this gateway boot.
+- ~~#4~~ — Activity bridge proactive long-running reply pattern.
+  **Closed 2026-05-13** in v0.5.0 (slices 19x-a..d). `send()`
+  falls through to `_send_proactive` when this lifetime hasn't
+  captured an inbound for the chat; POSTs to
+  `<serviceUrl>/v3/conversations/<conv_id>/activities`
+  (`sendToConversation`, no `replyToId`). Mints the agentic
+  three-stage user-FIC chain against a synthetic activity-shape.
+  `ConversationRegistry.prune_old_entries` mirrors Hermes'
+  `SessionStore.prune_old_entries`; `pin` / `unpin` /
+  `mark_used` explicit mutators. Path B proactive remains
+  gated on #16.
 - ~~#25~~ — Setup wizard XDG symlink gap. **Closed 2026-05-12**
   in v0.4.0 (slice 19r-bis). Wizard now creates / repairs a
   symlink at `~/.config/a365/a365.generated.config.json` pointing

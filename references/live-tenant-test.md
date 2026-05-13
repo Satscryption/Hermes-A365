@@ -1,6 +1,6 @@
-# Live tenant integration test — Hermes-A365 v0.4
+# Live tenant integration test — Hermes-A365 v0.5
 
-End-to-end runbook for verifying Hermes-A365 (v0.4.0 at time of last
+End-to-end runbook for verifying Hermes-A365 (v0.5.1 at time of last
 refresh) against a real Microsoft Agent 365 tenant. Walk top-to-bottom
 on first run; expect ~30–45 minutes including the M365 Admin Centre
 approval step (longer if the tenant is on macOS 26 — see §3's
@@ -842,11 +842,12 @@ Acceptance gates — Hermes side:
       `agent365`: `Agent365Adapter.handle_message(...)` fires.
 - [ ] The agent loop runs (look for tool-call lines if your
       `~/.hermes/skills/` set has any wired) and produces a reply.
-- [ ] The reply hits Teams within ~10 s. (Sustained turns >10 s
-      surface progress via the BF streaming protocol — slices 19s
-      + 19s-bis, `#3` closed. Cron-driven / unsolicited outbound
-      from a fresh agent state still needs the proactive pattern,
-      that's `#4`, not in scope here.)
+- [ ] The reply hits Teams within ~10 s. Sustained turns >10 s
+      surface progress via the BF streaming protocol (slices 19s +
+      19s-bis, `#3` closed). Cron-driven / unsolicited outbound
+      uses the proactive `sendToConversation` path (slices 19x-a..e,
+      `#4` + `#27` closed in v0.5.1) — exercised separately under
+      §9d.6 once the gateway has been restarted.
 - [ ] For replies > ~2 s of agent thinking, the Teams bubble
       grows incrementally rather than appearing all at once — BF
       streaming via `Agent365Adapter.edit_message` is in the path
@@ -882,13 +883,25 @@ hermes gateway status   # agent365 ✓ connected
 
 Send another Teams DM. The agent should reply on the same
 conversation thread without you having to seed it again — the
-registry hydrated the chat context on `__init__`. This is the
-precondition that unblocks proactive long-running replies (#4).
+registry hydrated the chat context on `__init__`.
+
+Then test the proactive path (`#4` + `#27` closed in v0.5.1). Without
+sending an inbound first, trigger an outbound — either from Hermes
+cron or by invoking `await adapter.send(chat_id, content)` directly.
+The send-side gate keys on
+`adapter._seen_inbounds_this_lifetime` (per-lifetime, non-persistent),
+so a fresh-restarted gateway with no inbound yet routes through
+`_send_proactive` → `sendToConversation` (no stale `replyToId`).
 
 - [ ] Across a gateway restart, a Teams DM still gets a reply (no
       "no cached inbound for chat_id" failure in the gateway log).
 - [ ] `conversations.json` carries the same conversation id before
       and after the restart.
+- [ ] Cron-driven (or test-driven) `send()` to the same chat **before
+      the user sends an inbound this lifetime** lands in Teams via
+      `sendToConversation`. POST URL ends `/v3/conversations/<id>/activities`
+      (no `/<activity_id>` suffix); the activity body has no
+      `replyToId`. Slice 19x-e gate fix verified.
 
 ### 9d.7 — Tear down
 

@@ -23,7 +23,7 @@ group chats, threading, file attachments.
 
 | Path | Surfacing | Operator prerequisites | Status |
 |---|---|---|---|
-| **A — AI Teammate** (M365 agentic user) | Agent appears in M365 tenant directory + "Built for your org" picker + M365 People search + agentic-user audit trails. Teams 1:1 chat with M365-native identity (distinct from a classic bot's user-facing affordance). | M365 tenant + Frontier Preview Program + Tier 3 license. **No Azure subscription.** | ✅ Round-8 end-to-end 2026-05-11 (v0.2.0 wizard, v0.3.0 streaming) |
+| **A — AI Teammate** (M365 agentic user) | Agent appears in M365 tenant directory + "Built for your org" picker + M365 People search + agentic-user audit trails. Teams 1:1 chat with M365-native identity (distinct from a classic bot's user-facing affordance). | M365 tenant + Frontier Preview Program + Tier 3 license. **No Azure subscription.** | ✅ Round-8 end-to-end 2026-05-11 (v0.2.0 wizard, v0.3.0 streaming); v0.5.0/v0.5.1 proactive soak 2026-05-13 |
 | **B — Custom Engine Agent** (Azure Bot Service + 1.21 manifest) | Agent appears in M365 Copilot Chat's agents picker, side-panels in Word/Excel/PowerPoint/Outlook, and Copilot-fabric search. Also reaches classic Teams surfaces (1:1 / group / channel) as a side effect of the Microsoft Teams channel on Bot Service. | Path A's prerequisites **+ Azure subscription** for Bot Service registration of the blueprint Entra app with the Microsoft Teams channel enabled. | ⏸ Emitter shipped 2026-05-12 (slice 19u-a, `hermes a365 publish --copilot-chat`); live surfacing test deferred pending Azure subscription provisioning (#16). |
 
 Both paths share the same blueprint Entra app + service principal + bot
@@ -97,7 +97,7 @@ Legend:
 | Web chat / Direct Line embed | Sibling adapter or separate skill | 🔵 | Bypasses M365 entirely; not Hermes-A365's lane. |
 | SharePoint embedded chat (`SPEmbedded`) | Sibling adapter or separate skill | 🔵 | Same — Direct Line, no M365 directory presence. |
 | Slack / Telegram / WhatsApp / Twilio / Line / Kik / GroupMe | Use the respective Hermes platform adapters | 🔵 | Each external messenger has its own first-class Hermes adapter; Hermes-A365 not the right path. |
-| Cron / proactive sends (any surface) | **Hermes-A365 (either path)** + #4 | 🟡 | Cron-driven outbound on M365 surfaces — slice 19o `ConversationRef` registry already shipped; #4 is the agent-side trigger mechanism. Sibling Teams adapter handles its own proactive sends independently. |
+| Cron / proactive sends (Path A surfaces) | **Hermes-A365** | ✅ | Shipped in v0.5.0 / v0.5.1 (slices 19x-a..e; #4 closed, #27 closed). `Agent365Adapter.send()` falls through to `_send_proactive` when this gateway lifetime hasn't captured an inbound for `chat_id`; POSTs to `<serviceUrl>/v3/conversations/<conv_id>/activities` (`sendToConversation` — no `replyToId`). Path B proactive (BF S2S outbound) gated on #16. Sibling Teams adapter handles its own proactive sends independently. |
 | Word / Excel / PowerPoint Copilot side-panel as **declarative agent** | Separate skill (not this one) | 🔴 | Declarative agents are a different runtime — Microsoft hosts the orchestrator + LLM. Hermes' value prop is the orchestrator, so we're a custom-engine agent (see Path B), not a declarative one. |
 | Office Add-ins (ribbon button, task pane) | Separate skill | 🔴 | Different SDK entirely; would be a complementary `office-addin-*` package. |
 | Loop components | Separate skill | 🔴 | Loop SDK; not a BF-protocol surface. |
@@ -179,6 +179,7 @@ Out-of-scope decisions, with reasons:
 | Path A Teams 1:1 (round-5 §9d) | round-5 §9d | 2026-05-06 | ✅ E2E via Hermes plugin path |
 | Path A Teams 1:1 (gateway-restart durability) | round-5 §9d.6 | 2026-05-06 | ✅ slice 19o registry hydrated |
 | Path A Teams 1:1 (full E2E + streaming on v0.3.0) | round-8 | 2026-05-11 | ✅ BF streaming protocol via `edit_message` validated (closes #3) |
+| Path A Teams 1:1 (proactive sendToConversation, v0.5.0 wire) | proactive soak | 2026-05-13 | ✅ token mint + `sendToConversation` POST + 201 wire-validated against live tenant; surfaced gate bug closed in v0.5.1 (#27) |
 | Path B Copilot Chat (emitter only — no Azure sub) | 2026-05-12 | 2026-05-12 | 🟡 manifest emitter shipped; agent enters Teams App Catalog but doesn't surface in Copilot Chat without Azure Bot Service. #16 deferred. |
 | All other surfaces | — | — | NOT YET WALKED (most are sibling-plugin lane) |
 
@@ -217,9 +218,13 @@ their state under the reframed positioning:
 - **#3 (streaming)** — **closed 2026-05-11** by slices 19s + 19s-bis.
   Custom-engine streaming protocol via `edit_message`. Applies to
   both Path A and Path B.
-- **#4 (proactive)** — surface-agnostic; applies to both paths and
-  the sibling Teams adapter independently. Cron-driven flows on M365
-  surfaces still need this.
+- **#4 (proactive)** — **closed 2026-05-13** by slices 19x-a..d in
+  v0.5.0; v0.5.1 (#27, slice 19x-e) fixed the production gate.
+  Path A proactive ships; Path B proactive gated on #16.
+- **#27 (proactive gate)** — **closed 2026-05-13** by slice 19x-e
+  in v0.5.1. Per-lifetime `_seen_inbounds_this_lifetime` set drives
+  `send()`'s decision between `replyToActivity` and
+  `sendToConversation`.
 - **#13 (setup wizard)** — **closed 2026-05-11** by slice 19r.
   Interactive setup + drift detection ship in v0.2.0.
 - **#14 (secret regression)** — closed 2026-05-07 by slice
@@ -237,10 +242,11 @@ their state under the reframed positioning:
   (`composeExtension/*`) move to the sibling adapter's roadmap.
 - **#24 (Custom Engine Agent emitter)** — **closed 2026-05-12** by
   slice 19u-a.
-- **#25 (setup wizard XDG symlink gap)** — surface-agnostic;
-  blocks both paths' setup.
+- **#25 (setup wizard XDG symlink gap)** — **closed 2026-05-12**
+  in v0.4.0 (slice 19r-bis).
 - **#26 (`--manifest-id` flag)** — Path B-specific; needed for
-  operators running A + B simultaneously.
+  operators running A + B simultaneously. Open;
+  `priority:conditional`.
 
 ## Sources
 

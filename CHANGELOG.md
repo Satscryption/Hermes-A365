@@ -6,6 +6,45 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.2] — 2026-05-13
+
+Patch release: documentation accuracy pass for v0.5.0 + v0.5.1.
+No code changes.
+
+### Documented
+
+- **`README.md`** — §Status rewritten around v0.5.1 (proactive
+  long-running reply pattern shipped, #4 + #27 closed). §What
+  works today matrix marks "Cron / proactive sends (Path A)" as
+  ✅ shipped. §Known limitations dropped the "Proactive replies
+  are not implemented" bullet; replaced with the Path B-only
+  proactive deferred-error note. Repo-layout test count 720 →
+  773. §Open work tree: "Ready to work" section retired (Path A
+  active-development front is currently empty); #4 + #27 added
+  to recent closures.
+- **`SKILL.md`** — Surfaces-that-work-today gained a "Path A
+  cron-driven proactive sends" bullet (slice 19x-a..e, v0.5.0 +
+  v0.5.1) with the live-soak validation date. Path B proactive
+  noted as gated on #16 alongside the surfacing test.
+- **`references/m365-surface-coverage.md`** — Path A status row
+  in the positioning table now lists the v0.5.0/v0.5.1 proactive
+  soak. "Cron / proactive sends" coverage row flipped from 🟡
+  pending to ✅ shipped (Path A) with the gating note for Path
+  B. Backlog impact updates #4 + #27 as closed and #25 as
+  closed. Validation status table gained a row for the v0.5.0
+  proactive soak.
+- **`references/live-tenant-test.md`** — Title bumped v0.4 →
+  v0.5. §9d.5 acceptance gates reframed: cron-driven proactive
+  uses `sendToConversation` (v0.5.1 gate fix) rather than being
+  "out of scope". §9d.6 restart-durability runbook gained an
+  explicit "send to a chat before any inbound this lifetime"
+  proactive-path checkbox.
+- **`references/webhook-contract.md`** — long-running responder
+  note rewritten: streaming via `edit_message` (slices 19s +
+  19s-bis, #3 closed) handles in-turn waits; proactive via
+  `sendToConversation` (slices 19x-a..e, #4 + #27 closed)
+  handles cron-driven outbound. No more "not yet implemented".
+
 ## [0.5.1] — 2026-05-13
 
 Patch release: fix the v0.5.0 proactive-path production gate (closes
