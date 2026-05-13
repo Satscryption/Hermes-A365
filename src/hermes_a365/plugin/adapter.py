@@ -304,6 +304,19 @@ class Agent365Adapter(BasePlatformAdapter):
         # or terminal 403.
         self._active_stream_by_chat: dict[str, str] = {}
 
+        # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
+        # captured an inbound for since boot. Used as ``send()``'s gate
+        # for routing through the proactive ``sendToConversation`` path
+        # rather than ``replyToActivity``: the latter requires a fresh
+        # ``activity_id`` from this lifetime; the former does not.
+        #
+        # NOT persisted — every gateway restart starts fresh, so a
+        # send() to a chat the registry knows about but the gateway
+        # hasn't heard from this lifetime correctly takes the proactive
+        # path. Surfaced during the v0.5.0 soak (2026-05-13); see #27
+        # for the gating finding the registry-raw-as-gate logic missed.
+        self._seen_inbounds_this_lifetime: set[str] = set()
+
         # Slice 19s-bis follow-up — Hermes' stream consumer can call
         # ``edit_message`` more than once with the same ``message_id``
         # after a legitimate ``finalize=True`` succeeds (e.g. an
@@ -459,6 +472,11 @@ class Agent365Adapter(BasePlatformAdapter):
             ref = ConversationRef.from_activity(activity)
             if ref is not None:
                 self._conversations.upsert(ref)
+                # Slice 19x-e (#27): record that this gateway lifetime
+                # has captured an inbound for this chat. Drives the
+                # send() gate that picks replyToActivity vs
+                # sendToConversation. Per-lifetime, not persisted.
+                self._seen_inbounds_this_lifetime.add(ref.conversation_id)
                 self._persist_conversations()
 
             # Build event + dispatch through Hermes' loop.
@@ -723,11 +741,18 @@ class Agent365Adapter(BasePlatformAdapter):
         """Render `content` as a reply Activity and POST via serviceUrl.
 
         Looks up the most recent inbound activity for ``chat_id`` in the
-        durable registry (slice 19o). When the registry has no cached
-        inbound activity (no ``raw`` for this chat) — e.g. a cron-driven
-        proactive delivery — slice 19x-b (#4) falls through to
-        ``_send_proactive`` which posts a non-reply Activity via the
-        ``sendToConversation`` BF endpoint instead of ``replyToActivity``.
+        durable registry (slice 19o). Routing decision (slice 19x-e, #27):
+
+        - **This gateway lifetime captured an inbound for ``chat_id``** →
+          use ``replyToActivity`` against the cached inbound's
+          ``activity_id``. This is the steady-state Hermes reply flow.
+        - **Otherwise** (gateway restarted since last inbound, or
+          cron-driven send for a chat the registry knows about but
+          this lifetime hasn't seen) → fall through to
+          ``_send_proactive`` which posts a non-reply Activity via the
+          ``sendToConversation`` BF endpoint. Avoids stale-activity-id
+          rejections from BF channels.
+
         Path A only — Path B (Custom Engine Agent via Azure Bot Service)
         proactive is gated on #16 and returns a clear deferred-error.
 
@@ -748,10 +773,21 @@ class Agent365Adapter(BasePlatformAdapter):
         - The streaming-start POST itself fails.
         """
         bridge = _import_bridge()
+        # Slice 19x-e (#27): the gate is "did this lifetime capture an
+        # inbound for chat_id", not "is the registry populated". The
+        # registry's raw persists across restarts (slice 19o), so the
+        # earlier ``_cached_inbound_for is None`` check never fired in
+        # production — every send took the cached-inbound path with a
+        # potentially stale activity_id.
+        if chat_id not in self._seen_inbounds_this_lifetime:
+            return await self._send_proactive(chat_id, content)
+
         inbound = self._cached_inbound_for(chat_id)
         if not inbound:
-            # Slice 19x-b (#4): no cached inbound this lifetime; try the
-            # proactive (sendToConversation) path against the registry.
+            # Defensive fallback: lifetime set says we saw an inbound,
+            # but the registry doesn't have raw. Should be unreachable
+            # under normal flow (capture writes both atomically); treat
+            # like a fresh-lifetime call and route via proactive.
             return await self._send_proactive(chat_id, content)
 
         # Slice 19x-d (#4): bump the registry's last_used_at so prune

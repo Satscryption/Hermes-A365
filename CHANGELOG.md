@@ -6,6 +6,45 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.1] — 2026-05-13
+
+Patch release: fix the v0.5.0 proactive-path production gate (closes
+#27).
+
+### Fixed
+
+- **Slice 19x-e (#27):** `Agent365Adapter.send()`'s decision to use
+  `replyToActivity` vs `sendToConversation` now keys on
+  **whether this gateway lifetime has captured an inbound for
+  `chat_id`**, not on whether the registry's `raw` field is
+  populated. Surfaced during the v0.5.0 soak (2026-05-13): the
+  registry persists `raw` to disk (slice 19o), so on every gateway
+  restart `_cached_inbound_for` returned the persisted value and
+  `send()` never fell through to `_send_proactive`. The proactive
+  path I shipped was wire-correct (validated against the live
+  satscryption tenant) but production-unreachable.
+
+  Fix is a per-lifetime `set[str]` of chat_ids — populated by the
+  `/api/messages` inbound capture point, consulted by `send()`'s
+  gate, not persisted (every gateway boot starts empty). When the
+  set has `chat_id`, `send()` mints a `replyToActivity` against
+  the cached inbound's activity_id. When the set doesn't, `send()`
+  routes through `_send_proactive` (sendToConversation — no stale
+  `replyToId` risk).
+
+  Behavioural changes: in-flight reply flow unchanged; cron-driven
+  send after gateway restart now correctly uses `sendToConversation`
+  (was using `replyToActivity` with a potentially stale
+  `activity_id`). No new public API.
+
+### Test count
+
+769 → 773 (+4 new gate tests covering the four state-combinations
+of seen/not-seen × registry-has-raw/not). Eight existing tests
+that bypass `/api/messages` and call `adapter.send()` directly
+updated to populate `_seen_inbounds_this_lifetime` after their
+`upsert` — production flow already does this automatically.
+
 ## [0.5.0] — 2026-05-13
 
 Feature release: proactive long-running reply pattern for Path A

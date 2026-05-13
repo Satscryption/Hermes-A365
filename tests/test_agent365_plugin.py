@@ -1312,6 +1312,8 @@ class TestSend:
         a._conversations.upsert(
             adapter_mod.ConversationRef.from_activity(_make_inbound())
         )
+        # Slice 19x-e (#27): production fills this set on inbound capture.
+        a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -1339,6 +1341,7 @@ class TestSend:
         a._conversations.upsert(
             adapter_mod.ConversationRef.from_activity(_make_inbound())
         )
+        a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -1351,6 +1354,183 @@ class TestSend:
         result = await a.send(chat_id="conv-1", content="x")
         assert result.success is False
         assert "token mint failed" in (result.error or "")
+
+
+# ---------------------------------------------------------------------------
+# Slice 19x-e (#27): send() gate — per-lifetime inbound tracking
+# ---------------------------------------------------------------------------
+
+
+class TestSendGate:
+    """`send()` routes via proactive when this lifetime hasn't captured
+    an inbound for chat_id, regardless of registry raw."""
+
+    @pytest.mark.asyncio
+    async def test_fresh_lifetime_with_registry_entry_routes_proactive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Simulates a gateway restart: the registry has the chat
+        # (raw populated), but the lifetime set is empty.
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                {
+                    "type": "message",
+                    "id": "act-prior",
+                    "channelId": "msteams",
+                    "serviceUrl": "https://smba.trafficmanager.net/x/",
+                    "conversation": {
+                        "id": "c1",
+                        "conversationType": "personal",
+                        "tenantId": "t",
+                    },
+                    "from": {"id": "u"},
+                    "recipient": {
+                        "id": "a",
+                        "agenticAppId": "aa",
+                        "agenticUserId": "au",
+                    },
+                }
+            )
+        )
+        # Critical: lifetime set is empty — like a fresh gateway boot.
+        assert a._seen_inbounds_this_lifetime == set()
+
+        # Confirm _cached_inbound_for returns the persisted raw —
+        # under the old gate this would have routed cached-inbound.
+        assert a._cached_inbound_for("c1") is not None
+
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.json = MagicMock(return_value={"id": "proactive-id"})
+        a._http_client = MagicMock()
+        a._http_client.post = AsyncMock(return_value=mock_resp)
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_outbound_token", AsyncMock(return_value="tok")
+        )
+        # send_reply must NOT fire — gate routes us through proactive.
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        result = await a.send(chat_id="c1", content="proactive ping")
+        assert result.success is True
+        assert result.message_id == "proactive-id"
+        # Wire-shape confirmation: sendToConversation URL, no replyToId.
+        url = a._http_client.post.await_args.args[0]
+        assert url.endswith("/v3/conversations/c1/activities")
+        body = a._http_client.post.await_args.kwargs["json"]
+        assert "replyToId" not in body
+        # The reply-path mock should never have been called.
+        assert send_reply_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_inbound_capture_populates_lifetime_set(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Drive a real inbound through the FastAPI route and confirm
+        # the lifetime set picks it up — the production capture point.
+        from fastapi.testclient import TestClient
+
+        conv_path = tmp_path / "convs.json"
+        a = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x"}),
+        )
+        a._http_client = MagicMock()
+
+        assert a._seen_inbounds_this_lifetime == set()
+
+        client = TestClient(a.build_app())
+        client.post(
+            "/api/messages",
+            json=_make_inbound(conv_id="conv-Z", activity_id="act-Z"),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert "conv-Z" in a._seen_inbounds_this_lifetime
+
+    @pytest.mark.asyncio
+    async def test_after_inbound_capture_send_uses_cached_inbound_path(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Drive an inbound, then call send() for the same chat —
+        # the lifetime set is populated so the gate routes
+        # cached-inbound (replyToActivity).
+        from fastapi.testclient import TestClient
+
+        conv_path = tmp_path / "convs.json"
+        a = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x"}),
+        )
+        a._http_client = MagicMock()
+
+        client = TestClient(a.build_app())
+        client.post(
+            "/api/messages",
+            json=_make_inbound(conv_id="conv-Y", activity_id="act-Y"),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert "conv-Y" in a._seen_inbounds_this_lifetime
+
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        # acquire_outbound_token would be called by the proactive path;
+        # if the gate is wrong and we go proactive, this mock catches it.
+        proactive_token_mock = AsyncMock(return_value="should-not-fire")
+        monkeypatch.setattr(
+            bridge, "acquire_outbound_token", proactive_token_mock
+        )
+
+        result = await a.send(chat_id="conv-Y", content="reply")
+        assert result.success is True
+        # Cached-inbound path fires send_reply, NOT acquire_outbound_token.
+        assert send_reply_mock.await_count == 1
+        assert proactive_token_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_lifetime_set_is_per_adapter_not_persisted(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # Persist a registry entry to disk, construct a fresh adapter
+        # against the same conversations_path — the new adapter's
+        # lifetime set is empty. This is what a gateway restart looks
+        # like.
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        conv_path = tmp_path / "convs.json"
+        seed = ConversationRegistry()
+        seed.upsert(
+            ConversationRef.from_activity(_make_inbound(conv_id="conv-survive"))
+        )
+        seed.save(conv_path)
+
+        # First adapter — pretend the inbound was processed in a
+        # prior lifetime.
+        a1 = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        a1._seen_inbounds_this_lifetime.add("conv-survive")
+        # ... gateway restart simulated by constructing a fresh adapter
+        a2 = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        # Registry has the entry from disk.
+        assert a2._conversations.get("conv-survive") is not None
+        # But the lifetime set starts empty.
+        assert a2._seen_inbounds_this_lifetime == set()
 
 
 # ---------------------------------------------------------------------------
@@ -2252,6 +2432,7 @@ class TestEditMessage:
         successive POST), or ``None`` (defaults to a 202 OK).
         """
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -2603,6 +2784,7 @@ class TestSendStreamStart:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-S1")  # personal by default
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -2657,6 +2839,7 @@ class TestSendStreamStart:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-S2")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -2718,6 +2901,7 @@ class TestSendStreamStart:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-C")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -2752,6 +2936,7 @@ class TestSendStreamStart:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-X")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -2806,6 +2991,7 @@ class TestSendStreamStart:
         inbound = _make_inbound(conv_id="conv-G")
         inbound["conversation"]["conversationType"] = "groupChat"
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add("conv-G")  # slice 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -2834,6 +3020,7 @@ class TestSendStreamStart:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-F")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add("conv-F")  # slice 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -2866,6 +3053,7 @@ class TestSendStreamStart:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-N")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add("conv-N")  # slice 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -3309,6 +3497,9 @@ class TestMarkUsedFromOutboundPaths:
             adapter_mod.ConversationRef.from_activity(_make_inbound()),
             now=100.0,
         )
+        # Slice 19x-e (#27): tell the gate this lifetime has seen
+        # an inbound for the chat — otherwise send() routes proactively.
+        a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()

@@ -1,7 +1,7 @@
 ---
 name: hermes-a365
 description: Use when integrating a Hermes agent into the Microsoft 365 ecosystem — agent-as-tenant-directory-identity (AI Teammate / agentic user) or Copilot Chat surfacing (Custom Engine Agent + Azure Bot Service). Distinct from Hermes' sibling Teams adapter (`plugins/platforms/teams/`) which covers classic Bot-Framework Teams chat. Wraps the GA `Microsoft.Agents.A365.DevTools.Cli` verbs, ships the BF activity bridge that backs the `agent365` gateway platform, and emits both AI Teammate and Custom Engine Agent manifests.
-version: 0.5.0
+version: 0.5.1
 author: Hermes Agent
 license: MIT
 metadata:
