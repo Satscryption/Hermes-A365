@@ -6,6 +6,73 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.5.0] — 2026-05-13
+
+Feature release: proactive long-running reply pattern for Path A
+(closes #4). Four slices: 19x-a (target-spec read), 19x-b (send
+fall-through), 19x-c (registry pruning + pin/mark_used), 19x-d
+(adapter lifecycle wiring).
+
+Path A users with the registry hydrated can now send to chats the
+gateway hasn't seen an inbound for this lifetime — cron-driven
+flows, scheduled reminders, and proactive nudges all unblock from
+this release. Path B proactive remains deferred behind #16
+(Azure Bot Service registration); the adapter refuses Path B
+target specs with a clear deferred-error referencing #16 rather
+than 401-ing with the wrong token chain.
+
+### Added
+
+- **Slice 19x-a (#4):** `Agent365Adapter._build_proactive_target_spec(chat_id) → dict | None`
+  — pure-function read over `ConversationRegistry`. Builds the
+  minimal spec (`service_url`, `conversation_id`, `channel_id`,
+  `chat_type`, `tenant_id`, `agentic_app_id`, `agentic_user_id`,
+  `from`, `recipient`, `path`) needed to construct an outbound
+  Activity + mint the outbound token chain. Path-tags entries as
+  `"A"` only when the cached inbound's recipient carries both
+  `agenticAppId` and `agenticUserId`; `"unknown"` otherwise.
+- **Slice 19x-b (#4):** `Agent365Adapter.send()` falls through to
+  `_send_proactive(chat_id, content)` when `_cached_inbound_for`
+  returns `None`. Mints the agentic user-FIC chain against a
+  synthetic activity-shape and POSTs to
+  `<serviceUrl>/v3/conversations/<conv_id>/activities` (the
+  `sendToConversation` BF endpoint — no `replyToId`, no
+  `/activities/<id>` suffix). Path B target specs surface a clear
+  "Path B proactive not yet implemented — gated on #16" error.
+- **Slice 19x-c (#4):** `ConversationRegistry.prune_old_entries(max_age_days, *, active_session_keys, now) → int`
+  mirrors `gateway/session.py:1031`'s
+  `SessionStore.prune_old_entries` shape. Three skip conditions:
+  active, pinned, no-stamp. Adds `last_used_at: float | None` and
+  `pinned: bool` fields to `ConversationRef` with
+  backward-compatible read of older payloads. New explicit
+  mutators on `ConversationRegistry`: `pin(id)`, `unpin(id)`,
+  `mark_used(id, *, now=None)`. `upsert(ref, *, now=None)`
+  auto-stamps `last_used_at` and preserves `pinned` across
+  merges.
+- **Slice 19x-d (#4):** `Agent365Adapter.prune_conversations() → int`
+  — reads `self._active_sessions.keys()` for the skip set, calls
+  the registry's `prune_old_entries` with
+  `extra.conversations_prune_max_age_days` (default 30 days),
+  persists when anything drops, logs the count. One-shot;
+  operators wire from cron via Hermes' `cronjob_tools`.
+  `mark_used` calls added to every outbound path (`send`,
+  `_send_proactive`, `send_typing`, `send_image`, `edit_message`)
+  so conversations with outbound-only traffic resist prune
+  correctly.
+
+### Test count
+
+720 → 769 (+49 across the four slices). Ruff clean throughout.
+
+### Deferred (separately tracked)
+
+- **Path B proactive send** (BF S2S outbound via Azure Bot
+  Service) — gated on #16.
+- **Built-in periodic prune loop** — explicitly out of scope
+  per #4's "less moving machinery" framing. Operators run
+  `await adapter.prune_conversations()` from cron at their
+  preferred cadence.
+
 ## [0.4.1] — 2026-05-12
 
 Patch release: documentation accuracy pass for v0.4.0 + CI workflow
