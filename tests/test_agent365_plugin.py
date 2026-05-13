@@ -1735,6 +1735,284 @@ class TestConversationRegistry:
         assert leftovers == []
 
 
+# ---------------------------------------------------------------------------
+# Slice 19x-c (#4): prune_old_entries + pin/unpin + mark_used
+# ---------------------------------------------------------------------------
+
+
+class TestPruneOldEntries:
+    """ConversationRegistry pruning semantics — mirrors SessionStore.prune_old_entries."""
+
+    def _reg_with(self, entries: list[dict]) -> Any:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        for e in entries:
+            ref = ConversationRef(
+                conversation_id=e["id"],
+                service_url=e.get("service_url", f"https://{e['id']}/"),
+                chat_type=e.get("chat_type", "personal"),
+                last_used_at=e.get("last_used_at"),
+                pinned=e.get("pinned", False),
+            )
+            # Bypass upsert's auto-stamp by inserting directly so tests
+            # can pin specific timestamps (including None).
+            reg._by_id[ref.conversation_id] = ref
+        return reg
+
+    def test_drops_stale_keeps_recent(self) -> None:
+        reg = self._reg_with(
+            [
+                {"id": "stale", "last_used_at": 1000.0},
+                {"id": "recent", "last_used_at": 999_000.0},
+            ]
+        )
+        # now = 1_000_000; max_age 10 days -> cutoff = 1_000_000 - 864_000 = 136_000.
+        # stale=1000 < 136_000 → drop.
+        # recent=999_000 >= 136_000 → keep.
+        dropped = reg.prune_old_entries(max_age_days=10, now=1_000_000.0)
+        assert dropped == 1
+        assert "stale" not in reg
+        assert "recent" in reg
+
+    def test_skip_active_session_keys(self) -> None:
+        reg = self._reg_with(
+            [
+                {"id": "active-conv", "last_used_at": 1000.0},  # ancient + active
+            ]
+        )
+        dropped = reg.prune_old_entries(
+            max_age_days=10,
+            active_session_keys={"active-conv"},
+            now=1_000_000.0,
+        )
+        assert dropped == 0
+        assert "active-conv" in reg
+
+    def test_skip_pinned(self) -> None:
+        reg = self._reg_with(
+            [
+                {"id": "ancient-pinned", "last_used_at": 1000.0, "pinned": True},
+                {"id": "ancient-unpinned", "last_used_at": 1000.0, "pinned": False},
+            ]
+        )
+        dropped = reg.prune_old_entries(max_age_days=10, now=1_000_000.0)
+        assert dropped == 1
+        assert "ancient-pinned" in reg
+        assert "ancient-unpinned" not in reg
+
+    def test_skip_when_last_used_at_is_none(self) -> None:
+        # Defensive: schema-migrated entries without a timestamp shouldn't
+        # be insta-dropped on the first prune.
+        reg = self._reg_with(
+            [
+                {"id": "no-stamp", "last_used_at": None},
+            ]
+        )
+        dropped = reg.prune_old_entries(max_age_days=10, now=1_000_000.0)
+        assert dropped == 0
+        assert "no-stamp" in reg
+
+    def test_active_session_keys_none_is_treated_as_empty(self) -> None:
+        reg = self._reg_with([{"id": "stale", "last_used_at": 1000.0}])
+        dropped = reg.prune_old_entries(
+            max_age_days=10, active_session_keys=None, now=1_000_000.0
+        )
+        assert dropped == 1
+
+    def test_returns_count_of_dropped(self) -> None:
+        reg = self._reg_with(
+            [
+                {"id": "s1", "last_used_at": 1000.0},
+                {"id": "s2", "last_used_at": 1000.0},
+                {"id": "s3", "last_used_at": 1000.0},
+                {"id": "keep", "last_used_at": 999_000.0},
+            ]
+        )
+        assert reg.prune_old_entries(max_age_days=10, now=1_000_000.0) == 3
+        # Idempotent: re-running drops nothing.
+        assert reg.prune_old_entries(max_age_days=10, now=1_000_000.0) == 0
+
+    def test_max_age_zero_drops_everything_with_stamp(self) -> None:
+        # Useful as a "drop all timestamped" knob; entries without a
+        # stamp still survive (defensive default).
+        reg = self._reg_with(
+            [
+                {"id": "a", "last_used_at": 999_999.99},
+                {"id": "b", "last_used_at": None},
+            ]
+        )
+        dropped = reg.prune_old_entries(max_age_days=0, now=1_000_000.0)
+        assert dropped == 1
+        assert "a" not in reg
+        assert "b" in reg
+
+
+class TestPinUnpin:
+    def test_pin_marks_entry_and_returns_true(self) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(ConversationRef(conversation_id="c1", service_url="https://x/"))
+        assert reg.pin("c1") is True
+        assert reg.get("c1").pinned is True
+
+    def test_pin_returns_false_for_unknown(self) -> None:
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        reg = ConversationRegistry()
+        assert reg.pin("nope") is False
+
+    def test_unpin_clears_flag(self) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(
+            ConversationRef(conversation_id="c1", service_url="https://x/", pinned=True)
+        )
+        assert reg.unpin("c1") is True
+        assert reg.get("c1").pinned is False
+
+    def test_pinned_survives_round_trip_through_disk(self, tmp_path: Path) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(ConversationRef(conversation_id="c1", service_url="https://x/"))
+        reg.pin("c1")
+        path = tmp_path / "convs.json"
+        reg.save(path)
+        reloaded = ConversationRegistry.load(path)
+        assert reloaded.get("c1").pinned is True
+
+    def test_old_payload_without_pinned_field_defaults_to_false(self) -> None:
+        # Backward-compat: registries persisted before slice 19x-c had
+        # no `pinned` / `last_used_at` keys. Load must tolerate that.
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        old_payload = {
+            "schema": 1,
+            "conversations": [
+                {
+                    "conversation_id": "c1",
+                    "service_url": "https://x/",
+                    "chat_type": "personal",
+                    "raw": {},
+                    # No pinned, no last_used_at
+                }
+            ],
+        }
+        reg = ConversationRegistry.from_payload(old_payload)
+        ref = reg.get("c1")
+        assert ref is not None
+        assert ref.pinned is False
+        assert ref.last_used_at is None
+
+    def test_upsert_preserves_existing_pinned_when_incoming_unpinned(self) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(
+            ConversationRef(conversation_id="c1", service_url="https://x/", pinned=True)
+        )
+        # Re-upsert with pinned=False (default) — must NOT unpin.
+        reg.upsert(
+            ConversationRef(
+                conversation_id="c1", service_url="https://x/", pinned=False
+            )
+        )
+        assert reg.get("c1").pinned is True
+
+
+class TestMarkUsedAndUpsertTimestamps:
+    def test_upsert_sets_last_used_at_from_now_kwarg(self) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(
+            ConversationRef(conversation_id="c1", service_url="https://x/"),
+            now=42.0,
+        )
+        assert reg.get("c1").last_used_at == 42.0
+
+    def test_upsert_merge_refreshes_last_used_at(self) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(
+            ConversationRef(conversation_id="c1", service_url="https://x/"),
+            now=100.0,
+        )
+        reg.upsert(
+            ConversationRef(conversation_id="c1", service_url="https://x/"),
+            now=200.0,
+        )
+        assert reg.get("c1").last_used_at == 200.0
+
+    def test_mark_used_bumps_timestamp_without_other_changes(self) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(
+            ConversationRef(
+                conversation_id="c1",
+                service_url="https://x/",
+                chat_name="original",
+            ),
+            now=100.0,
+        )
+        result = reg.mark_used("c1", now=500.0)
+        ref = reg.get("c1")
+        assert result is True
+        assert ref.last_used_at == 500.0
+        assert ref.chat_name == "original"
+
+    def test_mark_used_returns_false_for_unknown(self) -> None:
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        reg = ConversationRegistry()
+        assert reg.mark_used("nope") is False
+
+    def test_last_used_at_round_trips_through_disk(self, tmp_path: Path) -> None:
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        reg.upsert(
+            ConversationRef(conversation_id="c1", service_url="https://x/"),
+            now=12345.6789,
+        )
+        path = tmp_path / "convs.json"
+        reg.save(path)
+        reloaded = ConversationRegistry.load(path)
+        assert reloaded.get("c1").last_used_at == 12345.6789
+
+
 class TestAdapterPersistsRegistry:
     def test_inbound_writes_registry_to_disk(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
