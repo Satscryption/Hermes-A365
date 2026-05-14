@@ -1134,6 +1134,25 @@ reach that the sibling structurally cannot deliver.
   az account show --query "{tenantId:tenantId, name:name}" -o table
   ```
 
+- **`Microsoft.BotService` resource provider registered on the
+  subscription.** ⚠️ Fresh Azure subscriptions ship with this
+  provider `NotRegistered`; `az bot create` will fail until you
+  register it. Confirmed against a fresh sub on 2026-05-14 —
+  deterministic blocker, not a quirky propagation issue. One-line
+  fix:
+
+  ```bash
+  az provider register --namespace Microsoft.BotService --wait
+  # Verify:
+  az provider show --namespace Microsoft.BotService \
+      --query "registrationState" -o tsv
+  # Expect: Registered
+  ```
+
+  Idempotent + free + ~2 min propagation. Slice 20a's
+  `bot-service verify` should probe this; `bot-service create --apply`
+  should auto-register before attempting `az bot create`.
+
 Path B authentication shape: Microsoft's
 [provision-azure-bot-service-manually](https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/provision-azure-bot-service-manually)
 doc lists three options — Client Secret (single tenant), User-Assigned
@@ -1147,6 +1166,7 @@ Record these once, used throughout §11:
 | Var | Example | Meaning |
 |---|---|---|
 | `<azure-rg>` | `hermes-a365-bots` | Resource group for the bot resource |
+| `<region>` | `westeurope` | Azure region for the resource group's metadata residency. RG location is required; bot resource itself stays `--location global` regardless |
 | `<azure-bot-name>` | `hermes-inbox-helper-bot` | Bot resource name. 4–42 chars, `-`, `a–z`, `A–Z`, `0–9`, `_` only (per [`az bot create` reference](https://learn.microsoft.com/en-us/cli/azure/bot#az-bot-create)) |
 | `<tunnel-url>` | `https://apollo-….trycloudflare.com` | Same tunnel URL you used in §9d.4 |
 | `<blueprint-app-id>` | `<guid>` | The MSA App ID from §3 (`A365_APP_ID` in `~/.hermes/.env`) |
@@ -1156,11 +1176,16 @@ Record these once, used throughout §11:
 Per the [`az bot create` reference](https://learn.microsoft.com/en-us/cli/azure/bot#az-bot-create):
 
 ```bash
-# Resource group (skip if you already have one earmarked).
-az group create --name <azure-rg> --location global
+# Resource group (skip if you already have one earmarked). The RG
+# --location is a regional spec for the group's metadata residency
+# (e.g. westeurope, eastus, uksouth); pick a region near you. It is
+# NOT "global" — global is reserved for resources, not groups.
+az group create --name <azure-rg> --location <region>
 
 # Bot resource. --app-type SingleTenant + --appid + --tenant-id binds
-# the bot identity to the blueprint Entra app from Path A's §3.
+# the bot identity to the blueprint Entra app from Path A's §3. The
+# bot itself stays --location global (Bot Service is a global Azure
+# resource; the RG's region is just metadata residency).
 az bot create \
     --resource-group <azure-rg> \
     --name <azure-bot-name> \
