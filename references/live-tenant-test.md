@@ -6,9 +6,10 @@ on first run; expect ~30–45 minutes including the M365 Admin Centre
 approval step (longer if the tenant is on macOS 26 — see §3's
 device-code-volume failure mode).
 
-**Snapshot:** 2026-05-12 (rounds 1–8 incorporated + slice 19u-a
-walkthrough). Tracks the current `main` branch; specific slices are
-referenced inline where they matter to operator behaviour.
+**Snapshot:** 2026-05-14 (rounds 1–8 incorporated + slice 19u-a
+walkthrough; §11 Path B draft added 2026-05-14, un-walked). Tracks
+the current `main` branch; specific slices are referenced inline
+where they matter to operator behaviour.
 
 > ## Scope: Path A (AI Teammate) only
 >
@@ -28,21 +29,18 @@ referenced inline where they matter to operator behaviour.
 >
 > **Path B (Custom Engine Agent + Azure Bot Service)** — for
 > Copilot Chat agents picker and Word/Excel/PowerPoint/Outlook
-> side-panel surfacing — is **not yet walked**. The emitter
-> (`hermes a365 publish --copilot-chat`) shipped 2026-05-12
-> (slice 19u-a), but the additional Azure-side prerequisites
-> (provision Azure subscription, register the blueprint app as
-> an Azure Bot Service resource, enable the Microsoft Teams
-> channel) surfaced during the 2026-05-12 walkthrough and
-> haven't been validated end-to-end yet. The Path B steps will
-> be added to this playbook (or split out into a sibling
-> playbook) when [#16](https://github.com/satscryption/Hermes-A365/issues/16)
-> walks green. Until then, follow Microsoft's
-> [Custom Engine Agents deployment guide](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/create-deploy-agents-sdk)
-> for the Azure Bot Service half; everything from §0 to §6 of this
-> playbook still applies to Path B's blueprint registration
-> (Path B reuses Path A's Entra app + service principal as the
-> bot identity).
+> side-panel surfacing — has a **draft runbook in §11**, transcribed
+> 2026-05-14 from Microsoft docs but **not yet walked end-to-end**
+> against a live Azure subscription. Path B reuses Path A's
+> blueprint Entra app + service principal as the bot identity, so
+> §§0–6 still apply unchanged; §11 layers Azure Bot Service
+> registration + Microsoft Teams channel enable + Custom Engine
+> Agent manifest upload on top of that. Expect to find surprises on
+> the first live walk (issue
+> [#28](https://github.com/satscryption/Hermes-A365/issues/28)
+> tracks the Phase 2 walkthrough + findings; when it lands green,
+> [#16](https://github.com/satscryption/Hermes-A365/issues/16) closes
+> as a side effect).
 >
 > Note: if you only want generic Teams chat (DM / channels / group
 > / threading / file attachments) and don't need M365 directory
@@ -1076,3 +1074,353 @@ record — every row is now closed (the architectural one too).
 | 17 | `mutator.py` (architectural) | ~~`subprocess.run(capture_output=True)` blocks until completion, so device-code prompts and admin-consent flows from `a365 setup *` are invisible.~~ **Fixed in slice 18j** — replaced with `_run_streaming` (line-buffered Popen + `select.select` deadline + stderr→stdout merge). Device-code prompts surface in real time; round-6 (2026-05-07) drove `register --apply` end-to-end through the wrapper this way. The 900 s timeout from slice 18i remains as the per-step ceiling. |
 | 18 | `setup permissions bot` interaction | **Resolved upstream — intended behaviour with cosmetic logging gap.** Filed with Microsoft as [microsoft/Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402); reply on 2026-05-05 from @sellakumaran clarifies: (a) the blueprint SP is **supposed to** receive only the `Agent365Observability` S2S app-role assignment — Messaging Bot API and Power Platform API are configured via delegated OAuth2 grants only, the misleading `Configuring S2S app role assignments...` header will be reworded; (b) the mid-run "non-admin user" message is a real bug but cosmetic — fires on `AppRoleAssignment.ReadWrite.All` consent state, not a role check, and the PowerShell fallback acquires the token interactively, so a run that exits 0 completed correctly; (c) the unconditional `Bot API permissions configured successfully` log will be gated on the actual S2S outcome. **All three fixes shipped in 1.1.174** (verified 2026-05-07 via NuGet changelog scan). **Do not** manually `POST /servicePrincipals/<sp>/appRoleAssignments` for Messaging Bot / Power Platform — that would grant privileges the system doesn't intend. Operator-side query (informational only): `az rest --method GET --url "https://graph.microsoft.com/v1.0/servicePrincipals/<blueprint-sp-id>/appRoleAssignments" --query "value[].{resource:resourceDisplayName, role:appRoleId}" -o table` — expect exactly one row (`Agent365Observability`). |
 | 19 | `register.py` / GA CLI persistence regression | After `setup blueprint` claims success, `agentBlueprintClientSecret` is `null` on disk on macOS / Linux. **Wrapper-side coverage in slice 19s** — `register.py` detects + warns by default and runs `az ad app credential reset --append` + patches the generated config + `chmod 0600` when `--auto-recover-secret` is set. Layer 1 fix `9e0187e`; live-found follow-up `4b1a2e8` extracts JSON past the `az -o json` credential-protection WARNING that `_run_streaming`'s stderr→stdout merge dumped into stdout. Filed upstream as [microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408); reproduces 100% across CLI 1.1.171 → 1.1.174. |
+
+## 11. Path B — Custom Engine Agent + Azure Bot Service (Copilot Chat surfacing)
+
+> ## ⚠️ Draft section, un-walked
+>
+> §11 was transcribed 2026-05-14 from Microsoft's published docs
+> (cited inline) but has not been validated end-to-end against a live
+> Azure subscription. Treat every `az` argv shape and admin-portal UI
+> path as best-effort. Expect to find surprises on the first walk —
+> the same pattern that shaped Path A's slices 18a–w from speculative
+> assumptions to wrapped behaviour. Issue
+> [#28](https://github.com/satscryption/Hermes-A365/issues/28)
+> tracks the Phase 2 live walkthrough; findings land in §11.10 + the
+> wrapper-bug history table.
+>
+> Path A (§§0–10) is the validated path. Use Path B at your own pace.
+
+Path B layers Azure Bot Service registration on top of Path A's
+blueprint work. The blueprint Entra app from §3 + its client secret
+(per §3's `--auto-recover-secret`) + its service principal stay
+exactly as they are — Path B reuses them as the Bot Service identity.
+Operators running both paths share one Hermes install and one
+`/api/messages` endpoint.
+
+### 11.1 — What this gets you
+
+- Agent surfaces in M365 Copilot Chat agents picker (`@` mention).
+- Agent surfaces in Word / Excel / PowerPoint / Outlook side-panels
+  inside Copilot.
+- Microsoft Search invokes (`search`) once #18 (invoke handlers) lands.
+- Classic Teams reach (DM / group / channel) as a side effect of the
+  Microsoft Teams channel on Bot Service.
+
+If plain Teams chat is all you want, the sibling
+[`plugins/platforms/teams/`](https://github.com/NousResearch/hermes-agent/tree/main/plugins/platforms/teams)
+adapter is the right tool — classic Bot Framework, no Azure / M365
+agentic-user setup. Path B's defensible value is the Copilot-fabric
+reach that the sibling structurally cannot deliver.
+
+### 11.2 — Prerequisites (additive to Path A)
+
+- ✅ Path A §§3–6 complete: blueprint Entra app registered, client
+  secret recovered (`--auto-recover-secret`), service principal in
+  place, agent already published once (the secret is required for
+  Bot Service Client Secret authentication below).
+- **Azure subscription** in the same Entra tenant as your M365
+  tenant. Free Bot Service SKU (`F0`) is sufficient — billed at $0/mo
+  for the registration-only shape we use here.
+- **Contributor** (or higher) RBAC on the subscription or the
+  resource group you plan to use. *[Phase 2: confirm minimum-sufficient
+  role; Microsoft's manual-deployment doc doesn't state this
+  explicitly.]*
+- `az` CLI ≥ 2.55 signed in to the same tenant + with the right
+  subscription selected:
+
+  ```bash
+  az account set --subscription <subscription-id>
+  az account show --query "{tenantId:tenantId, name:name}" -o table
+  ```
+
+Path B authentication shape: Microsoft's
+[provision-azure-bot-service-manually](https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/provision-azure-bot-service-manually)
+doc lists three options — Client Secret (single tenant), User-Assigned
+Managed Identity, Federated Credentials. Path A's blueprint app
+already has a single-tenant client secret from §3, so **Client Secret
+(Single tenant)** is the natural pairing. The other two would require
+additional Entra setup beyond Path A.
+
+Record these once, used throughout §11:
+
+| Var | Example | Meaning |
+|---|---|---|
+| `<azure-rg>` | `hermes-a365-bots` | Resource group for the bot resource |
+| `<azure-bot-name>` | `hermes-inbox-helper-bot` | Bot resource name. 4–42 chars, `-`, `a–z`, `A–Z`, `0–9`, `_` only (per [`az bot create` reference](https://learn.microsoft.com/en-us/cli/azure/bot#az-bot-create)) |
+| `<tunnel-url>` | `https://apollo-….trycloudflare.com` | Same tunnel URL you used in §9d.4 |
+| `<blueprint-app-id>` | `<guid>` | The MSA App ID from §3 (`A365_APP_ID` in `~/.hermes/.env`) |
+
+### 11.3 — Provision the Azure Bot resource
+
+Per the [`az bot create` reference](https://learn.microsoft.com/en-us/cli/azure/bot#az-bot-create):
+
+```bash
+# Resource group (skip if you already have one earmarked).
+az group create --name <azure-rg> --location global
+
+# Bot resource. --app-type SingleTenant + --appid + --tenant-id binds
+# the bot identity to the blueprint Entra app from Path A's §3.
+az bot create \
+    --resource-group <azure-rg> \
+    --name <azure-bot-name> \
+    --app-type SingleTenant \
+    --appid <blueprint-app-id> \
+    --tenant-id <tenant-id> \
+    --endpoint <tunnel-url>/api/messages \
+    --sku F0 \
+    --location global
+```
+
+⚠️ **Phase 1 finding — argv shape differs from #28's anticipated draft.**
+Issue #28 anticipated `--kind registration --msa-app-id ...
+--msa-app-type SingleTenant`. The actual GA argv per Microsoft's
+reference doc is what you see above: no `--kind` parameter exists,
+the MSA App ID flag is `--appid` (not `--msa-app-id`), and the
+tenant flag is `--tenant-id` (not `--msa-app-tenant-id`). Phase 2
+walk: re-confirm against the operator's `az` CLI version and bump
+this note if Microsoft changes the surface.
+
+Verify:
+
+```bash
+az bot show --resource-group <azure-rg> --name <azure-bot-name>
+```
+
+Expect a JSON object with `properties.endpoint` = your tunnel URL +
+`/api/messages` and `properties.msaAppId` = `<blueprint-app-id>`.
+
+### 11.4 — Enable the Microsoft Teams channel
+
+The Microsoft Teams channel on Bot Service is what makes Copilot
+Chat (and classic Teams) route activities to `/api/messages`. Per
+[Microsoft's manual deployment doc](https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/deploy-azure-bot-service-manually#deploy-to-microsoft-365):
+"Ensure that your Azure Bot resource has the **Microsoft Teams**
+channel added under **Channels**."
+
+```bash
+az bot msteams create \
+    --resource-group <azure-rg> \
+    --name <azure-bot-name>
+```
+
+⚠️ **Preview status.** `az bot msteams` is in Azure CLI **Preview**
+per the [reference](https://learn.microsoft.com/en-us/cli/azure/bot/msteams).
+Argv is stable across recent releases; behaviour may shift. The
+portal path (Azure Portal → your Bot resource → Channels → Microsoft
+Teams) is the GA fallback.
+
+Verify:
+
+```bash
+az bot msteams show --resource-group <azure-rg> --name <azure-bot-name>
+```
+
+Optional: enable calling on the channel if your agent needs Teams
+voice (`--enable-calling --calling-web-hook https://.../calls`). Not
+required for Copilot Chat surfacing.
+
+### 11.5 — Re-point the messaging endpoint (when the tunnel URL changes)
+
+Quick tunnels (cloudflared) rotate their URL on every restart. After
+your tunnel comes up at a new URL, update both registrations:
+
+```bash
+# Azure side (Path B).
+az bot update \
+    --resource-group <azure-rg> \
+    --name <azure-bot-name> \
+    --endpoint <new-tunnel-url>/api/messages
+
+# M365 / MCP Platform side (Path A). Run if you're also operating Path A.
+hermes-a365 activity-bridge update-endpoint \
+    --agent-name "<display-name>" \
+    --url <new-tunnel-url>/api/messages --apply
+```
+
+The two endpoint registrations are independent — `az bot update`
+talks to Azure Resource Manager, `activity-bridge update-endpoint`
+talks to M365 MCP Platform via the GA `a365` CLI. Both can stay
+active and pointed at the same `/api/messages`; the Hermes plugin
+processes inbound traffic from either path identically (`agent365`
+adapter sits behind one FastAPI route).
+
+### 11.6 — Publish the Custom Engine Agent manifest
+
+Emit the `manifestVersion: 1.21+` zip using the `--copilot-chat`
+flag (slice 19u-a, v0.4.0+):
+
+```bash
+hermes-a365 publish \
+    --agent-name "<display-name>" \
+    --tenant-id <tenant-id> \
+    --copilot-chat \
+    --apply
+```
+
+The wrapper post-processes the GA CLI's emitted zip: sets
+`manifestVersion: "1.21"`, populates `bots[]` referencing
+`<blueprint-app-id>`, adds the `copilotAgents.customEngineAgents`
+block, strips `agenticUserTemplates`. The 19r-c `name.short`
+truncation to ≤30 chars runs against this zip too. Output lands at
+`~/manifest/manifest.copilot-chat.zip` (or `~/manifest/manifest.zip`
+when run without `--aiteammate`).
+
+⚠️ **Running A + B simultaneously hits Teams App Catalog
+duplicate-id rejection.** When you publish both the AI Teammate zip
+(Path A §6) and the Custom Engine Agent zip (§11.6) against the same
+tenant, the second upload is rejected because both zips carry the
+same `manifest.id` (= `<blueprint-app-id>` by transformer default).
+[#26](https://github.com/satscryption/Hermes-A365/issues/26) tracks
+adding `--manifest-id auto|<guid>` to mint a fresh catalog id while
+keeping `bots[0].botId` = `<blueprint-app-id>`. Until that ships,
+walkthrough workaround: open the zip, edit `manifest.json`'s `id`
+field to a fresh UUID (`python -c 'import uuid; print(uuid.uuid4())'`),
+re-zip, then upload.
+
+### 11.7 — Upload via Microsoft Admin Portal
+
+Per [Microsoft's manual-deployment doc](https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/deploy-azure-bot-service-manually#deploy-to-microsoft-365):
+
+1. Navigate to the [Microsoft Admin Portal](https://admin.microsoft.com)
+   (MAC).
+2. **Settings** → **Integrated Apps** → **Upload custom apps**.
+3. Select the `manifest.copilot-chat.zip` from §11.6.
+4. Confirm the per-user app permission policy that governs this user
+   admits the new app (Teams Admin Center → Teams apps → Permission
+   policies → check the policy assigned to the test user).
+
+⚠️ **Phase 1 uncertainty — upload destination.** Issue #28 anticipated
+upload via Teams Admin Center. Microsoft's manual-deployment doc says
+MAC Settings → Integrated Apps. The Path A walkthroughs (round-8,
+2026-05-11; slice 19u-a, 2026-05-12) used MAC → Agents → Upload
+custom agent. The three surfaces share an underlying catalog so the upload
+likely lands either way, but the affordances differ. Phase 2: walk
+each path and pin which one actually surfaces the Custom Engine
+Agent in Copilot Chat.
+
+⚠️ **App permission policy is the silent gate.** A successful zip
+upload is necessary but not sufficient — without an "Allow all apps"
+policy (or a custom policy admitting your specific app) assigned to
+your test user, the agent will not appear in their Copilot Chat
+agents picker. Phase 2: capture the exact PowerShell or Teams admin
+UI path. Path A's `A365_ALLOW_ALL_USERS=true` (§9d.2) governs the
+gateway-side allowlist and is unrelated to this Teams policy.
+
+### 11.8 — Verify in M365 Copilot Chat
+
+After a short propagation delay (Microsoft's deploy doc says "after
+a short period of time"; *Phase 2: capture actual minutes against
+satscryption tenant*):
+
+1. Open M365 Copilot Chat at
+   [https://m365.cloud.microsoft](https://m365.cloud.microsoft) or
+   the Copilot Chat side-panel in any Microsoft 365 app.
+2. Click the agents picker (icon to the left of the prompt box).
+3. The agent should appear under **Built for your org** (or **Agents
+   from your organization**) with the `name.short` from §11.6's
+   manifest.
+4. Click it. Type a test prompt.
+
+Acceptance gates — Hermes side:
+
+- [ ] Hermes gateway log shows the inbound activity arriving on
+      `agent365`: `Agent365Adapter.handle_message(...)` fires.
+- [ ] The activity carries a `channelData` shape consistent with the
+      Microsoft Teams channel (Path B inbound semantically matches
+      Path A's `msteams` channel — same BF activity protocol).
+- [ ] The agent loop runs and the reply lands in Copilot Chat within
+      ~10 s. Replies > 2 s exercise BF streaming via
+      `Agent365Adapter.edit_message` (slices 19s + 19s-bis, #3 closed).
+
+Acceptance gates — Microsoft side:
+
+- [ ] Bot resource's **Test in Web Chat** affordance (Azure Portal
+      → your Bot resource → Test in Web Chat) round-trips a message
+      end-to-end. This is an independent verification path that
+      bypasses Copilot Chat and exercises just Bot Service →
+      `/api/messages` → reply.
+
+Common failure shapes (Phase 1 prediction; Phase 2 confirm):
+
+- **Agent doesn't appear in picker** — most likely the app permission
+  policy (§11.7) hasn't propagated. Try a fresh browser session +
+  `Ctrl-R` after 10 min. If still missing, check Teams Admin Center
+  → Manage apps for the uploaded app's status.
+- **Agent appears but messages don't arrive** — check
+  `az bot show` for the current `properties.endpoint`. Quick tunnels
+  rotate; if the URL drifted, run §11.5 to re-point. Verify the
+  tunnel is reachable with `curl <tunnel-url>/api/messages` (expect
+  401 from the gateway's JWT validation, not 502 / connection-refused).
+- **JWT validation failure in the gateway log** — Path B inbound
+  traffic may carry a different issuer / audience shape than Path A.
+  Path A validates against the agentic-user T2 audience; Path B
+  validates against the classic BF audience (`https://api.botframework.com`).
+  *Phase 2: capture the exact failure mode + fix any wrapper-side gap*.
+
+### 11.9 — Tear down (Path B only; leaves Path A intact)
+
+To remove the Azure-side Bot Service registration while keeping the
+blueprint Entra app for Path A's continued use:
+
+```bash
+# Remove the Microsoft Teams channel first (Bot Service deletes are
+# happier when channels are gone first).
+az bot msteams delete --resource-group <azure-rg> --name <azure-bot-name>
+
+# Remove the Bot resource itself.
+az bot delete --resource-group <azure-rg> --name <azure-bot-name>
+
+# Optionally remove the resource group if it was created solely for
+# this bot.
+# az group delete --name <azure-rg> --yes --no-wait
+```
+
+The Teams App Catalog entry from §11.7 also needs cleanup —
+[Microsoft Admin Portal](https://admin.microsoft.com) → **Settings**
+→ **Integrated Apps** → select the app → **Remove**.
+
+Path A's blueprint Entra app + service principal + agentic-user
+instances remain untouched. To tear down both paths, run §11.9
+first, then §10.
+
+Phase 2 walk should capture:
+
+- Whether `az bot delete` propagates immediately or has a soft-delete
+  retention window (Path A's AI Teammate Admin-Centre Delete is
+  30-day soft-delete).
+- Whether removing the Teams App Catalog entry is sufficient to
+  remove the agent from per-user pickers, or if a per-user policy
+  update is also needed.
+- Whether the Bot Service `--purge-orphans` concept (analogous to
+  Path A's `cleanup --purge-orphans`) applies to anything Azure-side
+  — channel registrations, App Insights resources, etc.
+
+### 11.10 — Phase 2 walkthrough log (TBD)
+
+Intentionally blank until the first live walk against an Azure
+subscription. Findings land here, mirroring the wrapper-bug fix
+history's row-per-surprise shape (file/area, symptom, resolution or
+upstream-issue link). When this fills out and #28 closes, the §11
+banner at the top should be retired and the `Snapshot:` line at the
+top of the playbook bumped.
+
+### Sources
+
+- [Custom Engine Agents for Microsoft 365 (overview)](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/overview-custom-engine-agent)
+  — manifest 1.21+ requirement, streaming ordering rules,
+  channel list.
+- [Create and Deploy a Custom Engine Agent with M365 Agents SDK](https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/create-deploy-agents-sdk)
+  — links into the deployment chain.
+- [Deploy your agent to Azure manually](https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/deploy-azure-bot-service-manually)
+  — the canonical manual deployment doc; source of §11.4 + §11.7's
+  exact wording on channel + upload steps.
+- [Provision your Azure Bot Service resources manually](https://learn.microsoft.com/en-us/microsoft-365/agents-sdk/provision-azure-bot-service-manually)
+  — authentication-type matrix (Client Secret / Managed Identity /
+  Federated Credentials).
+- [`az bot create` reference](https://learn.microsoft.com/en-us/cli/azure/bot#az-bot-create)
+  — canonical argv for §11.3.
+- [`az bot msteams` reference](https://learn.microsoft.com/en-us/cli/azure/bot/msteams)
+  — canonical argv for §11.4.
+- [Custom Engine Agent emitter (slice 19u-a)](https://github.com/satscryption/Hermes-A365/blob/main/src/hermes_a365/publish.py)
+  — Hermes-A365 side of the §11.6 manifest emission.
