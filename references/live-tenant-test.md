@@ -53,10 +53,12 @@ referenced inline where they matter to operator behaviour.
 > **Round history:** rounds 1–6 ran against this tenant between
 > 2026-05-05 and 2026-05-07. Each round surfaced a discrete bug
 > bundle that landed as slices 18i–19s. The runbook's ⚠️ callouts
-> capture findings still active against current GA (e.g. the
-> [#408](https://github.com/microsoft/Agent365-devTools/issues/408)
-> persistence regression in §3, which reproduces 100% across CLI
-> 1.1.171 → 1.1.174); the **[Wrapper-bug fix history](#wrapper-bug-fix-history-rounds-16)**
+> capture findings still active against current GA and fixed-upstream
+> deltas. The [#408](https://github.com/microsoft/Agent365-devTools/issues/408)
+> persistence regression in §3 reproduced 100% across CLI
+> 1.1.171 → 1.1.174; Microsoft closed it in the next build line, and
+> doctor now treats 1.1.178 as the fixed-version floor. The
+> **[Wrapper-bug fix history](#wrapper-bug-fix-history-rounds-16)**
 > section at the end summarises the wrapper-side fix history. If
 > you hit something the runbook doesn't predict, that's a
 > high-signal finding — log it.
@@ -80,7 +82,8 @@ referenced inline where they matter to operator behaviour.
   hard-codes the same default (`probe_custom_client_app`); if your
   operator named the app differently, rename in Entra rather than
   registering a duplicate.
-- Local prereqs: `a365` CLI ≥ 1.0.0 (verified GA: 1.1.171, 1.1.174), `az` CLI
+- Local prereqs: `a365` CLI ≥ 1.1.178 recommended (verified affected:
+  1.1.171, 1.1.174; doctor warns below the fixed-version floor), `az` CLI
   ≥ 2.55.0 signed in to the target tenant (`az login --tenant <tenant>`),
   `pwsh` 7+ on PATH (install via `brew install powershell` — the cask
   variant is deprecated), an OS keychain backend (macOS Security or
@@ -212,13 +215,16 @@ in order. Each step may emit its own device-code prompt — see the
 "device-code volume" caveat below. The wrapper streams every prompt
 to stdout the moment the CLI prints it.
 
-**Use `--auto-recover-secret` to auto-handle the
-`agentBlueprintClientSecret` persistence regression** (see "Failure
-modes" below): when set, after a successful apply the wrapper detects
-the broken state and runs `az ad app credential reset --append` +
-patches the generated config + tightens to mode `0600`. Off by
-default; without the flag the wrapper prints a paste-ready recovery
-hint and exits 0.
+**Use `--auto-recover-secret` to auto-handle the historical
+`agentBlueprintClientSecret` persistence regression on older CLI
+builds** (see "Failure modes" below): when set, after a successful
+apply the wrapper detects the broken state and runs
+`az ad app credential reset --append` + patches the generated config +
+tightens to mode `0600`. Off by default; without the flag the wrapper
+prints a paste-ready recovery hint and exits 0. On CLI ≥ 1.1.178 the
+detector should not fire on a clean run; keep the flag as a safety net
+only when doctor warns about an older CLI or you are deliberately
+testing the recovery path.
 
 ```bash
 hermes-a365 register \
@@ -237,16 +243,17 @@ is Windows-only). Treat that file as keychain-equivalent sensitivity.
 Failure modes to watch:
 
 - **`agentBlueprintClientSecret: null` on disk despite "Client secret
-  created successfully!"** — GA CLI persistence regression on
-  macOS / Linux. Reproduces 100% across rounds 3–6 (CLI 1.1.171
-  through 1.1.174). The credential really is minted on the Entra app
-  side; only the local persistence is broken. Filed upstream as
-  [microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408).
-  The wrapper's layer-1 detection (slice 19s) catches this and
-  surfaces a paste-ready recovery line; pass `--auto-recover-secret`
-  to fix it inline. If the warning fires post-apply, the on-disk
-  secret is null and downstream commands (`update-endpoint`,
-  bridge runtime) won't work without recovery.
+  created successfully!"** — historical GA CLI persistence regression
+  on macOS / Linux. Reproduces 100% across rounds 3–6 (CLI 1.1.171
+  through 1.1.174); Microsoft closed
+  [microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408)
+  in the next build line, and doctor warns below the fixed-version
+  floor (1.1.178). The wrapper's layer-1 detection (slice 19s) remains
+  as a safety net and surfaces a paste-ready recovery line; pass
+  `--auto-recover-secret` to fix it inline on older builds. If the
+  warning fires post-apply, the on-disk secret is null and downstream
+  commands (`update-endpoint`, bridge runtime) won't work without
+  recovery.
 - **Device-code volume on macOS 26** — `Failed to register persistent
   token cache. Authentication prompts may be repeated.` and `Browser
   authentication is not supported on this platform: macOS 26.4.1`
@@ -281,10 +288,11 @@ Failure modes to watch:
 - [ ] `a365.generated.config.json` exists and is **gitignored** (verify
       with `git check-ignore -v a365.generated.config.json`).
 - [ ] `agentBlueprintClientSecret` is populated in
-      `a365.generated.config.json`. If null, the wrapper's layer-1
-      `[warn]` line should have fired pointing at Microsoft#408 with
-      a paste-ready recovery. Re-run with `--auto-recover-secret` or
-      paste the suggested `az ad app credential reset --append`
+      `a365.generated.config.json`. On CLI ≥ 1.1.178 this should land
+      populated without wrapper recovery. If null, the wrapper's
+      layer-1 `[warn]` line should have fired pointing at Microsoft#408
+      with a paste-ready recovery. Re-run with `--auto-recover-secret`
+      or paste the suggested `az ad app credential reset --append`
       command, then patch the field manually.
 
 ## 4. consent — admin grant
@@ -1075,7 +1083,7 @@ record — every row is now closed (the architectural one too).
 | 16 | `references/a365-cli-reference.md:144` | ~~`brew install --cask powershell` is deprecated.~~ **Doc-fixed in slice 18s** — references doc now says `brew install powershell` (the formula) and notes the cask was renamed to `powershell@preview` and flagged for Gatekeeper failures. Snapshot also gained the macOS `DOTNET_ROOT` gotcha that bit the walkthrough. |
 | 17 | `mutator.py` (architectural) | ~~`subprocess.run(capture_output=True)` blocks until completion, so device-code prompts and admin-consent flows from `a365 setup *` are invisible.~~ **Fixed in slice 18j** — replaced with `_run_streaming` (line-buffered Popen + `select.select` deadline + stderr→stdout merge). Device-code prompts surface in real time; round-6 (2026-05-07) drove `register --apply` end-to-end through the wrapper this way. The 900 s timeout from slice 18i remains as the per-step ceiling. |
 | 18 | `setup permissions bot` interaction | **Resolved upstream — intended behaviour with cosmetic logging gap.** Filed with Microsoft as [microsoft/Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402); reply on 2026-05-05 from @sellakumaran clarifies: (a) the blueprint SP is **supposed to** receive only the `Agent365Observability` S2S app-role assignment — Messaging Bot API and Power Platform API are configured via delegated OAuth2 grants only, the misleading `Configuring S2S app role assignments...` header will be reworded; (b) the mid-run "non-admin user" message is a real bug but cosmetic — fires on `AppRoleAssignment.ReadWrite.All` consent state, not a role check, and the PowerShell fallback acquires the token interactively, so a run that exits 0 completed correctly; (c) the unconditional `Bot API permissions configured successfully` log will be gated on the actual S2S outcome. **All three fixes shipped in 1.1.174** (verified 2026-05-07 via NuGet changelog scan). **Do not** manually `POST /servicePrincipals/<sp>/appRoleAssignments` for Messaging Bot / Power Platform — that would grant privileges the system doesn't intend. Operator-side query (informational only): `az rest --method GET --url "https://graph.microsoft.com/v1.0/servicePrincipals/<blueprint-sp-id>/appRoleAssignments" --query "value[].{resource:resourceDisplayName, role:appRoleId}" -o table` — expect exactly one row (`Agent365Observability`). |
-| 19 | `register.py` / GA CLI persistence regression | After `setup blueprint` claims success, `agentBlueprintClientSecret` is `null` on disk on macOS / Linux. **Wrapper-side coverage in slice 19s** — `register.py` detects + warns by default and runs `az ad app credential reset --append` + patches the generated config + `chmod 0600` when `--auto-recover-secret` is set. Layer 1 fix `9e0187e`; live-found follow-up `4b1a2e8` extracts JSON past the `az -o json` credential-protection WARNING that `_run_streaming`'s stderr→stdout merge dumped into stdout. Filed upstream as [microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408); reproduces 100% across CLI 1.1.171 → 1.1.174. |
+| 19 | `register.py` / GA CLI persistence regression | After `setup blueprint` claims success, `agentBlueprintClientSecret` is `null` on disk on macOS / Linux. **Wrapper-side coverage in slice 19s** — `register.py` detects + warns by default and runs `az ad app credential reset --append` + patches the generated config + `chmod 0600` when `--auto-recover-secret` is set. Layer 1 fix `9e0187e`; live-found follow-up `4b1a2e8` extracts JSON past the `az -o json` credential-protection WARNING that `_run_streaming`'s stderr→stdout merge dumped into stdout. Filed upstream as [microsoft/Agent365-devTools#408](https://github.com/microsoft/Agent365-devTools/issues/408); reproduces 100% across CLI 1.1.171 → 1.1.174. **Issue #35 follow-up:** Microsoft closed #408 in the next build line; doctor now warns below 1.1.178 and keeps `--auto-recover-secret` as an opt-in safety net for older installs / regressions. |
 
 ## 11. Path B — Custom Engine Agent + Azure Bot Service (Copilot Chat surfacing)
 

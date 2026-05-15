@@ -9,12 +9,14 @@ from unittest.mock import patch
 import pytest
 
 from hermes_a365.doctor import (
+    A365_CLI_SECRET_FIX_MIN_VERSION_TEXT,
     CUSTOM_CLIENT_APP_DOCS,
     DEFAULT_CLIENT_APP_NAME,
     FRONTIER_PROGRAM_URL,
     DoctorReport,
     ProbeResult,
     overall_to_exit_code,
+    parse_a365_cli_version,
     probe_a365_cli,
     probe_az_cli,
     probe_custom_client_app,
@@ -41,7 +43,7 @@ class TestProbeA365Cli:
         assert "a365 not found" in r.detail
         assert "dotnet tool install" in r.detail
 
-    def test_present_returns_ok_with_version(self) -> None:
+    def test_old_version_warns_with_recovery_hint(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
             patch(
@@ -50,8 +52,48 @@ class TestProbeA365Cli:
             ),
         ):
             r = probe_a365_cli()
-        assert r.state == "ok"
+        assert r.state == "warn"
         assert "v1.1.171" in r.detail
+        assert A365_CLI_SECRET_FIX_MIN_VERSION_TEXT in r.detail
+        assert "--auto-recover-secret" in r.detail
+
+    def test_fixed_version_returns_ok(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value="1.1.178+abcdef",
+            ),
+        ):
+            r = probe_a365_cli()
+        assert r.state == "ok"
+        assert "1.1.178" in r.detail
+
+    def test_unknown_version_warns(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
+            patch("hermes_a365.doctor.safe_run", return_value="Agent 365 CLI"),
+        ):
+            r = probe_a365_cli()
+        assert r.state == "warn"
+        assert "could not confirm" in r.detail
+
+
+class TestParseA365CliVersion:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("1.1.178+abcdef", (1, 1, 178)),
+            ("Agent 365 Developer Tools CLI v1.1.171", (1, 1, 171)),
+            ("cliVersion: 1.1.174.9623", (1, 1, 174)),
+            ("Microsoft.Agents.A365.DevTools.Cli 1.1.124-preview", (1, 1, 124)),
+            ("version unknown", None),
+        ],
+    )
+    def test_extracts_semver(
+        self, text: str, expected: tuple[int, int, int] | None
+    ) -> None:
+        assert parse_a365_cli_version(text) == expected
 
 
 # ---------------------------------------------------------------------------

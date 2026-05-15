@@ -32,6 +32,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
 from dataclasses import asdict, dataclass, field
@@ -65,6 +66,16 @@ CUSTOM_CLIENT_APP_DOCS = (
 )
 FRONTIER_PROGRAM_URL = "https://adoption.microsoft.com/copilot/frontier-program/"
 
+# Slice 20 / issue #35: microsoft/Agent365-devTools#408 (macOS/Linux
+# `agentBlueprintClientSecret: null` after `setup blueprint`) was fixed
+# upstream after 1.1.174. The next NuGet build observed in the live
+# walkthrough / package feed was 1.1.178, so doctor treats that as the
+# minimum "fixed" version and warns older installs to upgrade or keep
+# using the wrapper's opt-in recovery flag.
+A365_CLI_SECRET_FIX_MIN_VERSION = (1, 1, 178)
+A365_CLI_SECRET_FIX_MIN_VERSION_TEXT = "1.1.178"
+A365_CLI_NUGET_URL = "https://www.nuget.org/packages/Microsoft.Agents.A365.DevTools.Cli"
+
 
 # ---------------------------------------------------------------------------
 # Data model
@@ -96,12 +107,66 @@ def probe_a365_cli() -> ProbeResult:
         )
     version_text = safe_run([binary, "--version"], timeout=10.0) or ""
     version_first = version_text.splitlines()[0] if version_text else "version unknown"
+    parsed = parse_a365_cli_version(version_text)
+    data: dict[str, Any] = {"path": binary, "version_raw": version_text}
+    if parsed is None:
+        return ProbeResult(
+            "a365_cli",
+            _WARN,
+            (
+                f"present at {binary}; {version_first}; could not confirm "
+                f"whether CLI is >= {A365_CLI_SECRET_FIX_MIN_VERSION_TEXT} "
+                "(Microsoft#408 secret persistence fix)"
+            ),
+            data,
+        )
+    data["version"] = ".".join(str(part) for part in parsed)
+    if parsed < A365_CLI_SECRET_FIX_MIN_VERSION:
+        return ProbeResult(
+            "a365_cli",
+            _WARN,
+            (
+                f"present at {binary}; {version_first}; upgrade to "
+                f">= {A365_CLI_SECRET_FIX_MIN_VERSION_TEXT} for the "
+                "Microsoft#408 secret persistence fix, or pass "
+                "`register --auto-recover-secret` on older CLI builds"
+            ),
+            {
+                **data,
+                "min_fixed_version": A365_CLI_SECRET_FIX_MIN_VERSION_TEXT,
+                "upgrade": (
+                    "dotnet tool update -g "
+                    "Microsoft.Agents.A365.DevTools.Cli --prerelease"
+                ),
+                "nuget": A365_CLI_NUGET_URL,
+            },
+        )
     return ProbeResult(
         "a365_cli",
         _OK,
-        f"present at {binary}; {version_first}",
-        {"path": binary, "version_raw": version_text},
+        (
+            f"present at {binary}; {version_first}; "
+            f">= {A365_CLI_SECRET_FIX_MIN_VERSION_TEXT}"
+        ),
+        {
+            **data,
+            "min_fixed_version": A365_CLI_SECRET_FIX_MIN_VERSION_TEXT,
+        },
     )
+
+
+def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
+    """Extract the first semantic ``major.minor.patch`` from CLI output.
+
+    Observed shapes include plain ``1.1.171+11c378141d`` and prose like
+    ``Agent 365 Developer Tools CLI v1.1.171``. Build metadata and
+    preview suffixes are irrelevant for the doctor floor check.
+    """
+    match = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)(?:[.+-][0-9A-Za-z.-]+)?\b", text)
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
 
 
 def probe_az_cli() -> ProbeResult:

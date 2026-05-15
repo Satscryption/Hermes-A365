@@ -104,8 +104,11 @@ Don't use when:
   or **Agent Administrator** role and is enrolled in Microsoft's
   Frontier Preview Program.
 - The A365 CLI on PATH: `Microsoft.Agents.A365.DevTools.Cli` (.NET tool,
-  ships as `a365`), ≥ 1.1.171. Only the .NET tool ships at GA — the
-  npm `atk` variant referenced in pre-GA documentation never landed.
+  ships as `a365`), ≥ 1.1.178 recommended. Only the .NET tool ships at
+  GA — the npm `atk` variant referenced in pre-GA documentation never
+  landed. Versions < 1.1.178 are allowed but doctor warns because they
+  predate the Microsoft#408 secret-persistence fix; use
+  `--auto-recover-secret` on those builds.
 - `az` CLI ≥ 2.55.0, signed into the target tenant. Many `a365`
   subcommands shell out to `az` for Entra reads.
 - **PowerShell 7+ (`pwsh`) on PATH.** The CLI invokes `pwsh` for some
@@ -364,6 +367,10 @@ the split.
    `a365.generated.config.json` — DPAPI-encrypted on Windows,
    plaintext elsewhere. That file and the `cleanup -y`-emitted
    `*.backup-*.json` are gitignored; treat both as keychain-grade.
+   CLI versions 1.1.171 through 1.1.174 also had Microsoft#408, where
+   the secret was minted but persisted as `null` on macOS / Linux. Keep
+   `--auto-recover-secret` for those versions; doctor recommends
+   upgrading to ≥ 1.1.178.
 
 ## Verification checklist
 
