@@ -1,8 +1,8 @@
 # A365 CLI reference
 
 Snapshot date: 2026-05-05 (verified against installed CLI v1.1.171);
-issue #35 addendum on 2026-05-15 pins 1.1.178 as the minimum version
-with Microsoft's #408 secret-persistence fix.
+issue #35 addendum on 2026-05-15 re-checks the #408
+secret-persistence regression against CLI 1.1.181.
 
 The CLI is **`Microsoft.Agents.A365.DevTools.Cli`** (binary name `a365`),
 distributed as a .NET tool from NuGet:
@@ -12,11 +12,11 @@ dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease
 ```
 
 Verified GA version: **1.1.171** (`a365 --version` output:
-`1.1.171+11c378141d`). Minimum recommended for macOS / Linux setup
-flows: **1.1.178**. Versions 1.1.171 through 1.1.174 reproduce
-Microsoft#408 (`agentBlueprintClientSecret` persists as `null` after a
-successful `setup blueprint`); wrapper recovery remains available via
-`register --auto-recover-secret` for older installs.
+`1.1.171+11c378141d`). Latest live-verified affected build for macOS /
+Linux setup flows: **1.1.181**. Versions 1.1.171, 1.1.174, and 1.1.181
+reproduce Microsoft#408 (`agentBlueprintClientSecret` persists as
+`null` after a successful `setup blueprint`); wrapper recovery remains
+available via `register --auto-recover-secret`.
 
 macOS dotnet-host gotcha: `brew install dotnet` doesn't set
 `DOTNET_ROOT`, so the freshly-installed `a365` errors with
@@ -28,8 +28,9 @@ macOS dotnet-host gotcha: `brew install dotnet` doesn't set
 - NuGet: <https://www.nuget.org/packages/Microsoft.Agents.A365.DevTools.Cli>
 - Docs: <https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli>
 
-Verified version: **1.1.171** (commit `11c378141d`). Latest fixed
-version floor for the secret-persistence regression: **1.1.178**.
+Verified version: **1.1.171** (commit `11c378141d`). Latest
+live-verified affected version for the secret-persistence regression:
+**1.1.181**. No fixed-version floor is currently live-verified.
 
 There is **no npm variant**. What lives on npm under the
 `@microsoft/agents-a365-*` namespace is the **runtime SDK**, not a CLI:

@@ -521,8 +521,11 @@ External issues filed:
   on macOS despite successful credential creation. Filed 2026-05-07
   after round-6 walkthrough confirmed the regression is still
   present in CLI 1.1.174 (reproduces 100% across rounds 3, 4, 5, 6
-  spanning 1.1.171 → 1.1.174). Wrapper-side coverage shipped in
-  slice 19s — see closure of [#14](../../issues/14) below.
+  spanning 1.1.171 → 1.1.174). Re-checked 2026-05-15 for issue #35:
+  NuGet release notes first mention the intended fix in 1.1.178, but
+  a live R9 registration still reproduced the null-on-disk state on
+  1.1.181. Wrapper-side coverage shipped in slice 19s — see closure
+  of [#14](../../issues/14) below.
 - **[Hermes#20133](https://github.com/NousResearch/hermes-agent/issues/20133)** —
   upstream proposal to add `hermes-a365` as an official optional
   skill. Filed 2026-05-05. Reframed in slice 19l after the SPEC §10
@@ -656,7 +659,9 @@ explicit triggers that would re-prioritise it.
 - ~~#14~~ — GA CLI client-secret persistence regression. **Closed
   2026-05-07** after slice 19s shipped layer 1 (detection +
   `--auto-recover-secret` flag) and round-6 walkthrough validated
-  end-to-end against CLI 1.1.174. Layer 2 filed upstream as
+  end-to-end against CLI 1.1.174. Issue #35 re-check on 2026-05-15
+  reproduced the upstream persistence gap on CLI 1.1.181, so layer 1
+  remains required for live setup. Layer 2 filed upstream as
   [Microsoft#408](https://github.com/microsoft/Agent365-devTools/issues/408).
   Live-found bug fixed during validation: `_run_streaming` (slice
   18j) merges stderr into stdout, so `az -o json` output begins

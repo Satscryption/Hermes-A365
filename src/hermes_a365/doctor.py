@@ -67,13 +67,12 @@ CUSTOM_CLIENT_APP_DOCS = (
 FRONTIER_PROGRAM_URL = "https://adoption.microsoft.com/copilot/frontier-program/"
 
 # Slice 20 / issue #35: microsoft/Agent365-devTools#408 (macOS/Linux
-# `agentBlueprintClientSecret: null` after `setup blueprint`) was fixed
-# upstream after 1.1.174. The next NuGet build observed in the live
-# walkthrough / package feed was 1.1.178, so doctor treats that as the
-# minimum "fixed" version and warns older installs to upgrade or keep
-# using the wrapper's opt-in recovery flag.
-A365_CLI_SECRET_FIX_MIN_VERSION = (1, 1, 178)
-A365_CLI_SECRET_FIX_MIN_VERSION_TEXT = "1.1.178"
+# `agentBlueprintClientSecret: null` after `setup blueprint`) was marked
+# fixed upstream, but a 2026-05-15 live R9 walkthrough still reproduced
+# the persistence gap on 1.1.181. Keep this probe conservative until a
+# later CLI build is live-verified.
+A365_CLI_SECRET_LATEST_AFFECTED_VERSION = (1, 1, 181)
+A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT = "1.1.181"
 A365_CLI_NUGET_URL = "https://www.nuget.org/packages/Microsoft.Agents.A365.DevTools.Cli"
 
 
@@ -115,25 +114,26 @@ def probe_a365_cli() -> ProbeResult:
             _WARN,
             (
                 f"present at {binary}; {version_first}; could not confirm "
-                f"whether CLI is >= {A365_CLI_SECRET_FIX_MIN_VERSION_TEXT} "
-                "(Microsoft#408 secret persistence fix)"
+                "whether this CLI build still has the Microsoft#408 secret "
+                "persistence regression; keep `register --auto-recover-secret` "
+                "enabled for live setup"
             ),
             data,
         )
     data["version"] = ".".join(str(part) for part in parsed)
-    if parsed < A365_CLI_SECRET_FIX_MIN_VERSION:
+    if parsed <= A365_CLI_SECRET_LATEST_AFFECTED_VERSION:
         return ProbeResult(
             "a365_cli",
             _WARN,
             (
-                f"present at {binary}; {version_first}; upgrade to "
-                f">= {A365_CLI_SECRET_FIX_MIN_VERSION_TEXT} for the "
-                "Microsoft#408 secret persistence fix, or pass "
-                "`register --auto-recover-secret` on older CLI builds"
+                f"present at {binary}; {version_first}; Microsoft#408 "
+                "secret persistence is live-verified affected through "
+                f"{A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT}; pass "
+                "`register --auto-recover-secret` for live setup"
             ),
             {
                 **data,
-                "min_fixed_version": A365_CLI_SECRET_FIX_MIN_VERSION_TEXT,
+                "latest_known_affected_version": A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT,
                 "upgrade": (
                     "dotnet tool update -g "
                     "Microsoft.Agents.A365.DevTools.Cli --prerelease"
@@ -143,14 +143,17 @@ def probe_a365_cli() -> ProbeResult:
         )
     return ProbeResult(
         "a365_cli",
-        _OK,
+        _WARN,
         (
             f"present at {binary}; {version_first}; "
-            f">= {A365_CLI_SECRET_FIX_MIN_VERSION_TEXT}"
+            "newer than the latest live-verified affected build "
+            f"({A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT}) but not "
+            "yet verified fixed; keep `register --auto-recover-secret` "
+            "enabled for live setup"
         ),
         {
             **data,
-            "min_fixed_version": A365_CLI_SECRET_FIX_MIN_VERSION_TEXT,
+            "latest_known_affected_version": A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT,
         },
     )
 

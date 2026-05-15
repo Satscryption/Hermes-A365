@@ -9,7 +9,7 @@ from unittest.mock import patch
 import pytest
 
 from hermes_a365.doctor import (
-    A365_CLI_SECRET_FIX_MIN_VERSION_TEXT,
+    A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT,
     CUSTOM_CLIENT_APP_DOCS,
     DEFAULT_CLIENT_APP_NAME,
     FRONTIER_PROGRAM_URL,
@@ -54,20 +54,34 @@ class TestProbeA365Cli:
             r = probe_a365_cli()
         assert r.state == "warn"
         assert "v1.1.171" in r.detail
-        assert A365_CLI_SECRET_FIX_MIN_VERSION_TEXT in r.detail
+        assert A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT in r.detail
         assert "--auto-recover-secret" in r.detail
 
-    def test_fixed_version_returns_ok(self) -> None:
+    def test_latest_known_affected_version_warns(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
             patch(
                 "hermes_a365.doctor.safe_run",
-                return_value="1.1.178+abcdef",
+                return_value="1.1.181+abcdef",
             ),
         ):
             r = probe_a365_cli()
-        assert r.state == "ok"
-        assert "1.1.178" in r.detail
+        assert r.state == "warn"
+        assert "1.1.181" in r.detail
+        assert "--auto-recover-secret" in r.detail
+
+    def test_newer_unverified_version_still_warns(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value="1.1.182+abcdef",
+            ),
+        ):
+            r = probe_a365_cli()
+        assert r.state == "warn"
+        assert "not yet verified fixed" in r.detail
+        assert "--auto-recover-secret" in r.detail
 
     def test_unknown_version_warns(self) -> None:
         with (
