@@ -28,6 +28,8 @@ from fastapi.testclient import TestClient
 
 from hermes_a365.activity_bridge import (
     APX_PRODUCTION_SCOPE,
+    BF_ISSUER,
+    BF_OPENID_CONFIG_URL,
     DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES,
     FMI_TOKEN_SCOPE,
     GRAPH_RESOURCE,
@@ -56,6 +58,7 @@ from hermes_a365.activity_bridge import (
     load_generated_config,
     main,
     make_app,
+    peek_unverified_iss,
     probe_generated_config,
     probe_local_config,
     probe_otlp_endpoint,
@@ -66,6 +69,7 @@ from hermes_a365.activity_bridge import (
     render_reply_activity,
     run_verify,
     validate_inbound_jwt,
+    validate_inbound_jwt_bf,
 )
 
 # ---------------------------------------------------------------------------
@@ -776,6 +780,253 @@ class TestValidateInboundJwt:
                 )
         # First call hits both URLs (2 requests). Subsequent calls use the cache (0 each).
         assert request_count["n"] == 2
+
+
+# ---------------------------------------------------------------------------
+# #34 — Path B (classic Bot Framework) JWT validation
+# ---------------------------------------------------------------------------
+
+
+BF_TEST_SERVICE_URL = "https://smba.trafficmanager.net/emea/"
+
+
+def _bf_jwks_transport(jwk: dict[str, Any]) -> httpx.MockTransport:
+    """httpx transport that serves a fixed JWKS at the BF discovery URLs.
+
+    Microsoft documents these as static (not tenant-scoped); we hit the
+    discovery URL first, then follow ``jwks_uri`` to the keys document.
+    """
+    config = {
+        "issuer": BF_ISSUER,
+        "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+        "id_token_signing_alg_values_supported": ["RS256"],
+    }
+    keys = {"keys": [jwk]}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if str(request.url) == BF_OPENID_CONFIG_URL:
+            return httpx.Response(200, json=config)
+        if request.url.path.endswith("/keys"):
+            return httpx.Response(200, json=keys)
+        return httpx.Response(404)
+
+    return httpx.MockTransport(handler)
+
+
+class TestValidateInboundJwtBf:
+    """Path B (#34): classic Bot Framework Connector-to-Bot S2S tokens.
+
+    Mirrors the slice 19f ``TestValidateInboundJwt`` shape so failures
+    pin to the divergence between A365 and BF validation rules:
+    - issuer is ``https://api.botframework.com`` (static, not tenant)
+    - JWKS via BF discovery URL (not AAD-v2)
+    - ``serviceUrl`` claim must match activity.serviceUrl
+    - no ``azp`` allowlist (issuer pin is the strong identity signal)
+    """
+
+    async def test_valid_token_returns_claims(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+            claims = await validate_inbound_jwt_bf(
+                token=token,
+                expected_app_id="bot-app-id",
+                expected_service_url=BF_TEST_SERVICE_URL,
+                client=client,
+                cache=_JwksCache(),
+            )
+        assert claims["aud"] == "bot-app-id"
+        assert claims["iss"] == BF_ISSUER
+        assert claims["serviceUrl"] == BF_TEST_SERVICE_URL
+
+    async def test_wrong_audience_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(
+            priv,
+            aud="other-app",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError, match="BF signature/aud/iss"):
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_wrong_issuer_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        """A token issued by an AAD tenant (Path A shape) must NOT
+        pass the BF validator — even if the signature happens to be
+        verifiable. The dispatcher in adapter.py routes by issuer so
+        this branch shouldn't normally fire, but the validator must
+        still defence-in-depth check."""
+        priv, jwk = rsa_keypair
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=TEST_AAD_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError, match="BF signature/aud/iss"):
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_missing_service_url_claim_accepted(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        """Microsoft's BF docs say the token MUST carry a serviceUrl
+        claim, but real Connector→Bot tokens issued for Direct Line +
+        Test in Web Chat against a SingleTenant Bot Service
+        registration don't include it (Phase 2 walk 2026-05-15, #34).
+        The validator accepts tokens missing the claim — issuer pin
+        (api.botframework.com) + signing-key check already prove
+        Microsoft signed it. If Microsoft tightens the protocol
+        later, ``test_mismatched_service_url_rejected`` still pins
+        the defence-in-depth path."""
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)  # no serviceUrl extra
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+            claims = await validate_inbound_jwt_bf(
+                token=token,
+                expected_app_id="bot-app-id",
+                expected_service_url=BF_TEST_SERVICE_URL,
+                client=client,
+                cache=_JwksCache(),
+            )
+        assert claims["aud"] == "bot-app-id"
+        assert claims["iss"] == BF_ISSUER
+        assert "serviceUrl" not in claims
+
+    async def test_mismatched_service_url_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        """When the serviceUrl claim IS present but doesn't match the
+        activity's serviceUrl, that's a replay against a different
+        bot — 403 (defence-in-depth even though real BF tokens
+        observed 2026-05-15 don't carry the claim)."""
+        priv, jwk = rsa_keypair
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": "https://attacker.example/"},
+        )
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError, match="does not match"):
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_unknown_kid_rejected(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, good_jwk = rsa_keypair
+        bad_jwk = {**good_jwk, "kid": "different-kid"}
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(bad_jwk)) as client:
+            with pytest.raises(JwtValidationError, match="not in BF JWKS"):
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    async def test_jwks_cache_hits_on_second_call(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        request_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_count["n"] += 1
+            if str(request.url) == BF_OPENID_CONFIG_URL:
+                return httpx.Response(
+                    200,
+                    json={
+                        "issuer": BF_ISSUER,
+                        "jwks_uri": "https://login.botframework.com/v1/.well-known/keys",
+                        "id_token_signing_alg_values_supported": ["RS256"],
+                    },
+                )
+            return httpx.Response(200, json={"keys": [jwk]})
+
+        cache = _JwksCache()
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            for _ in range(3):
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    client=client,
+                    cache=cache,
+                )
+        # First call hits discovery + keys (2 requests). Subsequent calls hit the cache.
+        assert request_count["n"] == 2
+
+
+class TestPeekUnverifiedIss:
+    """The dispatcher peeks the JWT's ``iss`` claim without verifying
+    the signature to pick between Path A and Path B validators. Peek
+    is a routing hint — the actual validator does the real signature
+    check, so peek must be tolerant of malformed input (return None;
+    caller defaults to A365 path)."""
+
+    def test_returns_bf_issuer(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, _jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)
+        assert peek_unverified_iss(token) == BF_ISSUER
+
+    def test_returns_aad_issuer(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, _jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id")  # defaults to TEST_AAD_ISSUER
+        assert peek_unverified_iss(token) == TEST_AAD_ISSUER
+
+    def test_returns_none_on_garbage(self) -> None:
+        # Not a JWT at all — caller falls through to A365 path (which
+        # will reject the token in its own real validation step).
+        assert peek_unverified_iss("not-a-token") is None
+        assert peek_unverified_iss("") is None
 
 
 # ---------------------------------------------------------------------------

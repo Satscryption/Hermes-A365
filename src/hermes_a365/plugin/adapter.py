@@ -279,7 +279,8 @@ class Agent365Adapter(BasePlatformAdapter):
 
         # Lazily-built runtime objects (populated in connect()).
         self._http_client: Any = None
-        self._jwks_cache: Any = None
+        self._jwks_cache: Any = None  # AAD-v2 / A365 path (slice 19f)
+        self._bf_jwks_cache: Any = None  # Bot Framework path (#34)
         self._idempotency_cache: Any = None
         self._fmi_cache: Any = None
         self._user_cache: Any = None
@@ -401,6 +402,8 @@ class Agent365Adapter(BasePlatformAdapter):
         # builds them once before this method runs.
         if self._jwks_cache is None:
             self._jwks_cache = bridge._JwksCache()
+        if self._bf_jwks_cache is None:
+            self._bf_jwks_cache = bridge._JwksCache()
         if self._idempotency_cache is None:
             self._idempotency_cache = bridge._IdempotencyCache(
                 ttl_seconds=bridge.DEFAULT_IDEMPOTENCY_TTL_SECONDS,
@@ -425,32 +428,71 @@ class Agent365Adapter(BasePlatformAdapter):
             service_url = activity.get("serviceUrl") or ""
             trusted_suffixes = bridge.DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
             if not trusted_suffixes:
+                logger.warning(
+                    "inbound 403 reason=config-bug detail=empty-trusted-suffixes"
+                )
                 raise HTTPException(
                     status_code=403,
                     detail="trusted_service_url_suffixes is empty — refusing to "
                     "process inbound activity. This is a config bug.",
                 )
             if not bridge._is_trusted_service_url(service_url, trusted_suffixes):
+                logger.warning(
+                    "inbound 403 reason=untrusted-service-url url=%r",
+                    service_url,
+                )
                 raise HTTPException(
                     status_code=403,
                     detail=f"untrusted serviceUrl: {service_url!r}",
                 )
 
-            # Slice 19f — JWT validation against AAD-v2 + azp allowlist.
+            # Bearer presence check (shared by Path A and Path B).
             if not authorization or not authorization.lower().startswith("bearer "):
+                logger.warning("inbound 401 reason=missing-bearer-token")
                 raise HTTPException(status_code=401, detail="missing bearer token")
             token = authorization.split(None, 1)[1]
-            try:
-                await bridge.validate_inbound_jwt(
-                    token=token,
-                    tenant_id=self.tenant_id,
-                    expected_app_id=self.blueprint_app_id,
-                    azp_allowlist=bridge.DEFAULT_INBOUND_AZP_ALLOWLIST,
-                    client=self._http_client,
-                    cache=self._jwks_cache,
-                )
-            except bridge.JwtValidationError as e:
-                raise HTTPException(status_code=403, detail=str(e)) from e
+
+            # #34 — peek unverified `iss` to pick the right validator.
+            # BF tokens (Direct Line / Teams via Bot Service / Test in
+            # Web Chat) say ``https://api.botframework.com``; A365 /
+            # MCP Platform tokens say
+            # ``https://login.microsoftonline.com/<tid>/v2.0``.
+            # Unverified peek is a routing hint only — both validator
+            # branches do full signature checks, so a malformed token
+            # gets rejected either way; default to the A365 path on
+            # peek failure to preserve pre-#34 behaviour.
+            iss = bridge.peek_unverified_iss(token)
+            if iss == bridge.BF_ISSUER:
+                logger.info("inbound path=B (iss=%s)", iss)
+                try:
+                    await bridge.validate_inbound_jwt_bf(
+                        token=token,
+                        expected_app_id=self.blueprint_app_id,
+                        expected_service_url=service_url,
+                        client=self._http_client,
+                        cache=self._bf_jwks_cache,
+                    )
+                except bridge.JwtValidationError as e:
+                    logger.warning(
+                        "inbound 403 path=B reason=%s", e
+                    )
+                    raise HTTPException(status_code=403, detail=str(e)) from e
+            else:
+                logger.info("inbound path=A (iss=%r)", iss)
+                try:
+                    await bridge.validate_inbound_jwt(
+                        token=token,
+                        tenant_id=self.tenant_id,
+                        expected_app_id=self.blueprint_app_id,
+                        azp_allowlist=bridge.DEFAULT_INBOUND_AZP_ALLOWLIST,
+                        client=self._http_client,
+                        cache=self._jwks_cache,
+                    )
+                except bridge.JwtValidationError as e:
+                    logger.warning(
+                        "inbound 403 path=A reason=%s", e
+                    )
+                    raise HTTPException(status_code=403, detail=str(e)) from e
 
             # Slice 19i — dedupe (conversationId, activityId).
             delivery_id = bridge._activity_delivery_id(activity)

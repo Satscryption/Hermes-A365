@@ -1126,6 +1126,190 @@ async def validate_inbound_jwt(
 
 
 # ---------------------------------------------------------------------------
+# Path B inbound auth — classic Bot Framework S2S tokens (#34, slice 20-pre)
+# ---------------------------------------------------------------------------
+#
+# Microsoft's Bot Connector signs activities with classic BF S2S tokens. The
+# validation rules are fixed and documented at
+# https://learn.microsoft.com/en-us/azure/bot-service/rest-api/bot-framework-rest-connector-authentication
+# (Connector-to-Bot section):
+#
+#   - iss = https://api.botframework.com  (pinned; not tenant-scoped)
+#   - aud = bot's MSA App ID              (the blueprint app id for us)
+#   - alg = RS256
+#   - serviceUrl claim must match the activity's serviceUrl field
+#   - JWKS via the BF OpenID Connect discovery URL below (static; cache 24h)
+#
+# Differences from the A365 path (slice 19f):
+#   - issuer is BF's static `api.botframework.com`, not the AAD-v2 tenant URL
+#   - JWKS lives at a different discovery URL (login.botframework.com)
+#   - no `azp` check — issuer pin already proves Microsoft signed it; classic
+#     BF tokens don't carry a meaningful `azp` for connector→bot direction
+#   - `serviceUrl` claim match IS required (A365 tokens don't carry that
+#     claim — slice 19f explicitly removed it on the A365 path).
+#
+# Phase 2 walk 2026-05-14 against Hermes-A365#28 confirmed Path B inbound
+# fails A365-shape validation deterministically — Direct Line probe returns
+# `BotError / Failed to send activity / 403` from BF service after our gateway
+# rejects every token. This validator is the fix.
+BF_OPENID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openidconfiguration"
+BF_ISSUER = "https://api.botframework.com"
+
+
+async def _fetch_bf_jwks_keys(client: Any) -> dict[str, Any]:
+    """Fetch the Bot Framework Connector JWKS via OpenID discovery.
+
+    Returns ``{kid: PyJWK}``. Pure function — caching handled by the
+    caller so tests can substitute a fixed JWKS via httpx MockTransport
+    the same way slice 19f's A365 fetcher tests do.
+
+    Unlike the A365 path, the BF discovery URL is static (not
+    tenant-scoped) and the issuer is hard-coded
+    (``https://api.botframework.com``). Microsoft documents this as
+    safe to hardcode.
+    """
+    if _jwt is None:
+        raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
+    config_resp = await client.get(BF_OPENID_CONFIG_URL, timeout=10.0)
+    config_resp.raise_for_status()
+    jwks_uri = config_resp.json()["jwks_uri"]
+    jwks_resp = await client.get(jwks_uri, timeout=10.0)
+    jwks_resp.raise_for_status()
+    keys: dict[str, Any] = {}
+    for jwk in jwks_resp.json().get("keys", []):
+        kid = jwk.get("kid")
+        if not kid:
+            continue
+        keys[kid] = _jwt.PyJWK(jwk)
+    return keys
+
+
+async def _ensure_bf_jwks_loaded(
+    client: Any,
+    cache: _JwksCache,
+    *,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Mirror of ``_ensure_jwks_loaded`` for the BF JWKS. Separate cache
+    instance because BF and AAD-v2 have different issuers + tenants and
+    we don't want to merge two key sources behind one ``kid``-keyed
+    dict (a kid collision across issuers is improbable but the kind of
+    failure shape we'd rather not have).
+    """
+    import time as _time
+
+    cur = now if now is not None else _time.time()
+    if cache.keys_by_kid and (cur - cache.fetched_at) < cache.ttl_seconds:
+        return cache.keys_by_kid
+    cache.keys_by_kid = await _fetch_bf_jwks_keys(client)
+    cache.fetched_at = cur
+    return cache.keys_by_kid
+
+
+def peek_unverified_iss(token: str) -> str | None:
+    """Read the JWT's ``iss`` claim without verifying the signature.
+
+    Used by the route dispatcher to pick A365 vs BF validator without
+    paying for two full JWKS fetches. Returns ``None`` for any
+    parse failure (caller falls through to the A365 path, which will
+    do a real signature check and reject malformed tokens itself —
+    this peek is a routing hint, not a security gate).
+    """
+    if _jwt is None:
+        return None
+    try:
+        claims = _jwt.decode(
+            token,
+            options={
+                "verify_signature": False,
+                "verify_aud": False,
+                "verify_exp": False,
+                "verify_nbf": False,
+                "verify_iss": False,
+            },
+        )
+    except Exception:
+        # Any decode failure → no signal; caller falls through to A365 path.
+        return None
+    iss = claims.get("iss")
+    if isinstance(iss, str):
+        return iss
+    return None
+
+
+async def validate_inbound_jwt_bf(
+    *,
+    token: str,
+    expected_app_id: str,
+    expected_service_url: str,
+    client: Any,
+    cache: _JwksCache,
+    now: float | None = None,
+) -> dict[str, Any]:
+    """Validate a classic Bot Framework Connector-to-Bot S2S token.
+
+    Path B inbound (#34, slice 20-pre). Mirrors the shape of
+    :func:`validate_inbound_jwt` (slice 19f) but against the BF
+    issuer + BF JWKS + a `serviceUrl` claim match instead of an
+    `azp` allowlist.
+
+    Raises :class:`JwtValidationError` on any failure with a short
+    reason. Caller dispatches HTTP 401/403 from there.
+    """
+    if _jwt is None:
+        raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
+    keys = await _ensure_bf_jwks_loaded(client, cache, now=now)
+    try:
+        unverified_header = _jwt.get_unverified_header(token)
+    except _jwt.PyJWTError as e:
+        raise JwtValidationError(f"unverified header parse failed: {e}") from e
+    kid = unverified_header.get("kid")
+    if not kid or kid not in keys:
+        raise JwtValidationError(f"signing key (kid={kid!r}) not in BF JWKS")
+    try:
+        claims = _jwt.decode(
+            token,
+            key=keys[kid].key,
+            algorithms=["RS256"],
+            audience=expected_app_id,
+            issuer=BF_ISSUER,
+            leeway=300,
+        )
+    except _jwt.PyJWTError as e:
+        raise JwtValidationError(f"BF signature/aud/iss check failed: {e}") from e
+    # Microsoft's BF docs (requirement 7 at
+    # /azure/bot-service/rest-api/bot-framework-rest-connector-authentication)
+    # say "the token contains a 'serviceUrl' claim with value that
+    # matches the `serviceUrl` property at the root of the Activity
+    # object", and the bot must 403 on mismatch. **Reality differs:**
+    # the 2026-05-15 Phase 2 walk (#34) found that real
+    # Connector→Bot tokens issued by Microsoft's BF service for
+    # Direct Line traffic to a SingleTenant Bot Service registration
+    # don't carry the `serviceUrl` claim at all — only `aud`, `iss`,
+    # `exp`, `nbf`, signing-key-id, with no `serviceUrl` field.
+    #
+    # The defensible posture is: validate the claim IF it's present
+    # (defend against forged-routing attacks where the claim *is*
+    # set but doesn't match), but don't reject on absence (which
+    # would block every real BF Connector inbound). The issuer pin
+    # (`api.botframework.com`) + signature check already prove the
+    # token came from Microsoft's BF service; if Microsoft tightens
+    # the protocol later to require the claim, this validator picks
+    # up the stricter shape automatically.
+    token_service_url = claims.get("serviceUrl")
+    if (
+        isinstance(token_service_url, str)
+        and token_service_url
+        and token_service_url != expected_service_url
+    ):
+        raise JwtValidationError(
+            f"BF token serviceUrl {token_service_url!r} does not match "
+            f"activity serviceUrl {expected_service_url!r}"
+        )
+    return claims
+
+
+# ---------------------------------------------------------------------------
 # Outbound auth — three-stage agentic-user-FIC chain
 # ---------------------------------------------------------------------------
 #

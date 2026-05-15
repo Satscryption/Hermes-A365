@@ -901,6 +901,159 @@ class TestMessagesRoute:
         assert a._handled_events == []
 
 
+class TestMessagesRoutePathBDispatch:
+    """#34 — route handler peeks the unverified ``iss`` claim and
+    dispatches to ``validate_inbound_jwt_bf`` for Path B (classic Bot
+    Framework) tokens, or ``validate_inbound_jwt`` for Path A (A365 /
+    AAD-v2) tokens. The peek is a routing hint only — both validators
+    still do real signature checks, so a malformed ``Bearer pretend``
+    falls through to the A365 path (preserved pre-#34 behaviour)."""
+
+    @staticmethod
+    def _make_unverifiable_token(iss: str) -> str:
+        """Build a JWT that's parseable enough for ``peek_unverified_iss``
+        to read the iss claim, but whose signature won't verify
+        against any real key. Tests monkeypatch the *real* validators
+        so the signature never actually matters."""
+        import base64
+        import json
+
+        header = base64.urlsafe_b64encode(
+            json.dumps({"alg": "RS256", "typ": "JWT", "kid": "fake"}).encode()
+        ).rstrip(b"=").decode()
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"iss": iss, "aud": "bot-app-id", "exp": 9999999999}).encode()
+        ).rstrip(b"=").decode()
+        # Padded fake signature — adapter doesn't decode it; only
+        # validator branches care, and those are monkeypatched.
+        return f"{header}.{payload}.AAAA"
+
+    def test_bf_iss_dispatches_to_bf_validator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BF-issued token → adapter calls ``validate_inbound_jwt_bf``
+        with the activity's serviceUrl + bot app id, NOT the A365
+        validator."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+
+        a365_validator = AsyncMock(return_value={"iss": "should-not-be-called"})
+        bf_validator = AsyncMock(return_value={"iss": bridge.BF_ISSUER})
+        monkeypatch.setattr(bridge, "validate_inbound_jwt", a365_validator)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", bf_validator)
+        a._http_client = MagicMock()
+
+        token = self._make_unverifiable_token(bridge.BF_ISSUER)
+        client = TestClient(a.build_app())
+        body = _make_inbound(text="hello path B")
+        r = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "dispatched"
+        # BF validator called with the right args.
+        bf_validator.assert_awaited_once()
+        kwargs = bf_validator.await_args.kwargs
+        assert kwargs["expected_app_id"] == a.blueprint_app_id
+        assert kwargs["expected_service_url"] == body["serviceUrl"]
+        assert kwargs["cache"] is a._bf_jwks_cache
+        # A365 validator NOT called.
+        a365_validator.assert_not_awaited()
+        # MessageEvent landed in handle_message.
+        assert len(a._handled_events) == 1
+        assert a._handled_events[0].text == "hello path B"
+
+    def test_aad_iss_dispatches_to_a365_validator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Path A token (AAD-v2 issuer) → adapter calls ``validate_inbound_jwt``,
+        NOT the BF validator."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+
+        a365_validator = AsyncMock(return_value={"iss": "ok"})
+        bf_validator = AsyncMock(return_value={"iss": "should-not-be-called"})
+        monkeypatch.setattr(bridge, "validate_inbound_jwt", a365_validator)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", bf_validator)
+        a._http_client = MagicMock()
+
+        aad_iss = f"https://login.microsoftonline.com/{a.tenant_id}/v2.0"
+        token = self._make_unverifiable_token(aad_iss)
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages",
+            json=_make_inbound(),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200, r.text
+        a365_validator.assert_awaited_once()
+        bf_validator.assert_not_awaited()
+
+    def test_unparseable_token_defaults_to_a365(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """``Bearer pretend`` (not even a JWT) — peek returns None, so
+        the dispatcher falls through to the A365 path. Pins the
+        pre-#34 behaviour that other ``TestMessagesRoute`` cases
+        already rely on (they pass ``Bearer pretend`` + monkeypatched
+        A365 validator)."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+
+        a365_validator = AsyncMock(return_value={"iss": "ok"})
+        bf_validator = AsyncMock(return_value={"iss": "should-not-be-called"})
+        monkeypatch.setattr(bridge, "validate_inbound_jwt", a365_validator)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", bf_validator)
+        a._http_client = MagicMock()
+
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages",
+            json=_make_inbound(),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200, r.text
+        a365_validator.assert_awaited_once()
+        bf_validator.assert_not_awaited()
+
+    def test_bf_validator_failure_returns_403(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """BF-issued token where the validator raises → 403 with the
+        validator's reason in the detail. Pins the actual route
+        behaviour against the Direct Line probe failure mode that
+        was documented in §11.10 finding 11."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+
+        async def _reject(**_kwargs: Any) -> dict[str, Any]:
+            raise bridge.JwtValidationError("BF signature/aud/iss check failed: bad")
+
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", _reject)
+        a._http_client = MagicMock()
+
+        token = self._make_unverifiable_token(bridge.BF_ISSUER)
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages",
+            json=_make_inbound(),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 403
+        assert "BF signature/aud/iss" in r.json()["detail"]
+        assert a._handled_events == []
+
+
 # ---------------------------------------------------------------------------
 # Slice 19q — filter agents-channel synthetic events
 # ---------------------------------------------------------------------------
