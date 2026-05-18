@@ -15,6 +15,7 @@
 # stray `git add .` can't ship a tenant-shaped artefact.
 a365.config.json*
 a365.generated.config.json*
+a365.bot-service.config.json*
 *.generated.config.json*
 # Newcomers seed `a365.config.json` from this template — keep it tracked.
 !a365.config.json.example

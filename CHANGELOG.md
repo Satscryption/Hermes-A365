@@ -6,6 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Slice 20a (#29):** `hermes-a365 bot-service` / `hermes a365
+  bot-service` verb tree with `create` and `verify` for Path B Azure
+  Bot Service. `create --apply` auto-registers the `Microsoft.BotService`
+  provider, ensures the resource group, creates or reuses the bot bound
+  to `A365_BF_APP_ID`, enables Microsoft Teams with the accepted-terms
+  ARM PATCH, and writes `a365.bot-service.config.json` mode 0600.
+  `verify` checks provider/resource/channel drift and can run a live
+  Direct Line auth probe with `--directline-probe`.
+
 ## [0.5.2] — 2026-05-13
 
 Patch release: documentation accuracy pass for v0.5.0 + v0.5.1.
