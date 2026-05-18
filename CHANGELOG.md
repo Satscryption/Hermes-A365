@@ -6,6 +6,18 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Slice 20b (#30):** `hermes-a365 bot-service enable-channel`
+  and `bot-service update-endpoint`. `enable-channel --apply`
+  idempotently enables the Microsoft Teams channel from the sidecar
+  and reapplies the accepted-terms ARM PATCH when needed.
+  `update-endpoint --apply` updates Azure Bot Service's Path B
+  messaging endpoint, preserves sidecar channel state, and leaves
+  Path A's independent `activity-bridge update-endpoint` flow alone.
+  `bot-service verify` now warns when Path A's generated-config
+  endpoint and Path B's Bot Service endpoint drift apart.
+
 ## [0.6.0] — 2026-05-18
 
 Path B (Custom Engine Agent + Azure Bot Service) Copilot Chat

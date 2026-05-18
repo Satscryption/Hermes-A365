@@ -228,6 +228,93 @@ class BotServiceCreateResult:
     messages: list[str] = field(default_factory=list)
 
 
+@dataclass
+class BotServiceEnableChannelInputs:
+    agent_name: str
+    channel: str = "msteams"
+    sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
+
+    def __post_init__(self) -> None:
+        if not self.agent_name.strip():
+            raise ValueError("agent_name must be non-empty")
+        self.channel = self.channel.lower().strip()
+        if self.channel != "msteams":
+            raise ValueError("only --channel msteams is supported in slice 20b")
+
+
+@dataclass
+class BotServiceEnableChannelPlan:
+    inputs: BotServiceEnableChannelInputs
+    config: BotServiceConfig
+
+    def render_human(self) -> str:
+        return "\n".join(
+            [
+                f"[plan] hermes a365 bot-service enable-channel {self.inputs.agent_name}",
+                f"  channel:        {self.inputs.channel}",
+                f"  resource group: {self.config.resourceGroup}",
+                f"  bot resource:   {self.config.botName}",
+                f"  sidecar:        {self.inputs.sidecar_path}",
+                "  azure steps:",
+                "    - az bot msteams show",
+                "    - az bot msteams create (skip if already enabled)",
+                "    - acceptedTerms ARM PATCH if terms are not accepted",
+            ]
+        )
+
+
+@dataclass
+class BotServiceEnableChannelResult:
+    config: BotServiceConfig
+    sidecar_path: Path
+    channel_created: bool
+    patched_teams_terms: bool
+    messages: list[str] = field(default_factory=list)
+
+
+@dataclass
+class BotServiceUpdateEndpointInputs:
+    agent_name: str
+    url: str
+    sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
+
+    def __post_init__(self) -> None:
+        if not self.agent_name.strip():
+            raise ValueError("agent_name must be non-empty")
+        self.url = _normalize_endpoint(self.url)
+
+
+@dataclass
+class BotServiceUpdateEndpointPlan:
+    inputs: BotServiceUpdateEndpointInputs
+    config: BotServiceConfig
+
+    def render_human(self) -> str:
+        return "\n".join(
+            [
+                f"[plan] hermes a365 bot-service update-endpoint {self.inputs.agent_name}",
+                f"  resource group: {self.config.resourceGroup}",
+                f"  bot resource:   {self.config.botName}",
+                f"  current URL:     {self.config.messagingEndpoint}",
+                f"  new URL:         {self.inputs.url}",
+                f"  sidecar:        {self.inputs.sidecar_path}",
+                "  azure step:",
+                "    - az bot update --endpoint <new-url> (skip if already current)",
+                "  note:",
+                "    - Path A uses activity-bridge update-endpoint; run both",
+                "      when operating both paths.",
+            ]
+        )
+
+
+@dataclass
+class BotServiceUpdateEndpointResult:
+    config: BotServiceConfig
+    sidecar_path: Path
+    endpoint_updated: bool
+    messages: list[str] = field(default_factory=list)
+
+
 Status = Literal["OK", "WARN", "ERROR"]
 
 
@@ -272,6 +359,24 @@ def build_create_plan(
         inputs=inputs,
         app_id_source=app_source,
         tenant_id_source=tenant_source,
+    )
+
+
+def build_enable_channel_plan(
+    inputs: BotServiceEnableChannelInputs,
+) -> BotServiceEnableChannelPlan:
+    return BotServiceEnableChannelPlan(
+        inputs=inputs,
+        config=BotServiceConfig.from_file(inputs.sidecar_path),
+    )
+
+
+def build_update_endpoint_plan(
+    inputs: BotServiceUpdateEndpointInputs,
+) -> BotServiceUpdateEndpointPlan:
+    return BotServiceUpdateEndpointPlan(
+        inputs=inputs,
+        config=BotServiceConfig.from_file(inputs.sidecar_path),
     )
 
 
@@ -378,6 +483,10 @@ def _enabled_channels(bot: dict[str, Any]) -> list[str]:
     return sorted({str(c).lower() for c in raw if c})
 
 
+def _with_channel(channels: list[str], channel: str) -> list[str]:
+    return sorted({*(str(c).lower() for c in channels if c), channel.lower()})
+
+
 def _teams_terms_accepted(channel: dict[str, Any] | None) -> bool:
     if not channel:
         return False
@@ -479,6 +588,10 @@ def _patch_teams_terms(
         ),
         "az rest acceptedTerms PATCH",
     )
+
+
+def _write_bot_service_config(path: Path, config: BotServiceConfig) -> None:
+    _write_text_atomic(path, config.to_json(), mode=0o600)
 
 
 def apply_create_plan(
@@ -645,7 +758,7 @@ def apply_create_plan(
         channelsEnabled=sorted(set(channels)),
         createdAt=now().astimezone(UTC).isoformat().replace("+00:00", "Z"),
     )
-    _write_text_atomic(inputs.sidecar_path, cfg.to_json(), mode=0o600)
+    _write_bot_service_config(inputs.sidecar_path, cfg)
     messages.append(f"[apply] wrote {inputs.sidecar_path} (mode 0600)")
     return BotServiceCreateResult(
         config=cfg,
@@ -653,6 +766,130 @@ def apply_create_plan(
         created_bot=created_bot,
         created_teams_channel=created_teams_channel,
         patched_teams_terms=patched_teams_terms,
+        messages=messages,
+    )
+
+
+def apply_enable_channel_plan(
+    plan: BotServiceEnableChannelPlan,
+    *,
+    runner: CommandRunner | None = None,
+) -> BotServiceEnableChannelResult:
+    if runner is None:
+        runner = SubprocessRunner()
+
+    config = plan.config
+    inputs = plan.inputs
+    messages: list[str] = []
+    channel_created = False
+
+    teams = _msteams_show(runner, config.resourceGroup, config.botName)
+    if teams is None:
+        _require_success(
+            runner.run(
+                [
+                    "az",
+                    "bot",
+                    "msteams",
+                    "create",
+                    "--resource-group",
+                    config.resourceGroup,
+                    "--name",
+                    config.botName,
+                ]
+            ),
+            "az bot msteams create",
+        )
+        channel_created = True
+        messages.append("[apply] created Microsoft Teams channel")
+        teams = _msteams_show(runner, config.resourceGroup, config.botName)
+    else:
+        messages.append("[apply] Microsoft Teams channel already enabled")
+
+    patched_teams_terms = False
+    if not _teams_terms_accepted(teams):
+        _patch_teams_terms(
+            runner,
+            subscription_id=config.subscriptionId,
+            resource_group=config.resourceGroup,
+            bot_name=config.botName,
+        )
+        patched_teams_terms = True
+        messages.append("[apply] accepted Microsoft Teams channel terms")
+
+    updated = BotServiceConfig(
+        **{
+            **config.__dict__,
+            "channelsEnabled": _with_channel(config.channelsEnabled, inputs.channel),
+        }
+    )
+    _write_bot_service_config(inputs.sidecar_path, updated)
+    messages.append(f"[apply] wrote {inputs.sidecar_path} (mode 0600)")
+    return BotServiceEnableChannelResult(
+        config=updated,
+        sidecar_path=inputs.sidecar_path,
+        channel_created=channel_created,
+        patched_teams_terms=patched_teams_terms,
+        messages=messages,
+    )
+
+
+def apply_update_endpoint_plan(
+    plan: BotServiceUpdateEndpointPlan,
+    *,
+    runner: CommandRunner | None = None,
+) -> BotServiceUpdateEndpointResult:
+    if runner is None:
+        runner = SubprocessRunner()
+
+    config = plan.config
+    inputs = plan.inputs
+    messages: list[str] = []
+
+    bot = _bot_show(runner, config.resourceGroup, config.botName)
+    if bot is None:
+        raise BotServiceError(f"{config.botName} not found in {config.resourceGroup}")
+
+    current = _bot_endpoint(bot)
+    endpoint_updated = False
+    if current.rstrip("/") != inputs.url.rstrip("/"):
+        bot = _json_from_result(
+            runner.run(
+                [
+                    "az",
+                    "bot",
+                    "update",
+                    "--resource-group",
+                    config.resourceGroup,
+                    "--name",
+                    config.botName,
+                    "--endpoint",
+                    inputs.url,
+                    "-o",
+                    "json",
+                ]
+            ),
+            "az bot update",
+        )
+        endpoint_updated = True
+        messages.append(f"[apply] updated Bot Service endpoint to {inputs.url}")
+    else:
+        messages.append("[apply] Bot Service endpoint already current")
+
+    channels = sorted({*_enabled_channels(bot), *config.channelsEnabled})
+    updated = BotServiceConfig(
+        **{
+            **config.__dict__,
+            "messagingEndpoint": inputs.url,
+            "channelsEnabled": sorted({str(c).lower() for c in channels if c}),
+        }
+    )
+    _write_bot_service_config(inputs.sidecar_path, updated)
+    messages.append(f"[apply] wrote {inputs.sidecar_path} (mode 0600)")
+    return BotServiceUpdateEndpointResult(
+        config=updated,
+        sidecar_path=inputs.sidecar_path,
+        endpoint_updated=endpoint_updated,
         messages=messages,
     )
 
@@ -794,18 +1031,68 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
     return ProbeResult("runtime_auth", "OK", "Direct Line activity accepted by Bot Service")
 
 
+def _path_endpoint_parity_probe(
+    config: BotServiceConfig,
+    generated_config_path: Path,
+    *,
+    path_b_endpoint: str | None = None,
+) -> ProbeResult:
+    if not generated_config_path.exists():
+        return ProbeResult(
+            "path_endpoint_parity",
+            "OK",
+            f"skipped; {generated_config_path} not found",
+        )
+    try:
+        generated = json.loads(generated_config_path.read_text())
+    except json.JSONDecodeError as e:
+        return ProbeResult(
+            "path_endpoint_parity",
+            "WARN",
+            f"{generated_config_path} is not valid JSON: {e}",
+        )
+    if not isinstance(generated, dict):
+        return ProbeResult(
+            "path_endpoint_parity",
+            "WARN",
+            f"{generated_config_path} is JSON {type(generated).__name__}, expected object",
+        )
+    path_a_endpoint = str(generated.get("messagingEndpoint") or "").strip()
+    if not path_a_endpoint:
+        return ProbeResult(
+            "path_endpoint_parity",
+            "OK",
+            f"skipped; {generated_config_path} has no messagingEndpoint",
+        )
+    bot_service_endpoint = path_b_endpoint or config.messagingEndpoint
+    if path_a_endpoint.rstrip("/") != bot_service_endpoint.rstrip("/"):
+        return ProbeResult(
+            "path_endpoint_parity",
+            "WARN",
+            "Path A activity-bridge endpoint differs from Path B Bot Service endpoint: "
+            f"{path_a_endpoint} != {bot_service_endpoint}. "
+            "Run both activity-bridge update-endpoint and bot-service update-endpoint "
+            "when operating both paths.",
+        )
+    return ProbeResult("path_endpoint_parity", "OK", "Path A and Path B endpoints match")
+
+
 def verify_bot_service(
     sidecar_path: Path,
     *,
     runner: CommandRunner | None = None,
     runtime_probe: RuntimeProbe | None = None,
+    generated_config_path: Path | None = None,
 ) -> BotServiceVerifyReport:
     if runner is None:
         runner = SubprocessRunner()
+    if generated_config_path is None:
+        generated_config_path = Path.cwd() / "a365.generated.config.json"
     config = BotServiceConfig.from_file(sidecar_path)
     results: list[ProbeResult] = [_provider_probe(runner)]
 
     bot = _bot_show(runner, config.resourceGroup, config.botName)
+    actual_bot_endpoint: str | None = None
     if bot is None:
         results.append(
             ProbeResult(
@@ -817,6 +1104,7 @@ def verify_bot_service(
     else:
         app_id = _bot_app_id(bot)
         endpoint = _bot_endpoint(bot)
+        actual_bot_endpoint = endpoint
         if app_id.lower() != config.msaAppId.lower():
             results.append(
                 ProbeResult(
@@ -831,7 +1119,7 @@ def verify_bot_service(
             results.append(
                 ProbeResult(
                     "bot_endpoint",
-                    "ERROR",
+                    "WARN",
                     f"Azure endpoint={endpoint}; sidecar expects {config.messagingEndpoint}",
                 )
             )
@@ -870,6 +1158,14 @@ def verify_bot_service(
         )
     else:
         results.append(ProbeResult("msteams_channel", "OK", "enabled with acceptedTerms=true"))
+
+    results.append(
+        _path_endpoint_parity_probe(
+            config,
+            generated_config_path,
+            path_b_endpoint=actual_bot_endpoint,
+        )
+    )
 
     if runtime_probe is None:
         results.append(
@@ -920,12 +1216,48 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     create.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
     create.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
 
+    enable = subs.add_parser(
+        "enable-channel",
+        help="Enable a Bot Framework channel on the existing Path B bot",
+    )
+    enable.add_argument("--agent-name", required=True)
+    enable.add_argument(
+        "--channel",
+        default="msteams",
+        choices=["msteams"],
+        help="Bot Framework channel to enable (slice 20b supports msteams)",
+    )
+    enable.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
+    enable.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
+
+    endpoint = subs.add_parser(
+        "update-endpoint",
+        help=(
+            "Update Azure Bot Service Path B endpoint; Path A uses "
+            "`activity-bridge update-endpoint`"
+        ),
+    )
+    endpoint.add_argument("--agent-name", required=True)
+    endpoint.add_argument(
+        "--url",
+        required=True,
+        help="HTTPS endpoint; /api/messages is appended if omitted",
+    )
+    endpoint.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
+    endpoint.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
+
     verify = subs.add_parser("verify", help="Verify the Path B Azure Bot resource from the sidecar")
     verify.add_argument(
         "--agent-name",
         help="accepted for operator symmetry; sidecar remains source of truth",
     )
     verify.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
+    verify.add_argument(
+        "--generated-config",
+        type=Path,
+        default=Path.cwd() / "a365.generated.config.json",
+        help="Path A generated config for endpoint parity check",
+    )
     verify.add_argument(
         "--directline-probe",
         action="store_true",
@@ -967,10 +1299,66 @@ def _run_create(args: argparse.Namespace) -> int:
     return 0
 
 
+def _run_enable_channel(args: argparse.Namespace) -> int:
+    try:
+        inputs = BotServiceEnableChannelInputs(
+            agent_name=args.agent_name,
+            channel=args.channel,
+            sidecar_path=args.sidecar,
+        )
+        plan = build_enable_channel_plan(inputs)
+    except (ValueError, BotServiceError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    sys.stdout.write(plan.render_human() + "\n")
+    if not args.apply:
+        sys.stdout.write("\nNo mutations. Re-run with --apply to enable the channel.\n")
+        return 0
+
+    try:
+        result = apply_enable_channel_plan(plan)
+    except BotServiceError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    sys.stdout.write("\n" + "\n".join(result.messages) + "\ndone.\n")
+    return 0
+
+
+def _run_update_endpoint(args: argparse.Namespace) -> int:
+    try:
+        inputs = BotServiceUpdateEndpointInputs(
+            agent_name=args.agent_name,
+            url=args.url,
+            sidecar_path=args.sidecar,
+        )
+        plan = build_update_endpoint_plan(inputs)
+    except (ValueError, BotServiceError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    sys.stdout.write(plan.render_human() + "\n")
+    if not args.apply:
+        sys.stdout.write("\nNo mutations. Re-run with --apply to update Azure Bot Service.\n")
+        return 0
+
+    try:
+        result = apply_update_endpoint_plan(plan)
+    except BotServiceError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    sys.stdout.write("\n" + "\n".join(result.messages) + "\ndone.\n")
+    return 0
+
+
 def _run_verify(args: argparse.Namespace) -> int:
     probe = directline_runtime_probe if args.directline_probe else None
     try:
-        report = verify_bot_service(args.sidecar, runtime_probe=probe)
+        report = verify_bot_service(
+            args.sidecar,
+            runtime_probe=probe,
+            generated_config_path=args.generated_config,
+        )
     except BotServiceError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
@@ -982,9 +1370,16 @@ def run(args: argparse.Namespace) -> int:
     sub = getattr(args, "bot_service_command", None)
     if sub == "create":
         return _run_create(args)
+    if sub == "enable-channel":
+        return _run_enable_channel(args)
+    if sub == "update-endpoint":
+        return _run_update_endpoint(args)
     if sub == "verify":
         return _run_verify(args)
-    print("usage: hermes-a365 bot-service {create,verify}", file=sys.stderr)
+    print(
+        "usage: hermes-a365 bot-service {create,enable-channel,update-endpoint,verify}",
+        file=sys.stderr,
+    )
     return 2
 
 

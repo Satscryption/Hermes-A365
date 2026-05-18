@@ -13,11 +13,17 @@ import pytest
 from hermes_a365.bot_service import (
     BotServiceConfig,
     BotServiceCreateInputs,
+    BotServiceEnableChannelInputs,
     BotServiceError,
+    BotServiceUpdateEndpointInputs,
     CommandResult,
     ProbeResult,
     apply_create_plan,
+    apply_enable_channel_plan,
+    apply_update_endpoint_plan,
     build_create_plan,
+    build_enable_channel_plan,
+    build_update_endpoint_plan,
     derive_bot_name,
     verify_bot_service,
 )
@@ -240,7 +246,109 @@ def test_verify_reports_green_resource_and_channel_state(tmp_path: Path) -> None
     assert statuses["provider"] == "OK"
     assert statuses["bot_msa_app_id"] == "OK"
     assert statuses["msteams_channel"] == "OK"
+    assert statuses["path_endpoint_parity"] == "OK"
     assert statuses["runtime_auth"] == "WARN"
+
+
+def test_enable_channel_apply_creates_teams_and_updates_sidecar(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=None)
+    cfg = BotServiceConfig.from_file(sidecar)
+    cfg.channelsEnabled = ["webchat", "directline"]
+    sidecar.write_text(cfg.to_json())
+    plan = build_enable_channel_plan(
+        BotServiceEnableChannelInputs(
+            agent_name="Hermes Inbox Helper",
+            channel="msteams",
+            sidecar_path=sidecar,
+        )
+    )
+
+    result = apply_enable_channel_plan(plan, runner=runner)
+
+    assert result.channel_created is True
+    assert result.patched_teams_terms is True
+    assert BotServiceConfig.from_file(sidecar).channelsEnabled == [
+        "directline",
+        "msteams",
+        "webchat",
+    ]
+    assert any(call[:4] == ["az", "bot", "msteams", "create"] for call in runner.calls)
+    assert any(call[:3] == ["az", "rest", "--method"] for call in runner.calls)
+
+
+def test_enable_channel_apply_is_noop_when_teams_enabled(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_enable_channel_plan(
+        BotServiceEnableChannelInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
+    )
+
+    result = apply_enable_channel_plan(plan, runner=runner)
+
+    assert result.channel_created is False
+    assert result.patched_teams_terms is False
+    assert "already enabled" in "\n".join(result.messages)
+    assert not any(call[:4] == ["az", "bot", "msteams", "create"] for call in runner.calls)
+    assert not any(call[:3] == ["az", "rest", "--method"] for call in runner.calls)
+
+
+def test_update_endpoint_apply_updates_bot_and_sidecar_without_disabling_channels(
+    tmp_path: Path,
+) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+        )
+    )
+
+    result = apply_update_endpoint_plan(plan, runner=runner)
+
+    assert result.endpoint_updated is True
+    updated = BotServiceConfig.from_file(sidecar)
+    assert updated.messagingEndpoint == "https://new-tunnel.example/api/messages"
+    assert updated.channelsEnabled == ["directline", "msteams", "webchat"]
+    assert any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
+
+
+def test_update_endpoint_apply_noops_when_endpoint_current(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://example.test/api/messages",
+            sidecar_path=sidecar,
+        )
+    )
+
+    result = apply_update_endpoint_plan(plan, runner=runner)
+
+    assert result.endpoint_updated is False
+    assert not any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
+    assert BotServiceConfig.from_file(sidecar).messagingEndpoint == (
+        "https://example.test/api/messages"
+    )
+
+
+def test_verify_warns_when_path_a_and_path_b_endpoints_drift(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    generated_config = tmp_path / "a365.generated.config.json"
+    generated_config.write_text(
+        json.dumps({"messagingEndpoint": "https://path-a.example/api/messages"})
+    )
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+
+    report = verify_bot_service(sidecar, runner=runner, generated_config_path=generated_config)
+
+    assert report.ok is True
+    parity = next(result for result in report.results if result.name == "path_endpoint_parity")
+    assert parity.status == "WARN"
+    assert "activity-bridge update-endpoint" in parity.detail
 
 
 def test_verify_detects_runtime_auth_probe_rejection(tmp_path: Path) -> None:
