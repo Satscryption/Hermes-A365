@@ -39,6 +39,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
 
+from . import bot_service, bot_service_diagnostics
 from ._common import parse_env, safe_run, tcp_reachable
 
 ProbeState = Literal["ok", "warn", "error"]
@@ -406,7 +407,20 @@ def overall_to_exit_code(o: ProbeState) -> int:
     return {"ok": 0, "warn": 1, "error": 2}[o]
 
 
-def run_all_probes(*, no_network: bool = False) -> DoctorReport:
+def _map_bot_service_probe(result: bot_service_diagnostics.DiagnosticResult) -> ProbeResult:
+    state: ProbeState = _WARN if result.state == "skipped" else result.state
+    return ProbeResult(result.name, state, result.detail, result.data)
+
+
+def run_all_probes(
+    *,
+    no_network: bool = False,
+    bot_service_sidecar_path: Path | None = None,
+    generated_config_path: Path | None = None,
+    bot_service_runner: bot_service.CommandRunner | None = None,
+    bot_service_operator_env: dict[str, str] | None = None,
+    bot_service_runtime_auth_probe: bot_service_diagnostics.RuntimeAuthProbe | None = None,
+) -> DoctorReport:
     probes: list[ProbeResult] = []
     probes.append(probe_a365_cli())
     probes.append(probe_az_cli())
@@ -416,6 +430,21 @@ def run_all_probes(*, no_network: bool = False) -> DoctorReport:
         probes.append(probe_network())
     probes.append(probe_keychain())
     probes.append(probe_local_config())
+    if bot_service_sidecar_path is None:
+        bot_service_sidecar_path = Path.cwd() / bot_service.SIDECAR_FILENAME
+    if generated_config_path is None:
+        generated_config_path = Path.cwd() / "a365.generated.config.json"
+    probes.extend(
+        _map_bot_service_probe(result)
+        for result in bot_service_diagnostics.collect_bot_service_diagnostics(
+            sidecar_path=bot_service_sidecar_path,
+            generated_config_path=generated_config_path,
+            no_network=no_network,
+            runner=bot_service_runner,
+            operator_env=bot_service_operator_env,
+            runtime_auth_probe=bot_service_runtime_auth_probe,
+        )
+    )
     probes.append(probe_hermes_harness())
     return DoctorReport(probes=probes)
 

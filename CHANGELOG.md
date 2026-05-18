@@ -8,6 +8,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Slice 20d (#32):** `hermes-a365 doctor` and
+  `hermes-a365 status` now include read-only Path B Bot Service
+  diagnostics. Doctor only fires these probes when
+  `a365.bot-service.config.json` is present, so Path-A-only installs
+  keep their existing exit-code behaviour. Status adds a `bot_service`
+  row between `instance_scopes` and `activity_bridge`, skipped when
+  the sidecar is absent and escalated to warn/error for MSA app-id
+  drift, disabled Teams channel state, or incomplete BF-token runtime
+  auth wiring.
 - **Slice 20c (#31):** `hermes-a365 bot-service cleanup`
   deletes the Path B Azure Bot resource, backs up then removes
   `a365.bot-service.config.json`, preserves the Path A blueprint

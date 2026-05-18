@@ -48,6 +48,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
+from . import bot_service, bot_service_diagnostics
 from ._common import parse_env, safe_run, slugify
 
 ComponentState = Literal["ok", "warn", "error", "missing", "skipped"]
@@ -436,6 +437,69 @@ def gather_instance_scopes(
 
 
 # ---------------------------------------------------------------------------
+# Path B Bot Service gatherer
+# ---------------------------------------------------------------------------
+
+
+def _bot_service_overall(
+    diagnostics: list[bot_service_diagnostics.DiagnosticResult],
+) -> ComponentState:
+    if any(result.state == _ERROR for result in diagnostics):
+        return _ERROR
+    if any(result.state == _WARN for result in diagnostics):
+        return _WARN
+    return _OK
+
+
+def _bot_service_detail(
+    diagnostics: list[bot_service_diagnostics.DiagnosticResult],
+    *,
+    state: ComponentState,
+) -> str:
+    if state in (_ERROR, _WARN):
+        first = next(result for result in diagnostics if result.state == state)
+        return first.detail
+    return f"{len(diagnostics)} Path B probe(s) ok"
+
+
+def gather_bot_service(
+    *,
+    sidecar_path: Path,
+    generated_config_path: Path,
+    runner: bot_service.CommandRunner | None = None,
+    operator_env: dict[str, str] | None = None,
+    runtime_auth_probe: bot_service_diagnostics.RuntimeAuthProbe | None = None,
+) -> StatusComponent:
+    """Aggregate read-only Path B diagnostics into one status row."""
+    if not sidecar_path.exists():
+        return StatusComponent(
+            "bot_service",
+            _SKIPPED,
+            f"Path B not configured ({bot_service.SIDECAR_FILENAME} absent)",
+            {"sidecar": str(sidecar_path)},
+        )
+
+    diagnostics = bot_service_diagnostics.collect_bot_service_diagnostics(
+        sidecar_path=sidecar_path,
+        generated_config_path=generated_config_path,
+        runner=runner,
+        operator_env=operator_env,
+        runtime_auth_probe=runtime_auth_probe,
+    )
+    state = _bot_service_overall(diagnostics)
+    return StatusComponent(
+        "bot_service",
+        state,
+        _bot_service_detail(diagnostics, state=state),
+        {
+            "sidecar": str(sidecar_path),
+            "generated_config": str(generated_config_path),
+            "probes": [asdict(result) for result in diagnostics],
+        },
+    )
+
+
+# ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
 
@@ -446,12 +510,21 @@ def collect_status(
     hermes_home: Path | None = None,
     query_source: QuerySource | None = None,
     tenant_id: str | None = None,
+    bot_service_sidecar_path: Path | None = None,
+    generated_config_path: Path | None = None,
+    bot_service_runner: bot_service.CommandRunner | None = None,
+    bot_service_operator_env: dict[str, str] | None = None,
+    bot_service_runtime_auth_probe: bot_service_diagnostics.RuntimeAuthProbe | None = None,
 ) -> StatusReport:
     """Build the full status report."""
     if hermes_home is None:
         hermes_home = _resolve_hermes_home()
     if query_source is None:
         query_source = get_query_source()
+    if bot_service_sidecar_path is None:
+        bot_service_sidecar_path = Path.cwd() / bot_service.SIDECAR_FILENAME
+    if generated_config_path is None:
+        generated_config_path = Path.cwd() / "a365.generated.config.json"
 
     components: list[StatusComponent] = []
 
@@ -473,6 +546,15 @@ def collect_status(
     )
     components.append(
         gather_instance_scopes(query_source, agent_name=agent_name, tenant_id=tenant_id)
+    )
+    components.append(
+        gather_bot_service(
+            sidecar_path=bot_service_sidecar_path,
+            generated_config_path=generated_config_path,
+            runner=bot_service_runner,
+            operator_env=bot_service_operator_env,
+            runtime_auth_probe=bot_service_runtime_auth_probe,
+        )
     )
 
     if agent_name:
@@ -510,7 +592,8 @@ def render_human(report: StatusReport) -> str:
     lines.append(f"overall: {report.overall}")
     if skipped:
         lines.append(
-            f"note: {skipped} component(s) skipped (a365 CLI unavailable or awaiting auth)"
+            f"note: {skipped} component(s) skipped (a365 CLI unavailable, awaiting auth, "
+            "or Path B not configured)"
         )
     return "\n".join(lines) + "\n"
 

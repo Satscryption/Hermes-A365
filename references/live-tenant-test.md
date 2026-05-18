@@ -161,6 +161,12 @@ amber paths:
 - Network probe failing → corporate proxy. Doctor honours `HTTPS_PROXY`.
 - `~/.hermes/.env` missing → step 0 above.
 
+When `a365.bot-service.config.json` exists, doctor also runs the
+read-only Path B Bot Service probes from slice 20d (#32). Path-A-only
+walkthroughs do not get those probes at all; a clean Path B install
+should show green `bot_service_*` rows, while app-id drift or runtime
+BF-token auth gaps surface as `FAIL`.
+
 After doctor, also run the CLI's authoritative check:
 
 ```bash
@@ -473,13 +479,20 @@ hermes-a365 status <slug> --human
 echo "exit=$?"
 ```
 
-**Pass criterion:** all three cloud components report `ok`. The
+**Pass criterion:** all cloud components report `ok`. The
 overall report returns `partial` / exit 1 if `activity_bridge:
 missing` (the probe checks for `bridge.pid` in
 `~/.hermes/agents/<slug>/`; absent when neither §9c nor §9d is
 currently running). Run §9b's `bridge verify` for runtime config
 sanity, or §9c / §9d to actually start the bridge if you want a
 green `activity_bridge` row.
+
+Slice 20d (#32) adds a `bot_service` row between `instance_scopes`
+and `activity_bridge`. It is `skipped` when the Path B sidecar is
+absent, `ok` when the sidecar, Azure Bot resource, Teams channel,
+and BF-token runtime wiring agree, `warn` for channel-disabled or
+non-fatal Azure-read issues, and `error` for MSA app-id drift or
+runtime auth gaps that would break standalone `activity-bridge serve`.
 
 You can now pass either the slug (`inbox-helper`) or the display name
 (`"Hermes Inbox Helper"`) — slice 18l made `gather_local_config`
@@ -491,6 +504,7 @@ rather than the CLI's "Querying Entra ID for…" progress preamble.
 - [ ] `local_config: ok`
 - [ ] `blueprint_scopes: ok`
 - [ ] `instance_scopes: ok`
+- [ ] `bot_service: ok` when walking Path B, or `skipped` for Path A only.
 
 ## 9b. activity-bridge verify (slice 19a) — runtime config sanity
 

@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
+from hermes_a365.bot_service import BotServiceConfig, CommandResult
+from hermes_a365.bot_service_diagnostics import DiagnosticResult
 from hermes_a365.status import (
     A365CliQuerySource,
     QuerySource,
@@ -18,6 +21,7 @@ from hermes_a365.status import (
     collect_status,
     gather_activity_bridge,
     gather_blueprint_scopes,
+    gather_bot_service,
     gather_instance_scopes,
     gather_local_config,
     overall_to_exit_code,
@@ -54,6 +58,56 @@ class FakeQuerySource:
 _: QuerySource = FakeQuerySource()
 
 
+class FakeBotServiceRunner:
+    def __init__(
+        self,
+        *,
+        bot_app_id: str = "11111111-1111-1111-1111-111111111111",
+        endpoint: str = "https://example.test/api/messages",
+        teams: dict[str, Any] | None = None,
+    ) -> None:
+        self.bot_app_id = bot_app_id
+        self.endpoint = endpoint
+        self.teams = teams or self._teams()
+
+    def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+        if argv[:3] == ["az", "account", "show"]:
+            return CommandResult(
+                argv,
+                0,
+                stdout=json.dumps({"id": "33333333-3333-3333-3333-333333333333"}),
+            )
+        if argv[:3] == ["az", "bot", "show"]:
+            return CommandResult(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "properties": {
+                            "msaAppId": self.bot_app_id,
+                            "endpoint": self.endpoint,
+                        }
+                    }
+                ),
+            )
+        if argv[:4] == ["az", "bot", "msteams", "show"]:
+            if self.teams is None:
+                return CommandResult(argv, 3, stderr="Channel not found")
+            return CommandResult(argv, 0, stdout=json.dumps(self.teams))
+        raise AssertionError(f"unexpected command: {argv}")
+
+    @staticmethod
+    def _teams(*, accepted: bool = True, enabled: bool = True) -> dict[str, Any]:
+        return {
+            "properties": {
+                "properties": {
+                    "acceptedTerms": accepted,
+                    "isEnabled": enabled,
+                }
+            }
+        }
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -67,6 +121,29 @@ def _seed_skill_env(home: Path, **overrides: str) -> None:
     base.update(overrides)
     text = "".join(f"{k}={v}\n" for k, v in sorted(base.items()))
     (home / ".env").write_text(text)
+
+
+def _write_bot_service_sidecar(tmp_path: Path) -> Path:
+    sidecar = tmp_path / "a365.bot-service.config.json"
+    sidecar.write_text(
+        BotServiceConfig(
+            schemaVersion=1,
+            subscriptionId="33333333-3333-3333-3333-333333333333",
+            resourceGroup="hermes-a365-bots",
+            botName="hermes-inbox-helper-bot",
+            armResourceId=(
+                "/subscriptions/33333333-3333-3333-3333-333333333333"
+                "/resourceGroups/hermes-a365-bots/providers/Microsoft.BotService"
+                "/botServices/hermes-inbox-helper-bot"
+            ),
+            msaAppId="11111111-1111-1111-1111-111111111111",
+            tenantId="22222222-2222-2222-2222-222222222222",
+            messagingEndpoint="https://example.test/api/messages",
+            channelsEnabled=["msteams"],
+            createdAt="2026-05-18T12:30:00Z",
+        ).to_json()
+    )
+    return sidecar
 
 
 # ---------------------------------------------------------------------------
@@ -283,6 +360,76 @@ class TestCloudScopeGatherers:
 
 
 # ---------------------------------------------------------------------------
+# gather_bot_service
+# ---------------------------------------------------------------------------
+
+
+class TestBotServiceStatus:
+    def test_absent_sidecar_is_skipped(self, tmp_path: Path) -> None:
+        result = gather_bot_service(
+            sidecar_path=tmp_path / "missing.json",
+            generated_config_path=tmp_path / "a365.generated.config.json",
+        )
+
+        assert result.state == "skipped"
+        assert result.name == "bot_service"
+
+    def test_clean_path_b_install_reports_ok(self, tmp_path: Path) -> None:
+        sidecar = _write_bot_service_sidecar(tmp_path)
+
+        result = gather_bot_service(
+            sidecar_path=sidecar,
+            generated_config_path=tmp_path / "a365.generated.config.json",
+            runner=FakeBotServiceRunner(),
+            operator_env={"A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"},
+            runtime_auth_probe=lambda _config: DiagnosticResult(
+                "bot_service_runtime_auth", "ok", "runtime ok"
+            ),
+        )
+
+        assert result.state == "ok"
+        assert result.name == "bot_service"
+        assert "Path B probe(s) ok" in result.detail
+
+    def test_runtime_auth_failure_reports_error(self, tmp_path: Path) -> None:
+        sidecar = _write_bot_service_sidecar(tmp_path)
+
+        result = gather_bot_service(
+            sidecar_path=sidecar,
+            generated_config_path=tmp_path / "a365.generated.config.json",
+            runner=FakeBotServiceRunner(),
+            operator_env={"A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"},
+            runtime_auth_probe=lambda _config: DiagnosticResult(
+                "bot_service_runtime_auth",
+                "error",
+                "standalone activity-bridge serve must dispatch BF-token replies",
+            ),
+        )
+
+        assert result.state == "error"
+        assert "activity-bridge serve" in result.detail
+        assert "BF-token" in result.detail
+
+    def test_channel_disabled_reports_warn(self, tmp_path: Path) -> None:
+        sidecar = _write_bot_service_sidecar(tmp_path)
+
+        result = gather_bot_service(
+            sidecar_path=sidecar,
+            generated_config_path=tmp_path / "a365.generated.config.json",
+            runner=FakeBotServiceRunner(
+                teams=FakeBotServiceRunner._teams(accepted=False, enabled=False)
+            ),
+            operator_env={"A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"},
+            runtime_auth_probe=lambda _config: DiagnosticResult(
+                "bot_service_runtime_auth", "ok", "runtime ok"
+            ),
+        )
+
+        assert result.state == "warn"
+        assert "acceptedTerms/isEnabled" in result.detail
+
+
+# ---------------------------------------------------------------------------
 # gather_activity_bridge (PID file probe — kept from v0.1)
 # ---------------------------------------------------------------------------
 
@@ -359,8 +506,43 @@ class TestCollectStatus:
             "local_config",
             "blueprint_scopes",
             "instance_scopes",
+            "bot_service",
             "activity_bridge",
         ]
+        bot_service = next(c for c in report.components if c.name == "bot_service")
+        assert bot_service.state == "skipped"
+
+    def test_path_b_sidecar_row_sits_before_activity_bridge(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        agent_env = tmp_path / "agents" / "inbox-helper" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text("AA_INSTANCE_ID=x\n")
+        sidecar = _write_bot_service_sidecar(tmp_path)
+
+        report = collect_status(
+            "inbox-helper",
+            hermes_home=tmp_path,
+            query_source=FakeQuerySource(available=False),
+            bot_service_sidecar_path=sidecar,
+            generated_config_path=tmp_path / "a365.generated.config.json",
+            bot_service_runner=FakeBotServiceRunner(),
+            bot_service_operator_env={
+                "A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"
+            },
+            bot_service_runtime_auth_probe=lambda _config: DiagnosticResult(
+                "bot_service_runtime_auth", "ok", "runtime ok"
+            ),
+        )
+
+        names = [c.name for c in report.components]
+        assert names == [
+            "local_config",
+            "blueprint_scopes",
+            "instance_scopes",
+            "bot_service",
+            "activity_bridge",
+        ]
+        assert report.components[3].state == "ok"
 
     def test_explicit_tenant_id_overrides_local(self, tmp_path: Path) -> None:
         _seed_skill_env(tmp_path)
