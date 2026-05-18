@@ -1366,9 +1366,7 @@ class TestAcquireBfS2sToken:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(handler)
         ) as client:
-            with pytest.raises(
-                TokenAcquisitionError, match="Agentic application"
-            ):
+            with pytest.raises(TokenAcquisitionError) as exc_info:
                 await acquire_bf_s2s_token(
                     client=client,
                     tenant_id="tenant-1",
@@ -1376,6 +1374,12 @@ class TestAcquireBfS2sToken:
                     blueprint_client_secret="sek",
                     bf_cache=_BfTokenCache(),
                 )
+        msg = str(exc_info.value)
+        assert "Agentic application" in msg
+        # #36: error references the env vars operators set to fix it.
+        assert "A365_BF_APP_ID" in msg
+        assert "A365_BF_CLIENT_SECRET" in msg
+        assert "#36" in msg
 
     async def test_other_400_re_raises_as_http_error(self) -> None:
         """A non-82001 4xx surfaces as the regular httpx HTTPStatusError —
@@ -1523,6 +1527,116 @@ class TestAcquireReplyTokenDispatcher:
         assert len(capture) == 1
         assert capture[0]["grant_type"] == "client_credentials"
         assert capture[0]["scope"] == BF_S2S_SCOPE
+
+    async def test_path_b_uses_bf_app_id_when_set(self) -> None:
+        """#36: when ``cfg.bf_app_id`` and ``cfg.bf_client_secret`` are
+        set, the dispatcher mints against the separate non-agentic
+        identity instead of the blueprint creds (which would 401 with
+        AADSTS82001 in production)."""
+        capture: list[dict[str, Any]] = []
+        a = _inbound_message_activity()
+        a["recipient"].pop("agenticAppId")
+        a["recipient"].pop("agenticUserId")
+        a["recipient"].pop("tenantId")
+        a["conversation"].pop("tenantId")
+        a["serviceUrl"] = "https://smba.trafficmanager.net/emea/"
+
+        cfg = BridgeConfig(
+            slug="inbox-helper",
+            tenant_id="tenant-1",
+            blueprint_client_id="blueprint-app-id",
+            blueprint_client_secret="blueprint-sek",
+            webhook_url="http://hook.test/responder",
+            log_path=Path("/tmp/x.log"),
+            pid_path=Path("/tmp/x.pid"),
+            bf_app_id="bf-app-id",
+            bf_client_secret="bf-sek",
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture))
+        ) as client:
+            token, path = await acquire_reply_token(
+                client=client,
+                cfg=cfg,
+                activity=a,
+                fmi_cache=_FmiCache(),
+                user_cache=_UserTokenCache(),
+                bf_cache=_BfTokenCache(),
+            )
+        assert (token, path) == ("BF-S2S", "B")
+        # Critical: the form-encoded body uses the BF (not blueprint) creds.
+        assert capture[0]["client_id"] == "bf-app-id"
+        assert capture[0]["client_secret"] == "bf-sek"
+
+    async def test_path_b_falls_back_to_blueprint_when_bf_unset(self) -> None:
+        """#36: when ``bf_app_id`` is empty (default — Path A-only
+        operators), the dispatcher falls back to blueprint creds.
+        Production would then 401 AADSTS82001 with the operator-actionable
+        error pointing at #36; the test just confirms the credential
+        plumbing (which creds get posted)."""
+        capture: list[dict[str, Any]] = []
+        a = _inbound_message_activity()
+        a["recipient"].pop("agenticAppId")
+        a["recipient"].pop("agenticUserId")
+        a["recipient"].pop("tenantId")
+        a["conversation"].pop("tenantId")
+        a["serviceUrl"] = "https://smba.trafficmanager.net/emea/"
+
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture))
+        ) as client:
+            token, path = await acquire_reply_token(
+                client=client,
+                cfg=_cfg(),  # bf_app_id / bf_client_secret default to ""
+                activity=a,
+                fmi_cache=_FmiCache(),
+                user_cache=_UserTokenCache(),
+                bf_cache=_BfTokenCache(),
+            )
+        assert (token, path) == ("BF-S2S", "B")
+        # Falls back to blueprint creds.
+        assert capture[0]["client_id"] == "blueprint-app-id"
+        assert capture[0]["client_secret"] == "sek"
+
+    async def test_path_b_falls_back_when_only_one_bf_field_set(self) -> None:
+        """Defence-in-depth: both ``bf_app_id`` AND ``bf_client_secret``
+        must be set; a half-configured operator state falls back to
+        blueprint (which fails with AADSTS82001 + the actionable error)
+        rather than minting against a half-shape that would 401 with a
+        confusing 'invalid_client' instead."""
+        capture: list[dict[str, Any]] = []
+        a = _inbound_message_activity()
+        a["recipient"].pop("agenticAppId")
+        a["recipient"].pop("agenticUserId")
+        a["recipient"].pop("tenantId")
+        a["conversation"].pop("tenantId")
+        a["serviceUrl"] = "https://smba.trafficmanager.net/emea/"
+
+        cfg = BridgeConfig(
+            slug="inbox-helper",
+            tenant_id="tenant-1",
+            blueprint_client_id="blueprint-app-id",
+            blueprint_client_secret="blueprint-sek",
+            webhook_url="http://hook.test/responder",
+            log_path=Path("/tmp/x.log"),
+            pid_path=Path("/tmp/x.pid"),
+            bf_app_id="bf-app-id",
+            bf_client_secret="",  # half-configured
+        )
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture))
+        ) as client:
+            await acquire_reply_token(
+                client=client,
+                cfg=cfg,
+                activity=a,
+                fmi_cache=_FmiCache(),
+                user_cache=_UserTokenCache(),
+                bf_cache=_BfTokenCache(),
+            )
+        # Half-config falls back to blueprint creds.
+        assert capture[0]["client_id"] == "blueprint-app-id"
+        assert capture[0]["client_secret"] == "blueprint-sek"
 
     async def test_unknown_path_raises(self) -> None:
         """An inbound that's neither Path A nor Path B must raise —
@@ -1680,6 +1794,41 @@ class TestLoadBridgeConfig:
         assert cfg.blueprint_client_id == "blueprint-app-id"
         assert cfg.blueprint_client_secret == "sek"
         assert cfg.webhook_url == "http://hook"
+        # #36 defaults — empty when not set in agent .env.
+        assert cfg.bf_app_id == ""
+        assert cfg.bf_client_secret == ""
+
+    def test_path_b_identity_loaded_from_agent_env(
+        self, tmp_path: Path
+    ) -> None:
+        """#36: ``A365_BF_APP_ID`` and ``A365_BF_CLIENT_SECRET`` in the
+        per-agent .env populate the Path B identity fields. Empty/unset
+        defaults to "" (Path A-only operators unaffected)."""
+        _seed_agent_env(
+            tmp_path,
+            A365_BF_APP_ID="bf-app-id",
+            A365_BF_CLIENT_SECRET="bf-secret",
+        )
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "agentBlueprintId": "blueprint-app-id",
+                    "agentBlueprintClientSecret": "sek",
+                }
+            )
+        )
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="http://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.bf_app_id == "bf-app-id"
+        assert cfg.bf_client_secret == "bf-secret"
+        # Blueprint creds untouched — both identities coexist.
+        assert cfg.blueprint_client_id == "blueprint-app-id"
+        assert cfg.blueprint_client_secret == "sek"
 
     def test_falls_back_to_env_var_when_no_webhook_arg(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

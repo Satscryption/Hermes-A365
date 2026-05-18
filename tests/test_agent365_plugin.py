@@ -949,7 +949,11 @@ class TestMessagesRoutePathBDispatch:
     ) -> None:
         """BF-issued token → adapter calls ``validate_inbound_jwt_bf``
         with the activity's serviceUrl + bot app id, NOT the A365
-        validator."""
+        validator. With ``bf_app_id`` unset (default), the expected
+        audience falls back to ``blueprint_app_id`` — preserves
+        pre-#36 behaviour for operators on Path A only or for the
+        provisional bot resource registered against the blueprint
+        app id."""
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -974,6 +978,7 @@ class TestMessagesRoutePathBDispatch:
         # BF validator called with the right args.
         bf_validator.assert_awaited_once()
         kwargs = bf_validator.await_args.kwargs
+        # bf_app_id is unset by default → falls back to blueprint.
         assert kwargs["expected_app_id"] == a.blueprint_app_id
         assert kwargs["expected_service_url"] == body["serviceUrl"]
         assert kwargs["cache"] is a._bf_jwks_cache
@@ -982,6 +987,40 @@ class TestMessagesRoutePathBDispatch:
         # MessageEvent landed in handle_message.
         assert len(a._handled_events) == 1
         assert a._handled_events[0].text == "hello path B"
+
+    def test_bf_iss_uses_bf_app_id_when_set(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#36: when the adapter is configured with a separate Path B
+        identity (``bf_app_id``), inbound BF JWTs are validated
+        against THAT app id rather than the blueprint. Mirrors the
+        operator's bot-resource rewire to the non-agentic identity —
+        Microsoft signs inbound JWTs with `aud = bf_app_id` after
+        the rewire."""
+        from fastapi.testclient import TestClient
+
+        monkeypatch.setenv("A365_BF_APP_ID", "path-b-app-id")
+        monkeypatch.setenv("A365_BF_CLIENT_SECRET", "path-b-secret")
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+
+        bf_validator = AsyncMock(return_value={"iss": bridge.BF_ISSUER})
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", bf_validator)
+        a._http_client = MagicMock()
+
+        token = self._make_unverifiable_token(bridge.BF_ISSUER)
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages",
+            json=_make_inbound(),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert r.status_code == 200, r.text
+        bf_validator.assert_awaited_once()
+        # Critical: expected_app_id = bf_app_id, NOT blueprint.
+        assert bf_validator.await_args.kwargs["expected_app_id"] == "path-b-app-id"
+        assert a.bf_app_id == "path-b-app-id"
+        assert a.bf_client_secret == "path-b-secret"
 
     def test_aad_iss_dispatches_to_a365_validator(
         self, monkeypatch: pytest.MonkeyPatch

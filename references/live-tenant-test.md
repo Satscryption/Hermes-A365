@@ -6,12 +6,13 @@ on first run; expect ~30–45 minutes including the M365 Admin Centre
 approval step (longer if the tenant is on macOS 26 — see §3's
 device-code-volume failure mode).
 
-**Snapshot:** 2026-05-15 (rounds 1–8 incorporated + slice 19u-a
+**Snapshot:** 2026-05-18 (rounds 1–8 incorporated + slice 19u-a
 walkthrough; §11 Path B drafted + Phase 2 walked 2026-05-14; #34
-inbound shipped 2026-05-15; #33 outbound wrapper shipped 2026-05-15
-but blocked on a separate-identity follow-up — see §11.10 finding
-14). Tracks the current `main` branch; specific slices are
-referenced inline where they matter to operator behaviour.
+inbound shipped 2026-05-15; #33 outbound wrapper shipped 2026-05-15;
+#36 wrapper-side identity plumbing shipped 2026-05-18; live end-to-end
+pending the §11.2.5 operator walk). Tracks the current `main` branch;
+specific slices are referenced inline where they matter to operator
+behaviour.
 
 > ## Scope: Path A (AI Teammate) only
 >
@@ -1087,7 +1088,7 @@ record — every row is now closed (the architectural one too).
 
 ## 11. Path B — Custom Engine Agent + Azure Bot Service (Copilot Chat surfacing)
 
-> ## ⚠️ Inbound shipped; outbound blocked on operator identity registration
+> ## ⚠️ Wrapper-side complete; live verification pending operator §11.2.5 walk
 >
 > §11 was drafted 2026-05-14 from Microsoft's published docs and
 > walked the same day against the satscryption Azure GA account
@@ -1101,18 +1102,17 @@ record — every row is now closed (the architectural one too).
 >   shipped + live-verified. The agent loop now runs end-to-end on
 >   Path B traffic.
 > - **[#33](https://github.com/satscryption/Hermes-A365/issues/33)
->   wrapper code shipped 2026-05-15** — BF S2S `client_credentials`
->   mint + Path A/B dispatcher + path-tag refinement. But the
->   blueprint Entra app is classified Agentic by Microsoft's policy,
->   so the live token mint fails with `AADSTS82001`. Path B outbound
->   is gated on the **#33 follow-up**: register a separate
->   non-agentic Entra app for Path B and rewire the Bot Service
->   `--appid` to it.
->
-> Until the follow-up lands, Path B end-to-end shows: inbound
-> arrives, agent loop runs, outbound mint fails with the explicit
-> AADSTS82001 error pointing at the follow-up issue. See §11.10 for
-> the full findings table + the Direct Line probe recipe.
+>   closed 2026-05-15** — Path B outbound dispatcher + BF S2S
+>   `client_credentials` mint shipped. Live mint failed
+>   `AADSTS82001` because the blueprint Entra app inherits
+>   Microsoft's Agentic policy class.
+> - **[#36](https://github.com/satscryption/Hermes-A365/issues/36)
+>   wrapper-side closed 2026-05-18** — `A365_BF_APP_ID` +
+>   `A365_BF_CLIENT_SECRET` threaded through `BridgeConfig` to both
+>   the inbound aud check and outbound mint. Path B end-to-end
+>   round-trips once the operator walks §11.2.5 (register the
+>   non-agentic Entra app + `Bot.Connector` admin consent + set the
+>   env vars).
 >
 > Path A (§§0–10) remains the validated end-to-end path.
 
@@ -1194,7 +1194,72 @@ Record these once, used throughout §11:
 | `<region>` | `westeurope` | Azure region for the resource group's metadata residency. RG location is required; bot resource itself stays `--location global` regardless |
 | `<azure-bot-name>` | `hermes-inbox-helper-bot` | Bot resource name. 4–42 chars, `-`, `a–z`, `A–Z`, `0–9`, `_` only (per [`az bot create` reference](https://learn.microsoft.com/en-us/cli/azure/bot#az-bot-create)) |
 | `<tunnel-url>` | `https://apollo-….trycloudflare.com` | Same tunnel URL you used in §9d.4 |
-| `<blueprint-app-id>` | `<guid>` | The MSA App ID from §3 (`A365_APP_ID` in `~/.hermes/.env`) |
+| `<blueprint-app-id>` | `<guid>` | The MSA App ID from §3 (`A365_APP_ID` in `~/.hermes/.env`). Path A's agentic identity — used as the Bot Service's `--appid` only on pre-#36 installs that haven't migrated to the separate Path B identity yet. |
+| `<bf-app-id>` | `<guid>` | #36: the SEPARATE non-agentic Entra app registered for Path B outbound (and inbound, post-migration). Use this as the Bot Service's `--appid` after completing §11.2.5. |
+
+### 11.2.5 — Register the Path B Entra app (#36)
+
+⚠️ **Load-bearing prereq for Path B end-to-end.** The blueprint
+Entra app from Path A's §3 inherits Microsoft's **Agentic
+application** policy class, which refuses `client_credentials`
+tokens for any Bot Framework resource (AADSTS82001 — confirmed live
+on 2026-05-15 against `Bot.Connector` for app id `2e5e2dea-…`).
+Path B's outbound bearer is a classic BF S2S `client_credentials`
+mint, so the blueprint app can't satisfy it. **Path B needs a
+separate, non-agentic Entra app** as the bot identity. The wrapper
+threads `A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET` from your
+operator `.env` through to both the inbound JWT audience check and
+the outbound S2S mint when those vars are set; empty defaults fall
+back to the blueprint app (and 401 with AADSTS82001).
+
+Operator walk:
+
+1. **Register the app.** Microsoft Entra admin portal → App
+   registrations → New registration. Display name: e.g.
+   `Hermes Inbox Helper Path B Identity` (mirrors Path A's
+   `<Agent Name> Blueprint` naming). Supported account types:
+   **Accounts in this organizational directory only (single tenant)**.
+   Redirect URI: skip (this is a service identity).
+
+2. **Add a client secret.** Certificates & secrets → New client
+   secret → 24-month expiry. Copy the secret VALUE (not the
+   secret id) immediately — Entra masks it after navigating away.
+   Store in `~/.hermes/.env`:
+
+   ```bash
+   echo "A365_BF_APP_ID=<bf-app-id>" >> ~/.hermes/.env
+   echo "A365_BF_CLIENT_SECRET=<the-secret-value>" >> ~/.hermes/.env
+   chmod 600 ~/.hermes/.env
+   ```
+
+3. **Grant `Bot.Connector` admin consent.** API permissions →
+   Add a permission → APIs my organization uses → search for
+   `Bot.Connector` (resource id `8d2d3342-cf29-4959-9577-0e0eafbd16bc`)
+   → application permission → grant admin consent. Without this the
+   `client_credentials` mint will return AADSTS65001 (consent not
+   granted) rather than the AADSTS82001 the blueprint hits.
+
+4. **Re-run `instance create --apply`** for your agent slug so the
+   new env vars propagate from operator `~/.hermes/.env` to the
+   per-agent `~/.hermes/agents/<slug>/.env`:
+
+   ```bash
+   hermes-a365 instance create <slug> --apply
+   ```
+
+   (Or manually append the two `A365_BF_*` lines to the per-agent
+   `.env` — `load_bridge_config` reads them from there at gateway
+   startup.)
+
+5. **Restart the Hermes gateway** so the new `BridgeConfig` is
+   picked up. Verify on next inbound by checking the gateway log
+   for `inbound path=B (iss=https://api.botframework.com aud=<bf-app-id-prefix>…)`
+   — the aud should be the bf app id, not the blueprint.
+
+⚠️ **`az bot update` cannot change `--appid` post-creation.** If
+you already followed §11.3 with `--appid <blueprint-app-id>` on a
+pre-#36 walk, you need to `az bot delete` and re-create with
+`--appid <bf-app-id>` — see the migration sub-step in §11.3.
 
 ### 11.3 — Provision the Azure Bot resource
 
@@ -1208,19 +1273,39 @@ Per the [`az bot create` reference](https://learn.microsoft.com/en-us/cli/azure/
 az group create --name <azure-rg> --location <region>
 
 # Bot resource. --app-type SingleTenant + --appid + --tenant-id binds
-# the bot identity to the blueprint Entra app from Path A's §3. The
-# bot itself stays --location global (Bot Service is a global Azure
-# resource; the RG's region is just metadata residency).
+# the bot identity to the SEPARATE non-agentic Path B app from §11.2.5
+# (#36) — NOT the Path A blueprint app, which inherits the Agentic
+# policy class and 401s any BF client_credentials. The bot itself
+# stays --location global (Bot Service is a global Azure resource;
+# the RG's region is just metadata residency).
 az bot create \
     --resource-group <azure-rg> \
     --name <azure-bot-name> \
     --app-type SingleTenant \
-    --appid <blueprint-app-id> \
+    --appid <bf-app-id> \
     --tenant-id <tenant-id> \
     --endpoint <tunnel-url>/api/messages \
     --sku F0 \
     --location global
 ```
+
+⚠️ **Migration from a pre-#36 bot resource.** If you already
+created the bot with `--appid <blueprint-app-id>` on a pre-#36
+walk, you cannot change `--appid` via `az bot update` (it does not
+expose that parameter). Tear down + re-create:
+
+```bash
+az bot msteams delete --resource-group <azure-rg> --name <azure-bot-name>
+az bot delete         --resource-group <azure-rg> --name <azure-bot-name>
+# Then re-run the az bot create block above with --appid <bf-app-id>,
+# followed by §11.4 (msteams channel + acceptedTerms PATCH).
+```
+
+The bot resource is registration-only on the F0 SKU, so the delete +
+re-create has no cost impact, but you'll need to also republish the
+Custom Engine Agent manifest (§11.6) with `--bot-id <bf-app-id>` and
+re-upload via MAC (§11.7) because the previous manifest references
+the blueprint app id in its `bots[]` block.
 
 ⚠️ **Phase 1 finding — argv shape differs from #28's anticipated draft.**
 Issue #28 anticipated `--kind registration --msa-app-id ...
@@ -1329,23 +1414,28 @@ adapter sits behind one FastAPI route).
 ### 11.6 — Publish the Custom Engine Agent manifest
 
 Emit the `manifestVersion: 1.21+` zip using the `--copilot-chat`
-flag (slice 19u-a, v0.4.0+):
+flag (slice 19u-a, v0.4.0+), and pass `--bot-id <bf-app-id>` so the
+zip's `bots[]` block references the Path B identity (NOT the
+blueprint, which is the GA CLI's default extraction target):
 
 ```bash
 hermes-a365 publish \
     --agent-name "<display-name>" \
     --tenant-id <tenant-id> \
     --copilot-chat \
+    --bot-id <bf-app-id> \
     --apply
 ```
 
 The wrapper post-processes the GA CLI's emitted zip: sets
 `manifestVersion: "1.21"`, populates `bots[]` referencing
-`<blueprint-app-id>`, adds the `copilotAgents.customEngineAgents`
-block, strips `agenticUserTemplates` from `manifest.json`. The 19r-c
-`name.short` truncation to ≤30 chars runs against this zip too.
-Output lands at `~/manifest/manifest.copilot-chat.zip` (or
-`~/manifest/manifest.zip` when run without `--aiteammate`).
+`<bf-app-id>` (when `--bot-id` is passed; otherwise extracts from the
+manifest, which defaults to the blueprint app on Path A walks), adds
+the `copilotAgents.customEngineAgents` block, strips
+`agenticUserTemplates` from `manifest.json`. The 19r-c `name.short`
+truncation to ≤30 chars runs against this zip too. Output lands at
+`~/manifest/manifest.copilot-chat.zip` (or `~/manifest/manifest.zip`
+when run without `--aiteammate`).
 
 ⚠️ **Make sure you're running the right `hermes-a365` binary** —
 Phase 2 walk found that `pipx install hermes-a365` lands an older
@@ -1461,58 +1551,53 @@ Acceptance gates — Hermes side:
       ~10 s. Replies > 2 s exercise BF streaming via
       `Agent365Adapter.edit_message` (slices 19s + 19s-bis, #3 closed).
 
-⚠️ **Phase 2 finding — Path B inbound JWT branch is missing.** The
-`agent365` plugin's `validate_inbound_jwt`
-(`src/hermes_a365/activity_bridge.py`) is A365-only by design (slice
-19f): it expects `iss = https://login.microsoftonline.com/<tenant>/v2.0`
-+ `azp = APX_PRODUCTION_APP_ID` (Messaging Bot API SP
-`5a807f24-…`). Classic Bot Framework S2S tokens — which Path B
-inbound carries — have `iss = https://api.botframework.com` and a
-different `azp`. So **every Path B inbound currently fails JWT
-validation with HTTP 403** and the agent loop never runs. The 2026-05-14
-walk confirmed this end-to-end via a Direct Line probe that returned
-`BotError / Failed to send activity / 403`. Path B end-to-end is
-blocked on this code branch landing; tracked in
-[#34](https://github.com/satscryption/Hermes-A365/issues/34) (sibling
-to [#33](https://github.com/satscryption/Hermes-A365/issues/33)
-which handles the outbound side).
+✅ **#34 closed 2026-05-15** — Path B inbound JWT branch shipped.
+`validate_inbound_jwt_bf` validates `iss = https://api.botframework.com`,
+`aud = blueprint_app_id` OR `aud = bf_app_id` (#36, when the operator
+has migrated the bot identity to the non-agentic Path B app), and
+the BF JWKS via `https://login.botframework.com/v1/.well-known/openidconfiguration`.
+The route handler at `src/hermes_a365/plugin/adapter.py:419` peeks
+unverified `iss` and dispatches to the right validator.
 
-⚠️ **Plugin emits zero request-level logging.** Even
-`hermes gateway run -vv` (DEBUG) doesn't surface inbound POST
-requests or their 401/403 rejections — only application-level INFO/DEBUG
-from the bridge. Operators debugging Path B routing get no
-observability without a tcpdump or middleware shim. Worth a polish
-pass: add a structured logger to the FastAPI route in
-`src/hermes_a365/plugin/adapter.py:419` so operators can correlate
-gateway-side rejections with upstream Microsoft errors.
+✅ **#33 closed 2026-05-15** — Path B outbound dispatcher +
+`acquire_bf_s2s_token` shipped. The dispatcher routes Path A → user-FIC
+chain, Path B → BF S2S `client_credentials`, raises on unknown.
 
-⚠️ **Phase 2 finding (2026-05-15, #33) — Path B outbound is blocked
-on Entra identity shape.** [#34](https://github.com/satscryption/Hermes-A365/issues/34)
-closed the inbound JWT branch; agent loop now runs end-to-end on Path
-B inbound. The outbound side then mints a classic BF S2S
-`client_credentials` bearer per [#33](https://github.com/satscryption/Hermes-A365/issues/33)
-— but Microsoft returns `AADSTS82001: Agentic application is not
-permitted to request app-only tokens for resource Bot.Connector`. The
-blueprint Entra app inherits Microsoft's "Agentic" policy class (the
-same policy that bit slice 19e for general BF resources) and **cannot
-mint app-only tokens for any BF-family resource**, regardless of
-scope. Wrapper code is shape-complete (token mint logic, dispatcher,
-caching, tests); the gateway surfaces the failure cleanly with the
-operator-actionable error message. Path B end-to-end is blocked on
-**registering a separate non-agentic Entra app for Path B outbound** —
-filed as the #33 follow-up. Until that lands, Path B inbound replies
-hang silently on the Copilot Chat side and the gateway log shows the
-AADSTS82001 message.
+✅ **#36 wrapper-side closed 2026-05-18** — `A365_BF_APP_ID` +
+`A365_BF_CLIENT_SECRET` threaded through `BridgeConfig` → both inbound
+audience check and outbound mint use the bf identity when set. Empty
+defaults fall back to blueprint (which 401s AADSTS82001 with the
+operator-actionable error message pointing at §11.2.5).
+
+⚠️ **Live Copilot Chat round-trip pending the §11.2.5 operator walk.**
+On Path B today, the gateway log on every inbound shows:
+
+```
+INFO  inbound path=B (iss=https://api.botframework.com aud=<aud-prefix>…)
+INFO  inbound message: platform=agent365 user=… chat=… msg='…'
+INFO  Turn ended: text_response model=… response_len=…
+```
+
+— inbound + agent loop work end-to-end. Outbound succeeds when
+`A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET` are set AND the operator
+has registered the matching Path B Entra app with `Bot.Connector`
+admin consent (§11.2.5). Without those, outbound 401s AADSTS82001
+with the wrapper's operator-actionable error message.
+
+⚠️ **Plugin emits zero request-level logging at the FastAPI route
+level.** Even `hermes gateway run -vv` (DEBUG) doesn't surface inbound
+POST requests' raw access lines — only the structured INFO `inbound
+path=…` line from the JWT dispatcher and WARNING `inbound 4xx
+reason=…` lines on rejections. That's enough to debug Path B routing
+now (added in #34); operators no longer need a tcpdump for the
+common cases.
 
 Acceptance gates — Microsoft side:
 
 - [ ] Bot resource's **Test in Web Chat** affordance (Azure Portal
       → your Bot resource → Test in Web Chat) round-trips a message
-      end-to-end. This is an independent verification path that
-      bypasses Copilot Chat and exercises just Bot Service →
-      `/api/messages` → reply. **#34 closed inbound; outbound
-      currently fails with AADSTS82001 — gated on the #33 follow-up
-      (separate Entra identity).**
+      end-to-end. **Inbound works post-#34; outbound works after
+      §11.2.5 is walked.**
 
 Common failure shapes (encoded from the 2026-05-14 walk):
 

@@ -852,6 +852,17 @@ class BridgeConfig:
     credential at the start of the three-stage agentic-user token
     chain. The agent app instance id (``recipient.agentic_app_id`` on
     the inbound activity) is what the chain swaps in for steps 2-3.
+
+    ``bf_app_id`` / ``bf_client_secret`` (#36) are the optional
+    separate non-agentic Entra app used as the Azure Bot Service
+    identity for Path B. The blueprint app's Agentic-application
+    policy class refuses ``client_credentials`` for BF resources
+    (AADSTS82001), so Path B outbound and inbound both need a
+    non-agentic identity when the operator configures Path B end-to-end.
+    Leaving these empty means the wrapper falls back to the blueprint
+    credentials for Path B, which fails AADSTS82001 at outbound mint
+    — the gateway logs that explicitly pointing at #36's operator
+    walk.
     """
 
     slug: str
@@ -871,6 +882,11 @@ class BridgeConfig:
     trusted_service_url_suffixes: tuple[str, ...] = (
         DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
     )
+    # #36: optional separate Path B identity (non-agentic). When set,
+    # used as `expected_app_id` for inbound BF JWT validation AND as
+    # the `client_id` / `client_secret` for outbound BF S2S mint.
+    bf_app_id: str = ""
+    bf_client_secret: str = ""
 
 
 def load_bridge_config(
@@ -918,6 +934,11 @@ def load_bridge_config(
         )
 
     agent_dir = hermes_home / "agents" / slug
+    # #36: optional Path B identity. Empty defaults match Path A-only
+    # operators; setting both fields enables the BF S2S mint against
+    # a non-agentic Entra app.
+    bf_app_id = agent_env.get("A365_BF_APP_ID", "")
+    bf_client_secret = agent_env.get("A365_BF_CLIENT_SECRET", "")
     return BridgeConfig(
         slug=slug,
         tenant_id=agent_env["A365_TENANT_ID"],
@@ -927,6 +948,8 @@ def load_bridge_config(
         log_path=agent_dir / "bridge.log",
         pid_path=agent_dir / "bridge.pid",
         skip_jwt_validation=skip_jwt_validation,
+        bf_app_id=bf_app_id,
+        bf_client_secret=bf_client_secret,
     )
 
 
@@ -1641,11 +1664,12 @@ async def acquire_bf_s2s_token(
         if 82001 in aadsts:
             raise TokenAcquisitionError(
                 "AADSTS82001",
-                f"BF S2S mint failed: blueprint app {blueprint_client_id!r} "
+                f"BF S2S mint failed: app {blueprint_client_id!r} "
                 "is classified as an Agentic application by Microsoft's "
                 "policy and cannot mint app-only tokens for BF resources. "
                 "Path B outbound needs a SEPARATE non-agentic Entra app — "
-                "see the follow-up to #33. "
+                "register one per #36 and set `A365_BF_APP_ID` + "
+                "`A365_BF_CLIENT_SECRET` in your operator .env. "
                 f"Microsoft response: {desc!r}",
             )
         resp.raise_for_status()
@@ -1739,11 +1763,21 @@ async def acquire_reply_token(
         )
         return token, "A"
     if path_tag == "B":
+        # #36: use the separate non-agentic identity when set,
+        # else fall back to the (agentic) blueprint creds — which
+        # then fail AADSTS82001 with an operator-actionable error
+        # pointing at #36's identity-registration walk.
+        if cfg.bf_app_id and cfg.bf_client_secret:
+            bf_client_id = cfg.bf_app_id
+            bf_secret = cfg.bf_client_secret
+        else:
+            bf_client_id = cfg.blueprint_client_id
+            bf_secret = cfg.blueprint_client_secret
         token = await acquire_bf_s2s_token(
             client=client,
             tenant_id=cfg.tenant_id,
-            blueprint_client_id=cfg.blueprint_client_id,
-            blueprint_client_secret=cfg.blueprint_client_secret,
+            blueprint_client_id=bf_client_id,
+            blueprint_client_secret=bf_secret,
             bf_cache=bf_cache,
             scope=scope_b,
             now=now,

@@ -240,6 +240,17 @@ class Agent365Adapter(BasePlatformAdapter):
             "A365_BLUEPRINT_CLIENT_SECRET"
         ) or str(extra.get("blueprint_client_secret") or "")
 
+        # #36: optional separate non-agentic Path B identity. Empty
+        # defaults to the blueprint app (which fails AADSTS82001 on
+        # outbound for #36's reasons). Operators following the #36
+        # walk register a second Entra app + set these env vars.
+        self.bf_app_id: str = os.getenv("A365_BF_APP_ID") or str(
+            extra.get("bf_app_id") or ""
+        )
+        self.bf_client_secret: str = os.getenv("A365_BF_CLIENT_SECRET") or str(
+            extra.get("bf_client_secret") or ""
+        )
+
         self._generated_config_path: Path = Path(
             extra.get("generated_config_path")
             or os.getenv("A365_GENERATED_CONFIG_PATH")
@@ -381,6 +392,8 @@ class Agent365Adapter(BasePlatformAdapter):
             webhook_url="",  # unused — we dispatch via handle_message instead
             log_path=log_path,
             pid_path=pid_path,
+            bf_app_id=self.bf_app_id,
+            bf_client_secret=self.bf_client_secret,
         )
 
     # ── FastAPI app construction (separated for testability) ──────────────
@@ -464,11 +477,22 @@ class Agent365Adapter(BasePlatformAdapter):
             # peek failure to preserve pre-#34 behaviour.
             iss = bridge.peek_unverified_iss(token)
             if iss == bridge.BF_ISSUER:
-                logger.info("inbound path=B (iss=%s)", iss)
+                # #36: when the operator has migrated the bot's
+                # `--appid` to the non-agentic Path B identity, BF
+                # signs inbound tokens with `aud = bf_app_id` rather
+                # than the blueprint. Use bf_app_id when set; fall
+                # back to blueprint to preserve pre-#36 behaviour
+                # (bot's --appid still being the blueprint).
+                bf_expected_aud = self.bf_app_id or self.blueprint_app_id
+                logger.info(
+                    "inbound path=B (iss=%s aud=%s…)",
+                    iss,
+                    bf_expected_aud[:8] if bf_expected_aud else "",
+                )
                 try:
                     await bridge.validate_inbound_jwt_bf(
                         token=token,
-                        expected_app_id=self.blueprint_app_id,
+                        expected_app_id=bf_expected_aud,
                         expected_service_url=service_url,
                         client=self._http_client,
                         cache=self._bf_jwks_cache,
