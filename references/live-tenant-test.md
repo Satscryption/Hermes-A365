@@ -1386,6 +1386,18 @@ Verify (look for `acceptedTerms: true` AND `isEnabled: true`):
 az bot msteams show --resource-group <azure-rg> --name <azure-bot-name>
 ```
 
+Wrapper path (slice 20b):
+
+```bash
+hermes-a365 bot-service enable-channel \
+    --agent-name "<display-name>" \
+    --channel msteams \
+    --apply
+```
+
+Re-running is safe: it reports the channel as already enabled and
+keeps `a365.bot-service.config.json::channelsEnabled` in sync.
+
 Optional: enable calling on the channel if your agent needs Teams
 voice (`--enable-calling --calling-web-hook https://.../calls`). Not
 required for Copilot Chat surfacing.
@@ -1397,10 +1409,10 @@ your tunnel comes up at a new URL, update both registrations:
 
 ```bash
 # Azure side (Path B).
-az bot update \
-    --resource-group <azure-rg> \
-    --name <azure-bot-name> \
-    --endpoint <new-tunnel-url>/api/messages
+hermes-a365 bot-service update-endpoint \
+    --agent-name "<display-name>" \
+    --url <new-tunnel-url>/api/messages \
+    --apply
 
 # M365 / MCP Platform side (Path A). Run if you're also operating Path A.
 hermes-a365 activity-bridge update-endpoint \
@@ -1413,7 +1425,11 @@ talks to Azure Resource Manager, `activity-bridge update-endpoint`
 talks to M365 MCP Platform via the GA `a365` CLI. Both can stay
 active and pointed at the same `/api/messages`; the Hermes plugin
 processes inbound traffic from either path identically (`agent365`
-adapter sits behind one FastAPI route).
+adapter sits behind one FastAPI route). `bot-service verify` warns
+when the sidecar's Path B endpoint differs from
+`a365.generated.config.json::messagingEndpoint`, which is the usual
+signal that one of the two update verbs was missed after a tunnel
+rotation.
 
 ### 11.6 — Publish the Custom Engine Agent manifest
 
