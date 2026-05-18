@@ -1,10 +1,12 @@
 """Render the per-agent ``.env`` file for ``hermes a365 instance create``.
 
 The output is the file written to ``~/.hermes/agents/<slug>/.env``.
-Note that the blueprint client secret
-is **never** written to this file; the activity bridge pulls it from
-the OS keychain (or, on macOS / Linux where DPAPI isn't available,
-from ``a365.generated.config.json`` per slice 18i's gitignore).
+Note that the blueprint client secret is **never** written to this
+file; the activity bridge pulls it from the OS keychain (or, on macOS /
+Linux where DPAPI isn't available, from ``a365.generated.config.json``
+per slice 18i's gitignore). Path B's optional Bot Framework client
+secret is written here when configured because the gateway needs that
+per-agent runtime credential for BF S2S outbound.
 
 Programmatic use::
 
@@ -52,10 +54,15 @@ class InstanceEnvInputs:
     business_hours_tz: str | None = None
     business_hours_start: str | None = None
     business_hours_end: str | None = None
+    a365_bf_app_id: str | None = None
+    a365_bf_client_secret: str | None = None
+    preserved_env: dict[str, str] | None = None
 
     def __post_init__(self) -> None:
         if self.aa_instance_id is None:
             self.aa_instance_id = str(uuid.uuid4())
+        if self.preserved_env is None:
+            self.preserved_env = {}
 
 
 def render_instance_env(inputs: InstanceEnvInputs) -> str:
@@ -73,6 +80,9 @@ def render_instance_env(inputs: InstanceEnvInputs) -> str:
         business_hours_tz=inputs.business_hours_tz,
         business_hours_start=inputs.business_hours_start,
         business_hours_end=inputs.business_hours_end,
+        a365_bf_app_id=inputs.a365_bf_app_id,
+        a365_bf_client_secret=inputs.a365_bf_client_secret,
+        preserved_env=inputs.preserved_env or {},
     )
 
 
@@ -90,6 +100,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--business-hours-tz")
     parser.add_argument("--business-hours-start")
     parser.add_argument("--business-hours-end")
+    parser.add_argument("--a365-bf-app-id")
+    parser.add_argument("--a365-bf-client-secret")
     args = parser.parse_args(argv)
 
     inputs = InstanceEnvInputs(
@@ -103,6 +115,8 @@ def main(argv: list[str] | None = None) -> int:
         business_hours_tz=args.business_hours_tz,
         business_hours_start=args.business_hours_start,
         business_hours_end=args.business_hours_end,
+        a365_bf_app_id=args.a365_bf_app_id,
+        a365_bf_client_secret=args.a365_bf_client_secret,
     )
     sys.stdout.write(render_instance_env(inputs))
     return 0

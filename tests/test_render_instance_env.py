@@ -59,6 +59,40 @@ def test_render_instance_env_with_business_hours(update_golden: bool) -> None:
     _check_golden("with_business_hours.env", actual, update=update_golden)
 
 
+def test_render_instance_env_with_path_b_identity() -> None:
+    text = render_instance_env(
+        _base_inputs(
+            a365_bf_app_id="11111111-1111-1111-1111-111111111111",
+            a365_bf_client_secret="bf-secret",
+        )
+    )
+    assert "A365_BF_APP_ID=11111111-1111-1111-1111-111111111111\n" in text
+    assert "A365_BF_CLIENT_SECRET=bf-secret\n" in text
+
+
+def test_render_instance_env_half_configured_path_b_identity() -> None:
+    text = render_instance_env(
+        _base_inputs(
+            a365_bf_app_id="11111111-1111-1111-1111-111111111111",
+            a365_bf_client_secret="",
+        )
+    )
+    assert "A365_BF_APP_ID=11111111-1111-1111-1111-111111111111\n" in text
+    assert "A365_BF_CLIENT_SECRET" not in text
+
+
+def test_render_instance_env_preserves_user_managed_env() -> None:
+    text = render_instance_env(
+        _base_inputs(
+            preserved_env={
+                "CUSTOM_OPERATOR_FLAG": "1",
+                "Z_SIDE_SETTING": "kept",
+            }
+        )
+    )
+    assert text.endswith("CUSTOM_OPERATOR_FLAG=1\nZ_SIDE_SETTING=kept\n")
+
+
 def test_render_instance_env_generates_uuid_when_missing() -> None:
     inputs = _base_inputs(aa_instance_id=None)
     assert inputs.aa_instance_id is not None

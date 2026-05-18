@@ -154,6 +154,76 @@ class TestBuildInstancePlan:
         plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
         assert not hasattr(plan.desired_env_inputs, "a365_cli_variant")
 
+    def test_path_b_identity_inherited_from_parent_env(self, tmp_path: Path) -> None:
+        _seed_skill_env(
+            tmp_path,
+            A365_BF_APP_ID="11111111-1111-1111-1111-111111111111",
+            A365_BF_CLIENT_SECRET="bf-secret",
+        )
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        assert plan.desired_env_inputs.a365_bf_app_id == (
+            "11111111-1111-1111-1111-111111111111"
+        )
+        assert plan.desired_env_inputs.a365_bf_client_secret == "bf-secret"
+
+    def test_path_b_identity_absent_when_parent_env_absent(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        assert plan.desired_env_inputs.a365_bf_app_id is None
+        assert plan.desired_env_inputs.a365_bf_client_secret is None
+
+    @pytest.mark.parametrize(
+        ("key", "expected_app_id", "expected_secret"),
+        [
+            ("A365_BF_APP_ID", "11111111-1111-1111-1111-111111111111", None),
+            ("A365_BF_CLIENT_SECRET", None, "bf-secret"),
+        ],
+    )
+    def test_half_configured_path_b_identity_inherited(
+        self,
+        tmp_path: Path,
+        key: str,
+        expected_app_id: str | None,
+        expected_secret: str | None,
+    ) -> None:
+        value = "11111111-1111-1111-1111-111111111111"
+        if key == "A365_BF_CLIENT_SECRET":
+            value = "bf-secret"
+        _seed_skill_env(tmp_path, **{key: value})
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        assert plan.desired_env_inputs.a365_bf_app_id == expected_app_id
+        assert plan.desired_env_inputs.a365_bf_client_secret == expected_secret
+
+    def test_preserves_user_managed_existing_env_keys(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        agent_env = tmp_path / "agents" / "inbox-helper" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text(
+            "AA_INSTANCE_ID=550e8400-e29b-41d4-a716-446655440000\n"
+            "CUSTOM_OPERATOR_FLAG=1\n"
+            "Z_SIDE_SETTING=kept\n"
+        )
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        assert plan.desired_env_inputs.preserved_env == {
+            "CUSTOM_OPERATOR_FLAG": "1",
+            "Z_SIDE_SETTING": "kept",
+        }
+
+    def test_managed_existing_env_keys_are_not_preserved(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        agent_env = tmp_path / "agents" / "inbox-helper" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text(
+            "AA_INSTANCE_ID=550e8400-e29b-41d4-a716-446655440000\n"
+            "A365_BF_APP_ID=stale-bf-app\n"
+            "A365_BF_CLIENT_SECRET=stale-bf-secret\n"
+            "CUSTOM_OPERATOR_FLAG=1\n"
+        )
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        assert plan.desired_env_inputs.a365_bf_app_id is None
+        assert plan.desired_env_inputs.a365_bf_client_secret is None
+        assert plan.desired_env_inputs.preserved_env == {"CUSTOM_OPERATOR_FLAG": "1"}
+
 
 # ---------------------------------------------------------------------------
 # Plan rendering
@@ -235,6 +305,68 @@ class TestApplyInstance:
         assert "A365_APP_PASSWORD" not in text
         # Bug #9: no v0.1 leftover field.
         assert "A365_CLI_VARIANT" not in text
+
+    def test_writes_path_b_identity_when_parent_env_has_it(self, tmp_path: Path) -> None:
+        _seed_skill_env(
+            tmp_path,
+            A365_BF_APP_ID="11111111-1111-1111-1111-111111111111",
+            A365_BF_CLIENT_SECRET="bf-secret",
+        )
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        apply_instance_plan(plan)
+
+        text = (tmp_path / "agents" / "inbox-helper" / ".env").read_text()
+        assert "A365_BF_APP_ID=11111111-1111-1111-1111-111111111111\n" in text
+        assert "A365_BF_CLIENT_SECRET=bf-secret\n" in text
+
+    @pytest.mark.parametrize(
+        ("key", "expected_line", "unexpected_key"),
+        [
+            (
+                "A365_BF_APP_ID",
+                "A365_BF_APP_ID=11111111-1111-1111-1111-111111111111\n",
+                "A365_BF_CLIENT_SECRET",
+            ),
+            (
+                "A365_BF_CLIENT_SECRET",
+                "A365_BF_CLIENT_SECRET=bf-secret\n",
+                "A365_BF_APP_ID",
+            ),
+        ],
+    )
+    def test_writes_half_configured_path_b_identity(
+        self,
+        tmp_path: Path,
+        key: str,
+        expected_line: str,
+        unexpected_key: str,
+    ) -> None:
+        value = "11111111-1111-1111-1111-111111111111"
+        if key == "A365_BF_CLIENT_SECRET":
+            value = "bf-secret"
+        _seed_skill_env(tmp_path, **{key: value})
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        apply_instance_plan(plan)
+
+        text = (tmp_path / "agents" / "inbox-helper" / ".env").read_text()
+        assert expected_line in text
+        assert unexpected_key not in text
+
+    def test_re_run_preserves_user_managed_env_keys(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        agent_env = tmp_path / "agents" / "inbox-helper" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text(
+            "AA_INSTANCE_ID=550e8400-e29b-41d4-a716-446655440000\n"
+            "CUSTOM_OPERATOR_FLAG=1\n"
+            "Z_SIDE_SETTING=kept\n"
+        )
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        apply_instance_plan(plan)
+
+        text = agent_env.read_text()
+        assert "CUSTOM_OPERATOR_FLAG=1\n" in text
+        assert "Z_SIDE_SETTING=kept\n" in text
 
     def test_idempotent_re_run_preserves_aa_instance_id(self, tmp_path: Path) -> None:
         _seed_skill_env(tmp_path)

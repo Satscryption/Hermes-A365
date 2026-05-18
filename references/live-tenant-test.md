@@ -1255,10 +1255,6 @@ Operator walk:
    hermes-a365 instance create <slug> --apply
    ```
 
-   (Or manually append the two `A365_BF_*` lines to the per-agent
-   `.env` — `load_bridge_config` reads them from there at gateway
-   startup.)
-
 5. **Restart the Hermes gateway** so the new `BridgeConfig` is
    picked up. Verify on next inbound by checking the gateway log
    for `inbound path=B (iss=https://api.botframework.com aud=<bf-app-id-prefix>…)`
@@ -1605,13 +1601,14 @@ Teams messaging also walked green (`Test message`, `test message`),
 and the recreated WebChatChannel API probe logged `channel=webchat`
 and returned `OK`.
 
-⚠️ **Per-agent env propagation gap.** During the live walk,
+✅ **#40 fixed per-agent env propagation.** During the live walk,
 `instance create --apply` did not propagate `A365_BF_APP_ID` /
-`A365_BF_CLIENT_SECRET` into `~/.hermes/agents/inbox-helper-r8/.env`.
-The walk manually appended them before restarting the gateway.
-[#40](https://github.com/satscryption/Hermes-A365/issues/40) tracks
-fixing `InstanceEnvInputs` / `instance.env.j2` so this runbook no
-longer needs a manual env edit.
+`A365_BF_CLIENT_SECRET` into `~/.hermes/agents/inbox-helper-r8/.env`;
+the walk manually appended them before restarting the gateway. #40
+threads those optional vars through `InstanceEnvInputs` /
+`instance.env.j2`, so re-running `instance create --apply` now carries
+the operator env values into the per-agent runtime env and preserves
+unrelated user-managed keys.
 
 ⚠️ **Plugin emits zero request-level logging at the FastAPI route
 level.** Even `hermes gateway run -vv` (DEBUG) doesn't surface inbound
@@ -1723,7 +1720,7 @@ Copilot Chat surfacing, sibling to this validation work).
 | 12 | §11.8 | `agent365` plugin emits **zero request-level logging** for `/api/messages`. Even `hermes gateway run -vv` (DEBUG) doesn't surface inbound POSTs or their 401/403 rejections — only application-level bridge INFO/DEBUG. Operators debugging Path B routing get no observability without a tcpdump or middleware shim. Would have shortened the §11.8 walk from ~60 min to ~10 min if it existed. | §11.8 flagged. Worth a polish pass: add a structured logger to the FastAPI route in `src/hermes_a365/plugin/adapter.py:419` that logs `(method, path, source_ip, response_status, latency_ms)` at INFO and the rejection reason at WARNING. |
 | 13 | §11.9 | Not exercised on the 2026-05-14 walk — bot resource left running for #34 dev cycle (see §11.10 footer below for resume instructions). Phase 2 follow-up: walk the teardown once #34 lands and confirm `az bot delete` retention/soft-delete shape + Teams App Catalog removal propagation. | Open follow-up. Skip until #34 closes. |
 | 14 | §11.8 | **HEADLINE for Path B outbound (#33 walk, 2026-05-15).** After #34 closed the inbound JWT branch, the live Direct Line probe showed Microsoft posting a real BF S2S token-mint request… but Microsoft returned `AADSTS82001: Agentic application '2e5e2dea-…' is not permitted to request app-only tokens for resource '8d2d3342-cf29-4959-9577-0e0eafbd16bc' (Bot Framework V4)`. The blueprint Entra app inherits Microsoft's Agentic-application policy class (which also blocked the v0.1 design's app-only chain — slice 19e replaced it with the user-FIC chain for Path A) and **cannot mint app-only tokens for ANY BF-family resource**, regardless of scope. Path B outbound's BF S2S `client_credentials` flow architecturally needs a non-agentic identity, which the blueprint app can't satisfy. | #33 wrapper code shipped (`dddb96b` had #34 inbound; the follow-on commit ships the BF S2S mint + dispatcher + path-tag refinement + AADSTS82001-aware error). Live mint fails AADSTS82001 with an operator-actionable error message in the gateway log pointing at the #33-follow-up issue. **The follow-up tracks the separate-Entra-app registration walk** (operator: `az ad app create` + admin consent for `Bot.Connector` + `az bot update --appid <new>` + republish manifest with new `botId`). |
-| 15 | §11.2.5 | **#36 final walk (2026-05-18): separate non-agentic Path B app works.** The satscryption tenant registered `Hermes Inbox Helper Path B Identity`, created/ensured its service principal, granted `Bot.Connector`, wrote `A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`, recreated the bot resource with `msaAppId=<bf-app-id>`, and republished the CEA manifest with `botId=<bf-app-id>`. BF S2S token mint returned `token_status=200`, `has_access_token=True`. | #36 closed as complete from Hermes side. Keep #40 open for the wrapper env-propagation gap discovered during the manual operator walk. |
+| 15 | §11.2.5 | **#36 final walk (2026-05-18): separate non-agentic Path B app works.** The satscryption tenant registered `Hermes Inbox Helper Path B Identity`, created/ensured its service principal, granted `Bot.Connector`, wrote `A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`, recreated the bot resource with `msaAppId=<bf-app-id>`, and republished the CEA manifest with `botId=<bf-app-id>`. BF S2S token mint returned `token_status=200`, `has_access_token=True`. The walk manually appended the BF vars to the per-agent env because `instance create` did not carry them yet. | #36 closed as complete from Hermes side. #40 fixes the env propagation gap: `instance create --apply` now carries `A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET` from the operator env and preserves unrelated user-managed keys. |
 | 16 | §11.6 | `publish --copilot-chat --bot-id ... --apply` failed to transform the emitted zip when the workspace path contained a space (`Hermes A365`) because the package-path regex used `\S+\.zip`. | #26 tracks parser hardening. Manual walk called `_patch_manifest_to_copilot_chat(...)` / `_patch_manifest_name_short(...)` directly, then bumped manifest `version` to satisfy MAC's newer-version check. |
 | 17 | §11.6 | M365 Copilot Chat surfaced the agent but returned `Oops! Something happened. Can you try again?` until the manifest was republished as v1.1.6 with CEA bot scopes `["copilot", "personal", "team"]` and a `commandLists` entry for `copilot`/`personal`. | #26 tracks updating `_transform_manifest_to_copilot_chat` so generated CEA zips match the shape that walked green. |
 | 18 | §11.8 | **Azure Portal Test in Web Chat blade is not authoritative for this walk.** It stayed stuck on `Connecting` / `Taking longer than usual to connect` across Safari + Chrome on macOS and Edge on Windows, including private/incognito. Rotating WebChatChannel keys and full WebChatChannel delete/recreate did not fix the blade. The recreated WebChatChannel API path itself worked: gateway logged `channel=webchat`, dispatched `Recreated WebChat channel probe: reply OK`, and returned `OK`. | Track upstream with Azure Support via #41. Do not block Hermes-side Path B closure when WebChatChannel API + Teams UI + M365 Copilot Chat UI are green. |

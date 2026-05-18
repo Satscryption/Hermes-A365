@@ -33,6 +33,22 @@ _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
 
 _REQUIRED_PARENT_KEYS = ("A365_APP_ID", "A365_TENANT_ID")
+_MANAGED_AGENT_ENV_KEYS = frozenset(
+    {
+        "AGENT_IDENTITY",
+        "OWNER",
+        "OWNER_AAD_ID",
+        "A365_APP_ID",
+        "A365_TENANT_ID",
+        "AA_INSTANCE_ID",
+        "HERMES_OTLP_ENDPOINT",
+        "BUSINESS_HOURS_TZ",
+        "BUSINESS_HOURS_START",
+        "BUSINESS_HOURS_END",
+        "A365_BF_APP_ID",
+        "A365_BF_CLIENT_SECRET",
+    }
+)
 
 
 # ---------------------------------------------------------------------------
@@ -180,6 +196,15 @@ def _resolve_otlp_endpoint(
     )
 
 
+def _preserved_agent_env(existing_agent: dict[str, str]) -> dict[str, str]:
+    """Return user-managed env keys that instance create should carry forward."""
+    return {
+        key: value
+        for key, value in existing_agent.items()
+        if key not in _MANAGED_AGENT_ENV_KEYS
+    }
+
+
 def build_instance_plan(
     inputs: InstanceCreateInputs,
     *,
@@ -216,6 +241,11 @@ def build_instance_plan(
             inputs.business_hours_start or existing_agent.get("BUSINESS_HOURS_START")
         ),
         business_hours_end=(inputs.business_hours_end or existing_agent.get("BUSINESS_HOURS_END")),
+        # #40: propagate optional Path B Bot Framework identity from
+        # the operator env into the per-agent runtime env.
+        a365_bf_app_id=parent_env.get("A365_BF_APP_ID"),
+        a365_bf_client_secret=parent_env.get("A365_BF_CLIENT_SECRET"),
+        preserved_env=_preserved_agent_env(existing_agent),
     )
 
     return InstancePlan(
