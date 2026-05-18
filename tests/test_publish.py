@@ -543,8 +543,26 @@ class TestTransformManifestToCopilotChat:
                 "supportsCalling": False,
                 "supportsVideo": False,
                 "supportsFiles": False,
+                "isNotificationOnly": False,
+                "commandLists": [
+                    {
+                        "scopes": ["copilot", "personal"],
+                        "commands": [
+                            {
+                                "title": "How can you help me?",
+                                "description": "How can you help me?",
+                            }
+                        ],
+                    }
+                ],
             }
         ]
+
+    def test_default_copilot_chat_bot_scopes_include_copilot(self) -> None:
+        from hermes_a365.publish import _transform_manifest_to_copilot_chat
+
+        out = _transform_manifest_to_copilot_chat({}, bot_id="bid")
+        assert out["bots"][0]["scopes"] == ["copilot", "personal", "team"]
 
     def test_inserts_copilot_agents_block(self) -> None:
         from hermes_a365.publish import _transform_manifest_to_copilot_chat
@@ -674,7 +692,7 @@ class TestPatchManifestToCopilotChat:
         bot_id, summary = result
         assert bot_id == "the-app-id"
         assert summary["manifest_version"] == "1.21"
-        assert summary["scopes"] == ["personal"]
+        assert summary["scopes"] == ["copilot", "personal", "team"]
         assert summary["dropped_agentic_user_templates"] is True
         # Re-zip preserves other files
         with zipfile.ZipFile(zp) as zf:

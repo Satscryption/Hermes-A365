@@ -9,8 +9,9 @@ device-code-volume failure mode).
 **Snapshot:** 2026-05-18 (rounds 1–8 incorporated + slice 19u-a
 walkthrough; §11 Path B drafted + Phase 2 walked 2026-05-14; #34
 inbound shipped 2026-05-15; #33 outbound wrapper shipped 2026-05-15;
-#36 wrapper-side identity plumbing shipped 2026-05-18; live end-to-end
-pending the §11.2.5 operator walk). Tracks the current `main` branch;
+#36 identity plumbing + final Hermes-side live walk completed
+2026-05-18; Azure Portal Test in Web Chat externalized to #41).
+Tracks the current `main` branch;
 specific slices are referenced inline where they matter to operator
 behaviour.
 
@@ -1088,7 +1089,7 @@ record — every row is now closed (the architectural one too).
 
 ## 11. Path B — Custom Engine Agent + Azure Bot Service (Copilot Chat surfacing)
 
-> ## ⚠️ Wrapper-side complete; live verification pending operator §11.2.5 walk
+> ## ✅ Hermes-side Path B walk complete; Azure Portal blade tracked upstream
 >
 > §11 was drafted 2026-05-14 from Microsoft's published docs and
 > walked the same day against the satscryption Azure GA account
@@ -1107,21 +1108,28 @@ record — every row is now closed (the architectural one too).
 >   `AADSTS82001` because the blueprint Entra app inherits
 >   Microsoft's Agentic policy class.
 > - **[#36](https://github.com/satscryption/Hermes-A365/issues/36)
->   wrapper-side closed 2026-05-18** — `A365_BF_APP_ID` +
+>   closed 2026-05-18** — `A365_BF_APP_ID` +
 >   `A365_BF_CLIENT_SECRET` threaded through `BridgeConfig` to both
->   the inbound aud check and outbound mint. Path B end-to-end
->   round-trips once the operator walks §11.2.5 (register the
->   non-agentic Entra app + `Bot.Connector` admin consent + set the
->   env vars).
+>   the inbound aud check and outbound mint. The satscryption tenant
+>   walk registered the separate non-agentic Entra app, migrated the
+>   Bot Service resource to that app id, republished the CEA manifest,
+>   and verified M365 Copilot Chat + Teams + WebChatChannel API
+>   round-trips. Azure Portal **Test in Web Chat** still fails across
+>   browsers despite the recreated API-green WebChatChannel and is
+>   tracked as an upstream Azure Portal/Bot Service blade issue
+>   ([#41](https://github.com/satscryption/Hermes-A365/issues/41)).
 >
 > Path A (§§0–10) remains the validated end-to-end path.
 
 Path B layers Azure Bot Service registration on top of Path A's
 blueprint work. The blueprint Entra app from §3 + its client secret
 (per §3's `--auto-recover-secret`) + its service principal stay
-exactly as they are — Path B reuses them as the Bot Service identity.
-Operators running both paths share one Hermes install and one
-`/api/messages` endpoint.
+exactly as they are for Path A. For Path B, register a separate
+non-agentic Entra app in §11.2.5 and use THAT app id as the Bot
+Service identity / manifest `botId`; the blueprint app remains the
+agentic Path A identity and cannot mint BF app-only tokens. Operators
+running both paths share one Hermes install and one `/api/messages`
+endpoint.
 
 ### 11.1 — What this gets you
 
@@ -1469,6 +1477,17 @@ walkthrough workaround: open the zip, edit `manifest.json`'s `id`
 field to a fresh UUID (`python -c 'import uuid; print(uuid.uuid4())'`),
 re-zip, then upload.
 
+⚠️ **Two live-walk publish follow-ups found 2026-05-18.** First,
+`publish --copilot-chat --bot-id ... --apply` failed to transform the
+starter zip when the workspace path contained a space (`Hermes A365`);
+the package-path parser used `\S+\.zip` and split the path. Manual
+workaround was to call the manifest patch helpers directly, then bump
+the manifest `version` for MAC's "newer version" upload requirement.
+Second, M365 Copilot Chat only walked green after the CEA `bots[]`
+shape included the `copilot` scope alongside `personal` + `team`, plus
+a `commandLists` entry for `copilot`/`personal`. [#26](https://github.com/satscryption/Hermes-A365/issues/26)
+now tracks both generator fixes.
+
 ### 11.7 — Upload via Microsoft Admin Portal → Agents
 
 Phase 2 walk (2026-05-14) resolved the destination uncertainty: the
@@ -1532,13 +1551,14 @@ Steps (assuming Copilot Chat propagation has completed):
 4. After it moves to the active picker, click it and send a test
    prompt.
 
-Independent verification path: **Azure Portal → your Bot resource →
-Test in Web Chat**. This routes Direct Line → BF service → tunnel →
-gateway, bypassing Copilot's UX entirely. Cleaner diagnostic when
-something doesn't work because it cuts the orchestrator layer out of
-the picture. Same path works programmatically via Direct Line API if
-you want to see Microsoft's exact error response (script in §11.10's
-finding 11 below).
+Independent verification path: **Direct Line / WebChatChannel API**.
+This routes Direct Line → BF service → tunnel → gateway, bypassing
+Copilot's UX entirely. The Azure Portal **Test in Web Chat** blade is
+useful when it works, but the 2026-05-18 walk proved it can fail even
+when the underlying WebChatChannel API is healthy; see finding 18 and
+[#41](https://github.com/satscryption/Hermes-A365/issues/41). Prefer
+the programmatic probe when you need Microsoft's exact error response
+or a reliable gate (script in §11.10's finding 11 below).
 
 Acceptance gates — Hermes side:
 
@@ -1569,20 +1589,29 @@ audience check and outbound mint use the bf identity when set. Empty
 defaults fall back to blueprint (which 401s AADSTS82001 with the
 operator-actionable error message pointing at §11.2.5).
 
-⚠️ **Live Copilot Chat round-trip pending the §11.2.5 operator walk.**
-On Path B today, the gateway log on every inbound shows:
+✅ **#36 final live walk completed 2026-05-18.** After §11.2.5,
+bot-resource migration, and MAC upload of the v1.1.6 CEA manifest,
+M365 Copilot Chat and Teams both round-tripped through the gateway.
+Representative Copilot probe:
 
 ```
 INFO  inbound path=B (iss=https://api.botframework.com aud=<aud-prefix>…)
-INFO  inbound message: platform=agent365 user=… chat=… msg='…'
+INFO  inbound message: platform=agent365 user=… chat=… msg='Copilot portal probe: reply OK'
 INFO  Turn ended: text_response model=… response_len=…
+INFO  response ready: platform=agent365 ... response=2 chars
 ```
 
-— inbound + agent loop work end-to-end. Outbound succeeds when
-`A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET` are set AND the operator
-has registered the matching Path B Entra app with `Bot.Connector`
-admin consent (§11.2.5). Without those, outbound 401s AADSTS82001
-with the wrapper's operator-actionable error message.
+Teams messaging also walked green (`Test message`, `test message`),
+and the recreated WebChatChannel API probe logged `channel=webchat`
+and returned `OK`.
+
+⚠️ **Per-agent env propagation gap.** During the live walk,
+`instance create --apply` did not propagate `A365_BF_APP_ID` /
+`A365_BF_CLIENT_SECRET` into `~/.hermes/agents/inbox-helper-r8/.env`.
+The walk manually appended them before restarting the gateway.
+[#40](https://github.com/satscryption/Hermes-A365/issues/40) tracks
+fixing `InstanceEnvInputs` / `instance.env.j2` so this runbook no
+longer needs a manual env edit.
 
 ⚠️ **Plugin emits zero request-level logging at the FastAPI route
 level.** Even `hermes gateway run -vv` (DEBUG) doesn't surface inbound
@@ -1594,10 +1623,16 @@ common cases.
 
 Acceptance gates — Microsoft side:
 
-- [ ] Bot resource's **Test in Web Chat** affordance (Azure Portal
-      → your Bot resource → Test in Web Chat) round-trips a message
-      end-to-end. **Inbound works post-#34; outbound works after
-      §11.2.5 is walked.**
+- [x] M365 Copilot Chat UI round-trips a message end-to-end.
+- [x] Teams messaging UI round-trips a message end-to-end.
+- [x] WebChatChannel / Direct Line API round-trips a message
+      end-to-end (`channel=webchat` in the gateway log).
+- [ ] Azure Portal **Test in Web Chat** round-trips. As of the
+      2026-05-18 walk this is RED but externalized: the underlying
+      WebChatChannel API works, while the Azure Portal embedded blade
+      remains stuck on `Connecting` across Safari, Chrome, and Edge.
+      Track with Azure Support via #41 rather than blocking Hermes-side
+      Path B closure.
 
 Common failure shapes (encoded from the 2026-05-14 walk):
 
@@ -1676,18 +1711,23 @@ Copilot Chat surfacing, sibling to this validation work).
 |---|---|---|---|
 | 1 | §11.2 | `Microsoft.BotService` resource provider ships `NotRegistered` on fresh Azure subscriptions; `az bot create` fails until it's registered. No upstream error message guides operators toward the fix. | §11.2 patched with `az provider register --namespace Microsoft.BotService --wait` as a prereq. Slice 20a `bot-service verify` should probe; `bot-service create --apply` should auto-register. |
 | 2 | §11.3 | `az group create --location global` (anticipated by #28's draft) is invalid; resource-group `--location` is a regional spec (`westeurope`, `eastus`, `uksouth`, …). The bot resource itself stays `--location global` per Bot Service convention; RG region is metadata-only. | §11.3 patched: `--location <region>` on the group, `--location global` on the bot. `<region>` added as a recorded variable in §11.2. |
-| 3 | §11.3 | `az bot create` auto-enables `webchat` + `directline` channels at creation; only `msteams` needs an explicit `az bot msteams create`. Useful operationally — Test in Web Chat works the moment the bot exists. | §11.3 verify-step note added. |
+| 3 | §11.3 | `az bot create` auto-enables `webchat` + `directline` channels at creation; only `msteams` needs an explicit `az bot msteams create`. Useful operationally — WebChatChannel / Direct Line API can work the moment the bot exists, but the Azure Portal **Test in Web Chat** blade is not authoritative after finding 18. | §11.3 verify-step note added; §11.8 now prefers a programmatic Direct Line/WebChatChannel probe for the gate. |
 | 4 | §11.4 | **`az bot msteams create` is incomplete.** Channel provisions with `acceptedTerms: false`, and Microsoft holds **all** traffic on terms-unaccepted channels with no surfaced error. The CLI exposes no `--accepted-terms`-shaped flag; only the Azure portal UI or an ARM PATCH on `properties.properties.acceptedTerms` sets it. Confirmed root cause of "no traffic to gateway despite correct endpoint" during the 2026-05-14 walk. | §11.4 patched with the ARM PATCH recipe. Slice 20a `bot-service create --apply` MUST follow `az bot msteams create` with this PATCH or operators hit the same dead end. Filed as the headline operator-ergonomics finding. |
 | 5 | §11.6 | `pipx install hermes-a365` lands an older binary at `~/.local/bin/hermes-a365` (no `--copilot-chat` flag) that PATH-shadows the Hermes venv install (v0.5.2+). `which hermes-a365` returns the wrong one. | §11.6 patched with explicit venv-binary invocation note. Small wrapper packaging clarification worth folding into README's install section. |
 | 6 | §11.6 | `--copilot-chat` transformer strips `agenticUserTemplates` from `manifest.json` but leaves the sibling `agenticUserTemplateManifest.json` file inside the zip. Microsoft tolerates the leftover (uploads work), but it's dead weight in a Custom Engine Agent zip. | Small slice-19u-a polish item; note added inline in §11.6. |
 | 7 | §11.6 | Wrapper's post-publish console message says "Teams Admin Center → Manage apps → Upload" but the actual destination (resolved in §11.7 below) is MAC → Agents → Upload custom agent. Three-way doc drift: GA CLI says one thing, our wrapper another, Microsoft's transcribed doc a third. | §11.7 resolved the canonical destination; small slice-19u-a polish item to update the wrapper's post-publish text. |
 | 8 | §11.7 | The MAC upload destination uncertainty resolves to **MAC → Agents → Upload custom agent**. Attempting upload via Settings → Integrated Apps surfaces an in-UI message at upload time directing you over to Agents tab — the Integrated Apps surface doesn't accept the Custom Engine Agent zip itself, but it does signpost. Teams Admin Center → Manage apps is a third surface that exists but lives in a separate operator lane. | §11.7 rewritten with the resolved destination. Banner removed. |
 | 9 | §11.8 | Custom Engine Agent surfaces in **Microsoft 365 Copilot Cowork** within a few minutes of MAC upload. Surfacing in main **M365 Copilot Chat** (`m365.cloud.microsoft`) takes longer (~5–15 min on satscryption) and shows up under **Available to add** rather than the active agents picker; operator must click **Add** before it becomes usable. | §11.8 rewritten with both surfaces + propagation timing. |
-| 10 | §11.8 | Cowork @-mention produces a templated reply paraphrased from the manifest description WITHOUT calling the bot endpoint. Zero POSTs hit the gateway or cloudflared during the exchange. So Cowork is good for confirming the manifest registered, but **does not** exercise the actual bot routing — debugging Path B requires Copilot Chat (`m365.cloud.microsoft`) or Azure Portal **Test in Web Chat** / a Direct Line probe. | §11.8 flagged the Cowork-orchestrator distinction. |
+| 10 | §11.8 | Cowork @-mention produces a templated reply paraphrased from the manifest description WITHOUT calling the bot endpoint. Zero POSTs hit the gateway or cloudflared during the exchange. So Cowork is good for confirming the manifest registered, but **does not** exercise the actual bot routing — debugging Path B requires M365 Copilot Chat (`m365.cloud.microsoft`), Teams, or a Direct Line/WebChatChannel API probe. | §11.8 flagged the Cowork-orchestrator distinction and de-emphasized the Azure Portal blade after finding 18. |
 | 11 | §11.8 | **HEADLINE.** `agent365` plugin's `validate_inbound_jwt` in `src/hermes_a365/activity_bridge.py:1063` is A365-only by design (slice 19f): it expects `iss = https://login.microsoftonline.com/<tenant>/v2.0` and `azp ∈ {APX_PRODUCTION_APP_ID}`. Classic Bot Framework S2S tokens (which Path B inbound carries) have `iss = https://api.botframework.com` and a different `azp`, so every Path B request fails JWT validation with HTTP 403 and the agent loop never runs. Confirmed by Direct Line probe returning `BotError / Failed to send activity / 403` via Microsoft's BF service. **Path B end-to-end blocked on this code branch landing.** | Filed as [#34](https://github.com/satscryption/Hermes-A365/issues/34) — sibling to [#33](https://github.com/satscryption/Hermes-A365/issues/33) (Path B outbound S2S). Needs a Path-A-vs-B detection branch on the route handler (likely keyed on token `iss` or activity `serviceUrl`) and a BF-shaped validator path that uses BF's JWKS + a BF-azp allowlist. |
 | 12 | §11.8 | `agent365` plugin emits **zero request-level logging** for `/api/messages`. Even `hermes gateway run -vv` (DEBUG) doesn't surface inbound POSTs or their 401/403 rejections — only application-level bridge INFO/DEBUG. Operators debugging Path B routing get no observability without a tcpdump or middleware shim. Would have shortened the §11.8 walk from ~60 min to ~10 min if it existed. | §11.8 flagged. Worth a polish pass: add a structured logger to the FastAPI route in `src/hermes_a365/plugin/adapter.py:419` that logs `(method, path, source_ip, response_status, latency_ms)` at INFO and the rejection reason at WARNING. |
 | 13 | §11.9 | Not exercised on the 2026-05-14 walk — bot resource left running for #34 dev cycle (see §11.10 footer below for resume instructions). Phase 2 follow-up: walk the teardown once #34 lands and confirm `az bot delete` retention/soft-delete shape + Teams App Catalog removal propagation. | Open follow-up. Skip until #34 closes. |
 | 14 | §11.8 | **HEADLINE for Path B outbound (#33 walk, 2026-05-15).** After #34 closed the inbound JWT branch, the live Direct Line probe showed Microsoft posting a real BF S2S token-mint request… but Microsoft returned `AADSTS82001: Agentic application '2e5e2dea-…' is not permitted to request app-only tokens for resource '8d2d3342-cf29-4959-9577-0e0eafbd16bc' (Bot Framework V4)`. The blueprint Entra app inherits Microsoft's Agentic-application policy class (which also blocked the v0.1 design's app-only chain — slice 19e replaced it with the user-FIC chain for Path A) and **cannot mint app-only tokens for ANY BF-family resource**, regardless of scope. Path B outbound's BF S2S `client_credentials` flow architecturally needs a non-agentic identity, which the blueprint app can't satisfy. | #33 wrapper code shipped (`dddb96b` had #34 inbound; the follow-on commit ships the BF S2S mint + dispatcher + path-tag refinement + AADSTS82001-aware error). Live mint fails AADSTS82001 with an operator-actionable error message in the gateway log pointing at the #33-follow-up issue. **The follow-up tracks the separate-Entra-app registration walk** (operator: `az ad app create` + admin consent for `Bot.Connector` + `az bot update --appid <new>` + republish manifest with new `botId`). |
+| 15 | §11.2.5 | **#36 final walk (2026-05-18): separate non-agentic Path B app works.** The satscryption tenant registered `Hermes Inbox Helper Path B Identity`, created/ensured its service principal, granted `Bot.Connector`, wrote `A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`, recreated the bot resource with `msaAppId=<bf-app-id>`, and republished the CEA manifest with `botId=<bf-app-id>`. BF S2S token mint returned `token_status=200`, `has_access_token=True`. | #36 closed as complete from Hermes side. Keep #40 open for the wrapper env-propagation gap discovered during the manual operator walk. |
+| 16 | §11.6 | `publish --copilot-chat --bot-id ... --apply` failed to transform the emitted zip when the workspace path contained a space (`Hermes A365`) because the package-path regex used `\S+\.zip`. | #26 tracks parser hardening. Manual walk called `_patch_manifest_to_copilot_chat(...)` / `_patch_manifest_name_short(...)` directly, then bumped manifest `version` to satisfy MAC's newer-version check. |
+| 17 | §11.6 | M365 Copilot Chat surfaced the agent but returned `Oops! Something happened. Can you try again?` until the manifest was republished as v1.1.6 with CEA bot scopes `["copilot", "personal", "team"]` and a `commandLists` entry for `copilot`/`personal`. | #26 tracks updating `_transform_manifest_to_copilot_chat` so generated CEA zips match the shape that walked green. |
+| 18 | §11.8 | **Azure Portal Test in Web Chat blade is not authoritative for this walk.** It stayed stuck on `Connecting` / `Taking longer than usual to connect` across Safari + Chrome on macOS and Edge on Windows, including private/incognito. Rotating WebChatChannel keys and full WebChatChannel delete/recreate did not fix the blade. The recreated WebChatChannel API path itself worked: gateway logged `channel=webchat`, dispatched `Recreated WebChat channel probe: reply OK`, and returned `OK`. | Track upstream with Azure Support via #41. Do not block Hermes-side Path B closure when WebChatChannel API + Teams UI + M365 Copilot Chat UI are green. |
+| 19 | §11.8 | **M365 Copilot Chat and Teams UI walked green.** Gateway logged `Copilot portal probe: reply OK` → `response ready ... response=2 chars`; Teams/M365 messages (`Test message`, `test message`) also produced successful responses. | Final #36 closure evidence. Future wrapper re-walk should target: env propagation, bot-service wrapper create/verify/update, publish wrapper, WebChatChannel API probe, Teams UI, and M365 Copilot Chat UI. |
 
 **Reproducing the Direct Line probe** (for finding 11, when #34 dev
 wants to verify the failure mode pre-fix or the success mode post-fix):
@@ -1766,9 +1806,10 @@ az bot update --resource-group hermes-a365-bots \
     --name hermes-inbox-helper-bot \
     --endpoint "${NEW_URL}/api/messages"
 
-# After the #34 fix lands, re-test via either Test in Web Chat in the
-# Azure Portal or the Direct Line probe recipe above. Watch the
-# gateway log for a successful 200 + handle_message line.
+# Re-test via the Direct Line/WebChatChannel probe recipe above, then
+# Teams and M365 Copilot Chat. Azure Portal Test in Web Chat is tracked
+# separately in #41 because the 2026-05-18 walk showed the portal blade
+# can fail even when WebChatChannel API + Teams + Copilot are green.
 ```
 
 ### Sources

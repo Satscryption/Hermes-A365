@@ -311,7 +311,7 @@ def _patch_manifest_name_short(zip_path: str) -> tuple[str, str] | None:
 # emitted zip into the 1.21 shape.
 
 _COPILOT_CHAT_MANIFEST_VERSION = "1.21"
-_COPILOT_CHAT_DEFAULT_SCOPES: tuple[str, ...] = ("personal",)
+_COPILOT_CHAT_DEFAULT_SCOPES: tuple[str, ...] = ("copilot", "personal", "team")
 _COPILOT_CHAT_ZIP_INFIX = ".copilot-chat"
 
 
@@ -334,6 +334,18 @@ def _transform_manifest_to_copilot_chat(
             "supportsCalling": False,
             "supportsVideo": False,
             "supportsFiles": False,
+            "isNotificationOnly": False,
+            "commandLists": [
+                {
+                    "scopes": ["copilot", "personal"],
+                    "commands": [
+                        {
+                            "title": "How can you help me?",
+                            "description": "How can you help me?",
+                        }
+                    ],
+                }
+            ],
         }
     ]
     out["copilotAgents"] = {
