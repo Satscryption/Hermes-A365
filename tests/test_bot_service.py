@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from hermes_a365.bot_service import (
+    BotServiceCleanupInputs,
     BotServiceConfig,
     BotServiceCreateInputs,
     BotServiceEnableChannelInputs,
@@ -18,9 +19,11 @@ from hermes_a365.bot_service import (
     BotServiceUpdateEndpointInputs,
     CommandResult,
     ProbeResult,
+    apply_cleanup_plan,
     apply_create_plan,
     apply_enable_channel_plan,
     apply_update_endpoint_plan,
+    build_cleanup_plan,
     build_create_plan,
     build_enable_channel_plan,
     build_update_endpoint_plan,
@@ -39,10 +42,12 @@ class FakeRunner:
         *,
         bot: dict[str, Any] | None = None,
         teams: dict[str, Any] | None = None,
+        group_exists: bool = True,
         provider_state: str = "Registered",
     ) -> None:
         self.bot = bot
         self.teams = teams
+        self.group_exists = group_exists
         self.provider_state = provider_state
         self.calls: list[list[str]] = []
 
@@ -55,8 +60,16 @@ class FakeRunner:
             return self._ok({}, argv)
         if argv[:3] == ["az", "provider", "show"]:
             return CommandResult(argv, 0, stdout=self.provider_state)
-        if argv[:3] == ["az", "group", "create"]:
+        if argv[:3] == ["az", "group", "show"]:
+            if not self.group_exists:
+                return CommandResult(argv, 3, stderr="Resource group not found")
             return self._ok({"name": self._arg(argv, "--name")}, argv)
+        if argv[:3] == ["az", "group", "create"]:
+            self.group_exists = True
+            return self._ok({"name": self._arg(argv, "--name")}, argv)
+        if argv[:3] == ["az", "group", "delete"]:
+            self.group_exists = False
+            return self._ok({}, argv)
         if argv[:3] == ["az", "bot", "show"]:
             if self.bot is None:
                 return CommandResult(argv, 3, stderr="BotService not found")
@@ -68,6 +81,11 @@ class FakeRunner:
             rg = self._arg(argv, "--resource-group")
             self.bot = self._bot(name=name, resource_group=rg, app_id=app_id, endpoint=endpoint)
             return self._ok(self.bot, argv)
+        if argv[:3] == ["az", "bot", "delete"]:
+            if self.bot is None:
+                return CommandResult(argv, 3, stderr="BotService not found")
+            self.bot = None
+            return self._ok({}, argv)
         if argv[:3] == ["az", "bot", "update"]:
             assert self.bot is not None
             self.bot["properties"]["endpoint"] = self._arg(argv, "--endpoint")
@@ -79,6 +97,11 @@ class FakeRunner:
         if argv[:4] == ["az", "bot", "msteams", "create"]:
             self.teams = self._teams(accepted=False)
             return self._ok(self.teams, argv)
+        if argv[:4] == ["az", "bot", "msteams", "delete"]:
+            if self.teams is None:
+                return CommandResult(argv, 3, stderr="Channel not found")
+            self.teams = None
+            return self._ok({}, argv)
         if argv[:3] == ["az", "rest", "--method"]:
             self.teams = self._teams(accepted=True)
             return self._ok(self.teams, argv)
@@ -145,7 +168,7 @@ def test_derive_bot_name_matches_playbook_shape() -> None:
 
 
 def test_create_apply_writes_0600_sidecar_and_enables_teams(tmp_path: Path) -> None:
-    runner = FakeRunner()
+    runner = FakeRunner(group_exists=False)
     plan = build_create_plan(_inputs(tmp_path), operator_env={"A365_BF_APP_ID": BF_APP_ID})
 
     result = apply_create_plan(
@@ -165,6 +188,7 @@ def test_create_apply_writes_0600_sidecar_and_enables_teams(tmp_path: Path) -> N
     assert data["tenantId"] == TENANT_ID
     assert data["messagingEndpoint"] == "https://example.test/api/messages"
     assert data["channelsEnabled"] == ["directline", "msteams", "webchat"]
+    assert data["resourceGroupManaged"] is True
     assert any(call[:3] == ["az", "provider", "register"] for call in runner.calls)
     assert any(call[:4] == ["az", "bot", "msteams", "create"] for call in runner.calls)
     assert any(call[:3] == ["az", "rest", "--method"] for call in runner.calls)
@@ -217,7 +241,7 @@ def test_verify_missing_sidecar_fails_cleanly(tmp_path: Path) -> None:
         verify_bot_service(tmp_path / "a365.bot-service.config.json", runner=FakeRunner())
 
 
-def _write_sidecar(tmp_path: Path) -> Path:
+def _write_sidecar(tmp_path: Path, *, resource_group_managed: bool = False) -> Path:
     path = tmp_path / "a365.bot-service.config.json"
     cfg = BotServiceConfig(
         schemaVersion=1,
@@ -230,6 +254,7 @@ def _write_sidecar(tmp_path: Path) -> Path:
         messagingEndpoint="https://example.test/api/messages",
         channelsEnabled=["webchat", "directline", "msteams"],
         createdAt="2026-05-18T12:30:00Z",
+        resourceGroupManaged=resource_group_managed,
     )
     path.write_text(cfg.to_json())
     return path
@@ -333,6 +358,101 @@ def test_update_endpoint_apply_noops_when_endpoint_current(tmp_path: Path) -> No
     assert BotServiceConfig.from_file(sidecar).messagingEndpoint == (
         "https://example.test/api/messages"
     )
+
+
+def test_cleanup_apply_deletes_bot_and_backs_up_sidecar(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    a365_config = tmp_path / "a365.config.json"
+    a365_config.write_text('{"tenantId":"t"}\n')
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
+    )
+
+    result = apply_cleanup_plan(
+        plan,
+        runner=runner,
+        now=lambda: datetime(2026, 5, 18, 13, 0, tzinfo=UTC),
+    )
+
+    assert result.bot_deleted is True
+    assert result.sidecar_removed is True
+    assert not sidecar.exists()
+    assert result.sidecar_backup_path == (
+        tmp_path / "a365.bot-service.config.backup-20260518-130000.json"
+    )
+    assert result.sidecar_backup_path.exists()
+    assert a365_config.exists()
+    assert any(call[:3] == ["az", "bot", "delete"] for call in runner.calls)
+    assert any("Blueprint Entra app" in message for message in result.messages)
+
+
+def test_cleanup_apply_is_noop_when_sidecar_missing(tmp_path: Path) -> None:
+    sidecar = tmp_path / "a365.bot-service.config.json"
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.bot_deleted is False
+    assert result.sidecar_removed is False
+    assert runner.calls == []
+    assert "nothing to clean up" in "\n".join(result.messages)
+
+
+def test_cleanup_apply_missing_bot_still_backs_up_sidecar(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    runner = FakeRunner(bot=None, teams=None)
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
+    )
+
+    result = apply_cleanup_plan(
+        plan,
+        runner=runner,
+        now=lambda: datetime(2026, 5, 18, 13, 0, tzinfo=UTC),
+    )
+
+    assert result.bot_deleted is False
+    assert result.sidecar_removed is True
+    assert not sidecar.exists()
+    assert any("no bot resource found" in message for message in result.messages)
+
+
+def test_cleanup_purge_resource_group_requires_managed_sidecar(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=False)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is False
+    assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+
+
+def test_cleanup_purge_resource_group_deletes_when_managed(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is True
+    assert any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
 
 
 def test_verify_warns_when_path_a_and_path_b_endpoints_drift(tmp_path: Path) -> None:

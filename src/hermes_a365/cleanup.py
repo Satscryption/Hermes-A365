@@ -36,11 +36,12 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
+from . import bot_service
 from ._common import slugify
 from .mutator import AADSTSError, CliInvocationError, Mutator, get_mutator
 
-CleanupKind = Literal["azure", "instance", "blueprint"]
-CLEANUP_KINDS: tuple[CleanupKind, ...] = ("azure", "instance", "blueprint")
+CleanupKind = Literal["bot-service", "azure", "instance", "blueprint"]
+CLEANUP_KINDS: tuple[CleanupKind, ...] = ("bot-service", "azure", "instance", "blueprint")
 
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
@@ -90,8 +91,11 @@ def _local_artefacts(hermes_home: Path, slug: str) -> list[Path]:
 class CleanupInputs:
     agent_name: str
     tenant_id: str | None = None
-    kinds: tuple[CleanupKind, ...] = CLEANUP_KINDS  # default: all three
+    kinds: tuple[CleanupKind, ...] = CLEANUP_KINDS  # default: all four
     slug: str | None = None  # local-dir slug; defaults to slugify(agent_name)
+    bot_service_sidecar_path: Path = field(
+        default_factory=lambda: Path.cwd() / bot_service.SIDECAR_FILENAME
+    )
 
     def __post_init__(self) -> None:
         if not self.agent_name:
@@ -158,6 +162,7 @@ class CleanupPlan:
 
 
 _DESCRIPTIONS: dict[CleanupKind, str] = {
+    "bot-service": "remove Path B Azure Bot Service resource + sidecar",
     "azure": "remove Azure App Service + App Service Plan",
     "instance": "remove agent instance identity + user from Entra ID",
     "blueprint": "remove Entra blueprint app + service principal",
@@ -165,6 +170,16 @@ _DESCRIPTIONS: dict[CleanupKind, str] = {
 
 
 def _step_argv(kind: CleanupKind, inputs: CleanupInputs) -> list[str]:
+    if kind == "bot-service":
+        return [
+            "hermes-a365",
+            "bot-service",
+            "cleanup",
+            "--agent-name",
+            inputs.agent_name,
+            "--sidecar",
+            str(inputs.bot_service_sidecar_path),
+        ]
     # `-y` lives on the parent `cleanup` verb in the GA help text, but
     # empirically it does NOT propagate to subcommands — slice 18w's
     # round-2 walkthrough caught `a365 cleanup -y blueprint ...` still
@@ -184,7 +199,7 @@ def build_cleanup_plan(
 ) -> CleanupPlan:
     """Compose the ordered list of CLI cleanup steps + local artefact list.
 
-    Order is canonical (azure → instance → blueprint) regardless of the
+    Order is canonical (bot-service → azure → instance → blueprint) regardless of the
     order in ``inputs.kinds`` — we always tear down the runtime infra
     before revoking the identity.
     """
@@ -302,6 +317,7 @@ def apply_cleanup_plan(
     purge_orphans: bool = False,
     generated_config_path: Path | None = None,
     additional_orphan_instance_ids: tuple[str, ...] = (),
+    bot_service_runner: bot_service.CommandRunner | None = None,
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
 
@@ -341,6 +357,27 @@ def apply_cleanup_plan(
             candidate_instance_ids.append(normalised)
 
     for step in plan.steps:
+        if step.kind == "bot-service":
+            bs_plan = bot_service.build_cleanup_plan(
+                bot_service.BotServiceCleanupInputs(
+                    agent_name=plan.inputs.agent_name,
+                    sidecar_path=plan.inputs.bot_service_sidecar_path,
+                )
+            )
+            bs_result = bot_service.apply_cleanup_plan(bs_plan, runner=bot_service_runner)
+            result.completed.append(step.kind)
+            blueprint_teardown_requested = "blueprint" in plan.inputs.kinds
+            for message in bs_result.messages:
+                if blueprint_teardown_requested and "Blueprint Entra app" in message:
+                    continue
+                result.messages.append(message)
+            if blueprint_teardown_requested:
+                result.messages.append(
+                    "[apply] bot-service cleanup complete before blueprint teardown"
+                )
+            else:
+                result.messages.append("[apply] bot-service cleanup complete")
+            continue
         # Pre-feed `y\n` for the GA CLI's "Continue with X cleanup? (y/N):"
         # prompt that `-y` on the parent verb doesn't actually suppress
         # for subcommands. Slice 18w (corrects the gap left by 18l).
@@ -493,7 +530,8 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         "--kinds",
         help=(
             "comma-separated subset of "
-            f"{list(CLEANUP_KINDS)}; default = all (azure → instance → blueprint)"
+            f"{list(CLEANUP_KINDS)}; default = all "
+            "(bot-service → azure → instance → blueprint)"
         ),
     )
     parser.add_argument(
@@ -580,6 +618,9 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
         return 2
     except CliInvocationError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except bot_service.BotServiceError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 

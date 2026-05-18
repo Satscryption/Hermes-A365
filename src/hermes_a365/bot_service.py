@@ -22,7 +22,7 @@ import os
 import subprocess
 import sys
 from collections.abc import Callable
-from dataclasses import dataclass, field
+from dataclasses import MISSING, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -165,6 +165,7 @@ class BotServiceConfig:
     messagingEndpoint: str
     channelsEnabled: list[str]
     createdAt: str
+    resourceGroupManaged: bool = False
 
     @classmethod
     def from_file(cls, path: Path) -> BotServiceConfig:
@@ -174,7 +175,14 @@ class BotServiceConfig:
             raw = json.loads(path.read_text())
         except json.JSONDecodeError as e:
             raise BotServiceError(f"{path} is not valid JSON: {e}") from e
-        missing = [k for k in cls.__dataclass_fields__ if k not in raw]
+        if not isinstance(raw, dict):
+            raise BotServiceError(f"{path} is JSON {type(raw).__name__}, expected object")
+        raw.setdefault("resourceGroupManaged", False)
+        missing = [
+            f.name
+            for f in fields(cls)
+            if f.name not in raw and f.default is MISSING and f.default_factory is MISSING
+        ]
         if missing:
             raise BotServiceError(f"{path} missing required keys: {missing}")
         if raw.get("schemaVersion") != SIDECAR_SCHEMA_VERSION:
@@ -182,7 +190,8 @@ class BotServiceConfig:
                 f"{path} schemaVersion={raw.get('schemaVersion')!r}; "
                 f"expected {SIDECAR_SCHEMA_VERSION}"
             )
-        return cls(**raw)
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in raw.items() if k in known})
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, sort_keys=True) + "\n"
@@ -315,6 +324,59 @@ class BotServiceUpdateEndpointResult:
     messages: list[str] = field(default_factory=list)
 
 
+@dataclass
+class BotServiceCleanupInputs:
+    agent_name: str
+    sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
+    purge_resource_group: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.agent_name.strip():
+            raise ValueError("agent_name must be non-empty")
+
+
+@dataclass
+class BotServiceCleanupPlan:
+    inputs: BotServiceCleanupInputs
+    config: BotServiceConfig | None
+    sidecar_exists: bool
+
+    def render_human(self) -> str:
+        lines = [f"[plan] hermes a365 bot-service cleanup {self.inputs.agent_name}"]
+        lines.append(f"  sidecar:        {self.inputs.sidecar_path}")
+        if self.config is None:
+            lines.append("  bot resource:   (none; sidecar missing)")
+            lines.append("  azure steps:    (none)")
+        else:
+            lines.append(f"  resource group: {self.config.resourceGroup}")
+            lines.append(f"  bot resource:   {self.config.botName}")
+            lines.append("  azure steps:")
+            lines.append("    - az bot msteams delete (best effort)")
+            lines.append("    - az bot delete (skip if already gone)")
+            if self.inputs.purge_resource_group:
+                if self.config.resourceGroupManaged:
+                    lines.append("    - az group delete (resourceGroupManaged=true)")
+                else:
+                    lines.append("    - skip az group delete (resourceGroupManaged=false)")
+            else:
+                lines.append("    - skip az group delete (--purge-resource-group not set)")
+        lines.append("  local steps:")
+        lines.append("    - back up and remove a365.bot-service.config.json when present")
+        lines.append("  preserved:")
+        lines.append("    - Blueprint Entra app + service principal (Path A still depends on it)")
+        return "\n".join(lines)
+
+
+@dataclass
+class BotServiceCleanupResult:
+    sidecar_path: Path
+    bot_deleted: bool = False
+    resource_group_deleted: bool = False
+    sidecar_backup_path: Path | None = None
+    sidecar_removed: bool = False
+    messages: list[str] = field(default_factory=list)
+
+
 Status = Literal["OK", "WARN", "ERROR"]
 
 
@@ -380,6 +442,16 @@ def build_update_endpoint_plan(
     )
 
 
+def build_cleanup_plan(inputs: BotServiceCleanupInputs) -> BotServiceCleanupPlan:
+    if not inputs.sidecar_path.exists():
+        return BotServiceCleanupPlan(inputs=inputs, config=None, sidecar_exists=False)
+    return BotServiceCleanupPlan(
+        inputs=inputs,
+        config=BotServiceConfig.from_file(inputs.sidecar_path),
+        sidecar_exists=True,
+    )
+
+
 def _require_success(result: CommandResult, action: str) -> CommandResult:
     if result.returncode != 0:
         detail = result.output or f"exit code {result.returncode}"
@@ -419,6 +491,15 @@ def _bot_show(runner: CommandRunner, resource_group: str, bot_name: str) -> dict
     return _json_from_result(result, "az bot show")
 
 
+def _group_show(runner: CommandRunner, resource_group: str) -> dict[str, Any] | None:
+    result = runner.run(["az", "group", "show", "--name", resource_group, "-o", "json"])
+    if result.returncode != 0:
+        if _is_not_found(result):
+            return None
+        _require_success(result, "az group show")
+    return _json_from_result(result, "az group show")
+
+
 def _msteams_show(
     runner: CommandRunner,
     resource_group: str,
@@ -443,6 +524,26 @@ def _msteams_show(
             return None
         _require_success(result, "az bot msteams show")
     return _json_from_result(result, "az bot msteams show")
+
+
+def _msteams_delete(runner: CommandRunner, resource_group: str, bot_name: str) -> bool:
+    result = runner.run(
+        [
+            "az",
+            "bot",
+            "msteams",
+            "delete",
+            "--resource-group",
+            resource_group,
+            "--name",
+            bot_name,
+        ]
+    )
+    if result.returncode != 0:
+        if _is_not_found(result):
+            return False
+        _require_success(result, "az bot msteams delete")
+    return True
 
 
 def _bot_properties(bot: dict[str, Any]) -> dict[str, Any]:
@@ -594,6 +695,13 @@ def _write_bot_service_config(path: Path, config: BotServiceConfig) -> None:
     _write_text_atomic(path, config.to_json(), mode=0o600)
 
 
+def _backup_sidecar_path(path: Path, *, now: datetime) -> Path:
+    stamp = now.astimezone(UTC).strftime("%Y%m%d-%H%M%S")
+    if path.name.endswith(".json"):
+        return path.with_name(f"{path.name[:-5]}.backup-{stamp}.json")
+    return path.with_name(f"{path.name}.backup-{stamp}")
+
+
 def apply_create_plan(
     plan: BotServiceCreatePlan,
     *,
@@ -626,6 +734,8 @@ def apply_create_plan(
     )
     messages.append(f"[apply] registered provider {_BOT_SERVICE_NAMESPACE}")
 
+    existing_group = _group_show(runner, inputs.resource_group)
+    resource_group_managed = existing_group is None
     _require_success(
         runner.run(
             [
@@ -642,7 +752,10 @@ def apply_create_plan(
         ),
         "az group create",
     )
-    messages.append(f"[apply] ensured resource group {inputs.resource_group}")
+    if resource_group_managed:
+        messages.append(f"[apply] created resource group {inputs.resource_group}")
+    else:
+        messages.append(f"[apply] reused resource group {inputs.resource_group}")
 
     created_bot = False
     bot = _bot_show(runner, inputs.resource_group, bot_name)
@@ -757,6 +870,7 @@ def apply_create_plan(
         messagingEndpoint=inputs.endpoint,
         channelsEnabled=sorted(set(channels)),
         createdAt=now().astimezone(UTC).isoformat().replace("+00:00", "Z"),
+        resourceGroupManaged=resource_group_managed,
     )
     _write_bot_service_config(inputs.sidecar_path, cfg)
     messages.append(f"[apply] wrote {inputs.sidecar_path} (mode 0600)")
@@ -892,6 +1006,85 @@ def apply_update_endpoint_plan(
         endpoint_updated=endpoint_updated,
         messages=messages,
     )
+
+
+def apply_cleanup_plan(
+    plan: BotServiceCleanupPlan,
+    *,
+    runner: CommandRunner | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> BotServiceCleanupResult:
+    if runner is None:
+        runner = SubprocessRunner()
+    if now is None:
+        def now() -> datetime:
+            return datetime.now(UTC)
+
+    inputs = plan.inputs
+    result = BotServiceCleanupResult(sidecar_path=inputs.sidecar_path)
+    config = plan.config
+    if config is None:
+        result.messages.append(
+            f"[apply] no bot-service sidecar at {inputs.sidecar_path}; nothing to clean up"
+        )
+        result.messages.append(
+            "[apply] Blueprint Entra app + service principal preserved — Path A still depends on it"
+        )
+        return result
+
+    bot = _bot_show(runner, config.resourceGroup, config.botName)
+    if bot is None:
+        result.messages.append(
+            f"[apply] no bot resource found: {config.resourceGroup}/{config.botName}"
+        )
+    else:
+        if _msteams_delete(runner, config.resourceGroup, config.botName):
+            result.messages.append("[apply] deleted Microsoft Teams channel")
+        _require_success(
+            runner.run(
+                [
+                    "az",
+                    "bot",
+                    "delete",
+                    "--resource-group",
+                    config.resourceGroup,
+                    "--name",
+                    config.botName,
+                    "--yes",
+                ]
+            ),
+            "az bot delete",
+        )
+        result.bot_deleted = True
+        result.messages.append(f"[apply] deleted bot resource {config.botName}")
+
+    if inputs.purge_resource_group:
+        if config.resourceGroupManaged:
+            _require_success(
+                runner.run(["az", "group", "delete", "--name", config.resourceGroup, "--yes"]),
+                "az group delete",
+            )
+            result.resource_group_deleted = True
+            result.messages.append(f"[apply] deleted managed resource group {config.resourceGroup}")
+        else:
+            result.messages.append(
+                f"[apply] skipped resource group purge for {config.resourceGroup}: "
+                "sidecar resourceGroupManaged=false"
+            )
+
+    if inputs.sidecar_path.exists():
+        backup = _backup_sidecar_path(inputs.sidecar_path, now=now())
+        _write_text_atomic(backup, inputs.sidecar_path.read_text(), mode=0o600)
+        inputs.sidecar_path.unlink()
+        result.sidecar_backup_path = backup
+        result.sidecar_removed = True
+        result.messages.append(f"[apply] backed up sidecar to {backup}")
+        result.messages.append(f"[apply] removed {inputs.sidecar_path}")
+
+    result.messages.append(
+        "[apply] Blueprint Entra app + service principal preserved — Path A still depends on it"
+    )
+    return result
 
 
 RuntimeProbe = Callable[[BotServiceConfig, CommandRunner], ProbeResult]
@@ -1246,6 +1439,23 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     endpoint.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
     endpoint.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
 
+    cleanup = subs.add_parser(
+        "cleanup",
+        help="Delete the Path B Azure Bot resource and back up/remove the sidecar",
+    )
+    cleanup.add_argument("--agent-name", required=True)
+    cleanup.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
+    cleanup.add_argument(
+        "--purge-resource-group",
+        action="store_true",
+        help="delete the resource group only when the sidecar marks it as wrapper-managed",
+    )
+    cleanup.add_argument(
+        "--confirm",
+        help="must equal --agent-name for the apply path to proceed",
+    )
+    cleanup.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
+
     verify = subs.add_parser("verify", help="Verify the Path B Azure Bot resource from the sidecar")
     verify.add_argument(
         "--agent-name",
@@ -1351,6 +1561,54 @@ def _run_update_endpoint(args: argparse.Namespace) -> int:
     return 0
 
 
+def _validate_confirm(agent_name: str, confirm: str | None) -> None:
+    if confirm is None:
+        raise BotServiceError(
+            f"--confirm is required for --apply and must be the agent name literal "
+            f"(e.g. --confirm={agent_name})"
+        )
+    if confirm != agent_name:
+        raise BotServiceError(
+            f"--confirm value {confirm!r} does not match agent-name {agent_name!r}; "
+            "refusing to proceed"
+        )
+
+
+def _run_cleanup(args: argparse.Namespace) -> int:
+    try:
+        inputs = BotServiceCleanupInputs(
+            agent_name=args.agent_name,
+            sidecar_path=args.sidecar,
+            purge_resource_group=args.purge_resource_group,
+        )
+        plan = build_cleanup_plan(inputs)
+    except (ValueError, BotServiceError) as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    sys.stdout.write(plan.render_human() + "\n")
+    if not args.apply:
+        sys.stdout.write(
+            f"\nNo mutations. Re-run with --apply --confirm={args.agent_name} "
+            "to clean up Bot Service.\n"
+        )
+        return 0
+
+    try:
+        _validate_confirm(args.agent_name, args.confirm)
+    except BotServiceError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+
+    try:
+        result = apply_cleanup_plan(plan)
+    except BotServiceError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 1
+    sys.stdout.write("\n" + "\n".join(result.messages) + "\ndone.\n")
+    return 0
+
+
 def _run_verify(args: argparse.Namespace) -> int:
     probe = directline_runtime_probe if args.directline_probe else None
     try:
@@ -1374,10 +1632,13 @@ def run(args: argparse.Namespace) -> int:
         return _run_enable_channel(args)
     if sub == "update-endpoint":
         return _run_update_endpoint(args)
+    if sub == "cleanup":
+        return _run_cleanup(args)
     if sub == "verify":
         return _run_verify(args)
     print(
-        "usage: hermes-a365 bot-service {create,enable-channel,update-endpoint,verify}",
+        "usage: hermes-a365 bot-service "
+        "{create,enable-channel,update-endpoint,cleanup,verify}",
         file=sys.stderr,
     )
     return 2

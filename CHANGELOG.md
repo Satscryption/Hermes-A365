@@ -8,6 +8,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Slice 20c (#31):** `hermes-a365 bot-service cleanup`
+  deletes the Path B Azure Bot resource, backs up then removes
+  `a365.bot-service.config.json`, preserves the Path A blueprint
+  Entra app/service principal, and only purges the resource group
+  when `--purge-resource-group` is set and the sidecar marks the
+  group as wrapper-managed. Top-level `hermes-a365 cleanup` now
+  has a `bot-service` kind and runs it before `azure → instance →
+  blueprint` so Bot Service teardown happens before Path A identity
+  teardown.
 - **Slice 20b (#30):** `hermes-a365 bot-service enable-channel`
   and `bot-service update-endpoint`. `enable-channel --apply`
   idempotently enables the Microsoft Teams channel from the sidecar

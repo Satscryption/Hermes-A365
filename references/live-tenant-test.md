@@ -1675,16 +1675,21 @@ To remove the Azure-side Bot Service registration while keeping the
 blueprint Entra app for Path A's continued use:
 
 ```bash
-# Remove the Microsoft Teams channel first (Bot Service deletes are
-# happier when channels are gone first).
-az bot msteams delete --resource-group <azure-rg> --name <azure-bot-name>
+# Remove the Teams channel + Bot resource, back up and remove the
+# sidecar, and preserve the Path A blueprint Entra app.
+hermes-a365 bot-service cleanup \
+    --agent-name "<display-name>" \
+    --apply \
+    --confirm "<display-name>"
 
-# Remove the Bot resource itself.
-az bot delete --resource-group <azure-rg> --name <azure-bot-name>
-
-# Optionally remove the resource group if it was created solely for
-# this bot.
-# az group delete --name <azure-rg> --yes --no-wait
+# Optionally remove the resource group, but only when the sidecar
+# records resourceGroupManaged=true (created by the wrapper rather
+# than reused).
+# hermes-a365 bot-service cleanup \
+#     --agent-name "<display-name>" \
+#     --purge-resource-group \
+#     --apply \
+#     --confirm "<display-name>"
 ```
 
 The Teams App Catalog entry from §11.7 also needs cleanup —
@@ -1692,8 +1697,20 @@ The Teams App Catalog entry from §11.7 also needs cleanup —
 → **Integrated Apps** → select the app → **Remove**.
 
 Path A's blueprint Entra app + service principal + agentic-user
-instances remain untouched. To tear down both paths, run §11.9
-first, then §10.
+instances remain untouched by `bot-service cleanup`. To tear down
+both paths in one command, top-level cleanup now includes a
+`bot-service` kind first:
+
+```bash
+hermes-a365 cleanup \
+    --agent-name "<display-name>" \
+    --kinds=bot-service,azure,instance,blueprint \
+    --apply \
+    --confirm "<display-name>"
+```
+
+Use `--kinds=bot-service,instance` or similar subsets when you need
+to scope teardown deliberately.
 
 Phase 2 walk should capture:
 

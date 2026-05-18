@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_a365.bot_service import CommandResult
 from hermes_a365.cleanup import (
     CLEANUP_KINDS,
     CleanupError,
@@ -53,6 +54,41 @@ class FakeMutator:
         return RunResult(argv=list(argv), returncode=0, stdout="", stderr="")
 
 
+@dataclass
+class FakeBotServiceRunner:
+    calls: list[list[str]] = field(default_factory=list)
+    bot_exists: bool = True
+    teams_exists: bool = True
+
+    def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+        self.calls.append(list(argv))
+        if argv[:3] == ["az", "bot", "show"]:
+            if not self.bot_exists:
+                return CommandResult(argv, 3, stderr="BotService not found")
+            return CommandResult(
+                argv,
+                0,
+                stdout=json.dumps(
+                    {
+                        "properties": {
+                            "endpoint": "https://example.test/api/messages",
+                            "msaAppId": "bot-app-id",
+                            "enabledChannels": ["webchat", "directline", "msteams"],
+                        }
+                    }
+                ),
+            )
+        if argv[:4] == ["az", "bot", "msteams", "delete"]:
+            if not self.teams_exists:
+                return CommandResult(argv, 3, stderr="Channel not found")
+            self.teams_exists = False
+            return CommandResult(argv, 0, stdout="{}")
+        if argv[:3] == ["az", "bot", "delete"]:
+            self.bot_exists = False
+            return CommandResult(argv, 0, stdout="{}")
+        raise AssertionError(f"unexpected bot-service command: {argv}")
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -72,6 +108,31 @@ def _seed_agent_dir(
     if with_blueprint_cache:
         (agent_dir / "blueprint.json").write_text("{}")
     return agent_dir
+
+
+def _seed_bot_service_sidecar(tmp_path: Path) -> Path:
+    path = tmp_path / "a365.bot-service.config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "subscriptionId": "sub-id",
+                "resourceGroup": "hermes-a365-bots",
+                "botName": "hermes-inbox-helper-bot",
+                "armResourceId": (
+                    "/subscriptions/sub/resourceGroups/rg/providers/"
+                    "Microsoft.BotService/botServices/bot"
+                ),
+                "msaAppId": "bot-app-id",
+                "tenantId": "tenant-id",
+                "messagingEndpoint": "https://example.test/api/messages",
+                "channelsEnabled": ["webchat", "directline", "msteams"],
+                "createdAt": "2026-05-18T12:30:00Z",
+                "resourceGroupManaged": False,
+            }
+        )
+    )
+    return path
 
 
 # ---------------------------------------------------------------------------
@@ -117,6 +178,9 @@ class TestParseKinds:
     def test_subset(self) -> None:
         assert _parse_kinds("azure,instance") == ("azure", "instance")
 
+    def test_bot_service_kind_allowed(self) -> None:
+        assert _parse_kinds("bot-service,instance") == ("bot-service", "instance")
+
     def test_unknown_kind_rejected(self) -> None:
         with pytest.raises(CleanupError, match="unknown cleanup kind"):
             _parse_kinds("azure,bogus")
@@ -149,7 +213,7 @@ class TestBuildCleanupPlan:
     def test_default_plans_all_three_in_canonical_order(self, tmp_path: Path) -> None:
         plan = build_cleanup_plan(CleanupInputs(agent_name="x"), hermes_home=tmp_path)
         kinds = [s.kind for s in plan.steps]
-        assert kinds == ["azure", "instance", "blueprint"]
+        assert kinds == ["bot-service", "azure", "instance", "blueprint"]
 
     def test_subset_preserves_canonical_order(self, tmp_path: Path) -> None:
         # Even when caller orders the kinds differently, we emit canonical.
@@ -161,7 +225,9 @@ class TestBuildCleanupPlan:
         assert kinds == ["azure", "blueprint"]
 
     def test_argv_shape_minimal(self, tmp_path: Path) -> None:
-        plan = build_cleanup_plan(CleanupInputs(agent_name="x"), hermes_home=tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="x", kinds=("azure",)), hermes_home=tmp_path
+        )
         # Slice 18l (bug #11): -y is a parent flag — `a365 cleanup -y <kind>`,
         # not `a365 cleanup <kind> --yes`.
         assert plan.steps[0].argv == [
@@ -175,7 +241,11 @@ class TestBuildCleanupPlan:
 
     def test_argv_shape_with_tenant(self, tmp_path: Path) -> None:
         plan = build_cleanup_plan(
-            CleanupInputs(agent_name="x", tenant_id="contoso.onmicrosoft.com"),
+            CleanupInputs(
+                agent_name="x",
+                tenant_id="contoso.onmicrosoft.com",
+                kinds=("azure",),
+            ),
             hermes_home=tmp_path,
         )
         assert plan.steps[0].argv == [
@@ -273,7 +343,7 @@ class TestApplyCleanup:
         result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
 
         assert isinstance(result, CleanupResult)
-        assert result.completed == ["azure", "instance", "blueprint"]
+        assert result.completed == ["bot-service", "azure", "instance", "blueprint"]
         # Mutator received argv lists matching plan order.
         # Index 3 = subcommand (after `a365 cleanup -y`).
         assert [argv[3] for argv in mutator.calls] == ["azure", "instance", "blueprint"]
@@ -297,6 +367,55 @@ class TestApplyCleanup:
         result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
         assert result.completed == ["blueprint"]
         assert [argv[3] for argv in mutator.calls] == ["blueprint"]
+
+    def test_bot_service_runs_before_a365_cleanup_when_sidecar_present(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        sidecar = _seed_bot_service_sidecar(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(
+                agent_name="inbox-helper",
+                bot_service_sidecar_path=sidecar,
+            ),
+            hermes_home=tmp_path,
+        )
+        bot_runner = FakeBotServiceRunner()
+        mutator = FakeMutator()
+
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            bot_service_runner=bot_runner,
+        )
+
+        assert result.completed == ["bot-service", "azure", "instance", "blueprint"]
+        assert bot_runner.calls[0][:3] == ["az", "bot", "show"]
+        assert [argv[3] for argv in mutator.calls] == ["azure", "instance", "blueprint"]
+        assert not sidecar.exists()
+
+    def test_kinds_can_scope_bot_service_and_instance(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        sidecar = _seed_bot_service_sidecar(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(
+                agent_name="inbox-helper",
+                kinds=("bot-service", "instance"),
+                bot_service_sidecar_path=sidecar,
+            ),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator()
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            bot_service_runner=FakeBotServiceRunner(),
+        )
+
+        assert result.completed == ["bot-service", "instance"]
+        assert [argv[3] for argv in mutator.calls] == ["instance"]
 
     def test_chmods_secret_bearing_backups_to_600(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -777,5 +896,4 @@ class TestApplyCleanupAdditionalOrphanInstance:
 
 
 def test_kinds_constant_pinned() -> None:
-    # Real CLI has exactly these three subs (verified 2026-05-04 v1.1.171).
-    assert CLEANUP_KINDS == ("azure", "instance", "blueprint")
+    assert CLEANUP_KINDS == ("bot-service", "azure", "instance", "blueprint")
