@@ -19,6 +19,7 @@ import sys
 def _build_parser() -> argparse.ArgumentParser:
     """Build the top-level ``hermes-a365`` parser."""
     from hermes_a365 import activity_bridge as _activity_bridge
+    from hermes_a365 import bot_service as _bot_service
     from hermes_a365 import cleanup as _cleanup
     from hermes_a365 import consent as _consent
     from hermes_a365 import doctor as _doctor
@@ -75,6 +76,12 @@ def _build_parser() -> argparse.ArgumentParser:
             help="Bot Framework adapter daemon (verify / serve / update-endpoint)",
         )
     )
+    _bot_service.build_parser(
+        subs.add_parser(
+            "bot-service",
+            help="Manage Path B Azure Bot Service resources (create / verify)",
+        )
+    )
 
     return parser
 
@@ -119,6 +126,9 @@ def main(argv: list[str] | None = None) -> int:
     if sub == "activity-bridge":
         from hermes_a365 import activity_bridge
         return activity_bridge.run(args)
+    if sub == "bot-service":
+        from hermes_a365 import bot_service
+        return bot_service.run(args)
 
     print(f"unknown subcommand: {sub}", file=sys.stderr)
     return 2

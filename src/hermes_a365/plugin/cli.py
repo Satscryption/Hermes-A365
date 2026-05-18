@@ -14,6 +14,7 @@ flags as ``hermes-a365 doctor --help``.
   status           — per-component status report
   cleanup          — destructive teardown
   activity-bridge  — Bot Framework adapter daemon (verify / serve / update-endpoint)
+  bot-service      — Azure Bot Service Path B create / verify
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     # Deferred imports so plugin-load time doesn't pay for them when
     # the operator never invokes the CLI.
     from hermes_a365 import activity_bridge as _activity_bridge
+    from hermes_a365 import bot_service as _bot_service
     from hermes_a365 import cleanup as _cleanup
     from hermes_a365 import consent as _consent
     from hermes_a365 import doctor as _doctor
@@ -89,12 +91,18 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     _activity_bridge.build_parser(bridge_p)
 
+    bot_service_p = subs.add_parser(
+        "bot-service",
+        help="Manage Path B Azure Bot Service resources (create / verify)",
+    )
+    _bot_service.build_parser(bot_service_p)
+
     subparser.set_defaults(func=a365_command)
 
 
 _USAGE = (
     "usage: hermes a365 "
-    "{doctor,license,register,consent,instance,publish,status,cleanup,activity-bridge}"
+    "{doctor,license,register,consent,instance,publish,status,cleanup,activity-bridge,bot-service}"
 )
 
 
@@ -136,6 +144,9 @@ def a365_command(args: argparse.Namespace) -> int:
     if sub == "activity-bridge":
         from hermes_a365 import activity_bridge as _activity_bridge
         return _activity_bridge.run(args)
+    if sub == "bot-service":
+        from hermes_a365 import bot_service as _bot_service
+        return _bot_service.run(args)
 
     print(f"unknown subcommand: {sub}", file=sys.stderr)
     print(_USAGE, file=sys.stderr)

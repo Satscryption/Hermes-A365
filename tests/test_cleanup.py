@@ -196,6 +196,15 @@ class TestBuildCleanupPlan:
         assert ".env" in names
         assert "blueprint.json" in names  # legacy v0.1 cache picked up too
 
+    def test_bot_service_sidecar_is_not_cleanup_local_artefact(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path, with_env=True)
+        sidecar = tmp_path / "agents" / "inbox-helper" / "a365.bot-service.config.json"
+        sidecar.write_text("{}")
+
+        plan = build_cleanup_plan(CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path)
+
+        assert sidecar not in plan.local_paths
+
     def test_no_local_paths_when_agent_dir_missing(self, tmp_path: Path) -> None:
         plan = build_cleanup_plan(CleanupInputs(agent_name="ghost"), hermes_home=tmp_path)
         assert plan.local_paths == []
