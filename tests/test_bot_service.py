@@ -388,6 +388,29 @@ def test_cleanup_apply_deletes_bot_and_backs_up_sidecar(tmp_path: Path) -> None:
     assert any("Blueprint Entra app" in message for message in result.messages)
 
 
+def test_cleanup_calls_az_bot_delete_without_yes_flag(tmp_path: Path) -> None:
+    # `az bot delete` only accepts `--name` and `--resource-group`; it
+    # rejects `--yes`. The v0.7.0 release walk hit this against the live
+    # tenant after `az bot msteams delete` had already succeeded, leaving
+    # the install half-cleaned (msteams gone, bot alive, sidecar drifted).
+    sidecar = _write_sidecar(tmp_path)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
+    )
+
+    apply_cleanup_plan(plan, runner=runner)
+
+    bot_delete_calls = [
+        call for call in runner.calls if call[:3] == ["az", "bot", "delete"]
+    ]
+    assert bot_delete_calls, "az bot delete was never invoked"
+    for call in bot_delete_calls:
+        assert "--yes" not in call, (
+            f"az bot delete must not be invoked with --yes; got {call}"
+        )
+
+
 def test_cleanup_apply_is_noop_when_sidecar_missing(tmp_path: Path) -> None:
     sidecar = tmp_path / "a365.bot-service.config.json"
     runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())

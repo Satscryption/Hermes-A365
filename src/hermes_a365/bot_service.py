@@ -1040,6 +1040,8 @@ def apply_cleanup_plan(
     else:
         if _msteams_delete(runner, config.resourceGroup, config.botName):
             result.messages.append("[apply] deleted Microsoft Teams channel")
+        # `az bot delete` is non-interactive (no confirm prompt) and rejects
+        # `--yes`; only `--name` and `--resource-group` are accepted.
         _require_success(
             runner.run(
                 [
@@ -1050,7 +1052,6 @@ def apply_cleanup_plan(
                     config.resourceGroup,
                     "--name",
                     config.botName,
-                    "--yes",
                 ]
             ),
             "az bot delete",

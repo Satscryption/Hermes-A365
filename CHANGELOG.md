@@ -8,6 +8,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **#50:** `hermes-a365 bot-service cleanup --apply` no longer
+  invokes `az bot delete --yes`. The `--yes` argument is rejected by
+  `az bot delete` (which is non-interactive by default), so cleanup
+  failed mid-flight against every live install after `az bot msteams
+  delete` had already succeeded — leaving the operator with the
+  msteams channel gone but the bot resource and sidecar still
+  present and drifted. The previous regression test sliced calls to
+  the first three argv elements so `--yes` was invisible; the new
+  test asserts `--yes` does not appear in the full `az bot delete`
+  arg list.
 - **#49:** `hermes-a365 bot-service verify --directline-probe` now
   finds the Direct Line channel secret in real `az bot directline
   show --with-secrets` output. The probe walked
