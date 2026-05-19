@@ -19,6 +19,7 @@ from hermes_a365.bot_service import (
     BotServiceUpdateEndpointInputs,
     CommandResult,
     ProbeResult,
+    _extract_directline_secret,
     apply_cleanup_plan,
     apply_create_plan,
     apply_enable_channel_plan,
@@ -488,6 +489,109 @@ def test_verify_detects_runtime_auth_probe_rejection(tmp_path: Path) -> None:
     runtime = next(result for result in report.results if result.name == "runtime_auth")
     assert runtime.status == "ERROR"
     assert "BF Connector token" in runtime.detail
+
+
+# Structure mirrors a real `az bot directline show --with-secrets` response
+# captured during the v0.7.0 release walk (2026-05-19). The `properties` key
+# is doubly-nested, and a sibling `resource.properties` repeats the channel.
+# All key material is placeholder.
+_AZ_DIRECTLINE_REAL_SHAPE: dict[str, Any] = {
+    "changedTime": "0001-01-01T00:00:00Z",
+    "etag": None,
+    "id": (
+        "/subscriptions/00000000-0000-0000-0000-000000000000"
+        "/resourceGroups/rg/providers/Microsoft.BotService/botServices"
+        "/bot/channels/DirectLineChannel"
+    ),
+    "location": "global",
+    "name": None,
+    "properties": {
+        "channelName": "DirectLineChannel",
+        "etag": "W/\"x\"",
+        "location": "global",
+        "properties": {
+            "directLineEmbedCode": None,
+            "extensionKey1": "EXT_KEY_1_PLACEHOLDER",
+            "extensionKey2": "EXT_KEY_2_PLACEHOLDER",
+            "isEnabled": True,
+            "sites": [
+                {
+                    "isEnabled": True,
+                    "isV1Enabled": True,
+                    "isV3Enabled": True,
+                    "key": "PRIMARY_SITE_KEY_PLACEHOLDER",
+                    "key2": "SECONDARY_SITE_KEY_PLACEHOLDER",
+                    "siteId": "SITE_ID_PLACEHOLDER",
+                    "siteName": "Default Site",
+                    "trustedOrigins": [],
+                }
+            ],
+        },
+        "provisioningState": None,
+    },
+    "resource": {
+        "channelName": "DirectLineChannel",
+        "etag": "W/\"x\"",
+        "location": "global",
+        "properties": {
+            "isEnabled": True,
+            "sites": [
+                {
+                    "isEnabled": True,
+                    "key": "PRIMARY_SITE_KEY_PLACEHOLDER",
+                    "key2": "SECONDARY_SITE_KEY_PLACEHOLDER",
+                    "siteId": "SITE_ID_PLACEHOLDER",
+                    "siteName": "Default Site",
+                }
+            ],
+        },
+        "provisioningState": None,
+    },
+    "resourceGroup": "rg",
+}
+
+
+def test_extract_directline_secret_walks_real_az_double_nested_shape() -> None:
+    # Live `az bot directline show --with-secrets` nests the channel sites at
+    # `data.properties.properties.sites[]`. Regression: pre-fix code only
+    # checked the single-nested `data.properties.sites[]` and failed against
+    # real az output during the v0.7.0 release walk.
+    assert (
+        _extract_directline_secret(_AZ_DIRECTLINE_REAL_SHAPE)
+        == "PRIMARY_SITE_KEY_PLACEHOLDER"
+    )
+
+
+def test_extract_directline_secret_handles_single_nested_legacy_shape() -> None:
+    legacy = {
+        "properties": {
+            "sites": [
+                {"key": "LEGACY_KEY_PLACEHOLDER"},
+            ],
+        },
+    }
+    assert _extract_directline_secret(legacy) == "LEGACY_KEY_PLACEHOLDER"
+
+
+def test_extract_directline_secret_falls_back_to_resource_properties() -> None:
+    # If az ever drops the double-nested `properties.properties` but keeps the
+    # `resource.properties.sites[]` copy, the probe should still succeed.
+    resource_only = {
+        "properties": {"channelName": "DirectLineChannel"},
+        "resource": {
+            "properties": {
+                "sites": [{"key": "RESOURCE_KEY_PLACEHOLDER"}],
+            },
+        },
+    }
+    assert (
+        _extract_directline_secret(resource_only) == "RESOURCE_KEY_PLACEHOLDER"
+    )
+
+
+def test_extract_directline_secret_raises_when_no_secret_anywhere() -> None:
+    with pytest.raises(BotServiceError, match="not present in az output"):
+        _extract_directline_secret({"properties": {"sites": [{"siteName": "x"}]}})
 
 
 def test_verify_errors_when_teams_terms_not_accepted(tmp_path: Path) -> None:

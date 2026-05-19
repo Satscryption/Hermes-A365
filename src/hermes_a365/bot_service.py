@@ -1117,15 +1117,32 @@ def _provider_probe(runner: CommandRunner) -> ProbeResult:
 
 
 def _extract_directline_secret(data: dict[str, Any]) -> str:
+    # `az bot directline show --with-secrets` returns the channel as
+    # `data.properties.properties.sites[].key` (note: doubly-nested
+    # `properties`). Some versions also expose a sibling `data.resource.
+    # properties.sites[]` copy. Older / mocked shapes use the simpler
+    # `data.properties.sites[]`. Walk all known paths and keep the
+    # top-level fallback so we degrade gracefully if az adds another
+    # wrapper.
     candidates: list[Any] = []
-    props = data.get("properties")
-    if isinstance(props, dict):
+
+    def _collect_from_props(props: Any) -> None:
+        if not isinstance(props, dict):
+            return
         candidates.extend([props.get("key"), props.get("key1"), props.get("key2")])
         sites = props.get("sites")
         if isinstance(sites, list):
             for site in sites:
                 if isinstance(site, dict):
                     candidates.extend([site.get("key"), site.get("key1"), site.get("key2")])
+
+    outer = data.get("properties")
+    _collect_from_props(outer)
+    if isinstance(outer, dict):
+        _collect_from_props(outer.get("properties"))
+    resource = data.get("resource")
+    if isinstance(resource, dict):
+        _collect_from_props(resource.get("properties"))
     candidates.extend([data.get("key"), data.get("key1"), data.get("key2")])
     for value in candidates:
         if isinstance(value, str) and value.strip():

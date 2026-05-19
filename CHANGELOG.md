@@ -6,6 +6,19 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#49:** `hermes-a365 bot-service verify --directline-probe` now
+  finds the Direct Line channel secret in real `az bot directline
+  show --with-secrets` output. The probe walked
+  `properties.sites[]`; live az returns the channel at
+  `properties.properties.sites[]` (and a sibling
+  `resource.properties.sites[]` copy), so the prior code raised
+  `BotServiceError` against every real install. Surfaced by the
+  v0.7.0 release walk against the satscryption tenant. Regression
+  tests now feed a realistic az response shape through
+  `_extract_directline_secret`.
+
 ### Added
 
 - **Slice 20d (#32):** `hermes-a365 doctor` and
