@@ -6,6 +6,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#51:** `SKILL.md` no longer frames A365 CLI 1.1.178 as the
+  Microsoft#408 fix floor. The docs now match the conservative
+  `doctor` probe and the 2026-05-15 R9 finding: no CLI build is
+  live-verified clean yet, 1.1.181 still reproduced the
+  secret-persistence regression, and operators should keep
+  `--auto-recover-secret` enabled until a later build is walked clean.
+
 ## [0.7.0] — 2026-05-26
 
 Slice 20 wrapper family graduates to general availability:
