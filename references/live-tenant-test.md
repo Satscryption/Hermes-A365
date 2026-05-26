@@ -1508,6 +1508,7 @@ hermes-a365 publish \
     --tenant-id <tenant-id> \
     --copilot-chat \
     --bot-id <bf-app-id> \
+    --manifest-id auto \
     --apply
 ```
 
@@ -1516,10 +1517,15 @@ The wrapper post-processes the GA CLI's emitted zip: sets
 `<bf-app-id>` (when `--bot-id` is passed; otherwise extracts from the
 manifest, which defaults to the blueprint app on Path A walks), adds
 the `copilotAgents.customEngineAgents` block, strips
-`agenticUserTemplates` from `manifest.json`. The 19r-c `name.short`
-truncation to ≤30 chars runs against this zip too. Output lands at
-`~/manifest/manifest.copilot-chat.zip` (or `~/manifest/manifest.zip`
-when run without `--aiteammate`).
+`agenticUserTemplates` from `manifest.json`, omits the
+AI-Teammate template sidecar from the CEA zip, and can set
+`manifest.id` independently of `bots[0].botId` via
+`--manifest-id auto|<guid>`. The 19r-c `name.short` truncation to
+≤30 chars runs against this zip too; in combined
+`--aiteammate --copilot-chat` mode the Copilot Chat zip also gets a
+short-name `CC` suffix so both catalog entries are distinguishable.
+Output lands at `~/manifest/manifest.copilot-chat.zip` (or
+`~/manifest/manifest.zip` when run without `--aiteammate`).
 
 ⚠️ **Make sure you're running the right `hermes-a365` binary** —
 Phase 2 walk found that `pipx install hermes-a365` lands an older
@@ -1530,39 +1536,17 @@ the pipx one first because PATH puts `~/.local/bin` before
 explicitly (`~/.hermes/hermes-agent/venv/bin/hermes-a365 publish ...`)
 or `pipx upgrade hermes-a365` before running this step.
 
-⚠️ **Minor wrapper drift** — Phase 2 walk also noted that the
-`--copilot-chat` transformer strips `agenticUserTemplates` from
-`manifest.json` but leaves the sibling `agenticUserTemplateManifest.json`
-file inside the zip. Microsoft tolerates the leftover (uploads work),
-but the file is dead weight in a Custom Engine Agent zip; small
-slice-19u-a polish item. Same goes for the wrapper's post-publish
-console message ("Teams Admin Center → Manage apps → Upload") which
-doesn't match either Microsoft's docs (Microsoft Admin Portal →
-Integrated Apps) or the live MAC UI behaviour (MAC → Agents →
-Upload — see §11.7 for the resolved destination).
+When publishing both Path A and Path B against the same tenant, use
+`--manifest-id auto` on the Copilot Chat path. This mints a fresh
+Teams App Catalog id for the CEA zip while leaving
+`bots[0].botId = <bf-app-id>`, avoiding the duplicate-id rejection
+seen during the 2026-05-12 walk. `--manifest-id <guid>` is also
+available when a stable catalog id is required for repeat uploads.
 
-⚠️ **Running A + B simultaneously hits Teams App Catalog
-duplicate-id rejection.** When you publish both the AI Teammate zip
-(Path A §6) and the Custom Engine Agent zip (§11.6) against the same
-tenant, the second upload is rejected because both zips carry the
-same `manifest.id` (= `<blueprint-app-id>` by transformer default).
-[#26](https://github.com/satscryption/Hermes-A365/issues/26) tracks
-adding `--manifest-id auto|<guid>` to mint a fresh catalog id while
-keeping `bots[0].botId` = `<blueprint-app-id>`. Until that ships,
-walkthrough workaround: open the zip, edit `manifest.json`'s `id`
-field to a fresh UUID (`python -c 'import uuid; print(uuid.uuid4())'`),
-re-zip, then upload.
-
-⚠️ **Two live-walk publish follow-ups found 2026-05-18.** First,
-`publish --copilot-chat --bot-id ... --apply` failed to transform the
-starter zip when the workspace path contained a space (`Hermes A365`);
-the package-path parser used `\S+\.zip` and split the path. Manual
-workaround was to call the manifest patch helpers directly, then bump
-the manifest `version` for MAC's "newer version" upload requirement.
-Second, M365 Copilot Chat only walked green after the CEA `bots[]`
-shape included the `copilot` scope alongside `personal` + `team`, plus
-a `commandLists` entry for `copilot`/`personal`. [#26](https://github.com/satscryption/Hermes-A365/issues/26)
-now tracks both generator fixes.
+The wrapper parser now handles emitted zip paths that contain spaces
+(for example the live `Hermes A365` workspace path), so the transform
+should run without the manual `_patch_manifest_to_copilot_chat(...)`
+workaround used during the 2026-05-18 walk.
 
 ### 11.7 — Upload via Microsoft Admin Portal → Agents
 

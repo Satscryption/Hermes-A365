@@ -25,6 +25,7 @@ import argparse
 import re
 import shlex
 import sys
+import uuid
 from dataclasses import dataclass, field
 
 from .mutator import AADSTSError, CliInvocationError, Mutator, RunResult, get_mutator
@@ -35,7 +36,9 @@ ADMIN_CENTRE_URL = "https://admin.microsoft.com/"
 # similar line, grab the path. The exact wording isn't pinned in v1.1.171 yet,
 # so we accept several phrasings.
 _PACKAGE_PATH_RE = re.compile(
-    r"(?:created package|wrote zip|package(?: created)?)[\s:]+(\S+\.zip)",
+    r"(?:created package|wrote zip|package(?: created)?)[\s:]+"
+    r"(?P<path>\"[^\r\n\"]+?\.zip\"|'[^\r\n']+?\.zip'|[^\r\n]+?\.zip)"
+    r"(?:\s|$)",
     re.IGNORECASE,
 )
 
@@ -59,6 +62,7 @@ class PublishInputs:
     aiteammate: bool = False  # blueprint-only by default per CLI default
     copilot_chat: bool = False  # slice 19u-a (#24): Custom Engine Agent emit
     bot_id: str | None = None  # optional override for the Copilot Chat botId
+    manifest_id: str | None = None  # "auto" or explicit Teams App Catalog id
     use_blueprint: bool = False  # blueprint-based non-DW flow (only with aiteammate=False)
     verbose: bool = False
 
@@ -69,6 +73,13 @@ class PublishInputs:
             raise ValueError("--use-blueprint is only meaningful with --aiteammate false")
         if self.use_blueprint and self.copilot_chat:
             raise ValueError("--use-blueprint is incompatible with --copilot-chat")
+        if self.manifest_id and not self.copilot_chat:
+            raise ValueError("--manifest-id is only meaningful with --copilot-chat")
+        if self.manifest_id and self.manifest_id != "auto":
+            try:
+                uuid.UUID(self.manifest_id)
+            except ValueError as e:
+                raise ValueError("--manifest-id must be 'auto' or a GUID") from e
 
 
 # ---------------------------------------------------------------------------
@@ -107,10 +118,10 @@ class PublishPlan:
         if self.inputs.aiteammate and self.inputs.copilot_chat:
             lines.append(
                 "  output:  AI Teammate zip (M365 Admin Centre) + "
-                "Copilot Chat zip (Teams Admin Center)"
+                "Copilot Chat zip (Microsoft Admin Portal)"
             )
         elif self.inputs.copilot_chat:
-            lines.append("  output:  Custom Engine Agent zip for Teams Admin Center upload")
+            lines.append("  output:  Custom Engine Agent zip for Microsoft Admin Portal upload")
         elif self.inputs.aiteammate:
             lines.append("  output:  manifest zip for M365 Admin Centre upload")
         else:
@@ -119,6 +130,10 @@ class PublishPlan:
             lines.append("  flow:    blueprint-based non-DW (explicit)")
         if self.inputs.bot_id:
             lines.append(f"  bot-id:  {self.inputs.bot_id} (override)")
+        if self.inputs.manifest_id:
+            lines.append(f"  manifest-id: {self.inputs.manifest_id}")
+        elif self.inputs.aiteammate and self.inputs.copilot_chat:
+            lines.append("  manifest-id: auto (Copilot Chat catalog id)")
         lines.append(f"  step:    {self.step.description}")
         # shlex.join (slice 18p, bug #7) keeps multi-word values quoted
         # so the printed line is shell-pasteable verbatim.
@@ -147,7 +162,7 @@ def _step_description(inputs: PublishInputs) -> str:
     if inputs.aiteammate and inputs.copilot_chat:
         return "package both AI Teammate + Custom Engine Agent manifests"
     if inputs.copilot_chat:
-        return "package the Custom Engine Agent manifest for Teams Admin Center upload"
+        return "package the Custom Engine Agent manifest for Microsoft Admin Portal upload"
     if inputs.aiteammate:
         return "package the agent manifest for M365 Admin Centre upload"
     return "register agent instance via Microsoft Graph (no zip emitted)"
@@ -177,13 +192,16 @@ class PublishResult:
     # Slice 19u-a (#24): Custom Engine Agent zip produced for Copilot Chat.
     copilot_chat_package_path: str | None = None
     copilot_chat_bot_id: str | None = None
+    copilot_chat_manifest_id: str | None = None
     messages: list[str] = field(default_factory=list)
 
 
 def _extract_package_path(output: str) -> str | None:
     """Best-effort grep for a `*.zip` path in the CLI's stdout/stderr."""
     match = _PACKAGE_PATH_RE.search(output)
-    return match.group(1) if match else None
+    if not match:
+        return None
+    return match.group("path").strip("\"'")
 
 
 # Slice 19r-c (round-8 walkthrough finding, 2026-05-11): the GA CLI
@@ -204,6 +222,23 @@ def _extract_package_path(output: str) -> str | None:
 _NAME_SHORT_MAX = 30
 
 
+def _truncate_name_short_to(value: str, max_chars: int) -> str:
+    if len(value) <= max_chars:
+        return value
+    words = value.split(" ")
+    out_words: list[str] = []
+    out_len = 0
+    for w in words:
+        candidate_len = out_len + len(w) + (1 if out_words else 0)
+        if candidate_len > max_chars:
+            break
+        out_words.append(w)
+        out_len = candidate_len
+    if out_words:
+        return " ".join(out_words)
+    return value[:max_chars].rstrip()
+
+
 def _truncate_name_short(value: str) -> str:
     """Return ``value`` shortened to ``<=30`` chars at a sensible boundary.
 
@@ -215,18 +250,20 @@ def _truncate_name_short(value: str) -> str:
         stripped = value[: -len(" Blueprint")].rstrip()
         if 1 <= len(stripped) <= _NAME_SHORT_MAX:
             return stripped
-    words = value.split(" ")
-    out_words: list[str] = []
-    out_len = 0
-    for w in words:
-        candidate_len = out_len + len(w) + (1 if out_words else 0)
-        if candidate_len > _NAME_SHORT_MAX:
-            break
-        out_words.append(w)
-        out_len = candidate_len
-    if out_words:
-        return " ".join(out_words)
-    return value[:_NAME_SHORT_MAX].rstrip()
+    return _truncate_name_short_to(value, _NAME_SHORT_MAX)
+
+
+def _with_name_short_suffix(value: str, suffix: str = " CC") -> str:
+    """Append a suffix while preserving the 30-char manifest cap."""
+    if not value:
+        return value
+    if value.endswith(suffix):
+        return _truncate_name_short(value)
+    base_max = _NAME_SHORT_MAX - len(suffix)
+    base = _truncate_name_short_to(value, base_max).rstrip()
+    if not base:
+        return suffix.strip()[:_NAME_SHORT_MAX]
+    return f"{base}{suffix}"
 
 
 def _patch_manifest_name_short(zip_path: str) -> tuple[str, str] | None:
@@ -328,14 +365,23 @@ def _transform_manifest_to_copilot_chat(
     manifest: dict,
     *,
     bot_id: str,
+    manifest_id: str | None = None,
+    distinguish_name_short: bool = False,
     scopes: tuple[str, ...] = _COPILOT_CHAT_DEFAULT_SCOPES,
 ) -> dict:
     """Pure transform: AI Teammate manifest dict → Custom Engine Agent shape."""
     out = dict(manifest)
+    if manifest_id:
+        out["id"] = manifest_id
     out["manifestVersion"] = _COPILOT_CHAT_MANIFEST_VERSION
     # ``agenticUserTemplates`` is the AI Teammate shape and is not part
     # of the 1.21+ schema; strip it.
     out.pop("agenticUserTemplates", None)
+    if distinguish_name_short and isinstance(out.get("name"), dict):
+        short = str(out["name"].get("short") or "")
+        if short:
+            out["name"] = dict(out["name"])
+            out["name"]["short"] = _with_name_short_suffix(short)
     out["bots"] = [
         {
             "botId": bot_id,
@@ -397,10 +443,23 @@ def _extract_bot_id_from_manifest(manifest: dict) -> str | None:
     return None
 
 
+def _agentic_template_sidecar_files(manifest: dict) -> set[str]:
+    """Return AI-Teammate template sidecars to omit from CEA zips."""
+    sidecars = {"agenticUserTemplateManifest.json"}
+    templates = manifest.get("agenticUserTemplates")
+    if isinstance(templates, list):
+        for item in templates:
+            if isinstance(item, dict) and isinstance(item.get("file"), str):
+                sidecars.add(item["file"])
+    return sidecars
+
+
 def _patch_manifest_to_copilot_chat(
     zip_path: str,
     *,
     bot_id_override: str | None = None,
+    manifest_id: str | None = None,
+    distinguish_name_short: bool = False,
     scopes: tuple[str, ...] = _COPILOT_CHAT_DEFAULT_SCOPES,
 ) -> tuple[str, dict] | None:
     """Rewrite ``manifest.json`` inside *zip_path* into a Custom Engine
@@ -424,7 +483,13 @@ def _patch_manifest_to_copilot_chat(
                 return None
             with zf.open("manifest.json") as fh:
                 manifest = json.load(fh)
-            other_files = {n: zf.read(n) for n in names if n != "manifest.json"}
+            sidecars = _agentic_template_sidecar_files(manifest)
+            dropped_sidecars = sidecars.intersection(names)
+            other_files = {
+                n: zf.read(n)
+                for n in names
+                if n != "manifest.json" and n not in dropped_sidecars
+            }
     except (OSError, zipfile.BadZipFile, json.JSONDecodeError):
         return None
 
@@ -434,7 +499,11 @@ def _patch_manifest_to_copilot_chat(
 
     had_aut = "agenticUserTemplates" in manifest
     new_manifest = _transform_manifest_to_copilot_chat(
-        manifest, bot_id=bot_id, scopes=scopes
+        manifest,
+        bot_id=bot_id,
+        manifest_id=manifest_id,
+        distinguish_name_short=distinguish_name_short,
+        scopes=scopes,
     )
     blob = json.dumps(new_manifest, indent=2).encode("utf-8")
 
@@ -460,8 +529,10 @@ def _patch_manifest_to_copilot_chat(
     summary = {
         "manifest_version": _COPILOT_CHAT_MANIFEST_VERSION,
         "bot_id": bot_id,
+        "manifest_id": new_manifest.get("id"),
         "scopes": list(scopes),
         "dropped_agentic_user_templates": had_aut,
+        "dropped_agentic_template_files": sorted(dropped_sidecars),
     }
     return (bot_id, summary)
 
@@ -486,12 +557,22 @@ def apply_publish_plan(
     package_path: str | None = None
     copilot_chat_package_path: str | None = None
     copilot_chat_bot_id: str | None = None
+    copilot_chat_manifest_id: str | None = None
     instance_id: str | None = None
     messages: list[str] = [f"[apply] {plan.step.description} — done"]
 
     if plan.inputs.aiteammate or plan.inputs.copilot_chat:
         emitted_zip = _extract_package_path(run.combined)
         if emitted_zip:
+            if plan.inputs.manifest_id == "auto" or (
+                plan.inputs.manifest_id is None
+                and plan.inputs.aiteammate
+                and plan.inputs.copilot_chat
+            ):
+                copilot_chat_manifest_id = str(uuid.uuid4())
+            else:
+                copilot_chat_manifest_id = plan.inputs.manifest_id
+
             # Decide which file we end up calling the Copilot Chat zip.
             # - Both surfaces requested → copy the CLI-emitted zip aside
             #   to a sibling ``.copilot-chat.zip`` and transform the copy
@@ -516,10 +597,16 @@ def apply_publish_plan(
 
             if copilot_chat_target is not None:
                 cc_result = _patch_manifest_to_copilot_chat(
-                    copilot_chat_target, bot_id_override=plan.inputs.bot_id
+                    copilot_chat_target,
+                    bot_id_override=plan.inputs.bot_id,
+                    manifest_id=copilot_chat_manifest_id,
+                    distinguish_name_short=(
+                        plan.inputs.aiteammate and plan.inputs.copilot_chat
+                    ),
                 )
                 if cc_result is not None:
                     copilot_chat_bot_id, summary = cc_result
+                    copilot_chat_manifest_id = summary.get("manifest_id")
                     copilot_chat_package_path = copilot_chat_target
                     dropped = " (dropped agenticUserTemplates)" if summary[
                         "dropped_agentic_user_templates"
@@ -528,8 +615,15 @@ def apply_publish_plan(
                         f"[apply] transformed to Custom Engine Agent: "
                         f"manifestVersion={summary['manifest_version']}, "
                         f"botId={copilot_chat_bot_id}, "
+                        f"manifestId={summary['manifest_id']}, "
                         f"scopes={summary['scopes']}" + dropped
                     )
+                    if summary["dropped_agentic_template_files"]:
+                        messages.append(
+                            "[apply] omitted AI Teammate template files from "
+                            "Copilot Chat zip: "
+                            + ", ".join(summary["dropped_agentic_template_files"])
+                        )
                 else:
                     messages.append(
                         "[apply] WARNING: Copilot Chat transform failed "
@@ -578,8 +672,8 @@ def apply_publish_plan(
                 f"[apply] Copilot Chat package: {copilot_chat_package_path}"
             )
             messages.append(
-                "[apply] Copilot Chat next: upload to Teams Admin Center → "
-                "Manage apps → Upload + assign per-user policy"
+                "[apply] Copilot Chat next: upload to Microsoft Admin Portal → "
+                "Agents → Upload custom agent"
             )
     else:
         instance_id = _extract_instance_id(run.combined)
@@ -596,6 +690,7 @@ def apply_publish_plan(
         instance_id=instance_id,
         copilot_chat_package_path=copilot_chat_package_path,
         copilot_chat_bot_id=copilot_chat_bot_id,
+        copilot_chat_manifest_id=copilot_chat_manifest_id,
         messages=messages,
     )
 
@@ -638,6 +733,14 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         ),
     )
     parser.add_argument(
+        "--manifest-id",
+        help=(
+            "override the Teams App Catalog manifest.id used in the Copilot "
+            "Chat zip; pass 'auto' to generate a fresh GUID. Defaults to "
+            "auto when --aiteammate and --copilot-chat are combined"
+        ),
+    )
+    parser.add_argument(
         "--use-blueprint",
         action="store_true",
         help="use blueprint-based non-DW flow (only with --aiteammate false)",
@@ -655,6 +758,7 @@ def run(args: argparse.Namespace) -> int:
             aiteammate=args.aiteammate,
             copilot_chat=args.copilot_chat,
             bot_id=args.bot_id,
+            manifest_id=args.manifest_id,
             use_blueprint=args.use_blueprint,
             verbose=args.verbose,
         )

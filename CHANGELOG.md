@@ -8,6 +8,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **#26:** `publish --copilot-chat` now supports
+  `--manifest-id auto|<guid>` so operators can publish AI Teammate
+  and Custom Engine Agent zips side-by-side without Teams App Catalog
+  duplicate-id rejection. In both-surface mode the Copilot Chat zip
+  auto-generates a fresh catalog id, keeps `bots[0].botId` on the
+  bot identity, applies a `name.short` `CC` suffix within the 30-char
+  cap, parses emitted zip paths that contain spaces, and omits
+  AI-Teammate template sidecars from CEA packages. Copilot Chat
+  post-apply guidance now points at Microsoft Admin Portal → Agents.
 - **#38:** `activity-bridge` reply POSTs now treat non-2xx Bot
   Framework connector responses as failures instead of reporting
   success. The shared `send_reply()` path raises a typed error with

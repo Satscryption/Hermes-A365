@@ -116,7 +116,7 @@ streaming) is identical for both; only the registration manifest
 | Flow | Wrapper command | Manifest type | `manifestVersion` | Admin upload | Surfaces it lights up |
 |---|---|---|---|---|---|
 | **AI Teammate** | `hermes a365 publish --aiteammate --apply` | `agenticUserTemplates` shape | `devPreview` | M365 Admin Centre → Agents → Upload custom agent → Agent 365 admin centre per-user activation | Teams 1:1 ("Built for your org" list); shows up under the user's agentic identity |
-| **Custom Engine Agent** | `hermes a365 publish --copilot-chat --apply` (emitter shipped slice 19u-a) | `bots` + `copilotAgents.customEngineAgents` blocks | `1.21+` | Teams Admin Center → Manage apps → Upload + assign per-user policy | M365 Copilot Chat (standalone web + side-panels in Word/Excel/PowerPoint/Outlook), Teams as a classic bot. **Hard prerequisite:** Azure subscription + Azure Bot Service registration (Microsoft Teams channel enabled) using the blueprint Entra app id. Without Bot Service registration, the agent enters the catalog but doesn't route in Copilot Chat — surfaced during the 2026-05-12 live walkthrough on the satscryption tenant which has no Azure subscription. AI Teammate path bypasses this because M365's agentic user infrastructure routes Teams 1:1 traffic without Azure Bot Service. |
+| **Custom Engine Agent** | `hermes a365 publish --copilot-chat --apply` (add `--manifest-id auto` or a GUID when publishing beside AI Teammate) | `bots` + `copilotAgents.customEngineAgents` blocks | `1.21+` | Microsoft Admin Portal → Agents → Upload custom agent | M365 Copilot Chat (standalone web + side-panels in Word/Excel/PowerPoint/Outlook), Teams as a classic bot. **Hard prerequisite:** Azure subscription + Azure Bot Service registration (Microsoft Teams channel enabled) using the blueprint Entra app id. Without Bot Service registration, the agent enters the catalog but doesn't route in Copilot Chat — surfaced during the 2026-05-12 live walkthrough on the satscryption tenant which has no Azure subscription. AI Teammate path bypasses this because M365's agentic user infrastructure routes Teams 1:1 traffic without Azure Bot Service. |
 
 Reasoning for keeping both: AI Teammates surface as agentic users
 (distinct identity in the user's tenant directory) which is the
@@ -244,9 +244,13 @@ their state under the reframed positioning:
   slice 19u-a.
 - **#25 (setup wizard XDG symlink gap)** — **closed 2026-05-12**
   in v0.4.0 (slice 19r-bis).
-- **#26 (`--manifest-id` flag)** — Path B-specific; needed for
-  operators running A + B simultaneously. Open;
-  `priority:conditional`.
+- **#26 (`--manifest-id` flag)** — Path B-specific; v0.7.2 work
+  adds `--manifest-id auto|<guid>` so operators can run A + B
+  simultaneously with distinct Teams App Catalog ids while keeping
+  `bots[0].botId` on the Bot Framework app id. The same slice also
+  hardens emitted zip path parsing for workspaces containing spaces
+  and keeps the CEA bot scope/command shape aligned with the
+  2026-05-18 live walk.
 
 ## Sources
 

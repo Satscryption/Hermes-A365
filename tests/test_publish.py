@@ -67,6 +67,18 @@ class TestPublishInputs:
         with pytest.raises(ValueError, match="--use-blueprint"):
             PublishInputs(agent_name="x", aiteammate=True, use_blueprint=True)
 
+    def test_manifest_id_requires_copilot_chat(self) -> None:
+        with pytest.raises(ValueError, match="--manifest-id"):
+            PublishInputs(agent_name="x", manifest_id="auto")
+
+    def test_manifest_id_guid_validated(self) -> None:
+        with pytest.raises(ValueError, match="GUID"):
+            PublishInputs(agent_name="x", copilot_chat=True, manifest_id="not-a-guid")
+
+    def test_manifest_id_auto_allowed_with_copilot_chat(self) -> None:
+        inp = PublishInputs(agent_name="x", copilot_chat=True, manifest_id="auto")
+        assert inp.manifest_id == "auto"
+
 
 # ---------------------------------------------------------------------------
 # build_publish_plan — argv shapes
@@ -161,6 +173,14 @@ class TestExtractPackagePath:
     def test_picks_first_zip_when_multiple(self) -> None:
         out = "Created package: /tmp/first.zip\nlater unrelated /tmp/other.zip mention"
         assert _extract_package_path(out) == "/tmp/first.zip"
+
+    def test_handles_unquoted_path_with_spaces(self) -> None:
+        out = "Package created: /tmp/Hermes A365/manifest.zip"
+        assert _extract_package_path(out) == "/tmp/Hermes A365/manifest.zip"
+
+    def test_handles_quoted_path_with_spaces(self) -> None:
+        out = 'Wrote zip: "/tmp/Hermes A365/manifest.zip"'
+        assert _extract_package_path(out) == "/tmp/Hermes A365/manifest.zip"
 
 
 # ---------------------------------------------------------------------------
@@ -343,6 +363,29 @@ class TestTruncateNameShort:
         assert len(out) <= 30
 
 
+class TestNameShortSuffix:
+    def test_appends_cc_suffix_when_it_fits(self) -> None:
+        from hermes_a365.publish import _with_name_short_suffix
+
+        assert _with_name_short_suffix("Hermes Inbox Helper R8") == (
+            "Hermes Inbox Helper R8 CC"
+        )
+
+    def test_truncates_base_and_preserves_suffix(self) -> None:
+        from hermes_a365.publish import _with_name_short_suffix
+
+        out = _with_name_short_suffix("Production Customer Support Assistant")
+        assert len(out) <= 30
+        assert out.endswith(" CC")
+
+    def test_does_not_double_suffix(self) -> None:
+        from hermes_a365.publish import _with_name_short_suffix
+
+        assert _with_name_short_suffix("Hermes Inbox Helper CC") == (
+            "Hermes Inbox Helper CC"
+        )
+
+
 class TestPatchManifestNameShort:
     """Integration tests for the zip-rewrite path."""
 
@@ -493,6 +536,14 @@ class TestPublishInputsCopilotChat:
         assert inp.copilot_chat is True
         assert inp.aiteammate is False
 
+    def test_manifest_id_override_allowed(self) -> None:
+        inp = PublishInputs(
+            agent_name="x",
+            copilot_chat=True,
+            manifest_id="11111111-1111-1111-1111-111111111111",
+        )
+        assert inp.manifest_id == "11111111-1111-1111-1111-111111111111"
+
 
 class TestBuildPublishPlanCopilotChat:
     def test_copilot_chat_alone_invokes_cli_with_aiteammate(self) -> None:
@@ -514,7 +565,7 @@ class TestBuildPublishPlanCopilotChat:
         plan = build_publish_plan(PublishInputs(agent_name="x", copilot_chat=True))
         text = plan.render_human()
         assert "Custom Engine Agent" in text
-        assert "Teams Admin Center" in text
+        assert "Microsoft Admin Portal" in text
 
     def test_render_human_both_surfaces(self) -> None:
         plan = build_publish_plan(
@@ -523,7 +574,8 @@ class TestBuildPublishPlanCopilotChat:
         text = plan.render_human()
         assert "AI Teammate + Custom Engine Agent" in text
         assert "M365 Admin Centre" in text
-        assert "Teams Admin Center" in text
+        assert "Microsoft Admin Portal" in text
+        assert "manifest-id: auto" in text
 
     def test_render_human_bot_id_override_surfaced(self) -> None:
         plan = build_publish_plan(
@@ -536,6 +588,16 @@ class TestBuildPublishPlanCopilotChat:
         text = plan.render_human()
         assert "00000000-0000-0000-0000-000000000bad" in text
         assert "override" in text
+
+    def test_render_human_manifest_id_override_surfaced(self) -> None:
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="x",
+                copilot_chat=True,
+                manifest_id="11111111-1111-1111-1111-111111111111",
+            )
+        )
+        assert "11111111-1111-1111-1111-111111111111" in plan.render_human()
 
 
 class TestTransformManifestToCopilotChat:
@@ -596,6 +658,28 @@ class TestTransformManifestToCopilotChat:
         assert out["copilotAgents"] == {
             "customEngineAgents": [{"type": "bot", "id": "bid"}]
         }
+
+    def test_manifest_id_override_updates_catalog_id_only(self) -> None:
+        from hermes_a365.publish import _transform_manifest_to_copilot_chat
+
+        out = _transform_manifest_to_copilot_chat(
+            {"id": "blueprint-app-id"},
+            bot_id="bot-framework-app-id",
+            manifest_id="11111111-1111-1111-1111-111111111111",
+        )
+        assert out["id"] == "11111111-1111-1111-1111-111111111111"
+        assert out["bots"][0]["botId"] == "bot-framework-app-id"
+
+    def test_distinguish_name_short_adds_cc_suffix(self) -> None:
+        from hermes_a365.publish import _transform_manifest_to_copilot_chat
+
+        out = _transform_manifest_to_copilot_chat(
+            {"name": {"short": "Hermes Inbox Helper R8", "full": "Hermes Inbox Helper"}},
+            bot_id="bid",
+            distinguish_name_short=True,
+        )
+        assert out["name"]["short"] == "Hermes Inbox Helper R8 CC"
+        assert len(out["name"]["short"]) <= 30
 
     def test_scopes_propagated(self) -> None:
         from hermes_a365.publish import _transform_manifest_to_copilot_chat
@@ -707,30 +791,44 @@ class TestPatchManifestToCopilotChat:
             {
                 "manifestVersion": "devPreview",
                 "webApplicationInfo": {"id": "the-app-id"},
-                "agenticUserTemplates": [{"a": 1}],
+                "agenticUserTemplates": [
+                    {"id": "x", "file": "agenticUserTemplateManifest.json"}
+                ],
                 "name": {"short": "X", "full": "X agent"},
             },
-            extra_files={"icon.png": b"png-bytes"},
+            extra_files={
+                "icon.png": b"png-bytes",
+                "agenticUserTemplateManifest.json": b"ai-teammate-template",
+            },
         )
-        result = _patch_manifest_to_copilot_chat(str(zp))
+        result = _patch_manifest_to_copilot_chat(
+            str(zp),
+            manifest_id="11111111-1111-1111-1111-111111111111",
+            distinguish_name_short=True,
+        )
         assert result is not None
         bot_id, summary = result
         assert bot_id == "the-app-id"
         assert summary["manifest_version"] == "1.21"
+        assert summary["manifest_id"] == "11111111-1111-1111-1111-111111111111"
         assert summary["scopes"] == ["copilot", "personal", "team"]
         assert summary["dropped_agentic_user_templates"] is True
+        assert summary["dropped_agentic_template_files"] == [
+            "agenticUserTemplateManifest.json"
+        ]
         # Re-zip preserves other files
         with zipfile.ZipFile(zp) as zf:
             assert set(zf.namelist()) == {"manifest.json", "icon.png"}
             assert zf.read("icon.png") == b"png-bytes"
             m = json.loads(zf.read("manifest.json"))
+            assert m["id"] == "11111111-1111-1111-1111-111111111111"
             assert m["manifestVersion"] == "1.21"
             assert m["bots"][0]["botId"] == "the-app-id"
             assert m["copilotAgents"]["customEngineAgents"] == [
                 {"type": "bot", "id": "the-app-id"}
             ]
             assert "agenticUserTemplates" not in m
-            assert m["name"] == {"short": "X", "full": "X agent"}
+            assert m["name"] == {"short": "X CC", "full": "X agent"}
 
     def test_bot_id_override_wins(self, tmp_path):
         import json
@@ -807,13 +905,15 @@ class TestApplyPublishPlanCopilotChat:
             ]
         )
 
-    def _seed_manifest_zip(self, tmp_path, manifest: dict):
+    def _seed_manifest_zip(self, tmp_path, manifest: dict, extra_files: dict | None = None):
         import json
         import zipfile
 
         zp = tmp_path / "manifest.zip"
         with zipfile.ZipFile(zp, "w") as zf:
             zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+            for name, blob in (extra_files or {}).items():
+                zf.writestr(name, blob)
         return zp
 
     def test_copilot_chat_alone_transforms_in_place(self, tmp_path):
@@ -844,12 +944,13 @@ class TestApplyPublishPlanCopilotChat:
             assert m["manifestVersion"] == "1.21"
             assert m["bots"][0]["botId"] == "the-bot"
             assert "agenticUserTemplates" not in m
-        # Operator-facing message points at Teams Admin Center, not M365.
-        assert any("Teams Admin Center" in msg for msg in result.messages)
+        # Operator-facing message points at the MAC Agents upload path.
+        assert any("Microsoft Admin Portal" in msg for msg in result.messages)
         assert not any("AI Teammate package" in msg for msg in result.messages)
 
     def test_both_surfaces_keeps_aiteammate_zip_and_emits_sibling(self, tmp_path):
         import json
+        import uuid
         import zipfile
 
         from hermes_a365.publish import apply_publish_plan, build_publish_plan
@@ -858,9 +959,10 @@ class TestApplyPublishPlanCopilotChat:
             tmp_path,
             {
                 "manifestVersion": "devPreview",
+                "id": "blueprint-catalog-id",
                 "webApplicationInfo": {"id": "the-bot"},
                 "agenticUserTemplates": [{"a": 1}],
-                "name": {"short": "X", "full": "X"},
+                "name": {"short": "Hermes Inbox Helper R8", "full": "X"},
             },
         )
         plan = build_publish_plan(
@@ -874,23 +976,117 @@ class TestApplyPublishPlanCopilotChat:
         # Sibling name uses the .copilot-chat infix.
         assert result.copilot_chat_package_path.endswith(".copilot-chat.zip")
         assert result.copilot_chat_bot_id == "the-bot"
+        assert result.copilot_chat_manifest_id is not None
+        uuid.UUID(result.copilot_chat_manifest_id)
 
         # AI Teammate zip stayed in devPreview shape.
         with zipfile.ZipFile(zp) as zf:
             m = json.loads(zf.read("manifest.json"))
             assert m["manifestVersion"] == "devPreview"
+            assert m["id"] == "blueprint-catalog-id"
             assert "agenticUserTemplates" in m
 
         # Copilot Chat sibling is in 1.21 shape.
         with zipfile.ZipFile(result.copilot_chat_package_path) as zf:
             m = json.loads(zf.read("manifest.json"))
             assert m["manifestVersion"] == "1.21"
+            assert m["id"] == result.copilot_chat_manifest_id
             assert "agenticUserTemplates" not in m
             assert m["bots"][0]["botId"] == "the-bot"
+            assert m["name"]["short"] == "Hermes Inbox Helper R8 CC"
 
         # Both upload destinations surfaced.
         assert any("M365 Admin Centre" in msg for msg in result.messages)
-        assert any("Teams Admin Center" in msg for msg in result.messages)
+        assert any("Microsoft Admin Portal" in msg for msg in result.messages)
+
+    def test_explicit_manifest_id_used_for_copilot_chat_zip(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": "blueprint-catalog-id",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                manifest_id="11111111-1111-1111-1111-111111111111",
+            )
+        )
+        result = apply_publish_plan(plan, mutator=self._scripted_zip_emit(zp))
+
+        assert result.copilot_chat_manifest_id == (
+            "11111111-1111-1111-1111-111111111111"
+        )
+        with zipfile.ZipFile(zp) as zf:
+            m = json.loads(zf.read("manifest.json"))
+            assert m["id"] == "11111111-1111-1111-1111-111111111111"
+            assert m["bots"][0]["botId"] == "the-bot"
+
+    def test_copilot_chat_alone_without_manifest_id_keeps_catalog_id(
+        self, tmp_path
+    ):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": "blueprint-catalog-id",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        result = apply_publish_plan(plan, mutator=self._scripted_zip_emit(zp))
+
+        assert result.copilot_chat_manifest_id == "blueprint-catalog-id"
+        with zipfile.ZipFile(zp) as zf:
+            m = json.loads(zf.read("manifest.json"))
+            assert m["id"] == "blueprint-catalog-id"
+            assert m["name"]["short"] == "X"
+
+    def test_copilot_chat_zip_omits_ai_teammate_template_sidecar(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": "blueprint-catalog-id",
+                "webApplicationInfo": {"id": "the-bot"},
+                "agenticUserTemplates": [
+                    {"id": "x", "file": "agenticUserTemplateManifest.json"}
+                ],
+                "name": {
+                    "short": "Hermes Inbox Helper R8",
+                    "full": "Hermes Inbox Helper R8",
+                },
+            },
+            extra_files={
+                "agenticUserTemplateManifest.json": b"name.short/name.full echo source",
+                "color.png": b"icon",
+            },
+        )
+        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        result = apply_publish_plan(plan, mutator=self._scripted_zip_emit(zp))
+
+        with zipfile.ZipFile(result.copilot_chat_package_path) as zf:
+            assert "agenticUserTemplateManifest.json" not in zf.namelist()
+            assert "color.png" in zf.namelist()
+            m = json.loads(zf.read("manifest.json"))
+            assert "agenticUserTemplates" not in m
 
     def test_bot_id_override_used(self, tmp_path):
         import json
