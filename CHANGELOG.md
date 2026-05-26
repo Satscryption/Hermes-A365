@@ -6,6 +6,21 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.0] — 2026-05-26
+
+Slice 20 wrapper family graduates to general availability:
+operators can now run `hermes-a365 bot-service enable-channel`,
+`update-endpoint`, and `cleanup` (slice 20a `create` shipped in
+v0.6.0) instead of raw `az bot` commands plus the acceptedTerms
+ARM PATCH. `doctor` and `status` gained read-only Path B Bot
+Service diagnostics. Three bug fixes surfaced during the v0.7.0
+release walk against the satscryption tenant (see §11 of
+`references/live-tenant-test.md` for the full walk record):
+`bot-service verify --directline-probe` JSON-path drift (#49),
+`bot-service cleanup` invalid `az bot delete --yes` flag (#50),
+and `publish --apply` 180 s timeout truncating device-code auth
+(#52).
+
 ### Fixed
 
 - **#52:** `hermes-a365 publish --apply` no longer truncates the
