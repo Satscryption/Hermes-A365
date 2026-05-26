@@ -6,6 +6,20 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.7.1] — 2026-05-26
+
+Slice 21a operator-visible polish + docs corrections — the first
+patch after v0.7.0. `bot-service create --region` now defaults
+from `az config get defaults.location` before falling back to
+`westeurope`. App-id drift refusal prints paste-ready
+delete/recreate recovery commands. Path B `doctor`/`status` probes
+no longer cascade Azure resource/channel errors after `az account
+show` fails. The §11 runbook surfaces `bot-service create --apply`
+as the canonical Path B command with raw `az` demoted to detail.
+SKILL.md no longer frames CLI 1.1.178 as the Microsoft#408 fix
+floor — no build is currently live-verified clean (1.1.181 still
+reproduced the secret-persistence regression in the R9 walk).
+
 ### Fixed
 
 - **#47:** operator-visible slice 20 polish. `bot-service create`
