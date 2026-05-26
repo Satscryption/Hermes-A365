@@ -4,6 +4,14 @@ on:
   push:
     tags:
       - "v*"
+  # Manual trigger — backup for when push-tag trigger is unavailable
+  # (e.g. account-wide Actions scheduler bug 2026-05-26). Allows
+  # `gh workflow run publish.yml --ref v0.x.y` to publish a tag
+  # that didn't auto-fire publish.yml on tag push. NOTE: PyPI
+  # Trusted Publisher (OIDC) may need a separate trust entry for
+  # `workflow_dispatch` events; verify with a test publish to
+  # TestPyPI first if relying on this path.
+  workflow_dispatch:
 
 jobs:
   build-and-publish:
