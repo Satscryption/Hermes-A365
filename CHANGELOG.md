@@ -6,6 +6,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#38:** `activity-bridge` reply POSTs now treat non-2xx Bot
+  Framework connector responses as failures instead of reporting
+  success. The shared `send_reply()` path raises a typed error with
+  HTTP status and a bounded response-body excerpt; serve mode returns
+  `reply_failed`, and plugin `send()` / `send_image()` surface
+  `SendResult(success=False, error=...)`.
+
 ## [0.7.1] — 2026-05-26
 
 Slice 21a operator-visible polish + docs corrections — the first

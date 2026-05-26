@@ -1862,6 +1862,8 @@ def _serve_handler_factory(
     *,
     webhook_response: dict[str, Any] | None = None,
     webhook_status: int = 200,
+    reply_status: int = 200,
+    reply_body: str = "",
     capture: dict[str, Any] | None = None,
     jwk: dict[str, Any] | None = None,
 ) -> httpx.MockTransport:
@@ -1907,7 +1909,9 @@ def _serve_handler_factory(
             return httpx.Response(200, json=webhook_response or {})
         if "/v3/conversations/" in url:
             capture["reply"].append({"url": url, "body": json.loads(req.content)})
-            return httpx.Response(200, json={})
+            if reply_status == 200:
+                return httpx.Response(200, json={})
+            return httpx.Response(reply_status, text=reply_body)
         # AAD-v2 JWKS discovery + keys (slice 19f).
         if url.endswith("openid-configuration"):
             return httpx.Response(
@@ -1934,11 +1938,15 @@ def _client_for(
     capture: dict[str, Any],
     webhook_response: dict[str, Any] | None = None,
     webhook_status: int = 200,
+    reply_status: int = 200,
+    reply_body: str = "",
     jwk: dict[str, Any] | None = None,
 ) -> TestClient:
     transport = _serve_handler_factory(
         webhook_response=webhook_response,
         webhook_status=webhook_status,
+        reply_status=reply_status,
+        reply_body=reply_body,
         capture=capture,
         jwk=jwk,
     )
@@ -1977,6 +1985,49 @@ class TestServeApp:
         reply_url = capture["reply"][0]["url"]
         assert "/v3/conversations/conv-1/activities/1234" in reply_url
         assert capture["reply"][0]["body"]["text"] == "hi back"
+
+    @pytest.mark.parametrize("reply_status", [401, 500])
+    def test_message_reply_post_failure_does_not_report_replied(
+        self, reply_status: int
+    ) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        body = "microsoft rejected the reply"
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={"text": "hi back"},
+            reply_status=reply_status,
+            reply_body=body,
+        ) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+
+        assert r.status_code == 502
+        payload = r.json()
+        assert payload["status"] == "reply_failed"
+        assert f"HTTP {reply_status}" in payload["error"]
+        assert body in payload["error"]
+        assert len(capture["reply"]) == 1
+
+    def test_message_reply_post_failure_bounds_response_excerpt(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        long_body = "x" * 600
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={"text": "hi back"},
+            reply_status=500,
+            reply_body=long_body,
+        ) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+
+        error = r.json()["error"]
+        assert "x" * 500 in error
+        assert "x" * 501 not in error
+        assert error.endswith("...")
 
     def test_message_with_card_response(self) -> None:
         cfg = _cfg()

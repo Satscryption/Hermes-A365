@@ -1590,6 +1590,33 @@ class TestSend:
         assert result.success is False
         assert "token mint failed" in (result.error or "")
 
+    @pytest.mark.parametrize("status_code", [403, 500])
+    async def test_send_reply_http_failure_surfaces_in_send_result(
+        self, monkeypatch: pytest.MonkeyPatch, status_code: int
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        failure = bridge.ReplyPostError(
+            status_code=status_code,
+            url="https://smba.test/v3/conversations/conv-1/activities/act-1",
+            body_excerpt="denied by connector",
+        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=failure))
+
+        result = await a.send(chat_id="conv-1", content="x")
+        assert result.success is False
+        assert f"HTTP {status_code}" in (result.error or "")
+        assert "denied by connector" in (result.error or "")
+
 
 # ---------------------------------------------------------------------------
 # Slice 19x-e (#27): send() gate — per-lifetime inbound tracking
@@ -2721,6 +2748,32 @@ class TestSendImage:
         result = await a.send_image("missing", "https://example.test/x.png")
         assert result.success is False
         assert "no cached inbound" in (result.error or "")
+
+    @pytest.mark.parametrize("status_code", [401, 503])
+    async def test_reply_http_failure_surfaces_in_send_result(
+        self, monkeypatch: pytest.MonkeyPatch, status_code: int
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        failure = bridge.ReplyPostError(
+            status_code=status_code,
+            url="https://smba.test/v3/conversations/conv-1/activities/act-1",
+            body_excerpt="connector said no",
+        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=failure))
+
+        result = await a.send_image("conv-1", "https://example.test/x.png")
+        assert result.success is False
+        assert f"HTTP {status_code}" in (result.error or "")
+        assert "connector said no" in (result.error or "")
 
 
 # ---------------------------------------------------------------------------

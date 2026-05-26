@@ -1899,6 +1899,38 @@ def render_error_card(message: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
+_REPLY_ERROR_EXCERPT_CHARS = 500
+
+
+class ReplyPostError(RuntimeError):
+    """Raised when the Bot Framework reply endpoint rejects a reply POST."""
+
+    def __init__(
+        self,
+        *,
+        status_code: int,
+        url: str,
+        body_excerpt: str,
+    ) -> None:
+        self.status_code = status_code
+        self.url = url
+        self.body_excerpt = body_excerpt
+        detail = f"reply POST failed: HTTP {status_code} from {url}"
+        if body_excerpt:
+            detail += f"; response body: {body_excerpt}"
+        super().__init__(detail)
+
+
+def _response_text_excerpt(response: Any) -> str:
+    try:
+        text = str(response.text)
+    except Exception:
+        text = ""
+    if len(text) > _REPLY_ERROR_EXCERPT_CHARS:
+        return text[:_REPLY_ERROR_EXCERPT_CHARS] + "..."
+    return text
+
+
 async def send_reply(
     *,
     inbound: dict[str, Any],
@@ -1939,11 +1971,26 @@ async def send_reply(
         user_cache=user_cache,
         bf_cache=bf_cache,
     )
-    return await client.post(
+    response = await client.post(
         url,
         json=reply,
         headers={"Authorization": f"Bearer {token}"},
         timeout=15.0,
+    )
+    status_code = int(getattr(response, "status_code", 0) or 0)
+    if status_code < 200 or status_code >= 300:
+        raise ReplyPostError(
+            status_code=status_code,
+            url=url,
+            body_excerpt=_response_text_excerpt(response),
+        )
+    return response
+
+
+def _reply_failed_response(error: Exception) -> Any:
+    return _JSONResponse(
+        {"status": "reply_failed", "error": str(error)},
+        status_code=502,
     )
 
 
@@ -2064,15 +2111,18 @@ def make_app(
                 activity,
                 {"text": "", "card": render_error_card(f"Webhook error: {e}")},
             )
-            await send_reply(
-                inbound=activity,
-                reply=error_reply,
-                cfg=cfg,
-                client=http_client,
-                fmi_cache=fmi_cache,
-                user_cache=user_cache,
-                bf_cache=bf_cache,
-            )
+            try:
+                await send_reply(
+                    inbound=activity,
+                    reply=error_reply,
+                    cfg=cfg,
+                    client=http_client,
+                    fmi_cache=fmi_cache,
+                    user_cache=user_cache,
+                    bf_cache=bf_cache,
+                )
+            except Exception as reply_error:
+                return _reply_failed_response(reply_error)
             return _JSONResponse({"status": "webhook_error"}, status_code=200)
 
         # Invoke replies must be synchronous: return the invokeResponse body
@@ -2088,15 +2138,18 @@ def make_app(
         if not webhook_resp.get("text") and not webhook_resp.get("card"):
             return _JSONResponse({"status": "no_reply"})
         reply = render_reply_activity(activity, webhook_resp)
-        await send_reply(
-            inbound=activity,
-            reply=reply,
-            cfg=cfg,
-            client=http_client,
-            fmi_cache=fmi_cache,
-            user_cache=user_cache,
-            bf_cache=bf_cache,
-        )
+        try:
+            await send_reply(
+                inbound=activity,
+                reply=reply,
+                cfg=cfg,
+                client=http_client,
+                fmi_cache=fmi_cache,
+                user_cache=user_cache,
+                bf_cache=bf_cache,
+            )
+        except Exception as e:
+            return _reply_failed_response(e)
         return _JSONResponse({"status": "replied"})
 
     return app
