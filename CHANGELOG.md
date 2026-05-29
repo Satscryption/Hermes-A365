@@ -21,6 +21,18 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - Added §11.9 / §11.10 runbook notes that `bot-service cleanup` does not
   remove the Managed App Catalog entry (remove it manually via MAC →
   Agents) and that `az bot delete` propagates immediately.
+- Swept `README.md` and all reference docs for Path B GA drift: most
+  predated v0.6.0 and still framed Copilot Chat as "deferred pending
+  #16". Corrected version/status (`README` v0.5.1 → v0.7.2, Path B
+  surface rows 🟡/⏸ → ✅), documented that Copilot Chat arrives as
+  `groupChat` (`m365-surface-coverage.md`), the separate non-agentic
+  Path B Entra app + `AADSTS82001` (`entra-blueprint-properties.md`,
+  `error-codes.md`), and that §11 is the GA Path B runbook
+  (`live-tenant-test.md`). Removed the v0.1-era "skill doesn't drive the
+  CLI" note and clarified there is no Microsoft#408 fix-floor
+  (`a365-cli-reference.md`). Path B *replies* are GA; Path B *proactive*
+  is described conservatively pending a `_send_proactive` code/docstring
+  reconciliation.
 
 ## [0.7.2] — 2026-05-29
 

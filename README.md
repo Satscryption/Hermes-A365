@@ -21,7 +21,7 @@ identity, no Copilot Chat surfacing.
 | Path | Surfaces it lights up | Operator prerequisites | Status |
 |---|---|---|---|
 | **A — AI Teammate** (M365 agentic user) | Hermes appears as a first-class agentic identity in your M365 tenant directory + "Built for your org" picker + M365 People search + agentic-user audit trails. Teams 1:1 chat with M365-native identity. | M365 tenant + Frontier Preview Program + Tier 3 license. **No Azure subscription.** | ✅ Validated round-8 end-to-end 2026-05-11 with streaming (v0.3.0) |
-| **B — Custom Engine Agent** (Azure Bot Service + 1.21 manifest) | M365 Copilot Chat agents picker + side-panels in Word/Excel/PowerPoint/Outlook + Copilot-fabric search. Reaches classic Teams surfaces too as a side effect, but the sibling Teams adapter is the cleaner tool for those. | Path A's prerequisites **+ Azure subscription** for Bot Service registration of the blueprint Entra app with the Microsoft Teams channel enabled. | 🟡 Emitter shipped 2026-05-12 (`hermes a365 publish --copilot-chat`, slice 19u-a). Live Copilot Chat surfacing deferred pending Azure subscription ([#16](https://github.com/satscryption/Hermes-A365/issues/16)). |
+| **B — Custom Engine Agent** (Azure Bot Service + 1.21 manifest) | M365 Copilot Chat agents picker + side-panels in Word/Excel/PowerPoint/Outlook + Copilot-fabric search. Reaches classic Teams surfaces too as a side effect, but the sibling Teams adapter is the cleaner tool for those. | Path A's prerequisites **+ Azure subscription** + a **separate non-agentic Entra app** (`A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`) for Bot Service S2S — the blueprint/agentic app can't mint BF tokens (`AADSTS82001`). | ✅ GA since v0.6.0 (2026-05-18); live Copilot Chat round-trip validated. Provision via the `bot-service` wrapper family (slice 20). |
 
 Both paths share the same blueprint Entra app, service principal, and
 bot endpoint, so an operator with both prerequisites can run both
@@ -47,34 +47,45 @@ reasoning behind the split.
 
 ## Status
 
-**v0.5.1** (released 2026-05-13). Path A active development is
-feature-complete for the current scope:
+**v0.7.2** (released 2026-05-29). Both paths are GA — Path A
+(AI Teammate) and Path B (Copilot Chat) are live-validated
+end-to-end against the satscryption tenant.
 
-- **v0.5.0 / v0.5.1** bundle slices 19x-a..e — proactive long-running
-  reply pattern (closes [#4](https://github.com/satscryption/Hermes-A365/issues/4))
-  + the v0.5.1 fix for the proactive-path production gate (closes
+- **v0.7.2** (2026-05-29) — Copilot Chat reply-quality: non-personal
+  turns coalesce into one rendered bubble (Copilot Chat doesn't render
+  BF streaming), the duplicated agent-name lines are gone, and a
+  stale-stream liveness guard protects the streaming path (closes
+  [#54](https://github.com/satscryption/Hermes-A365/issues/54) /
+  [#55](https://github.com/satscryption/Hermes-A365/issues/55) /
+  [#62](https://github.com/satscryption/Hermes-A365/issues/62) /
+  [#26](https://github.com/satscryption/Hermes-A365/issues/26) /
+  [#38](https://github.com/satscryption/Hermes-A365/issues/38)).
+- **v0.7.0 / v0.7.1** (2026-05-26) — the Path B `bot-service` wrapper
+  family GA (`create` / `verify` / `update-endpoint` / `cleanup`,
+  slice 20) plus operator-visible polish and docs corrections.
+- **v0.6.0** (2026-05-18) — **Path B Copilot Chat GA**: inbound
+  BF-shaped JWT validation ([#34](https://github.com/satscryption/Hermes-A365/issues/34)),
+  a separate non-agentic Bot Framework app
+  ([#36](https://github.com/satscryption/Hermes-A365/issues/36)), and
+  the end-to-end live walk ([#16](https://github.com/satscryption/Hermes-A365/issues/16)).
+  Closes the headline value-prop gap.
+- **v0.5.0 / v0.5.1** (2026-05-13) — Path A proactive long-running
+  reply pattern ([#4](https://github.com/satscryption/Hermes-A365/issues/4) /
   [#27](https://github.com/satscryption/Hermes-A365/issues/27)).
-  Wire-validated against the live satscryption tenant; cron-driven
-  sends to chats the gateway hasn't seen this lifetime route
-  correctly via `sendToConversation`.
-- **v0.4.x** (2026-05-12) shipped the Custom Engine Agent emitter for
-  Path B (slice 19u-a, closes [#24](https://github.com/satscryption/Hermes-A365/issues/24)),
-  the M365-ecosystem positioning reframe, and the setup-wizard
-  hardening pass (XDG symlink + slug + YAML diff noise).
-- **v0.3.0** (2026-05-11) closed [#3](https://github.com/satscryption/Hermes-A365/issues/3)
-  with BF streaming-response protocol (slices 19s + 19s-bis).
+- **v0.3.0** (2026-05-11) — BF streaming-response protocol
+  ([#3](https://github.com/satscryption/Hermes-A365/issues/3)).
 
-**773 tests passing, ruff clean.** See [CHANGELOG.md](CHANGELOG.md)
+**876 tests passing, ruff clean.** See [CHANGELOG.md](CHANGELOG.md)
 for the full per-release notes.
 
 Path A (AI Teammate) validated end-to-end against the satscryption
 M365 tenant rounds 3 → 8, including full BF streaming protocol
-round-trip on 2026-05-11 and v0.5.0 proactive soak on 2026-05-13.
+round-trip on 2026-05-11 and the v0.5.0 proactive soak on 2026-05-13.
 
-Path B (Custom Engine Agent) emitter shipped + manifest shape
-validated by Teams App Catalog upload 2026-05-12; **live Copilot
-Chat round-trip deferred pending Azure subscription provisioning**
-(see [#16](https://github.com/satscryption/Hermes-A365/issues/16)).
+Path B (Custom Engine Agent) is GA since v0.6.0 — the live Copilot
+Chat round-trip is validated, provisioned via the `bot-service`
+wrapper family against a separate non-agentic Entra app. See the §11
+runbook in [`references/live-tenant-test.md`](references/live-tenant-test.md).
 
 ## What works today
 
@@ -89,10 +100,10 @@ Legend: ✅ shipped + validated · 🟡 shipped, validation deferred ·
 | Teams 1:1 chat (generic chat bot, no M365 identity) | Sibling Teams adapter | 🔵 use sibling |
 | Teams group chat / channel / meetings | Sibling Teams adapter | 🔵 use sibling |
 | Teams file attachments (image, PDF, DOCX, …) | Sibling Teams adapter (PR #13767) | 🔵 use sibling |
-| **M365 Copilot Chat (standalone)** | Hermes-A365 Path B | 🟡 emitter shipped; needs Azure (#16) |
-| Word / Excel / PowerPoint Copilot side-panels (Hermes as Copilot agent) | Hermes-A365 Path B | 🟡 same Custom Engine Agent registration |
-| Outlook — Copilot Chat side-panel inside Outlook | Hermes-A365 Path B | 🟡 same |
-| Microsoft Search invocation | Hermes-A365 Path B + #18 | 🟡 needs Azure + invoke handlers |
+| **M365 Copilot Chat (standalone)** | Hermes-A365 Path B | ✅ GA since v0.6.0; provisioned via `bot-service` |
+| Word / Excel / PowerPoint Copilot side-panels (Hermes as Copilot agent) | Hermes-A365 Path B | ✅ same Custom Engine Agent registration |
+| Outlook — Copilot Chat side-panel inside Outlook | Hermes-A365 Path B | ✅ same |
+| Microsoft Search invocation | Hermes-A365 Path B + #18 | 🟡 Path B GA; invoke handlers pending (#18) |
 | Outlook compose-action (`task/fetch` / `task/submit`) | Path B (Copilot fabric) or sibling adapter | 🟡 / 🔵 |
 | Teams compose extensions (`composeExtension/*`) | Sibling Teams adapter | 🔵 use sibling |
 | Cron / proactive sends on M365 surfaces (Path A) | Hermes-A365 | ✅ shipped in v0.5.0 / v0.5.1 (slices 19x-a..e, #4 closed) |
@@ -103,39 +114,32 @@ Legend: ✅ shipped + validated · 🟡 shipped, validation deferred ·
 
 ## Known limitations
 
-v0.5.1 ships the operator wrapper, read path, Bot Framework activity
-bridge, BF streaming protocol, hardened setup wizard (with XDG-symlink
-auto-repair), the Custom Engine Agent emitter for Path B, and the
-Path A proactive long-running reply pattern (cron-driven
-`sendToConversation`). Outstanding gaps:
+v0.7.2 ships both paths GA — Path A (AI Teammate) and Path B
+(Copilot Chat via the `bot-service` wrapper family), the BF activity
+bridge + streaming protocol (with non-personal reply coalescing), the
+hardened setup wizard (with XDG-symlink auto-repair), and the Path A
+proactive long-running reply pattern. Outstanding gaps:
 
-- **Path B (Copilot Chat) needs Azure subscription.** Custom Engine
-  Agent surfacing in Copilot Chat requires registering the blueprint
-  Entra app as an Azure Bot Service resource with the Microsoft Teams
-  channel enabled — confirmed during the 2026-05-12 live walkthrough.
-  Without Azure, the 1.21 manifest uploads to the Teams App Catalog
-  cleanly but Microsoft's routing layer doesn't forward Copilot Chat
-  activities to our endpoint. The agent stays AI-Teammate-shaped
-  (instance creation → Teams notification only).
-  [#16](https://github.com/satscryption/Hermes-A365/issues/16) tracks
-  the live walkthrough once Azure is provisioned.
-- **Path B proactive sends** — `_send_proactive` refuses Path B
-  target specs with a clear deferred-error referencing #16. Will
-  light up once Azure Bot Service registration is in place; the
-  outbound token chain for Path B is BF S2S (`Bot.Connector`
-  audience) vs Path A's agentic three-stage user-FIC.
+- **Path B (Copilot Chat) requires Azure + a separate Entra app.** The
+  Custom Engine Agent surfaces in Copilot Chat via an Azure Bot Service
+  registration, provisioned with `hermes a365 bot-service create
+  --apply` (slice 20). It needs a **separate non-agentic Entra app**
+  (`A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`) for Bot Framework S2S —
+  the blueprint/agentic app can't mint BF tokens (`AADSTS82001`). This
+  is a setup requirement, not a gap: Path B is GA and live-validated
+  since v0.6.0. See the §11 runbook in
+  [`references/live-tenant-test.md`](references/live-tenant-test.md).
+- **Path B proactive sends** — Path B *replies* (responding to an
+  inbound Copilot Chat message) are GA; agent-*initiated* proactive
+  sends on a Path B target are not yet a validated path. The outbound
+  token chain for Path B is BF S2S (`Bot.Connector` audience) vs
+  Path A's agentic three-stage user-FIC.
 - **Invoke activities (Path B)** — Outlook compose-action
   (`task/fetch` / `task/submit`), Microsoft Search invocation, and
   OAuth invoke (`signin/verifyState`) for tools inside Copilot Chat
   are tracked under [#18](https://github.com/satscryption/Hermes-A365/issues/18);
   umbrella not yet implemented. Teams compose-extension invokes
   (`composeExtension/*`) are sibling-plugin lane, not Hermes-A365's.
-- **`--manifest-id` flag for Path B** — operators running A + B
-  simultaneously against the same tenant hit a Teams App Catalog
-  duplicate-id rejection because the transformer preserves
-  `manifest.id`. Workaround: manually patch a fresh uuid4 into
-  `manifest.id` before upload. Proper fix in
-  [#26](https://github.com/satscryption/Hermes-A365/issues/26).
 - **Plaintext on-disk secret on macOS / Linux.** DPAPI is Windows-only;
   on macOS / Linux the GA CLI writes the agent blueprint client secret
   to `a365.generated.config.json` in plaintext. See [Security model](#security-model).
@@ -276,7 +280,7 @@ v0.1 design draft is archived at
 │           ├── consent-url.txt.j2
 │           ├── instance.env.j2
 │           └── adaptive-cards/      # greeting / confirmation / error
-└── tests/                   # 773 tests (pytest + ruff clean)
+└── tests/                   # 876 tests (pytest + ruff clean)
     ├── conftest.py
     ├── golden/
     └── test_*.py
@@ -538,29 +542,16 @@ Issues are tagged with `priority:next` / `priority:ready` /
 labels — `gh issue list --label "priority:ready"` surfaces the
 working set.
 
-The Path A active-development front is currently **empty** —
-every open issue is either gated on Azure (#16 / #18), conditional
-on operator signal (#26), or deferred-pending-demand
-(#19 / #20 / #21). New Path A work would surface from concrete
-operator pain.
+Both paths are GA; the open backlog is feature-extension and
+internal cleanup, not blocked-on-Azure work. The open fronts are
+invoke activities ([#18](../../issues/18)), the v0.7.3 / v0.7.4 polish
++ Hermes-core slices ([#48](../../issues/48) /
+[#65](../../issues/65) / [#53](../../issues/53)), and the
+deferred-pending-demand set ([#19](../../issues/19) /
+[#20](../../issues/20) / [#21](../../issues/21)).
 
-**Conditional on operator signal:**
+**Active feature work:**
 
-- **[#26](../../issues/26)** — `--manifest-id` flag to avoid Teams
-  App Catalog duplicate-id rejection when both AI Teammate and
-  Custom Engine Agent zips are published against the same tenant.
-  Pick up if Azure provisioning becomes concrete (otherwise the
-  manual `uuid4()` workaround is fine). `priority:conditional`.
-
-**Blocked on Azure subscription provisioning:**
-
-- **[#16](../../issues/16)** — Slice 19u: validate M365 Copilot Chat
-  surface end-to-end. **Path B's primary validation.** Custom Engine
-  Agent emitter shipped (slice 19u-a, v0.4.0); the live surfacing
-  test requires Azure Bot Service registration of the blueprint
-  Entra app with the Microsoft Teams channel enabled. Same Azure
-  registration also lights up the Copilot side-panels +
-  Microsoft Search invokes.
 - **[#18](../../issues/18)** — Slice 19w: handle invoke activities
   (BF wire-protocol). Foundation slices 19w-a (typed dispatch +
   `InvokeContext` + response builders) and 19w-b (generalised
@@ -570,7 +561,7 @@ operator pain.
   `searchMessageExtension/query`) and invoke-aware idempotency
   replay. Compose-extension invokes (`composeExtension/*`) moved
   to sibling-Teams-adapter lane under the 2026-05-12 reframe.
-  Effectively gated on #16. Work IQ V2 amplifier work split out
+  Work IQ V2 amplifier work split out
   to [#21](../../issues/21). Supersedes the older #5.
 
 **Deferred (pending operator demand):**
@@ -607,6 +598,17 @@ explicit triggers that would re-prioritise it.
 
 **Recent closures:**
 
+- ~~#54~~ / ~~#55~~ / ~~#62~~ / ~~#26~~ / ~~#38~~ — **v0.7.2**
+  Copilot Chat reply-quality (coalesce non-streaming replies into one
+  bubble, drop the duplicate agent-name line, stale-stream liveness
+  guard, `publish --manifest-id auto`, non-2xx reply-POST failures).
+- ~~#47~~ / ~~#51~~ — **v0.7.1** Path B operator polish + docs
+  corrections.
+- bot-service wrapper family (`create` / `verify` / `update-endpoint`
+  / `cleanup`) — **v0.7.0** (slice 20).
+- ~~#16~~ / ~~#34~~ / ~~#36~~ — **v0.6.0 Path B Copilot Chat GA**: the
+  end-to-end live walk (#16), inbound BF-shaped JWT validation (#34),
+  and the separate non-agentic Bot Framework app for BF S2S (#36).
 - ~~#27~~ — `send()` proactive fall-through unreachable in
   production. **Closed 2026-05-13** in v0.5.1 (slice 19x-e).
   Surfaced during the v0.5.0 soak: the registry persists `raw`
@@ -624,8 +626,8 @@ explicit triggers that would re-prioritise it.
   three-stage user-FIC chain against a synthetic activity-shape.
   `ConversationRegistry.prune_old_entries` mirrors Hermes'
   `SessionStore.prune_old_entries`; `pin` / `unpin` /
-  `mark_used` explicit mutators. Path B proactive remains
-  gated on #16.
+  `mark_used` explicit mutators. Path B proactive (agent-initiated
+  sends on a Path B target) is not yet a validated path.
 - ~~#25~~ — Setup wizard XDG symlink gap. **Closed 2026-05-12**
   in v0.4.0 (slice 19r-bis). Wizard now creates / repairs a
   symlink at `~/.config/a365/a365.generated.config.json` pointing
@@ -636,9 +638,9 @@ explicit triggers that would re-prioritise it.
   surface. **Closed 2026-05-12** in v0.4.0 (slice 19u-a).
   `hermes a365 publish --copilot-chat` emits a 1.21 manifest;
   optional `--bot-id` overrides; combine with `--aiteammate` for
-  side-by-side zips. Live Copilot Chat surfacing tracked
-  separately under [#16](../../issues/16) — additionally needs
-  Azure Bot Service registration.
+  side-by-side zips. Live Copilot Chat surfacing shipped in v0.6.0
+  ([#16](../../issues/16) / #34 / #36), provisioned via the
+  `bot-service` wrapper family.
 - ~~#22~~ — Setup wizard polish (slug + YAML diff noise).
   **Closed 2026-05-12** in v0.4.0 (slice 19r-a-bis). Slug
   prompt uses `prompt_choice` when >1 agent dirs;

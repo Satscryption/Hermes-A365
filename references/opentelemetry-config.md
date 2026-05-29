@@ -1,6 +1,6 @@
 # OpenTelemetry config & span schema
 
-Snapshot date: 2026-05-04
+Snapshot date: 2026-05-04 (re-verified against v0.7.2 2026-05-29; no schema drift)
 
 A365 auto-instruments registered agents (SPEC §6.8). This document
 captures the canonical event vocabulary, span attributes, and sampler

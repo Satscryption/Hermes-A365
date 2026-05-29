@@ -1,21 +1,23 @@
-# Live tenant integration test — Hermes-A365 v0.5
+# Live tenant integration test — Hermes-A365 v0.7.2
 
-End-to-end runbook for verifying Hermes-A365 (v0.5.1 at time of last
+End-to-end runbook for verifying Hermes-A365 (v0.7.2 at time of last
 refresh) against a real Microsoft Agent 365 tenant. Walk top-to-bottom
 on first run; expect ~30–45 minutes including the M365 Admin Centre
 approval step (longer if the tenant is on macOS 26 — see §3's
 device-code-volume failure mode).
 
-**Snapshot:** 2026-05-18 (rounds 1–8 incorporated + slice 19u-a
-walkthrough; §11 Path B drafted + Phase 2 walked 2026-05-14; #34
-inbound shipped 2026-05-15; #33 outbound wrapper shipped 2026-05-15;
-#36 identity plumbing + final Hermes-side live walk completed
-2026-05-18; Azure Portal Test in Web Chat externalized to #41).
+**Snapshot:** 2026-05-29 (v0.7.2). Rounds 1–8 incorporated + slice
+19u-a walkthrough; §11 Path B Phase 2 walked 2026-05-14; #34 inbound
++ #33 outbound shipped 2026-05-15; #36 identity plumbing + final
+Hermes-side live walk completed 2026-05-18 (**Path B GA, v0.6.0**); the
+`bot-service` wrapper family shipped v0.7.0; §11 re-walked for Copilot
+Chat reply-quality 2026-05-29 (#54 / #55 / #62); Azure Portal Test in
+Web Chat externalized to #41.
 Tracks the current `main` branch;
 specific slices are referenced inline where they matter to operator
 behaviour.
 
-> ## Scope: Path A (AI Teammate) only
+> ## Scope: Path A end-to-end (§§0–6); Path B is §11
 >
 > Hermes-A365 has two M365-ecosystem paths (see
 > [`references/m365-surface-coverage.md`](m365-surface-coverage.md)
@@ -33,18 +35,19 @@ behaviour.
 >
 > **Path B (Custom Engine Agent + Azure Bot Service)** — for
 > Copilot Chat agents picker and Word/Excel/PowerPoint/Outlook
-> side-panel surfacing — has a **draft runbook in §11**, transcribed
-> 2026-05-14 from Microsoft docs but **not yet walked end-to-end**
-> against a live Azure subscription. Path B reuses Path A's
-> blueprint Entra app + service principal as the bot identity, so
-> §§0–6 still apply unchanged; §11 layers Azure Bot Service
-> registration + Microsoft Teams channel enable + Custom Engine
-> Agent manifest upload on top of that. Expect to find surprises on
-> the first live walk (issue
-> [#28](https://github.com/satscryption/Hermes-A365/issues/28)
-> tracks the Phase 2 walkthrough + findings; when it lands green,
-> [#16](https://github.com/satscryption/Hermes-A365/issues/16) closes
-> as a side effect).
+> side-panel surfacing — is **GA since v0.6.0** and has a full,
+> live-walked runbook in **§11** (Phase 2 walked 2026-05-14;
+> end-to-end from v0.6.0; re-walked for reply-quality 2026-05-29).
+> Path B uses a **separate non-agentic Entra app** as the bot identity
+> (NOT the blueprint app — it can't mint BF S2S tokens, `AADSTS82001`),
+> so §§0–6 still apply unchanged for the shared blueprint/registration;
+> §11 layers the `bot-service` wrapper family (Azure Bot Service
+> registration + Microsoft Teams channel enable + `acceptedTerms`
+> PATCH) + Custom Engine Agent manifest upload on top.
+> [#28](https://github.com/satscryption/Hermes-A365/issues/28) (Phase 2
+> walkthrough) and
+> [#16](https://github.com/satscryption/Hermes-A365/issues/16) (Path B
+> surfacing) are both closed.
 >
 > Note: if you only want generic Teams chat (DM / channels / group
 > / threading / file attachments) and don't need M365 directory
@@ -382,17 +385,17 @@ would discard.
 - **AI Teammate (`--aiteammate`)** — emits a manifest zip the operator
   uploads via M365 Admin Centre (see §7).
 
-> **Path B note (v0.4.0, slice 19u-a, `#24` closed):**
+> **Path B note (Custom Engine Agent, GA v0.6.0):**
 > `hermes-a365 publish --copilot-chat` (optionally combined with
 > `--aiteammate`) post-processes the emitted zip into a Custom
 > Engine Agent manifest (`manifestVersion: "1.21"` + `bots[]` +
-> `copilotAgents.customEngineAgents`) for Teams Admin Center
-> upload + Copilot Chat surfacing. **Out of scope for this
-> playbook** — Path B additionally needs Azure subscription +
-> Azure Bot Service registration of the blueprint Entra app
-> (`#16`). See the scope callout at the top of this file. The
-> emitter itself is shipped and tested; the live walkthrough is
-> deferred until Azure provisioning lands.
+> `copilotAgents.customEngineAgents`) for Microsoft Admin Portal →
+> Agents upload + Copilot Chat surfacing. **The full Path B walk lives
+> in §11** — it additionally needs an Azure subscription + an Azure Bot
+> Service registration bound to a separate non-agentic Entra app (the
+> blueprint app can't mint BF S2S tokens, `AADSTS82001`), provisioned
+> via the `bot-service` wrapper family. Path B is GA and live-walked
+> end-to-end (#16 / #34 / #36 closed).
 
 The wrapper distinguishes these (slice 18t): plan output prints
 `output: Graph API instance registration (no zip)` vs `manifest zip

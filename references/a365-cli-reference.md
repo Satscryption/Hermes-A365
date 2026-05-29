@@ -11,12 +11,13 @@ distributed as a .NET tool from NuGet:
 dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease
 ```
 
-Verified GA version: **1.1.171** (`a365 --version` output:
-`1.1.171+11c378141d`). Latest live-verified affected build for macOS /
-Linux setup flows: **1.1.181**. Versions 1.1.171, 1.1.174, and 1.1.181
-reproduce Microsoft#408 (`agentBlueprintClientSecret` persists as
-`null` after a successful `setup blueprint`); wrapper recovery remains
-available via `register --auto-recover-secret`.
+Latest live-verified CLI: **1.1.181** (2026-05-15). **No fixed-version
+floor for Microsoft#408 is currently live-verified** — versions 1.1.171,
+1.1.174, and 1.1.181 all reproduce it (`agentBlueprintClientSecret`
+persists as `null` after a successful `setup blueprint` on macOS /
+Linux). Keep `register --auto-recover-secret` enabled regardless of CLI
+version; the skill's doctor probe stays warning-only across all versions
+to avoid a false green (#51).
 
 macOS dotnet-host gotcha: `brew install dotnet` doesn't set
 `DOTNET_ROOT`, so the freshly-installed `a365` errors with
@@ -197,17 +198,17 @@ directory (and `ToolingManifest.json` for MCP server bindings). When
 omitted, `--agent-name` is the universal handle; tenant is detected via
 `az account show`.
 
-## What this skill currently doesn't drive
+## Mutator ↔ CLI mapping
 
-Given the divergence above, the v0.1 skill scripts in this repo do not
-yet map to the real CLI. The Mutator protocol needs to be redesigned
-around the actual command set. Until that lands, treat the skill as a
-**design artefact + planner architecture** that needs the apply-side
-re-implemented; the unit tests, reconcilers, status report, doctor,
-and local artefact handling all survive the redesign.
+The Mutator protocol was redesigned around the real command set during
+the slice-19 series; the apply side is implemented and live-walked
+(Path A end-to-end rounds 3–8; Path B end-to-end from v0.6.0). The
+planner architecture, unit tests, reconcilers, status report, doctor,
+and local artefact handling described elsewhere in this repo all drive
+the real `a365` CLI today. (This section previously flagged a v0.1-era
+gap where the scripts didn't map to the GA CLI — that gap is closed.)
 
 Live SKU naming spotted in the user's tenant during the same probe:
 `MICROSOFT_AGENT_365_TIER_3` — the SKU part number, distinct from the
-"Agent 365 add-on" / "M365 E7" labels we recorded in
-[`license-cost-table.md`](license-cost-table.md). That file should be
-updated to use the real SKU part numbers.
+"Agent 365 add-on" / "M365 E7" labels. [`license-cost-table.md`](license-cost-table.md)
+has since been updated to use the real SKU part number.

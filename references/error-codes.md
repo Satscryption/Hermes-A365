@@ -1,6 +1,6 @@
 # Error codes
 
-Snapshot date: 2026-05-04
+Snapshot date: 2026-05-04 (re-verified against v0.7.2 2026-05-29)
 
 Catalogue of AADSTS / A365 / Bot Framework error codes the skill detects,
 the surface that emits each one, and the recovery posture. The
@@ -14,8 +14,9 @@ loops.
 |---|---|---|---|
 | `AADSTS500011` | `register` (T1/T2 setup) | Resource principal `Microsoft.Agent365` not found in tenant — license has not propagated yet. | Retry up to 3× with 30 s backoff (configurable, mockable in tests). |
 | `AADSTS90094` | `register` (FIC configure), any post-register call | Admin consent required and not yet granted. | `register` records `consent_deferred=True`, surfaces a follow-up to run `hermes a365 consent`, and exits 0 (the apps are still created). Other commands surface the error. |
-| `AADSTS70043` | `activity-bridge` runtime, `fic rotate` reasons | Refresh token expired — user-FIC needs rotation. | Surfaced in spec example with `hermes a365 fic rotate <slug>` remediation hint. (Activity bridge is currently TODO.) |
+| `AADSTS70043` | `activity-bridge` runtime, `fic rotate` reasons | Refresh token expired — user-FIC needs rotation. | Surfaced in spec example with `hermes a365 fic rotate <slug>` remediation hint. (Activity bridge shipped v0.2.0+; runs via `hermes a365 activity-bridge serve`.) |
 | `AADSTS65001` | Any delegated-permission call | Scope not consented or not granted. | Surfaced as a fatal error; remediation is `hermes a365 consent` or operator-side consent. |
+| `AADSTS82001` | Path B outbound (BF S2S token mint) | Agentic application not permitted to request app-only tokens for a Bot Framework resource — the blueprint/agentic app can't mint BF S2S. | Use a **separate non-agentic Entra app** (`A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`) for Path B; the gateway surfaces an operator-actionable error pointing at the §11.2.5 registration walk. |
 
 ## Codes the skill surfaces but does not specifically handle
 

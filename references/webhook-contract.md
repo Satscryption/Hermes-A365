@@ -148,8 +148,8 @@ bump the version.
   `await adapter.send(chat_id, content)` from Hermes' cron tools;
   the adapter routes via `sendToConversation` for any chat the
   current gateway lifetime hasn't yet captured an inbound for.
-  Path B proactive (BF S2S outbound via Azure Bot Service) is
-  gated on `#16`.
+  Path B *replies* (responding to an inbound) are GA; Path B
+  agent-initiated proactive sends are not yet a validated path.
 
 ## Reference responder (slice 19c)
 

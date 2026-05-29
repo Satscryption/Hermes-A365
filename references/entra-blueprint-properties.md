@@ -10,6 +10,14 @@ and the GA preview docs. The skill renders blueprints via
 this property" allowlist consulted by the (TODO) `--allow-unknown` flag
 and by `references/error-codes.md` drift checks.
 
+> **Path B needs a *separate* Entra app — not this blueprint app.** The
+> blueprint app is an agentic-application class and cannot mint Bot
+> Framework S2S tokens (`AADSTS82001`). Path B (Copilot Chat via Azure
+> Bot Service) therefore requires a **separate non-agentic Entra app**
+> with the `Bot.Connector` scope, surfaced as `A365_BF_APP_ID` /
+> `A365_BF_CLIENT_SECRET`. See `references/live-tenant-test.md` §11.2.5
+> for the registration walk (#36, shipped v0.6.0).
+
 ## Top-level properties (rendered by `blueprint.json.j2`)
 
 | Property | Type | Required | Notes |
