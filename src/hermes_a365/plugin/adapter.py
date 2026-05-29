@@ -129,6 +129,8 @@ def _strip_streaming_cursor(text: str) -> str:
 #
 # Reference: https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
 _STREAMING_MIN_GAP_SEC = 1.5
+_STREAMING_FORCE_DROP_AFTER_SEC = 130.0
+_STREAMING_FINALIZE_MAX_FAILURES = 2
 
 
 # Slice 19q (round-5 walkthrough finding, 2026-05-06): the BF connector
@@ -846,10 +848,12 @@ class Agent365Adapter(BasePlatformAdapter):
         turn" rule (custom-engine-agents doc) and gives a single
         growing bubble per Hermes segment.
 
+        Suppress one-shot non-streaming sends while a stream is active;
+        Copilot Chat renders interleaved progress/fallback activities
+        as separate bubbles. A new streaming first chunk must first
+        finalize the prior stream successfully before opening another.
+
         Fallback to a non-streaming ``message`` activity when:
-        - The conversation already has an active stream (tool progress
-          or content streaming claimed it first; only one stream
-          per turn is allowed).
         - ``chat_type != "personal"`` (BF streaming is DM-only).
         - The streaming-start POST itself fails.
         """
@@ -900,13 +904,32 @@ class Agent365Adapter(BasePlatformAdapter):
         # ``edit_message(finalize=True)`` on the previous stream's
         # message_id. The old stream stays open in our state and as a
         # typing indicator on the user's surface until BF's 2-min cap
-        # fires. We auto-close any stale stream when a new ``send()``
-        # arrives for the same conversation.
+        # fires.
+        #
+        # #54 / CEA ordering rule: do not interleave non-streaming
+        # progress/fallback messages into an active stream. Copilot Chat
+        # renders those as additional bubbles. Only a new streaming
+        # first-chunk (reply_to != None) may force-finalize the old
+        # stream, and the next activity is allowed only if finalization
+        # succeeded.
         if chat_id in self._active_stream_by_chat:
             stale_msg_id = self._active_stream_by_chat[chat_id]
-            await self._auto_finalize_stale_stream(
+            if reply_to is None:
+                logger.info(
+                    "agent365 send suppressed while stream active: "
+                    "chat_id=%s active_message_id=%s",
+                    chat_id,
+                    stale_msg_id,
+                )
+                return SendResult(success=True, message_id=str(stale_msg_id))
+            finalized = await self._auto_finalize_stale_stream(
                 chat_id=chat_id, message_id=stale_msg_id, inbound=inbound,
             )
+            if not finalized and chat_id in self._active_stream_by_chat:
+                return SendResult(
+                    success=False,
+                    error="active stream still open; suppressed next send",
+                )
 
         if (
             chat_type == "personal"
@@ -1143,11 +1166,14 @@ class Agent365Adapter(BasePlatformAdapter):
         bf_stream_id = str(bf_stream_id)
 
         loop = asyncio.get_event_loop()
+        now = loop.time()
         clean_content = _strip_streaming_cursor(content)
         self._streams[bf_stream_id] = {
             "bf_stream_id": bf_stream_id,
             "sequence": 1,
-            "last_emit_ts": loop.time(),
+            "last_emit_ts": now,
+            "opened_ts": now,
+            "finalize_failures": 0,
             # Track last-sent content so auto-finalize-stale-stream has
             # something non-empty to POST as the close (BF rejects
             # empty-text final activities with 400 BadSyntax).
@@ -1237,6 +1263,10 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._http_client is None or self._bridge_cfg is None:
             msg = "agent365 send_image: adapter not connected"
             logger.error(msg)
+            return SendResult(success=False, error=msg)
+        if chat_id in self._active_stream_by_chat:
+            msg = "agent365 send_image: active stream still open"
+            logger.warning("%s for %s", msg, chat_id)
             return SendResult(success=False, error=msg)
 
         body: list[dict[str, Any]] = [{"type": "Image", "url": image_url}]
@@ -1335,10 +1365,32 @@ class Agent365Adapter(BasePlatformAdapter):
         if message_id in self._recently_finalized:
             return SendResult(success=True, message_id="")
 
+        active_msg_id = self._active_stream_by_chat.get(chat_id)
+        if active_msg_id and active_msg_id not in self._streams:
+            self._active_stream_by_chat.pop(chat_id, None)
+            active_msg_id = None
+        if active_msg_id and active_msg_id != message_id:
+            logger.info(
+                "agent365 edit_message continuing active stream: "
+                "chat_id=%s requested_message_id=%s active_message_id=%s "
+                "finalize=%s",
+                chat_id,
+                message_id,
+                active_msg_id,
+                finalize,
+            )
+            message_id = active_msg_id
+
         state = self._streams.get(message_id)
         is_first = state is None
         if state is None:
-            state = {"bf_stream_id": None, "sequence": 0, "last_emit_ts": 0.0}
+            state = {
+                "bf_stream_id": None,
+                "sequence": 0,
+                "last_emit_ts": 0.0,
+                "opened_ts": loop_now,
+                "finalize_failures": 0,
+            }
             self._streams[message_id] = state
 
         # Throttle — Microsoft recommends 1.5-2 s pacing even though the
@@ -1435,6 +1487,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 # First + finalize is degenerate but legal — drop state.
                 self._drop_stream_state(chat_id, message_id)
                 self._recently_finalized[message_id] = loop_now
+            else:
+                self._active_stream_by_chat[chat_id] = message_id
             return SendResult(success=True, message_id=state["bf_stream_id"])
 
         if 200 <= resp.status_code < 300:
@@ -1488,7 +1542,7 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         inbound: dict[str, Any],
-    ) -> None:
+    ) -> bool:
         """Emit a synthetic ``streamType=final`` POST to close a stream
         that Hermes' consumer abandoned without calling
         ``edit_message(finalize=True)``. Best-effort: any failure here
@@ -1506,7 +1560,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # Nothing to close, or never received a stream id from
             # Microsoft (stream-start failed). Just drop the slot.
             self._drop_stream_state(chat_id, message_id)
-            return
+            return True
 
         bf_stream_id = state["bf_stream_id"]
         conv = inbound.get("conversation") or {}
@@ -1514,7 +1568,7 @@ class Agent365Adapter(BasePlatformAdapter):
         conv_id = conv.get("id")
         if not service_url or not conv_id:
             self._drop_stream_state(chat_id, message_id)
-            return
+            return True
 
         # BF rejects final activities with empty text (400 BadSyntax).
         # Use the last content we streamed for this stream; fall back to
@@ -1553,19 +1607,81 @@ class Agent365Adapter(BasePlatformAdapter):
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
             )
-            logger.info(
-                "agent365 auto-finalize stale stream %s: status=%s",
-                bf_stream_id, resp.status_code,
-            )
         except Exception as e:
             logger.warning(
                 "agent365 auto-finalize stale stream %s failed: %s",
                 bf_stream_id, e,
             )
-        finally:
+            return self._record_stale_finalize_failure(
+                chat_id=chat_id,
+                message_id=message_id,
+                state=state,
+                reason=str(e),
+            )
+
+        if 200 <= resp.status_code < 300:
+            logger.info(
+                "agent365 auto-finalize stale stream %s: status=%s",
+                bf_stream_id, resp.status_code,
+            )
             self._drop_stream_state(chat_id, message_id)
             loop_now = asyncio.get_event_loop().time()
             self._recently_finalized[message_id] = loop_now
+            return True
+
+        logger.warning(
+            "agent365 auto-finalize stale stream %s returned HTTP %s: %s",
+            bf_stream_id,
+            resp.status_code,
+            resp.text[:200] if hasattr(resp, "text") else "",
+        )
+        return self._record_stale_finalize_failure(
+            chat_id=chat_id,
+            message_id=message_id,
+            state=state,
+            reason=f"HTTP {resp.status_code}",
+        )
+
+    def _record_stale_finalize_failure(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        state: dict[str, Any],
+        reason: str,
+    ) -> bool:
+        """Return True when the failed stale stream was force-dropped.
+
+        One failed close blocks the replacement stream to avoid
+        knowingly interleaving activities. Repeated failure or an
+        already-expired stream id is treated as dead BF state; force-drop
+        it so the chat cannot wedge forever.
+        """
+        loop_now = asyncio.get_event_loop().time()
+        failures = int(state.get("finalize_failures") or 0) + 1
+        state["finalize_failures"] = failures
+        opened_ts = state.get("opened_ts")
+        if not isinstance(opened_ts, (int, float)):
+            opened_ts = loop_now
+            state["opened_ts"] = opened_ts
+        age = loop_now - float(opened_ts)
+        if (
+            failures >= _STREAMING_FINALIZE_MAX_FAILURES
+            or age >= _STREAMING_FORCE_DROP_AFTER_SEC
+        ):
+            logger.warning(
+                "agent365 force-dropping stale stream after failed finalize: "
+                "chat_id=%s message_id=%s failures=%s age=%.1fs reason=%s",
+                chat_id,
+                message_id,
+                failures,
+                age,
+                reason,
+            )
+            self._drop_stream_state(chat_id, message_id)
+            self._recently_finalized[message_id] = loop_now
+            return True
+        return False
 
     def _prune_recently_finalized(self, now: float) -> None:
         """Drop ``_recently_finalized`` entries older than the TTL."""

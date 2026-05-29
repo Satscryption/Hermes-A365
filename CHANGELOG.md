@@ -8,6 +8,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **#54:** Path B streaming now enforces one active Custom Engine
+  Agent stream per chat turn. Streams opened via `edit_message()`
+  register as the chat's active stream, fresh message ids continue
+  that stream instead of starting a second bubble, one-shot
+  progress/fallback sends are suppressed while streaming, separate
+  image activities are blocked mid-stream, and stale-stream
+  finalization must succeed before a replacement stream can start
+  unless bounded retry/age guards identify the stale stream as dead
+  and force-drop it to preserve chat liveness.
 - **#26:** `publish --copilot-chat` now supports
   `--manifest-id auto|<guid>` so operators can publish AI Teammate
   and Custom Engine Agent zips side-by-side without Teams App Catalog

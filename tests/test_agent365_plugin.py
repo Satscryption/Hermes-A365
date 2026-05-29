@@ -10,6 +10,7 @@ upstream Hermes uses for its own unit tests of platform plugins.
 
 from __future__ import annotations
 
+import asyncio
 import importlib
 import sys
 import types
@@ -2749,6 +2750,35 @@ class TestSendImage:
         assert result.success is False
         assert "no cached inbound" in (result.error or "")
 
+    @pytest.mark.asyncio
+    async def test_active_stream_blocks_separate_image_activity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-1")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._active_stream_by_chat["conv-1"] = "m1"
+        a._streams["m1"] = {
+            "bf_stream_id": "bf-1",
+            "sequence": 1,
+            "last_emit_ts": 0.0,
+        }
+        a._http_client = MagicMock()
+        a._http_client.post = AsyncMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        result = await a.send_image("conv-1", "https://example.test/x.png")
+        assert result.success is False
+        assert "active stream" in (result.error or "")
+        assert send_reply_mock.await_count == 0
+        assert a._http_client.post.await_count == 0
+
     @pytest.mark.parametrize("status_code", [401, 503])
     async def test_reply_http_failure_surfaces_in_send_result(
         self, monkeypatch: pytest.MonkeyPatch, status_code: int
@@ -2905,6 +2935,7 @@ class TestEditMessage:
         assert "streamId" not in entity
         # State now tracks the BF-side stream id.
         assert a._streams["hermes-msg-1"]["bf_stream_id"] == "bf-stream-abc"
+        assert a._active_stream_by_chat["conv-S"] == "hermes-msg-1"
 
     @pytest.mark.asyncio
     async def test_subsequent_calls_include_streamid_and_monotonic_sequence(
@@ -2966,6 +2997,42 @@ class TestEditMessage:
         # State is dropped after finalize=True so a future stream on
         # the same message_id starts cleanly.
         assert "m1" not in a._streams
+        assert "conv-F" not in a._active_stream_by_chat
+
+    @pytest.mark.asyncio
+    async def test_new_message_id_continues_active_stream_instead_of_starting_second(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #54: Hermes can segment a turn and call edit_message with a
+        # fresh message_id before the prior stream has finalized. Copilot
+        # Chat requires one stream per turn, so continue the active stream
+        # rather than opening another 201-created sequence.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-CC")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-cc"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        r1 = await a.edit_message("conv-CC", "m1", "A", finalize=False)
+        r2 = await a.edit_message("conv-CC", "m2", "A B", finalize=False)
+        r3 = await a.edit_message("conv-CC", "m2", "A B C", finalize=True)
+
+        assert r1.success and r2.success and r3.success
+        assert post_mock.await_count == 3
+        body2 = post_mock.await_args_list[1].kwargs["json"]
+        body3 = post_mock.await_args_list[2].kwargs["json"]
+        assert body2["entities"][0]["streamId"] == "bf-cc"
+        assert body2["entities"][0]["streamSequence"] == 2
+        assert body3["entities"][0]["streamId"] == "bf-cc"
+        assert body3["entities"][0]["streamType"] == "final"
+        # The second message id never opened its own stream slot.
+        assert "m2" not in a._streams
+        assert "conv-CC" not in a._active_stream_by_chat
 
     @pytest.mark.asyncio
     async def test_no_inbound_returns_failure(
@@ -3310,16 +3377,13 @@ class TestSendStreamStart:
         assert a._http_client.post.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_send_auto_finalizes_stale_stream_when_one_is_active(
+    async def test_send_with_no_reply_to_suppresses_while_stream_active(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Slice 19s-bis follow-up: Hermes' stream consumer occasionally
-        # starts a new segment without finalizing the previous stream
-        # (segment break, commentary handoff, interim_assistant_messages).
-        # When ``send()`` fires with an active stream in the conversation,
-        # we POST a synthetic ``streamType=final`` for the stale stream
-        # to close it on the user's surface before deciding what to do
-        # with the new send.
+        # #54: commentary / tool-progress / fallback messages must not
+        # interleave into an active CEA stream. Copilot Chat renders those
+        # as separate bubbles, so we suppress them and let the stream
+        # continue to its normal finalize=True close.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-X")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
@@ -3338,36 +3402,222 @@ class TestSendStreamStart:
 
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(
-            bridge, "acquire_outbound_token",
-            AsyncMock(return_value="bearer-x"),
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-x", "A")),
         )
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
-        # The auto-finalize POST returns 202. The reply_to=None path
-        # then falls back to non-streaming send_reply (no further POST).
-        a._http_client.post = AsyncMock(
-            return_value=MagicMock(status_code=202, text="", json=lambda: {}),
-        )
+        a._http_client.post = AsyncMock()
 
         result = await a.send(chat_id="conv-X", content="next segment", reply_to=None)
         assert result.success is True
+        assert result.message_id == "stale-stream"
+        assert a._http_client.post.await_count == 0
+        assert send_reply_mock.await_count == 0
+        assert "stale-stream" in a._streams
+        assert a._active_stream_by_chat["conv-X"] == "stale-stream"
 
-        # Auto-finalize fired (one POST) — close the stale stream first.
-        assert a._http_client.post.await_count == 1
-        body = a._http_client.post.await_args.kwargs["json"]
-        assert body["type"] == "message"
-        assert body["entities"][0]["streamId"] == "bf-stale-id"
-        assert body["entities"][0]["streamType"] == "final"
-        assert "streamSequence" not in body["entities"][0]
-        # Stale stream state cleared.
+    @pytest.mark.asyncio
+    async def test_new_stream_first_chunk_finalizes_prior_stream_before_starting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A new streaming first chunk may replace a stale stream, but only
+        # after the adapter sends streamType=final for the previous one.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-X2")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        a._active_stream_by_chat["conv-X2"] = "stale-stream"
+        a._streams["stale-stream"] = {
+            "bf_stream_id": "bf-stale-id",
+            "sequence": 5,
+            "last_emit_ts": 0.0,
+            "last_content": "old content",
+        }
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-x", "A")),
+        )
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        a._http_client.post = AsyncMock(
+            side_effect=[
+                MagicMock(status_code=202, text="", json=lambda: {}),
+                MagicMock(status_code=201, text="", json=lambda: {"id": "bf-new"}),
+            ]
+        )
+
+        result = await a.send(
+            chat_id="conv-X2", content="new content", reply_to="inbound-id-1"
+        )
+        assert result.success is True
+        assert result.message_id == "bf-new"
+        assert a._http_client.post.await_count == 2
+        final_body = a._http_client.post.await_args_list[0].kwargs["json"]
+        start_body = a._http_client.post.await_args_list[1].kwargs["json"]
+        assert final_body["type"] == "message"
+        assert final_body["text"] == "old content"
+        assert final_body["entities"][0]["streamId"] == "bf-stale-id"
+        assert final_body["entities"][0]["streamType"] == "final"
+        assert start_body["type"] == "typing"
+        assert start_body["text"] == "new content"
+        assert start_body["entities"][0]["streamSequence"] == 1
         assert "stale-stream" not in a._streams
-        assert "conv-X" not in a._active_stream_by_chat
-        # Stale message id marked as recently finalized so post-finalize
-        # follow-up edit_message calls (Hermes' double-finalize quirk)
-        # no-op as success rather than POSTing malformed activities.
+        assert a._active_stream_by_chat["conv-X2"] == "bf-new"
+        assert send_reply_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_new_stream_first_chunk_blocked_when_prior_finalize_fails(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-X3")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        a._active_stream_by_chat["conv-X3"] = "stale-stream"
+        a._streams["stale-stream"] = {
+            "bf_stream_id": "bf-stale-id",
+            "sequence": 5,
+            "last_emit_ts": 0.0,
+            "last_content": "old content",
+        }
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-x", "A")),
+        )
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        a._http_client.post = AsyncMock(
+            return_value=MagicMock(status_code=503, text="busy", json=lambda: {})
+        )
+
+        result = await a.send(
+            chat_id="conv-X3", content="new content", reply_to="inbound-id-1"
+        )
+        assert result.success is False
+        assert "active stream still open" in (result.error or "")
+        assert a._http_client.post.await_count == 1
+        assert "stale-stream" in a._streams
+        assert a._active_stream_by_chat["conv-X3"] == "stale-stream"
+        assert send_reply_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_repeated_stale_finalize_failure_force_drops_and_starts_new_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Liveness guard for #54 review feedback: a permanently dead BF
+        # stream id must not wedge the chat forever.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-X4")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        a._active_stream_by_chat["conv-X4"] = "stale-stream"
+        a._streams["stale-stream"] = {
+            "bf_stream_id": "bf-stale-id",
+            "sequence": 5,
+            "last_emit_ts": 0.0,
+            "last_content": "old content",
+        }
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-x", "A")),
+        )
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        a._http_client.post = AsyncMock(
+            side_effect=[
+                MagicMock(status_code=503, text="busy", json=lambda: {}),
+                MagicMock(status_code=503, text="still busy", json=lambda: {}),
+                MagicMock(status_code=201, text="", json=lambda: {"id": "bf-new"}),
+            ]
+        )
+
+        first = await a.send(
+            chat_id="conv-X4", content="new content", reply_to="inbound-id-1"
+        )
+        second = await a.send(
+            chat_id="conv-X4", content="new content", reply_to="inbound-id-1"
+        )
+
+        assert first.success is False
+        assert second.success is True
+        assert second.message_id == "bf-new"
+        assert a._http_client.post.await_count == 3
+        assert "stale-stream" not in a._streams
         assert "stale-stream" in a._recently_finalized
-        # New send took the non-streaming fallback path (reply_to=None).
-        assert send_reply_mock.await_count == 1
+        assert a._active_stream_by_chat["conv-X4"] == "bf-new"
+        assert send_reply_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_expired_stale_stream_force_drops_on_first_finalize_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-X5")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        loop_now = asyncio.get_event_loop().time()
+        a._active_stream_by_chat["conv-X5"] = "stale-stream"
+        a._streams["stale-stream"] = {
+            "bf_stream_id": "bf-stale-id",
+            "sequence": 5,
+            "last_emit_ts": 0.0,
+            "opened_ts": loop_now - adapter_mod._STREAMING_FORCE_DROP_AFTER_SEC - 1.0,
+            "last_content": "old content",
+        }
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-x", "A")),
+        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        a._http_client.post = AsyncMock(
+            side_effect=[
+                MagicMock(status_code=503, text="expired", json=lambda: {}),
+                MagicMock(status_code=201, text="", json=lambda: {"id": "bf-new"}),
+            ]
+        )
+
+        result = await a.send(
+            chat_id="conv-X5", content="new content", reply_to="inbound-id-1"
+        )
+        assert result.success is True
+        assert result.message_id == "bf-new"
+        assert a._http_client.post.await_count == 2
+        assert "stale-stream" not in a._streams
+        assert a._active_stream_by_chat["conv-X5"] == "bf-new"
 
     @pytest.mark.asyncio
     async def test_send_falls_back_to_non_streaming_when_chat_is_not_personal(
