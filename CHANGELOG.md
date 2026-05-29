@@ -16,7 +16,11 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   image activities are blocked mid-stream, and stale-stream
   finalization must succeed before a replacement stream can start
   unless bounded retry/age guards identify the stale stream as dead
-  and force-drop it to preserve chat liveness.
+  and force-drop it to preserve chat liveness. After the #54 branch
+  walk showed Copilot Chat `groupChat` accepts but does not render BF
+  streaming activities, non-personal stream-consumer chunks are now
+  buffered locally and emitted as one normal `send_reply()` only on
+  `edit_message(finalize=True)`.
 - **#26:** `publish --copilot-chat` now supports
   `--manifest-id auto|<guid>` so operators can publish AI Teammate
   and Custom Engine Agent zips side-by-side without Teams App Catalog

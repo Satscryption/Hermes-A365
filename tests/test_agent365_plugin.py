@@ -2888,23 +2888,73 @@ class TestEditMessage:
         assert adapter_mod.Agent365Adapter.REQUIRES_EDIT_FINALIZE is True
 
     @pytest.mark.asyncio
-    async def test_refuses_non_personal_chat(
+    async def test_non_personal_reply_to_coalesces_until_finalize(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # BF streaming-ux: "Streaming bot message is available only
-        # for one-on-one chats." Group/channel must hard-fail so
-        # Hermes falls back to send().
+        # #54 branch walk: Copilot Chat/groupChat accepts BF streaming
+        # activities but renders them silently. Keep the conversation on
+        # normal send_reply, but emit only once when Hermes finalizes.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
-        self._patch_token_mint(monkeypatch)
+        post_mock = self._wire_adapter(a, inbound=inbound)
 
-        r = await a.edit_message("conv-G", "msg-1", "hi", finalize=False)
-        assert r.success is False
-        assert "personal chat" in (r.error or "").lower()
-        # No POST should have been issued.
-        assert a._http_client.post.await_count == 0
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        first = await a.send(
+            chat_id="conv-G",
+            content="Hello ▉",
+            reply_to="act-1",
+        )
+        assert first.success is True
+        assert str(first.message_id).startswith("coalesced:conv-G:")
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_count == 0
+        assert a._coalesced_replies[first.message_id]["content"] == "Hello"
+
+        progress = await a.send(
+            chat_id="conv-G",
+            content="interim progress",
+            reply_to=None,
+        )
+        assert progress.success is True
+        assert progress.message_id == first.message_id
+        assert send_reply_mock.await_count == 0
+        assert a._coalesced_replies[first.message_id]["content"] == "Hello"
+
+        update = await a.edit_message(
+            "conv-G",
+            str(first.message_id),
+            "Hello world ▉",
+            finalize=False,
+        )
+        assert update.success is True
+        assert send_reply_mock.await_count == 0
+        assert a._coalesced_replies[first.message_id]["content"] == "Hello world"
+
+        final = await a.edit_message(
+            "conv-G",
+            str(first.message_id),
+            "Hello world!",
+            finalize=True,
+        )
+        assert final.success is True
+        assert send_reply_mock.await_count == 1
+        kwargs = send_reply_mock.await_args.kwargs
+        assert kwargs["reply"]["text"] == "Hello world!"
+        assert first.message_id not in a._coalesced_replies
+        assert "conv-G" not in a._active_coalesced_reply_by_chat
+
+        duplicate = await a.edit_message(
+            "conv-G",
+            str(first.message_id),
+            "Hello world!",
+            finalize=True,
+        )
+        assert duplicate.success is True
+        assert send_reply_mock.await_count == 1
 
     @pytest.mark.asyncio
     async def test_first_call_starts_stream_with_sequence_one_no_streamid(

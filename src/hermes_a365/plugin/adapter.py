@@ -319,6 +319,16 @@ class Agent365Adapter(BasePlatformAdapter):
         # or terminal 403.
         self._active_stream_by_chat: dict[str, str] = {}
 
+        # #54 branch-walk correction: Copilot Chat arrives as
+        # ``groupChat`` and renders BF streaming activities silently,
+        # even though BF accepts them. For non-personal conversations,
+        # keep Hermes' stream-consumer out of fallback mode by buffering
+        # streamed chunks under a synthetic message id and emitting one
+        # normal ``send_reply`` only when ``edit_message(finalize=True)``
+        # arrives. Maps synthetic message_id -> buffer state.
+        self._coalesced_replies: dict[str, dict[str, Any]] = {}
+        self._active_coalesced_reply_by_chat: dict[str, str] = {}
+
         # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
         # captured an inbound for since boot. Used as ``send()``'s gate
         # for routing through the proactive ``sendToConversation`` path
@@ -848,16 +858,21 @@ class Agent365Adapter(BasePlatformAdapter):
         turn" rule (custom-engine-agents doc) and gives a single
         growing bubble per Hermes segment.
 
+        #54 branch-walk correction: Copilot Chat arrives as
+        ``groupChat`` and does not visibly render BF streaming
+        activities. For non-personal chats, a stream-consumer first
+        chunk (``reply_to`` present) starts a local coalescing buffer
+        instead of POSTing immediately. ``edit_message(finalize=True)``
+        later emits one normal ``send_reply`` with the final text.
+
         Suppress one-shot non-streaming sends while a stream is active;
         Copilot Chat renders interleaved progress/fallback activities
         as separate bubbles. A new streaming first chunk must first
         finalize the prior stream successfully before opening another.
 
-        Fallback to a non-streaming ``message`` activity when:
-        - ``chat_type != "personal"`` (BF streaming is DM-only).
-        - The streaming-start POST itself fails.
+        Fallback to a non-streaming ``message`` activity when the
+        streaming-start POST itself fails.
         """
-        bridge = _import_bridge()
         # Slice 19x-e (#27): the gate is "did this lifetime capture an
         # inbound for chat_id", not "is the registry populated". The
         # registry's raw persists across restarts (slice 19o), so the
@@ -931,6 +946,22 @@ class Agent365Adapter(BasePlatformAdapter):
                     error="active stream still open; suppressed next send",
                 )
 
+        if chat_id in self._active_coalesced_reply_by_chat:
+            active_msg_id = self._active_coalesced_reply_by_chat[chat_id]
+            if reply_to is None:
+                logger.info(
+                    "agent365 send suppressed while coalesced reply active: "
+                    "chat_id=%s active_message_id=%s",
+                    chat_id,
+                    active_msg_id,
+                )
+                return SendResult(success=True, message_id=active_msg_id)
+            return self._buffer_coalesced_reply(
+                chat_id=chat_id,
+                content=content,
+                message_id=active_msg_id,
+            )
+
         if (
             chat_type == "personal"
             and reply_to is not None
@@ -944,6 +975,28 @@ class Agent365Adapter(BasePlatformAdapter):
             # Stream start failed (logged inside _send_stream_start);
             # fall through to non-streaming reply.
 
+        if chat_type != "personal" and reply_to is not None:
+            message_id = self._coalesced_reply_message_id(chat_id, reply_to)
+            return self._buffer_coalesced_reply(
+                chat_id=chat_id,
+                content=content,
+                message_id=message_id,
+            )
+
+        return await self._send_reply_activity(
+            inbound=inbound,
+            content=content,
+            log_context="send",
+        )
+
+    async def _send_reply_activity(
+        self,
+        *,
+        inbound: dict[str, Any],
+        content: str,
+        log_context: str,
+    ) -> SendResult:
+        bridge = _import_bridge()
         reply = bridge.render_reply_activity(inbound, {"text": content})
         try:
             await bridge.send_reply(
@@ -955,9 +1008,84 @@ class Agent365Adapter(BasePlatformAdapter):
                 user_cache=self._user_cache,
             )
         except Exception as e:
-            logger.error("agent365 send_reply failed: %s", e)
+            logger.error("agent365 %s send_reply failed: %s", log_context, e)
             return SendResult(success=False, error=str(e))
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
+
+    @staticmethod
+    def _coalesced_reply_message_id(chat_id: str, reply_to: Any) -> str:
+        return f"coalesced:{chat_id}:{reply_to}"
+
+    def _buffer_coalesced_reply(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        message_id: str,
+    ) -> SendResult:
+        self._coalesced_replies[message_id] = {
+            "chat_id": chat_id,
+            "content": _strip_streaming_cursor(content),
+        }
+        self._active_coalesced_reply_by_chat[chat_id] = message_id
+        return SendResult(success=True, message_id=message_id)
+
+    async def _edit_coalesced_reply(
+        self,
+        *,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        finalize: bool,
+        inbound: dict[str, Any],
+        loop_now: float,
+    ) -> SendResult:
+        active_msg_id = self._active_coalesced_reply_by_chat.get(chat_id)
+        if active_msg_id and active_msg_id != message_id:
+            logger.info(
+                "agent365 edit_message continuing coalesced reply: "
+                "chat_id=%s requested_message_id=%s active_message_id=%s "
+                "finalize=%s",
+                chat_id,
+                message_id,
+                active_msg_id,
+                finalize,
+            )
+            message_id = active_msg_id
+
+        if message_id not in self._coalesced_replies:
+            self._buffer_coalesced_reply(
+                chat_id=chat_id,
+                content=content,
+                message_id=message_id,
+            )
+        else:
+            self._coalesced_replies[message_id]["content"] = (
+                _strip_streaming_cursor(content)
+            )
+
+        if not finalize:
+            return SendResult(success=True, message_id=message_id)
+
+        if self._http_client is None or self._bridge_cfg is None:
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: adapter not connected",
+            )
+
+        state = self._coalesced_replies.get(message_id) or {}
+        final_content = str(state.get("content") or "")
+        result = await self._send_reply_activity(
+            inbound=inbound,
+            content=final_content,
+            log_context="coalesced edit_message",
+        )
+        if result.success:
+            self._coalesced_replies.pop(message_id, None)
+            self._active_coalesced_reply_by_chat.pop(chat_id, None)
+            self._recently_finalized[message_id] = loop_now
+            return SendResult(success=True, message_id=result.message_id)
+        return result
 
     async def _send_proactive(
         self, chat_id: str, content: str
@@ -1315,9 +1443,12 @@ class Agent365Adapter(BasePlatformAdapter):
         ``typing`` to ``message``, sets ``streamType=final``, and
         omits ``streamSequence`` per the Microsoft spec.
 
+        Non-personal chat types are coalesced into a single normal
+        ``send_reply`` on ``finalize=True`` because Copilot Chat
+        accepts but does not visibly render BF streaming activities.
+
         Returns ``SendResult(success=False, ...)`` and falls back to
         ``send()`` on:
-        - non-personal chat types (BF streaming is DM-only),
         - missing cached inbound (proactive sends with no prior turn),
         - terminal 403 ``ContentStreamNotAllowed`` (2-min timeout,
           stop-button cancel, oversize message),
@@ -1342,21 +1473,6 @@ class Agent365Adapter(BasePlatformAdapter):
         # mark the conversation as recently used so prune respects it.
         self._conversations.mark_used(chat_id)
 
-        # DM-only: BF streaming-ux doc:
-        # "Streaming bot message is available only for one-on-one chats."
-        conv = inbound.get("conversation") or {}
-        if str(conv.get("conversationType") or "") != "personal":
-            return SendResult(
-                success=False,
-                error="streaming requires personal chat",
-            )
-
-        if self._http_client is None or self._bridge_cfg is None:
-            return SendResult(
-                success=False,
-                error="agent365 edit_message: adapter not connected",
-            )
-
         # Slice 19s-bis follow-up — drop a recently-finalized message_id
         # follow-up call as a successful no-op. See ``_recently_finalized``
         # docstring for the Hermes stream-consumer quirk this guards.
@@ -1364,6 +1480,25 @@ class Agent365Adapter(BasePlatformAdapter):
         self._prune_recently_finalized(loop_now)
         if message_id in self._recently_finalized:
             return SendResult(success=True, message_id="")
+
+        # DM-only: BF streaming-ux doc:
+        # "Streaming bot message is available only for one-on-one chats."
+        conv = inbound.get("conversation") or {}
+        if str(conv.get("conversationType") or "") != "personal":
+            return await self._edit_coalesced_reply(
+                chat_id=chat_id,
+                message_id=message_id,
+                content=content,
+                finalize=finalize,
+                inbound=inbound,
+                loop_now=loop_now,
+            )
+
+        if self._http_client is None or self._bridge_cfg is None:
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: adapter not connected",
+            )
 
         active_msg_id = self._active_stream_by_chat.get(chat_id)
         if active_msg_id and active_msg_id not in self._streams:
