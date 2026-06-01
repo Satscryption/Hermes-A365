@@ -131,9 +131,10 @@ proactive long-running reply pattern. Outstanding gaps:
   [`references/live-tenant-test.md`](references/live-tenant-test.md).
 - **Path B proactive sends** — Path B *replies* (responding to an
   inbound Copilot Chat message) are GA; agent-*initiated* proactive
-  sends on a Path B target are not yet a validated path. The outbound
-  token chain for Path B is BF S2S (`Bot.Connector` audience) vs
-  Path A's agentic three-stage user-FIC.
+  sends on a Path B target are implemented and unit-covered via #33
+  (BF S2S `Bot.Connector` token + `sendToConversation`) but not yet
+  separately live-walked. Path A uses the agentic three-stage user-FIC
+  chain instead.
 - **Invoke activities (Path B)** — Outlook compose-action
   (`task/fetch` / `task/submit`), Microsoft Search invocation, and
   OAuth invoke (`signin/verifyState`) for tools inside Copilot Chat
@@ -627,7 +628,8 @@ explicit triggers that would re-prioritise it.
   `ConversationRegistry.prune_old_entries` mirrors Hermes'
   `SessionStore.prune_old_entries`; `pin` / `unpin` /
   `mark_used` explicit mutators. Path B proactive (agent-initiated
-  sends on a Path B target) is not yet a validated path.
+  sends on a Path B target) is implemented and unit-covered via #33
+  but not yet separately live-walked.
 - ~~#25~~ — Setup wizard XDG symlink gap. **Closed 2026-05-12**
   in v0.4.0 (slice 19r-bis). Wizard now creates / repairs a
   symlink at `~/.config/a365/a365.generated.config.json` pointing

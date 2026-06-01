@@ -97,7 +97,7 @@ Legend:
 | Web chat / Direct Line embed | Sibling adapter or separate skill | 🔵 | Bypasses M365 entirely; not Hermes-A365's lane. |
 | SharePoint embedded chat (`SPEmbedded`) | Sibling adapter or separate skill | 🔵 | Same — Direct Line, no M365 directory presence. |
 | Slack / Telegram / WhatsApp / Twilio / Line / Kik / GroupMe | Use the respective Hermes platform adapters | 🔵 | Each external messenger has its own first-class Hermes adapter; Hermes-A365 not the right path. |
-| Cron / proactive sends (Path A surfaces) | **Hermes-A365** | ✅ | Shipped in v0.5.0 / v0.5.1 (slices 19x-a..e; #4 closed, #27 closed). `Agent365Adapter.send()` falls through to `_send_proactive` when this gateway lifetime hasn't captured an inbound for `chat_id`; POSTs to `<serviceUrl>/v3/conversations/<conv_id>/activities` (`sendToConversation` — no `replyToId`). Path B *replies* are GA; Path B agent-initiated proactive sends are not yet a validated path. Sibling Teams adapter handles its own proactive sends independently. |
+| Cron / proactive sends (Path A surfaces) | **Hermes-A365** | ✅ | Shipped in v0.5.0 / v0.5.1 (slices 19x-a..e; #4 closed, #27 closed). `Agent365Adapter.send()` falls through to `_send_proactive` when this gateway lifetime hasn't captured an inbound for `chat_id`; POSTs to `<serviceUrl>/v3/conversations/<conv_id>/activities` (`sendToConversation` — no `replyToId`). Path B *replies* are GA; Path B agent-initiated proactive sends are implemented and unit-covered via #33 (BF S2S + `sendToConversation`) but not yet separately live-walked. Sibling Teams adapter handles its own proactive sends independently. |
 | Word / Excel / PowerPoint Copilot side-panel as **declarative agent** | Separate skill (not this one) | 🔴 | Declarative agents are a different runtime — Microsoft hosts the orchestrator + LLM. Hermes' value prop is the orchestrator, so we're a custom-engine agent (see Path B), not a declarative one. |
 | Office Add-ins (ribbon button, task pane) | Separate skill | 🔴 | Different SDK entirely; would be a complementary `office-addin-*` package. |
 | Loop components | Separate skill | 🔴 | Loop SDK; not a BF-protocol surface. |
@@ -219,7 +219,8 @@ their state under the reframed positioning:
   both Path A and Path B.
 - **#4 (proactive)** — **closed 2026-05-13** by slices 19x-a..d in
   v0.5.0; v0.5.1 (#27, slice 19x-e) fixed the production gate.
-  Path A proactive ships; Path B proactive is not yet a validated path.
+  Path A proactive ships; Path B proactive is implemented and
+  unit-covered via #33 but not yet separately live-walked.
 - **#27 (proactive gate)** — **closed 2026-05-13** by slice 19x-e
   in v0.5.1. Per-lifetime `_seen_inbounds_this_lifetime` set drives
   `send()`'s decision between `replyToActivity` and

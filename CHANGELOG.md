@@ -31,8 +31,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   (`live-tenant-test.md`). Removed the v0.1-era "skill doesn't drive the
   CLI" note and clarified there is no Microsoft#408 fix-floor
   (`a365-cli-reference.md`). Path B *replies* are GA; Path B *proactive*
-  is described conservatively pending a `_send_proactive` code/docstring
-  reconciliation.
+  code is shipped and unit-covered via #33 (BF S2S +
+  `sendToConversation`) but remains described as not separately
+  live-walked until #67 validates the round trip.
+- Reconciled `_send_proactive` / `send()` docstrings with the shipped
+  #33 Path B proactive path: only `path == "unknown"` is refused; Path B
+  targets use the BF S2S dispatcher branch and `sendToConversation`
+  rather than a stale "#16 deferred" guard.
 
 ## [0.7.2] — 2026-05-29
 

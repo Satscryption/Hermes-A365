@@ -846,8 +846,10 @@ class Agent365Adapter(BasePlatformAdapter):
           ``sendToConversation`` BF endpoint. Avoids stale-activity-id
           rejections from BF channels.
 
-        Path A only — Path B (Custom Engine Agent via Azure Bot Service)
-        proactive is gated on #16 and returns a clear deferred-error.
+        Path A proactive is live-walked. Path B proactive code shipped
+        in #33 and uses the BF S2S branch of ``acquire_reply_token``;
+        its end-to-end ``sendToConversation`` round trip is tracked
+        separately for live validation.
 
         Slice 19s-bis: in personal chats with no active stream for the
         conversation, ``send()`` emits a BF streaming-start activity
@@ -1097,16 +1099,17 @@ class Agent365Adapter(BasePlatformAdapter):
         falls cleanly on three conditions:
 
         - No registry entry → ``no registry entry`` error.
-        - Target tagged ``path != "A"`` → Path B proactive not yet
-          implemented (#16 prerequisite); deferred-error rather than a
-          silent 401 from the wrong token chain.
+        - Target tagged ``path == "unknown"`` → cannot safely choose
+          the Path A user-FIC chain or the Path B BF S2S chain.
         - Adapter not connected (HTTP client / bridge cfg unset) →
           ``adapter not connected`` error.
 
-        Happy path: mints the user-FIC chain against a synthetic
-        activity-shaped dict (``acquire_reply_token`` reads
-        ``recipient`` + ``conversation`` to extract the agentic ids), then
-        POSTs a non-reply Activity to
+        Happy path: dispatches token minting through
+        ``acquire_reply_token`` against a synthetic activity-shaped
+        dict. Path A reads ``recipient`` + ``conversation`` to extract
+        the agentic ids; Path B classifies the BF ``serviceUrl`` and
+        mints a Bot Framework S2S bearer. Both paths then POST a
+        non-reply Activity to
         ``<serviceUrl>/v3/conversations/<conv_id>/activities`` (the
         ``sendToConversation`` BF endpoint — no ``replyToId``, no
         ``/activities/<id>`` suffix). Returns the new activity id from

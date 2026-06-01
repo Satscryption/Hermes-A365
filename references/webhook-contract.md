@@ -149,7 +149,9 @@ bump the version.
   the adapter routes via `sendToConversation` for any chat the
   current gateway lifetime hasn't yet captured an inbound for.
   Path B *replies* (responding to an inbound) are GA; Path B
-  agent-initiated proactive sends are not yet a validated path.
+  agent-initiated proactive sends are implemented and unit-covered
+  via #33 (BF S2S + `sendToConversation`) but not yet separately
+  live-walked.
 
 ## Reference responder (slice 19c)
 
