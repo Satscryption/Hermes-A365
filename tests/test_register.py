@@ -17,6 +17,7 @@ from hermes_a365.mutator import (
     RunResult,
 )
 from hermes_a365.register import (
+    AITEAMMATE_REGISTER_UNSUPPORTED,
     DEFAULT_BACKOFF_SECONDS,
     DEFAULT_RETRIES,
     ApplyResult,
@@ -26,10 +27,12 @@ from hermes_a365.register import (
     SecretRecoveryOutcome,
     apply_register_plan,
     auto_recover_secret,
+    build_parser,
     build_register_plan,
     default_recovery_display_name,
     detect_missing_secret,
     report_missing_secret_warning,
+    run,
     update_config_for_agent,
 )
 
@@ -81,7 +84,12 @@ class TestRegisterInputs:
         assert inp.agent_name == "inbox-helper"
         assert inp.tenant_id is None
         assert inp.m365 is False
+        assert inp.aiteammate is False
         assert inp.authmode == "obo"
+
+    def test_aiteammate_rejected_with_real_flow_hint(self) -> None:
+        with pytest.raises(ValueError, match="publish --aiteammate"):
+            RegisterInputs(agent_name="x", aiteammate=True)
 
     def test_empty_agent_name_rejected(self) -> None:
         with pytest.raises(ValueError, match="agent_name"):
@@ -150,6 +158,40 @@ class TestBuildRegisterPlan:
         plan = build_register_plan(RegisterInputs(agent_name="x"))
         bot = plan.steps[2]
         assert bot.argv == ["a365", "setup", "permissions", "bot", "--agent-name", "x"]
+
+
+class TestCliAiteammateUnsupported:
+    def test_help_marks_aiteammate_as_unsupported(self) -> None:
+        help_text = build_parser().format_help()
+        assert "--aiteammate" in help_text
+        assert "deprecated/unsupported on register" in help_text
+        assert "publish --aiteammate" in help_text
+
+    def test_run_rejects_aiteammate_before_plan_or_apply(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        args = build_parser().parse_args(
+            ["--agent-name", "x", "--aiteammate", "--apply"]
+        )
+
+        rc = run(args)
+
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert AITEAMMATE_REGISTER_UNSUPPORTED in captured.err
+        assert "a365 setup blueprint" not in captured.out
+
+    def test_dry_run_rejects_aiteammate_before_plan_render(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        args = build_parser().parse_args(["--agent-name", "x", "--aiteammate"])
+
+        rc = run(args)
+
+        assert rc == 2
+        captured = capsys.readouterr()
+        assert AITEAMMATE_REGISTER_UNSUPPORTED in captured.err
+        assert "a365 setup blueprint" not in captured.out
 
 
 class TestPlanRender:

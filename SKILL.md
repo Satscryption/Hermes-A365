@@ -151,7 +151,7 @@ Read-only. Recommends the A365 add-on or E7 based on the decision matrix
 in [`references/license-cost-table.md`](references/license-cost-table.md).
 Records the chosen model in `~/.hermes/.env` as `A365_LICENSE_MODEL`.
 
-### `hermes a365 register --agent-name <name> [--tenant-id <id>] [--m365] [--aiteammate] [--no-endpoint] [--skip-requirements]`
+### `hermes a365 register --agent-name <name> [--tenant-id <id>] [--m365] [--no-endpoint] [--skip-requirements]`
 
 Composite plan that orchestrates the three real CLI steps a blueprint
 needs:
@@ -177,9 +177,12 @@ identities), and surface known auth errors:
   The blueprint apps remain created.
 
 `--m365` registers the messaging endpoint via MCP Platform.
-`--aiteammate` treats the agent as an AI Teammate (creates an Entra
-user + manager). `--no-endpoint` and `--skip-requirements` are
-passthroughs to `a365 setup blueprint`.
+`--aiteammate` is intentionally unsupported on `register`: the wrapper
+only runs blueprint + permission setup. Use
+`hermes a365 publish --aiteammate --apply`, then upload and activate the
+zip in M365 Admin Centre, to create/bind the AI Teammate agentic user.
+`--no-endpoint` and `--skip-requirements` are passthroughs to
+`a365 setup blueprint`.
 
 ### `hermes a365 consent`
 
@@ -409,7 +412,7 @@ hermes a365 register --agent-name "<Display Name>" --apply --auto-recover-secret
 hermes a365 consent                                                    # in-browser grant
 hermes a365 instance create <slug> --owner <email> --owner-aad-id <oid> --apply
 hermes a365 publish --agent-name "<Display Name>" --aiteammate --apply # produce zip
-# Operator: upload the zip in the M365 Admin Centre and approve for users.
+# Operator: upload the zip in the M365 Admin Centre and activate for users.
 hermes a365 activity-bridge verify --slug <slug>                       # bridge preflight
 # Run the gateway with the agent365 platform configured (loads the
 # bridge in-process via the entry-point-discovered plugin):

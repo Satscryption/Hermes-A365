@@ -86,6 +86,12 @@ DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_SECONDS = 30.0
 
 VALID_AUTH_MODES: frozenset[str] = frozenset({"obo", "s2s", "both"})
+AITEAMMATE_REGISTER_UNSUPPORTED = (
+    "`register --aiteammate` is unsupported. Register only runs "
+    "`a365 setup blueprint` plus MCP/Bot permission setup; the AI Teammate "
+    "agentic user is created/activated after `publish --aiteammate` via "
+    "M365 Admin Centre upload and per-user activation."
+)
 
 GENERATED_CONFIG_FILENAME = "a365.generated.config.json"
 
@@ -111,7 +117,7 @@ class RegisterInputs:
     agent_name: str
     tenant_id: str | None = None  # None → CLI auto-detects from `az account show`
     m365: bool = False  # register messaging endpoint via MCP Platform
-    aiteammate: bool = False  # AI Teammate (creates Entra user) vs blueprint-only
+    aiteammate: bool = False  # Parser back-compat; rejected in __post_init__.
     authmode: str = "obo"  # obo / s2s / both — only used by `setup all`, kept here for config
     no_endpoint: bool = False  # blueprint-only; skip endpoint registration
     skip_requirements: bool = False  # pass --skip-requirements to setup blueprint
@@ -119,6 +125,8 @@ class RegisterInputs:
     def __post_init__(self) -> None:
         if not self.agent_name:
             raise ValueError("agent_name must be non-empty")
+        if self.aiteammate:
+            raise ValueError(AITEAMMATE_REGISTER_UNSUPPORTED)
         if self.authmode not in VALID_AUTH_MODES:
             raise ValueError(
                 f"authmode must be one of {sorted(VALID_AUTH_MODES)}, got {self.authmode!r}"
@@ -548,7 +556,10 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     parser.add_argument(
         "--aiteammate",
         action="store_true",
-        help="treat as AI Teammate (creates Entra user + manager); default is blueprint-only",
+        help=(
+            "deprecated/unsupported on register; AI Teammate activation happens "
+            "after `publish --aiteammate` via M365 Admin Centre"
+        ),
     )
     parser.add_argument(
         "--authmode",

@@ -6,6 +6,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **#37:** `hermes a365 register --aiteammate` is now an explicit
+  unsupported/deprecated surface — accepted for backward compatibility
+  but rejected before any plan or apply work with exit code `2` and a
+  pointer at the real AI Teammate flow (`publish --aiteammate` →
+  M365 Admin Centre upload → per-user activation). README + SKILL.md +
+  `references/a365-cli-reference.md` no longer claim `register
+  --aiteammate` creates the agentic Entra user.
+
 ### Fixed
 
 - **#65:** Non-personal coalesced reply buffers now have a liveness

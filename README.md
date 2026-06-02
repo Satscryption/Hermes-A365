@@ -333,10 +333,9 @@ Global Admin and a `MICROSOFT_AGENT_365_TIER_3` license:
 
 > **Budget time before you start.** On macOS 26.x the GA `a365` CLI
 > falls back to device-code per Entra mutation, so `register --apply
-> --m365 --aiteammate` typically hits **10–12 device-code prompts** in
-> a row (each on a fresh tab) before it returns. On Linux / Windows
-> the prompt count is 1–2. If you can run the apply path from Linux,
-> do.
+> --m365` typically hits **10–12 device-code prompts** in a row (each
+> on a fresh tab) before it returns. On Linux / Windows the prompt
+> count is 1–2. If you can run the apply path from Linux, do.
 
 ```bash
 # 0. Seed the per-tenant config from the example. The wrapper auto-fills
@@ -350,11 +349,11 @@ hermes a365 doctor --human                                # exit 0/1/2
 hermes a365 license --users 12 --agents 3 --plan E5
 
 # 3. Register the blueprint + MCP/Bot permissions.
-#    --m365 routes Teams via MCP Platform; --aiteammate creates the
-#    agentic Entra user. --auto-recover-secret patches the GA CLI's
-#    macOS / Linux secret-null regression (Microsoft#408) in place.
+#    --m365 routes Teams via MCP Platform. --auto-recover-secret patches
+#    the GA CLI's macOS / Linux secret-null regression (Microsoft#408)
+#    in place.
 hermes a365 register --agent-name "Inbox Helper" \
-    --m365 --aiteammate --apply --auto-recover-secret
+    --m365 --apply --auto-recover-secret
 
 # 4. (Verify admin consent — usually granted automatically by setup blueprint;
 #     poll explicitly if `register` reported a deferred consent step)
@@ -366,7 +365,8 @@ hermes a365 instance create inbox-helper \
 
 # 6. Package the manifest zip for admin-centre upload.
 #    --aiteammate alone:  AI Teammate manifest (Teams 1:1 "Built for your org");
-#                         upload at M365 Admin Centre.
+#                         upload at M365 Admin Centre, then activate per user
+#                         to create/bind the agentic Entra user.
 #    --copilot-chat alone: Custom Engine Agent manifest (M365 Copilot Chat
 #                         agents picker); upload at Teams Admin Center.
 #    --aiteammate --copilot-chat: both zips side-by-side (Copilot Chat zip
@@ -481,7 +481,7 @@ hermes a365 status [<slug>] [--human]
 hermes a365 activity-bridge verify --slug <slug> [--human]
 
 # === Apply-path orchestrators ===
-hermes a365 register --agent-name "<display>" [--m365] [--aiteammate] \
+hermes a365 register --agent-name "<display>" [--m365] \
     [--no-endpoint] [--auto-recover-secret] [--apply]
 hermes a365 consent "<agent-name>" [--no-open] [--timeout 60]
 hermes a365 instance create <slug> --owner <email> --owner-aad-id <oid> [--apply]

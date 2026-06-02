@@ -109,8 +109,13 @@ Common flags across `setup *`:
   endpoint via MCP Platform). Default off.
 - `--skip-requirements` — skip prerequisites validation (use with care).
 
-`setup all` also accepts `--aiteammate` (AI Teammate vs blueprint-only)
-and `--authmode <obo|s2s|both>` (auth pattern for the agent identity).
+`setup all` also accepts `--aiteammate`, but current CLI help says that
+mode provisions blueprint + permissions only; it does **not** create the
+agentic Entra user during setup. The AI Teammate user is created/bound
+after `publish --aiteammate` package upload and per-user activation in
+M365 Admin Centre. `setup all` also accepts `--authmode <obo|s2s|both>`
+(auth pattern for the agent identity), which is not supported with
+`--aiteammate true`.
 
 ## `query-entra` subcommands
 
