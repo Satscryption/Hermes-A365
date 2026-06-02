@@ -87,12 +87,13 @@ whether the conversation actually renders Bot Framework streaming:
 > rendering visually in the target client, never from the gateway log
 > alone.
 
-**Known gap (#65):** the coalesce buffer flushes only on
+**Liveness fallback (#65):** the coalesce buffer normally flushes on
 `edit_message(finalize=True)`. If finalize never fires (consumer error,
-dropped final chunk, crash mid-turn) the buffered reply is never sent —
-there is no timeout/liveness fallback yet, unlike the streaming path's
-guard. Not reproduced in the v0.7.2 branch walk (finalize fired every
-turn); tracked as a robustness follow-up.
+dropped final chunk, crash mid-turn), a watchdog flushes the latest
+buffered text as one normal `send_reply` after the stale-stream
+threshold. If that timeout flush fails, the adapter logs a warning and
+drops the buffer so the failure is observable instead of silently
+wedging the conversation.
 
 ## Adaptive Card targets
 

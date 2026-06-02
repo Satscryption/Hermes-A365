@@ -6,6 +6,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#65:** Non-personal coalesced reply buffers now have a liveness
+  fallback. If Hermes' stream consumer never calls
+  `edit_message(finalize=True)`, a watchdog flushes the latest
+  buffered content as one normal `send_reply()` after the stale-stream
+  threshold; failed timeout flushes are logged and dropped instead of
+  remaining silently buffered forever.
+
 ### Documentation
 
 - Documented the Path B Copilot Chat reply-delivery model in

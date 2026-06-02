@@ -2957,6 +2957,117 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 1
 
     @pytest.mark.asyncio
+    async def test_stale_coalesced_reply_flushes_buffer_and_late_final_noops(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-stale")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        first = await a.send(
+            chat_id="conv-G-stale",
+            content="Recovered reply ▉",
+            reply_to="act-1",
+        )
+        message_id = str(first.message_id)
+        state = a._coalesced_replies[message_id]
+        loop_now = asyncio.get_event_loop().time()
+        state["last_update_ts"] = (
+            loop_now - adapter_mod._COALESCED_REPLY_FLUSH_AFTER_SEC - 1.0
+        )
+
+        flushed = await a._flush_stale_coalesced_reply(message_id)
+
+        assert flushed is True
+        assert send_reply_mock.await_count == 1
+        kwargs = send_reply_mock.await_args.kwargs
+        assert kwargs["reply"]["text"] == "Recovered reply"
+        assert message_id not in a._coalesced_replies
+        assert "conv-G-stale" not in a._active_coalesced_reply_by_chat
+        assert message_id not in a._coalesced_reply_tasks
+        assert message_id in a._recently_finalized
+
+        late_final = await a.edit_message(
+            "conv-G-stale",
+            message_id,
+            "Recovered reply",
+            finalize=True,
+        )
+        assert late_final.success is True
+        assert send_reply_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_coalesced_reply_watchdog_flushes_when_finalize_never_arrives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_FLUSH_AFTER_SEC", 0.01)
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-watch")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        first = await a.send(
+            chat_id="conv-G-watch",
+            content="Watchdog reply ▉",
+            reply_to="act-1",
+        )
+        message_id = str(first.message_id)
+        assert message_id in a._coalesced_reply_tasks
+
+        await asyncio.sleep(0.05)
+
+        assert send_reply_mock.await_count == 1
+        kwargs = send_reply_mock.await_args.kwargs
+        assert kwargs["reply"]["text"] == "Watchdog reply"
+        assert message_id not in a._coalesced_replies
+        assert "conv-G-watch" not in a._active_coalesced_reply_by_chat
+        assert message_id not in a._coalesced_reply_tasks
+        assert message_id in a._recently_finalized
+
+    @pytest.mark.asyncio
+    async def test_stale_coalesced_reply_flush_failure_logs_and_drops(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-fail")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(side_effect=RuntimeError("connector down"))
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        first = await a.send(
+            chat_id="conv-G-fail",
+            content="Will be dropped ▉",
+            reply_to="act-1",
+        )
+        message_id = str(first.message_id)
+        caplog.set_level("WARNING")
+
+        flushed = await a._flush_stale_coalesced_reply(message_id)
+
+        assert flushed is False
+        assert send_reply_mock.await_count == 1
+        assert message_id not in a._coalesced_replies
+        assert "conv-G-fail" not in a._active_coalesced_reply_by_chat
+        assert message_id not in a._coalesced_reply_tasks
+        assert message_id not in a._recently_finalized
+        assert any(
+            "dropping stale coalesced reply after flush failure" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_first_call_starts_stream_with_sequence_one_no_streamid(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

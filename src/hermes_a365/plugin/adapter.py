@@ -131,6 +131,7 @@ def _strip_streaming_cursor(text: str) -> str:
 _STREAMING_MIN_GAP_SEC = 1.5
 _STREAMING_FORCE_DROP_AFTER_SEC = 130.0
 _STREAMING_FINALIZE_MAX_FAILURES = 2
+_COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 
 
 # Slice 19q (round-5 walkthrough finding, 2026-05-06): the BF connector
@@ -328,6 +329,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # arrives. Maps synthetic message_id -> buffer state.
         self._coalesced_replies: dict[str, dict[str, Any]] = {}
         self._active_coalesced_reply_by_chat: dict[str, str] = {}
+        self._coalesced_reply_tasks: dict[str, asyncio.Task] = {}
 
         # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
         # captured an inbound for since boot. Used as ``send()``'s gate
@@ -687,6 +689,11 @@ class Agent365Adapter(BasePlatformAdapter):
             with contextlib.suppress(Exception):
                 await self._http_client.aclose()
             self._http_client = None
+        for task in list(self._coalesced_reply_tasks.values()):
+            task.cancel()
+        self._coalesced_reply_tasks.clear()
+        self._coalesced_replies.clear()
+        self._active_coalesced_reply_by_chat.clear()
         self._mark_disconnected()
 
     # ── Outbound ──────────────────────────────────────────────────────────
@@ -962,6 +969,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 content=content,
                 message_id=active_msg_id,
+                inbound=inbound,
             )
 
         if (
@@ -983,6 +991,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 content=content,
                 message_id=message_id,
+                inbound=inbound,
             )
 
         return await self._send_reply_activity(
@@ -1024,12 +1033,26 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         message_id: str,
+        inbound: dict[str, Any],
     ) -> SendResult:
-        self._coalesced_replies[message_id] = {
-            "chat_id": chat_id,
-            "content": _strip_streaming_cursor(content),
-        }
+        loop = asyncio.get_event_loop()
+        now = loop.time()
+        state = self._coalesced_replies.get(message_id)
+        if state is None:
+            state = {
+                "chat_id": chat_id,
+                "content": "",
+                "inbound": inbound,
+                "opened_ts": now,
+                "last_update_ts": now,
+            }
+            self._coalesced_replies[message_id] = state
+        else:
+            state["inbound"] = inbound
+            state["last_update_ts"] = now
+        state["content"] = _strip_streaming_cursor(content)
         self._active_coalesced_reply_by_chat[chat_id] = message_id
+        self._ensure_coalesced_reply_task(message_id)
         return SendResult(success=True, message_id=message_id)
 
     async def _edit_coalesced_reply(
@@ -1060,11 +1083,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id=chat_id,
                 content=content,
                 message_id=message_id,
+                inbound=inbound,
             )
         else:
             self._coalesced_replies[message_id]["content"] = (
                 _strip_streaming_cursor(content)
             )
+            self._coalesced_replies[message_id]["inbound"] = inbound
+            self._coalesced_replies[message_id]["last_update_ts"] = loop_now
+            self._ensure_coalesced_reply_task(message_id)
 
         if not finalize:
             return SendResult(success=True, message_id=message_id)
@@ -1083,11 +1110,131 @@ class Agent365Adapter(BasePlatformAdapter):
             log_context="coalesced edit_message",
         )
         if result.success:
-            self._coalesced_replies.pop(message_id, None)
-            self._active_coalesced_reply_by_chat.pop(chat_id, None)
+            self._drop_coalesced_reply_state(chat_id, message_id)
             self._recently_finalized[message_id] = loop_now
             return SendResult(success=True, message_id=result.message_id)
         return result
+
+    def _ensure_coalesced_reply_task(self, message_id: str) -> None:
+        task = self._coalesced_reply_tasks.get(message_id)
+        if task is not None and not task.done():
+            return
+        self._coalesced_reply_tasks[message_id] = asyncio.create_task(
+            self._watch_coalesced_reply(message_id)
+        )
+
+    async def _watch_coalesced_reply(self, message_id: str) -> None:
+        try:
+            while True:
+                state = self._coalesced_replies.get(message_id)
+                if state is None:
+                    return
+                loop_now = asyncio.get_event_loop().time()
+                last_update_ts = state.get("last_update_ts")
+                if not isinstance(last_update_ts, (int, float)):
+                    last_update_ts = state.get("opened_ts", loop_now)
+                    if not isinstance(last_update_ts, (int, float)):
+                        last_update_ts = loop_now
+                    state["last_update_ts"] = last_update_ts
+                age = loop_now - float(last_update_ts)
+                remaining = _COALESCED_REPLY_FLUSH_AFTER_SEC - age
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                await self._flush_stale_coalesced_reply(
+                    message_id, cancel_task=False
+                )
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "agent365 coalesced reply watchdog failed: "
+                "message_id=%s error=%s",
+                message_id,
+                e,
+            )
+
+    async def _flush_stale_coalesced_reply(
+        self,
+        message_id: str,
+        *,
+        cancel_task: bool = True,
+    ) -> bool:
+        state = self._coalesced_replies.get(message_id)
+        if state is None:
+            return True
+        chat_id = str(state.get("chat_id") or "")
+        inbound = state.get("inbound")
+        content = str(state.get("content") or "")
+        if not chat_id or not isinstance(inbound, dict):
+            logger.warning(
+                "agent365 dropping stale coalesced reply with incomplete state: "
+                "message_id=%s chat_id=%s",
+                message_id,
+                chat_id,
+            )
+            self._drop_coalesced_reply_state(
+                chat_id, message_id, cancel_task=cancel_task
+            )
+            return False
+
+        if self._http_client is None or self._bridge_cfg is None:
+            logger.warning(
+                "agent365 dropping stale coalesced reply while disconnected: "
+                "chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
+            self._drop_coalesced_reply_state(
+                chat_id, message_id, cancel_task=cancel_task
+            )
+            return False
+
+        result = await self._send_reply_activity(
+            inbound=inbound,
+            content=content,
+            log_context="stale coalesced reply",
+        )
+        if result.success:
+            logger.warning(
+                "agent365 auto-flushed stale coalesced reply: "
+                "chat_id=%s message_id=%s",
+                chat_id,
+                message_id,
+            )
+            self._drop_coalesced_reply_state(
+                chat_id, message_id, cancel_task=cancel_task
+            )
+            self._recently_finalized[message_id] = asyncio.get_event_loop().time()
+            return True
+
+        logger.warning(
+            "agent365 dropping stale coalesced reply after flush failure: "
+            "chat_id=%s message_id=%s error=%s",
+            chat_id,
+            message_id,
+            result.error,
+        )
+        self._drop_coalesced_reply_state(
+            chat_id, message_id, cancel_task=cancel_task
+        )
+        return False
+
+    def _drop_coalesced_reply_state(
+        self,
+        chat_id: str,
+        message_id: str,
+        *,
+        cancel_task: bool = True,
+    ) -> None:
+        self._coalesced_replies.pop(message_id, None)
+        if self._active_coalesced_reply_by_chat.get(chat_id) == message_id:
+            self._active_coalesced_reply_by_chat.pop(chat_id, None)
+        task = self._coalesced_reply_tasks.pop(message_id, None)
+        current = asyncio.current_task()
+        if cancel_task and task is not None and task is not current:
+            task.cancel()
 
     async def _send_proactive(
         self, chat_id: str, content: str
