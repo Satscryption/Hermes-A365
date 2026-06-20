@@ -1204,6 +1204,167 @@ class TestShouldDispatch:
         assert adapter_mod._should_dispatch(body) is True
 
 
+class TestLifecycleRegistryAction:
+    """#79 — pure classifier mapping BF lifecycle activities to a registry
+    action (capture for proactive / evict on uninstall / leave alone)."""
+
+    def test_installation_add_upserts(self) -> None:
+        body = {"type": "installationUpdate", "action": "add"}
+        assert adapter_mod._lifecycle_registry_action(body) == "upsert"
+
+    def test_installation_default_action_upserts(self) -> None:
+        # Missing/empty action is treated as add (capture, don't evict).
+        assert adapter_mod._lifecycle_registry_action(
+            {"type": "installationUpdate"}
+        ) == "upsert"
+
+    def test_installation_remove_evicts(self) -> None:
+        body = {"type": "installationUpdate", "action": "remove"}
+        assert adapter_mod._lifecycle_registry_action(body) == "evict"
+
+    def test_conversation_update_members_added_upserts(self) -> None:
+        body = {"type": "conversationUpdate", "membersAdded": [{"id": "bot-1"}]}
+        assert adapter_mod._lifecycle_registry_action(body) == "upsert"
+
+    def test_conversation_update_without_members_added_is_none(self) -> None:
+        # Plain conversationUpdate (topic rename etc.) — leave to
+        # _should_dispatch's existing ack-and-bail.
+        assert adapter_mod._lifecycle_registry_action(
+            {"type": "conversationUpdate"}
+        ) is None
+
+    def test_conversation_update_members_removed_is_none(self) -> None:
+        # A member leaving a still-live group must NOT evict; only an
+        # explicit installationUpdate remove does.
+        body = {"type": "conversationUpdate", "membersRemoved": [{"id": "u-1"}]}
+        assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_real_message_is_none(self) -> None:
+        assert adapter_mod._lifecycle_registry_action(_make_inbound()) is None
+
+    def test_typing_is_none(self) -> None:
+        assert adapter_mod._lifecycle_registry_action({"type": "typing"}) is None
+
+
+class TestConversationRegistryEvict:
+    """#79 — explicit tenant-driven removal (uninstall hygiene)."""
+
+    @staticmethod
+    def _reg():
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        return ConversationRegistry()
+
+    def test_evict_present_returns_true(self) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        reg = self._reg()
+        reg.upsert(ConversationRef(conversation_id="c1", service_url="u"))
+        assert reg.evict("c1") is True
+        assert "c1" not in reg
+
+    def test_evict_absent_returns_false(self) -> None:
+        assert self._reg().evict("nope") is False
+
+    def test_evict_removes_pinned_entry(self) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        reg = self._reg()
+        reg.upsert(ConversationRef(conversation_id="c2", service_url="u"))
+        assert reg.pin("c2") is True
+        # An uninstall is a harder signal than a pin.
+        assert reg.evict("c2") is True
+        assert "c2" not in reg
+
+
+class TestLifecycleCapture:
+    """#79 — route-level: lifecycle activities capture/evict the
+    conversation reference for proactive delivery and never reach the
+    agent loop. Driven via the FastAPI TestClient with the JWT validator
+    patched, same harness as ``TestMessagesRoute``."""
+
+    @staticmethod
+    def _client(a, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        a._http_client = MagicMock()
+        return TestClient(a.build_app())
+
+    @staticmethod
+    def _lifecycle_body(conv_id="conv-install", **overrides):
+        # Path B (classic BF: no agentic ids, trafficmanager serviceUrl)
+        # so the captured ref classifies as a Path B proactive target.
+        body = {**_make_inbound(path="B", conv_id=conv_id), **overrides}
+        body.pop("text", None)  # lifecycle activities carry no user text
+        return body
+
+    def test_installation_add_captures_ref_enables_proactive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(type="installationUpdate", action="add")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json() == {"status": "acked", "lifecycle": "upsert"}
+        # Never reached the agent loop (fixes the wasted-turn mishandling).
+        assert a._handled_events == []
+        # Captured into the registry...
+        assert "conv-install" in a._conversations
+        # ...but NOT marked seen-this-lifetime, so send() routes proactive.
+        assert "conv-install" not in a._seen_inbounds_this_lifetime
+        # And the captured ref is a usable Path B proactive target.
+        spec = a._build_proactive_target_spec("conv-install")
+        assert spec is not None
+        assert spec["path"] == "B"
+        assert spec["conversation_id"] == "conv-install"
+
+    def test_conversation_update_members_added_captures_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="conv-add",
+            type="conversationUpdate",
+            membersAdded=[{"id": "bot-1"}],
+        )
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.json() == {"status": "acked", "lifecycle": "upsert"}
+        assert a._handled_events == []
+        assert "conv-add" in a._conversations
+
+    def test_installation_remove_evicts_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        # Pre-seed as if the chat was captured earlier this lifetime.
+        seed = _make_inbound(path="B", conv_id="conv-rm")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
+        a._seen_inbounds_this_lifetime.add("conv-rm")
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="conv-rm", type="installationUpdate", action="remove"
+        )
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.json() == {"status": "acked", "lifecycle": "evict"}
+        assert a._handled_events == []
+        assert "conv-rm" not in a._conversations
+        assert "conv-rm" not in a._seen_inbounds_this_lifetime
+
+
 class TestServeAppAgentsChannelFilter:
     """Route-level coverage for the slice 19q filter — same shape
     as ``test_conversation_update_acked_no_dispatch`` from 19n."""

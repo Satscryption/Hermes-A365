@@ -189,6 +189,44 @@ _CHANNEL_CONTROL_TYPES: frozenset[str] = frozenset(
 )
 
 
+def _lifecycle_registry_action(activity: dict[str, Any]) -> str | None:
+    """Classify a BF lifecycle activity into a registry action (#79).
+
+    Returns:
+
+    - ``"upsert"`` — capture/refresh the conversation reference so
+      proactive delivery (#33/#67) can reach a chat the operator
+      installed the agent into but nobody has messaged yet. Fires for
+      ``installationUpdate`` (add) and ``conversationUpdate`` carrying
+      ``membersAdded``.
+    - ``"evict"`` — drop the conversation reference. Fires for
+      ``installationUpdate`` (remove): the tenant uninstalled the agent,
+      so proactive POSTs into the conversation must stop immediately.
+    - ``None`` — not a lifecycle activity we act on; the caller's normal
+      ``_should_dispatch`` channel-control / dispatch handling applies.
+
+    Lifecycle activities are channel-control, NOT user turns: the route
+    captures/evicts then ack-and-bails without an agent turn, and does
+    NOT add the conversation to ``_seen_inbounds_this_lifetime`` — a
+    lifecycle activity has no user-message activity id to
+    ``replyToActivity`` against, so ``send()`` must route via the
+    proactive ``sendToConversation`` path.
+
+    Eviction is intentionally keyed to ``installationUpdate`` remove (the
+    canonical uninstall hook). A ``conversationUpdate`` ``membersRemoved``
+    is usually just a member leaving a still-live group chat, so it must
+    NOT evict the conversation — only an explicit uninstall does.
+    """
+    activity_type = str(activity.get("type") or "")
+    if activity_type == "installationUpdate":
+        if str(activity.get("action") or "").lower() == "remove":
+            return "evict"
+        return "upsert"
+    if activity_type == "conversationUpdate" and activity.get("membersAdded"):
+        return "upsert"
+    return None
+
+
 def _should_dispatch(activity: dict[str, Any]) -> bool:
     """Return ``True`` for activities the agent loop should reason about.
 
@@ -584,6 +622,39 @@ class Agent365Adapter(BasePlatformAdapter):
                 delivery_id
             ):
                 return JSONResponse({"status": "duplicate"})
+
+            # #79 — BF lifecycle activities (install add/remove,
+            # membersAdded) are channel-control, not user turns, but they
+            # carry the conversation reference we need for proactive
+            # delivery. Capture it on add (so #33/#67 proactive can reach a
+            # chat the operator installed the agent into but nobody has
+            # messaged), and evict on uninstall (so we stop POSTing into a
+            # conversation the tenant removed us from, rather than waiting
+            # out the 30-day prune). We deliberately do NOT add to
+            # ``_seen_inbounds_this_lifetime``: a lifecycle activity has no
+            # user-message activity id, so ``send()`` must route via the
+            # proactive ``sendToConversation`` path, never replyToActivity.
+            # Out of the agent loop either way — ack-and-bail.
+            lifecycle_action = _lifecycle_registry_action(activity)
+            if lifecycle_action is not None:
+                ref = ConversationRef.from_activity(activity)
+                if ref is not None:
+                    if lifecycle_action == "evict":
+                        if self._conversations.evict(ref.conversation_id):
+                            self._seen_inbounds_this_lifetime.discard(
+                                ref.conversation_id
+                            )
+                            self._persist_conversations()
+                    else:  # "upsert"
+                        self._conversations.upsert(ref)
+                        self._persist_conversations()
+                logger.info(
+                    "inbound lifecycle type=%s action=%s conv=%s",
+                    str(activity.get("type") or ""),
+                    lifecycle_action,
+                    ref.conversation_id if ref is not None else "?(no conv.id)",
+                )
+                return JSONResponse({"status": "acked", "lifecycle": lifecycle_action})
 
             # Slice 19q — channel-control + synthetic agents-channel
             # probes ack-and-bail before the registry upsert. They're

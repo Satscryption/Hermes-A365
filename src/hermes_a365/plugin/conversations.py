@@ -169,6 +169,20 @@ class ConversationRegistry:
         self._by_id[ref.conversation_id] = merged
         return merged
 
+    def evict(self, conversation_id: str) -> bool:
+        """Remove a conversation entry outright (#79 uninstall hygiene).
+
+        Returns ``True`` if an entry was removed, ``False`` if the id was
+        not present. Unlike ``prune_old_entries`` (age-based, skips pinned
+        and active entries), this is an explicit tenant-driven removal: an
+        ``installationUpdate`` (remove) means the agent was uninstalled
+        from the conversation, so proactive POSTs into it must stop
+        immediately rather than wait out the 30-day prune. An uninstall is
+        a harder signal than an operator ``pin``, so pinned entries are
+        evicted too.
+        """
+        return self._by_id.pop(conversation_id, None) is not None
+
     def mark_used(
         self, conversation_id: str, *, now: float | None = None
     ) -> bool:
