@@ -4,7 +4,7 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.4] — 2026-06-20
 
 ### Fixed
 
@@ -33,10 +33,20 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   private surface in Bot Framework/Copilot Chat and is left as a
   follow-up.
 
-  Tests: 915 → 922 (+7 `TestSendOrUpdateStatus`: personal/unknown
+  Pre-release hardening (adversarial red-team): the flush now guards two
+  races — a same-key line appended while the consolidated bubble is
+  mid-send is re-armed into a trailing bubble instead of being dropped,
+  and a turn that opens *during* the debounce no longer lets a stray
+  status bubble interleave into it. Substantive `warn` notices bypass
+  coalescing (they post immediately), and a status for a chat not seen
+  this gateway lifetime falls back to the proactive send path rather than
+  a possibly-stale `replyToActivity`.
+
+  Tests: 915 → 926 (+11 `TestSendOrUpdateStatus`: personal/unknown
   pass-through, groupChat burst coalescing, exact-repeat dedup,
-  suppress-while-turn-active, empty no-op, disconnected flush drops
-  state).
+  suppress-while-turn-active, buffered-then-turn-opens suppression,
+  append-during-flush re-arm, `warn` pass-through, registry-only
+  fallback, empty no-op, disconnected flush drops state).
 
 ## [0.7.3] — 2026-06-02
 
