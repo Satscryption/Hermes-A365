@@ -4,6 +4,40 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **#53:** Hermes' internal status/lifecycle notifications (retry/fallback
+  traces, the terminal-failure summary) no longer spray Copilot Chat with
+  a separate bubble per line. The adapter now implements the gateway's
+  optional `send_or_update_status` hook (the same seam Telegram uses to
+  edit one status bubble in place, hermes-agent issue #30045). Copilot
+  Chat arrives as a `groupChat` and does not render a Bot Framework edit
+  (the v0.7.0 walk finding), so instead of editing we **coalesce**: a
+  burst of same-key status lines buffers under one synthetic id and
+  flushes as a single combined bubble once the burst settles. Status that
+  would interleave into an active streaming/coalesced reply is suppressed
+  (Custom-Engine-Agent message-ordering rule). Teams 1:1 (`personal`)
+  status is passed straight through to `send` unchanged — Path A
+  behaviour is preserved, no filtering. This is permanent, upstream-
+  sanctioned adapter surface, not a temporary content filter.
+
+  Note: the *per-turn* fallback noise that originally motivated this issue
+  (two status bubbles before every reply, from the xai-oauth 403 fallback)
+  was already eliminated upstream by hermes-agent#33816, which buffers
+  retry/fallback status and drops it on a successful turn; that fix is in
+  the running gateway. This change addresses the remaining Copilot Chat
+  residual — the terminal-failure flush rendering as N raw bubbles. The
+  one-shot `/sethome` onboarding notice is a separate path with no clean
+  private surface in Bot Framework/Copilot Chat and is left as a
+  follow-up.
+
+  Tests: 915 → 922 (+7 `TestSendOrUpdateStatus`: personal/unknown
+  pass-through, groupChat burst coalescing, exact-repeat dedup,
+  suppress-while-turn-active, empty no-op, disconnected flush drops
+  state).
+
 ## [0.7.3] — 2026-06-02
 
 Cleanup + correctness release on top of v0.7.2. `register --aiteammate`
