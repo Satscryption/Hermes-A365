@@ -1222,22 +1222,78 @@ class TestLifecycleRegistryAction:
         body = {"type": "installationUpdate", "action": "remove"}
         assert adapter_mod._lifecycle_registry_action(body) == "evict"
 
-    def test_conversation_update_members_added_upserts(self) -> None:
-        body = {"type": "conversationUpdate", "membersAdded": [{"id": "bot-1"}]}
+    def test_conversation_update_bot_added_upserts(self) -> None:
+        # Capture only when the BOT (recipient.id) is among membersAdded.
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersAdded": [{"id": "user-9"}, {"id": "bot-1"}],
+        }
         assert adapter_mod._lifecycle_registry_action(body) == "upsert"
 
-    def test_conversation_update_without_members_added_is_none(self) -> None:
+    def test_conversation_update_user_added_without_bot_is_none(self) -> None:
+        # An ordinary user joining a still-live group must not churn the
+        # registry — leave it to _should_dispatch's ack-and-bail.
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersAdded": [{"id": "user-9"}],
+        }
+        assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_conversation_update_members_added_without_recipient_is_none(
+        self,
+    ) -> None:
+        # No bot id to match against → cannot fire.
+        body = {"type": "conversationUpdate", "membersAdded": [{"id": "x"}]}
+        assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_conversation_update_without_members_is_none(self) -> None:
         # Plain conversationUpdate (topic rename etc.) — leave to
         # _should_dispatch's existing ack-and-bail.
         assert adapter_mod._lifecycle_registry_action(
-            {"type": "conversationUpdate"}
+            {"type": "conversationUpdate", "recipient": {"id": "bot-1"}}
         ) is None
 
-    def test_conversation_update_members_removed_is_none(self) -> None:
-        # A member leaving a still-live group must NOT evict; only an
-        # explicit installationUpdate remove does.
-        body = {"type": "conversationUpdate", "membersRemoved": [{"id": "u-1"}]}
+    def test_conversation_update_bot_removed_evicts(self) -> None:
+        # The bot being kicked from a group is a real uninstall signal on
+        # surfaces that don't send installationUpdate(remove).
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersRemoved": [{"id": "bot-1"}],
+        }
+        assert adapter_mod._lifecycle_registry_action(body) == "evict"
+
+    def test_conversation_update_user_removed_is_none(self) -> None:
+        # A user leaving a still-live group must NOT evict — only the bot's
+        # own removal does.
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersRemoved": [{"id": "user-9"}],
+        }
         assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_agents_channel_synthetic_install_is_none(self) -> None:
+        # Synthetic agents-channel probes must not reach the registry —
+        # they bypass _should_dispatch's screen (lifecycle runs first).
+        for sender in ("system", "no-reply@teams.mail.microsoft"):
+            body = {
+                "type": "installationUpdate",
+                "action": "add",
+                "channelId": "agents",
+                "from": {"id": sender},
+            }
+            assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_real_msteams_install_still_upserts(self) -> None:
+        body = {
+            "type": "installationUpdate",
+            "action": "add",
+            "channelId": "msteams",
+        }
+        assert adapter_mod._lifecycle_registry_action(body) == "upsert"
 
     def test_real_message_is_none(self) -> None:
         assert adapter_mod._lifecycle_registry_action(_make_inbound()) is None
@@ -1327,15 +1383,16 @@ class TestLifecycleCapture:
         assert spec["path"] == "B"
         assert spec["conversation_id"] == "conv-install"
 
-    def test_conversation_update_members_added_captures_ref(
+    def test_conversation_update_bot_added_captures_ref(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
         client = self._client(a, monkeypatch)
+        # The bot is recipient.id from _make_inbound (= "agent-1").
         body = self._lifecycle_body(
             conv_id="conv-add",
             type="conversationUpdate",
-            membersAdded=[{"id": "bot-1"}],
+            membersAdded=[{"id": "user-x"}, {"id": "agent-1"}],
         )
         r = client.post(
             "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
@@ -1343,6 +1400,41 @@ class TestLifecycleCapture:
         assert r.json() == {"status": "acked", "lifecycle": "upsert"}
         assert a._handled_events == []
         assert "conv-add" in a._conversations
+
+    def test_lifecycle_does_not_clobber_active_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Clobber regression: a real user message captured this lifetime,
+        # then a bot-add conversationUpdate for the SAME conv must NOT
+        # overwrite the cached user-message raw / last_inbound id (which
+        # would corrupt the replyToActivity target), and the chat must stay
+        # seen-this-lifetime (keep its reply path, not flip to proactive).
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        msg = _make_inbound(
+            path="B", conv_id="conv-live", activity_id="user-act-1", text="hi"
+        )
+        r1 = client.post(
+            "/api/messages", json=msg, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r1.json()["status"] == "dispatched"
+        assert "conv-live" in a._seen_inbounds_this_lifetime
+        assert a._conversations.get("conv-live").last_inbound_activity_id == "user-act-1"
+
+        lc = self._lifecycle_body(
+            conv_id="conv-live",
+            id="cu-act-9",  # different id than the user message (no dedupe)
+            type="conversationUpdate",
+            membersAdded=[{"id": "agent-1"}],
+        )
+        r2 = client.post(
+            "/api/messages", json=lc, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r2.json() == {"status": "acked", "lifecycle": "upsert"}
+        ref = a._conversations.get("conv-live")
+        assert ref.last_inbound_activity_id == "user-act-1"  # not clobbered
+        assert ref.raw.get("id") == "user-act-1"
+        assert "conv-live" in a._seen_inbounds_this_lifetime
 
     def test_installation_remove_evicts_ref(
         self, monkeypatch: pytest.MonkeyPatch

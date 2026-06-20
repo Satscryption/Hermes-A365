@@ -212,17 +212,65 @@ def _lifecycle_registry_action(activity: dict[str, Any]) -> str | None:
     ``replyToActivity`` against, so ``send()`` must route via the
     proactive ``sendToConversation`` path.
 
-    Eviction is intentionally keyed to ``installationUpdate`` remove (the
-    canonical uninstall hook). A ``conversationUpdate`` ``membersRemoved``
-    is usually just a member leaving a still-live group chat, so it must
-    NOT evict the conversation — only an explicit uninstall does.
+    Eviction fires for ``installationUpdate`` remove (the canonical
+    uninstall hook) AND for ``conversationUpdate`` ``membersRemoved``
+    carrying the bot itself (``recipient.id``) — the symmetric counterpart
+    of the ``membersAdded`` bot-add capture below. On some channels/surfaces
+    a group-chat bot removal is signalled by ``conversationUpdate``
+    ``membersRemoved`` (bot) rather than ``installationUpdate`` remove, so
+    not evicting on it would leave a stale ref that keeps proactive POSTing
+    into a chat the bot was kicked from. An ordinary *user* leaving a
+    still-live group (``membersRemoved`` without the bot id) must NOT evict
+    — only the bot's own removal does.
+
+    Synthetic ``agents``-channel probes (``from.id`` ``system`` or
+    ``no-reply@…``) are classified as ``None`` here so they never reach
+    the durable registry — they share the ``_should_dispatch``
+    synthetic-sender screen but would otherwise bypass it, since the
+    lifecycle interception runs *before* ``_should_dispatch``.
+
+    ``conversationUpdate`` ``membersAdded`` only upserts when the bot
+    itself (``recipient.id``) is among the added members — i.e. the agent
+    was added to the conversation, the documented "operator installed the
+    agent into this chat" signal. An ordinary user joining a still-live
+    group is left to ``_should_dispatch``'s ack-and-bail so it neither
+    churns the registry nor clobbers the cached inbound.
     """
     activity_type = str(activity.get("type") or "")
+    if activity_type not in ("installationUpdate", "conversationUpdate"):
+        return None
+    # Screen synthetic agents-channel probes before any registry action:
+    # the lifecycle interception runs ahead of _should_dispatch, so the
+    # synthetic-sender filter there is unreachable for these types.
+    if str(activity.get("channelId") or "") == "agents":
+        sender = activity.get("from")
+        sender_id = str(sender.get("id") or "") if isinstance(sender, dict) else ""
+        if sender_id == "system" or sender_id.startswith("no-reply@"):
+            return None
     if activity_type == "installationUpdate":
         if str(activity.get("action") or "").lower() == "remove":
             return "evict"
         return "upsert"
-    if activity_type == "conversationUpdate" and activity.get("membersAdded"):
+    recipient = activity.get("recipient")
+    bot_id = str(recipient.get("id") or "") if isinstance(recipient, dict) else ""
+    # A missing recipient/bot id can't be matched against members, so
+    # neither the add nor the remove branch can fire — fall through to None.
+    if not bot_id:
+        return None
+
+    def _member_ids(key: str) -> set[str]:
+        members = activity.get(key)
+        if not isinstance(members, list):
+            return set()
+        return {str(m.get("id") or "") for m in members if isinstance(m, dict)}
+
+    # Only act when the bot ITSELF was added/removed (install/uninstall
+    # into-this-chat), not an ordinary user join/leave of a still-live
+    # group. Removal is checked first so a single activity carrying the
+    # bot in both lists (pathological) resolves to evict.
+    if bot_id in _member_ids("membersRemoved"):
+        return "evict"
+    if bot_id in _member_ids("membersAdded"):
         return "upsert"
     return None
 
@@ -645,9 +693,20 @@ class Agent365Adapter(BasePlatformAdapter):
                                 ref.conversation_id
                             )
                             self._persist_conversations()
-                    else:  # "upsert"
-                        self._conversations.upsert(ref)
-                        self._persist_conversations()
+                    else:  # "upsert" — capture-if-missing only.
+                        # A lifecycle activity has no replyToActivity-able
+                        # id and no agentic ids, so it must NEVER overwrite a
+                        # richer captured user-message ref: doing so would
+                        # corrupt the cached reply target (send() would
+                        # replyToActivity against a non-message id) and
+                        # downgrade the proactive path (Path A -> B/unknown).
+                        # Only create a new entry, or fill one that has no
+                        # usable raw. A subsequent real user message refreshes
+                        # the entry via the normal dispatch path below.
+                        existing = self._conversations.get(ref.conversation_id)
+                        if existing is None or not existing.raw:
+                            self._conversations.upsert(ref)
+                            self._persist_conversations()
                 logger.info(
                     "inbound lifecycle type=%s action=%s conv=%s",
                     str(activity.get("type") or ""),
