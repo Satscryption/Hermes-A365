@@ -3387,6 +3387,193 @@ class TestEditMessage:
         assert body["recipient"]["id"] == "user-id-789"
 
 
+class TestSendOrUpdateStatus:
+    """#53 — gateway status/lifecycle callbacks routed through
+    ``send_or_update_status``. Copilot Chat (groupChat) coalesces a burst
+    of same-key status lines into one bubble; Teams 1:1 (personal) status
+    passes straight through to ``send`` unchanged."""
+
+    @staticmethod
+    def _wire(a: Any, inbound: dict[str, Any]) -> None:
+        """Register the inbound + stub the http/bridge plumbing the flush
+        path needs (``_send_reply_activity`` POSTs through ``send_reply``)."""
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+
+    @pytest.mark.asyncio
+    async def test_personal_status_passes_through_to_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Path A: do not filter or coalesce — delegate to send() unchanged
+        # (identical to the gateway's no-method plain-send fallback).
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-P")  # personal by default
+        self._wire(a, inbound)
+        sentinel = object()
+        send_mock = AsyncMock(return_value=sentinel)
+        monkeypatch.setattr(a, "send", send_mock)
+
+        res = await a.send_or_update_status(
+            "conv-P", "lifecycle", "⚠️ trying fallback", metadata={"thread_id": "t"}
+        )
+        assert res is sentinel
+        send_mock.assert_awaited_once_with(
+            "conv-P", "⚠️ trying fallback", metadata={"thread_id": "t"}
+        )
+        assert a._coalesced_status == {}
+
+    @pytest.mark.asyncio
+    async def test_unknown_chat_passes_through_to_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No cached inbound → mirror the gateway's plain-send fallback.
+        a = _make_adapter(monkeypatch)
+        sentinel = object()
+        send_mock = AsyncMock(return_value=sentinel)
+        monkeypatch.setattr(a, "send", send_mock)
+
+        res = await a.send_or_update_status("conv-none", "lifecycle", "hi")
+        assert res is sentinel
+        send_mock.assert_awaited_once_with("conv-none", "hi", metadata=None)
+        assert a._coalesced_status == {}
+
+    @pytest.mark.asyncio
+    async def test_groupchat_burst_coalesces_into_one_bubble(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The terminal-failure flush fires N lifecycle lines back-to-back.
+        # Copilot Chat can't edit a bubble in place, so they buffer under
+        # one key and the debounce watchdog emits a single combined bubble.
+        monkeypatch.setattr(adapter_mod, "_STATUS_COALESCE_FLUSH_AFTER_SEC", 0.01)
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-st")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire(a, inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        lines = [
+            "⚠️ Non-retryable error (HTTP 403) — trying fallback...",
+            "🔄 Primary model failed — switching to fallback: gpt-5.4",
+            "❌ API failed after 3 retries — giving up.",
+        ]
+        results = [
+            await a.send_or_update_status("conv-G-st", "lifecycle", line)
+            for line in lines
+        ]
+        key = a._coalesced_status_key("conv-G-st", "lifecycle")
+        # Buffered under one synthetic key; nothing sent during the burst.
+        assert all(r.message_id == key for r in results)
+        assert send_reply_mock.await_count == 0
+        assert a._coalesced_status[key]["lines"] == lines
+
+        await asyncio.sleep(0.05)  # let the debounce watchdog flush
+
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "\n".join(lines)
+        assert a._coalesced_status == {}
+        assert a._coalesced_status_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_groupchat_dedups_exact_repeat_of_last_line(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_STATUS_COALESCE_FLUSH_AFTER_SEC", 0.01)
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-dup")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire(a, inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        await a.send_or_update_status("conv-G-dup", "lifecycle", "same line")
+        await a.send_or_update_status("conv-G-dup", "lifecycle", "same line")
+        await a.send_or_update_status("conv-G-dup", "lifecycle", "different")
+        await asyncio.sleep(0.05)
+
+        assert send_reply_mock.await_count == 1
+        assert (
+            send_reply_mock.await_args.kwargs["reply"]["text"]
+            == "same line\ndifferent"
+        )
+
+    @pytest.mark.asyncio
+    async def test_groupchat_status_suppressed_while_reply_active(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Never interleave a status bubble into an active turn (CEA ordering).
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-act")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire(a, inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        first = await a.send(
+            chat_id="conv-G-act", content="partial ▉", reply_to="act-1"
+        )
+        assert "conv-G-act" in a._active_coalesced_reply_by_chat
+
+        res = await a.send_or_update_status(
+            "conv-G-act", "lifecycle", "⚠️ trying fallback"
+        )
+        # Suppressed: points at the active reply, never buffered as status,
+        # never its own bubble.
+        assert res.success is True
+        assert res.message_id == first.message_id
+        assert a._coalesced_status == {}
+        assert send_reply_mock.await_count == 0
+
+        # Finalize the reply so no watchdog lingers past the test.
+        await a.edit_message(
+            "conv-G-act", str(first.message_id), "partial done", finalize=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_empty_status_is_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-empty")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire(a, inbound)
+
+        res = await a.send_or_update_status("conv-G-empty", "lifecycle", "   ")
+        assert res.success is True
+        assert a._coalesced_status == {}
+        assert a._coalesced_status_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_flush_while_disconnected_drops_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-disc")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire(a, inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        await a.send_or_update_status("conv-G-disc", "lifecycle", "noise")
+        key = a._coalesced_status_key("conv-G-disc", "lifecycle")
+        a._http_client = None  # simulate a disconnect before the flush fires
+
+        ok = await a._flush_coalesced_status(key)
+        assert ok is False
+        assert send_reply_mock.await_count == 0
+        assert a._coalesced_status == {}
+        assert a._coalesced_status_tasks == {}
+
+
 class TestSendStreamStart:
     """Slice 19s-bis: send() participates in the same BF stream as
     edit_message when in a streaming context (personal chat, no active

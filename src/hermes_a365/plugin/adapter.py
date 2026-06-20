@@ -133,6 +133,16 @@ _STREAMING_FORCE_DROP_AFTER_SEC = 130.0
 _STREAMING_FINALIZE_MAX_FAILURES = 2
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 
+# #53 — Hermes' status/lifecycle callbacks (retry/fallback traces, a
+# terminal-failure summary) arrive as a rapid burst of same-``status_key``
+# calls. Copilot Chat renders each as its own bubble because BF
+# ``groupChat`` cannot edit a bubble in place (the Telegram trick from
+# issue #30045). We coalesce the burst into one bubble; this debounce is
+# how long we wait for the burst to settle before flushing. A terminal
+# failure produces no reply, so a couple of seconds of latency on the
+# consolidated notice is invisible.
+_STATUS_COALESCE_FLUSH_AFTER_SEC = 2.0
+
 
 # Slice 19q (round-5 walkthrough finding, 2026-05-06): the BF connector
 # delivers a handful of activities that aren't user messages and
@@ -360,6 +370,19 @@ class Agent365Adapter(BasePlatformAdapter):
         # can't outlive 2 minutes; 5 covers slow-clock skew).
         self._recently_finalized: dict[str, float] = {}
         self._recently_finalized_ttl_sec = 300.0
+
+        # #53 — gateway status/lifecycle callbacks (retry/fallback traces,
+        # terminal-failure summaries) are routed through
+        # ``send_or_update_status`` when the adapter implements it (see
+        # ``gateway/run.py`` ``_send_or_update_status_coro``). Copilot Chat
+        # cannot edit a bubble in place (unlike Telegram, #30045), so for
+        # non-personal chats we coalesce a burst of same-key status lines
+        # into ONE bubble: append distinct lines under a synthetic key and
+        # flush via a short debounce watchdog (mirrors the coalesced-reply
+        # machinery above). Personal (Teams 1:1) status passes straight
+        # through to ``send`` — Path A behaviour is preserved.
+        self._coalesced_status: dict[str, dict[str, Any]] = {}
+        self._coalesced_status_tasks: dict[str, asyncio.Task] = {}
 
     @property
     def name(self) -> str:
@@ -694,6 +717,10 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_reply_tasks.clear()
         self._coalesced_replies.clear()
         self._active_coalesced_reply_by_chat.clear()
+        for task in list(self._coalesced_status_tasks.values()):
+            task.cancel()
+        self._coalesced_status_tasks.clear()
+        self._coalesced_status.clear()
         self._mark_disconnected()
 
     # ── Outbound ──────────────────────────────────────────────────────────
@@ -1236,6 +1263,130 @@ class Agent365Adapter(BasePlatformAdapter):
         if cancel_task and task is not None and task is not current:
             task.cancel()
 
+    # ── Status coalescing (Copilot Chat, #53) ────────────────────────────
+    @staticmethod
+    def _coalesced_status_key(chat_id: str, status_key: str) -> str:
+        return f"status:{chat_id}:{status_key}"
+
+    def _buffer_coalesced_status(
+        self,
+        *,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        inbound: dict[str, Any],
+    ) -> SendResult:
+        """Append a status line to the per-(chat_id, status_key) buffer and
+        (re)arm the debounce watchdog. Distinct lines accumulate so the
+        flushed bubble preserves the whole trace; an exact repeat of the
+        last line is dropped (retry bookkeeping can fire the same callback
+        twice)."""
+        key = self._coalesced_status_key(chat_id, status_key)
+        now = asyncio.get_event_loop().time()
+        line = _strip_streaming_cursor(content).strip()
+        state = self._coalesced_status.get(key)
+        if state is None:
+            state = {
+                "chat_id": chat_id,
+                "lines": [],
+                "inbound": inbound,
+                "opened_ts": now,
+                "last_update_ts": now,
+            }
+            self._coalesced_status[key] = state
+        else:
+            state["inbound"] = inbound
+            state["last_update_ts"] = now
+        lines = state["lines"]
+        if line and (not lines or lines[-1] != line):
+            lines.append(line)
+        self._ensure_coalesced_status_task(key)
+        return SendResult(success=True, message_id=key)
+
+    def _ensure_coalesced_status_task(self, key: str) -> None:
+        task = self._coalesced_status_tasks.get(key)
+        if task is not None and not task.done():
+            return
+        self._coalesced_status_tasks[key] = asyncio.create_task(
+            self._watch_coalesced_status(key)
+        )
+
+    async def _watch_coalesced_status(self, key: str) -> None:
+        try:
+            while True:
+                state = self._coalesced_status.get(key)
+                if state is None:
+                    return
+                loop_now = asyncio.get_event_loop().time()
+                last_update_ts = state.get("last_update_ts")
+                if not isinstance(last_update_ts, (int, float)):
+                    last_update_ts = state.get("opened_ts", loop_now)
+                    if not isinstance(last_update_ts, (int, float)):
+                        last_update_ts = loop_now
+                    state["last_update_ts"] = last_update_ts
+                age = loop_now - float(last_update_ts)
+                remaining = _STATUS_COALESCE_FLUSH_AFTER_SEC - age
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
+                    continue
+                await self._flush_coalesced_status(key)
+                return
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(
+                "agent365 coalesced status watchdog failed: key=%s error=%s",
+                key,
+                e,
+            )
+
+    async def _flush_coalesced_status(self, key: str) -> bool:
+        """Emit the accumulated status lines as ONE reply bubble, then drop
+        the buffer + watchdog. Returns False (and still drops state) on
+        empty/incomplete buffers or a send failure — a stale status notice
+        must never wedge the buffer."""
+        state = self._coalesced_status.get(key)
+        if state is None:
+            return True
+        chat_id = str(state.get("chat_id") or "")
+        inbound = state.get("inbound")
+        lines = state.get("lines") or []
+        content = "\n".join(str(line) for line in lines).strip()
+        if not content or not isinstance(inbound, dict):
+            self._drop_coalesced_status_state(key)
+            return False
+        if self._http_client is None or self._bridge_cfg is None:
+            logger.warning(
+                "agent365 dropping coalesced status while disconnected: "
+                "chat_id=%s key=%s",
+                chat_id,
+                key,
+            )
+            self._drop_coalesced_status_state(key)
+            return False
+        result = await self._send_reply_activity(
+            inbound=inbound,
+            content=content,
+            log_context="coalesced status",
+        )
+        self._drop_coalesced_status_state(key)
+        if not result.success:
+            logger.warning(
+                "agent365 coalesced status flush failed: "
+                "chat_id=%s key=%s error=%s",
+                chat_id,
+                key,
+                result.error,
+            )
+        return result.success
+
+    def _drop_coalesced_status_state(self, key: str) -> None:
+        self._coalesced_status.pop(key, None)
+        task = self._coalesced_status_tasks.pop(key, None)
+        current = asyncio.current_task()
+        if task is not None and task is not current:
+            task.cancel()
+
     async def _send_proactive(
         self, chat_id: str, content: str
     ) -> SendResult:
@@ -1494,6 +1645,82 @@ class Agent365Adapter(BasePlatformAdapter):
             raise RuntimeError(
                 f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}"
             )
+
+    async def send_or_update_status(
+        self,
+        chat_id: str,
+        status_key: str,
+        content: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Render a gateway status/lifecycle callback, collapsing Copilot
+        Chat bursts into a single bubble (#53).
+
+        The gateway routes every status callback (retry/fallback traces,
+        context-pressure notices, terminal-failure summaries) through this
+        method when the adapter implements it
+        (``gateway/run.py:_send_or_update_status_coro``); adapters without
+        it fall back to plain ``send``. Telegram (issue #30045) edits one
+        bubble in place per ``status_key``. Copilot Chat arrives as
+        ``groupChat`` and does not visibly render a BF edit (#54
+        branch-walk finding), so the edit-in-place trick is unavailable —
+        a terminal-failure flush would otherwise render as N raw bubbles.
+
+        Behaviour:
+
+        - **Personal (Teams 1:1) / unknown chat type** → pass straight
+          through to ``send`` (identical to the gateway's no-method
+          fallback; Path A status behaviour is preserved — #53 discipline
+          says do not filter personal status).
+        - **Copilot Chat / non-personal** →
+            - while a stream or coalesced reply is already active for the
+              chat, suppress the status — interleaving a status bubble into
+              an active turn is the same CEA-ordering problem ``send``
+              already guards against (Copilot Chat would render it as an
+              extra bubble);
+            - otherwise coalesce: append the line under
+              ``(chat_id, status_key)`` and flush one consolidated bubble
+              once the burst settles (``_watch_coalesced_status``).
+        """
+        inbound = self._cached_inbound_for(chat_id)
+        conv = (inbound or {}).get("conversation") or {}
+        chat_type = str(conv.get("conversationType") or "")
+
+        # Personal / unknown → preserve the gateway's plain-send fallback
+        # exactly (this is also the path for chats we have no inbound for).
+        if inbound is None or chat_type == "personal" or not chat_type:
+            return await self.send(chat_id, content, metadata=metadata)
+
+        # Non-personal (Copilot Chat). Never interleave a status bubble into
+        # an active turn — mirror send()'s reply_to=None suppression.
+        if (
+            chat_id in self._active_stream_by_chat
+            or chat_id in self._active_coalesced_reply_by_chat
+        ):
+            active = (
+                self._active_coalesced_reply_by_chat.get(chat_id)
+                or self._active_stream_by_chat.get(chat_id)
+                or ""
+            )
+            logger.info(
+                "agent365 status suppressed while turn active: "
+                "chat_id=%s status_key=%s active=%s",
+                chat_id,
+                status_key,
+                active,
+            )
+            return SendResult(success=True, message_id=str(active))
+
+        if not (content or "").strip():
+            return SendResult(success=True, message_id="")
+
+        return self._buffer_coalesced_status(
+            chat_id=chat_id,
+            status_key=status_key,
+            content=content,
+            inbound=inbound,
+        )
 
     async def send_typing(
         self, chat_id: str, metadata: dict[str, Any] | None = None
