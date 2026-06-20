@@ -143,6 +143,28 @@ _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 # consolidated notice is invisible.
 _STATUS_COALESCE_FLUSH_AFTER_SEC = 2.0
 
+# Status keys that carry a single substantive, user-must-see notice rather
+# than a burst of transient retry/fallback traces. The agent emits these via
+# ``status_callback("warn", ...)`` for degraded side paths (auxiliary
+# compression / memory-flush failures: "the user needs to know something
+# important failed", run_agent.py:_emit_warning). They are never a retry
+# storm, so collapsing-into-one-bubble buys nothing — and the coalesce path's
+# debounce/active-turn suppression can silently drop a leading notice that
+# arrives just before a reply opens. Route them through plain ``send`` so they
+# post immediately (or are CEA-suppressed by send() while a turn is active),
+# never buffered-then-dropped at flush time.
+#
+# NOTE: the compression / context-pressure warning shares the *same*
+# ``"lifecycle"`` key as transient retry/fallback traces
+# (conversation_compression.py + run_agent.py:_emit_status both call
+# ``status_callback("lifecycle", ...)``), so it is intentionally NOT covered
+# here — there is no key-level way to tell a substantive lifecycle notice from
+# retry noise, and bypassing coalesce for all "lifecycle" would defeat #53's
+# terminal-failure burst collapse. A leading "lifecycle" notice emitted just
+# before a reply opens within the debounce window is therefore knowingly
+# lossy on Copilot Chat; that is an accepted tradeoff of sharing the key.
+_STATUS_PASS_THROUGH_KEYS = frozenset({"warn"})
+
 
 # Slice 19q (round-5 walkthrough finding, 2026-05-06): the BF connector
 # delivers a handful of activities that aren't user messages and
@@ -1344,7 +1366,20 @@ class Agent365Adapter(BasePlatformAdapter):
         """Emit the accumulated status lines as ONE reply bubble, then drop
         the buffer + watchdog. Returns False (and still drops state) on
         empty/incomplete buffers or a send failure — a stale status notice
-        must never wedge the buffer."""
+        must never wedge the buffer.
+
+        Two windows are guarded explicitly:
+
+        - A turn may have *opened* while the burst was settling (a status
+          buffered before any reply/stream existed). Re-check active-turn
+          state and suppress the bubble rather than interleaving it into
+          the active turn — the entry guard only covers calls that arrive
+          *after* the turn opened, so the flush must mirror it.
+        - A new same-key line may be *appended* during the ``await`` below
+          (the watchdog task is suspended here, so ``_ensure_…`` would not
+          re-arm). Status lines accumulate, so a dropped line is lost for
+          good; re-arm a fresh watchdog for the trailing remainder instead.
+        """
         state = self._coalesced_status.get(key)
         if state is None:
             return True
@@ -1364,12 +1399,27 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             self._drop_coalesced_status_state(key)
             return False
+        # A reply/stream that opened while this burst settled must suppress
+        # the status — never interleave a status bubble into an active turn
+        # (mirrors the entry guard in send_or_update_status).
+        if (
+            chat_id in self._active_stream_by_chat
+            or chat_id in self._active_coalesced_reply_by_chat
+        ):
+            logger.info(
+                "agent365 coalesced status suppressed (turn opened during "
+                "debounce): chat_id=%s key=%s",
+                chat_id,
+                key,
+            )
+            self._drop_coalesced_status_state(key)
+            return False
+        sent_count = len(lines)
         result = await self._send_reply_activity(
             inbound=inbound,
             content=content,
             log_context="coalesced status",
         )
-        self._drop_coalesced_status_state(key)
         if not result.success:
             logger.warning(
                 "agent365 coalesced status flush failed: "
@@ -1378,7 +1428,29 @@ class Agent365Adapter(BasePlatformAdapter):
                 key,
                 result.error,
             )
+        # If new lines were appended during the send (append-during-flush
+        # race), the watchdog task we are running in is suspended, so
+        # _ensure_coalesced_status_task could not re-arm. Trim the already
+        # sent lines and re-arm a fresh watchdog for the remainder so the
+        # trailing line is not silently lost.
+        live = self._coalesced_status.get(key)
+        if live is state and len(state.get("lines") or []) > sent_count:
+            del state["lines"][:sent_count]
+            state["last_update_ts"] = asyncio.get_event_loop().time()
+            self._rearm_coalesced_status_task(key)
+            return result.success
+        self._drop_coalesced_status_state(key)
         return result.success
+
+    def _rearm_coalesced_status_task(self, key: str) -> None:
+        """Force a fresh watchdog for ``key``. Unlike
+        ``_ensure_coalesced_status_task`` this does not early-return when the
+        current task is still running — it is called from inside the flush
+        (the watchdog task is about to return), so the stale entry must be
+        replaced rather than reused."""
+        self._coalesced_status_tasks[key] = asyncio.create_task(
+            self._watch_coalesced_status(key)
+        )
 
     def _drop_coalesced_status_state(self, key: str) -> None:
         self._coalesced_status.pop(key, None)
@@ -1689,7 +1761,32 @@ class Agent365Adapter(BasePlatformAdapter):
 
         # Personal / unknown → preserve the gateway's plain-send fallback
         # exactly (this is also the path for chats we have no inbound for).
-        if inbound is None or chat_type == "personal" or not chat_type:
+        #
+        # Also fall back to plain send() when no inbound was captured *this
+        # lifetime* (slice 19x-e / #27): the coalesce flush always uses
+        # replyToActivity against the cached inbound's activity_id, but
+        # ``_cached_inbound_for`` reads the persistent registry which survives
+        # gateway restarts, so the cached activity_id can be stale. send()'s
+        # own gate (``chat_id not in _seen_inbounds_this_lifetime`` → robust
+        # ``_send_proactive`` via sendToConversation) is the replyToActivity
+        # precondition; a resumed-turn status (built from persisted origin,
+        # never through the webhook that populates the lifetime set) would
+        # otherwise coalesce into a stale-activity-id reply BF can reject.
+        if (
+            inbound is None
+            or chat_type == "personal"
+            or not chat_type
+            or chat_id not in self._seen_inbounds_this_lifetime
+        ):
+            return await self.send(chat_id, content, metadata=metadata)
+
+        # Substantive single notices (``"warn"``) must never be buffered and
+        # then silently dropped at flush time when a reply opens during the
+        # debounce window. Route them through plain ``send`` so they post
+        # immediately when no turn is active, or are CEA-suppressed by send()
+        # when one is — same correctness as a transient trace, no silent loss
+        # (#53 leading-notice finding). See ``_STATUS_PASS_THROUGH_KEYS``.
+        if status_key in _STATUS_PASS_THROUGH_KEYS:
             return await self.send(chat_id, content, metadata=metadata)
 
         # Non-personal (Copilot Chat). Never interleave a status bubble into
