@@ -714,6 +714,20 @@ class TestValidateConfig:
 
 
 class TestAdapterConstruction:
+    def test_connect_accepts_is_reconnect_kwarg(self) -> None:
+        # Contract guard: BasePlatformAdapter.connect is
+        # ``connect(self, *, is_reconnect: bool = False)`` and the gateway
+        # always calls ``adapter.connect(is_reconnect=...)`` (gateway/run.py).
+        # An override that drops the kwarg breaks every connect against the
+        # current gateway core ("unexpected keyword argument 'is_reconnect'").
+        import inspect
+
+        params = inspect.signature(adapter_mod.Agent365Adapter.connect).parameters
+        assert "is_reconnect" in params, "connect() must accept is_reconnect"
+        p = params["is_reconnect"]
+        assert p.kind == inspect.Parameter.KEYWORD_ONLY
+        assert p.default is False
+
     def test_init_pulls_slug_and_port_from_extra(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

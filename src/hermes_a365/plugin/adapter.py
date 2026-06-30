@@ -771,8 +771,19 @@ class Agent365Adapter(BasePlatformAdapter):
 
     # ── Connection lifecycle ──────────────────────────────────────────────
 
-    async def connect(self) -> bool:
-        """Build the bridge runtime + start uvicorn on `self.port`."""
+    async def connect(self, *, is_reconnect: bool = False) -> bool:
+        """Build the bridge runtime + start uvicorn on `self.port`.
+
+        ``is_reconnect`` is part of the ``BasePlatformAdapter.connect``
+        contract — the gateway's reconnection watcher forwards it
+        (``gateway/run.py`` calls ``adapter.connect(is_reconnect=...)``).
+        The a365 adapter rebuilds its runtime the same way on a fresh
+        connect or a reconnect (``close()`` tears down the prior uvicorn
+        task + http client, so a reconnect starts clean), so the flag is
+        accepted for contract compatibility. Without this parameter the
+        gateway raises ``unexpected keyword argument 'is_reconnect'`` and
+        the platform never connects.
+        """
         bridge = _import_bridge()
         try:
             import httpx
