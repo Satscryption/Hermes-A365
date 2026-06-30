@@ -4,6 +4,20 @@ Snapshot date: 2026-05-05 (verified against installed CLI v1.1.171);
 issue #35 addendum on 2026-05-15 re-checks the #408
 secret-persistence regression against CLI 1.1.181.
 
+> **Currency note (2026-06-30):** NuGet latest is now **1.1.214**
+> (releases 1.1.184 / 188 / 193 / 199 / 206 / 214 have shipped since the
+> last verification); the latest **live-verified** build remains
+> **1.1.181**. Do **not** `dotnet tool update` to a newer build and rely
+> on it until the `publish` flow is re-verified against it — the
+> 1.1.171→1.1.181 jump silently changed `publish` from *emit-a-zip* to
+> *extract-a-template-and-stop* (caught at the v0.7.5 walk; see the
+> `publish.py` ≥1.1.181 handling), so a further jump may move it again.
+> Re-verification is checklisted on the #89 (0.8-arc) walk for the publish
+> path and the #90 fresh-tenant walk for the full setup/register/cleanup
+> surface; bump the version markers here + `doctor.py` once a newer build
+> is live-verified. The running gateway/adapter never invokes the CLI, so
+> this drift is operator-tooling-only — not runtime-affecting.
+
 The CLI is **`Microsoft.Agents.A365.DevTools.Cli`** (binary name `a365`),
 distributed as a .NET tool from NuGet:
 
