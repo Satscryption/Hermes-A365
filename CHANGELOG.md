@@ -4,7 +4,7 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [0.7.5] — 2026-06-30
 
 Milestone v0.7.5. Headline is #79 (BF lifecycle capture/evict); the live
 walk that validated it also caught two real regressions in the *shipped*
