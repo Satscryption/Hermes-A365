@@ -42,6 +42,21 @@ _PACKAGE_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Microsoft a365 CLI >= 1.1.181 changed the publish flow: instead of
+# emitting a packaged ``*.zip``, it extracts a manifest *template* to a
+# directory and stops for customisation ("Extracted manifest templates to
+# <dir>" / "Manifest updated: <dir>/manifest.json"). When no zip is found
+# we package that directory ourselves so the CEA transform pipeline can
+# run (older CLIs emitted the zip directly — both paths are supported).
+_MANIFEST_DIR_RE = re.compile(
+    r"Extracted manifest templates to\s+(?P<path>[^\r\n]+?)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+_MANIFEST_JSON_RE = re.compile(
+    r"Manifest updated:\s+(?P<path>[^\r\n]+?manifest\.json)\s*$",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 # Slice 18t (bug #14): blueprint-only flow registers an instance via
 # Graph and prints "Agent instance registered: <guid>" — extract the
 # id so the post-apply message is concrete.
@@ -202,6 +217,46 @@ def _extract_package_path(output: str) -> str | None:
     if not match:
         return None
     return match.group("path").strip("\"'")
+
+
+def _extract_manifest_dir(output: str) -> str | None:
+    """Best-effort grep for the extracted manifest *directory* (Microsoft
+    a365 CLI >= 1.1.181 extracts a template + stops instead of emitting a
+    zip). Prefers the explicit "Extracted manifest templates to <dir>" line;
+    falls back to the parent of the "Manifest updated: <dir>/manifest.json"
+    line."""
+    from pathlib import Path
+
+    match = _MANIFEST_DIR_RE.search(output)
+    if match:
+        return match.group("path").strip().strip("\"'")
+    match = _MANIFEST_JSON_RE.search(output)
+    if match:
+        return str(Path(match.group("path").strip().strip("\"'")).parent)
+    return None
+
+
+def _zip_manifest_dir(manifest_dir: str) -> str | None:
+    """Package an extracted manifest directory into a sibling ``.zip`` so the
+    CEA transform pipeline (which operates on a zip) can run against the
+    newer CLI's extract-and-stop output. Returns the zip path, or ``None``
+    when the directory is missing or carries no ``manifest.json``. Files are
+    written flat (the CLI extracts manifest.json + icons at the dir root)."""
+    import zipfile
+    from pathlib import Path
+
+    d = Path(manifest_dir)
+    if not d.is_dir() or not (d / "manifest.json").is_file():
+        return None
+    zip_path = d.with_name(d.name + ".zip")
+    try:
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+            for f in sorted(d.iterdir()):
+                if f.is_file():
+                    zf.write(f, arcname=f.name)
+    except OSError:
+        return None
+    return str(zip_path)
 
 
 # Slice 19r-c (round-8 walkthrough finding, 2026-05-11): the GA CLI
@@ -563,6 +618,19 @@ def apply_publish_plan(
 
     if plan.inputs.aiteammate or plan.inputs.copilot_chat:
         emitted_zip = _extract_package_path(run.combined)
+        if not emitted_zip:
+            # Microsoft a365 CLI >= 1.1.181 extracts a manifest template and
+            # stops ("Customize before packaging") instead of emitting a zip.
+            # Package the extracted directory ourselves so the CEA transform
+            # pipeline below runs unchanged (older CLIs emitted the zip).
+            manifest_dir = _extract_manifest_dir(run.combined)
+            if manifest_dir:
+                emitted_zip = _zip_manifest_dir(manifest_dir)
+                if emitted_zip:
+                    messages.append(
+                        "[apply] packaged extracted manifest template → "
+                        f"{emitted_zip} (CLI no longer emits a zip directly)"
+                    )
         if emitted_zip:
             if plan.inputs.manifest_id == "auto" or (
                 plan.inputs.manifest_id is None

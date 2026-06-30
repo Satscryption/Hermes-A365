@@ -948,6 +948,105 @@ class TestApplyPublishPlanCopilotChat:
         assert any("Microsoft Admin Portal" in msg for msg in result.messages)
         assert not any("AI Teammate package" in msg for msg in result.messages)
 
+    def _scripted_template_extract(self, manifest_dir):
+        # Mimics Microsoft a365 CLI >= 1.1.181: extracts a manifest template
+        # to a directory and stops — NO zip path appears in the output.
+        return FakeMutator(
+            scripted=[
+                RunResult(
+                    argv=[],
+                    returncode=0,
+                    stdout=(
+                        "Extracting manifest templates...\n"
+                        f"Extracted manifest templates to {manifest_dir}\n"
+                        f"Manifest updated: {manifest_dir}/manifest.json\n"
+                        "Customize before packaging:\n"
+                        "  name.short - EXCEEDS 30 chars (32)\n"
+                    ),
+                    stderr="",
+                )
+            ]
+        )
+
+    def _seed_manifest_dir(self, tmp_path, manifest: dict, extra_files=None):
+        import json
+
+        d = tmp_path / "manifest"
+        d.mkdir()
+        (d / "manifest.json").write_text(json.dumps(manifest, indent=2))
+        for name, blob in (extra_files or {}).items():
+            (d / name).write_bytes(blob)
+        return d
+
+    def test_packages_extracted_template_when_cli_emits_no_zip(self, tmp_path):
+        # Microsoft a365 CLI >= 1.1.181 extracts a template + stops instead of
+        # emitting a zip. The wrapper must package the directory itself and
+        # still produce a valid Custom Engine Agent zip (caught live by the
+        # v0.7.5 walk — the old flow silently produced nothing).
+        import json
+        import zipfile
+
+        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+
+        d = self._seed_manifest_dir(
+            tmp_path,
+            {
+                "manifestVersion": "devPreview",
+                "id": "2e5e2dea-blueprint",
+                "name": {"short": "Hermes Inbox Helper R8 Blueprint", "full": "X"},
+                "bots": [],
+            },
+            extra_files={
+                "color.png": b"png",
+                "outline.png": b"png",
+                "agenticUserTemplateManifest.json": b"ai-teammate",
+            },
+        )
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="Hermes Inbox Helper R8",
+                copilot_chat=True,
+                bot_id="1c2b61bc-fa6a-4c7b-9656-a82b662dacfe",
+                manifest_id="auto",
+            )
+        )
+        result = apply_publish_plan(
+            plan, mutator=self._scripted_template_extract(str(d))
+        )
+
+        assert result.copilot_chat_package_path is not None
+        assert result.copilot_chat_package_path.endswith("manifest.zip")
+        assert result.copilot_chat_bot_id == "1c2b61bc-fa6a-4c7b-9656-a82b662dacfe"
+        assert any(
+            "packaged extracted manifest template" in m for m in result.messages
+        )
+        with zipfile.ZipFile(result.copilot_chat_package_path) as zf:
+            names = set(zf.namelist())
+            assert "manifest.json" in names
+            assert "agenticUserTemplateManifest.json" not in names  # dropped
+            assert {"color.png", "outline.png"} <= names  # icons kept
+            m = json.loads(zf.read("manifest.json"))
+            assert m["manifestVersion"] == "1.21"
+            assert m["bots"][0]["botId"] == "1c2b61bc-fa6a-4c7b-9656-a82b662dacfe"
+            assert m["copilotAgents"]["customEngineAgents"] == [
+                {"type": "bot", "id": "1c2b61bc-fa6a-4c7b-9656-a82b662dacfe"}
+            ]
+            assert m["id"] != "2e5e2dea-blueprint"  # fresh manifest-id (auto)
+            # name.short truncated 32 -> <= 30 at a word boundary.
+            assert m["name"]["short"] == "Hermes Inbox Helper R8"
+
+    def test_extract_manifest_dir_parses_both_phrasings(self):
+        from hermes_a365.publish import _extract_manifest_dir
+
+        assert _extract_manifest_dir(
+            "Extracted manifest templates to /tmp/walk/manifest\n"
+        ) == "/tmp/walk/manifest"
+        # Falls back to the parent of the manifest.json line.
+        assert _extract_manifest_dir(
+            "Manifest updated: /tmp/walk/manifest/manifest.json\n"
+        ) == "/tmp/walk/manifest"
+        assert _extract_manifest_dir("no manifest here") is None
+
     def test_both_surfaces_keeps_aiteammate_zip_and_emits_sibling(self, tmp_path):
         import json
         import uuid
