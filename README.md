@@ -371,10 +371,6 @@ hermes a365 instance create inbox-helper \
 #                         agents picker); upload at Teams Admin Center.
 #    --aiteammate --copilot-chat: both zips side-by-side (Copilot Chat zip
 #                         lands at <original>.copilot-chat.zip).
-#    --prompt-starter "title=...,prompt=...": repeatable; sets the Copilot
-#                         Chat zero-state prompt starters (requires
-#                         --copilot-chat). Defaults to a set derived from
-#                         the agent name.
 hermes a365 publish --agent-name "Inbox Helper" --aiteammate --apply
 
 # 7. Operator: in M365 Admin Centre → Agents → All agents → Upload
@@ -490,7 +486,7 @@ hermes a365 register --agent-name "<display>" [--m365] \
 hermes a365 consent "<agent-name>" [--no-open] [--timeout 60]
 hermes a365 instance create <slug> --owner <email> --owner-aad-id <oid> [--apply]
 hermes a365 publish --agent-name "<display>" [--aiteammate] [--copilot-chat] \
-    [--bot-id <guid>] [--prompt-starter "title=...,prompt=..."] [--apply]
+    [--bot-id <guid>] [--apply]
 hermes a365 cleanup --agent-name "<display>" [--slug <slug>] [--kinds=...] \
     [--purge-orphans] [--orphan-instance-id <guid>] --apply --confirm "<display>"
 

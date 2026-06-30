@@ -15,13 +15,18 @@ live surface is authoritative; update + re-date this file when it drifts.
 
 - v0.7.5 **live-validated** the `1.21` Custom Engine Agent publish + Copilot
   Chat surface path on 2026-06-30. `1.21` is current-as-of-release.
-- A "bump 1.21 → 1.27" is a **category error**: the issue conflates two
-  *separate* manifest tracks (see below). Neither newer feature maps to a
-  capability `hermes-a365` authors today.
-- The minimal, correct deliverable is this doc. No default bump, no opt-in
-  `--manifest-version` flag (an un-validatable knob on a validated path —
-  when a bump is justified it is a one-line constant edit, no easier to
-  pre-stage now than at walk time).
+- The issue's `1.25 agenticUserTemplates` / `1.27 agentConnectors` framing
+  conflates two *separate* manifest tracks (see below) — neither maps to a
+  capability we author today. **But** a *different* 1.27 feature — bot
+  command-list **prompt starters** (`type:"prompt"` + `prompt`) — IS a
+  capability we want: it is **#74**, and it is the concrete motivator for a
+  future `1.27` bump. (`type`/`prompt` were introduced in manifest **1.27**;
+  the `1.21` command schema is `additionalProperties:false`, `title` +
+  `description` only.)
+- The minimal, correct **v0.7.6** deliverable is this doc: **no bump, no
+  opt-in flag**. The `1.27` bump + #74's prompt starters land together,
+  **walk-validated at the #89 v0.8.1 walk** — a schema-version bump must not
+  ship blind on a unit-tests-only release.
 
 ## Two manifest tracks — they are not the same version line
 
@@ -66,43 +71,51 @@ Yes, as of this snapshot. Microsoft documents Custom Engine Agents as
 supported in "app manifest version 1.21 and later" (recorded in
 [`m365-surface-coverage.md`](m365-surface-coverage.md)), and the v0.7.5
 walk published a `1.21` CEA zip that validated and surfaced in Copilot Chat
-and Teams. The CEA capabilities the wrapper emits (`bots`, streaming via
-`streaminfo`, `copilotAgents.customEngineAgents`, command lists / prompt
-starters) are all expressible at `1.21`.
+and Teams. The CEA capabilities the wrapper emits today (`bots`, streaming
+via `streaminfo`, `copilotAgents.customEngineAgents`, and command lists
+restricted to `{title, description}`) are all expressible at `1.21`.
+
+Note what is **not** expressible at `1.21`: bot command-list **prompt
+starters** (`type:"prompt"` + `prompt`). Verified against Microsoft's
+published v1.21 schema, the `commandLists.commands` item is
+`{additionalProperties: false, properties: {title, description}, required:
+[title, description]}` — extra fields are rejected. `type`/`prompt` were
+introduced in manifest **1.27**. (Surfaced by the v0.7.6 red-team, which
+caught an initial #74 attempt that emitted those fields under a `1.21`
+package; #74 was deferred to land with the bump.)
 
 ## Do we need 1.25 / 1.27?
 
-No named `hermes-a365` capability currently requires a `1.25`- or
-`1.27`-only field:
+Yes — for one concrete capability: **prompt starters (#74)** require
+manifest **1.27** (`type:"prompt"` is a 1.27 field, per the schema above).
+That is the named, committed capability that justifies the bump.
 
-- The prompt-starters work (#74) is `type:"prompt"` on bot command lists,
-  which is expressible in the current schema we already emit.
+The other two framings do *not* drive a Path B bump:
+
 - We do not surface MCP through the publish manifest (`agentConnectors`),
-  and Path A's `agenticUserTemplates` is CLI-authored.
+  and Path A's `agenticUserTemplates` is CLI-authored (`devPreview`).
 
-The honest position is **"no bump needed; revisit when a concrete feature
-requires it"** rather than pre-building bump machinery.
+So the honest position is **"bump to 1.27 to ship #74 — but only once it is
+walk-validated"**, not "no bump ever" and not a blind bump now.
 
 ## Open validation item (deferred to the #89 v0.8.1 walk)
 
-The core compatibility question can only be answered operator-side, at the
-Microsoft Admin Center, with a real upload:
-
-> When handed a `manifestVersion` of `1.25` / `1.27`, does the Admin Center
-> **accept-and-ignore** unknown blocks, or **hard-reject** the package?
-
-This is recorded as an open item for the #89 walk and must **not** be
-asserted here — it is unverified until walked.
+The concrete v0.8.1 item: publish a **`1.27`** CEA manifest carrying #74's
+`type:"prompt"` prompt starters and confirm at the Admin Center that it
+(a) uploads and (b) renders the starters in the Copilot Chat zero-state.
+Open until walked — do **not** assert the outcome here.
 
 ## Bump criteria + owner
 
 Move `_COPILOT_CHAT_MANIFEST_VERSION` off `1.21` only when **both** hold:
 
 1. A concrete, committed Copilot Chat / Teams capability we need cannot be
-   expressed at `1.21` (name it in the motivating issue), **and**
+   expressed at `1.21`. **This is now satisfied: prompt starters (#74)
+   require `1.27`.**
 2. The higher-version manifest has been **live-validated** at the Admin
-   Center on a walk (the #89 gate or a successor).
+   Center on a walk (the #89 gate). *Not yet satisfied* — this is the
+   remaining gate.
 
-The bump itself is a one-line constant change plus a test update; it should
-ride the walk that validates it, not a blind release. Owner: whoever runs
-the motivating walk.
+The bump itself is a one-line constant change plus #74's command-list
+emission and a test update; it should ride the #89 walk that validates it,
+not a blind release. Owner: whoever runs the #89 walk.

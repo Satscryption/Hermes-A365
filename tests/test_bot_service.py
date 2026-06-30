@@ -709,7 +709,9 @@ def test_endpoint_refuses_plain_http_remote_host(tmp_path: Path) -> None:
         )
 
 
-@pytest.mark.parametrize("host", ["localhost", "127.0.0.1"])
+# ``[::1]`` is the IPv6 loopback in URL form — urlparse strips the brackets
+# so the hostname compares equal to "::1"; exercise that branch explicitly.
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1", "[::1]"])
 def test_endpoint_refuses_loopback_without_allow_local(tmp_path: Path, host: str) -> None:
     with pytest.raises(BotServiceError, match="--allow-local"):
         _inputs(tmp_path, endpoint=f"https://{host}:3978")
@@ -719,16 +721,26 @@ def test_endpoint_refuses_loopback_without_allow_local(tmp_path: Path, host: str
         )
 
 
-def test_endpoint_allow_local_permits_http_loopback(tmp_path: Path) -> None:
-    create = _inputs(tmp_path, endpoint="http://localhost:3978", allow_local=True)
-    assert create.endpoint == "http://localhost:3978/api/messages"
+@pytest.mark.parametrize(
+    ("host", "expected"),
+    [
+        ("localhost:3978", "http://localhost:3978/api/messages"),
+        ("127.0.0.1:3978", "http://127.0.0.1:3978/api/messages"),
+        ("[::1]:3978", "http://[::1]:3978/api/messages"),
+    ],
+)
+def test_endpoint_allow_local_permits_http_loopback(
+    tmp_path: Path, host: str, expected: str
+) -> None:
+    create = _inputs(tmp_path, endpoint=f"http://{host}", allow_local=True)
+    assert create.endpoint == expected
     update = BotServiceUpdateEndpointInputs(
         agent_name="x",
-        url="http://127.0.0.1:3978",
+        url=f"http://{host}",
         sidecar_path=tmp_path / "s.json",
         allow_local=True,
     )
-    assert update.url == "http://127.0.0.1:3978/api/messages"
+    assert update.url == expected
 
 
 def test_allow_local_does_not_relax_https_for_remote_host(tmp_path: Path) -> None:

@@ -544,16 +544,6 @@ class TestPublishInputsCopilotChat:
         )
         assert inp.manifest_id == "11111111-1111-1111-1111-111111111111"
 
-    def test_prompt_starters_require_copilot_chat(self) -> None:
-        with pytest.raises(ValueError, match="--prompt-starter"):
-            PublishInputs(agent_name="x", prompt_starters=(("t", "p"),))
-
-    def test_prompt_starters_allowed_with_copilot_chat(self) -> None:
-        inp = PublishInputs(
-            agent_name="x", copilot_chat=True, prompt_starters=(("t", "p"),)
-        )
-        assert inp.prompt_starters == (("t", "p"),)
-
 
 class TestBuildPublishPlanCopilotChat:
     def test_copilot_chat_alone_invokes_cli_with_aiteammate(self) -> None:
@@ -643,14 +633,11 @@ class TestTransformManifestToCopilotChat:
                 "isNotificationOnly": False,
                 "commandLists": [
                     {
-                        # #74: command-list scopes track the bot scopes.
-                        "scopes": ["personal"],
+                        "scopes": ["copilot", "personal"],
                         "commands": [
                             {
                                 "title": "How can you help me?",
                                 "description": "How can you help me?",
-                                "type": "prompt",
-                                "prompt": "How can you help me?",
                             }
                         ],
                     }
@@ -726,149 +713,6 @@ class TestTransformManifestToCopilotChat:
         _transform_manifest_to_copilot_chat(src, bot_id="bid")
         # Input untouched
         assert src == {"manifestVersion": "devPreview", "agenticUserTemplates": [1]}
-
-    # ── #74: prompt starters ──────────────────────────────────────────
-
-    @staticmethod
-    def _commands(out: dict) -> list[dict]:
-        return out["bots"][0]["commandLists"][0]["commands"]
-
-    def test_default_starters_are_prompt_type(self) -> None:
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        out = _transform_manifest_to_copilot_chat({}, bot_id="bid")
-        commands = self._commands(out)
-        assert commands  # never empty
-        for cmd in commands:
-            assert cmd["type"] == "prompt"
-            assert cmd["prompt"]  # non-empty
-
-    def test_default_starters_derive_from_name(self) -> None:
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        out = _transform_manifest_to_copilot_chat(
-            {"name": {"short": "Hermes Inbox Helper"}}, bot_id="bid"
-        )
-        prompts = " ".join(c["prompt"] for c in self._commands(out))
-        assert "Hermes Inbox Helper" in prompts
-
-    def test_operator_starters_emitted_verbatim(self) -> None:
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        out = _transform_manifest_to_copilot_chat(
-            {},
-            bot_id="bid",
-            prompt_starters=(("Draft a reply", "Draft a reply to the latest email"),),
-        )
-        assert self._commands(out) == [
-            {
-                "title": "Draft a reply",
-                "description": "Draft a reply",
-                "type": "prompt",
-                "prompt": "Draft a reply to the latest email",
-            }
-        ]
-
-    def test_command_list_scopes_track_bot_scopes(self) -> None:
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        out = _transform_manifest_to_copilot_chat(
-            {}, bot_id="bid", scopes=("copilot", "personal", "team")
-        )
-        # The consistency fix: team is no longer dropped from the list.
-        assert out["bots"][0]["commandLists"][0]["scopes"] == [
-            "copilot",
-            "personal",
-            "team",
-        ]
-
-    def test_caps_to_ten_commands(self) -> None:
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        starters = tuple((f"t{i}", f"prompt {i}") for i in range(15))
-        out = _transform_manifest_to_copilot_chat(
-            {}, bot_id="bid", prompt_starters=starters
-        )
-        assert len(self._commands(out)) == 10
-
-    def test_prompt_truncated_to_4000_chars(self) -> None:
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        out = _transform_manifest_to_copilot_chat(
-            {}, bot_id="bid", prompt_starters=(("t", "x" * 5000),)
-        )
-        assert len(self._commands(out)[0]["prompt"]) == 4000
-
-    def test_empty_prompt_dropped_then_falls_back(self) -> None:
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        # A starter with a blank prompt is dropped; never emit empty commands.
-        out = _transform_manifest_to_copilot_chat(
-            {}, bot_id="bid", prompt_starters=(("t", "   "),)
-        )
-        commands = self._commands(out)
-        assert len(commands) == 1
-        assert commands[0]["prompt"] == "How can you help me?"
-
-    def test_prompt_with_quote_round_trips_through_zip(self) -> None:
-        import json
-
-        from hermes_a365.publish import _transform_manifest_to_copilot_chat
-
-        out = _transform_manifest_to_copilot_chat(
-            {}, bot_id="bid", prompt_starters=(('Say "hi"', 'Reply with "hello"'),)
-        )
-        # json round-trip is lossless for embedded quotes.
-        assert json.loads(json.dumps(out)) == out
-        assert self._commands(out)[0]["prompt"] == 'Reply with "hello"'
-
-
-class TestParsePromptStarters:
-    def test_well_formed_pair(self) -> None:
-        from hermes_a365.publish import _parse_prompt_starters
-
-        assert _parse_prompt_starters(["title=Foo,prompt=Bar"]) == (("Foo", "Bar"),)
-
-    def test_title_may_contain_commas(self) -> None:
-        from hermes_a365.publish import _parse_prompt_starters
-
-        assert _parse_prompt_starters(["title=Hi, there,prompt=Say hi"]) == (
-            ("Hi, there", "Say hi"),
-        )
-
-    def test_empty_list_yields_empty_tuple(self) -> None:
-        from hermes_a365.publish import _parse_prompt_starters
-
-        assert _parse_prompt_starters([]) == ()
-        assert _parse_prompt_starters(None) == ()
-
-    def test_missing_prompt_raises(self) -> None:
-        from hermes_a365.publish import _parse_prompt_starters
-
-        with pytest.raises(ValueError, match="prompt-starter must be"):
-            _parse_prompt_starters(["title=Foo"])
-
-    def test_missing_title_prefix_raises(self) -> None:
-        from hermes_a365.publish import _parse_prompt_starters
-
-        with pytest.raises(ValueError, match="start with 'title='"):
-            _parse_prompt_starters(["Foo,prompt=Bar"])
-
-    def test_empty_prompt_raises(self) -> None:
-        from hermes_a365.publish import _parse_prompt_starters
-
-        with pytest.raises(ValueError, match="empty prompt"):
-            _parse_prompt_starters(["title=Foo,prompt="])
-
-    def test_cli_flag_appends_and_defaults_empty(self) -> None:
-        from hermes_a365.publish import build_parser
-
-        ns = build_parser().parse_args(["--agent-name", "x"])
-        assert ns.prompt_starter == []
-        ns2 = build_parser().parse_args(
-            ["--agent-name", "x", "--prompt-starter", "title=A,prompt=B"]
-        )
-        assert ns2.prompt_starter == ["title=A,prompt=B"]
 
 
 class TestExtractBotIdFromManifest:

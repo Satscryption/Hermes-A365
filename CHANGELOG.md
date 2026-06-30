@@ -8,8 +8,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 Milestone v0.7.6 — collapsed pre-0.8 polish + manifest currency (absorbed
 the former v0.7.7/v0.7.8). All items ship on unit tests; live Copilot
-Chat / Teams validation of the surface-facing bits (#74 prompt starters,
-#78 Copilot Chat mention behaviour) is pooled into the #89 v0.8.1 walk.
+Chat / Teams validation of #78's mention behaviour is pooled into the #89
+v0.8.1 walk. **#74 (prompt starters) was deferred to v0.8.1** — a red-team
+pass (verified against Microsoft's v1.21 schema) found `type:"prompt"`
+command fields require manifest **1.27**, and per #75 the manifest version
+is not bumped without walk validation, so #74 lands together with that
+bump at the #89 walk.
 
 ### Added
 
@@ -22,15 +26,6 @@ Chat / Teams validation of the surface-facing bits (#74 prompt starters,
   `--allow-local`. Mirrors the Path A `activity-bridge update-endpoint`
   HTTPS guard. The `/api/messages` normalization tail is unchanged.
   *(`--probe-reachability` HEAD check deferred to a follow-up.)*
-- **#74:** the generated Custom Engine Agent manifest now emits Copilot
-  Chat **prompt starters** — `commandLists` commands carry `type:"prompt"`
-  with a non-empty `prompt`, replacing the single generic command.
-  Operator-configurable via a repeatable
-  `--prompt-starter "title=...,prompt=..."` flag (requires `--copilot-chat`);
-  with no flag a sensible default set is derived from the agent name.
-  Command-list `scopes` now track the bot's advertised scopes (the prior
-  hardcoded list dropped `team`). Defensive caps: ≤10 commands, ≤4000-char
-  prompts. UX-only — the `1.21` manifest already validated (v0.7.5 walk).
 - **#73:** outbound message activities now carry the BF/Teams
   **"AI generated" content label** (`https://schema.org/Message` with
   `additionalType: ["AIGeneratedContent"]`) — on text replies, the Copilot
@@ -44,10 +39,13 @@ Chat / Teams validation of the surface-facing bits (#74 prompt starters,
 
 - **#75:** added [`references/manifest-schema-currency.md`](references/manifest-schema-currency.md)
   — investigation of the `1.21` CEA manifest pin vs `1.25 agenticUserTemplates`
-  / `1.27 agentConnectors`. Records that the two are *separate* manifest
-  tracks (Path A `devPreview` vs Path B `1.21`), that no current capability
-  needs a bump, and the criteria for a future walk-validated bump. **The
-  default manifest version stays `1.21`** — no schema change, no opt-in flag.
+  / `1.27 agentConnectors`. Records that Path A (`devPreview`) and Path B
+  (`1.21`) are *separate* manifest tracks, and that the concrete capability
+  motivating a future bump is **prompt starters (#74)**: `type:"prompt"`
+  command fields were introduced in manifest **1.27** (the `1.21` command
+  schema is `additionalProperties:false` — `title`/`description` only), so
+  #74 must land with a `1.27` bump, walk-validated at #89. **The default
+  manifest version stays `1.21`** in v0.7.6 — no schema change, no opt-in flag.
 
 ### Fixed
 

@@ -5271,3 +5271,41 @@ class TestActivityToEvent:
         }
         # recipient_id == "" -> helper returns text unchanged.
         assert self._event(monkeypatch, act).text == "<at>Bot</at> hello"
+
+    def test_interior_whitespace_preserved_on_removal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Only the mention seam is touched — deliberate interior spacing
+        # elsewhere in the body survives (the collapse is not global).
+        act = self._channel_activity(
+            text="<at>Bot</at> keep   these   spaces",
+            entities=[self._mention("<at>Bot</at>")],
+        )
+        assert self._event(monkeypatch, act).text == "keep   these   spaces"
+
+    def test_mention_at_start_of_later_line_no_stray_space(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A mention beginning a continuation line must not leave a stray
+        # leading space on that line, and newlines are preserved.
+        act = self._channel_activity(
+            text="line one\n<at>Bot</at> line two",
+            entities=[self._mention("<at>Bot</at>")],
+        )
+        assert self._event(monkeypatch, act).text == "line one\nline two"
+
+    def test_not_removed_path_is_byte_for_byte_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No recipient mention removed -> the tidy must not run, so even
+        # messages with intentional double spaces / outer whitespace are
+        # returned verbatim.
+        act = {
+            "id": "a",
+            "text": "  keep   these   spaces  ",
+            "from": {"id": "29:u"},
+            "recipient": {"id": self.BOT_ID},
+            "conversation": {"id": "c", "conversationType": "groupChat"},
+            "entities": [self._mention()],  # no text field -> nothing removed
+        }
+        assert self._event(monkeypatch, act).text == "  keep   these   spaces  "

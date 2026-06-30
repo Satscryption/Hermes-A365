@@ -80,9 +80,6 @@ class PublishInputs:
     manifest_id: str | None = None  # "auto" or explicit Teams App Catalog id
     use_blueprint: bool = False  # blueprint-based non-DW flow (only with aiteammate=False)
     verbose: bool = False
-    # #74: operator-configured Copilot Chat prompt starters as (title, prompt)
-    # pairs. Empty -> a sensible default set is derived from the manifest.
-    prompt_starters: tuple[tuple[str, str], ...] = ()
 
     def __post_init__(self) -> None:
         if not self.agent_name:
@@ -98,8 +95,6 @@ class PublishInputs:
                 uuid.UUID(self.manifest_id)
             except ValueError as e:
                 raise ValueError("--manifest-id must be 'auto' or a GUID") from e
-        if self.prompt_starters and not self.copilot_chat:
-            raise ValueError("--prompt-starter is only meaningful with --copilot-chat")
 
 
 # ---------------------------------------------------------------------------
@@ -411,63 +406,6 @@ _COPILOT_CHAT_MANIFEST_VERSION = "1.21"
 _COPILOT_CHAT_DEFAULT_SCOPES: tuple[str, ...] = ("copilot", "personal", "team")
 _COPILOT_CHAT_ZIP_INFIX = ".copilot-chat"
 
-# #74: Microsoft prompt-starter caps + the scopes a Teams command list may
-# target. We cap defensively (truncate/drop, never error) so the transform
-# stays a pure best-effort function.
-_PROMPT_STARTER_MAX_COUNT = 10
-_PROMPT_STARTER_MAX_PROMPT_CHARS = 4000
-_COMMAND_LIST_ELIGIBLE_SCOPES = ("copilot", "personal", "team")
-_GENERIC_PROMPT_STARTER = ("How can you help me?", "How can you help me?")
-
-
-def _default_prompt_starters(manifest: dict) -> tuple[tuple[str, str], ...]:
-    """A small, sensible default starter set derived from the agent's name
-    when present, falling back to a single generic starter. Never empty."""
-    name = manifest.get("name")
-    short = ""
-    if isinstance(name, dict):
-        short = str(name.get("short") or name.get("full") or "").strip()
-    if short:
-        return (
-            ("How can you help me?", f"What can {short} help me with?"),
-            ("Get started", f"Show me a few examples of what {short} can do."),
-        )
-    return (_GENERIC_PROMPT_STARTER,)
-
-
-def _build_prompt_commands(
-    manifest: dict, prompt_starters: tuple[tuple[str, str], ...]
-) -> list[dict]:
-    """Build the bots[].commandLists[].commands entries as Microsoft
-    prompt-starters (``type:"prompt"`` with a non-empty ``prompt``).
-
-    Caps to <=10 commands and <=4000-char prompts, drops empty-prompt
-    entries, and never returns an empty list (falls back to the generic
-    starter) so the emitted command list is always schema-valid.
-    """
-    starters = prompt_starters or _default_prompt_starters(manifest)
-    commands: list[dict] = []
-    for title, prompt in starters[:_PROMPT_STARTER_MAX_COUNT]:
-        title = str(title).strip()
-        prompt = str(prompt).strip()[:_PROMPT_STARTER_MAX_PROMPT_CHARS]
-        if not prompt:
-            continue
-        label = title or prompt
-        commands.append(
-            {
-                "title": label,
-                "description": label,
-                "type": "prompt",
-                "prompt": prompt,
-            }
-        )
-    if not commands:
-        title, prompt = _GENERIC_PROMPT_STARTER
-        commands.append(
-            {"title": title, "description": title, "type": "prompt", "prompt": prompt}
-        )
-    return commands
-
 # Wall-clock budget for ``a365 publish`` invoked under ``apply_publish_plan``.
 # This is the only interactive call in the wrapper chain — when MSAL cannot
 # silent-token (fresh shell, stale cache), ``a365`` falls back to device-code
@@ -485,7 +423,6 @@ def _transform_manifest_to_copilot_chat(
     manifest_id: str | None = None,
     distinguish_name_short: bool = False,
     scopes: tuple[str, ...] = _COPILOT_CHAT_DEFAULT_SCOPES,
-    prompt_starters: tuple[tuple[str, str], ...] = (),
 ) -> dict:
     """Pure transform: AI Teammate manifest dict → Custom Engine Agent shape."""
     out = dict(manifest)
@@ -510,11 +447,13 @@ def _transform_manifest_to_copilot_chat(
             "isNotificationOnly": False,
             "commandLists": [
                 {
-                    # #74: keep the command-list scopes consistent with the
-                    # bot's advertised scopes (the prior hardcoded
-                    # ["copilot","personal"] dropped "team").
-                    "scopes": [s for s in scopes if s in _COMMAND_LIST_ELIGIBLE_SCOPES],
-                    "commands": _build_prompt_commands(manifest, prompt_starters),
+                    "scopes": ["copilot", "personal"],
+                    "commands": [
+                        {
+                            "title": "How can you help me?",
+                            "description": "How can you help me?",
+                        }
+                    ],
                 }
             ],
         }
@@ -577,7 +516,6 @@ def _patch_manifest_to_copilot_chat(
     manifest_id: str | None = None,
     distinguish_name_short: bool = False,
     scopes: tuple[str, ...] = _COPILOT_CHAT_DEFAULT_SCOPES,
-    prompt_starters: tuple[tuple[str, str], ...] = (),
 ) -> tuple[str, dict] | None:
     """Rewrite ``manifest.json`` inside *zip_path* into a Custom Engine
     Agent shape. Returns ``(bot_id_used, summary)`` on success, ``None``
@@ -621,7 +559,6 @@ def _patch_manifest_to_copilot_chat(
         manifest_id=manifest_id,
         distinguish_name_short=distinguish_name_short,
         scopes=scopes,
-        prompt_starters=prompt_starters,
     )
     blob = json.dumps(new_manifest, indent=2).encode("utf-8")
 
@@ -734,7 +671,6 @@ def apply_publish_plan(
                     distinguish_name_short=(
                         plan.inputs.aiteammate and plan.inputs.copilot_chat
                     ),
-                    prompt_starters=plan.inputs.prompt_starters,
                 )
                 if cc_result is not None:
                     copilot_chat_bot_id, summary = cc_result
@@ -832,37 +768,6 @@ def apply_publish_plan(
 # ---------------------------------------------------------------------------
 
 
-def _parse_prompt_starters(raw: list[str] | None) -> tuple[tuple[str, str], ...]:
-    """Parse repeatable ``--prompt-starter "title=...,prompt=..."`` tokens
-    into (title, prompt) pairs.
-
-    The value is split on the FIRST ``,prompt=`` so a title may itself
-    contain commas; both keys are required and must be non-empty. Raises
-    ``ValueError`` (→ rc 2 in ``run``) on a malformed token.
-    """
-    starters: list[tuple[str, str]] = []
-    for token in raw or []:
-        sep = ",prompt="
-        idx = token.find(sep)
-        if idx == -1:
-            raise ValueError(
-                f"--prompt-starter must be 'title=...,prompt=...' (got {token!r})"
-            )
-        title_part = token[:idx]
-        prompt = token[idx + len(sep):].strip()
-        if not title_part.startswith("title="):
-            raise ValueError(
-                f"--prompt-starter must start with 'title=' (got {token!r})"
-            )
-        title = title_part[len("title="):].strip()
-        if not title:
-            raise ValueError(f"--prompt-starter has an empty title (got {token!r})")
-        if not prompt:
-            raise ValueError(f"--prompt-starter has an empty prompt (got {token!r})")
-        starters.append((title, prompt))
-    return tuple(starters)
-
-
 def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.ArgumentParser:
     if parser is None:
         parser = argparse.ArgumentParser(
@@ -908,17 +813,6 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         action="store_true",
         help="use blueprint-based non-DW flow (only with --aiteammate false)",
     )
-    parser.add_argument(
-        "--prompt-starter",
-        action="append",
-        default=[],
-        metavar='"title=...,prompt=..."',
-        help=(
-            "Copilot Chat prompt starter (repeatable, requires --copilot-chat); "
-            "e.g. --prompt-starter \"title=Draft a reply,prompt=Draft a reply to "
-            "the latest email\". Defaults to a set derived from the agent name."
-        ),
-    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--apply", action="store_true", help="execute the plan; default is dry-run")
     return parser
@@ -935,7 +829,6 @@ def run(args: argparse.Namespace) -> int:
             manifest_id=args.manifest_id,
             use_blueprint=args.use_blueprint,
             verbose=args.verbose,
-            prompt_starters=_parse_prompt_starters(getattr(args, "prompt_starter", None)),
         )
     except ValueError as e:
         print(f"ERROR: {e}", file=sys.stderr)
