@@ -673,3 +673,75 @@ def test_verify_errors_when_teams_terms_not_accepted(tmp_path: Path) -> None:
     teams = next(result for result in report.results if result.name == "msteams_channel")
     assert teams.status == "ERROR"
     assert "acceptedTerms" in teams.detail
+
+
+# ── #71: endpoint URL validation (HTTPS + localhost guard) ─────────────
+
+
+def test_endpoint_https_happy_path_unchanged(tmp_path: Path) -> None:
+    """The v0.7.5-validated HTTPS path normalizes exactly as before."""
+    create = _inputs(tmp_path, endpoint="https://example.test")
+    assert create.endpoint == "https://example.test/api/messages"
+    update = BotServiceUpdateEndpointInputs(
+        agent_name="x",
+        url="https://new-tunnel.example/api/messages",
+        sidecar_path=tmp_path / "s.json",
+    )
+    assert update.url == "https://new-tunnel.example/api/messages"
+
+
+def test_endpoint_empty_still_rejected(tmp_path: Path) -> None:
+    with pytest.raises(BotServiceError, match="non-empty"):
+        _inputs(tmp_path, endpoint="   ")
+
+
+def test_endpoint_non_absolute_still_rejected(tmp_path: Path) -> None:
+    with pytest.raises(BotServiceError, match="absolute http"):
+        _inputs(tmp_path, endpoint="example.test/api/messages")
+
+
+def test_endpoint_refuses_plain_http_remote_host(tmp_path: Path) -> None:
+    with pytest.raises(BotServiceError, match="HTTPS"):
+        _inputs(tmp_path, endpoint="http://example.test")
+    with pytest.raises(BotServiceError, match="HTTPS"):
+        BotServiceUpdateEndpointInputs(
+            agent_name="x", url="http://example.test", sidecar_path=tmp_path / "s.json"
+        )
+
+
+@pytest.mark.parametrize("host", ["localhost", "127.0.0.1"])
+def test_endpoint_refuses_loopback_without_allow_local(tmp_path: Path, host: str) -> None:
+    with pytest.raises(BotServiceError, match="--allow-local"):
+        _inputs(tmp_path, endpoint=f"https://{host}:3978")
+    with pytest.raises(BotServiceError, match="--allow-local"):
+        BotServiceUpdateEndpointInputs(
+            agent_name="x", url=f"https://{host}:3978", sidecar_path=tmp_path / "s.json"
+        )
+
+
+def test_endpoint_allow_local_permits_http_loopback(tmp_path: Path) -> None:
+    create = _inputs(tmp_path, endpoint="http://localhost:3978", allow_local=True)
+    assert create.endpoint == "http://localhost:3978/api/messages"
+    update = BotServiceUpdateEndpointInputs(
+        agent_name="x",
+        url="http://127.0.0.1:3978",
+        sidecar_path=tmp_path / "s.json",
+        allow_local=True,
+    )
+    assert update.url == "http://127.0.0.1:3978/api/messages"
+
+
+def test_allow_local_does_not_relax_https_for_remote_host(tmp_path: Path) -> None:
+    """--allow-local only relaxes loopback — a remote http:// stays refused."""
+    with pytest.raises(BotServiceError, match="HTTPS"):
+        _inputs(tmp_path, endpoint="http://example.test", allow_local=True)
+
+
+@pytest.mark.parametrize("sub", ["create", "update-endpoint"])
+def test_allow_local_cli_flag_wiring(sub: str) -> None:
+    url_flag = "--endpoint" if sub == "create" else "--url"
+    common = [sub, "--agent-name", "x", url_flag, "https://h.example"]
+    if sub == "create":
+        common += ["--resource-group", "rg"]
+    assert build_parser().parse_args(common).allow_local is False
+    assert build_parser().parse_args([*common, "--allow-local"]).allow_local is True

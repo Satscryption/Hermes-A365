@@ -28,7 +28,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 from urllib import error, request
-from urllib.parse import quote
+from urllib.parse import quote, urlparse
 
 from ._common import parse_env, slugify
 
@@ -108,12 +108,34 @@ def _write_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
     os.replace(tmp, path)
 
 
-def _normalize_endpoint(raw: str) -> str:
+_LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
+
+
+def _normalize_endpoint(raw: str, *, allow_local: bool = False) -> str:
     value = raw.strip()
     if not value:
         raise BotServiceError("--endpoint must be non-empty")
-    if not value.startswith(("http://", "https://")):
+    parsed = urlparse(value)
+    if parsed.scheme not in ("http", "https") or not parsed.netloc:
         raise BotServiceError("--endpoint must be an absolute http(s) URL")
+    # ``hostname`` is lowercased and bracket-stripped by urlparse, so an
+    # exact set-membership test is correct (and avoids mis-bucketing
+    # ``localhost.example.com`` as loopback).
+    host = (parsed.hostname or "").lower()
+    is_loopback = host in _LOOPBACK_HOSTS
+    if is_loopback and not allow_local:
+        raise BotServiceError(
+            f"endpoint refuses localhost/loopback host ({value}); "
+            "pass --allow-local for a local dev tunnel"
+        )
+    # HTTPS is required for any real (non-loopback) endpoint — the BF /
+    # Copilot Bot Service fabric requires TLS. ``--allow-local`` relaxes
+    # this ONLY for loopback hosts (the http://localhost dev-tunnel case);
+    # a remote http:// URL is always refused.
+    if parsed.scheme != "https" and not is_loopback:
+        raise BotServiceError(
+            f"endpoint must be HTTPS ({value}); BF Bot Service requires TLS"
+        )
     trimmed = value.rstrip("/")
     if trimmed.endswith("/api/messages"):
         return trimmed
@@ -167,13 +189,14 @@ class BotServiceCreateInputs:
     subscription_id: str | None = None
     bot_name: str | None = None
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
+    allow_local: bool = False
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
             raise ValueError("agent_name must be non-empty")
         if not self.resource_group.strip():
             raise ValueError("resource_group must be non-empty")
-        self.endpoint = _normalize_endpoint(self.endpoint)
+        self.endpoint = _normalize_endpoint(self.endpoint, allow_local=self.allow_local)
         self.bot_name = self.bot_name or derive_bot_name(self.agent_name)
 
 
@@ -310,11 +333,12 @@ class BotServiceUpdateEndpointInputs:
     agent_name: str
     url: str
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
+    allow_local: bool = False
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
             raise ValueError("agent_name must be non-empty")
-        self.url = _normalize_endpoint(self.url)
+        self.url = _normalize_endpoint(self.url, allow_local=self.allow_local)
 
 
 @dataclass
@@ -1527,6 +1551,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     create.add_argument("--bot-name", help="override derived <agent-slug>-bot name")
     create.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
     create.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
+    create.add_argument(
+        "--allow-local",
+        action="store_true",
+        help="permit a localhost/loopback endpoint over http (local dev tunnels)",
+    )
 
     enable = subs.add_parser(
         "enable-channel",
@@ -1557,6 +1586,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     )
     endpoint.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
     endpoint.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
+    endpoint.add_argument(
+        "--allow-local",
+        action="store_true",
+        help="permit a localhost/loopback endpoint over http (local dev tunnels)",
+    )
 
     cleanup = subs.add_parser(
         "cleanup",
@@ -1616,6 +1650,7 @@ def _run_create(args: argparse.Namespace) -> int:
             subscription_id=args.subscription_id,
             bot_name=args.bot_name,
             sidecar_path=args.sidecar,
+            allow_local=args.allow_local,
         )
         plan = build_create_plan(inputs)
     except (ValueError, BotServiceError) as e:
@@ -1668,6 +1703,7 @@ def _run_update_endpoint(args: argparse.Namespace) -> int:
             agent_name=args.agent_name,
             url=args.url,
             sidecar_path=args.sidecar,
+            allow_local=args.allow_local,
         )
         plan = build_update_endpoint_plan(inputs)
     except (ValueError, BotServiceError) as e:

@@ -4,6 +4,61 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] — 2026-06-30
+
+Milestone v0.7.6 — collapsed pre-0.8 polish + manifest currency (absorbed
+the former v0.7.7/v0.7.8). All items ship on unit tests; live Copilot
+Chat / Teams validation of the surface-facing bits (#74 prompt starters,
+#78 Copilot Chat mention behaviour) is pooled into the #89 v0.8.1 walk.
+
+### Added
+
+- **#71:** `bot-service create` / `update-endpoint` now defensively
+  validate the operator-supplied endpoint via `urlparse`: a non-HTTPS URL
+  on a remote host is refused (BF Bot Service requires TLS), and a
+  `localhost` / `127.0.0.1` / `::1` host is refused unless the new
+  `--allow-local` flag is passed (which then also permits `http://` for
+  that loopback dev-tunnel case). Remote `http://` stays refused even with
+  `--allow-local`. Mirrors the Path A `activity-bridge update-endpoint`
+  HTTPS guard. The `/api/messages` normalization tail is unchanged.
+  *(`--probe-reachability` HEAD check deferred to a follow-up.)*
+- **#74:** the generated Custom Engine Agent manifest now emits Copilot
+  Chat **prompt starters** — `commandLists` commands carry `type:"prompt"`
+  with a non-empty `prompt`, replacing the single generic command.
+  Operator-configurable via a repeatable
+  `--prompt-starter "title=...,prompt=..."` flag (requires `--copilot-chat`);
+  with no flag a sensible default set is derived from the agent name.
+  Command-list `scopes` now track the bot's advertised scopes (the prior
+  hardcoded list dropped `team`). Defensive caps: ≤10 commands, ≤4000-char
+  prompts. UX-only — the `1.21` manifest already validated (v0.7.5 walk).
+- **#73:** outbound message activities now carry the BF/Teams
+  **"AI generated" content label** (`https://schema.org/Message` with
+  `additionalType: ["AIGeneratedContent"]`) — on text replies, the Copilot
+  Chat coalesced flush, card sends, the streaming-final activity, and
+  proactive sends. Inert on channels that don't render it; never attached
+  to typing / intermediate-streaming chunks. *(Part (b) citations and (c)
+  feedback-loop deferred: there is no citation data source today, and the
+  feedback loop depends on #18 invoke activities — splits forward to v0.8.1.)*
+
+### Documentation
+
+- **#75:** added [`references/manifest-schema-currency.md`](references/manifest-schema-currency.md)
+  — investigation of the `1.21` CEA manifest pin vs `1.25 agenticUserTemplates`
+  / `1.27 agentConnectors`. Records that the two are *separate* manifest
+  tracks (Path A `devPreview` vs Path B `1.21`), that no current capability
+  needs a bump, and the criteria for a future walk-validated bump. **The
+  default manifest version stays `1.21`** — no schema change, no opt-in flag.
+
+### Fixed
+
+- **#78:** inbound recipient `@mention` markup (`<at>AgentName</at>`) is now
+  stripped from the text handed to the agent in group/channel surfaces —
+  entity-driven, matched on `mentioned.id == recipient.id` so user-to-user
+  mentions are preserved. Whitespace is tidied only when a mention was
+  actually removed (multi-line bodies are not reflowed). `raw_message` and
+  the `entities` list are left untouched. Verified no-op on Copilot Chat
+  (which pre-strips). *(Outbound mention-entity support deferred — demand-gated.)*
+
 ## [0.7.5] — 2026-06-30
 
 Milestone v0.7.5. Headline is #79 (BF lifecycle capture/evict); the live

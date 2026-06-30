@@ -1838,6 +1838,22 @@ async def forward_to_webhook(
 # ---------------------------------------------------------------------------
 
 
+# #73(a): the BF/Teams "AI generated" content label. Attached to every
+# outbound *message* activity this adapter emits (replies, coalesced
+# Copilot-Chat flush, cards, streaming-final, proactive). It is inert on
+# channels that don't render it, and the inbound is shape-indistinguishable
+# between Teams group chat and Copilot Chat, so it is always-on rather than
+# channel-gated. NOT attached to typing/intermediate-streaming activities.
+# Append a fresh ``dict(...)`` copy per activity to avoid shared-mutable
+# aliasing across sends.
+AI_GENERATED_CONTENT_ENTITY: dict[str, Any] = {
+    "type": "https://schema.org/Message",
+    "@type": "Message",
+    "@context": "https://schema.org",
+    "additionalType": ["AIGeneratedContent"],
+}
+
+
 def render_reply_activity(
     inbound: dict[str, Any], webhook_response: dict[str, Any]
 ) -> dict[str, Any]:
@@ -1873,6 +1889,8 @@ def render_reply_activity(
         reply["text"] = reply_text
     if attachments:
         reply["attachments"] = attachments
+    # #73(a): label the reply as AI-generated content.
+    reply["entities"] = [dict(AI_GENERATED_CONTENT_ENTITY)]
     return reply
 
 

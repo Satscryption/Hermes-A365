@@ -1975,6 +1975,49 @@ class TestSendGate:
         assert send_reply_mock.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_proactive_send_carries_ai_label(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #73(a): proactive (sendToConversation) messages are AI-generated
+        # content too.
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                {
+                    "type": "message",
+                    "id": "act-prior",
+                    "channelId": "msteams",
+                    "serviceUrl": "https://smba.trafficmanager.net/x/",
+                    "conversation": {
+                        "id": "c1",
+                        "conversationType": "personal",
+                        "tenantId": "t",
+                    },
+                    "from": {"id": "u"},
+                    "recipient": {"id": "a", "agenticAppId": "aa", "agenticUserId": "au"},
+                }
+            )
+        )
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.json = MagicMock(return_value={"id": "pid"})
+        a._http_client = MagicMock()
+        a._http_client.post = AsyncMock(return_value=mock_resp)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "A"))
+        )
+
+        result = await a.send(chat_id="c1", content="proactive ping")
+        assert result.success is True
+        body = a._http_client.post.await_args.kwargs["json"]
+        assert "replyToId" not in body
+        assert body["entities"][0]["additionalType"] == ["AIGeneratedContent"]
+
+    @pytest.mark.asyncio
     async def test_inbound_capture_populates_lifetime_set(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -3169,6 +3212,53 @@ class TestEditMessage:
         # Hermes' stream consumer to route the final edit through even
         # if content didn't change.
         assert adapter_mod.Agent365Adapter.REQUIRES_EDIT_FINALIZE is True
+
+    @pytest.mark.asyncio
+    async def test_finalize_activity_carries_ai_label_with_streaminfo(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #73(a): the finalized message activity carries BOTH the
+        # streaminfo (final) entity AND the AI-generated-content label.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-S")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-stream-z"})
+        ok = MagicMock(status_code=202, text="", json=lambda: {})
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=[first, ok])
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-S", "m1", "Hi", finalize=False)
+        await a.edit_message("conv-S", "m1", "Hi, done.", finalize=True)
+
+        final_body = post_mock.await_args.kwargs["json"]
+        assert final_body["type"] == "message"
+        types = [e["type"] for e in final_body["entities"]]
+        assert "streaminfo" in types
+        assert "https://schema.org/Message" in types
+        streaminfo = next(e for e in final_body["entities"] if e["type"] == "streaminfo")
+        assert streaminfo["streamType"] == "final"
+        ai = next(
+            e for e in final_body["entities"] if e["type"] == "https://schema.org/Message"
+        )
+        assert ai["additionalType"] == ["AIGeneratedContent"]
+
+    @pytest.mark.asyncio
+    async def test_intermediate_chunk_has_no_ai_label(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Intermediate (typing) chunks are NOT AI-content-labelled —
+        # only the user-visible final message is.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-S")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-stream-y"})
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=first)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-S", "m1", "Hi", finalize=False)
+        body = post_mock.await_args.kwargs["json"]
+        assert body["type"] == "typing"
+        assert [e["type"] for e in body["entities"]] == ["streaminfo"]
 
     @pytest.mark.asyncio
     async def test_non_personal_reply_to_coalesces_until_finalize(
@@ -5042,3 +5132,142 @@ class TestMarkUsedFromOutboundPaths:
         result = await a.send(chat_id="never-seen", content="hi")
         assert result.success is False
         assert "no registry entry" in (result.error or "")
+
+
+class TestActivityToEvent:
+    """#78 — recipient @mention stripping in _activity_to_event.
+
+    Shapes are taken from real captured raws (CC groupChat + Teams
+    channel) in the v0.7.5 walk registry backup.
+    """
+
+    BOT_ID = "28:1c2b61bc-fa6a-4c7b-9656-a82b662dacfe"
+
+    def _event(self, monkeypatch: pytest.MonkeyPatch, activity: dict[str, Any]) -> Any:
+        return _make_adapter(monkeypatch)._activity_to_event(activity)
+
+    def _channel_activity(self, *, text: str, entities: list[Any]) -> dict[str, Any]:
+        return {
+            "id": "act-1",
+            "text": text,
+            "from": {"id": "29:user", "name": "Sadiq"},
+            "recipient": {"id": self.BOT_ID, "name": "hermes-inbox-helper-bot"},
+            "conversation": {"id": "19:thread@thread.v2", "conversationType": "channel"},
+            "entities": entities,
+        }
+
+    def _mention(self, text: str | None = None) -> dict[str, Any]:
+        ent: dict[str, Any] = {
+            "type": "mention",
+            "mentioned": {"id": self.BOT_ID, "name": "Hermes Inbox Helper R8"},
+        }
+        if text is not None:
+            ent["text"] = text
+        return ent
+
+    def test_teams_channel_mention_only_stripped_to_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Real Teams-channel raw: text IS the mention markup; entity carries
+        # the matching `text`; a clientInfo entity rides alongside.
+        act = self._channel_activity(
+            text="<at>Hermes Inbox Helper R8</at>",
+            entities=[
+                self._mention("<at>Hermes Inbox Helper R8</at>"),
+                {"type": "clientInfo", "locale": "en-GB", "platform": "Mac"},
+            ],
+        )
+        evt = self._event(monkeypatch, act)
+        assert evt.text == ""
+        # raw_message preserved verbatim (only event.text is cleaned).
+        assert evt.raw_message["text"] == "<at>Hermes Inbox Helper R8</at>"
+        assert evt.raw_message["entities"][0]["text"] == "<at>Hermes Inbox Helper R8</at>"
+
+    def test_cc_groupchat_no_text_field_is_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Real CC raw: text already clean; mention entity has NO `text` field.
+        act = {
+            "id": "act-2",
+            "text": "Tell me about your runtime agent",
+            "from": {"id": "29:user"},
+            "recipient": {"id": self.BOT_ID, "name": "hermes-inbox-helper-bot"},
+            "conversation": {"id": "19:x", "conversationType": "groupChat"},
+            "entities": [self._mention()],
+        }
+        assert self._event(monkeypatch, act).text == "Tell me about your runtime agent"
+
+    def test_mention_between_words_collapses_double_space(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        act = self._channel_activity(
+            text="hi <at>Bot</at> there",
+            entities=[self._mention("<at>Bot</at>")],
+        )
+        assert self._event(monkeypatch, act).text == "hi there"
+
+    def test_mention_at_end(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        act = self._channel_activity(
+            text="status please <at>Bot</at>",
+            entities=[self._mention("<at>Bot</at>")],
+        )
+        assert self._event(monkeypatch, act).text == "status please"
+
+    def test_non_recipient_mention_preserved(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        other = {
+            "type": "mention",
+            "mentioned": {"id": "29:someone-else", "name": "Alice"},
+            "text": "<at>Alice</at>",
+        }
+        act = self._channel_activity(
+            text="<at>Alice</at> ping <at>Bot</at>",
+            entities=[other, self._mention("<at>Bot</at>")],
+        )
+        # Only the recipient mention is stripped; user-to-user mention stays.
+        assert self._event(monkeypatch, act).text == "<at>Alice</at> ping"
+
+    def test_multiple_recipient_mentions_all_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        act = self._channel_activity(
+            text="<at>Bot</at> hi <at>Bot</at>",
+            entities=[self._mention("<at>Bot</at>")],
+        )
+        assert self._event(monkeypatch, act).text == "hi"
+
+    def test_multiline_body_not_reflowed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        act = self._channel_activity(
+            text="<at>Bot</at> line one\nline two",
+            entities=[self._mention("<at>Bot</at>")],
+        )
+        assert self._event(monkeypatch, act).text == "line one\nline two"
+
+    def test_no_entities_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        act = {
+            "id": "a",
+            "text": "plain dm message",
+            "from": {"id": "29:u"},
+            "recipient": {"id": self.BOT_ID},
+            "conversation": {"id": "c", "conversationType": "personal"},
+        }
+        assert self._event(monkeypatch, act).text == "plain dm message"
+
+    def test_recipient_missing_no_stripping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        act = {
+            "id": "a",
+            "text": "<at>Bot</at> hello",
+            "from": {"id": "29:u"},
+            "recipient": None,
+            "conversation": {"id": "c", "conversationType": "channel"},
+            "entities": [
+                {"type": "mention", "mentioned": {"id": "x"}, "text": "<at>Bot</at>"}
+            ],
+        }
+        # recipient_id == "" -> helper returns text unchanged.
+        assert self._event(monkeypatch, act).text == "<at>Bot</at> hello"
