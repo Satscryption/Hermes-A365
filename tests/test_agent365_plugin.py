@@ -714,6 +714,20 @@ class TestValidateConfig:
 
 
 class TestAdapterConstruction:
+    def test_connect_accepts_is_reconnect_kwarg(self) -> None:
+        # Contract guard: BasePlatformAdapter.connect is
+        # ``connect(self, *, is_reconnect: bool = False)`` and the gateway
+        # always calls ``adapter.connect(is_reconnect=...)`` (gateway/run.py).
+        # An override that drops the kwarg breaks every connect against the
+        # current gateway core ("unexpected keyword argument 'is_reconnect'").
+        import inspect
+
+        params = inspect.signature(adapter_mod.Agent365Adapter.connect).parameters
+        assert "is_reconnect" in params, "connect() must accept is_reconnect"
+        p = params["is_reconnect"]
+        assert p.kind == inspect.Parameter.KEYWORD_ONLY
+        assert p.default is False
+
     def test_init_pulls_slug_and_port_from_extra(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1202,6 +1216,275 @@ class TestShouldDispatch:
         body.pop("from", None)
         # No `from.id=system`, so we treat it as user-routable.
         assert adapter_mod._should_dispatch(body) is True
+
+
+class TestLifecycleRegistryAction:
+    """#79 — pure classifier mapping BF lifecycle activities to a registry
+    action (capture for proactive / evict on uninstall / leave alone)."""
+
+    def test_installation_add_upserts(self) -> None:
+        body = {"type": "installationUpdate", "action": "add"}
+        assert adapter_mod._lifecycle_registry_action(body) == "upsert"
+
+    def test_installation_default_action_upserts(self) -> None:
+        # Missing/empty action is treated as add (capture, don't evict).
+        assert adapter_mod._lifecycle_registry_action(
+            {"type": "installationUpdate"}
+        ) == "upsert"
+
+    def test_installation_remove_evicts(self) -> None:
+        body = {"type": "installationUpdate", "action": "remove"}
+        assert adapter_mod._lifecycle_registry_action(body) == "evict"
+
+    def test_conversation_update_bot_added_upserts(self) -> None:
+        # Capture only when the BOT (recipient.id) is among membersAdded.
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersAdded": [{"id": "user-9"}, {"id": "bot-1"}],
+        }
+        assert adapter_mod._lifecycle_registry_action(body) == "upsert"
+
+    def test_conversation_update_user_added_without_bot_is_none(self) -> None:
+        # An ordinary user joining a still-live group must not churn the
+        # registry — leave it to _should_dispatch's ack-and-bail.
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersAdded": [{"id": "user-9"}],
+        }
+        assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_conversation_update_members_added_without_recipient_is_none(
+        self,
+    ) -> None:
+        # No bot id to match against → cannot fire.
+        body = {"type": "conversationUpdate", "membersAdded": [{"id": "x"}]}
+        assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_conversation_update_without_members_is_none(self) -> None:
+        # Plain conversationUpdate (topic rename etc.) — leave to
+        # _should_dispatch's existing ack-and-bail.
+        assert adapter_mod._lifecycle_registry_action(
+            {"type": "conversationUpdate", "recipient": {"id": "bot-1"}}
+        ) is None
+
+    def test_conversation_update_bot_removed_evicts(self) -> None:
+        # The bot being kicked from a group is a real uninstall signal on
+        # surfaces that don't send installationUpdate(remove).
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersRemoved": [{"id": "bot-1"}],
+        }
+        assert adapter_mod._lifecycle_registry_action(body) == "evict"
+
+    def test_conversation_update_user_removed_is_none(self) -> None:
+        # A user leaving a still-live group must NOT evict — only the bot's
+        # own removal does.
+        body = {
+            "type": "conversationUpdate",
+            "recipient": {"id": "bot-1"},
+            "membersRemoved": [{"id": "user-9"}],
+        }
+        assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_agents_channel_synthetic_install_is_none(self) -> None:
+        # Synthetic agents-channel probes must not reach the registry —
+        # they bypass _should_dispatch's screen (lifecycle runs first).
+        for sender in ("system", "no-reply@teams.mail.microsoft"):
+            body = {
+                "type": "installationUpdate",
+                "action": "add",
+                "channelId": "agents",
+                "from": {"id": sender},
+            }
+            assert adapter_mod._lifecycle_registry_action(body) is None
+
+    def test_real_msteams_install_still_upserts(self) -> None:
+        body = {
+            "type": "installationUpdate",
+            "action": "add",
+            "channelId": "msteams",
+        }
+        assert adapter_mod._lifecycle_registry_action(body) == "upsert"
+
+    def test_real_message_is_none(self) -> None:
+        assert adapter_mod._lifecycle_registry_action(_make_inbound()) is None
+
+    def test_typing_is_none(self) -> None:
+        assert adapter_mod._lifecycle_registry_action({"type": "typing"}) is None
+
+
+class TestConversationRegistryEvict:
+    """#79 — explicit tenant-driven removal (uninstall hygiene)."""
+
+    @staticmethod
+    def _reg():
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        return ConversationRegistry()
+
+    def test_evict_present_returns_true(self) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        reg = self._reg()
+        reg.upsert(ConversationRef(conversation_id="c1", service_url="u"))
+        assert reg.evict("c1") is True
+        assert "c1" not in reg
+
+    def test_evict_absent_returns_false(self) -> None:
+        assert self._reg().evict("nope") is False
+
+    def test_evict_removes_pinned_entry(self) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        reg = self._reg()
+        reg.upsert(ConversationRef(conversation_id="c2", service_url="u"))
+        assert reg.pin("c2") is True
+        # An uninstall is a harder signal than a pin.
+        assert reg.evict("c2") is True
+        assert "c2" not in reg
+
+
+class TestLifecycleCapture:
+    """#79 — route-level: lifecycle activities capture/evict the
+    conversation reference for proactive delivery and never reach the
+    agent loop. Driven via the FastAPI TestClient with the JWT validator
+    patched, same harness as ``TestMessagesRoute``."""
+
+    @staticmethod
+    def _client(a, monkeypatch):
+        from fastapi.testclient import TestClient
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        a._http_client = MagicMock()
+        return TestClient(a.build_app())
+
+    @staticmethod
+    def _lifecycle_body(conv_id="conv-install", **overrides):
+        # Path B (classic BF: no agentic ids, trafficmanager serviceUrl)
+        # so the captured ref classifies as a Path B proactive target.
+        body = {**_make_inbound(path="B", conv_id=conv_id), **overrides}
+        body.pop("text", None)  # lifecycle activities carry no user text
+        return body
+
+    def test_route_logs_inbound_activity_shape(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Request-level observability: every inbound logs its shape-defining
+        # fields before any gate, so the log shows whether e.g. an
+        # installationUpdate ever reaches the endpoint (closes finding #5).
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        caplog.set_level("INFO")
+        body = self._lifecycle_body(type="installationUpdate", action="add")
+        client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert "inbound activity type=installationUpdate action=add" in caplog.text
+        assert "channelId=msteams" in caplog.text
+
+    def test_installation_add_captures_ref_enables_proactive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(type="installationUpdate", action="add")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json() == {"status": "acked", "lifecycle": "upsert"}
+        # Never reached the agent loop (fixes the wasted-turn mishandling).
+        assert a._handled_events == []
+        # Captured into the registry...
+        assert "conv-install" in a._conversations
+        # ...but NOT marked seen-this-lifetime, so send() routes proactive.
+        assert "conv-install" not in a._seen_inbounds_this_lifetime
+        # And the captured ref is a usable Path B proactive target.
+        spec = a._build_proactive_target_spec("conv-install")
+        assert spec is not None
+        assert spec["path"] == "B"
+        assert spec["conversation_id"] == "conv-install"
+
+    def test_conversation_update_bot_added_captures_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        # The bot is recipient.id from _make_inbound (= "agent-1").
+        body = self._lifecycle_body(
+            conv_id="conv-add",
+            type="conversationUpdate",
+            membersAdded=[{"id": "user-x"}, {"id": "agent-1"}],
+        )
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.json() == {"status": "acked", "lifecycle": "upsert"}
+        assert a._handled_events == []
+        assert "conv-add" in a._conversations
+
+    def test_lifecycle_does_not_clobber_active_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Clobber regression: a real user message captured this lifetime,
+        # then a bot-add conversationUpdate for the SAME conv must NOT
+        # overwrite the cached user-message raw / last_inbound id (which
+        # would corrupt the replyToActivity target), and the chat must stay
+        # seen-this-lifetime (keep its reply path, not flip to proactive).
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        msg = _make_inbound(
+            path="B", conv_id="conv-live", activity_id="user-act-1", text="hi"
+        )
+        r1 = client.post(
+            "/api/messages", json=msg, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r1.json()["status"] == "dispatched"
+        assert "conv-live" in a._seen_inbounds_this_lifetime
+        assert a._conversations.get("conv-live").last_inbound_activity_id == "user-act-1"
+
+        lc = self._lifecycle_body(
+            conv_id="conv-live",
+            id="cu-act-9",  # different id than the user message (no dedupe)
+            type="conversationUpdate",
+            membersAdded=[{"id": "agent-1"}],
+        )
+        r2 = client.post(
+            "/api/messages", json=lc, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r2.json() == {"status": "acked", "lifecycle": "upsert"}
+        ref = a._conversations.get("conv-live")
+        assert ref.last_inbound_activity_id == "user-act-1"  # not clobbered
+        assert ref.raw.get("id") == "user-act-1"
+        assert "conv-live" in a._seen_inbounds_this_lifetime
+
+    def test_installation_remove_evicts_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        # Pre-seed as if the chat was captured earlier this lifetime.
+        seed = _make_inbound(path="B", conv_id="conv-rm")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
+        a._seen_inbounds_this_lifetime.add("conv-rm")
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="conv-rm", type="installationUpdate", action="remove"
+        )
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.json() == {"status": "acked", "lifecycle": "evict"}
+        assert a._handled_events == []
+        assert "conv-rm" not in a._conversations
+        assert "conv-rm" not in a._seen_inbounds_this_lifetime
 
 
 class TestServeAppAgentsChannelFilter:

@@ -4,6 +4,66 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+Milestone v0.7.5. Headline is #79 (BF lifecycle capture/evict); the live
+walk that validated it also caught two real regressions in the *shipped*
+v0.7.4 (`connect()` + `publish`), both fixed here.
+
+### Added
+
+- **#79:** BF lifecycle activities (`installationUpdate` add/remove,
+  `conversationUpdate` membersAdded/membersRemoved) are now routed through
+  the conversation registry instead of being dropped (`conversationUpdate`)
+  or wasting an agent turn (`installationUpdate` fell through to
+  `handle_message`). On a bot add → capture the conversation reference so
+  proactive delivery (#33/#67) can reach a chat the operator installed the
+  agent into; on a bot remove → evict so we stop POSTing into a removed
+  conversation rather than waiting out the 30-day prune. A pure
+  `_lifecycle_registry_action` classifier gates capture/evict strictly on
+  the *bot itself* being the added/removed member (`recipient.id`), screens
+  synthetic `agents`-channel probes, and uses **capture-if-missing** so a
+  lifecycle activity never clobbers a richer captured user-message ref.
+  Lifecycle capture deliberately does not mark the chat seen-this-lifetime
+  (a lifecycle activity has no replyToActivity-able id, so `send()` routes
+  proactively). New `ConversationRegistry.evict`.
+  *Live-walk-validated:* capture fires correctly against real Microsoft
+  payloads on Copilot Chat, Teams 1:1, and Teams channel; evict is
+  unit-validated (its live trigger was blocked by Teams admin policy).
+- **Request-level inbound logging** (closes the finding-5 observability
+  gap): every inbound activity's shape (`type`/`action`/`channelId`/`from`/
+  `conversationType`/`conv`/`membersAdded`/`membersRemoved`) is logged at
+  the top of `/api/messages`, before any gate — so the log shows whether a
+  given activity (e.g. an `installationUpdate`) even reached the endpoint.
+
+### Fixed
+
+- **`Agent365Adapter.connect()` gateway-contract drift:** the base contract
+  is `connect(self, *, is_reconnect: bool = False)` and the gateway's
+  reconnection watcher always calls `adapter.connect(is_reconnect=...)`. Our
+  override had drifted to `connect(self)`, so against the current
+  hermes-agent core the platform failed to connect
+  (`unexpected keyword argument 'is_reconnect'`) and never bound its port —
+  affecting **shipped v0.7.4 and `main`**, not just this branch. Surfaced by
+  the live walk (unit tests mock `connect`, so the drift was invisible).
+- **`publish --copilot-chat` broke against Microsoft a365 CLI ≥ 1.1.181:**
+  the wrapper post-processed the `.zip` the CLI used to emit, but 1.1.181
+  changed to extract a manifest *template* and stop for customisation
+  (emitting no zip), so `--copilot-chat` silently produced only the raw
+  blueprint template (no `bots`/`copilotAgents`). Now the wrapper detects
+  the extracted directory and packages it itself, then the existing CEA
+  transform runs unchanged → valid 1.21 Custom Engine Agent zip. Also
+  affected **shipped v0.7.4**.
+
+### Validated (v0.7.5 live walk)
+
+- **#67:** Path B proactive `sendToConversation` round-trip — token mint →
+  POST → **visibly rendered** in Copilot Chat (not just a 2xx). Closes the
+  separately-tracked live-validation.
+- **#53** (shipped v0.7.4): both halves re-confirmed on the live CC surface
+  — per-turn fallback noise is invisible, and the terminal-failure flush
+  renders as **one** coalesced bubble (A/B: 3 separate bubbles vs 1).
+
 ## [0.7.4] — 2026-06-20
 
 ### Fixed
