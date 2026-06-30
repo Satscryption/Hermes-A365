@@ -65,6 +65,7 @@ import asyncio
 import json
 import logging
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -117,6 +118,67 @@ def _strip_streaming_cursor(text: str) -> str:
         if cursor and text.endswith(cursor):
             return text[: -len(cursor)]
     return text
+
+
+def _strip_one_mention(text: str, mention_text: str) -> str:
+    """Remove every occurrence of ``mention_text`` plus the horizontal
+    whitespace immediately around it.
+
+    The seam collapses to a single space only when the mention sat between
+    two non-space characters (so words don't fuse); at a line or string
+    boundary it is removed entirely (no stray leading/trailing space).
+    Whitespace *elsewhere* — interior runs and newlines — is never touched,
+    so a legitimate multi-line body is not reflowed.
+    """
+
+    def _replace(match: re.Match[str]) -> str:
+        start, end = match.span()
+        before = text[start - 1] if start > 0 else ""
+        after = text[end] if end < len(text) else ""
+        if before and after and not before.isspace() and not after.isspace():
+            return " "
+        return ""
+
+    return re.compile(r"[ \t]*" + re.escape(mention_text) + r"[ \t]*").sub(_replace, text)
+
+
+def _strip_recipient_mention(text: str, entities: Any, recipient_id: str) -> str:
+    """Remove the bot's own ``<at>…</at>`` recipient-mention markup from
+    inbound group/channel text — BF ``RemoveRecipientMention`` style (#78).
+
+    Entity-driven: only a ``mention`` entity whose ``mentioned.id`` equals
+    the activity's ``recipient.id`` (the bot itself, the same identity used
+    for bot-self detection elsewhere) is stripped, so user-to-user mentions
+    in the same message are preserved. Matching is on ``id`` not ``name`` —
+    the entity's ``mentioned.name`` is a display name that differs from
+    ``recipient.name``. The mention and the horizontal whitespace right
+    around it are removed (see ``_strip_one_mention``); interior whitespace
+    runs and newlines elsewhere are preserved, and the outer ends are
+    trimmed only when a mention was actually removed — so a message with no
+    recipient mention is returned byte-for-byte unchanged. The activity's
+    ``entities`` list and ``raw_message`` are left untouched.
+
+    A verified no-op on surfaces that pre-strip (Copilot Chat: the mention
+    entity carries no ``text`` field) or carry no entities at all.
+    """
+    if not text or not recipient_id or not isinstance(entities, list):
+        return text
+    removed = False
+    for entity in entities:
+        if not isinstance(entity, dict) or entity.get("type") != "mention":
+            continue
+        mentioned = entity.get("mentioned")
+        if not isinstance(mentioned, dict):
+            continue
+        if str(mentioned.get("id") or "") != recipient_id:
+            continue
+        mention_text = entity.get("text")
+        if isinstance(mention_text, str) and mention_text:
+            new_text = _strip_one_mention(text, mention_text)
+            if new_text != text:
+                text = new_text
+                removed = True
+    return text.strip() if removed else text
 
 
 # Slice 19s — BF streaming-response protocol pacing.
@@ -769,6 +831,15 @@ class Agent365Adapter(BasePlatformAdapter):
     def _activity_to_event(self, activity: dict[str, Any]) -> MessageEvent:
         conv = activity.get("conversation") or {}
         sender = activity.get("from") or {}
+        recipient = activity.get("recipient")
+        recipient_id = (
+            str(recipient.get("id") or "") if isinstance(recipient, dict) else ""
+        )
+        text = _strip_recipient_mention(
+            str(activity.get("text") or ""),
+            activity.get("entities"),
+            recipient_id,
+        )
         chat_id = str(conv.get("id") or "")
         # BF conversation.conversationType: "personal" / "groupChat" / "channel"
         conv_type = str(conv.get("conversationType") or "personal")
@@ -785,7 +856,7 @@ class Agent365Adapter(BasePlatformAdapter):
             message_id=str(activity.get("id") or ""),
         )
         return MessageEvent(
-            text=str(activity.get("text") or ""),
+            text=text,
             message_type=MessageType.TEXT,
             source=source,
             raw_message=activity,
@@ -1714,6 +1785,8 @@ class Agent365Adapter(BasePlatformAdapter):
             "recipient": dict(target["recipient"]),
             "conversation": {"id": target["conversation_id"]},
             "text": content,
+            # #73(a): proactive sends are AI-generated content too.
+            "entities": [dict(bridge.AI_GENERATED_CONTENT_ENTITY)],
         }
         service_url = target["service_url"].rstrip("/")
         url = f"{service_url}/v3/conversations/{target['conversation_id']}/activities"
@@ -2208,6 +2281,11 @@ class Agent365Adapter(BasePlatformAdapter):
         }
 
         bridge = _import_bridge()
+        if finalize:
+            # #73(a): the finalized, user-visible message is AI-generated
+            # content — append the label alongside the streaminfo entity.
+            # Intermediate (typing) chunks are NOT labelled.
+            activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
         service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
         conv_id = conv.get("id")
         if not service_url or not conv_id:

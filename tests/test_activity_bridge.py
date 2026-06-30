@@ -1737,6 +1737,29 @@ class TestRenderReply:
             "content": card,
         }
 
+    def test_reply_carries_ai_generated_content_label(self) -> None:
+        # #73(a): every outbound reply is labelled AI-generated content.
+        reply = render_reply_activity(
+            _inbound_message_activity(), {"text": "hello back"}
+        )
+        assert reply["entities"] == [
+            {
+                "type": "https://schema.org/Message",
+                "@type": "Message",
+                "@context": "https://schema.org",
+                "additionalType": ["AIGeneratedContent"],
+            }
+        ]
+
+    def test_card_reply_carries_ai_label_alongside_attachment(self) -> None:
+        card = {"type": "AdaptiveCard", "version": "1.6", "body": []}
+        reply = render_reply_activity(
+            _inbound_message_activity(), {"text": "see card", "card": card}
+        )
+        # Entity and attachment coexist on the same activity.
+        assert "attachments" in reply
+        assert reply["entities"][0]["additionalType"] == ["AIGeneratedContent"]
+
     def test_error_card_shape(self) -> None:
         card = render_error_card("oops")
         assert card["type"] == "AdaptiveCard"

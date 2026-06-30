@@ -4,6 +4,59 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.7.6] — 2026-06-30
+
+Milestone v0.7.6 — collapsed pre-0.8 polish + manifest currency (absorbed
+the former v0.7.7/v0.7.8). All items ship on unit tests; live Copilot
+Chat / Teams validation of #78's mention behaviour is pooled into the #89
+v0.8.1 walk. **#74 (prompt starters) was deferred to v0.8.1** — a red-team
+pass (verified against Microsoft's v1.21 schema) found `type:"prompt"`
+command fields require manifest **1.27**, and per #75 the manifest version
+is not bumped without walk validation, so #74 lands together with that
+bump at the #89 walk.
+
+### Added
+
+- **#71:** `bot-service create` / `update-endpoint` now defensively
+  validate the operator-supplied endpoint via `urlparse`: a non-HTTPS URL
+  on a remote host is refused (BF Bot Service requires TLS), and a
+  `localhost` / `127.0.0.1` / `::1` host is refused unless the new
+  `--allow-local` flag is passed (which then also permits `http://` for
+  that loopback dev-tunnel case). Remote `http://` stays refused even with
+  `--allow-local`. Mirrors the Path A `activity-bridge update-endpoint`
+  HTTPS guard. The `/api/messages` normalization tail is unchanged.
+  *(`--probe-reachability` HEAD check deferred to a follow-up.)*
+- **#73:** outbound message activities now carry the BF/Teams
+  **"AI generated" content label** (`https://schema.org/Message` with
+  `additionalType: ["AIGeneratedContent"]`) — on text replies, the Copilot
+  Chat coalesced flush, card sends, the streaming-final activity, and
+  proactive sends. Inert on channels that don't render it; never attached
+  to typing / intermediate-streaming chunks. *(Part (b) citations and (c)
+  feedback-loop deferred: there is no citation data source today, and the
+  feedback loop depends on #18 invoke activities — splits forward to v0.8.1.)*
+
+### Documentation
+
+- **#75:** added [`references/manifest-schema-currency.md`](references/manifest-schema-currency.md)
+  — investigation of the `1.21` CEA manifest pin vs `1.25 agenticUserTemplates`
+  / `1.27 agentConnectors`. Records that Path A (`devPreview`) and Path B
+  (`1.21`) are *separate* manifest tracks, and that the concrete capability
+  motivating a future bump is **prompt starters (#74)**: `type:"prompt"`
+  command fields were introduced in manifest **1.27** (the `1.21` command
+  schema is `additionalProperties:false` — `title`/`description` only), so
+  #74 must land with a `1.27` bump, walk-validated at #89. **The default
+  manifest version stays `1.21`** in v0.7.6 — no schema change, no opt-in flag.
+
+### Fixed
+
+- **#78:** inbound recipient `@mention` markup (`<at>AgentName</at>`) is now
+  stripped from the text handed to the agent in group/channel surfaces —
+  entity-driven, matched on `mentioned.id == recipient.id` so user-to-user
+  mentions are preserved. Whitespace is tidied only when a mention was
+  actually removed (multi-line bodies are not reflowed). `raw_message` and
+  the `entities` list are left untouched. Verified no-op on Copilot Chat
+  (which pre-strips). *(Outbound mention-entity support deferred — demand-gated.)*
+
 ## [0.7.5] — 2026-06-30
 
 Milestone v0.7.5. Headline is #79 (BF lifecycle capture/evict); the live
