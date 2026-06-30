@@ -583,6 +583,30 @@ class Agent365Adapter(BasePlatformAdapter):
             activity: dict[str, Any] = Body(...),  # noqa: B008
             authorization: str | None = Header(default=None),
         ) -> Any:
+            # Request-level inbound observability. Previously the plugin
+            # logged nothing for non-dispatched POSTs (lifecycle, channel
+            # control, synthetic probes, gate rejections), making it
+            # impossible to tell from the log whether a given activity (e.g.
+            # an installationUpdate) even reached the endpoint. Log every
+            # inbound's shape-defining fields here, BEFORE any gate, so the
+            # full picture is visible. No token/secret is logged.
+            _in_conv = activity.get("conversation")
+            _in_conv = _in_conv if isinstance(_in_conv, dict) else {}
+            _in_from = activity.get("from")
+            _in_from = _in_from if isinstance(_in_from, dict) else {}
+            logger.info(
+                "inbound activity type=%s action=%s channelId=%s from=%s "
+                "convType=%s conv=%s membersAdded=%s membersRemoved=%s",
+                activity.get("type"),
+                activity.get("action"),
+                activity.get("channelId"),
+                _in_from.get("id"),
+                _in_conv.get("conversationType"),
+                _in_conv.get("id"),
+                bool(activity.get("membersAdded")),
+                bool(activity.get("membersRemoved")),
+            )
+
             # Slice 19j — serviceUrl gate before anything else.
             service_url = activity.get("serviceUrl") or ""
             trusted_suffixes = bridge.DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES

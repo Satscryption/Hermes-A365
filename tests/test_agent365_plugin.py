@@ -1374,6 +1374,22 @@ class TestLifecycleCapture:
         body.pop("text", None)  # lifecycle activities carry no user text
         return body
 
+    def test_route_logs_inbound_activity_shape(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Request-level observability: every inbound logs its shape-defining
+        # fields before any gate, so the log shows whether e.g. an
+        # installationUpdate ever reaches the endpoint (closes finding #5).
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        caplog.set_level("INFO")
+        body = self._lifecycle_body(type="installationUpdate", action="add")
+        client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert "inbound activity type=installationUpdate action=add" in caplog.text
+        assert "channelId=msteams" in caplog.text
+
     def test_installation_add_captures_ref_enables_proactive(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
