@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hermes-a365"
-version = "0.7.6"
+version = "0.8.0"
 description = "Integrate Hermes agents into the Microsoft 365 ecosystem using Microsoft Agent 365 (A365)."
 readme = "README.md"
 license = {text = "MIT"}

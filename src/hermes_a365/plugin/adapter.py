@@ -86,6 +86,8 @@ from gateway.platforms.base import (  # noqa: E402
 )
 from gateway.session import SessionSource  # noqa: E402
 
+from hermes_a365 import invoke  # noqa: E402
+
 # Plugin-local imports — these don't depend on the Hermes harness.
 from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 
@@ -706,6 +708,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # branches do full signature checks, so a malformed token
             # gets rejected either way; default to the A365 path on
             # peek failure to preserve pre-#34 behaviour.
+            claims: dict[str, Any] = {}
             iss = bridge.peek_unverified_iss(token)
             if iss == bridge.BF_ISSUER:
                 # #36: when the operator has migrated the bot's
@@ -721,7 +724,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     bf_expected_aud[:8] if bf_expected_aud else "",
                 )
                 try:
-                    await bridge.validate_inbound_jwt_bf(
+                    claims = await bridge.validate_inbound_jwt_bf(
                         token=token,
                         expected_app_id=bf_expected_aud,
                         expected_service_url=service_url,
@@ -736,7 +739,7 @@ class Agent365Adapter(BasePlatformAdapter):
             else:
                 logger.info("inbound path=A (iss=%r)", iss)
                 try:
-                    await bridge.validate_inbound_jwt(
+                    claims = await bridge.validate_inbound_jwt(
                         token=token,
                         tenant_id=self.tenant_id,
                         expected_app_id=self.blueprint_app_id,
@@ -800,6 +803,36 @@ class Agent365Adapter(BasePlatformAdapter):
                     ref.conversation_id if ref is not None else "?(no conv.id)",
                 )
                 return JSONResponse({"status": "acked", "lifecycle": lifecycle_action})
+
+            # Slice 19w-a (#18) — invoke activities are a synchronous
+            # request/response wire: the invokeResponse must come back in THIS
+            # HTTP turn as {status, body}. They must NOT fall through to
+            # handle_message (fire-and-forget, no sync return channel) — that
+            # is the pre-#18 bug (Microsoft logs 200, user sees no response).
+            # Intercept after auth + dedupe + lifecycle, before _should_dispatch.
+            # The handler builds its response locally; a handler crash returns a
+            # graceful {status:500} invokeResponse rather than an HTTP 500.
+            if str(activity.get("type") or "") == "invoke":
+                path_tag = bridge._inbound_path_tag(activity)
+                ctx = invoke.build_invoke_context(
+                    activity, claims=claims, path_tag=path_tag
+                )
+                try:
+                    resp = await invoke.dispatch_invoke(ctx)
+                except Exception as e:
+                    logger.error(
+                        "agent365 invoke handler failed: name=%s %s", ctx.name, e
+                    )
+                    resp = invoke.InvokeResponse(
+                        status=500, body={"error": "invoke handler error"}
+                    )
+                logger.info(
+                    "inbound invoke name=%s path=%s status=%s",
+                    ctx.name,
+                    path_tag,
+                    resp.status,
+                )
+                return JSONResponse(resp.as_dict())
 
             # Slice 19q — channel-control + synthetic agents-channel
             # probes ack-and-bail before the registry upsert. They're
