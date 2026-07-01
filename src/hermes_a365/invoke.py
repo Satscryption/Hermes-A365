@@ -35,17 +35,18 @@ _ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
 
 @dataclass(frozen=True)
 class InvokeResponse:
-    """A Bot Framework invokeResponse — the synchronous HTTP body.
+    """A Bot Framework invokeResponse.
 
-    ``as_dict()`` yields the exact ``{"status": ..., "body": ...}`` shape the
-    BF connector reads directly from the HTTP response body.
+    ``status`` becomes the HTTP status code and ``body`` becomes the HTTP
+    response body (the taskInfo / result payload) — the route serialises this
+    as ``JSONResponse(resp.body, status_code=resp.status)``. It is **NOT**
+    wrapped in a ``{"status", "body"}`` object: that wrapper is an SDK
+    abstraction the transport unwraps, and sending it makes Teams reject the
+    response ("Unable to reach app"). Verified end-to-end on the v0.8.0 walk.
     """
 
     status: int
     body: dict[str, Any] | None = None
-
-    def as_dict(self) -> dict[str, Any]:
-        return {"status": self.status, "body": self.body}
 
 
 @dataclass(frozen=True)

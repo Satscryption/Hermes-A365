@@ -2259,14 +2259,21 @@ def make_app(
                 return _reply_failed_response(reply_error)
             return _JSONResponse({"status": "webhook_error"}, status_code=200)
 
-        # Invoke replies must be synchronous: return the invokeResponse body
-        # in this HTTP turn.
+        # Invoke replies must be synchronous. BF wire: the HTTP body is the
+        # invokeResponse *body* and the HTTP status is its status — NOT a
+        # {status, body} wrapper (that is an SDK abstraction the transport
+        # unwraps; sending the wrapper makes Teams reject it as "Unable to
+        # reach app"). The operator webhook still returns {status, body}; we
+        # unwrap it here.
         if activity_type == "invoke":
             invoke_response = webhook_resp.get("invokeResponse") or {
                 "status": 200,
                 "body": webhook_resp,
             }
-            return _JSONResponse(invoke_response)
+            return _JSONResponse(
+                invoke_response.get("body"),
+                status_code=int(invoke_response.get("status", 200) or 200),
+            )
 
         # Standard message: render reply and send asynchronously via serviceUrl.
         if not webhook_resp.get("text") and not webhook_resp.get("card"):

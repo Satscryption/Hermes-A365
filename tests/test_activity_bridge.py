@@ -2080,8 +2080,10 @@ class TestServeApp:
         ) as client:
             r = client.post("/api/messages", json=invoke)
         assert r.status_code == 200
-        # Invoke replies are SYNC: response body is the invokeResponse.
-        assert r.json() == {"status": 200, "body": {"text": "thanks"}}
+        # BF wire: HTTP body is the invokeResponse BODY (unwrapped), and the
+        # HTTP status is the invoke status. (v0.8.0 walk fix — Teams rejects
+        # the {status,body} wrapper as "Unable to reach app".)
+        assert r.json() == {"text": "thanks"}
         # No serviceUrl reply for invoke.
         assert capture["reply"] == []
 

@@ -129,14 +129,51 @@ reaches out first) at `~/.hermes/agents/<slug>/conversations.json`,
 mode 0600. Implemented in slice 19o (`ConversationRegistry`); see
 `hermes_a365.plugin.conversations` for the schema.
 
+## Invoke activities — `task/fetch` (v0.8.0 walk-validated, 2026-07-01)
+
+The BF `invoke` request/response wire, validated end-to-end against the
+satscryption tenant on the v0.8.0 walk (#18 / slice 19w).
+
+**`task/fetch` request** — triggered on **Teams 1:1** by an Adaptive Card
+`Action.Submit` carrying `data.msteams.type = "task/fetch"`:
+`type: "invoke"`, `name: "task/fetch"`, `channelId: "msteams"`,
+`conversation.conversationType: "personal"`, Path B (inbound token
+`iss = https://api.botframework.com`). `value` carries the invoking action's
+`data`.
+
+**`task/fetch` response** — the HTTP body **IS** the taskInfo, and the HTTP
+status = the invoke status. Do **NOT** wrap it in `{"status", "body"}` (that
+is an SDK abstraction the transport unwraps; sending it makes Teams reject
+the response as *"Unable to reach app"*):
+
+```json
+{ "task": { "type": "continue",
+            "value": { "title": "...",
+                       "card": { "contentType": "application/vnd.microsoft.card.adaptive",
+                                 "content": { "type": "AdaptiveCard", "version": "1.5", "body": [] } } } } }
+```
+
+(`type: "message"` with a string `value` is the close-with-message variant.)
+
+**Surface behaviour (decisive finding):**
+
+- **Teams** delivers `task/fetch` to the CEA endpoint and renders the returned
+  task module. ✅
+- **Copilot Chat** renders the Adaptive Card *body* but **strips the
+  `Action.Submit` task button** — it is an `Action.Execute` /
+  `adaptiveCard/action` surface, so `task/fetch` is not triggerable there. The
+  Copilot-native invoke is `adaptiveCard/action` (a v0.8.1 child).
+
 ## Open snapshots
 
 Forward-looking documentation gaps; capture during the next live walk:
 
+- The exact inbound `value` payload of a `task/fetch` invoke (not logged on
+  the v0.8.0 walk) and the BF error envelope for a malformed invoke response.
 - Catalogue the actual error envelopes BF returns on bad activity
   (round-N walkthroughs have only validated happy paths).
 - Snapshot a real `query-entra --instance-channel` payload from a
   Frontier-Preview tenant for inclusion above.
-- Invoke-activity shapes (`task/{fetch,submit}`, `composeExtension/*`,
-  `signin/*`, `search`) are tracked under
-  [#18](../../issues/18) (slice 19w).
+- Remaining invoke-activity shapes (`task/submit`, `composeExtension/*`,
+  `signin/*`, `search`, `adaptiveCard/action`) are tracked under
+  [#18](../../issues/18) (slice 19w); `task/fetch` captured above.

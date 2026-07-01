@@ -47,6 +47,27 @@ an early v0.8.0 gate.
   Previously `serve` validated only the AAD-v2 shape and would reject
   legitimate Path B Bot Framework Connector tokens (Direct Line / Teams via
   Bot Service / Copilot fabric).
+- **#18 (walk-caught):** the invokeResponse was serialised as a
+  `{"status", "body"}` wrapper; the BF wire wants the `body` (the taskInfo /
+  result) as the **HTTP body** with the **HTTP status** = the invoke status.
+  Teams rejected the wrapper with "Unable to reach app". Both runtimes now
+  serialise as `JSONResponse(resp.body, status_code=resp.status)`; the
+  misleading `InvokeResponse.as_dict()` was removed. (Neither the unit tests
+  nor the red-team caught this — both deferred to the never-live-validated
+  pre-existing `serve` shape; the walk broke it.)
+
+### Validated (v0.8.0 walk, 2026-07-01)
+
+- **`task/fetch` end-to-end on Teams 1:1** against the satscryption tenant:
+  a real `task/fetch` invoke arrives → Path B auth → typed dispatch →
+  synchronous taskInfo → Teams renders the task module ("Request received").
+  #18's live-walkthrough closure criterion is met.
+- **Copilot Chat does not surface `task/fetch`** — it renders the Adaptive
+  Card body but strips the `Action.Submit` task button (Copilot is an
+  `Action.Execute` / `adaptiveCard/action` surface). So `task/fetch` is a
+  Teams-surface invoke; the Copilot-native invoke (`adaptiveCard/action`) is
+  the v0.8.1 child for that surface. Real shapes captured in
+  [`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md).
 
 ### Deferred (→ v0.8.1)
 

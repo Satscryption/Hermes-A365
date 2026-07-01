@@ -5347,9 +5347,9 @@ class TestInvokeRoute:
             headers={"Authorization": "Bearer pretend"},
         )
         assert r.status_code == 200, r.text
-        payload = r.json()
-        assert payload["status"] == 200
-        assert payload["body"]["task"]["type"] == "continue"
+        # BF wire: the taskInfo is the top-level HTTP body (NOT a {status,body}
+        # wrapper); the HTTP status carries the invoke status. (v0.8.0 walk fix.)
+        assert r.json()["task"]["type"] == "continue"
         # Handled INLINE — never dispatched to the fire-and-forget agent loop.
         assert a._handled_events == []
         # No AI-generated content label on an invoke response.
@@ -5364,8 +5364,9 @@ class TestInvokeRoute:
             json=self._invoke_body(name="composeExtension/query"),
             headers={"Authorization": "Bearer pretend"},
         )
-        assert r.status_code == 200
-        assert r.json()["status"] == 501
+        # Unknown name -> HTTP 501 (BF "not implemented") with the error body.
+        assert r.status_code == 501
+        assert "error" in r.json()
         assert a._handled_events == []
 
     def test_non_dict_value_handled_gracefully(
@@ -5379,7 +5380,7 @@ class TestInvokeRoute:
             headers={"Authorization": "Bearer pretend"},
         )
         assert r.status_code == 200
-        assert r.json()["status"] == 200
+        assert r.json()["task"]["type"] == "continue"
 
     def test_message_activity_still_dispatches(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5411,8 +5412,10 @@ class TestInvokeRoute:
             json=self._invoke_body(),
             headers={"Authorization": "Bearer pretend"},
         )
-        assert r.status_code == 200
-        assert r.json() == {"status": 500, "body": {"error": "invoke handler error"}}
+        # Graceful degradation: a handler crash -> HTTP 500 with the error body,
+        # never an unhandled exception.
+        assert r.status_code == 500
+        assert r.json() == {"error": "invoke handler error"}
         assert a._handled_events == []
 
     def test_claims_wired_into_invoke_context(

@@ -11,12 +11,10 @@ from hermes_a365 import invoke
 # ---------------------------------------------------------------------------
 
 
-def test_invoke_response_as_dict() -> None:
-    assert invoke.InvokeResponse(200, {"task": {}}).as_dict() == {
-        "status": 200,
-        "body": {"task": {}},
-    }
-    assert invoke.InvokeResponse(501).as_dict() == {"status": 501, "body": None}
+def test_invoke_response_fields() -> None:
+    r = invoke.InvokeResponse(200, {"task": {}})
+    assert r.status == 200 and r.body == {"task": {}}
+    assert invoke.InvokeResponse(501).body is None
 
 
 # ---------------------------------------------------------------------------
@@ -133,10 +131,8 @@ def test_task_continue_shape_and_no_ai_label() -> None:
 
 def test_task_message_shape() -> None:
     resp = invoke.task_message("done")
-    assert resp.as_dict() == {
-        "status": 200,
-        "body": {"task": {"type": "message", "value": "done"}},
-    }
+    assert resp.status == 200
+    assert resp.body == {"task": {"type": "message", "value": "done"}}
 
 
 # ---------------------------------------------------------------------------

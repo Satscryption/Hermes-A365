@@ -834,7 +834,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 logger.info(
                     "inbound invoke name=%s status=%s", invoke_name, resp.status
                 )
-                return JSONResponse(resp.as_dict())
+                # BF wire: the HTTP body is the invokeResponse *body*, and the
+                # HTTP status is its status — NOT a {status, body} wrapper. The
+                # {status, body} shape is an SDK abstraction the transport
+                # unwraps. (v0.8.0 walk: Teams rejected the wrapper with
+                # "Unable to reach app"; the taskInfo must be the top-level body.)
+                return JSONResponse(resp.body, status_code=resp.status)
 
             # Slice 19q — channel-control + synthetic agents-channel
             # probes ack-and-bail before the registry upsert. They're
