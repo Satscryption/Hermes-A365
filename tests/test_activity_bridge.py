@@ -2397,22 +2397,27 @@ class TestServeDualJwtDispatch:
                 headers={"Authorization": f"Bearer {_unverifiable_token(iss)}"},
             )
         assert r.status_code == 200, r.text
-        return a365, bf, activity
+        return a365, bf, activity, cfg
 
     def test_bf_issuer_routes_to_bf_validator(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import hermes_a365.activity_bridge as ab
 
-        a365, bf, activity = self._run(monkeypatch, ab.BF_ISSUER)
+        a365, bf, activity, cfg = self._run(monkeypatch, ab.BF_ISSUER)
         bf.assert_awaited_once()
         a365.assert_not_awaited()
         assert bf.await_args.kwargs["expected_service_url"] == activity["serviceUrl"]
+        # Parity with the plugin adapter: expected_app_id falls back to the
+        # blueprint id when bf_app_id is unset.
+        assert bf.await_args.kwargs["expected_app_id"] == (
+            cfg.bf_app_id or cfg.blueprint_client_id
+        )
 
     def test_aad_issuer_routes_to_aad_validator(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a365, bf, _ = self._run(
+        a365, bf, _, _ = self._run(
             monkeypatch, "https://login.microsoftonline.com/tid/v2.0"
         )
         a365.assert_awaited_once()

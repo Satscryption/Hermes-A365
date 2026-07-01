@@ -44,6 +44,13 @@ def test_classify_chat_type(conv_type: str | None, path_tag: str, expected: str)
     assert invoke.classify_chat_type(activity, path_tag) == expected
 
 
+@pytest.mark.parametrize("bad_conv", ["19:x@thread.v2", [1, 2], 7])
+def test_classify_chat_type_non_dict_conversation_degrades(bad_conv: object) -> None:
+    # A truthy non-dict conversation must not crash (C1 regression guard) —
+    # `or {}` only catches falsy values, so an isinstance guard is required.
+    assert invoke.classify_chat_type({"conversation": bad_conv}, "B") == "dm"
+
+
 # ---------------------------------------------------------------------------
 # build_invoke_context — identity + value parsing
 # ---------------------------------------------------------------------------
@@ -93,6 +100,16 @@ def test_build_invoke_context_non_dict_value_becomes_empty() -> None:
         _invoke_activity(value="not-a-dict"), claims={}, path_tag="B"
     )
     assert ctx.value == {}
+
+
+def test_build_invoke_context_non_dict_conversation_degrades() -> None:
+    ctx = invoke.build_invoke_context(
+        {"name": "task/fetch", "conversation": "19:x@thread.v2"},
+        claims={},
+        path_tag="B",
+    )
+    assert ctx.conv == {}
+    assert ctx.chat_type == "dm"  # degrades, does not raise
 
 
 # ---------------------------------------------------------------------------

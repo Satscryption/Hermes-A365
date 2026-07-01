@@ -5394,3 +5394,63 @@ class TestInvokeRoute:
         assert r.status_code == 200
         assert r.json()["status"] == "dispatched"
         assert len(a._handled_events) == 1
+
+    def test_handler_exception_returns_graceful_500(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A handler crash must degrade to a {status:500} invokeResponse, never
+        # an unhandled HTTP 500.
+        a, client = self._client(monkeypatch)
+
+        async def boom(ctx: Any) -> Any:
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(adapter_mod.invoke, "dispatch_invoke", boom)
+        r = client.post(
+            "/api/messages",
+            json=self._invoke_body(),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        assert r.json() == {"status": 500, "body": {"error": "invoke handler error"}}
+        assert a._handled_events == []
+
+    def test_claims_wired_into_invoke_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The load-bearing new behavior: the validated JWT claims (previously
+        # discarded) feed InvokeContext identity.
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(
+                return_value={
+                    "oid": "claim-oid",
+                    "tid": "claim-tid",
+                    "preferred_username": "u@x",
+                }
+            ),
+        )
+        a._http_client = MagicMock()
+        captured: dict[str, Any] = {}
+
+        async def capture(ctx: Any) -> Any:
+            captured["ctx"] = ctx
+            return adapter_mod.invoke.InvokeResponse(200, {"ok": True})
+
+        monkeypatch.setattr(adapter_mod.invoke, "dispatch_invoke", capture)
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages",
+            json=self._invoke_body(),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        ctx = captured["ctx"]
+        assert ctx.user_oid == "claim-oid"
+        assert ctx.tenant_id == "claim-tid"
+        assert ctx.user_upn == "u@x"

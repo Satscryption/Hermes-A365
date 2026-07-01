@@ -83,7 +83,8 @@ def classify_chat_type(activity: dict[str, Any], path_tag: str) -> str:
     so a groupChat arriving on Path B is Copilot Chat. This is deliberately
     the minimal, non-defeatable signal — no channelData/tenant heuristic.
     """
-    conv = activity.get("conversation") or {}
+    conv = activity.get("conversation")
+    conv = conv if isinstance(conv, dict) else {}
     conv_type = str(conv.get("conversationType") or "personal")
     if conv_type == "channel":
         return "channel"

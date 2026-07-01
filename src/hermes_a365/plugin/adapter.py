@@ -813,24 +813,26 @@ class Agent365Adapter(BasePlatformAdapter):
             # The handler builds its response locally; a handler crash returns a
             # graceful {status:500} invokeResponse rather than an HTTP 500.
             if str(activity.get("type") or "") == "invoke":
-                path_tag = bridge._inbound_path_tag(activity)
-                ctx = invoke.build_invoke_context(
-                    activity, claims=claims, path_tag=path_tag
-                )
+                invoke_name = str(activity.get("name") or "")
+                # Context assembly (_inbound_path_tag / build_invoke_context) is
+                # inside the try too: a wire-shape surprise on the live walk
+                # must degrade to a graceful {status:500} invokeResponse, never
+                # an unhandled HTTP 500 that Microsoft reads as an outage.
                 try:
+                    path_tag = bridge._inbound_path_tag(activity)
+                    ctx = invoke.build_invoke_context(
+                        activity, claims=claims, path_tag=path_tag
+                    )
                     resp = await invoke.dispatch_invoke(ctx)
                 except Exception as e:
                     logger.error(
-                        "agent365 invoke handler failed: name=%s %s", ctx.name, e
+                        "agent365 invoke handler failed: name=%s %s", invoke_name, e
                     )
                     resp = invoke.InvokeResponse(
                         status=500, body={"error": "invoke handler error"}
                     )
                 logger.info(
-                    "inbound invoke name=%s path=%s status=%s",
-                    ctx.name,
-                    path_tag,
-                    resp.status,
+                    "inbound invoke name=%s status=%s", invoke_name, resp.status
                 )
                 return JSONResponse(resp.as_dict())
 
