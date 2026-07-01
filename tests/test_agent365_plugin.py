@@ -5309,3 +5309,151 @@ class TestActivityToEvent:
             "entities": [self._mention()],  # no text field -> nothing removed
         }
         assert self._event(monkeypatch, act).text == "  keep   these   spaces  "
+
+
+class TestInvokeRoute:
+    """#18 / 19w-a — invoke activities are handled synchronously in the route,
+    NOT dispatched to the fire-and-forget agent loop."""
+
+    def _client(self, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, Any]:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"oid": "o1", "tid": "t1"}),
+        )
+        a._http_client = MagicMock()
+        return a, TestClient(a.build_app())
+
+    def _invoke_body(
+        self, *, name: str = "task/fetch", value: Any = None, conv_id: str = "conv-I"
+    ) -> dict[str, Any]:
+        body = _make_inbound(conv_id=conv_id)
+        body["type"] = "invoke"
+        body["name"] = name
+        body["value"] = {"commandId": "x"} if value is None else value
+        return body
+
+    def test_task_fetch_returns_sync_invoke_response(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, client = self._client(monkeypatch)
+        r = client.post(
+            "/api/messages",
+            json=self._invoke_body(),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200, r.text
+        # BF wire: the taskInfo is the top-level HTTP body (NOT a {status,body}
+        # wrapper); the HTTP status carries the invoke status. (v0.8.0 walk fix.)
+        assert r.json()["task"]["type"] == "continue"
+        # Handled INLINE — never dispatched to the fire-and-forget agent loop.
+        assert a._handled_events == []
+        # No AI-generated content label on an invoke response.
+        assert "AIGeneratedContent" not in r.text
+
+    def test_unknown_invoke_name_is_501_not_dispatched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, client = self._client(monkeypatch)
+        r = client.post(
+            "/api/messages",
+            json=self._invoke_body(name="composeExtension/query"),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        # Unknown name -> HTTP 501 (BF "not implemented") with the error body.
+        assert r.status_code == 501
+        assert "error" in r.json()
+        assert a._handled_events == []
+
+    def test_non_dict_value_handled_gracefully(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # task/fetch ignores value; a non-dict value must not 500.
+        _a, client = self._client(monkeypatch)
+        r = client.post(
+            "/api/messages",
+            json=self._invoke_body(value="not-a-dict"),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        assert r.json()["task"]["type"] == "continue"
+
+    def test_message_activity_still_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Regression: the invoke branch must not capture normal messages.
+        a, client = self._client(monkeypatch)
+        r = client.post(
+            "/api/messages",
+            json=_make_inbound(text="hi", conv_id="conv-M"),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        assert r.json()["status"] == "dispatched"
+        assert len(a._handled_events) == 1
+
+    def test_handler_exception_returns_graceful_500(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A handler crash must degrade to a {status:500} invokeResponse, never
+        # an unhandled HTTP 500.
+        a, client = self._client(monkeypatch)
+
+        async def boom(ctx: Any) -> Any:
+            raise RuntimeError("kaboom")
+
+        monkeypatch.setattr(adapter_mod.invoke, "dispatch_invoke", boom)
+        r = client.post(
+            "/api/messages",
+            json=self._invoke_body(),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        # Graceful degradation: a handler crash -> HTTP 500 with the error body,
+        # never an unhandled exception.
+        assert r.status_code == 500
+        assert r.json() == {"error": "invoke handler error"}
+        assert a._handled_events == []
+
+    def test_claims_wired_into_invoke_context(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The load-bearing new behavior: the validated JWT claims (previously
+        # discarded) feed InvokeContext identity.
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(
+                return_value={
+                    "oid": "claim-oid",
+                    "tid": "claim-tid",
+                    "preferred_username": "u@x",
+                }
+            ),
+        )
+        a._http_client = MagicMock()
+        captured: dict[str, Any] = {}
+
+        async def capture(ctx: Any) -> Any:
+            captured["ctx"] = ctx
+            return adapter_mod.invoke.InvokeResponse(200, {"ok": True})
+
+        monkeypatch.setattr(adapter_mod.invoke, "dispatch_invoke", capture)
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages",
+            json=self._invoke_body(),
+            headers={"Authorization": "Bearer pretend"},
+        )
+        assert r.status_code == 200
+        ctx = captured["ctx"]
+        assert ctx.user_oid == "claim-oid"
+        assert ctx.tenant_id == "claim-tid"
+        assert ctx.user_upn == "u@x"

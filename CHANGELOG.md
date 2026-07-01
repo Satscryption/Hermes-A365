@@ -4,6 +4,81 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] — 2026-07-01
+
+Milestone v0.8.0 — the **BF invoke-activity foundation** (#18 / slice 19w),
+the floor the 0.8 arc builds on. Ships on unit tests; a coordinated live
+invoke walk (the #18 closure criterion) runs after the foundation lands as
+an early v0.8.0 gate.
+
+### Added
+
+- **#18 (19w-a):** typed, synchronous invoke dispatch. Invoke activities are
+  a request/response wire — the reply must return in the *same* HTTP turn as
+  a `{status, body}` invokeResponse, not via the async `send()` path.
+  Previously the plugin adapter let invokes fall through to `handle_message`
+  (fire-and-forget), so Microsoft logged a 200 and the user saw no response.
+  New shared `hermes_a365/invoke.py` — `InvokeResponse` / `InvokeContext`, a
+  per-`name` dispatch registry with a total 501 default (unknown names never
+  500 the endpoint), `classify_chat_type` (distinguishes Copilot Chat from a
+  genuine Teams group via the inbound path tag), and response builders that
+  build `card.invoke.response` envelopes **directly** — never through
+  `render_reply_activity`, so an invoke response never inherits the #73a
+  "AI generated" content-label entity. The plugin route intercepts `invoke`
+  after auth + dedupe + lifecycle, before `_should_dispatch`, and returns the
+  synchronous body; the JWT validators' claims (previously discarded) now
+  feed `InvokeContext` identity.
+- **#18 (19w-a): `task/fetch`** is the first end-to-end invoke name —
+  user-action-triggered (so live-walk-able on demand), a self-contained
+  `taskInfo` card echo needing no tool token. The parent wire shape for the
+  v0.8.1 children (#73 `message/*`, #77 `adaptiveCard/action`, …).
+- **#18 (19w-b): `TokenFactory`** — the seam for minting outbound *tool*
+  tokens (Graph/app) a per-name handler needs, reusing the existing
+  `_inbound_path_tag` Path-A/B dispatch (not re-deriving the chain).
+  `for_graph` is implemented (Graph works on both paths); `for_app` /
+  `for_workiq` (#21) are hooks their consuming v0.8.1 slices implement. No
+  v0.8.0 handler needs a tool token, so this is a landed foundation seam.
+
+### Fixed
+
+- **#18 (review finding 3):** the standalone `serve` runtime now dual-
+  dispatches inbound JWTs — BF-issuer tokens through `validate_inbound_jwt_bf`,
+  A365/AAD-v2 through `validate_inbound_jwt` — matching the plugin adapter.
+  Previously `serve` validated only the AAD-v2 shape and would reject
+  legitimate Path B Bot Framework Connector tokens (Direct Line / Teams via
+  Bot Service / Copilot fabric).
+- **#18 (walk-caught):** the invokeResponse was serialised as a
+  `{"status", "body"}` wrapper; the BF wire wants the `body` (the taskInfo /
+  result) as the **HTTP body** with the **HTTP status** = the invoke status.
+  Teams rejected the wrapper with "Unable to reach app". Both runtimes now
+  serialise as `JSONResponse(resp.body, status_code=resp.status)`; the
+  misleading `InvokeResponse.as_dict()` was removed. (Neither the unit tests
+  nor the red-team caught this — both deferred to the never-live-validated
+  pre-existing `serve` shape; the walk broke it.)
+
+### Validated (v0.8.0 walk, 2026-07-01)
+
+- **`task/fetch` end-to-end on Teams 1:1** against the satscryption tenant:
+  a real `task/fetch` invoke arrives → Path B auth → typed dispatch →
+  synchronous taskInfo → Teams renders the task module ("Request received").
+  #18's live-walkthrough closure criterion is met.
+- **Copilot Chat does not surface `task/fetch`** — it renders the Adaptive
+  Card body but strips the `Action.Submit` task button (Copilot is an
+  `Action.Execute` / `adaptiveCard/action` surface). So `task/fetch` is a
+  Teams-surface invoke; the Copilot-native invoke (`adaptiveCard/action`) is
+  the v0.8.1 child for that surface. Real shapes captured in
+  [`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md).
+
+### Deferred (→ v0.8.1)
+
+- All other per-name invoke handlers (#73 `message/submitAction`+`message/fetchTask`,
+  #76 `fileConsent/invoke`, #82 `handoff/action`, #77 `adaptiveCard/action`,
+  `search`, `signin/*`); `composeExtension/*` moves to the sibling Teams
+  adapter. 19w-g invoke idempotency replay (`task/fetch` is idempotent).
+  Typed invoke dispatch on `serve` (its operator webhook owns invoke
+  responses). The agent-loop→invoke bridge (the plugin's `handle_message` is
+  fire-and-forget); `task/fetch` synthesizes its first card locally.
+
 ## [0.7.6] — 2026-06-30
 
 Milestone v0.7.6 — collapsed pre-0.8 polish + manifest currency (absorbed

@@ -17,7 +17,7 @@ from collections.abc import Callable
 from io import BytesIO
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import jwt as _jwt
@@ -2080,8 +2080,10 @@ class TestServeApp:
         ) as client:
             r = client.post("/api/messages", json=invoke)
         assert r.status_code == 200
-        # Invoke replies are SYNC: response body is the invokeResponse.
-        assert r.json() == {"status": 200, "body": {"text": "thanks"}}
+        # BF wire: HTTP body is the invokeResponse BODY (unwrapped), and the
+        # HTTP status is the invoke status. (v0.8.0 walk fix — Teams rejects
+        # the {status,body} wrapper as "Unable to reach app".)
+        assert r.json() == {"text": "thanks"}
         # No serviceUrl reply for invoke.
         assert capture["reply"] == []
 
@@ -2356,3 +2358,131 @@ class TestUpdateEndpointCli:
         )
         assert rc == 2
         assert "must be HTTPS" in capsys.readouterr().err
+
+
+def _unverifiable_token(iss: str) -> str:
+    """A JWT parseable enough for peek_unverified_iss; signature is fake (the
+    real validators are monkeypatched so it never matters)."""
+    import base64
+    import json
+
+    def _seg(obj: dict[str, Any]) -> str:
+        return base64.urlsafe_b64encode(json.dumps(obj).encode()).rstrip(b"=").decode()
+
+    header = _seg({"alg": "RS256", "typ": "JWT", "kid": "fake"})
+    payload = _seg({"iss": iss, "aud": "x", "exp": 9999999999})
+    return f"{header}.{payload}.AAAA"
+
+
+class TestServeDualJwtDispatch:
+    """#18 finding 3 — serve now dispatches BF-issuer tokens to
+    validate_inbound_jwt_bf, not only the A365/AAD-v2 validator."""
+
+    def _run(
+        self, monkeypatch: pytest.MonkeyPatch, iss: str
+    ) -> tuple[AsyncMock, AsyncMock, Any]:
+        import hermes_a365.activity_bridge as ab
+
+        cfg = _cfg()
+        cfg.skip_jwt_validation = False
+        a365 = AsyncMock(return_value={"iss": "aad"})
+        bf = AsyncMock(return_value={"iss": ab.BF_ISSUER})
+        monkeypatch.setattr(ab, "validate_inbound_jwt", a365)
+        monkeypatch.setattr(ab, "validate_inbound_jwt_bf", bf)
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        # conversationUpdate acks right after the JWT gate — no webhook needed.
+        activity = {**_inbound_message_activity(), "type": "conversationUpdate"}
+        with _client_for(cfg, capture=capture) as client:
+            r = client.post(
+                "/api/messages",
+                json=activity,
+                headers={"Authorization": f"Bearer {_unverifiable_token(iss)}"},
+            )
+        assert r.status_code == 200, r.text
+        return a365, bf, activity, cfg
+
+    def test_bf_issuer_routes_to_bf_validator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        a365, bf, activity, cfg = self._run(monkeypatch, ab.BF_ISSUER)
+        bf.assert_awaited_once()
+        a365.assert_not_awaited()
+        assert bf.await_args.kwargs["expected_service_url"] == activity["serviceUrl"]
+        # Parity with the plugin adapter: expected_app_id falls back to the
+        # blueprint id when bf_app_id is unset.
+        assert bf.await_args.kwargs["expected_app_id"] == (
+            cfg.bf_app_id or cfg.blueprint_client_id
+        )
+
+    def test_aad_issuer_routes_to_aad_validator(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a365, bf, _, _ = self._run(
+            monkeypatch, "https://login.microsoftonline.com/tid/v2.0"
+        )
+        a365.assert_awaited_once()
+        bf.assert_not_awaited()
+
+
+class TestTokenFactory:
+    """#18 / 19w-b — TokenFactory mints tool tokens via the existing
+    Path-A/Path-B dispatch, without re-deriving the chain."""
+
+    def _factory(self) -> Any:
+        import hermes_a365.activity_bridge as ab
+
+        return ab.TokenFactory(
+            client=MagicMock(),
+            cfg=_cfg(),
+            fmi_cache=MagicMock(),
+            user_cache=MagicMock(),
+            bf_cache=MagicMock(),
+        )
+
+    @pytest.mark.asyncio
+    async def test_for_graph_path_a_uses_user_fic_at_graph_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        mint = AsyncMock(return_value="tokenA")
+        monkeypatch.setattr(ab, "acquire_outbound_token", mint)
+        activity = {
+            "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
+            "conversation": {"tenantId": "t"},
+        }
+        assert await self._factory().for_graph(activity) == "tokenA"
+        assert mint.await_args.kwargs["scope"] == f"{ab.GRAPH_RESOURCE}/.default"
+
+    @pytest.mark.asyncio
+    async def test_for_graph_path_b_uses_client_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        mint = MagicMock(return_value={"access_token": "tokenB"})
+        monkeypatch.setattr(ab, "acquire_token", mint)
+        activity = {
+            "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
+            "recipient": {},
+            "conversation": {},
+        }
+        assert await self._factory().for_graph(activity) == "tokenB"
+        assert mint.call_args.kwargs["resource"] == ab.GRAPH_RESOURCE
+
+    @pytest.mark.asyncio
+    async def test_for_graph_unknown_path_raises(self) -> None:
+        with pytest.raises(RuntimeError, match="Path A or Path B"):
+            await self._factory().for_graph(
+                {"recipient": {}, "conversation": {}, "serviceUrl": "https://x.example/y"}
+            )
+
+    @pytest.mark.asyncio
+    async def test_for_app_and_for_workiq_not_implemented(self) -> None:
+        tf = self._factory()
+        with pytest.raises(NotImplementedError):
+            await tf.for_app({"recipient": {}}, "some-resource")
+        with pytest.raises(NotImplementedError):
+            await tf.for_workiq(object())

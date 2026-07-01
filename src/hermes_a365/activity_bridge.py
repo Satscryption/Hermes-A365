@@ -1794,6 +1794,101 @@ async def acquire_reply_token(
 
 
 # ---------------------------------------------------------------------------
+# TokenFactory — slice 19w-b (#18)
+# ---------------------------------------------------------------------------
+
+
+class TokenFactory:
+    """Mint OUTBOUND TOOL tokens (Graph / another app) a per-invoke-name
+    handler needs — distinct from the reply/serviceUrl token
+    ``acquire_reply_token`` mints.
+
+    Path A vs Path B selection reuses ``_inbound_path_tag`` — the SAME
+    classifier ``acquire_reply_token`` uses — so it does NOT re-derive the
+    token chain. In v0.8.0 no shipped invoke handler needs a tool token
+    (``task/fetch`` is a pure card echo), so this is the landed *foundation
+    seam* that v0.8.1 tool-backed names (``signin/tokenExchange``,
+    ``fileConsent/invoke``, a Graph-backed ``search``) plug into without
+    re-plumbing. ``for_graph`` is implemented — Graph is the one resource that
+    works on both paths (it is exempt from the AADSTS82001 app-only limit);
+    ``for_app`` and ``for_workiq`` are hooks their consuming slices implement.
+    """
+
+    def __init__(
+        self,
+        *,
+        client: Any,
+        cfg: BridgeConfig,
+        fmi_cache: _FmiCache,
+        user_cache: _UserTokenCache,
+        bf_cache: _BfTokenCache,
+    ) -> None:
+        self._client = client
+        self._cfg = cfg
+        self._fmi_cache = fmi_cache
+        self._user_cache = user_cache
+        self._bf_cache = bf_cache
+
+    async def for_graph(
+        self, activity: dict[str, Any], *, now: float | None = None
+    ) -> str:
+        """Mint a Microsoft Graph bearer for the inbound activity's identity.
+
+        Path A → the three-stage user-FIC chain (delegated, user-context) at
+        the Graph scope. Path B → an app-only ``client_credentials`` token
+        (Graph is exempt from AADSTS82001, so the Path B identity mints it
+        directly). Raises for an unclassifiable activity rather than guessing.
+        """
+        path_tag = _inbound_path_tag(activity)
+        if path_tag == "A":
+            return await acquire_outbound_token(
+                client=self._client,
+                cfg=self._cfg,
+                activity=activity,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+                scope=f"{GRAPH_RESOURCE}/.default",
+                now=now,
+            )
+        if path_tag == "B":
+            payload = acquire_token(
+                tenant_id=self._cfg.tenant_id,
+                client_id=self._cfg.bf_app_id or self._cfg.blueprint_client_id,
+                client_secret=(
+                    self._cfg.bf_client_secret or self._cfg.blueprint_client_secret
+                ),
+                resource=GRAPH_RESOURCE,
+            )
+            return str(payload["access_token"])
+        raise RuntimeError(
+            "cannot classify inbound activity as Path A or Path B for a Graph "
+            f"token: recipient={activity.get('recipient')!r} "
+            f"serviceUrl={activity.get('serviceUrl')!r}"
+        )
+
+    async def for_app(
+        self,
+        activity: dict[str, Any],
+        target_resource: str,
+        *,
+        now: float | None = None,
+    ) -> str:
+        """Mint a token for an arbitrary tool app — lands with the v0.8.1
+        tool-backed invoke names (signin/tokenExchange, fileConsent) that need
+        it. A Path B non-Graph resource hits AADSTS82001 on the agentic app,
+        which that slice surfaces as an operator-actionable error."""
+        raise NotImplementedError(
+            "TokenFactory.for_app lands with the v0.8.1 tool-backed invoke names"
+        )
+
+    async def for_workiq(self, server: Any) -> str:
+        """Work IQ V2 token bootstrap — a #21 hook, not implemented in v0.8.0."""
+        raise NotImplementedError(
+            "TokenFactory.for_workiq (Work IQ V2 token bootstrap) is #21"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Webhook forwarding
 # ---------------------------------------------------------------------------
 
@@ -2022,6 +2117,7 @@ def make_app(
     *,
     http_client: Any | None = None,
     jwks_cache: _JwksCache | None = None,
+    bf_jwks_cache: _JwksCache | None = None,
     fmi_cache: _FmiCache | None = None,
     user_cache: _UserTokenCache | None = None,
     bf_cache: _BfTokenCache | None = None,
@@ -2041,6 +2137,8 @@ def make_app(
         http_client = _httpx.AsyncClient()
     if jwks_cache is None:
         jwks_cache = _JwksCache()
+    if bf_jwks_cache is None:
+        bf_jwks_cache = _JwksCache()
     if fmi_cache is None:
         fmi_cache = _FmiCache()
     if user_cache is None:
@@ -2092,15 +2190,33 @@ def make_app(
             if not authorization or not authorization.lower().startswith("bearer "):
                 raise _HTTPException(status_code=401, detail="missing bearer token")
             token = authorization.split(None, 1)[1]
+            # Slice 19w-a (#18, review finding 3): dual inbound-JWT dispatch,
+            # matching the plugin adapter. Previously serve validated ONLY the
+            # AAD-v2 shape and would reject legitimate Path B BF Connector
+            # tokens (Direct Line / Teams via Bot Service / Copilot fabric).
+            # Peek the unverified issuer to pick the validator; BF-issuer tokens
+            # go through validate_inbound_jwt_bf, A365/AAD-v2 through
+            # validate_inbound_jwt. Both do full signature checks, so a
+            # malformed token is rejected either way; default to AAD-v2 on peek
+            # failure to preserve pre-fix behaviour.
             try:
-                await validate_inbound_jwt(
-                    token=token,
-                    tenant_id=cfg.tenant_id,
-                    expected_app_id=cfg.blueprint_client_id,
-                    azp_allowlist=cfg.inbound_azp_allowlist,
-                    client=http_client,
-                    cache=jwks_cache,
-                )
+                if peek_unverified_iss(token) == BF_ISSUER:
+                    await validate_inbound_jwt_bf(
+                        token=token,
+                        expected_app_id=cfg.bf_app_id or cfg.blueprint_client_id,
+                        expected_service_url=service_url,
+                        client=http_client,
+                        cache=bf_jwks_cache,
+                    )
+                else:
+                    await validate_inbound_jwt(
+                        token=token,
+                        tenant_id=cfg.tenant_id,
+                        expected_app_id=cfg.blueprint_client_id,
+                        azp_allowlist=cfg.inbound_azp_allowlist,
+                        client=http_client,
+                        cache=jwks_cache,
+                    )
             except JwtValidationError as e:
                 raise _HTTPException(status_code=403, detail=str(e)) from e
 
@@ -2143,14 +2259,21 @@ def make_app(
                 return _reply_failed_response(reply_error)
             return _JSONResponse({"status": "webhook_error"}, status_code=200)
 
-        # Invoke replies must be synchronous: return the invokeResponse body
-        # in this HTTP turn.
+        # Invoke replies must be synchronous. BF wire: the HTTP body is the
+        # invokeResponse *body* and the HTTP status is its status — NOT a
+        # {status, body} wrapper (that is an SDK abstraction the transport
+        # unwraps; sending the wrapper makes Teams reject it as "Unable to
+        # reach app"). The operator webhook still returns {status, body}; we
+        # unwrap it here.
         if activity_type == "invoke":
             invoke_response = webhook_resp.get("invokeResponse") or {
                 "status": 200,
                 "body": webhook_resp,
             }
-            return _JSONResponse(invoke_response)
+            return _JSONResponse(
+                invoke_response.get("body"),
+                status_code=int(invoke_response.get("status", 200) or 200),
+            )
 
         # Standard message: render reply and send asynchronously via serviceUrl.
         if not webhook_resp.get("text") and not webhook_resp.get("card"):
