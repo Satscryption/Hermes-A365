@@ -1,9 +1,14 @@
 """Typed Bot Framework invoke-activity dispatch — slice 19w-a (#18).
 
 Invoke activities are a *synchronous* request/response wire: the reply must
-come back in the **same HTTP turn** as the ``POST /api/messages`` request, as
-an invokeResponse body (``{"status": int, "body": {...}}``) — NOT via the
-async ``send()`` reply path. This module is the shared invoke foundation.
+come back in the **same HTTP turn** as the ``POST /api/messages`` request —
+NOT via the async ``send()`` reply path. On that turn the invoke's result
+becomes the HTTP response *directly*: the HTTP status is the invoke status and
+the HTTP body is the taskInfo / result payload. It is **NOT** wrapped in a
+``{"status", "body"}`` object — that wrapper is an SDK abstraction the
+transport unwraps, and sending it makes Teams reject the response ("Unable to
+reach app"); see the ``InvokeResponse`` docstring. This module is the shared
+invoke foundation.
 In v0.8.0 the plugin adapter (``plugin/adapter.py``) consumes it: the plugin
 has no operator webhook, so a local typed handler must produce the
 synchronous invokeResponse. The standalone ``serve`` runtime keeps its

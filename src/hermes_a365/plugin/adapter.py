@@ -753,6 +753,50 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     raise HTTPException(status_code=403, detail=str(e)) from e
 
+            # Slice 19w-a (#18) — invoke activities are a synchronous
+            # request/response wire: the reply is the HTTP response of THIS POST
+            # (HTTP body = the invokeResponse body, HTTP status = the invoke
+            # status). They must NOT fall through to handle_message (fire-and-
+            # forget, no sync return channel) — the pre-#18 bug (Microsoft logs
+            # 200, user sees no response).
+            #
+            # Intercepted BEFORE the idempotency dedupe (#96): an invoke is
+            # synchronous and today's names (task/fetch) are local + idempotent,
+            # so a Bot Framework retry must re-render its taskInfo, not receive
+            # the {status:duplicate} marker (which is not a valid invokeResponse
+            # body). Invokes never enter the agent loop, so bypassing the message
+            # dedupe cannot double-fire it; when a side-effectful invoke name
+            # lands, 19w-g adds per-name response replay. A handler crash still
+            # returns a graceful {status:500} invokeResponse, not an HTTP 500.
+            if str(activity.get("type") or "") == "invoke":
+                invoke_name = str(activity.get("name") or "")
+                # Context assembly (_inbound_path_tag / build_invoke_context) is
+                # inside the try too: a wire-shape surprise on the live walk must
+                # degrade to a graceful {status:500} invokeResponse, never an
+                # unhandled HTTP 500 that Microsoft reads as an outage.
+                try:
+                    path_tag = bridge._inbound_path_tag(activity)
+                    ctx = invoke.build_invoke_context(
+                        activity, claims=claims, path_tag=path_tag
+                    )
+                    resp = await invoke.dispatch_invoke(ctx)
+                except Exception as e:
+                    logger.error(
+                        "agent365 invoke handler failed: name=%s %s", invoke_name, e
+                    )
+                    resp = invoke.InvokeResponse(
+                        status=500, body={"error": "invoke handler error"}
+                    )
+                logger.info(
+                    "inbound invoke name=%s status=%s", invoke_name, resp.status
+                )
+                # BF wire: the HTTP body is the invokeResponse *body*, and the
+                # HTTP status is its status — NOT a {status, body} wrapper (an
+                # SDK abstraction the transport unwraps). v0.8.0 walk: Teams
+                # rejected the wrapper with "Unable to reach app"; the taskInfo
+                # must be the top-level body.
+                return JSONResponse(resp.body, status_code=resp.status)
+
             # Slice 19i — dedupe (conversationId, activityId).
             delivery_id = bridge._activity_delivery_id(activity)
             if delivery_id is not None and self._idempotency_cache.is_duplicate(
@@ -803,43 +847,6 @@ class Agent365Adapter(BasePlatformAdapter):
                     ref.conversation_id if ref is not None else "?(no conv.id)",
                 )
                 return JSONResponse({"status": "acked", "lifecycle": lifecycle_action})
-
-            # Slice 19w-a (#18) — invoke activities are a synchronous
-            # request/response wire: the invokeResponse must come back in THIS
-            # HTTP turn as {status, body}. They must NOT fall through to
-            # handle_message (fire-and-forget, no sync return channel) — that
-            # is the pre-#18 bug (Microsoft logs 200, user sees no response).
-            # Intercept after auth + dedupe + lifecycle, before _should_dispatch.
-            # The handler builds its response locally; a handler crash returns a
-            # graceful {status:500} invokeResponse rather than an HTTP 500.
-            if str(activity.get("type") or "") == "invoke":
-                invoke_name = str(activity.get("name") or "")
-                # Context assembly (_inbound_path_tag / build_invoke_context) is
-                # inside the try too: a wire-shape surprise on the live walk
-                # must degrade to a graceful {status:500} invokeResponse, never
-                # an unhandled HTTP 500 that Microsoft reads as an outage.
-                try:
-                    path_tag = bridge._inbound_path_tag(activity)
-                    ctx = invoke.build_invoke_context(
-                        activity, claims=claims, path_tag=path_tag
-                    )
-                    resp = await invoke.dispatch_invoke(ctx)
-                except Exception as e:
-                    logger.error(
-                        "agent365 invoke handler failed: name=%s %s", invoke_name, e
-                    )
-                    resp = invoke.InvokeResponse(
-                        status=500, body={"error": "invoke handler error"}
-                    )
-                logger.info(
-                    "inbound invoke name=%s status=%s", invoke_name, resp.status
-                )
-                # BF wire: the HTTP body is the invokeResponse *body*, and the
-                # HTTP status is its status — NOT a {status, body} wrapper. The
-                # {status, body} shape is an SDK abstraction the transport
-                # unwraps. (v0.8.0 walk: Teams rejected the wrapper with
-                # "Unable to reach app"; the taskInfo must be the top-level body.)
-                return JSONResponse(resp.body, status_code=resp.status)
 
             # Slice 19q — channel-control + synthetic agents-channel
             # probes ack-and-bail before the registry upsert. They're

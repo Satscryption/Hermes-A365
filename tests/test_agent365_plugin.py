@@ -5396,6 +5396,26 @@ class TestInvokeRoute:
         assert r.json()["status"] == "dispatched"
         assert len(a._handled_events) == 1
 
+    def test_deduped_invoke_retry_redispatches_not_duplicate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #96 — a BF retry of an invoke (same conversationId:activityId) must
+        # re-render its taskInfo, NOT the {status:duplicate} dedupe marker (which
+        # is not a valid invokeResponse body). The invoke branch is intercepted
+        # BEFORE the idempotency dedupe; today's names (task/fetch) are local +
+        # idempotent, so re-running on a retry is safe.
+        a, client = self._client(monkeypatch)
+        headers = {"Authorization": "Bearer pretend"}
+        body = self._invoke_body()  # fixed activity id -> a repeat is a retry
+        r1 = client.post("/api/messages", json=body, headers=headers)
+        r2 = client.post("/api/messages", json=body, headers=headers)
+        for r in (r1, r2):
+            assert r.status_code == 200, r.text
+            assert r.json()["task"]["type"] == "continue"
+            assert r.json().get("status") != "duplicate"
+        # Never dispatched to the fire-and-forget agent loop either.
+        assert a._handled_events == []
+
     def test_handler_exception_returns_graceful_500(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
