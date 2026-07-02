@@ -2226,6 +2226,16 @@ def make_app(
         # them than to drop legitimate traffic on a missing id.
         delivery_id = _activity_delivery_id(activity)
         if delivery_id is not None and idempotency_cache.is_duplicate(delivery_id):
+            # A deduped *invoke* must not return the {status:duplicate} marker as
+            # its body (#96): Teams reads an invoke's HTTP body as the
+            # invokeResponse body, and the marker is not a valid taskInfo/result
+            # envelope. Serve deliberately does NOT re-forward — the whole point
+            # of deduping here is that the operator webhook may be non-idempotent
+            # (see the comment above) — so it returns a benign empty 200 invoke
+            # ack; the original turn already produced the real response. Per-name
+            # response replay is 19w-g.
+            if str(activity.get("type") or "") == "invoke":
+                return _JSONResponse(None, status_code=200)
             return _JSONResponse({"status": "duplicate"})
 
         activity_type = activity.get("type", "message")
@@ -2270,10 +2280,14 @@ def make_app(
                 "status": 200,
                 "body": webhook_resp,
             }
-            return _JSONResponse(
-                invoke_response.get("body"),
-                status_code=int(invoke_response.get("status", 200) or 200),
-            )
+            # #97 — coerce the operator-supplied status defensively: a
+            # non-numeric status (e.g. a string label) must degrade to 200, not
+            # raise a ValueError that becomes an unhandled HTTP 500.
+            try:
+                status_code = int(invoke_response.get("status", 200) or 200)
+            except (TypeError, ValueError):
+                status_code = 200
+            return _JSONResponse(invoke_response.get("body"), status_code=status_code)
 
         # Standard message: render reply and send asynchronously via serviceUrl.
         if not webhook_resp.get("text") and not webhook_resp.get("card"):

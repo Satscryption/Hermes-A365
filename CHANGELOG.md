@@ -4,6 +4,42 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.1] — 2026-07-02
+
+Milestone v0.8.1 — **invoke-foundation hardening**. The three follow-ups the
+#94 review surfaced against the v0.8.0 invoke foundation. No walk — all
+unit-tested; the rich-surface invoke children split forward to v0.8.2–v0.8.5.
+
+### Fixed
+
+- **#96:** a Bot Framework retry of an `invoke` (same
+  `conversationId:activityId` within the idempotency TTL) no longer returns the
+  `{"status": "duplicate"}` dedupe marker as its body. Teams reads an invoke's
+  HTTP body as the invokeResponse body, and the marker is not a valid
+  taskInfo/result envelope, so the task module failed to render on the retry.
+  The two runtimes are fixed differently by design:
+  - **Plugin:** the invoke branch is now intercepted *before* the idempotency
+    dedupe. Today's names (`task/fetch`) are local + idempotent, so a retry
+    safely re-renders; invokes never enter the agent loop, so bypassing the
+    message dedupe cannot double-fire it.
+  - **Serve:** the operator webhook may be non-idempotent (the reason serve
+    dedupes at all), so a deduped invoke does *not* re-forward — it returns a
+    benign empty `200` invoke ack instead of the marker.
+
+  Full per-name response replay (caching the original invokeResponse to replay
+  on retry, for future *side-effectful* names) remains deferred to 19w-g.
+- **#97:** the `serve` invoke pass-through now coerces the operator-supplied
+  status defensively — a non-numeric `status` degrades to `200` instead of
+  raising a `ValueError` that surfaced as an unhandled HTTP 500.
+
+### Documentation
+
+- **#95:** the `invoke.py` module docstring no longer re-teaches the removed
+  `{"status", "body"}` wire wrapper (the shape the v0.8.0 walk fix corrected);
+  it now describes the actual wire — HTTP status = the invoke status, HTTP body
+  = the taskInfo / result payload — matching the `InvokeResponse` class
+  docstring below it.
+
 ## [0.8.0] — 2026-07-01
 
 Milestone v0.8.0 — the **BF invoke-activity foundation** (#18 / slice 19w),

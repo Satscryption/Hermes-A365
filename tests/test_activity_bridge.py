@@ -2087,6 +2087,28 @@ class TestServeApp:
         # No serviceUrl reply for invoke.
         assert capture["reply"] == []
 
+    def test_invoke_non_numeric_status_coerces_to_200(self) -> None:
+        # #97 — a non-numeric operator-webhook status must degrade to 200, not
+        # raise a ValueError that becomes an unhandled HTTP 500.
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        invoke = {
+            **_inbound_message_activity(),
+            "type": "invoke",
+            "name": "adaptiveCard/action",
+        }
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={
+                "invokeResponse": {"status": "not-a-number", "body": {"ok": True}}
+            },
+        ) as client:
+            r = client.post("/api/messages", json=invoke)
+        assert r.status_code == 200
+        assert r.json() == {"ok": True}
+
     def test_conversation_update_acked_no_webhook(self) -> None:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
@@ -2202,6 +2224,37 @@ class TestServeAppDedupe:
         # Webhook + reply only fired once across both POSTs.
         assert len(capture["webhook"]) == 1
         assert len(capture["reply"]) == 1
+
+    def test_deduped_invoke_returns_benign_ack_not_marker(self) -> None:
+        # #96 — a deduped *invoke* must not return the {status:duplicate} marker
+        # as its body (Teams reads an invoke's HTTP body as the invokeResponse
+        # body). Serve does NOT re-forward — the webhook may be non-idempotent —
+        # so it returns a benign empty 200 ack; the webhook still fires once.
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        invoke = {
+            **_inbound_message_activity(),
+            "type": "invoke",
+            "name": "adaptiveCard/action",
+        }
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={
+                "invokeResponse": {"status": 200, "body": {"text": "ok"}}
+            },
+        ) as client:
+            r1 = client.post("/api/messages", json=invoke)
+            r2 = client.post("/api/messages", json=invoke)
+        # First turn: the real unwrapped invokeResponse body.
+        assert r1.status_code == 200
+        assert r1.json() == {"text": "ok"}
+        # Retry: benign empty ack (null body), NOT the {status:duplicate} marker.
+        assert r2.status_code == 200
+        assert r2.json() is None
+        # Webhook fired once — the retry did not re-forward.
+        assert len(capture["webhook"]) == 1
 
     def test_distinct_activities_both_processed(self) -> None:
         cfg = _cfg()
