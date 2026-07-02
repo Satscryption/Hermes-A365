@@ -2280,12 +2280,20 @@ def make_app(
                 "status": 200,
                 "body": webhook_resp,
             }
-            # #97 — coerce the operator-supplied status defensively: a
-            # non-numeric status (e.g. a string label) must degrade to 200, not
-            # raise a ValueError that becomes an unhandled HTTP 500.
+            # #97 — the operator webhook response is arbitrary operator-
+            # controlled JSON, so both the invokeResponse envelope AND its status
+            # must be coerced defensively: a non-dict envelope, or a status that
+            # is non-numeric / Infinity / NaN / wrong-type, must degrade to a 200
+            # empty ack — never an unhandled HTTP 500 that Microsoft reads as an
+            # outage. A non-dict envelope would raise AttributeError on .get(), so
+            # guard the shape first; int() on operator data can then still raise
+            # TypeError (wrong type), ValueError (bad string / NaN) or
+            # OverflowError (Infinity).
+            if not isinstance(invoke_response, dict):
+                invoke_response = {}
             try:
                 status_code = int(invoke_response.get("status", 200) or 200)
-            except (TypeError, ValueError):
+            except (TypeError, ValueError, OverflowError):
                 status_code = 200
             return _JSONResponse(invoke_response.get("body"), status_code=status_code)
 

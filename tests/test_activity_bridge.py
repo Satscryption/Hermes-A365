@@ -2109,6 +2109,40 @@ class TestServeApp:
         assert r.status_code == 200
         assert r.json() == {"ok": True}
 
+    @pytest.mark.parametrize(
+        "invoke_response",
+        [
+            ["not", "a", "dict"],  # non-dict envelope -> AttributeError on .get()
+            "a-string-envelope",  # non-dict envelope
+            {"status": float("inf"), "body": {}},  # int(inf) -> OverflowError
+            {"status": float("-inf"), "body": {}},  # int(-inf) -> OverflowError
+            {"status": float("nan"), "body": {}},  # int(nan) -> ValueError
+            {"status": [500], "body": {}},  # int([500]) -> TypeError
+        ],
+    )
+    def test_invoke_malformed_operator_response_degrades_to_200(
+        self, invoke_response: Any
+    ) -> None:
+        # #97 (red-team) — the operator webhook response is arbitrary operator-
+        # controlled JSON. A non-dict invokeResponse envelope, or a status that
+        # is Infinity / NaN / wrong-type, must degrade to a 200 ack — never an
+        # unhandled HTTP 500 (AttributeError / OverflowError / TypeError / ...).
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        invoke = {
+            **_inbound_message_activity(),
+            "type": "invoke",
+            "name": "adaptiveCard/action",
+        }
+        with _client_for(
+            cfg,
+            capture=capture,
+            webhook_response={"invokeResponse": invoke_response},
+        ) as client:
+            r = client.post("/api/messages", json=invoke)
+        assert r.status_code == 200
+
     def test_conversation_update_acked_no_webhook(self) -> None:
         cfg = _cfg()
         cfg.skip_jwt_validation = True

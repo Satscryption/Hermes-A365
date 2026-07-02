@@ -29,8 +29,11 @@ unit-tested; the rich-surface invoke children split forward to v0.8.2–v0.8.5.
   Full per-name response replay (caching the original invokeResponse to replay
   on retry, for future *side-effectful* names) remains deferred to 19w-g.
 - **#97:** the `serve` invoke pass-through now coerces the operator-supplied
-  status defensively — a non-numeric `status` degrades to `200` instead of
-  raising a `ValueError` that surfaced as an unhandled HTTP 500.
+  invokeResponse defensively — a non-`dict` envelope, or a `status` that is
+  non-numeric / `Infinity` / `NaN` / wrong-type, degrades to a `200` ack
+  instead of raising an `AttributeError` / `ValueError` / `OverflowError` /
+  `TypeError` that surfaced as an unhandled HTTP 500. (The #99 red-team caught
+  the non-dict-envelope and `Infinity` gaps in the first-cut fix.)
 
 ### Documentation
 
