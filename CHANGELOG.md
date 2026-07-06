@@ -4,6 +4,58 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.2] — 2026-07-02
+
+Milestone v0.8.2 — **inbound trust-boundary & secret-handling hardening**. The
+verified subset of the multi-model security red-team (#100 / #101). Every finding
+was independently re-verified against the code (two diverse-lens verifiers each)
+before fixing, which downgraded one "critical" to defense-in-depth, promoted a
+"PLAUSIBLE" to the top live finding, and rejected two proposed fixes as wrong. No
+walk — all unit-tested.
+
+### Security
+
+- **#100 H1 — a body-supplied agent identity no longer steers token minting.**
+  `recipient.agenticAppId` is an unauthenticated inbound body field, yet it named
+  the identity every FMI stage minted under (`fmi_path`, T2 / user_fic
+  `client_id`). `acquire_outbound_token` now asserts it equals the configured
+  `blueprint_client_id` — the round-3-confirmed A365 invariant that the blueprint
+  Entra app *is* the agent identity — and refuses to mint under a body-named
+  identity. Entra's FIC grant already backstops this server-side; this is
+  fail-fast local defense-in-depth.
+- **#100 M2 — the outbound `serviceUrl` allowlist is tightened to non-registrable
+  hosts.** `.trafficmanager.net` and `.azure.com` are customer-registrable (any
+  tenant can stand up `<label>.trafficmanager.net` and receive our freshly-minted
+  user bearer — token exfil). The allowlist now pins the exact Teams host
+  `smba.trafficmanager.net` and keeps only non-registrable Microsoft zones
+  (`.botframework.com` / `.us`, `.cloud.microsoft`) as suffixes: a bare entry is
+  an exact-host match, a leading-dot entry a subdomain-suffix match.
+- **#100 M1 — the per-user token cache is keyed on the full identity tuple**
+  `(tenant_id, agent_app_instance_id, agentic_user_id, scope)` (matching
+  `_FmiCache`) instead of `(agentic_user_id, scope)`, closing a latent
+  cross-identity handout.
+- **#100 L4 — the outbound mint path is bound to the validated JWT path.**
+  `acquire_reply_token` accepts the `validated_path` the serve route derives from
+  the validator that actually passed, so a BF-validated (Path B) inbound carrying
+  injected agentic ids can no longer be minted through the Path A user-FIC chain.
+- **#101 H2 — secrets are redacted from `hermes a365 status` output.**
+  `gather_local_config` masks secret-valued keys (`*SECRET* / *PASSWORD* / *KEY* /
+  *TOKEN*`) in the per-agent `.env` before storing them in the component `data`,
+  so the default JSON output no longer emits `A365_BF_CLIENT_SECRET` verbatim into
+  shell history / CI logs / support tickets. (`doctor.py` only counts keys, so it
+  needs no change.)
+
+### Deferred / accepted
+
+- **#100 M3** (dedupe pre-seed) → **v0.9.0**: real but low, and the proposed fix
+  is a no-op on Path A — `azp` is the shared platform SP, so scoping dedupe "per
+  authenticated sender" does not distinguish senders. Needs a different signal;
+  deferred rather than shipped ineffective.
+- **#101 L1** (Keychain secret on argv) → **accepted risk**: a same-UID attacker
+  can already read the secret from the Keychain directly (`security
+  find-generic-password -w`), so argv exposure adds no capability; the `security`
+  CLI has no stdin mode, and the trade-off is already documented in `keychain.py`.
+
 ## [0.8.1] — 2026-07-02
 
 Milestone v0.8.1 — **invoke-foundation hardening**. The three follow-ups the

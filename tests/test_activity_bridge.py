@@ -1219,6 +1219,45 @@ class TestAcquireOutboundToken:
         assert (t1, t2, final) == ("T1", "T2", "FINAL")
         assert len(capture) == 3
 
+    async def test_h1_rejects_foreign_agent_app_id(self) -> None:
+        # H1 (#100) — recipient.agenticAppId is an unauthenticated body field; a
+        # value differing from the configured blueprint must be refused BEFORE any
+        # FMI mint, never trusted to name the identity we mint under.
+        a = _inbound_message_activity()
+        a["recipient"]["agenticAppId"] = "some-other-tenant-app"
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            with pytest.raises(RuntimeError, match="does not match the configured"):
+                await acquire_outbound_token(
+                    client=client,
+                    cfg=_cfg(),
+                    activity=a,
+                    fmi_cache=_FmiCache(),
+                    user_cache=_UserTokenCache(),
+                )
+        # Refused before any token POST — no partial mint.
+        assert capture == []
+
+    async def test_m1_user_cache_key_is_full_identity_tuple(self) -> None:
+        # M1 (#100) — the per-user cache key is (tenant, agent_app_instance, user,
+        # scope), matching _FmiCache, so a (user, scope)-only collision cannot hand
+        # one caller a bearer minted under another agent identity.
+        user = _UserTokenCache()
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler())
+        ) as client:
+            await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(),
+                activity=_inbound_message_activity(agentic_user_id="user-A"),
+                fmi_cache=_FmiCache(),
+                user_cache=user,
+            )
+        (key,) = user.by_key
+        assert key == ("tenant-1", "blueprint-app-id", "user-A", APX_PRODUCTION_SCOPE)
+
 
 # ---------------------------------------------------------------------------
 # #33 — Path B outbound: BF S2S client_credentials + dispatcher
@@ -1501,6 +1540,33 @@ class TestAcquireReplyTokenDispatcher:
             "client_credentials",
             "user_fic",
         ]
+
+    async def test_l4_validated_path_b_overrides_body_agentic_ids(self) -> None:
+        # L4 (#100) — a BF-validated (Path B) inbound carrying INJECTED agentic ids
+        # must NOT mint via the Path A user-FIC chain. validated_path="B" is
+        # authoritative over the body-derived tag, so no user-context bearer is
+        # minted from a body the JWT never bound.
+        capture: list[dict[str, Any]] = []
+        # Body LOOKS like Path A (agentic ids present) — but the JWT validated B.
+        a = _inbound_message_activity()
+        a["serviceUrl"] = "https://smba.trafficmanager.net/emea/"
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture))
+        ) as client:
+            token, path = await acquire_reply_token(
+                client=client,
+                cfg=_cfg(),
+                activity=a,
+                fmi_cache=_FmiCache(),
+                user_cache=_UserTokenCache(),
+                bf_cache=_BfTokenCache(),
+                validated_path="B",
+            )
+        assert (token, path) == ("BF-S2S", "B")
+        # Single BF S2S client_credentials POST — NOT the Path A user-FIC chain.
+        assert len(capture) == 1
+        assert capture[0]["grant_type"] == "client_credentials"
+        assert capture[0]["scope"] == BF_S2S_SCOPE
 
     async def test_path_b_routes_to_bf_s2s_mint(self) -> None:
         capture: list[dict[str, Any]] = []
@@ -2357,6 +2423,34 @@ class TestIsTrustedServiceUrl:
         # suffix is the load-bearing detail.
         assert not _is_trusted_service_url(
             "https://evil-trafficmanager.net/", (".trafficmanager.net",)
+        )
+
+    def test_m2_registrable_trafficmanager_subdomain_rejected(self) -> None:
+        # M2 (#100) — .trafficmanager.net is customer-registrable (any tenant can
+        # stand up <label>.trafficmanager.net and receive our outbound bearer), so
+        # a registrable subdomain must NOT pass the default allowlist even though
+        # it sits under trafficmanager.net. .azure.com is dropped for the same
+        # reason.
+        assert not _is_trusted_service_url(
+            "https://attacker.trafficmanager.net/x/",
+            DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES,
+        )
+        assert not _is_trusted_service_url(
+            "https://evil.azure.com/x/", DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
+        )
+
+    def test_m2_exact_host_pin_vs_suffix_semantics(self) -> None:
+        # A bare allowlist entry is an EXACT host match (used to pin one Microsoft
+        # host inside a registrable zone); a leading-dot entry is a subdomain-
+        # suffix match on a non-registrable Microsoft zone.
+        suffixes = ("smba.trafficmanager.net", ".botframework.com")
+        assert _is_trusted_service_url("https://smba.trafficmanager.net/amer/", suffixes)
+        assert _is_trusted_service_url("https://x.botframework.com/", suffixes)
+        # The exact-host pin must not admit a registrable sibling or a suffix-
+        # spoof host that merely ends with the pinned string.
+        assert not _is_trusted_service_url("https://evilsmba.trafficmanager.net/", suffixes)
+        assert not _is_trusted_service_url(
+            "https://smba.trafficmanager.net.evil.com/", suffixes
         )
 
 

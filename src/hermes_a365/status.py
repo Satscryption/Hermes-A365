@@ -179,6 +179,24 @@ def _resolve_hermes_home() -> Path:
     return Path(os.path.expanduser(raw))
 
 
+# H2 (#101) — keys whose VALUES are secrets and must never appear in status
+# output. The default (non---human) mode emits `data` as JSON, which lands in
+# shell history, CI logs, and support tickets — so the per-agent .env must be
+# redacted before it is stored into the component `data`. Over-redaction (a
+# non-secret key that happens to contain one of these markers) is the safe
+# direction; we mask the value but keep the key so operators still see presence.
+_SECRET_KEY_MARKERS: tuple[str, ...] = ("SECRET", "PASSWORD", "_KEY", "TOKEN")
+_SECRET_REDACTION = "***redacted***"
+
+
+def _redact_secret_env(env: dict[str, str]) -> dict[str, str]:
+    """Mask values for keys that name a secret, preserving key presence."""
+    return {
+        k: (_SECRET_REDACTION if (v and any(m in k.upper() for m in _SECRET_KEY_MARKERS)) else v)
+        for k, v in env.items()
+    }
+
+
 def gather_local_config(hermes_home: Path, agent_name: str | None) -> StatusComponent:
     """Read ``~/.hermes/.env`` and (if name given) ``~/.hermes/agents/<name>/.env``."""
     env_file = hermes_home / ".env"
@@ -255,7 +273,7 @@ def gather_local_config(hermes_home: Path, agent_name: str | None) -> StatusComp
                 f"agent .env unreadable: {e}",
                 data,
             )
-        data["agent_env"] = agent_env
+        data["agent_env"] = _redact_secret_env(agent_env)
         data["agent_dir"] = str(agent_env_file.parent)
         data["aa_instance_id"] = agent_env.get("AA_INSTANCE_ID")
         detail_parts.append(

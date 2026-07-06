@@ -512,6 +512,30 @@ class TestCollectStatus:
         bot_service = next(c for c in report.components if c.name == "bot_service")
         assert bot_service.state == "skipped"
 
+    def test_agent_env_secrets_redacted_in_status_data(self, tmp_path: Path) -> None:
+        # H2 (#101) — secret-valued keys must be redacted from the status
+        # component data. Default (non---human) output is JSON, which lands in
+        # shell history / CI logs / support tickets.
+        _seed_skill_env(tmp_path)
+        agent_env = tmp_path / "agents" / "inbox-helper" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text(
+            "AA_INSTANCE_ID=x\nA365_BF_CLIENT_SECRET=supersekret\nA365_TENANT_ID=tenant-1\n"
+        )
+        report = collect_status(
+            "inbox-helper",
+            hermes_home=tmp_path,
+            query_source=FakeQuerySource(available=False),
+        )
+        local = next(c for c in report.components if c.name == "local_config")
+        env = local.data["agent_env"]
+        assert env["A365_BF_CLIENT_SECRET"] == "***redacted***"
+        # The secret value must not appear anywhere in the component data.
+        assert "supersekret" not in str(local.data)
+        # Non-secret values are preserved (key presence + value still visible).
+        assert env["A365_TENANT_ID"] == "tenant-1"
+        assert env["AA_INSTANCE_ID"] == "x"
+
     def test_path_b_sidecar_row_sits_before_activity_bridge(self, tmp_path: Path) -> None:
         _seed_skill_env(tmp_path)
         agent_env = tmp_path / "agents" / "inbox-helper" / ".env"

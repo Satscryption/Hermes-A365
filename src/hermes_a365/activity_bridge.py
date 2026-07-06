@@ -805,23 +805,27 @@ JWKS_CACHE_TTL_SECONDS = 24 * 3600
 # the wild. Configurable via ``BridgeConfig.idempotency_ttl_seconds``.
 DEFAULT_IDEMPOTENCY_TTL_SECONDS = 3600.0
 
-# Slice 19j: only POST outbound replies to ``serviceUrl`` hosts whose
-# DNS suffix is on this list. The bridge mints a user-FIC bearer for
-# the Messaging Bot API SP and ships it to whatever URL the inbound
-# activity carries; without an allowlist a forged activity could
-# steer that bearer's traffic anywhere. Suffix list adapted from
-# NousResearch/hermes-agent#10037's ``TRUSTED_SERVICE_URL_HOST_SUFFIXES``;
-# the round-3 walkthrough confirmed real Teams traffic lands on
-# ``smba.trafficmanager.net`` so ``.trafficmanager.net`` is the
-# load-bearing entry. ``.cloud.microsoft`` and ``.botframework.com``
-# are kept for cross-channel coverage; ``.azure.com`` covers Bot
-# Service-hosted endpoints.
+# Slice 19j / #100-M2: only POST outbound replies to ``serviceUrl`` hosts on
+# this allowlist. The bridge mints a user-FIC bearer for the Messaging Bot API SP
+# and ships it to whatever URL the inbound activity carries, and the inbound JWT
+# is NOT bound to ``serviceUrl`` — so without a TIGHT allowlist a forged activity
+# steers that bearer to an attacker endpoint (token exfil).
+#
+# Entries are matched by shape (see ``_is_trusted_service_url``): a leading-dot
+# entry (``.botframework.com``) is a subdomain-SUFFIX match and must name a
+# NON-registrable Microsoft zone; a bare entry (``smba.trafficmanager.net``) is an
+# EXACT-host match. ``trafficmanager.net`` and ``azure.com`` are customer-
+# registrable (any Azure tenant can stand up ``<label>.trafficmanager.net`` and
+# receive our bearer), so they must NOT be broad suffixes. The round-3 walkthrough
+# confirmed real Teams traffic lands on the single host ``smba.trafficmanager.net``
+# (region is in the path), which we pin exactly; ``.azure.com`` is dropped as both
+# registrable and unattested by real traffic. Operators needing another host add
+# it via ``BridgeConfig.trusted_service_url_suffixes``.
 DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES: tuple[str, ...] = (
-    ".trafficmanager.net",
+    "smba.trafficmanager.net",  # exact host — .trafficmanager.net is registrable
     ".botframework.com",
     ".botframework.us",
     ".cloud.microsoft",
-    ".azure.com",
 )
 
 # Refresh outbound token 5 min before expiry to avoid mid-flight 401s.
@@ -1019,13 +1023,21 @@ def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
 
 
 def _is_trusted_service_url(url: str, suffixes: tuple[str, ...]) -> bool:
-    """Slice 19j: True iff ``url`` is https + hostname ends with one of
-    the configured DNS suffixes.
+    """Slice 19j / #100-M2: True iff ``url`` is https and its hostname is on the
+    allowlist.
 
-    Empty or missing URL → False (caller dispatches the 4xx). Empty
-    ``suffixes`` is a config bug; caller checks for it separately so
-    the failure mode is explicit ("refusing to ship outbound" rather
-    than "silently accepted").
+    Each allowlist entry is matched by SHAPE. A leading-dot entry
+    (``.botframework.com``) is a case-insensitive subdomain-SUFFIX match and must
+    name a non-registrable Microsoft zone. A bare entry
+    (``smba.trafficmanager.net``) is an EXACT hostname match, used to pin a single
+    Microsoft host inside an otherwise customer-registrable zone
+    (``trafficmanager.net``): suffix-matching a registrable zone would let any
+    tenant register ``<label>.trafficmanager.net`` and receive our outbound bearer
+    (#100-M2), so registrable zones are pinned exactly, never by suffix.
+
+    Empty or missing URL → False (caller dispatches the 4xx). Empty ``suffixes``
+    is a config bug; caller checks for it separately so the failure mode is
+    explicit ("refusing to ship outbound" rather than "silently accepted").
     """
     if not url or not suffixes:
         return False
@@ -1035,10 +1047,14 @@ def _is_trusted_service_url(url: str, suffixes: tuple[str, ...]) -> bool:
     hostname = (parsed.hostname or "").lower()
     if not hostname:
         return False
-    for suffix in suffixes:
-        if not suffix:
+    for entry in suffixes:
+        if not entry:
             continue
-        if hostname.endswith(suffix.lower()):
+        e = entry.lower()
+        if e.startswith("."):
+            if hostname.endswith(e):
+                return True
+        elif hostname == e:
             return True
     return False
 
@@ -1382,8 +1398,15 @@ class _FmiCache:
 class _UserTokenCache:
     """Cache for the final per-user access token at the messaging resource."""
 
-    by_key: dict[tuple[str, str], tuple[str, float]] = field(default_factory=dict)
-    """``{(agentic_user_id, scope): (access_token, expires_at)}``"""
+    by_key: dict[tuple[str, str, str, str], tuple[str, float]] = field(
+        default_factory=dict
+    )
+    """``{(tenant_id, agent_app_instance_id, agentic_user_id, scope): (token, exp)}``
+
+    #100-M1: keyed on the FULL identity tuple (matching ``_FmiCache``), not just
+    ``(agentic_user_id, scope)`` — a narrower key would hand one caller a bearer
+    minted under another agent identity if the two ever differed.
+    """
 
 
 @dataclass
@@ -1543,8 +1566,26 @@ async def acquire_outbound_token(
         activity
     )
 
-    # Tier-2: per-user access token at the target scope.
-    user_key = (agentic_user_id, scope)
+    # H1 (#100) — recipient.agenticAppId is an UNAUTHENTICATED body field, yet it
+    # names the identity every FMI stage mints under (fmi_path, T2/user_fic
+    # client_id). The A365 invariant is that the blueprint Entra app *is* the
+    # agent identity (agenticAppId == blueprint_client_id; round-3 confirmed, see
+    # probe_fmi_exchange), and the inbound JWT aud is pinned to blueprint_client_id
+    # — so a body agenticAppId differing from the configured blueprint is misrouted
+    # or an impersonation attempt. Refuse to mint under a body-named identity.
+    # (Entra's FIC grant backstops this server-side; this is fail-fast local
+    # defense-in-depth — we never derive the mint identity from the request body.)
+    if agent_app_instance_id.lower() != cfg.blueprint_client_id.lower():
+        raise RuntimeError(
+            "inbound recipient.agenticAppId does not match the configured "
+            "blueprint app id; refusing to mint an outbound token under a "
+            "body-supplied agent identity (possible impersonation)"
+        )
+
+    # Tier-2: per-user access token at the target scope. Key on the full identity
+    # tuple (matching _FmiCache) — a (user, scope)-only key would collide across
+    # agent identities (#100-M1).
+    user_key = (tenant_id, agent_app_instance_id, agentic_user_id, scope)
     cached = user_cache.by_key.get(user_key)
     if cached and (cur + TOKEN_REFRESH_SKEW_SECONDS) < cached[1]:
         return cached[0]
@@ -1731,6 +1772,7 @@ async def acquire_reply_token(
     scope_a: str = APX_PRODUCTION_SCOPE,
     scope_b: str = BF_S2S_SCOPE,
     now: float | None = None,
+    validated_path: str | None = None,
 ) -> tuple[str, str]:
     """Dispatch outbound token mint by inbound path.
 
@@ -1750,7 +1792,14 @@ async def acquire_reply_token(
     ``_post_activity`` / ``edit_message`` — funnel through here so
     Path A vs Path B is decided in exactly one place.
     """
-    path_tag = _inbound_path_tag(activity)
+    # L4 (#100) — bind the mint path to the VALIDATED JWT path when the caller
+    # knows it (the inbound-reply site, where the JWT was just verified), instead
+    # of re-deriving it from the activity body. A BF-signed (Path B) inbound
+    # carrying injected recipient.agenticAppId/agenticUserId must NOT be minted
+    # through the Path A user-FIC chain. validated_path=None (decoupled sends whose
+    # ConversationRef was validated at capture time) falls back to the body tag,
+    # preserving existing behaviour.
+    path_tag = validated_path or _inbound_path_tag(activity)
     if path_tag == "A":
         token = await acquire_outbound_token(
             client=client,
@@ -2053,6 +2102,7 @@ async def send_reply(
     fmi_cache: _FmiCache,
     user_cache: _UserTokenCache,
     bf_cache: _BfTokenCache | None = None,
+    validated_path: str | None = None,
 ) -> Any:
     """POST a reply Activity to the inbound's serviceUrl.
 
@@ -2083,6 +2133,7 @@ async def send_reply(
         fmi_cache=fmi_cache,
         user_cache=user_cache,
         bf_cache=bf_cache,
+        validated_path=validated_path,
     )
     response = await client.post(
         url,
@@ -2186,6 +2237,11 @@ def make_app(
         # JWT validation — the inbound `Authorization: Bearer <token>` header.
         # Slice 19f: AAD-v2 issuer + JWKS for the bridge's tenant; azp
         # allowlist replaces the BF-specific serviceUrl claim check.
+        # L4 (#100): the validator that passes also decides the outbound mint
+        # path — bind it here rather than letting acquire_reply_token re-derive
+        # Path A/B from the (unauthenticated) activity body. None when validation
+        # is skipped (dev only) → falls back to the body-derived tag.
+        validated_path: str | None = None
         if not cfg.skip_jwt_validation:
             if not authorization or not authorization.lower().startswith("bearer "):
                 raise _HTTPException(status_code=401, detail="missing bearer token")
@@ -2199,8 +2255,10 @@ def make_app(
             # validate_inbound_jwt. Both do full signature checks, so a
             # malformed token is rejected either way; default to AAD-v2 on peek
             # failure to preserve pre-fix behaviour.
+            iss = peek_unverified_iss(token)
+            validated_path = "B" if iss == BF_ISSUER else "A"
             try:
-                if peek_unverified_iss(token) == BF_ISSUER:
+                if iss == BF_ISSUER:
                     await validate_inbound_jwt_bf(
                         token=token,
                         expected_app_id=cfg.bf_app_id or cfg.blueprint_client_id,
@@ -2264,6 +2322,7 @@ def make_app(
                     fmi_cache=fmi_cache,
                     user_cache=user_cache,
                     bf_cache=bf_cache,
+                    validated_path=validated_path,
                 )
             except Exception as reply_error:
                 return _reply_failed_response(reply_error)
@@ -2310,6 +2369,7 @@ def make_app(
                 fmi_cache=fmi_cache,
                 user_cache=user_cache,
                 bf_cache=bf_cache,
+                validated_path=validated_path,
             )
         except Exception as e:
             return _reply_failed_response(e)
