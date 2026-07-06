@@ -825,6 +825,13 @@ class Agent365Adapter(BasePlatformAdapter):
             if lifecycle_action is not None:
                 ref = ConversationRef.from_activity(activity)
                 if ref is not None:
+                    # L4 (#100, #106 review follow-up): stamp the JWT-validated
+                    # path on lifecycle-captured refs too, so a later proactive
+                    # mint off this ref binds to the validated path rather than
+                    # re-deriving it from the untrusted body. The main dispatch
+                    # branch below already stamps it; the lifecycle capture path
+                    # (install-then-proactive-without-a-user-message) was missed.
+                    ref.validated_path = validated_path
                     if lifecycle_action == "evict":
                         if self._conversations.evict(ref.conversation_id):
                             self._seen_inbounds_this_lifetime.discard(

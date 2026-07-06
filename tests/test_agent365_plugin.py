@@ -1413,6 +1413,32 @@ class TestLifecycleCapture:
         assert spec["path"] == "B"
         assert spec["conversation_id"] == "conv-install"
 
+    def test_lifecycle_capture_stamps_validated_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #106 review follow-up (L4): a lifecycle-captured ref must stamp the
+        # JWT-validated path so a later proactive mint off it binds to the
+        # validated path, not the untrusted activity body. Before the fix the
+        # lifecycle branch left validated_path=None → proactive send went
+        # body-derived. (In this harness the unverified-iss peek fails, so the
+        # validator dispatch defaults to the Path A branch → validated_path "A".)
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="conv-vp", type="installationUpdate", action="add"
+        )
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.json() == {"status": "acked", "lifecycle": "upsert"}
+        ref = a._conversations.get("conv-vp")
+        assert ref is not None
+        assert ref.validated_path == "A"
+        # ...and the proactive target spec carries it (not None) so the mint binds.
+        spec = a._build_proactive_target_spec("conv-vp")
+        assert spec is not None
+        assert spec["validated_path"] == "A"
+
     def test_conversation_update_bot_added_captures_ref(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
