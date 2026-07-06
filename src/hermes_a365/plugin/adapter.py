@@ -710,6 +710,11 @@ class Agent365Adapter(BasePlatformAdapter):
             # peek failure to preserve pre-#34 behaviour.
             claims: dict[str, Any] = {}
             iss = bridge.peek_unverified_iss(token)
+            # L4 (#100, #106 review) — capture the JWT-validated path (which
+            # validator passes: BF -> Path B, AAD-v2 -> Path A) so decoupled
+            # agent-loop sends bind to it via the ConversationRef, never
+            # re-deriving the path from the untrusted activity body.
+            validated_path: str | None = "B" if iss == bridge.BF_ISSUER else "A"
             if iss == bridge.BF_ISSUER:
                 # #36: when the operator has migrated the bot's
                 # `--appid` to the non-agentic Path B identity, BF
@@ -820,6 +825,13 @@ class Agent365Adapter(BasePlatformAdapter):
             if lifecycle_action is not None:
                 ref = ConversationRef.from_activity(activity)
                 if ref is not None:
+                    # L4 (#100, #106 review follow-up): stamp the JWT-validated
+                    # path on lifecycle-captured refs too, so a later proactive
+                    # mint off this ref binds to the validated path rather than
+                    # re-deriving it from the untrusted body. The main dispatch
+                    # branch below already stamps it; the lifecycle capture path
+                    # (install-then-proactive-without-a-user-message) was missed.
+                    ref.validated_path = validated_path
                     if lifecycle_action == "evict":
                         if self._conversations.evict(ref.conversation_id):
                             self._seen_inbounds_this_lifetime.discard(
@@ -860,6 +872,9 @@ class Agent365Adapter(BasePlatformAdapter):
             # ``conversation.id`` here.
             ref = ConversationRef.from_activity(activity)
             if ref is not None:
+                # L4 (#100): stamp the validated path so later decoupled mints
+                # off this ref bind to it, not the body.
+                ref.validated_path = validated_path
                 self._conversations.upsert(ref)
                 # Slice 19x-e (#27): record that this gateway lifetime
                 # has captured an inbound for this chat. Drives the
@@ -1084,6 +1099,23 @@ class Agent365Adapter(BasePlatformAdapter):
             return None
         return ref.raw
 
+    def _validated_path_for(self, chat_id: str) -> str | None:
+        """L4 (#100): the JWT-validated inbound path ("A"/"B") captured on the
+        ConversationRef, used to bind decoupled outbound mints instead of
+        re-deriving the path from the untrusted body. None for legacy/lifecycle
+        refs → the mint site passes it through and ``acquire_reply_token`` falls
+        back to body-derived routing."""
+        ref = self._conversations.get(chat_id)
+        return ref.validated_path if ref is not None else None
+
+    def _validated_path_for_inbound(self, inbound: dict[str, Any]) -> str | None:
+        """L4 (#100): validated path for a cached inbound the mint site holds as a
+        raw dict (rather than a chat_id) — keyed by its conversation id."""
+        conv = inbound.get("conversation")
+        conv = conv if isinstance(conv, dict) else {}
+        chat_id = conv.get("id")
+        return self._validated_path_for(str(chat_id)) if chat_id else None
+
     def _build_proactive_target_spec(self, chat_id: str) -> dict[str, Any] | None:
         """Slice 19x-a (#4): pure-function read over the registry.
 
@@ -1161,6 +1193,10 @@ class Agent365Adapter(BasePlatformAdapter):
             "from": dict(recipient_inbound),
             "recipient": dict(sender_inbound),
             "path": path_tag,
+            # L4 (#100): the JWT-validated path captured at inbound time (None for
+            # legacy/lifecycle refs). Callers pass this to acquire_reply_token so
+            # the mint binds to it rather than the body-derived `path` above.
+            "validated_path": ref.validated_path,
         }
 
     async def send(
@@ -1349,6 +1385,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 client=self._http_client,
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
+                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
             )
         except Exception as e:
             logger.error("agent365 %s send_reply failed: %s", log_context, e)
@@ -1821,6 +1858,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
                 bf_cache=self._bf_token_cache,
+                validated_path=target.get("validated_path"),  # L4 (#100)
             )
         except Exception as e:
             logger.error("agent365 proactive token mint failed: %s", e)
@@ -1917,6 +1955,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
                 bf_cache=self._bf_token_cache,
+                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
             )
             resp = await self._http_client.post(
                 url,
@@ -1991,6 +2030,7 @@ class Agent365Adapter(BasePlatformAdapter):
             fmi_cache=self._fmi_cache,
             user_cache=self._user_cache,
             bf_cache=self._bf_token_cache,
+            validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
         )
         resp = await self._http_client.post(
             url,
@@ -2174,6 +2214,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 client=self._http_client,
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
+                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
             )
         except Exception as e:
             logger.error("agent365 send_image failed: %s", e)
@@ -2350,6 +2391,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
                 bf_cache=self._bf_token_cache,
+                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
             )
             resp = await self._http_client.post(
                 url,
@@ -2499,6 +2541,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
                 bf_cache=self._bf_token_cache,
+                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
             )
             resp = await self._http_client.post(
                 url,
