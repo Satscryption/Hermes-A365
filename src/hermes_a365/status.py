@@ -185,16 +185,37 @@ def _resolve_hermes_home() -> Path:
 # redacted before it is stored into the component `data`. Over-redaction (a
 # non-secret key that happens to contain one of these markers) is the safe
 # direction; we mask the value but keep the key so operators still see presence.
-_SECRET_KEY_MARKERS: tuple[str, ...] = ("SECRET", "PASSWORD", "_KEY", "TOKEN")
+_SECRET_KEY_MARKERS: tuple[str, ...] = (
+    "SECRET",
+    "PASSWORD",
+    "PASSWD",
+    "TOKEN",
+    "CONNECTIONSTRING",
+    "CREDENTIAL",
+)
 _SECRET_REDACTION = "***redacted***"
 
 
 def _redact_secret_env(env: dict[str, str]) -> dict[str, str]:
-    """Mask values for keys that name a secret, preserving key presence."""
-    return {
-        k: (_SECRET_REDACTION if (v and any(m in k.upper() for m in _SECRET_KEY_MARKERS)) else v)
-        for k, v in env.items()
-    }
+    """Mask values for keys that name a secret, preserving key presence.
+
+    Matches on a NORMALIZED key (uppercased, non-alphanumerics stripped) so
+    ``CLIENT_SECRET``, camelCase ``clientSecret``, and glued ``APIKEY`` all match
+    the same markers, plus trailing-``KEY``/``PAT`` catch-alls for ``*_KEY`` /
+    ``*_PAT`` names (#106 review — the earlier ``_KEY`` substring missed
+    ``APIKEY`` / camelCase). Over-redaction (a non-secret key that trips a marker)
+    is the safe direction.
+    """
+    out: dict[str, str] = {}
+    for k, v in env.items():
+        norm = "".join(ch for ch in k.upper() if ch.isalnum())
+        is_secret = bool(v) and (
+            any(m in norm for m in _SECRET_KEY_MARKERS)
+            or norm.endswith("KEY")
+            or norm.endswith("PAT")
+        )
+        out[k] = _SECRET_REDACTION if is_secret else v
+    return out
 
 
 def gather_local_config(hermes_home: Path, agent_name: str | None) -> StatusComponent:

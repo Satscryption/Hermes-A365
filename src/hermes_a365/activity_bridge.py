@@ -1041,10 +1041,16 @@ def _is_trusted_service_url(url: str, suffixes: tuple[str, ...]) -> bool:
     """
     if not url or not suffixes:
         return False
-    parsed = urlparse(url)
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        # Malformed URL (bad IPv6 / port) → fail closed; never ship the bearer.
+        return False
     if parsed.scheme != "https":
         return False
-    hostname = (parsed.hostname or "").lower()
+    # Strip a trailing dot: "smba.trafficmanager.net." is the same host to DNS but
+    # would miss an exact-host pin (#106 review).
+    hostname = (parsed.hostname or "").lower().rstrip(".")
     if not hostname:
         return False
     for entry in suffixes:
@@ -1435,9 +1441,13 @@ def _agentic_ids_from_activity(activity: dict[str, Any]) -> tuple[str, str, str]
     """
     recipient = activity.get("recipient") or {}
     conversation = activity.get("conversation") or {}
-    tenant_id = recipient.get("tenantId") or conversation.get("tenantId") or ""
-    agent_app_instance_id = recipient.get("agenticAppId") or ""
-    agentic_user_id = recipient.get("agenticUserId") or ""
+    # #100-M1 — coerce to str: agentic ids are attacker-influenced body fields,
+    # and a non-str value would collide in the token cache key (bool True == int 1
+    # and hash(True) == hash(1) in Python), cross-handing a cached bearer. str()
+    # keeps distinct values distinct.
+    tenant_id = str(recipient.get("tenantId") or conversation.get("tenantId") or "")
+    agent_app_instance_id = str(recipient.get("agenticAppId") or "")
+    agentic_user_id = str(recipient.get("agenticUserId") or "")
     missing = [
         name
         for name, val in (
@@ -1580,6 +1590,17 @@ async def acquire_outbound_token(
             "inbound recipient.agenticAppId does not match the configured "
             "blueprint app id; refusing to mint an outbound token under a "
             "body-supplied agent identity (possible impersonation)"
+        )
+    # H1/tenant (#100, #106 review) — tenant_id is likewise a body field
+    # (recipient.tenantId / conversation.tenantId), yet it selects the token
+    # endpoint the FMI chain POSTs to. The inbound JWT iss is pinned to
+    # cfg.tenant_id, so a body tenant that differs is misrouted or forged. Assert
+    # it rather than minting against a body-named tenant. (H1's own "never
+    # body-derived" contract, extended to the tenant axis.)
+    if tenant_id.lower() != cfg.tenant_id.lower():
+        raise RuntimeError(
+            "inbound tenantId does not match the configured tenant; refusing to "
+            "mint an outbound token against a body-supplied tenant"
         )
 
     # Tier-2: per-user access token at the target scope. Key on the full identity
@@ -1772,7 +1793,7 @@ async def acquire_reply_token(
     scope_a: str = APX_PRODUCTION_SCOPE,
     scope_b: str = BF_S2S_SCOPE,
     now: float | None = None,
-    validated_path: str | None = None,
+    validated_path: str | None,
 ) -> tuple[str, str]:
     """Dispatch outbound token mint by inbound path.
 
@@ -1792,14 +1813,17 @@ async def acquire_reply_token(
     ``_post_activity`` / ``edit_message`` — funnel through here so
     Path A vs Path B is decided in exactly one place.
     """
-    # L4 (#100) — bind the mint path to the VALIDATED JWT path when the caller
-    # knows it (the inbound-reply site, where the JWT was just verified), instead
-    # of re-deriving it from the activity body. A BF-signed (Path B) inbound
-    # carrying injected recipient.agenticAppId/agenticUserId must NOT be minted
-    # through the Path A user-FIC chain. validated_path=None (decoupled sends whose
-    # ConversationRef was validated at capture time) falls back to the body tag,
-    # preserving existing behaviour.
-    path_tag = validated_path or _inbound_path_tag(activity)
+    # L4 (#100) — bind the mint path to the JWT-VALIDATED path; never re-derive it
+    # from the (unauthenticated) activity body. ``validated_path`` is REQUIRED
+    # (fail-closed): a caller states the validated path ("A"/"B") or explicitly
+    # opts into body-derived routing with None / "DECOUPLED" (a legacy/lifecycle
+    # ref with no validated context). Requiring it surfaces an un-plumbed mint site
+    # as a TypeError at the call boundary instead of silently trusting the body —
+    # the gap the #106 red-team caught. A BF-validated (Path B) inbound carrying
+    # injected agentic ids can thus never be minted via the Path A user-FIC chain.
+    path_tag = (
+        validated_path if validated_path in ("A", "B") else _inbound_path_tag(activity)
+    )
     if path_tag == "A":
         token = await acquire_outbound_token(
             client=client,
@@ -2102,9 +2126,13 @@ async def send_reply(
     fmi_cache: _FmiCache,
     user_cache: _UserTokenCache,
     bf_cache: _BfTokenCache | None = None,
-    validated_path: str | None = None,
+    validated_path: str | None,
 ) -> Any:
     """POST a reply Activity to the inbound's serviceUrl.
+
+    ``validated_path`` is REQUIRED (fail-closed, #106 review) — the caller states
+    the JWT-validated path ("A"/"B") or explicitly opts into body-derived routing
+    (None / "DECOUPLED"). It is forwarded to ``acquire_reply_token``.
 
     Auth: dispatched via ``acquire_reply_token`` — Path A (agentic
     user-FIC chain) or Path B (BF S2S ``client_credentials``)

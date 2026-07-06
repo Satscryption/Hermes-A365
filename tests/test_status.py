@@ -536,6 +536,31 @@ class TestCollectStatus:
         assert env["A365_TENANT_ID"] == "tenant-1"
         assert env["AA_INSTANCE_ID"] == "x"
 
+    def test_agent_env_redacts_widened_secret_markers(self, tmp_path: Path) -> None:
+        # H2 (#106 review) — normalized-key matching catches APIKEY (no
+        # underscore), connection strings, *_PAT, and CREDENTIAL that the earlier
+        # `_KEY`/`SECRET` substring markers missed.
+        _seed_skill_env(tmp_path)
+        agent_env = tmp_path / "agents" / "inbox-helper" / ".env"
+        agent_env.parent.mkdir(parents=True)
+        agent_env.write_text(
+            "AA_INSTANCE_ID=keep\nAPIKEY=a\nGRAPH_CONNECTIONSTRING=b\n"
+            "GITHUB_PAT=c\nMY_CREDENTIAL=d\nA365_TENANT_ID=keep2\n"
+        )
+        report = collect_status(
+            "inbox-helper",
+            hermes_home=tmp_path,
+            query_source=FakeQuerySource(available=False),
+        )
+        env = next(
+            c for c in report.components if c.name == "local_config"
+        ).data["agent_env"]
+        for k in ("APIKEY", "GRAPH_CONNECTIONSTRING", "GITHUB_PAT", "MY_CREDENTIAL"):
+            assert env[k] == "***redacted***", k
+        # Non-secret keys still pass through untouched.
+        assert env["AA_INSTANCE_ID"] == "keep"
+        assert env["A365_TENANT_ID"] == "keep2"
+
     def test_path_b_sidecar_row_sits_before_activity_bridge(self, tmp_path: Path) -> None:
         _seed_skill_env(tmp_path)
         agent_env = tmp_path / "agents" / "inbox-helper" / ".env"

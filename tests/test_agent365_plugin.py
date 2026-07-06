@@ -1853,6 +1853,34 @@ class TestSend:
         assert kwargs["reply"]["replyToId"] == "act-1"
 
     @pytest.mark.asyncio
+    async def test_send_binds_validated_path_not_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # L4 (#100, #106 review) — a BF-validated (Path B) inbound whose BODY
+        # carries injected agentic ids (which would body-derive to Path A) must
+        # mint via the validated path captured on the ConversationRef, NOT the
+        # body. The adapter threads ref.validated_path into send_reply.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-B")  # path="A": body has agentic ids
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        ref.validated_path = "B"  # ...but the JWT validated as Path B.
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add("conv-B")
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        result = await a.send(chat_id="conv-B", content="hi")
+        assert result.success is True
+        # send_reply received the VALIDATED path "B", not the body-derived "A".
+        assert send_reply_mock.await_args.kwargs["validated_path"] == "B"
+
+    @pytest.mark.asyncio
     async def test_send_reply_failure_surfaces_in_send_result(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

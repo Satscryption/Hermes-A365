@@ -47,6 +47,11 @@ class ConversationRef:
     user_name: str | None = None
     tenant_id: str | None = None
     last_inbound_activity_id: str | None = None
+    # L4 (#100): the JWT-validated inbound path ("A"/"B") captured at inbound
+    # time (which validator passed), so decoupled agent-loop outbound mints bind
+    # to the validated path instead of re-deriving it from the untrusted activity
+    # body. None for legacy payloads / lifecycle-captured refs (no user turn).
+    validated_path: str | None = None
     # Slice 19x-c (#4): last_used_at is the Unix timestamp the registry
     # last touched this entry (set by ConversationRegistry.upsert on
     # capture, by mark_used on outbound). pinned=True makes prune_old_entries
@@ -164,6 +169,7 @@ class ConversationRegistry:
             ),
             last_used_at=cur,
             pinned=bool(ref.pinned or existing.pinned),
+            validated_path=ref.validated_path or existing.validated_path,
             raw=ref.raw or existing.raw,
         )
         self._by_id[ref.conversation_id] = merged
