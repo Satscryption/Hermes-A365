@@ -415,9 +415,11 @@ _COPILOT_CHAT_DEFAULT_SCOPES: tuple[str, ...] = ("copilot", "personal", "team")
 
 # #74 — Copilot Chat zero-state prompt starters. Command-list commands of
 # type:"prompt" (manifest 1.27+): `title` is the button label (≤128), `prompt` is
-# the text sent when the user taps it (≤4000). Per the 1.27 schema only `title` is
-# required, so we omit `description` for prompt commands. Starters render as the
-# CC zero-state and in the "View prompts" flyout, on the copilot + personal
+# the text sent when the user taps it (≤4000). `description` is optional in 1.27
+# but drives the card's subtitle — Copilot Chat repeats the title when it is
+# absent (walk-observed 2026-07-06), so we set it to the prompt (title + preview).
+# Starters render as the CC zero-state and in the "View prompts" flyout, on the
+# copilot + personal
 # surfaces (team scope is the @mention command menu, not a zero-state surface, so
 # it is deliberately excluded). Operator-supplied starters are capped.
 _PROMPT_STARTER_MAX = 10
@@ -476,7 +478,15 @@ def _transform_manifest_to_copilot_chat(
                 {
                     "scopes": list(_PROMPT_STARTER_SCOPES),
                     "commands": [
-                        {"title": s["title"], "type": "prompt", "prompt": s["prompt"]}
+                        # description drives the card's subtitle line; without it
+                        # Copilot Chat repeats the title (walk-observed 2026-07-06).
+                        # Set it to the prompt so the card reads title + preview.
+                        {
+                            "title": s["title"],
+                            "description": s["prompt"],
+                            "type": "prompt",
+                            "prompt": s["prompt"],
+                        }
                         for s in starters
                     ],
                 }

@@ -645,16 +645,19 @@ class TestTransformManifestToCopilotChat:
                         "commands": [
                             {
                                 "title": "What can you do?",
+                                "description": "What can you help me with?",
                                 "type": "prompt",
                                 "prompt": "What can you help me with?",
                             },
                             {
                                 "title": "Get started",
+                                "description": "How do I get started with you?",
                                 "type": "prompt",
                                 "prompt": "How do I get started with you?",
                             },
                             {
                                 "title": "Show an example",
+                                "description": "Show me an example of something you can do.",
                                 "type": "prompt",
                                 "prompt": "Show me an example of something you can do.",
                             },
@@ -675,7 +678,8 @@ class TestTransformManifestToCopilotChat:
         for c in cmds:
             assert c["type"] == "prompt"
             assert c["title"] and c["prompt"]
-            assert "description" not in c
+            # description drives the card subtitle (walk-observed) — set to prompt.
+            assert c["description"] == c["prompt"]
 
     def test_prompt_starters_operator_override_and_cap(self) -> None:
         from hermes_a365.publish import (
@@ -691,7 +695,12 @@ class TestTransformManifestToCopilotChat:
         )
         cmds = out["bots"][0]["commandLists"][0]["commands"]
         assert len(cmds) == _PROMPT_STARTER_MAX  # capped at the schema max
-        assert cmds[0] == {"title": "t0", "type": "prompt", "prompt": "p0"}
+        assert cmds[0] == {
+            "title": "t0",
+            "description": "p0",
+            "type": "prompt",
+            "prompt": "p0",
+        }
 
     def test_prompt_starter_scopes_are_copilot_personal(self) -> None:
         # Prompt starters render on copilot + personal (zero-state); the team

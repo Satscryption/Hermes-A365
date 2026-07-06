@@ -7,6 +7,13 @@ Custom Engine Agent manifest version stays `1.21`; this file records what
 the newer schema versions add, whether `hermes-a365` needs them, and the
 criteria for a future, walk-validated bump.
 
+> **Update — v0.8.3 (2026-07-06):** the `1.27` bump **has now landed** together
+> with #74's `type:"prompt"` prompt starters, and was **walk-validated** on the
+> satscryption tenant (Admin Center accepted the 1.27 manifest; starters render
+> in the Copilot Chat zero-state). `_COPILOT_CHAT_MANIFEST_VERSION` is now
+> `1.27`. The 1.21-era analysis below is retained for history; the default CEA
+> manifest version is `1.27` as of v0.8.3.
+
 This is a *snapshot* of an external surface (the Teams app-manifest schema
 and Microsoft's docs) per the [`references/` convention](README.md) — the
 live surface is authoritative; update + re-date this file when it drifts.
