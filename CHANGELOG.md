@@ -4,6 +4,45 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.3] — 2026-07-06
+
+Milestone v0.8.3 — **Copilot Chat prompt starters + manifest 1.27 bump** (#74).
+Walk-validated live on the satscryption tenant (see *Validated* below).
+
+### Added
+
+- **#74:** the Custom Engine Agent manifest now emits **`type:"prompt"` prompt
+  starters** as the Copilot Chat zero-state UX, replacing the single generic
+  `title`/`description` command. Each starter is `{title, description, type:
+  "prompt", prompt}`; `title` is the card label, `prompt` is the text sent on
+  tap, and `description` (= the prompt) drives the card's subtitle. A sensible
+  **default set of 3** ships out of the box, and operators can override them with
+  a repeatable **`--prompt-starter "Title|Prompt text"`** flag (capped at 10).
+  Scoped to `copilot` + `personal` (the zero-state surfaces); `team` is the
+  @mention command menu and is deliberately excluded.
+
+### Changed
+
+- **#74:** `_COPILOT_CHAT_MANIFEST_VERSION` bumped **`1.21` → `1.27`** — the
+  minimum manifest version that carries the command `type`/`prompt` fields
+  (verified against Microsoft's live v1.27 schema, May 2026). The rest of the CEA
+  shape (`bots` + `copilotAgents`) is unchanged and remains valid at 1.27.
+
+### Validated (v0.8.3 walk, 2026-07-06)
+
+- **1.27 manifest accepted** by the Microsoft Admin Center on upload — the
+  load-bearing check for the version bump + `type:"prompt"` schema.
+- **Prompt starters render** in the Copilot Chat zero-state (3 cards, tappable
+  → prompt drops into the composer) against a throwaway `Hermes Inbox Helper R9`
+  blueprint. The walk surfaced (and this release fixes) that omitting
+  `description` makes Copilot repeat the title on the card's subtitle line.
+
+### Notes
+
+- The walk also surfaced that `publish --copilot-chat` re-stamps the *same* app
+  `version` each run, so an operator can't re-upload an updated package without
+  hand-bumping it — filed as a v0.8.x follow-up (auto-increment / `--app-version`).
+
 ## [0.8.2] — 2026-07-02
 
 Milestone v0.8.2 — **inbound trust-boundary & secret-handling hardening**. The

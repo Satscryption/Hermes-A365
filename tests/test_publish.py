@@ -79,6 +79,13 @@ class TestPublishInputs:
         inp = PublishInputs(agent_name="x", copilot_chat=True, manifest_id="auto")
         assert inp.manifest_id == "auto"
 
+    def test_prompt_starters_require_copilot_chat(self) -> None:
+        # #74 — prompt starters only apply to the Copilot Chat (CEA) manifest.
+        with pytest.raises(ValueError, match="only meaningful with --copilot-chat"):
+            PublishInputs(
+                agent_name="x", prompt_starters=({"title": "t", "prompt": "p"},)
+            )
+
 
 # ---------------------------------------------------------------------------
 # build_publish_plan — argv shapes
@@ -603,13 +610,14 @@ class TestBuildPublishPlanCopilotChat:
 class TestTransformManifestToCopilotChat:
     """Pure-function tests for the manifest transform."""
 
-    def test_bumps_manifest_version_to_1_21(self) -> None:
+    def test_bumps_manifest_version_to_1_27(self) -> None:
         from hermes_a365.publish import _transform_manifest_to_copilot_chat
 
         out = _transform_manifest_to_copilot_chat(
             {"manifestVersion": "devPreview"}, bot_id="bid"
         )
-        assert out["manifestVersion"] == "1.21"
+        # #74 — 1.27 is the minimum manifest version carrying type:"prompt" starters.
+        assert out["manifestVersion"] == "1.27"
 
     def test_strips_agentic_user_templates(self) -> None:
         from hermes_a365.publish import _transform_manifest_to_copilot_chat
@@ -636,14 +644,90 @@ class TestTransformManifestToCopilotChat:
                         "scopes": ["copilot", "personal"],
                         "commands": [
                             {
-                                "title": "How can you help me?",
-                                "description": "How can you help me?",
-                            }
+                                "title": "What can you do?",
+                                "description": "What can you help me with?",
+                                "type": "prompt",
+                                "prompt": "What can you help me with?",
+                            },
+                            {
+                                "title": "Get started",
+                                "description": "How do I get started with you?",
+                                "type": "prompt",
+                                "prompt": "How do I get started with you?",
+                            },
+                            {
+                                "title": "Show an example",
+                                "description": "Show me an example of something you can do.",
+                                "type": "prompt",
+                                "prompt": "Show me an example of something you can do.",
+                            },
                         ],
                     }
                 ],
             }
         ]
+
+    def test_prompt_starters_default_are_type_prompt(self) -> None:
+        # #74 — default command list emits type:"prompt" starters (title + prompt,
+        # no description — description is optional in 1.27).
+        from hermes_a365.publish import _transform_manifest_to_copilot_chat
+
+        out = _transform_manifest_to_copilot_chat({}, bot_id="bid")
+        cmds = out["bots"][0]["commandLists"][0]["commands"]
+        assert len(cmds) >= 1
+        for c in cmds:
+            assert c["type"] == "prompt"
+            assert c["title"] and c["prompt"]
+            # description drives the card subtitle (walk-observed) — set to prompt.
+            assert c["description"] == c["prompt"]
+
+    def test_prompt_starters_operator_override_and_cap(self) -> None:
+        from hermes_a365.publish import (
+            _PROMPT_STARTER_MAX,
+            _transform_manifest_to_copilot_chat,
+        )
+
+        supplied = tuple(
+            {"title": f"t{i}", "prompt": f"p{i}"} for i in range(_PROMPT_STARTER_MAX + 3)
+        )
+        out = _transform_manifest_to_copilot_chat(
+            {}, bot_id="bid", prompt_starters=supplied
+        )
+        cmds = out["bots"][0]["commandLists"][0]["commands"]
+        assert len(cmds) == _PROMPT_STARTER_MAX  # capped at the schema max
+        assert cmds[0] == {
+            "title": "t0",
+            "description": "p0",
+            "type": "prompt",
+            "prompt": "p0",
+        }
+
+    def test_prompt_starter_scopes_are_copilot_personal(self) -> None:
+        # Prompt starters render on copilot + personal (zero-state); the team
+        # scope is the @mention command menu, deliberately excluded.
+        from hermes_a365.publish import _transform_manifest_to_copilot_chat
+
+        out = _transform_manifest_to_copilot_chat({}, bot_id="bid")
+        assert out["bots"][0]["commandLists"][0]["scopes"] == ["copilot", "personal"]
+
+    def test_parse_prompt_starter_splits_on_pipe(self) -> None:
+        from hermes_a365.publish import _parse_prompt_starter
+
+        assert _parse_prompt_starter("Hi there|Say hello") == {
+            "title": "Hi there",
+            "prompt": "Say hello",
+        }
+        # No pipe → the whole string is used for both title and prompt.
+        assert _parse_prompt_starter("Just a title") == {
+            "title": "Just a title",
+            "prompt": "Just a title",
+        }
+
+    def test_parse_prompt_starter_rejects_empty_title(self) -> None:
+        from hermes_a365.publish import _parse_prompt_starter
+
+        with pytest.raises(ValueError, match="non-empty title"):
+            _parse_prompt_starter("|only a prompt")
 
     def test_default_copilot_chat_bot_scopes_include_copilot(self) -> None:
         from hermes_a365.publish import _transform_manifest_to_copilot_chat
@@ -809,7 +893,7 @@ class TestPatchManifestToCopilotChat:
         assert result is not None
         bot_id, summary = result
         assert bot_id == "the-app-id"
-        assert summary["manifest_version"] == "1.21"
+        assert summary["manifest_version"] == "1.27"
         assert summary["manifest_id"] == "11111111-1111-1111-1111-111111111111"
         assert summary["scopes"] == ["copilot", "personal", "team"]
         assert summary["dropped_agentic_user_templates"] is True
@@ -822,7 +906,7 @@ class TestPatchManifestToCopilotChat:
             assert zf.read("icon.png") == b"png-bytes"
             m = json.loads(zf.read("manifest.json"))
             assert m["id"] == "11111111-1111-1111-1111-111111111111"
-            assert m["manifestVersion"] == "1.21"
+            assert m["manifestVersion"] == "1.27"
             assert m["bots"][0]["botId"] == "the-app-id"
             assert m["copilotAgents"]["customEngineAgents"] == [
                 {"type": "bot", "id": "the-app-id"}
@@ -941,7 +1025,7 @@ class TestApplyPublishPlanCopilotChat:
         assert result.copilot_chat_bot_id == "the-bot"
         with zipfile.ZipFile(zp) as zf:
             m = json.loads(zf.read("manifest.json"))
-            assert m["manifestVersion"] == "1.21"
+            assert m["manifestVersion"] == "1.27"
             assert m["bots"][0]["botId"] == "the-bot"
             assert "agenticUserTemplates" not in m
         # Operator-facing message points at the MAC Agents upload path.
@@ -1026,7 +1110,7 @@ class TestApplyPublishPlanCopilotChat:
             assert "agenticUserTemplateManifest.json" not in names  # dropped
             assert {"color.png", "outline.png"} <= names  # icons kept
             m = json.loads(zf.read("manifest.json"))
-            assert m["manifestVersion"] == "1.21"
+            assert m["manifestVersion"] == "1.27"
             assert m["bots"][0]["botId"] == "1c2b61bc-fa6a-4c7b-9656-a82b662dacfe"
             assert m["copilotAgents"]["customEngineAgents"] == [
                 {"type": "bot", "id": "1c2b61bc-fa6a-4c7b-9656-a82b662dacfe"}
@@ -1085,10 +1169,10 @@ class TestApplyPublishPlanCopilotChat:
             assert m["id"] == "blueprint-catalog-id"
             assert "agenticUserTemplates" in m
 
-        # Copilot Chat sibling is in 1.21 shape.
+        # Copilot Chat sibling is in 1.27 shape.
         with zipfile.ZipFile(result.copilot_chat_package_path) as zf:
             m = json.loads(zf.read("manifest.json"))
-            assert m["manifestVersion"] == "1.21"
+            assert m["manifestVersion"] == "1.27"
             assert m["id"] == result.copilot_chat_manifest_id
             assert "agenticUserTemplates" not in m
             assert m["bots"][0]["botId"] == "the-bot"

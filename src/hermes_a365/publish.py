@@ -79,11 +79,15 @@ class PublishInputs:
     bot_id: str | None = None  # optional override for the Copilot Chat botId
     manifest_id: str | None = None  # "auto" or explicit Teams App Catalog id
     use_blueprint: bool = False  # blueprint-based non-DW flow (only with aiteammate=False)
+    # #74 — Copilot Chat zero-state prompt starters; None → the default set.
+    prompt_starters: tuple[dict[str, str], ...] | None = None
     verbose: bool = False
 
     def __post_init__(self) -> None:
         if not self.agent_name:
             raise ValueError("agent_name must be non-empty")
+        if self.prompt_starters and not self.copilot_chat:
+            raise ValueError("--prompt-starter is only meaningful with --copilot-chat")
         if self.use_blueprint and self.aiteammate:
             raise ValueError("--use-blueprint is only meaningful with --aiteammate false")
         if self.use_blueprint and self.copilot_chat:
@@ -402,8 +406,29 @@ def _patch_manifest_name_short(zip_path: str) -> tuple[str, str] | None:
 # is the same bot identity for both surfaces) and post-process the
 # emitted zip into the 1.21 shape.
 
-_COPILOT_CHAT_MANIFEST_VERSION = "1.21"
+# #74 — bumped 1.21 → 1.27: the minimum manifest version that adds the bot
+# command-list command `type` (`basic`|`prompt`) + `prompt` fields (verified
+# against Microsoft's live schema, v1.27 / May 2026). The rest of the CEA shape
+# (bots + copilotAgents) is unchanged and remains valid at 1.27.
+_COPILOT_CHAT_MANIFEST_VERSION = "1.27"
 _COPILOT_CHAT_DEFAULT_SCOPES: tuple[str, ...] = ("copilot", "personal", "team")
+
+# #74 — Copilot Chat zero-state prompt starters. Command-list commands of
+# type:"prompt" (manifest 1.27+): `title` is the button label (≤128), `prompt` is
+# the text sent when the user taps it (≤4000). `description` is optional in 1.27
+# but drives the card's subtitle — Copilot Chat repeats the title when it is
+# absent (walk-observed 2026-07-06), so we set it to the prompt (title + preview).
+# Starters render as the CC zero-state and in the "View prompts" flyout, on the
+# copilot + personal
+# surfaces (team scope is the @mention command menu, not a zero-state surface, so
+# it is deliberately excluded). Operator-supplied starters are capped.
+_PROMPT_STARTER_MAX = 10
+_PROMPT_STARTER_SCOPES: tuple[str, ...] = ("copilot", "personal")
+_DEFAULT_PROMPT_STARTERS: tuple[dict[str, str], ...] = (
+    {"title": "What can you do?", "prompt": "What can you help me with?"},
+    {"title": "Get started", "prompt": "How do I get started with you?"},
+    {"title": "Show an example", "prompt": "Show me an example of something you can do."},
+)
 _COPILOT_CHAT_ZIP_INFIX = ".copilot-chat"
 
 # Wall-clock budget for ``a365 publish`` invoked under ``apply_publish_plan``.
@@ -423,9 +448,13 @@ def _transform_manifest_to_copilot_chat(
     manifest_id: str | None = None,
     distinguish_name_short: bool = False,
     scopes: tuple[str, ...] = _COPILOT_CHAT_DEFAULT_SCOPES,
+    prompt_starters: tuple[dict[str, str], ...] | None = None,
 ) -> dict:
     """Pure transform: AI Teammate manifest dict → Custom Engine Agent shape."""
     out = dict(manifest)
+    # #74 — resolve + cap the zero-state prompt starters (the default set when the
+    # operator supplied none).
+    starters = list(prompt_starters or _DEFAULT_PROMPT_STARTERS)[:_PROMPT_STARTER_MAX]
     if manifest_id:
         out["id"] = manifest_id
     out["manifestVersion"] = _COPILOT_CHAT_MANIFEST_VERSION
@@ -447,12 +476,18 @@ def _transform_manifest_to_copilot_chat(
             "isNotificationOnly": False,
             "commandLists": [
                 {
-                    "scopes": ["copilot", "personal"],
+                    "scopes": list(_PROMPT_STARTER_SCOPES),
                     "commands": [
+                        # description drives the card's subtitle line; without it
+                        # Copilot Chat repeats the title (walk-observed 2026-07-06).
+                        # Set it to the prompt so the card reads title + preview.
                         {
-                            "title": "How can you help me?",
-                            "description": "How can you help me?",
+                            "title": s["title"],
+                            "description": s["prompt"],
+                            "type": "prompt",
+                            "prompt": s["prompt"],
                         }
+                        for s in starters
                     ],
                 }
             ],
@@ -516,6 +551,7 @@ def _patch_manifest_to_copilot_chat(
     manifest_id: str | None = None,
     distinguish_name_short: bool = False,
     scopes: tuple[str, ...] = _COPILOT_CHAT_DEFAULT_SCOPES,
+    prompt_starters: tuple[dict[str, str], ...] | None = None,
 ) -> tuple[str, dict] | None:
     """Rewrite ``manifest.json`` inside *zip_path* into a Custom Engine
     Agent shape. Returns ``(bot_id_used, summary)`` on success, ``None``
@@ -559,6 +595,7 @@ def _patch_manifest_to_copilot_chat(
         manifest_id=manifest_id,
         distinguish_name_short=distinguish_name_short,
         scopes=scopes,
+        prompt_starters=prompt_starters,
     )
     blob = json.dumps(new_manifest, indent=2).encode("utf-8")
 
@@ -671,6 +708,7 @@ def apply_publish_plan(
                     distinguish_name_short=(
                         plan.inputs.aiteammate and plan.inputs.copilot_chat
                     ),
+                    prompt_starters=plan.inputs.prompt_starters,
                 )
                 if cc_result is not None:
                     copilot_chat_bot_id, summary = cc_result
@@ -787,7 +825,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         "--copilot-chat",
         action="store_true",
         help=(
-            "emit a Custom Engine Agent manifest (manifestVersion 1.21, "
+            "emit a Custom Engine Agent manifest (manifestVersion 1.27, "
             "bots + copilotAgents blocks) for M365 Copilot Chat upload; "
             "combine with --aiteammate to emit both surfaces"
         ),
@@ -813,9 +851,34 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         action="store_true",
         help="use blueprint-based non-DW flow (only with --aiteammate false)",
     )
+    parser.add_argument(
+        "--prompt-starter",
+        action="append",
+        metavar="TITLE|PROMPT",
+        help=(
+            "Copilot Chat zero-state prompt starter as 'Title|Prompt text' "
+            f"(repeatable, max {_PROMPT_STARTER_MAX}; only with --copilot-chat). "
+            "Defaults to a generic set when omitted."
+        ),
+    )
     parser.add_argument("--verbose", action="store_true")
     parser.add_argument("--apply", action="store_true", help="execute the plan; default is dry-run")
     return parser
+
+
+def _parse_prompt_starter(spec: str) -> dict[str, str]:
+    """Parse a ``--prompt-starter`` value ('Title|Prompt text') into a
+    ``{title, prompt}`` command. The first ``|`` splits title from prompt; with
+    no ``|`` the whole string is used for both. Fields are trimmed to the 1.27
+    schema caps (title ≤128, prompt ≤4000)."""
+    title, sep, prompt = spec.partition("|")
+    title = title.strip()
+    prompt = prompt.strip() if sep else title
+    if not title:
+        raise ValueError(
+            "--prompt-starter needs a non-empty title (format: 'Title|Prompt text')"
+        )
+    return {"title": title[:128], "prompt": prompt[:4000]}
 
 
 def run(args: argparse.Namespace) -> int:
@@ -828,6 +891,11 @@ def run(args: argparse.Namespace) -> int:
             bot_id=args.bot_id,
             manifest_id=args.manifest_id,
             use_blueprint=args.use_blueprint,
+            prompt_starters=(
+                tuple(_parse_prompt_starter(s) for s in args.prompt_starter)
+                if getattr(args, "prompt_starter", None)
+                else None
+            ),
             verbose=args.verbose,
         )
     except ValueError as e:
