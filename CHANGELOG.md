@@ -4,6 +4,66 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] — Unreleased (pending #89 terminal walk)
+
+Milestone v0.8.4 — **rich Teams / Copilot Chat surfaces on the #18 invoke
+foundation**: file transfer both directions (#76), interactive approval/clarify
+cards (#77), outbound AI-content entities (#73), and Copilot→Teams handoff
+(#82). The single terminal arc walk (#89) validates all four together on the
+live tenant before this ships; the entry is held Unreleased until then.
+
+### Added
+
+- **#76 — Teams file/media both directions.** Inbound: image + file attachments
+  download into the platform media cache (`{HERMES_HOME}/platforms/agent365/
+  media`) and their local paths flow into `MessageEvent.media_urls` for the
+  gateway's auto-vision / document path (25 MiB cap, path-traversal-safe names,
+  best-effort). Outbound: `send_document` / `send_image_file` deliver a local
+  file to a Teams 1:1 via a **FileConsentCard → OneDrive upload** — on Accept the
+  `fileConsent/invoke` carries a pre-authenticated `uploadUrl` we PUT the bytes
+  to, then confirm with a FileInfoCard (pending offer popped before upload →
+  at-most-once). Non-personal chats (Copilot Chat / group / channel) degrade to a
+  text fallback; group/channel file transfer needs Graph and is deferred. Manifest
+  `supportsFiles` → **true**.
+- **#77 — interactive-UI cards.** `send_exec_approval`, `send_slash_confirm`, and
+  `send_clarify` render Adaptive Cards with **`Action.Submit`** buttons (documented
+  Copilot-Chat-supported; both surfaces). A click returns a message-with-`value`
+  tagged `hermes_kind`; the route intercepts it ahead of the agent loop and
+  resolves back through the gateway's module resolvers (`tools.approval` /
+  `tools.slash_confirm` / `tools.clarify_gateway`). Open-ended clarify sends the
+  question as text and arms the gateway text-intercept. `send_model_picker`
+  deferred (optional / lowest priority).
+- **#73(b) — citations.** `metadata["citations"]` maps to a `citation` array on
+  the root `https://schema.org/Message` entity (1-based `position` matching the
+  agent's in-text `[N]` markers; capped at 20; malformed entries skipped).
+- **#73(c) — feedback loop.** `channelData.feedbackLoop:{type:"default"}` on agent
+  replies (plain + streaming-final), env-gated **`A365_FEEDBACK_LOOP`** (default
+  on). `message/submitAction` + `message/fetchTask` land as per-name invoke
+  children; the reaction is recorded keyed by the replied message id (Teams stores
+  nothing).
+- **#82 — Copilot→Teams handoff.** A `handoff/action` invoke child mints/resolves
+  continuation tokens (in-memory map), and a policy-gated **"continue in Teams"**
+  deep link (env **`A365_HANDOFF_LINK`**, default off) is appended to degraded
+  coalesced-from-stream Copilot Chat replies.
+
+### Changed
+
+- Invoke dispatch now uses a **per-instance registry** (the module
+  `INVOKE_REGISTRY` plus adapter-bound children for feedback + handoff) passed to
+  `dispatch_invoke`, keeping `invoke.py` free of any `plugin/` import.
+- `render_reply_activity` gained `build_ai_message_entity` (shared by both
+  runtimes) and optional `citations` / `feedback` handling; existing serve callers
+  are unaffected unless they opt in.
+
+### Notes
+
+- Full agent-session import across a #82 handoff is a Hermes-core concern (a
+  conversation-import hook) and is flagged upstream — the adapter owns only the
+  token lifecycle + deep link.
+- Feedback-loop delivery on Copilot Chat carries a documented Microsoft caveat
+  (the reaction may not be surfaced to the developer there); the Teams 1:1 surface
+  still delivers it. To be confirmed on the #89 walk.
+
 ## [0.8.3] — 2026-07-06
 
 Milestone v0.8.3 — **Copilot Chat prompt starters + manifest 1.27 bump** (#74).
