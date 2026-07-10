@@ -64,6 +64,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import os
 import re
 import time
@@ -94,6 +95,17 @@ from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 # Bridge helpers are imported lazily inside methods so missing optional
 # extras (e.g. fastapi for `activity-bridge serve`) produce a clear runtime
 # error rather than blowing up at gateway-load time.
+
+# #76 — inbound Teams file/media. A file upload arrives as an attachment with
+# this contentType and a ``content.downloadUrl`` (pre-authenticated); inline
+# images arrive as ``image/*`` attachments whose ``contentUrl`` needs the bot's
+# reply bearer. Downloaded media lands in the platform media cache and its local
+# path goes into ``MessageEvent.media_urls`` for the gateway's auto-vision /
+# document path (mirrors the whatsapp_cloud adapter). Copilot Chat sends no
+# attachments (files unsupported there), so this is a no-op on CC turns.
+_TEAMS_FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
+# 25 MiB safety cap; the gateway enforces its own config-driven cap downstream.
+_MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024
 
 _DEFAULT_PORT = 3978
 
@@ -884,13 +896,155 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._persist_conversations()
 
             # Build event + dispatch through Hermes' loop.
-            event = self._activity_to_event(activity)
+            # #76 — download any inbound attachments (images/files) into the
+            # media cache so the agent's auto-vision / document path sees them.
+            media = await self._extract_inbound_media(
+                activity, validated_path=validated_path
+            )
+            event = self._activity_to_event(activity, media=media)
             await self.handle_message(event)
             return JSONResponse({"status": "dispatched"})
 
         return app
 
-    def _activity_to_event(self, activity: dict[str, Any]) -> MessageEvent:
+    # ── #76 inbound file/media ────────────────────────────────────────────
+
+    def _media_cache_dir(self) -> Path:
+        """#76: platform media cache — ``{HERMES_HOME}/platforms/agent365/media``.
+        Absolute paths under here go into ``MessageEvent.media_urls``; the gateway
+        reads them for auto-vision / documents (matches the whatsapp_cloud
+        adapter's per-platform cache convention)."""
+        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
+        return Path(home) / "platforms" / "agent365" / "media"
+
+    async def _reply_bearer(
+        self, activity: dict[str, Any], validated_path: str | None
+    ) -> str | None:
+        """Mint the reply bearer, reused to download an inbound image's
+        ``contentUrl`` (Teams serves inline-image content with the bot's
+        Connector token). Returns None on any failure. The token audience for
+        attachment download is walk-validated at #89."""
+        if self._http_client is None or self._bridge_cfg is None:
+            return None
+        try:
+            bridge = _import_bridge()
+            token, _p = await bridge.acquire_reply_token(
+                client=self._http_client,
+                cfg=self._bridge_cfg,
+                activity=activity,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+                bf_cache=self._bf_token_cache,
+                validated_path=validated_path,
+            )
+            return token
+        except Exception as e:
+            logger.warning("agent365 inbound-media token mint failed: %s", e)
+            return None
+
+    async def _download_inbound_media(
+        self, url: str, *, headers: dict[str, str] | None, cache_name: str
+    ) -> str | None:
+        """Download one inbound attachment into the media cache; return its local
+        path or None. Best-effort (a failed download is logged + skipped so the
+        text still dispatches) and size-capped. ``cache_name`` must be
+        caller-sanitised — it is joined onto the cache dir."""
+        if self._http_client is None:
+            return None
+        try:
+            resp = await self._http_client.get(url, headers=headers or {}, timeout=30.0)
+            resp.raise_for_status()
+            data = resp.content
+        except Exception as e:
+            logger.warning("agent365 inbound media download failed (%.60s): %s", url, e)
+            return None
+        if len(data) > _MAX_INBOUND_MEDIA_BYTES:
+            logger.warning(
+                "agent365 inbound media over %d-byte cap (%d); dropped",
+                _MAX_INBOUND_MEDIA_BYTES,
+                len(data),
+            )
+            return None
+        try:
+            cache_dir = self._media_cache_dir()
+            cache_dir.mkdir(parents=True, exist_ok=True)
+            out = cache_dir / cache_name
+            out.write_bytes(data)
+        except OSError as e:
+            logger.warning("agent365 inbound media cache write failed: %s", e)
+            return None
+        return str(out)
+
+    async def _extract_inbound_media(
+        self, activity: dict[str, Any], *, validated_path: str | None
+    ) -> tuple[list[str], list[str], MessageType]:
+        """#76(a/b): download Teams inbound attachments into the media cache so
+        the agent's auto-vision (images) / document path sees them. Returns
+        ``(media_urls, media_types, message_type)``. Best-effort; a failed
+        attachment is skipped. No-op when there are no attachments (the common
+        text turn, and every Copilot Chat turn — files are unsupported on CC)."""
+        attachments = activity.get("attachments")
+        if not isinstance(attachments, list) or not attachments:
+            return [], [], MessageType.TEXT
+        media_urls: list[str] = []
+        media_types: list[str] = []
+        saw_image = saw_file = False
+        # Collision-free, path-traversal-safe base from the (validated) activity
+        # id — never interpolate the user-supplied file name into the path.
+        base = re.sub(r"[^A-Za-z0-9._-]", "_", str(activity.get("id") or "att"))[:64]
+        image_bearer: str | None = None  # minted once, lazily, for image contentUrls
+        for i, att in enumerate(attachments):
+            if not isinstance(att, dict):
+                continue
+            ctype = str(att.get("contentType") or "")
+            if ctype.startswith("image/"):
+                url = att.get("contentUrl")
+                if not isinstance(url, str) or not url or url.startswith("data:"):
+                    continue  # inline data: URIs carry bytes directly — deferred
+                if image_bearer is None:
+                    image_bearer = await self._reply_bearer(activity, validated_path)
+                if image_bearer is None:
+                    continue
+                ext = mimetypes.guess_extension(ctype.split(";", 1)[0]) or ".bin"
+                path = await self._download_inbound_media(
+                    url,
+                    headers={"Authorization": f"Bearer {image_bearer}"},
+                    cache_name=f"{base}_{i}{ext}",
+                )
+                if path is not None:
+                    media_urls.append(path)
+                    media_types.append(ctype)
+                    saw_image = True
+            elif ctype == _TEAMS_FILE_DOWNLOAD_INFO:
+                content = att.get("content")
+                content = content if isinstance(content, dict) else {}
+                url = content.get("downloadUrl")
+                if not isinstance(url, str) or not url:
+                    continue
+                # downloadUrl is a pre-authenticated SharePoint/OneDrive link.
+                file_type = str(content.get("fileType") or "").lower()
+                ext = f".{file_type}" if file_type and file_type.isalnum() else ".bin"
+                path = await self._download_inbound_media(
+                    url, headers=None, cache_name=f"{base}_{i}{ext}"
+                )
+                if path is not None:
+                    media_urls.append(path)
+                    media_types.append(_TEAMS_FILE_DOWNLOAD_INFO)
+                    saw_file = True
+        message_type = (
+            MessageType.PHOTO
+            if saw_image
+            else MessageType.DOCUMENT
+            if saw_file
+            else MessageType.TEXT
+        )
+        return media_urls, media_types, message_type
+
+    def _activity_to_event(
+        self,
+        activity: dict[str, Any],
+        media: tuple[list[str], list[str], MessageType] | None = None,
+    ) -> MessageEvent:
         conv = activity.get("conversation") or {}
         sender = activity.get("from") or {}
         recipient = activity.get("recipient")
@@ -917,13 +1071,18 @@ class Agent365Adapter(BasePlatformAdapter):
             user_name=str(sender.get("name") or ""),
             message_id=str(activity.get("id") or ""),
         )
+        # #76 — media downloaded by the async _extract_inbound_media step; the
+        # message_type reflects the attachment kind (PHOTO/DOCUMENT) or TEXT.
+        media_urls, media_types, media_message_type = media or ([], [], MessageType.TEXT)
         return MessageEvent(
             text=text,
-            message_type=MessageType.TEXT,
+            message_type=media_message_type,
             source=source,
             raw_message=activity,
             message_id=str(activity.get("id") or ""),
             timestamp=datetime.now(),
+            media_urls=media_urls,
+            media_types=media_types,
         )
 
     # ── Connection lifecycle ──────────────────────────────────────────────

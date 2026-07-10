@@ -48,6 +48,8 @@ class _StubMessageEvent:
     raw_message: Any = None
     message_id: str | None = None
     timestamp: Any = None
+    media_urls: list = field(default_factory=list)
+    media_types: list = field(default_factory=list)
 
 
 class _StubPlatform:
@@ -5531,3 +5533,142 @@ class TestInvokeRoute:
         assert ctx.user_oid == "claim-oid"
         assert ctx.tenant_id == "claim-tid"
         assert ctx.user_upn == "u@x"
+
+
+class TestInboundMedia:
+    """#76(a/b) — Teams inbound attachments downloaded into the media cache and
+    surfaced on MessageEvent.media_urls / media_types."""
+
+    def _adapter(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> Any:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        a = _make_adapter(monkeypatch)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        return a
+
+    @staticmethod
+    def _resp(content: bytes) -> Any:
+        r = MagicMock()
+        r.content = content
+        r.raise_for_status = MagicMock(return_value=None)
+        return r
+
+    @pytest.mark.asyncio
+    async def test_no_attachments_is_text(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = self._adapter(monkeypatch, tmp_path)
+        out = await a._extract_inbound_media({"id": "act-1"}, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)
+
+    @pytest.mark.asyncio
+    async def test_inbound_file_download_info_no_bearer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = self._adapter(monkeypatch, tmp_path)
+        a._http_client.get = AsyncMock(return_value=self._resp(b"PDFDATA"))
+        activity = {
+            "id": "act:9",  # ':' must be sanitised out of the cache filename
+            "attachments": [
+                {
+                    "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
+                    "name": "../../evil.pdf",  # user-controlled — must not reach the path
+                    "content": {"downloadUrl": "https://sp/dl", "fileType": "pdf"},
+                }
+            ],
+        }
+        urls, types, mt = await a._extract_inbound_media(activity, validated_path="A")
+        assert mt == adapter_mod.MessageType.DOCUMENT
+        assert types == [adapter_mod._TEAMS_FILE_DOWNLOAD_INFO]
+        p = Path(urls[0])
+        assert p.read_bytes() == b"PDFDATA"
+        assert p.suffix == ".pdf"
+        # Path-traversal: the malicious name/id never escape the cache dir.
+        assert p.parent == a._media_cache_dir()
+        assert ".." not in p.name and "evil" not in p.name
+        # Pre-authenticated downloadUrl fetched WITHOUT an auth header.
+        assert not a._http_client.get.await_args.kwargs.get("headers")
+
+    @pytest.mark.asyncio
+    async def test_inbound_image_downloads_with_reply_bearer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = self._adapter(monkeypatch, tmp_path)
+        a._http_client.get = AsyncMock(return_value=self._resp(b"PNGDATA"))
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("BEARER", "A"))
+        )
+        activity = {
+            "id": "act-img",
+            "attachments": [
+                {"contentType": "image/png", "contentUrl": "https://smba/att/1"}
+            ],
+        }
+        urls, types, mt = await a._extract_inbound_media(activity, validated_path="A")
+        assert mt == adapter_mod.MessageType.PHOTO
+        assert types == ["image/png"]
+        p = Path(urls[0])
+        assert p.read_bytes() == b"PNGDATA"
+        assert p.suffix == ".png"
+        # contentUrl fetched WITH the reply bearer.
+        assert (
+            a._http_client.get.await_args.kwargs["headers"]["Authorization"]
+            == "Bearer BEARER"
+        )
+
+    @pytest.mark.asyncio
+    async def test_oversized_media_dropped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = self._adapter(monkeypatch, tmp_path)
+        big = b"x" * (adapter_mod._MAX_INBOUND_MEDIA_BYTES + 1)
+        a._http_client.get = AsyncMock(return_value=self._resp(big))
+        activity = {
+            "id": "a",
+            "attachments": [
+                {
+                    "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
+                    "content": {"downloadUrl": "https://sp/x"},
+                }
+            ],
+        }
+        out = await a._extract_inbound_media(activity, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)
+
+    @pytest.mark.asyncio
+    async def test_failed_download_is_skipped(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = self._adapter(monkeypatch, tmp_path)
+        a._http_client.get = AsyncMock(side_effect=RuntimeError("boom"))
+        activity = {
+            "id": "a",
+            "attachments": [
+                {
+                    "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
+                    "content": {"downloadUrl": "https://sp/x"},
+                }
+            ],
+        }
+        out = await a._extract_inbound_media(activity, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)
+
+    def test_activity_to_event_populates_media(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        ev = a._activity_to_event(
+            _make_inbound(text="see pic"),
+            media=(["/cache/x.png"], ["image/png"], adapter_mod.MessageType.PHOTO),
+        )
+        assert ev.media_urls == ["/cache/x.png"]
+        assert ev.media_types == ["image/png"]
+        assert ev.message_type == adapter_mod.MessageType.PHOTO
+        # No media → TEXT + empty lists (regression: text turns unaffected).
+        ev2 = a._activity_to_event(_make_inbound(text="hi"))
+        assert ev2.message_type == adapter_mod.MessageType.TEXT
+        assert ev2.media_urls == []
