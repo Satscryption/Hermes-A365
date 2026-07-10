@@ -6460,3 +6460,78 @@ class TestHandoff:
             adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-dm"))
         )
         assert a._maybe_append_handoff_link("conv-dm", "body") == "body"
+
+
+# ---------------------------------------------------------------------------
+# v0.8.4 review follow-ups — bounded correlator maps, upload zero-guard
+# ---------------------------------------------------------------------------
+
+
+class TestCorrelatorBounds:
+    def test_bound_map_drops_oldest(self) -> None:
+        m = {str(i): i for i in range(5)}
+        adapter_mod._bound_map(m, cap=3)
+        assert list(m) == ["2", "3", "4"]
+
+    @pytest.mark.asyncio
+    async def test_feedback_map_is_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_CORRELATOR_ENTRIES", 3)
+        a = _make_adapter(monkeypatch)
+        for i in range(6):
+            ctx = adapter_mod.invoke.build_invoke_context(
+                {
+                    "type": "invoke",
+                    "name": "message/submitAction",
+                    "replyToId": f"msg-{i}",
+                    "conversation": {"id": "conv-1"},
+                    "value": {"actionName": "feedback", "actionValue": {"reaction": "like"}},
+                },
+                claims=None,
+                path_tag="A",
+            )
+            await a._handle_feedback_submit(ctx)
+        assert len(a._feedback_by_message_id) == 3
+
+    @pytest.mark.asyncio
+    async def test_handoff_upload_zero_byte_file_acks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # #76c review nit: a file truncated to empty between offer and Accept
+        # must not build a malformed Content-Range — ack gracefully instead.
+        a = _make_adapter(monkeypatch)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        f = tmp_path / "empty.bin"
+        f.write_bytes(b"")
+        a._pending_file_uploads["c1"] = {"path": str(f), "name": "empty.bin"}
+        a._http_client.put = AsyncMock()
+        activity = {
+            "type": "invoke",
+            "name": adapter_mod._FILE_CONSENT_INVOKE,
+            "value": {
+                "action": "accept",
+                "context": {"consentId": "c1"},
+                "uploadInfo": {"uploadUrl": "https://x/up"},
+            },
+            "conversation": {"id": "conv-1"},
+        }
+        resp = await a._handle_file_consent(activity, validated_path="A")
+        assert resp.status == 200
+        # No malformed PUT attempted.
+        assert a._http_client.put.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_disconnect_clears_correlator_maps(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._feedback_by_message_id["m"] = {"reaction": "like"}
+        a._handoff_tokens["t"] = {"conversation_id": "c"}
+        await a.disconnect()
+        assert a._feedback_by_message_id == {}
+        assert a._handoff_tokens == {}

@@ -120,6 +120,12 @@ _FILE_CONSENT_INVOKE = "fileConsent/invoke"
 # file well above this); chunked upload for larger files is a follow-up.
 _MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024
 
+# #73(c)/#82 — bound the per-lifetime feedback / handoff-token correlator maps
+# so a long-running gateway can't grow them without limit (feedback is
+# default-on; unclicked handoff links are never popped). Oldest entry is
+# dropped past the cap (dict preserves insertion order).
+_MAX_CORRELATOR_ENTRIES = 2048
+
 # #77 — interactive-UI cards. Approve/deny, slash-confirm, and clarify prompts
 # render as Adaptive Cards whose buttons are ``Action.Submit`` (documented CC-
 # supported; both surfaces). A click returns an inbound ``message`` activity
@@ -149,6 +155,17 @@ _DEFAULT_PORT = 3978
 # imported so the plugin stays importable in pytest contexts that
 # don't pull in the Hermes harness.
 _STREAMING_CURSORS_TO_STRIP: tuple[str, ...] = (" ▉", "▉")
+
+
+def _bound_map(m: dict[str, Any], cap: int | None = None) -> None:
+    """Drop oldest entries until ``m`` is within ``cap`` (in place). Dicts
+    preserve insertion order, so the first key is the oldest. Keeps the
+    per-lifetime feedback / handoff correlator maps from growing without
+    limit on a long-running gateway. ``cap`` defaults to
+    ``_MAX_CORRELATOR_ENTRIES`` (read at call time so it stays tunable)."""
+    limit = _MAX_CORRELATOR_ENTRIES if cap is None else cap
+    while len(m) > limit:
+        m.pop(next(iter(m)))
 
 
 def _strip_streaming_cursor(text: str) -> str:
@@ -1304,6 +1321,9 @@ class Agent365Adapter(BasePlatformAdapter):
             task.cancel()
         self._coalesced_status_tasks.clear()
         self._coalesced_status.clear()
+        # #73(c)/#82 — drop per-lifetime correlator maps on disconnect.
+        self._feedback_by_message_id.clear()
+        self._handoff_tokens.clear()
         self._mark_disconnected()
 
     # ── Outbound ──────────────────────────────────────────────────────────
@@ -1746,8 +1766,10 @@ class Agent365Adapter(BasePlatformAdapter):
 
         state = self._coalesced_replies.get(message_id) or {}
         final_content = str(state.get("content") or "")
-        # #82 — this is the CC "coalesced-from-stream" degradation; offer a
-        # "continue in Teams" link (policy-gated, off by default).
+        # #82 — the coalesced path is the "degraded-from-stream" surface for
+        # every non-personal chat (Copilot Chat AND genuine Teams groups are
+        # wire-indistinguishable here). Offer a "continue in Teams" link
+        # (policy-gated, off by default).
         final_content = self._maybe_append_handoff_link(chat_id, final_content)
         result = await self._send_reply_activity(
             inbound=inbound,
@@ -2700,6 +2722,12 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.InvokeResponse(status=200, body={})
 
         size = len(data)
+        if size <= 0:
+            # File truncated to empty between the offer and the Accept — the
+            # OneDrive range header (bytes 0--1/0) would be malformed. Ack
+            # gracefully rather than send a doomed request.
+            logger.warning("agent365 fileConsent: file empty at upload time")
+            return invoke.InvokeResponse(status=200, body={})
         try:
             put_resp = await self._http_client.put(
                 upload_url,
@@ -2775,6 +2803,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "conversation_id": str(ctx.conv.get("id") or ""),
                 "user_oid": ctx.user_oid,
             }
+            _bound_map(self._feedback_by_message_id)
         logger.info(
             "agent365 feedback reaction=%s msg=%s",
             str(action_value.get("reaction") or "?"),
@@ -2802,10 +2831,14 @@ class Agent365Adapter(BasePlatformAdapter):
         )
 
     def _maybe_append_handoff_link(self, chat_id: str, content: str) -> str:
-        """#82: append a "continue in Teams" deep link to a degraded Copilot Chat
+        """#82: append a "continue in Teams" deep link to a degraded non-personal
         reply, when enabled (A365_HANDOFF_LINK). No-op for personal chats, when
         disabled, or when the conversation can't be resolved — the original
-        content is returned unchanged."""
+        content is returned unchanged. NB: Copilot Chat and a genuine Teams group
+        are indistinguishable from the stored ref (the discriminator is the
+        per-turn path tag, absent here), so an enabled link also appears on real
+        Teams-group degraded replies — acceptable as the feature is opt-in and
+        walk-gated (#89)."""
         if not self._handoff_link_enabled:
             return content
         ref = self._conversations.get(chat_id)
@@ -2830,6 +2863,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "tenant_id": ref.tenant_id,
             "reason": reason,
         }
+        _bound_map(self._handoff_tokens)
         return self._handoff_deep_link(token)
 
     async def _handle_handoff_action(
