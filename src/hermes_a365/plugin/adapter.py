@@ -68,6 +68,7 @@ import mimetypes
 import os
 import re
 import time
+import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -106,6 +107,18 @@ from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 _TEAMS_FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
 # 25 MiB safety cap; the gateway enforces its own config-driven cap downstream.
 _MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024
+
+# #76c — outbound Teams file transfer. A local file is offered via a
+# FileConsentCard; on Accept the user's ``fileConsent/invoke`` carries a
+# pre-authenticated OneDrive ``uploadUrl`` we PUT the bytes to, then we confirm
+# with a FileInfoCard. Personal (Teams 1:1) scope only — group/channel needs
+# Graph (#76 slice d) and degrades to a text fallback here.
+_FILE_CONSENT_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.consent"
+_FILE_INFO_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.info"
+_FILE_CONSENT_INVOKE = "fileConsent/invoke"
+# Single-PUT upload cap (the OneDrive session accepts one range for the whole
+# file well above this); chunked upload for larger files is a follow-up.
+_MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024
 
 _DEFAULT_PORT = 3978
 
@@ -568,6 +581,15 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_status: dict[str, dict[str, Any]] = {}
         self._coalesced_status_tasks: dict[str, asyncio.Task] = {}
 
+        # #76c — outbound file transfer. Maps our generated ``consentId`` ->
+        # {"path": <safe local path>, "name": <file name>} for a FileConsentCard
+        # awaiting the user's Accept/Decline. Consumed (popped) by the
+        # ``fileConsent/invoke`` handler; a consent the user never answers is
+        # simply never uploaded. In-memory + per-lifetime (mirrors
+        # ``_active_stream_by_chat``) — a gateway restart drops pending offers,
+        # so a late Accept acks gracefully without an upload.
+        self._pending_file_uploads: dict[str, dict[str, Any]] = {}
+
     @property
     def name(self) -> str:
         return "Agent 365"
@@ -787,6 +809,25 @@ class Agent365Adapter(BasePlatformAdapter):
             # returns a graceful {status:500} invokeResponse, not an HTTP 500.
             if str(activity.get("type") or "") == "invoke":
                 invoke_name = str(activity.get("name") or "")
+                # #76c — fileConsent/invoke is the user's Accept/Decline on an
+                # outbound FileConsentCard. It drives an upload side-effect (PUT
+                # bytes to a OneDrive session) + a FileInfoCard ack, so it is NOT
+                # a #18 typed-invoke child (task/fetch/search) and never enters
+                # the agent loop. Handled here, ahead of the message dedupe, so a
+                # BF retry re-acks idempotently (the pending entry is popped on
+                # first handling — see ``_handle_file_consent``).
+                if invoke_name == _FILE_CONSENT_INVOKE:
+                    try:
+                        resp = await self._handle_file_consent(
+                            activity, validated_path=validated_path
+                        )
+                    except Exception as e:
+                        logger.error("agent365 fileConsent handler crashed: %s", e)
+                        resp = invoke.InvokeResponse(status=200, body={})
+                    logger.info(
+                        "inbound invoke name=%s status=%s", invoke_name, resp.status
+                    )
+                    return JSONResponse(resp.body, status_code=resp.status)
                 # Context assembly (_inbound_path_tag / build_invoke_context) is
                 # inside the try too: a wire-shape surprise on the live walk must
                 # degrade to a graceful {status:500} invokeResponse, never an
@@ -2379,6 +2420,259 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.error("agent365 send_image failed: %s", e)
             return SendResult(success=False, error=str(e))
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
+
+    # ── #76c outbound file transfer (FileConsentCard → OneDrive) ───────────
+
+    @staticmethod
+    def _reply_with_attachment(
+        inbound: dict[str, Any],
+        attachment: dict[str, Any],
+        *,
+        text: str = "",
+    ) -> dict[str, Any]:
+        """Build a BF ``message`` reply carrying a single non-Adaptive
+        attachment (Teams file consent/info cards). Mirrors
+        ``bridge.render_reply_activity``'s conversation/recipient/from triple but
+        deliberately OMITS the AI-generated-content entity — a file-transfer card
+        is a platform affordance, not model output, so #73(a)'s label doesn't
+        apply."""
+        reply: dict[str, Any] = {
+            "type": "message",
+            "from": inbound.get("recipient", {}),
+            "recipient": inbound.get("from", {}),
+            "conversation": inbound.get("conversation", {}),
+            "replyToId": inbound.get("id"),
+            "attachments": [attachment],
+        }
+        if text:
+            reply["text"] = text
+        return reply
+
+    async def _send_file_consent(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str,
+        file_name: str,
+        *,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """#76c: offer a local file to a Teams 1:1 chat via a FileConsentCard.
+        The bytes are NOT sent now — on Accept the user's ``fileConsent/invoke``
+        (see ``_handle_file_consent``) carries the OneDrive upload session we PUT
+        to. Personal scope only: a non-personal chat (Copilot Chat / group /
+        channel) has no file-consent affordance, so it degrades to the base text
+        fallback so the agent still communicates the file."""
+        inbound = self._cached_inbound_for(chat_id)
+        if not inbound:
+            msg = f"agent365 send_file: no cached inbound for {chat_id!r}"
+            logger.error(msg)
+            return SendResult(success=False, error=msg)
+        conv = inbound.get("conversation") or {}
+        if str(conv.get("conversationType") or "") != "personal":
+            logger.info(
+                "agent365 send_file: non-personal chat %s → text fallback", chat_id
+            )
+            text = f"📎 {file_name}"
+            if caption:
+                text = f"{caption}\n{text}"
+            return await self.send(
+                chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
+            )
+        if self._http_client is None or self._bridge_cfg is None:
+            msg = "agent365 send_file: adapter not connected"
+            logger.error(msg)
+            return SendResult(success=False, error=msg)
+
+        # Path-safety + existence + size via the gateway's shared validator
+        # (resolves symlinks, blocks credential/system paths).
+        safe_path = self.validate_media_delivery_path(file_path)
+        if safe_path is None:
+            msg = f"agent365 send_file: unsafe or missing path for {file_name!r}"
+            logger.warning(msg)
+            return SendResult(success=False, error=msg)
+        try:
+            size = os.path.getsize(safe_path)
+        except OSError as e:
+            return SendResult(success=False, error=str(e))
+        if size <= 0 or size > _MAX_OUTBOUND_FILE_BYTES:
+            msg = f"agent365 send_file: size {size} out of range for {file_name!r}"
+            logger.warning(msg)
+            return SendResult(success=False, error=msg)
+
+        self._conversations.mark_used(chat_id)
+        consent_id = uuid.uuid4().hex
+        card = {
+            "contentType": _FILE_CONSENT_CONTENT_TYPE,
+            "name": file_name,
+            "content": {
+                "description": caption or file_name,
+                "sizeInBytes": size,
+                "acceptContext": {"consentId": consent_id},
+                "declineContext": {"consentId": consent_id},
+            },
+        }
+        reply = self._reply_with_attachment(inbound, card)
+        try:
+            await _import_bridge().send_reply(
+                inbound=inbound,
+                reply=reply,
+                cfg=self._bridge_cfg,
+                client=self._http_client,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+                bf_cache=self._bf_token_cache,
+                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+            )
+        except Exception as e:
+            logger.error("agent365 send_file consent card failed: %s", e)
+            return SendResult(success=False, error=str(e))
+        # Record the pending upload only AFTER the card is accepted by BF — a
+        # failed send leaves no consent the user can act on.
+        self._pending_file_uploads[consent_id] = {"path": safe_path, "name": file_name}
+        return SendResult(success=True, message_id=consent_id)
+
+    async def send_document(
+        self,
+        chat_id: str,
+        file_path: str,
+        caption: str | None = None,
+        file_name: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """#76c: deliver a local file to a Teams 1:1 chat as a downloadable
+        attachment via the FileConsentCard → OneDrive flow. Non-personal chats
+        degrade to the base text fallback."""
+        name = file_name or os.path.basename(file_path) or "file"
+        return await self._send_file_consent(
+            chat_id, file_path, caption or "", name,
+            reply_to=reply_to, metadata=metadata,
+        )
+
+    async def send_image_file(
+        self,
+        chat_id: str,
+        image_path: str,
+        caption: str | None = None,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> SendResult:
+        """#76c: deliver a local image file to a Teams 1:1 chat as a downloadable
+        attachment (FileConsentCard → OneDrive). Unlike ``send_image`` (URL →
+        inline Adaptive Card), this hands over the actual bytes. Non-personal →
+        text fallback."""
+        name = os.path.basename(image_path) or "image"
+        return await self._send_file_consent(
+            chat_id, image_path, caption or "", name,
+            reply_to=reply_to, metadata=metadata,
+        )
+
+    async def _handle_file_consent(
+        self, activity: dict[str, Any], *, validated_path: str | None
+    ) -> invoke.InvokeResponse:
+        """#76c: handle a ``fileConsent/invoke`` — the user's Accept/Decline on a
+        FileConsentCard we sent. On Accept: PUT the file bytes to the OneDrive
+        upload session, then confirm with a FileInfoCard. On Decline / unknown
+        consent: ack without uploading. ALWAYS returns a 200 InvokeResponse —
+        Teams renders a non-200 as an upload-failure banner, and the outcome here
+        (uploaded, declined, or lost-to-restart) is not a protocol error.
+
+        The pending entry is popped BEFORE the upload, so a BF retry of the same
+        invoke acks idempotently rather than uploading the file twice."""
+        value = activity.get("value")
+        value = value if isinstance(value, dict) else {}
+        action = str(value.get("action") or "")
+        context = value.get("context")
+        context = context if isinstance(context, dict) else {}
+        consent_id = str(context.get("consentId") or "")
+        pending = self._pending_file_uploads.pop(consent_id, None)
+
+        if action != "accept":
+            logger.info(
+                "agent365 fileConsent action=%s consent=%s", action, consent_id[:8]
+            )
+            return invoke.InvokeResponse(status=200, body={})
+        if pending is None:
+            # Consent we don't know about — restart dropped the in-memory map, a
+            # replay, or a spoofed id. Ack without uploading.
+            logger.warning(
+                "agent365 fileConsent accept for unknown consent=%s", consent_id[:8]
+            )
+            return invoke.InvokeResponse(status=200, body={})
+
+        upload_info = value.get("uploadInfo")
+        upload_info = upload_info if isinstance(upload_info, dict) else {}
+        upload_url = str(upload_info.get("uploadUrl") or "")
+        if not upload_url or self._http_client is None:
+            logger.warning("agent365 fileConsent accept missing uploadUrl/client")
+            return invoke.InvokeResponse(status=200, body={})
+
+        # Re-validate at upload time — the file may have been removed between the
+        # offer and the Accept; never trust the stored path blindly.
+        safe_path = self.validate_media_delivery_path(str(pending.get("path") or ""))
+        if safe_path is None:
+            logger.warning("agent365 fileConsent accept: file no longer available")
+            return invoke.InvokeResponse(status=200, body={})
+        try:
+            data = Path(safe_path).read_bytes()
+        except OSError as e:
+            logger.warning("agent365 fileConsent read failed: %s", e)
+            return invoke.InvokeResponse(status=200, body={})
+
+        size = len(data)
+        try:
+            put_resp = await self._http_client.put(
+                upload_url,
+                content=data,
+                headers={
+                    "Content-Length": str(size),
+                    "Content-Range": f"bytes 0-{size - 1}/{size}",
+                },
+                timeout=60.0,
+            )
+            status_code = int(getattr(put_resp, "status_code", 0) or 0)
+            if status_code < 200 or status_code >= 300:
+                logger.error("agent365 fileConsent upload HTTP %s", status_code)
+                return invoke.InvokeResponse(status=200, body={})
+        except Exception as e:
+            logger.error("agent365 fileConsent upload failed: %s", e)
+            return invoke.InvokeResponse(status=200, body={})
+
+        # Confirm with a FileInfoCard so the file renders inline in the chat.
+        # Best-effort — the upload already succeeded, so a failed card is logged,
+        # not surfaced as an error.
+        info_card = {
+            "contentType": _FILE_INFO_CONTENT_TYPE,
+            "contentUrl": upload_info.get("contentUrl"),
+            "name": upload_info.get("name") or pending.get("name"),
+            "content": {
+                "uniqueId": upload_info.get("uniqueId"),
+                "fileType": upload_info.get("fileType"),
+            },
+        }
+        try:
+            reply = self._reply_with_attachment(activity, info_card)
+            await _import_bridge().send_reply(
+                inbound=activity,
+                reply=reply,
+                cfg=self._bridge_cfg,
+                client=self._http_client,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+                bf_cache=self._bf_token_cache,
+                validated_path=validated_path,
+            )
+        except Exception as e:
+            logger.warning("agent365 fileConsent info card failed: %s", e)
+
+        logger.info(
+            "agent365 fileConsent uploaded %d bytes consent=%s", size, consent_id[:8]
+        )
+        return invoke.InvokeResponse(status=200, body={})
 
     # ── Slice 19s — BF streaming response protocol ────────────────────────
 

@@ -127,6 +127,18 @@ class _StubBasePlatformAdapter:
     async def handle_message(self, event: Any) -> None:
         self._handled_events.append(event)
 
+    @staticmethod
+    def validate_media_delivery_path(path: str) -> str | None:
+        """Mirror BasePlatformAdapter.validate_media_delivery_path enough for
+        the #76c outbound-file tests: accept an existing absolute regular file,
+        else None (the real one also applies a credential/system denylist)."""
+        if not path:
+            return None
+        p = Path(path)
+        if not p.is_absolute() or not p.is_file():
+            return None
+        return str(p.resolve())
+
 
 def _install_gateway_stubs() -> None:
     if "gateway.platforms.base" in sys.modules:
@@ -5672,3 +5684,345 @@ class TestInboundMedia:
         ev2 = a._activity_to_event(_make_inbound(text="hi"))
         assert ev2.message_type == adapter_mod.MessageType.TEXT
         assert ev2.media_urls == []
+
+
+# ---------------------------------------------------------------------------
+# #76c — outbound file transfer (FileConsentCard → OneDrive upload)
+# ---------------------------------------------------------------------------
+
+
+class TestOutboundFiles:
+    def _connect(self, a: Any) -> None:
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+
+    def _consent_activity(
+        self,
+        *,
+        action: str = "accept",
+        consent_id: str = "c1",
+        upload_info: dict[str, Any] | None = None,
+        conv_id: str = "conv-1",
+    ) -> dict[str, Any]:
+        act = _make_inbound(conv_id=conv_id, activity_id="fc-act-1")
+        act["type"] = "invoke"
+        act["name"] = adapter_mod._FILE_CONSENT_INVOKE
+        val: dict[str, Any] = {"action": action, "context": {"consentId": consent_id}}
+        if upload_info is not None:
+            val["uploadInfo"] = upload_info
+        act["value"] = val
+        return act
+
+    # ── outbound: FileConsentCard ─────────────────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_send_document_personal_emits_consent_card(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        f = tmp_path / "report.pdf"
+        f.write_bytes(b"%PDF-1.4 fake bytes")
+        result = await a.send_document("conv-1", str(f), caption="Here you go")
+
+        assert result.success is True
+        assert send_reply.await_count == 1
+        reply = send_reply.await_args.kwargs["reply"]
+        att = reply["attachments"][0]
+        assert att["contentType"] == adapter_mod._FILE_CONSENT_CONTENT_TYPE
+        assert att["name"] == "report.pdf"
+        assert att["content"]["sizeInBytes"] == f.stat().st_size
+        cid = att["content"]["acceptContext"]["consentId"]
+        # Accept + decline share one consentId (both route back to us).
+        assert att["content"]["declineContext"]["consentId"] == cid
+        # A file-transfer card is NOT AI-generated content — no #73(a) entity.
+        assert "entities" not in reply
+        assert reply["replyToId"] == "act-1"
+        # Pending upload recorded under the consentId; message_id echoes it.
+        assert a._pending_file_uploads[cid]["name"] == "report.pdf"
+        assert result.message_id == cid
+
+    @pytest.mark.asyncio
+    async def test_send_image_file_personal_emits_consent_card(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        f = tmp_path / "pic.png"
+        f.write_bytes(b"\x89PNG fake bytes")
+        result = await a.send_image_file("conv-1", str(f))
+
+        assert result.success is True
+        att = send_reply.await_args.kwargs["reply"]["attachments"][0]
+        assert att["contentType"] == adapter_mod._FILE_CONSENT_CONTENT_TYPE
+        assert att["name"] == "pic.png"
+
+    @pytest.mark.asyncio
+    async def test_send_document_non_personal_text_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-grp")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        # Intercept the base text fallback path.
+        fallback = AsyncMock(return_value=adapter_mod.SendResult(success=True))
+        monkeypatch.setattr(a, "send", fallback)
+
+        f = tmp_path / "doc.txt"
+        f.write_text("hi")
+        result = await a.send_document("conv-grp", str(f), caption="cap")
+
+        assert result.success is True
+        # Degraded to text — no consent card, no pending upload.
+        assert send_reply.await_count == 0
+        assert a._pending_file_uploads == {}
+        assert fallback.await_count == 1
+        assert "doc.txt" in fallback.await_args.kwargs["content"]
+
+    @pytest.mark.asyncio
+    async def test_send_document_missing_file_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        result = await a.send_document("conv-1", str(tmp_path / "nope.pdf"))
+        assert result.success is False
+        assert "unsafe or missing" in (result.error or "")
+        assert send_reply.await_count == 0
+        assert a._pending_file_uploads == {}
+
+    @pytest.mark.asyncio
+    async def test_send_document_oversized_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(adapter_mod, "_MAX_OUTBOUND_FILE_BYTES", 4)
+
+        f = tmp_path / "big.bin"
+        f.write_bytes(b"more than four bytes")
+        result = await a.send_document("conv-1", str(f))
+        assert result.success is False
+        assert "out of range" in (result.error or "")
+        assert send_reply.await_count == 0
+        assert a._pending_file_uploads == {}
+
+    @pytest.mark.asyncio
+    async def test_send_document_no_cached_inbound_fails(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "x.pdf"
+        f.write_bytes(b"x")
+        result = await a.send_document("ghost", str(f))
+        assert result.success is False
+        assert "no cached inbound" in (result.error or "")
+
+    # ── inbound: fileConsent/invoke handler ───────────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_accept_uploads_and_sends_info_card(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "report.pdf"
+        payload = b"the-actual-pdf-bytes"
+        f.write_bytes(payload)
+        a._pending_file_uploads["c1"] = {"path": str(f), "name": "report.pdf"}
+        a._http_client.put = AsyncMock(return_value=MagicMock(status_code=201))
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        upload_info = {
+            "uploadUrl": "https://onedrive.example/upload/session",
+            "contentUrl": "https://sp.example/report.pdf",
+            "name": "report.pdf",
+            "uniqueId": "drive-item-1",
+            "fileType": "pdf",
+        }
+        resp = await a._handle_file_consent(
+            self._consent_activity(upload_info=upload_info), validated_path="A"
+        )
+
+        assert resp.status == 200
+        # Bytes PUT to the pre-authenticated OneDrive session with the range header.
+        assert a._http_client.put.await_count == 1
+        assert a._http_client.put.await_args.args[0] == upload_info["uploadUrl"]
+        assert a._http_client.put.await_args.kwargs["content"] == payload
+        n = len(payload)
+        assert (
+            a._http_client.put.await_args.kwargs["headers"]["Content-Range"]
+            == f"bytes 0-{n - 1}/{n}"
+        )
+        # FileInfoCard confirmation sent, pointing at the uploaded content.
+        assert send_reply.await_count == 1
+        info_att = send_reply.await_args.kwargs["reply"]["attachments"][0]
+        assert info_att["contentType"] == adapter_mod._FILE_INFO_CONTENT_TYPE
+        assert info_att["contentUrl"] == upload_info["contentUrl"]
+        # Pending consumed → a BF retry acks idempotently, no double upload.
+        assert "c1" not in a._pending_file_uploads
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_decline_no_upload(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "x.pdf"
+        f.write_bytes(b"x")
+        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        a._http_client.put = AsyncMock()
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        resp = await a._handle_file_consent(
+            self._consent_activity(action="decline"), validated_path="A"
+        )
+        assert resp.status == 200
+        assert a._http_client.put.await_count == 0
+        assert send_reply.await_count == 0
+        # Pending dropped even on decline (the offer is spent).
+        assert "c1" not in a._pending_file_uploads
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_unknown_consent_acks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        a._http_client.put = AsyncMock()
+        resp = await a._handle_file_consent(
+            self._consent_activity(
+                consent_id="nope", upload_info={"uploadUrl": "https://x/y"}
+            ),
+            validated_path="A",
+        )
+        assert resp.status == 200
+        assert a._http_client.put.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_accept_missing_upload_url_acks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "x.pdf"
+        f.write_bytes(b"x")
+        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        a._http_client.put = AsyncMock()
+        resp = await a._handle_file_consent(
+            self._consent_activity(upload_info=None), validated_path="A"
+        )
+        assert resp.status == 200
+        assert a._http_client.put.await_count == 0
+        assert "c1" not in a._pending_file_uploads
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_upload_http_error_still_acks(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "x.pdf"
+        f.write_bytes(b"data")
+        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        a._http_client.put = AsyncMock(return_value=MagicMock(status_code=500))
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        resp = await a._handle_file_consent(
+            self._consent_activity(
+                upload_info={"uploadUrl": "https://x/y", "contentUrl": "c", "name": "x"}
+            ),
+            validated_path="A",
+        )
+        assert resp.status == 200
+        # Upload failed → no confirmation card, pending consumed (no retry loop).
+        assert send_reply.await_count == 0
+        assert "c1" not in a._pending_file_uploads
+
+    # ── route: fileConsent/invoke reaches the handler ─────────────────────
+
+    def test_route_file_consent_invoke_dispatches_handler(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"oid": "o1", "tid": "t1"}),
+        )
+        self._connect(a)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"pdf")
+        a._pending_file_uploads["c1"] = {"path": str(f), "name": "r.pdf"}
+        a._http_client.put = AsyncMock(return_value=MagicMock(status_code=201))
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        body = _make_inbound(conv_id="conv-fc", activity_id="fc-1")
+        body["type"] = "invoke"
+        body["name"] = adapter_mod._FILE_CONSENT_INVOKE
+        body["value"] = {
+            "action": "accept",
+            "context": {"consentId": "c1"},
+            "uploadInfo": {
+                "uploadUrl": "https://x/up",
+                "contentUrl": "https://x/c",
+                "name": "r.pdf",
+                "uniqueId": "u",
+                "fileType": "pdf",
+            },
+        }
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.status_code == 200, r.text
+        # Handled inline — never dispatched to the fire-and-forget agent loop.
+        assert a._handled_events == []
+        assert a._http_client.put.await_count == 1
+        assert "c1" not in a._pending_file_uploads

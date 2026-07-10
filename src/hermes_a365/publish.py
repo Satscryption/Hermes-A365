@@ -472,7 +472,11 @@ def _transform_manifest_to_copilot_chat(
             "scopes": list(scopes),
             "supportsCalling": False,
             "supportsVideo": False,
-            "supportsFiles": False,
+            # #76c — enables Teams file transfer both ways: inbound attachments
+            # (download.info → media cache) and outbound FileConsentCard →
+            # OneDrive upload. Personal (Teams 1:1) scope; group/channel needs
+            # Graph and is deferred (#76 slice d).
+            "supportsFiles": True,
             "isNotificationOnly": False,
             "commandLists": [
                 {
