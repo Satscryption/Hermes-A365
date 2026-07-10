@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import json
 import sys
 import types
 from dataclasses import dataclass, field
@@ -5529,8 +5530,9 @@ class TestInvokeRoute:
         a._http_client = MagicMock()
         captured: dict[str, Any] = {}
 
-        async def capture(ctx: Any) -> Any:
+        async def capture(ctx: Any, *, registry: Any = None) -> Any:
             captured["ctx"] = ctx
+            captured["registry"] = registry
             return adapter_mod.invoke.InvokeResponse(200, {"ok": True})
 
         monkeypatch.setattr(adapter_mod.invoke, "dispatch_invoke", capture)
@@ -6026,3 +6028,435 @@ class TestOutboundFiles:
         assert a._handled_events == []
         assert a._http_client.put.await_count == 1
         assert "c1" not in a._pending_file_uploads
+
+
+# ---------------------------------------------------------------------------
+# #73(b/c) — citations + feedback loop (plugin send path + invoke children)
+# ---------------------------------------------------------------------------
+
+
+class TestFeedbackAndCitations:
+    def _connected_send(self, monkeypatch: pytest.MonkeyPatch, a: Any) -> Any:
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        return send_reply
+
+    @pytest.mark.asyncio
+    async def test_send_stamps_feedback_channel_data(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        send_reply = self._connected_send(monkeypatch, a)
+        await a.send(chat_id="conv-1", content="hi")
+        reply = send_reply.await_args.kwargs["reply"]
+        assert reply["channelData"] == {"feedbackLoop": {"type": "default"}}
+
+    @pytest.mark.asyncio
+    async def test_feedback_disabled_by_env(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_FEEDBACK_LOOP", "0")
+        a = _make_adapter(monkeypatch)
+        send_reply = self._connected_send(monkeypatch, a)
+        await a.send(chat_id="conv-1", content="hi")
+        assert "channelData" not in send_reply.await_args.kwargs["reply"]
+
+    @pytest.mark.asyncio
+    async def test_send_threads_citations_from_metadata(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        send_reply = self._connected_send(monkeypatch, a)
+        await a.send(
+            chat_id="conv-1",
+            content="See [1].",
+            metadata={"citations": [{"title": "Doc", "url": "https://d"}]},
+        )
+        entity = send_reply.await_args.kwargs["reply"]["entities"][0]
+        assert entity["citation"][0]["appearance"]["name"] == "Doc"
+
+    def _feedback_ctx(
+        self, *, action_name: str = "feedback", reaction: str = "like", msg_id: str = "msg-1"
+    ) -> Any:
+        activity = {
+            "type": "invoke",
+            "name": "message/submitAction",
+            "replyToId": msg_id,
+            "conversation": {"id": "conv-1"},
+            "from": {"id": "user-1"},
+            "value": {
+                "actionName": action_name,
+                "actionValue": {"reaction": reaction, "feedback": "great"},
+            },
+        }
+        return adapter_mod.invoke.build_invoke_context(
+            activity, claims={"oid": "o1", "tid": "t1"}, path_tag="A"
+        )
+
+    @pytest.mark.asyncio
+    async def test_feedback_submit_records_reaction(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        resp = await a._handle_feedback_submit(self._feedback_ctx())
+        assert resp.status == 200
+        rec = a._feedback_by_message_id["msg-1"]
+        assert rec["reaction"] == "like"
+        assert rec["conversation_id"] == "conv-1"
+
+    @pytest.mark.asyncio
+    async def test_feedback_submit_ignores_non_feedback_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        resp = await a._handle_feedback_submit(
+            self._feedback_ctx(action_name="somethingElse")
+        )
+        assert resp.status == 200
+        assert a._feedback_by_message_id == {}
+
+    @pytest.mark.asyncio
+    async def test_message_fetch_task_acks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        ctx = adapter_mod.invoke.build_invoke_context(
+            {"type": "invoke", "name": "message/fetchTask", "conversation": {}},
+            claims=None,
+            path_tag="A",
+        )
+        resp = await a._handle_message_fetch_task(ctx)
+        assert resp.status == 200
+
+    def test_invoke_registry_has_children(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        for name in ("task/fetch", "message/submitAction", "message/fetchTask", "handoff/action"):
+            assert name in a._invoke_registry
+
+
+# ---------------------------------------------------------------------------
+# #77 — interactive-UI cards (approval / confirm / clarify)
+# ---------------------------------------------------------------------------
+
+
+class TestInteractiveCards:
+    def _connect(self, a: Any) -> None:
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        result = await a.send_exec_approval("conv-1", "rm -rf /tmp/x", "sess-1")
+        assert result.success is True
+        reply = send_reply.await_args.kwargs["reply"]
+        att = reply["attachments"][0]
+        assert att["contentType"] == "application/vnd.microsoft.card.adaptive"
+        actions = att["content"]["actions"]
+        assert [act["data"]["choice"] for act in actions] == [
+            "once", "session", "always", "deny",
+        ]
+        assert all(act["data"]["hermes_kind"] == "exec_approval" for act in actions)
+        assert all(act["data"]["session_key"] == "sess-1" for act in actions)
+        # A system approval card is NOT AI-generated content — no #73(a) entity.
+        assert "entities" not in reply
+
+    @pytest.mark.asyncio
+    async def test_send_slash_confirm_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        result = await a.send_slash_confirm(
+            "conv-1", "Confirm", "Run it?", "sess-1", "cfm-9"
+        )
+        assert result.success is True
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
+            "actions"
+        ]
+        assert [act["data"]["choice"] for act in actions] == ["once", "always", "cancel"]
+        assert all(act["data"]["confirm_id"] == "cfm-9" for act in actions)
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_with_choices(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        result = await a.send_clarify(
+            "conv-1", "Which one?", ["Alpha", "Beta"], "clr-1", "sess-1"
+        )
+        assert result.success is True
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
+            "actions"
+        ]
+        assert [act["title"] for act in actions] == ["Alpha", "Beta", "Something else"]
+        assert actions[0]["data"]["choice_text"] == "Alpha"
+        assert actions[-1]["data"]["choice"] == "other"
+
+    @pytest.mark.asyncio
+    async def test_send_clarify_open_ended_arms_text_intercept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        mark = MagicMock()
+        monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
+
+        result = await a.send_clarify("conv-1", "Say more?", None, "clr-2", "sess-1")
+        assert result.success is True
+        # Question sent as a plain text reply; intercept armed for the answer.
+        assert send_reply.await_args.kwargs["reply"]["text"] == "Say more?"
+        mark.assert_called_once_with("clr-2")
+
+    @pytest.mark.asyncio
+    async def test_send_exec_approval_no_inbound_falls_back(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        result = await a.send_exec_approval("ghost", "cmd", "sess-1")
+        # No cached inbound → success=False so the gateway text-fallback fires.
+        assert result.success is False
+
+    def test_extract_card_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        a = _make_adapter(monkeypatch)
+        good = {"type": "message", "value": {"hermes_kind": "exec_approval", "choice": "once"}}
+        assert a._extract_card_action(good) == good["value"]
+        # Not ours / not a card submit.
+        assert a._extract_card_action({"type": "message", "text": "hi"}) is None
+        assert a._extract_card_action({"type": "message", "value": "x"}) is None
+        assert (
+            a._extract_card_action({"type": "message", "value": {"hermes_kind": "nope"}})
+            is None
+        )
+        # An invoke (not a message) carrying the tag is not a card submit.
+        invoke_shaped = {"type": "invoke", "value": {"hermes_kind": "exec_approval"}}
+        assert a._extract_card_action(invoke_shaped) is None
+
+    @pytest.mark.asyncio
+    async def test_handle_card_action_exec_approval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        activity = {"type": "message", "conversation": {"id": "conv-1"}}
+        value = {"hermes_kind": "exec_approval", "session_key": "sess-1", "choice": "always"}
+        resp = await a._handle_card_action(activity, value)
+        assert resp.status_code == 200
+        assert json.loads(resp.body)["kind"] == "exec_approval"
+        resolver.assert_called_once_with("sess-1", "always")
+
+    @pytest.mark.asyncio
+    async def test_handle_card_action_slash_confirm_posts_followup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(
+            a, "_gw_resolve_slash_confirm", AsyncMock(return_value="Command ran.")
+        )
+        activity = _make_inbound(conv_id="conv-1")
+        value = {
+            "hermes_kind": "slash_confirm",
+            "session_key": "sess-1",
+            "confirm_id": "cfm-1",
+            "choice": "once",
+        }
+        resp = await a._handle_card_action(activity, value)
+        assert resp.status_code == 200
+        # The resolver's follow-up text is posted as a reply.
+        assert send_reply.await_args.kwargs["reply"]["text"] == "Command ran."
+
+    @pytest.mark.asyncio
+    async def test_handle_card_action_clarify_numeric(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        resolver = MagicMock(return_value=True)
+        monkeypatch.setattr(a, "_gw_resolve_clarify", resolver)
+        value = {"hermes_kind": "clarify", "clarify_id": "clr-1", "choice_text": "Beta"}
+        resp = await a._handle_card_action({"type": "message"}, value)
+        assert resp.status_code == 200
+        resolver.assert_called_once_with("clr-1", "Beta")
+
+    @pytest.mark.asyncio
+    async def test_handle_card_action_clarify_other_arms_intercept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        mark = MagicMock()
+        monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
+        value = {"hermes_kind": "clarify", "clarify_id": "clr-1", "choice": "other"}
+        resp = await a._handle_card_action({"type": "message"}, value)
+        assert resp.status_code == 200
+        mark.assert_called_once_with("clr-1")
+
+    def test_route_card_submit_not_dispatched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "validate_inbound_jwt", AsyncMock(return_value={"oid": "o1"})
+        )
+        a._http_client = MagicMock()
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+
+        body = _make_inbound(conv_id="conv-card", activity_id="ca-1", text="")
+        body["value"] = {
+            "hermes_kind": "exec_approval",
+            "session_key": "sess-1",
+            "choice": "deny",
+        }
+        client = TestClient(a.build_app())
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.status_code == 200, r.text
+        assert r.json()["status"] == "card_action"
+        # Routed to the resolver, NOT the agent loop.
+        resolver.assert_called_once_with("sess-1", "deny")
+        assert a._handled_events == []
+
+
+# ---------------------------------------------------------------------------
+# #82 — Copilot→Teams handoff
+# ---------------------------------------------------------------------------
+
+
+class TestHandoff:
+    def test_mint_handoff_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-cc")
+            )
+        )
+        link = a._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        assert "continuation=" in link
+        token = link.split("continuation=")[1]
+        assert a._handoff_tokens[token]["conversation_id"] == "conv-cc"
+        assert f"28:{a.blueprint_app_id}" in link
+
+    def test_mint_handoff_link_unknown_conv(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        assert a._mint_handoff_link("ghost", reason="x") is None
+
+    @pytest.mark.asyncio
+    async def test_handle_handoff_action_known_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._handoff_tokens["tok-1"] = {"conversation_id": "conv-cc", "chat_type": "groupChat"}
+        ctx = adapter_mod.invoke.build_invoke_context(
+            {
+                "type": "invoke",
+                "name": "handoff/action",
+                "value": {"continuation": "tok-1"},
+                "conversation": {"id": "conv-teams"},
+            },
+            claims=None,
+            path_tag="A",
+        )
+        resp = await a._handle_handoff_action(ctx)
+        assert resp.status == 200
+        # Token consumed; linkage recorded.
+        assert "tok-1" not in a._handoff_tokens
+
+    @pytest.mark.asyncio
+    async def test_handle_handoff_action_unknown_token(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        ctx = adapter_mod.invoke.build_invoke_context(
+            {
+                "type": "invoke",
+                "name": "handoff/action",
+                "value": {"continuation": "nope"},
+                "conversation": {"id": "conv-teams"},
+            },
+            claims=None,
+            path_tag="A",
+        )
+        resp = await a._handle_handoff_action(ctx)
+        assert resp.status == 200
+
+    def test_append_handoff_link_disabled_by_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cc")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        assert a._maybe_append_handoff_link("conv-cc", "body") == "body"
+
+    def test_append_handoff_link_enabled_nonpersonal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_HANDOFF_LINK", "1")
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cc")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        out = a._maybe_append_handoff_link("conv-cc", "body")
+        assert "Continue in Teams" in out
+        assert "body" in out
+
+    def test_append_handoff_link_personal_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_HANDOFF_LINK", "1")
+        a = _make_adapter(monkeypatch)
+        # _make_inbound default is personal.
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-dm"))
+        )
+        assert a._maybe_append_handoff_link("conv-dm", "body") == "body"

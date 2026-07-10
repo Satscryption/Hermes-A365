@@ -2021,6 +2021,50 @@ AI_GENERATED_CONTENT_ENTITY: dict[str, Any] = {
     "additionalType": ["AIGeneratedContent"],
 }
 
+# #73(c) — Teams/CC feedback-loop opt-in. Attached as ``channelData`` (NOT an
+# entity) on an agent message; renders the thumbs-up/down affordance. Results
+# arrive as ``message/submitAction`` invokes (handled by the plugin's per-name
+# registry). CC known-issue: the reaction may not be surfaced to the developer
+# there — the Teams 1:1 surface still delivers it. Walk-validated at #89.
+FEEDBACK_LOOP_CHANNEL_DATA: dict[str, Any] = {"feedbackLoop": {"type": "default"}}
+
+# #73(b) — Teams caps rendered citations at 20.
+_MAX_CITATIONS = 20
+
+
+def build_ai_message_entity(citations: Any = None) -> dict[str, Any]:
+    """The root ``https://schema.org/Message`` entity that carries the #73(a)
+    AI-generated label and, when supplied, a #73(b) ``citation`` array.
+
+    ``citations`` is an optional list of Hermes-side source dicts
+    ``{"title"|"name", "url"?, "abstract"?, "keywords"?}``; each maps to a
+    ``Claim`` whose 1-based ``position`` matches the in-text ``[N]`` marker the
+    agent already wrote (the adapter does NOT invent markers). Capped at 20
+    (Teams limit); malformed entries are skipped, never raised."""
+    entity = dict(AI_GENERATED_CONTENT_ENTITY)
+    claims = []
+    if isinstance(citations, list):
+        for i, src in enumerate(citations[:_MAX_CITATIONS], start=1):
+            if not isinstance(src, dict):
+                continue
+            name = str(src.get("title") or src.get("name") or f"Source {i}")
+            appearance: dict[str, Any] = {"@type": "DigitalDocument", "name": name}
+            url = src.get("url")
+            if isinstance(url, str) and url:
+                appearance["url"] = url
+            abstract = src.get("abstract")
+            if isinstance(abstract, str) and abstract:
+                appearance["abstract"] = abstract
+            keywords = src.get("keywords")
+            if isinstance(keywords, list) and keywords:
+                appearance["keywords"] = [str(k) for k in keywords]
+            claims.append(
+                {"@type": "Claim", "position": i, "appearance": appearance}
+            )
+    if claims:
+        entity["citation"] = claims
+    return entity
+
 
 def render_reply_activity(
     inbound: dict[str, Any], webhook_response: dict[str, Any]
@@ -2029,12 +2073,19 @@ def render_reply_activity(
 
     Webhook response contract (see ``references/webhook-contract.md``):
 
-        { "text": "<plain text>", "card": { ... }, "metadata": { ... } }
+        { "text": "<plain text>", "card": { ... }, "metadata": { ... },
+          "citations": [ { "title", "url"?, ... } ], "feedback": <bool> }
 
     Either ``text`` or ``card`` must be present (or both). For replies
     the bridge stamps ``type=message``, mirrors the conversation /
     recipient / from triple per BF reply convention, and forwards
     optional attachments.
+
+    #73(b): ``citations`` (if a non-empty list) renders as a ``citation`` array
+    on the AI-content entity. #73(c): ``feedback`` truthy attaches the
+    feedback-loop ``channelData`` (opt-in — the plugin gates it on
+    ``A365_FEEDBACK_LOOP``; existing serve callers are unaffected unless they
+    set it).
     """
     reply_text = webhook_response.get("text", "")
     card = webhook_response.get("card")
@@ -2057,8 +2108,11 @@ def render_reply_activity(
         reply["text"] = reply_text
     if attachments:
         reply["attachments"] = attachments
-    # #73(a): label the reply as AI-generated content.
-    reply["entities"] = [dict(AI_GENERATED_CONTENT_ENTITY)]
+    # #73(a) label + #73(b) citations on the one root Message entity.
+    reply["entities"] = [build_ai_message_entity(webhook_response.get("citations"))]
+    # #73(c) feedback loop — opt-in channelData.
+    if webhook_response.get("feedback"):
+        reply["channelData"] = dict(FEEDBACK_LOOP_CHANNEL_DATA)
     return reply
 
 

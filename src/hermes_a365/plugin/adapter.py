@@ -120,6 +120,20 @@ _FILE_CONSENT_INVOKE = "fileConsent/invoke"
 # file well above this); chunked upload for larger files is a follow-up.
 _MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024
 
+# #77 — interactive-UI cards. Approve/deny, slash-confirm, and clarify prompts
+# render as Adaptive Cards whose buttons are ``Action.Submit`` (documented CC-
+# supported; both surfaces). A click returns an inbound ``message`` activity
+# whose ``value`` is the button's ``data`` dict, tagged with ``hermes_kind`` so
+# the route can route it back to the gateway's pending-approval resolvers
+# (``tools.approval`` / ``tools.slash_confirm`` / ``tools.clarify_gateway``)
+# instead of the agent loop.
+_CARD_KIND_EXEC_APPROVAL = "exec_approval"
+_CARD_KIND_SLASH_CONFIRM = "slash_confirm"
+_CARD_KIND_CLARIFY = "clarify"
+_CARD_ACTION_KINDS = frozenset(
+    {_CARD_KIND_EXEC_APPROVAL, _CARD_KIND_SLASH_CONFIRM, _CARD_KIND_CLARIFY}
+)
+
 _DEFAULT_PORT = 3978
 
 # Slice 19s-bis: Hermes' stream consumer appends a "cursor" character
@@ -590,6 +604,43 @@ class Agent365Adapter(BasePlatformAdapter):
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
 
+        # #73(c) — feedback-loop opt-in. Default on; operators disable via
+        # A365_FEEDBACK_LOOP=0. Gates the channelData.feedbackLoop stamp so the
+        # thumbs up/down affordance can be turned off without a code change.
+        self._feedback_enabled = os.environ.get(
+            "A365_FEEDBACK_LOOP", "1"
+        ).strip().lower() not in ("0", "false", "no", "off", "")
+
+        # #82 — "continue in Teams" deep-link affordance on degraded Copilot Chat
+        # replies. Default OFF (a UX-changing surface that needs walk validation
+        # and could read as noise); operators opt in with A365_HANDOFF_LINK=1.
+        self._handoff_link_enabled = os.environ.get(
+            "A365_HANDOFF_LINK", "0"
+        ).strip().lower() in ("1", "true", "yes", "on")
+
+        # #73(c) — message-id -> {reaction, feedback, ...} captured from
+        # ``message/submitAction`` feedback invokes. Teams stores nothing, so we
+        # keep the latest reaction per replied message (in-memory, per-lifetime).
+        self._feedback_by_message_id: dict[str, dict[str, Any]] = {}
+
+        # #82 — Copilot→Teams handoff. Maps a minted continuation token ->
+        # {"conversation_id", "chat_type", ...} so a ``handoff/action`` invoke
+        # (fired when the user clicks the "continue in Teams" deep link) can
+        # resolve the originating CC session. In-memory + per-lifetime — a
+        # restart drops tokens and the deep link simply lands in a fresh 1:1.
+        self._handoff_tokens: dict[str, dict[str, Any]] = {}
+
+        # #73(c)/#82 — per-instance invoke registry: the shared #18 table plus
+        # adapter-bound children that need adapter state (feedback map / handoff
+        # tokens / ConversationRegistry). Passed to ``dispatch_invoke`` so the
+        # module-level ``INVOKE_REGISTRY`` stays plugin-free.
+        self._invoke_registry: dict[str, invoke.InvokeHandler] = {
+            **invoke.INVOKE_REGISTRY,
+            "message/submitAction": self._handle_feedback_submit,
+            "message/fetchTask": self._handle_message_fetch_task,
+            "handoff/action": self._handle_handoff_action,
+        }
+
     @property
     def name(self) -> str:
         return "Agent 365"
@@ -837,7 +888,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     ctx = invoke.build_invoke_context(
                         activity, claims=claims, path_tag=path_tag
                     )
-                    resp = await invoke.dispatch_invoke(ctx)
+                    resp = await invoke.dispatch_invoke(
+                        ctx, registry=self._invoke_registry
+                    )
                 except Exception as e:
                     logger.error(
                         "agent365 invoke handler failed: name=%s %s", invoke_name, e
@@ -861,6 +914,16 @@ class Agent365Adapter(BasePlatformAdapter):
                 delivery_id
             ):
                 return JSONResponse({"status": "duplicate"})
+
+            # #77 — a card Action.Submit arrives as a ``message`` with ``value``
+            # (our ``hermes_kind`` tag) and no user text. It is an approval/
+            # clarify control signal, not a user turn: route it to the gateway
+            # resolver and ack, never dispatch it to the agent loop. After the
+            # dedupe so a BF retry is dropped (a re-resolve is harmless but
+            # wasteful).
+            card_action = self._extract_card_action(activity)
+            if card_action is not None:
+                return await self._handle_card_action(activity, card_action)
 
             # #79 — BF lifecycle activities (install add/remove,
             # membersAdded) are channel-control, not user turns, but they
@@ -1566,6 +1629,9 @@ class Agent365Adapter(BasePlatformAdapter):
             inbound=inbound,
             content=content,
             log_context="send",
+            # #73(b): the agent surfaces sources under metadata["citations"];
+            # render_reply_activity converts them to Teams citation entities.
+            citations=(metadata or {}).get("citations"),
         )
 
     async def _send_reply_activity(
@@ -1574,9 +1640,16 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound: dict[str, Any],
         content: str,
         log_context: str,
+        citations: Any = None,
     ) -> SendResult:
         bridge = _import_bridge()
-        reply = bridge.render_reply_activity(inbound, {"text": content})
+        webhook_response: dict[str, Any] = {"text": content}
+        # #73(b) citations (metadata-driven) + #73(c) feedback loop (env-gated).
+        if citations:
+            webhook_response["citations"] = citations
+        if self._feedback_enabled:
+            webhook_response["feedback"] = True
+        reply = bridge.render_reply_activity(inbound, webhook_response)
         try:
             await bridge.send_reply(
                 inbound=inbound,
@@ -1673,6 +1746,9 @@ class Agent365Adapter(BasePlatformAdapter):
 
         state = self._coalesced_replies.get(message_id) or {}
         final_content = str(state.get("content") or "")
+        # #82 — this is the CC "coalesced-from-stream" degradation; offer a
+        # "continue in Teams" link (policy-gated, off by default).
+        final_content = self._maybe_append_handoff_link(chat_id, final_content)
         result = await self._send_reply_activity(
             inbound=inbound,
             content=final_content,
@@ -2674,6 +2750,361 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         return invoke.InvokeResponse(status=200, body={})
 
+    # ── #73(c) feedback loop + #82 handoff (invoke children) ──────────────
+
+    async def _handle_feedback_submit(
+        self, ctx: invoke.InvokeContext
+    ) -> invoke.InvokeResponse:
+        """#73(c): ``message/submitAction`` — the user pressed thumbs up/down on
+        a reply (or submitted the feedback form). Teams stores nothing, so we
+        record the reaction keyed by the replied message id (best-effort,
+        in-memory). Always a 200 — a non-200 shows the user an error toast."""
+        value = ctx.value
+        action_name = str(value.get("actionName") or "")
+        if action_name != "feedback":
+            # Some other submitAction — ack without recording.
+            return invoke.InvokeResponse(status=200, body={})
+        action_value = value.get("actionValue")
+        action_value = action_value if isinstance(action_value, dict) else {}
+        # The reply the reaction targets: Teams sets replyToId on the invoke.
+        msg_id = str(ctx.activity.get("replyToId") or ctx.activity.get("id") or "")
+        if msg_id:
+            self._feedback_by_message_id[msg_id] = {
+                "reaction": str(action_value.get("reaction") or ""),
+                "feedback": action_value.get("feedback"),
+                "conversation_id": str(ctx.conv.get("id") or ""),
+                "user_oid": ctx.user_oid,
+            }
+        logger.info(
+            "agent365 feedback reaction=%s msg=%s",
+            str(action_value.get("reaction") or "?"),
+            msg_id[:16],
+        )
+        return invoke.InvokeResponse(status=200, body={})
+
+    async def _handle_message_fetch_task(
+        self, ctx: invoke.InvokeContext
+    ) -> invoke.InvokeResponse:
+        """#73(c): ``message/fetchTask`` — Teams requests a custom feedback form.
+        We use the built-in ``feedbackLoop type:"default"`` (no custom form), so
+        there is nothing to render; ack with a benign empty task so Teams closes
+        cleanly rather than erroring."""
+        return invoke.InvokeResponse(status=200, body={})
+
+    def _handoff_deep_link(self, token: str) -> str:
+        """#82: the Copilot→Teams continuation deep link. Clicking it opens a
+        Teams 1:1 with this bot and fires a ``handoff/action`` invoke carrying
+        ``token``. ``28:<botId>`` is the bot's messaging id."""
+        bot_id = self.blueprint_app_id or ""
+        return (
+            "https://teams.microsoft.com/l/chat/0/0"
+            f"?users=28:{bot_id}&continuation={token}"
+        )
+
+    def _maybe_append_handoff_link(self, chat_id: str, content: str) -> str:
+        """#82: append a "continue in Teams" deep link to a degraded Copilot Chat
+        reply, when enabled (A365_HANDOFF_LINK). No-op for personal chats, when
+        disabled, or when the conversation can't be resolved — the original
+        content is returned unchanged."""
+        if not self._handoff_link_enabled:
+            return content
+        ref = self._conversations.get(chat_id)
+        if ref is None or ref.chat_type == "personal":
+            return content
+        link = self._mint_handoff_link(chat_id, reason="cc_degraded")
+        if not link:
+            return content
+        return f"{content}\n\n[Continue in Teams]({link})"
+
+    def _mint_handoff_link(self, chat_id: str, *, reason: str) -> str | None:
+        """#82: mint a continuation token bound to ``chat_id`` and return the
+        deep link, or None if we can't resolve the conversation. Used to append
+        a "continue in Teams" affordance to a degraded Copilot Chat reply."""
+        ref = self._conversations.get(chat_id)
+        if ref is None:
+            return None
+        token = uuid.uuid4().hex
+        self._handoff_tokens[token] = {
+            "conversation_id": chat_id,
+            "chat_type": ref.chat_type,
+            "tenant_id": ref.tenant_id,
+            "reason": reason,
+        }
+        return self._handoff_deep_link(token)
+
+    async def _handle_handoff_action(
+        self, ctx: invoke.InvokeContext
+    ) -> invoke.InvokeResponse:
+        """#82: ``handoff/action`` — the user clicked a continuation deep link,
+        so Teams opened a 1:1 and handed us the token. Resolve it back to the
+        originating Copilot Chat session so the Teams turn can inherit context.
+
+        The token→session map is resolved here; full agent-session import is a
+        Hermes-core concern (a conversation-import hook) and is flagged upstream
+        — for now we ack so Teams completes the handoff, and record the linkage.
+        Always 200 (Teams reads non-200 as a failed handoff)."""
+        token = str(ctx.value.get("continuation") or "")
+        origin = self._handoff_tokens.pop(token, None) if token else None
+        if origin is None:
+            logger.warning("agent365 handoff/action unknown token=%s", token[:8])
+            return invoke.InvokeResponse(status=200, body={})
+        # Record the CC-origin → Teams-conversation linkage so a later
+        # Hermes-core session-import hook can bridge them.
+        origin["resumed_conversation_id"] = str(ctx.conv.get("id") or "")
+        logger.info(
+            "agent365 handoff resumed: origin=%s teams=%s",
+            origin.get("conversation_id"),
+            origin["resumed_conversation_id"],
+        )
+        return invoke.InvokeResponse(status=200, body={})
+
+    # ── #77 interactive-UI cards (approval / confirm / clarify) ────────────
+
+    @staticmethod
+    def _action_submit_card(text: str, actions: list[tuple[str, dict[str, Any]]]) -> dict[str, Any]:
+        """Build an Adaptive Card with a prompt TextBlock + one ``Action.Submit``
+        button per (title, data) pair. The ``data`` dict is echoed verbatim in
+        the inbound ``message.value`` when the button is pressed."""
+        return {
+            "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+            "type": "AdaptiveCard",
+            "version": "1.5",
+            "body": [{"type": "TextBlock", "text": text, "wrap": True}],
+            "actions": [
+                {"type": "Action.Submit", "title": title, "data": data}
+                for (title, data) in actions
+            ],
+        }
+
+    async def _send_card(
+        self, chat_id: str, card: dict[str, Any], *, log_context: str
+    ) -> SendResult:
+        """Send an Adaptive Card as a reply (no AI-content label / feedback loop —
+        these are system-interaction cards, not agent output). Returns
+        ``success=False`` when there's no cached inbound or the adapter isn't
+        connected, so the gateway falls back to its text prompt."""
+        inbound = self._cached_inbound_for(chat_id)
+        if not inbound:
+            msg = f"agent365 {log_context}: no cached inbound for {chat_id!r}"
+            logger.warning(msg)
+            return SendResult(success=False, error=msg)
+        if self._http_client is None or self._bridge_cfg is None:
+            msg = f"agent365 {log_context}: adapter not connected"
+            logger.warning(msg)
+            return SendResult(success=False, error=msg)
+        self._conversations.mark_used(chat_id)
+        attachment = {
+            "contentType": "application/vnd.microsoft.card.adaptive",
+            "content": card,
+        }
+        reply = self._reply_with_attachment(inbound, attachment)
+        try:
+            await _import_bridge().send_reply(
+                inbound=inbound,
+                reply=reply,
+                cfg=self._bridge_cfg,
+                client=self._http_client,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+                bf_cache=self._bf_token_cache,
+                validated_path=self._validated_path_for_inbound(inbound),
+            )
+        except Exception as e:
+            logger.error("agent365 %s card send failed: %s", log_context, e)
+            return SendResult(success=False, error=str(e))
+        return SendResult(success=True, message_id=str(inbound.get("id") or ""))
+
+    async def send_exec_approval(
+        self,
+        chat_id: str,
+        command: str,
+        session_key: str,
+        description: str = "dangerous command",
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """#77: dangerous-command Approve/Deny as an Adaptive Card. ``command`` is
+        already credential-redacted gateway-side. On click the route resolves via
+        ``tools.approval.resolve_gateway_approval(session_key, choice)``."""
+        text = f"**Approval required** — {description}\n\n`{command}`"
+        base = {"hermes_kind": _CARD_KIND_EXEC_APPROVAL, "session_key": session_key}
+        actions = [
+            ("Approve once", {**base, "choice": "once"}),
+            ("Approve for session", {**base, "choice": "session"}),
+            ("Always allow", {**base, "choice": "always"}),
+            ("Deny", {**base, "choice": "deny"}),
+        ]
+        return await self._send_card(
+            chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
+        )
+
+    async def send_slash_confirm(
+        self,
+        chat_id: str,
+        title: str,
+        message: str,
+        session_key: str,
+        confirm_id: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """#77: Approve Once / Always / Cancel for an expensive command. On click
+        the route resolves via
+        ``tools.slash_confirm.resolve(session_key, confirm_id, choice)`` and posts
+        any follow-up text the resolver returns."""
+        text = f"**{title}**\n\n{message}"
+        base = {
+            "hermes_kind": _CARD_KIND_SLASH_CONFIRM,
+            "session_key": session_key,
+            "confirm_id": confirm_id,
+        }
+        actions = [
+            ("Approve once", {**base, "choice": "once"}),
+            ("Always", {**base, "choice": "always"}),
+            ("Cancel", {**base, "choice": "cancel"}),
+        ]
+        return await self._send_card(
+            chat_id, self._action_submit_card(text, actions), log_context="slash_confirm"
+        )
+
+    async def send_clarify(
+        self,
+        chat_id: str,
+        question: str,
+        choices: list | None,
+        clarify_id: str,
+        session_key: str,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """#77: multiple-choice clarification as choice buttons + a
+        "Something else" free-text escape. Open-ended (no choices) sends the
+        question as text and arms the gateway's text-intercept. On a choice click
+        the route resolves via
+        ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, choice_text)``;
+        "Something else" arms ``mark_awaiting_text(clarify_id)``."""
+        if not choices:
+            inbound = self._cached_inbound_for(chat_id)
+            if not inbound:
+                msg = f"agent365 clarify: no cached inbound for {chat_id!r}"
+                logger.warning(msg)
+                return SendResult(success=False, error=msg)
+            result = await self._send_reply_activity(
+                inbound=inbound, content=question, log_context="clarify"
+            )
+            if result.success:
+                # Arm the gateway text-intercept for the user's typed answer.
+                try:
+                    self._gw_mark_awaiting_text(clarify_id)
+                except Exception as e:  # gateway tools absent (tests) / import race
+                    logger.warning("agent365 clarify mark_awaiting_text failed: %s", e)
+            return result
+        actions: list[tuple[str, dict[str, Any]]] = [
+            (
+                str(choice),
+                {
+                    "hermes_kind": _CARD_KIND_CLARIFY,
+                    "clarify_id": clarify_id,
+                    "choice_text": str(choice),
+                },
+            )
+            for choice in choices
+        ]
+        actions.append(
+            (
+                "Something else",
+                {
+                    "hermes_kind": _CARD_KIND_CLARIFY,
+                    "clarify_id": clarify_id,
+                    "choice": "other",
+                },
+            )
+        )
+        return await self._send_card(
+            chat_id, self._action_submit_card(question, actions), log_context="clarify"
+        )
+
+    # ── #77 card-action routing (Action.Submit → gateway resolvers) ────────
+
+    @staticmethod
+    def _extract_card_action(activity: dict[str, Any]) -> dict[str, Any] | None:
+        """Return the ``value`` dict of an inbound card ``Action.Submit`` if it is
+        one of ours (tagged ``hermes_kind``), else None. Card submits arrive as a
+        ``message`` activity carrying ``value`` and (usually) no ``text``."""
+        if str(activity.get("type") or "") != "message":
+            return None
+        value = activity.get("value")
+        if not isinstance(value, dict):
+            return None
+        if value.get("hermes_kind") in _CARD_ACTION_KINDS:
+            return value
+        return None
+
+    # Gateway resolver seams — lazily import the gateway ``tools`` package (only
+    # importable inside the gateway process at runtime; monkeypatched in tests).
+
+    @staticmethod
+    def _gw_resolve_approval(session_key: str, choice: str) -> int:
+        from tools.approval import resolve_gateway_approval
+
+        return resolve_gateway_approval(session_key, choice)
+
+    @staticmethod
+    async def _gw_resolve_slash_confirm(
+        session_key: str, confirm_id: str, choice: str
+    ) -> str | None:
+        from tools.slash_confirm import resolve as _resolve
+
+        return await _resolve(session_key, confirm_id, choice)
+
+    @staticmethod
+    def _gw_resolve_clarify(clarify_id: str, text: str) -> bool:
+        from tools.clarify_gateway import resolve_gateway_clarify
+
+        return resolve_gateway_clarify(clarify_id, text)
+
+    @staticmethod
+    def _gw_mark_awaiting_text(clarify_id: str) -> None:
+        from tools.clarify_gateway import mark_awaiting_text
+
+        mark_awaiting_text(clarify_id)
+
+    async def _handle_card_action(
+        self, activity: dict[str, Any], value: dict[str, Any]
+    ) -> Any:
+        """Route a card ``Action.Submit`` back to the gateway's pending-approval
+        resolver. Never dispatches to the agent loop; always acks 200 (the button
+        press is a control signal, not a user turn). Resolver errors degrade to a
+        logged ack so a wire surprise on the walk isn't an HTTP 500."""
+        from fastapi.responses import JSONResponse
+
+        kind = str(value.get("hermes_kind") or "")
+        try:
+            if kind == _CARD_KIND_EXEC_APPROVAL:
+                self._gw_resolve_approval(
+                    str(value.get("session_key") or ""), str(value.get("choice") or "")
+                )
+            elif kind == _CARD_KIND_SLASH_CONFIRM:
+                follow = await self._gw_resolve_slash_confirm(
+                    str(value.get("session_key") or ""),
+                    str(value.get("confirm_id") or ""),
+                    str(value.get("choice") or ""),
+                )
+                if follow:
+                    # The resolver returns a follow-up (command result / cancelled
+                    # notice) the adapter must post as a new message.
+                    await self._send_reply_activity(
+                        inbound=activity, content=str(follow), log_context="slash_confirm"
+                    )
+            elif kind == _CARD_KIND_CLARIFY:
+                clarify_id = str(value.get("clarify_id") or "")
+                if str(value.get("choice") or "") == "other":
+                    self._gw_mark_awaiting_text(clarify_id)
+                else:
+                    self._gw_resolve_clarify(
+                        clarify_id, str(value.get("choice_text") or "")
+                    )
+        except Exception as e:
+            logger.error("agent365 card action (%s) resolve failed: %s", kind, e)
+        return JSONResponse({"status": "card_action", "kind": kind})
+
     # ── Slice 19s — BF streaming response protocol ────────────────────────
 
     async def edit_message(
@@ -2827,6 +3258,10 @@ class Agent365Adapter(BasePlatformAdapter):
             # content — append the label alongside the streaminfo entity.
             # Intermediate (typing) chunks are NOT labelled.
             activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
+            # #73(c): feedback loop only on the FINAL streamed message
+            # (streaming-UX rule — feedback/label are final-only).
+            if self._feedback_enabled:
+                activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
         service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
         conv_id = conv.get("id")
         if not service_url or not conv_id:

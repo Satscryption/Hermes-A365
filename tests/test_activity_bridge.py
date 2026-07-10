@@ -57,6 +57,7 @@ from hermes_a365.activity_bridge import (
     acquire_t2_token,
     acquire_token,
     acquire_user_fic_token,
+    build_ai_message_entity,
     build_webhook_envelope,
     load_agent_env,
     load_bridge_config,
@@ -1852,6 +1853,54 @@ class TestRenderReply:
         # Entity and attachment coexist on the same activity.
         assert "attachments" in reply
         assert reply["entities"][0]["additionalType"] == ["AIGeneratedContent"]
+
+    # ── #73(b) citations ──────────────────────────────────────────────────
+
+    def test_no_citations_leaves_bare_ai_entity(self) -> None:
+        reply = render_reply_activity(_inbound_message_activity(), {"text": "hi"})
+        assert "citation" not in reply["entities"][0]
+
+    def test_citations_render_on_message_entity(self) -> None:
+        reply = render_reply_activity(
+            _inbound_message_activity(),
+            {
+                "text": "See [1] and [2].",
+                "citations": [
+                    {"title": "Doc A", "url": "https://a", "abstract": "aa"},
+                    {"name": "Doc B", "keywords": ["k1", "k2"]},
+                ],
+            },
+        )
+        cits = reply["entities"][0]["citation"]
+        assert [c["position"] for c in cits] == [1, 2]
+        assert cits[0]["@type"] == "Claim"
+        assert cits[0]["appearance"] == {
+            "@type": "DigitalDocument",
+            "name": "Doc A",
+            "url": "https://a",
+            "abstract": "aa",
+        }
+        assert cits[1]["appearance"]["name"] == "Doc B"
+        assert cits[1]["appearance"]["keywords"] == ["k1", "k2"]
+
+    def test_citations_capped_at_20_and_skip_non_dict(self) -> None:
+        entity = build_ai_message_entity(
+            [{"title": f"S{i}"} for i in range(25)] + ["bad"]  # type: ignore[list-item]
+        )
+        assert len(entity["citation"]) == 20
+        assert entity["additionalType"] == ["AIGeneratedContent"]
+
+    # ── #73(c) feedback loop ──────────────────────────────────────────────
+
+    def test_feedback_opt_in_adds_channel_data(self) -> None:
+        reply = render_reply_activity(
+            _inbound_message_activity(), {"text": "hi", "feedback": True}
+        )
+        assert reply["channelData"] == {"feedbackLoop": {"type": "default"}}
+
+    def test_feedback_absent_by_default(self) -> None:
+        reply = render_reply_activity(_inbound_message_activity(), {"text": "hi"})
+        assert "channelData" not in reply
 
     def test_error_card_shape(self) -> None:
         card = render_error_card("oops")
