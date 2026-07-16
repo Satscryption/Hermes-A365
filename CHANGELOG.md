@@ -4,7 +4,7 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.4] — Unreleased (#89 walk ran 2026-07-16; three lanes carried to #116)
+## [0.8.4] — 2026-07-16
 
 Milestone v0.8.4 — **rich Teams / Copilot Chat surfaces on the #18 invoke
 foundation**: file transfer both directions (#76), interactive approval/clarify
