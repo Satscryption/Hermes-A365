@@ -368,6 +368,130 @@ def probe_local_config() -> ProbeResult:
     )
 
 
+def _agent365_file_hosts_from_config() -> tuple[str, list[str], bool]:
+    """Read ``gateway.platforms.agent365.extra.file_host_allowlist`` from the
+    default ``$HERMES_HOME/config.yaml``, mirroring the adapter's precedence.
+
+    Returns ``(status, hosts, multiplex)`` where ``multiplex`` is
+    ``gateway.multiplex_profiles`` (truthy) and ``status`` is:
+
+    - ``"set"`` — the key is present with a non-null value (``hosts`` may be an
+      empty list for an explicit ``[]`` / ``""`` / a non-str/non-list scalar,
+      which the adapter also treats as no hosts). The profile is authoritative;
+      the adapter ignores the env in this case.
+    - ``"key_absent"`` — config readable but the key is missing or explicitly
+      ``null`` (the adapter falls back to the env var).
+    - ``"unreadable"`` — config.yaml absent, or the parser/pyyaml is unavailable,
+      or a parse error — the profile can't be inspected. Only the DEFAULT profile
+      is visible here; multiplex profiles under ``profiles/<name>/`` are never
+      inspected (the caller downgrades to indeterminate when multiplex is on)."""
+    home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
+    cfg = home / "config.yaml"
+    if not cfg.exists():
+        return ("unreadable", [], False)
+    try:
+        import yaml
+
+        data = yaml.safe_load(cfg.read_text()) or {}
+    except Exception:
+        return ("unreadable", [], False)
+    gw = data.get("gateway") if isinstance(data, dict) else None
+    multiplex = bool(gw.get("multiplex_profiles")) if isinstance(gw, dict) else False
+    node: Any = data
+    for key in ("gateway", "platforms", "agent365", "extra"):
+        node = node.get(key) if isinstance(node, dict) else None
+        if node is None:
+            return ("key_absent", [], multiplex)
+    raw = node.get("file_host_allowlist") if isinstance(node, dict) else None
+    if raw is None:
+        # key missing OR explicitly null → the adapter's ``extra.get(...) is None``
+        # branch falls through to the env var, so mirror that here.
+        return ("key_absent", [], multiplex)
+    if isinstance(raw, str):
+        items: list[Any] = raw.split(",")
+    elif isinstance(raw, (list, tuple)):
+        items = list(raw)
+    else:
+        items = []  # non-str/non-list (int/bool/mapping) → no hosts (adapter parity)
+    return ("set", [str(h).strip() for h in items if str(h).strip()], multiplex)
+
+
+def probe_file_transfer() -> ProbeResult:
+    """#76 file transfer is fail-closed on host allowlisting (R2/R3/R4/R5). Reports
+    whether a tenant SharePoint/OneDrive host is pinned, **mirroring the adapter's
+    precedence**: the profile ``extra.file_host_allowlist`` wins whenever the key
+    is present (an explicit empty list disables it — env is NOT consulted); the
+    ``A365_FILE_HOST_ALLOWLIST`` env var applies only when the profile key is
+    absent. When the profile config can't be read (no config.yaml / no pyyaml /
+    parse error) the state is *indeterminate*, never a false 'disabled'. Never an
+    error — file transfer is optional."""
+    status, cfg_hosts, multiplex = _agent365_file_hosts_from_config()
+    if multiplex:
+        # Only the DEFAULT profile's config is visible here; under
+        # multiplex_profiles the active profile may pin a different (or no) host,
+        # so a determinate verdict would mislead. Report indeterminate + what the
+        # default profile shows for context.
+        seen = (
+            f"default profile pins {len(cfg_hosts)} host(s)"
+            if status == "set" and cfg_hosts
+            else "default profile sets an empty allowlist"
+            if status == "set"
+            else "default profile key absent"
+        )
+        return ProbeResult(
+            "file_transfer",
+            _OK,
+            "#76 file transfer state indeterminate — gateway.multiplex_profiles is "
+            f"on and only the default profile is inspected here ({seen}); check each "
+            "profile's extra.file_host_allowlist",
+            {"source": "indeterminate-multiplex", "host_count": len(cfg_hosts)},
+        )
+    if status == "set":
+        if cfg_hosts:
+            return ProbeResult(
+                "file_transfer",
+                _OK,
+                "#76 file transfer enabled via profile extra.file_host_allowlist "
+                f"— {len(cfg_hosts)} pinned tenant host(s)",
+                {"source": "profile", "host_count": len(cfg_hosts)},
+            )
+        return ProbeResult(
+            "file_transfer",
+            _OK,
+            "#76 file transfer disabled — the profile sets an empty "
+            "extra.file_host_allowlist (fail-closed; env is not consulted when the "
+            "profile pins the key)",
+            {"source": "profile-empty", "host_count": 0},
+        )
+    if status == "key_absent":
+        raw = os.environ.get("A365_FILE_HOST_ALLOWLIST", "")
+        env_hosts = [h.strip() for h in raw.split(",") if h.strip()]
+        if env_hosts:
+            return ProbeResult(
+                "file_transfer",
+                _OK,
+                "#76 file transfer enabled via A365_FILE_HOST_ALLOWLIST "
+                f"(profile key absent) — {len(env_hosts)} pinned tenant host(s)",
+                {"source": "env", "host_count": len(env_hosts)},
+            )
+        return ProbeResult(
+            "file_transfer",
+            _OK,
+            "#76 file transfer disabled (fail-closed) — the default profile and "
+            "A365_FILE_HOST_ALLOWLIST both unset; set extra.file_host_allowlist "
+            "(per profile) or the env var to the tenant SharePoint/OneDrive host(s)",
+            {"source": "none", "host_count": 0},
+        )
+    return ProbeResult(
+        "file_transfer",
+        _OK,
+        "#76 file transfer state indeterminate — the profile config.yaml can't be "
+        "read here (absent / unparseable); its extra.file_host_allowlist (which "
+        "takes precedence over the env var) may still enable or disable it",
+        {"source": "indeterminate", "host_count": 0},
+    )
+
+
 def probe_hermes_harness() -> ProbeResult:
     binary = shutil.which("hermes")
     if not binary:
@@ -430,6 +554,7 @@ def run_all_probes(
         probes.append(probe_network())
     probes.append(probe_keychain())
     probes.append(probe_local_config())
+    probes.append(probe_file_transfer())
     if bot_service_sidecar_path is None:
         bot_service_sidecar_path = Path.cwd() / bot_service.SIDECAR_FILENAME
     if generated_config_path is None:

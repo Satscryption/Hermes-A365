@@ -4,6 +4,132 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.4] — 2026-07-16
+
+Milestone v0.8.4 — **rich Teams / Copilot Chat surfaces on the #18 invoke
+foundation**: file transfer both directions (#76), interactive approval/clarify
+cards (#77), outbound AI-content entities (#73), and a Copilot→Teams handoff
+**foundation** (#82). The terminal arc walk (#89) exercised these on the live
+tenant and **validated the load-bearing card/entity paths on Copilot Chat**;
+three personal-Teams-1:1-only lanes (#76c FileConsent accept, personal
+streaming, #73c reaction round-trip) were blocked by an environmental
+personal-1:1 delivery gap and are carried to **#116**. **#89 stays open** until
+that lane completes; **#82 stays open** pending a Hermes-core session-import
+hook.
+
+### Added
+
+- **#76 — Teams file/media both directions.** Inbound: image + file attachments
+  download into the platform media cache (`{HERMES_HOME}/platforms/agent365/
+  media`) and their local paths flow into `MessageEvent.media_urls` for the
+  gateway's auto-vision / document path (25 MiB cap, path-traversal-safe names,
+  best-effort). Outbound: `send_document` / `send_image_file` deliver a local
+  file to a Teams 1:1 via a **FileConsentCard → OneDrive upload** — on Accept the
+  `fileConsent/invoke` carries a pre-authenticated `uploadUrl` we PUT the bytes
+  to, then confirm with a FileInfoCard (pending offer popped before upload →
+  at-most-once). Non-personal chats (Copilot Chat / group / channel) degrade to a
+  text fallback; group/channel file transfer needs Graph and is deferred. Manifest
+  `supportsFiles` → **true**.
+- **#77 — interactive-UI cards.** `send_exec_approval`, `send_slash_confirm`, and
+  `send_clarify` render Adaptive Cards with **`Action.Submit`** buttons (documented
+  Copilot-Chat-supported; both surfaces). A click returns a message-with-`value`
+  tagged `hermes_kind`; the route intercepts it ahead of the agent loop and
+  resolves back through the gateway's module resolvers (`tools.approval` /
+  `tools.slash_confirm` / `tools.clarify_gateway`). Open-ended clarify sends the
+  question as text and arms the gateway text-intercept. `send_model_picker`
+  deferred (optional / lowest priority).
+- **#73(b) — citations.** `metadata["citations"]` maps to a `citation` array on
+  the root `https://schema.org/Message` entity (1-based `position` matching the
+  agent's in-text `[N]` markers; capped at 20; malformed entries skipped).
+- **#73(c) — feedback loop.** `channelData.feedbackLoop:{type:"default"}` on agent
+  replies (plain + streaming-final), env-gated **`A365_FEEDBACK_LOOP`** (default
+  on). `message/submitAction` + `message/fetchTask` land as per-name invoke
+  children; the reaction is recorded keyed by the replied message id (Teams stores
+  nothing).
+- **#82 — Copilot→Teams handoff (foundation only).** A `handoff/action` invoke
+  child mints/validates/consumes continuation tokens (in-memory map), and a
+  policy-gated **"continue in Teams"** deep link (env **`A365_HANDOFF_LINK`**,
+  default off) is appended to degraded coalesced-from-stream Copilot Chat replies.
+  It does **not** yet import the Copilot session into the Teams turn — that needs
+  a Hermes-core conversation-import hook, so **#82 remains open** tracking that
+  dependency (this release ships the token lifecycle + deep link only).
+
+### Security hardening (PR #119 review, rounds 1–2)
+
+- **File-transfer hosts are pinned to the deployment's own tenant**, sourced from
+  the **profile config** `extra.file_host_allowlist` (list or comma-separated) so
+  multiplexed profiles each pin their OWN tenant rather than sharing a process-env
+  union; `A365_FILE_HOST_ALLOWLIST` is the single-profile fallback. Exact
+  hostnames only (e.g. `contoso.sharepoint.com,contoso-my.sharepoint.com`) — a
+  `*.sharepoint.com` suffix is **not** trusted (customer-registrable zone → an
+  attacker-owned tenant's session would match). **Empty ⇒ fail-closed:** outbound
+  files degrade to a **text notice** *before* a FileConsentCard is offered (never
+  a consent flow that can't complete), and inbound file downloads are refused.
+  `doctor` reports whether a host is pinned.
+- **Inbound download URLs validated before any fetch** (same #100 body-field
+  threat model). Image `contentUrl` (which receives the reply bearer) is pinned
+  to the Bot Framework connector allowlist; https-only, IP-literal / private /
+  link-local hosts rejected, redirects not followed — closing a bearer-exfil /
+  SSRF path.
+- **Inbound download is streamed + hard-bounded** — an oversized `Content-Length`
+  is refused up front and the body is aborted after `MAX+1` bytes rather than
+  buffered whole, so an allowed endpoint can't exhaust memory.
+- **Outbound `fileConsent/invoke` is a capability flow, honestly scoped.** The
+  security boundary is the JWT-validated platform caller plus the unguessable
+  single-use `consentId` (uuid4, minted by us, sent only in the card, popped
+  once); conversation / user / serviceUrl are checked as consistency
+  defence-in-depth (BF service tokens carry no end-user claim, so this is **not**
+  authenticated-user verification). The `uploadUrl` is pinned to the configured
+  tenant host, and the offered bytes are read once through a bounded descriptor
+  and bound by **SHA-256** — a file that grew, shrank, or was swapped for
+  same-size different content since the offer is rejected (closes the
+  stat-then-read TOCTOU). `_pending_file_uploads` is capped, TTL-expired, and
+  cleared on disconnect.
+
+### Changed
+
+- Invoke dispatch now uses a **per-instance registry** (the module
+  `INVOKE_REGISTRY` plus adapter-bound children for feedback + handoff) passed to
+  `dispatch_invoke`, keeping `invoke.py` free of any `plugin/` import.
+- `render_reply_activity` gained `build_ai_message_entity` (shared by both
+  runtimes) and optional `citations` / `feedback` handling; existing serve callers
+  are unaffected unless they opt in.
+
+### Validated (#89 walk, 2026-07-16 — Copilot Chat / Path B)
+
+- **#77 interactive cards — the load-bearing check:** an Adaptive Card
+  `Action.Submit` **renders and resolves on Copilot Chat** end-to-end
+  (`/reset` → slash-confirm card → click → `tools.slash_confirm.resolve` →
+  follow-up posted; the submit is intercepted by the route, never dispatched to
+  the agent loop).
+- **#73b citations** render as numbered clickable references (validated by
+  bench-posting the real `build_ai_message_entity` wire format).
+- **#73c feedbackLoop** renders (thumbs + form). **#82** continuation deep link
+  renders on degraded CC replies. Plain text turns round-trip on Path B.
+- **#82 fix (walk-caught):** `_handoff_deep_link` now targets the Teams-routable
+  BF/messaging bot id (`bf_app_id or blueprint_app_id`), not the CEA blueprint —
+  the walk caught the blueprint variant opening the wrong bot in Teams.
+
+### Not yet live-validated (tracked in #116)
+
+- **#76c FileConsent→OneDrive accept**, **personal BF streaming**, and the
+  **#73c feedback reaction round-trip** are personal-Teams-1:1-only and were
+  blocked by an environmental personal-1:1 message-delivery gap on the fresh walk
+  bot (channel + Copilot delivered fine; personal DM did not). All three remain
+  unit-tested + wire-format-sound. The Copilot Chat feedback caveat (reaction not
+  surfaced to the developer) was **confirmed live**. Provisioning finding: the CEA
+  `bots` block requires an Azure Bot Service (#117).
+
+### Notes
+
+- **#82 and #89 are NOT closed by this release.** #82 ships the handoff
+  foundation only (token lifecycle + deep link); full session import needs a
+  Hermes-core conversation-import hook. #89's terminal-walk acceptance (both paths
+  × all three surfaces) is incomplete — the three personal-1:1 lanes are tracked
+  in #116, and #89 stays open until they are validated.
+- Provisioning finding: the CEA `bots` block requires an Azure Bot Service
+  resource; the Path A blueprint alone yields "Invalid bot" in Teams (#117).
+
 ## [0.8.3] — 2026-07-06
 
 Milestone v0.8.3 — **Copilot Chat prompt starters + manifest 1.27 bump** (#74).

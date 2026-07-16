@@ -22,6 +22,7 @@ from hermes_a365.doctor import (
     probe_a365_cli,
     probe_az_cli,
     probe_custom_client_app,
+    probe_file_transfer,
     probe_hermes_harness,
     probe_keychain,
     probe_local_config,
@@ -326,6 +327,138 @@ class TestProbeLocalConfig:
         r = probe_local_config()
         assert r.state == "ok"
         assert ".env: 2 keys" in r.detail
+
+
+# ---------------------------------------------------------------------------
+# probe_file_transfer (#76 / R4)
+# ---------------------------------------------------------------------------
+
+
+class TestProbeFileTransfer:
+    def test_env_fallback_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # config present but the profile key is absent → env is the fallback.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    agent365:\n      enabled: true\n"
+        )
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "contoso.sharepoint.com")
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "env"
+        assert r.data["host_count"] == 1
+
+    def test_profile_beats_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Mirrors the adapter: a present profile key wins; env is ignored.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "stale-env.sharepoint.com")
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    agent365:\n      extra:\n"
+            "        file_host_allowlist:\n          - profile.sharepoint.com\n"
+        )
+        r = probe_file_transfer()
+        assert r.data["source"] == "profile"
+        assert r.data["host_count"] == 1
+
+    def test_explicit_empty_profile_beats_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The P2 bug: a profile that explicitly disables files (empty list) is NOT
+        # re-enabled by a stale env var — reported disabled, not enabled.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "stale-env.sharepoint.com")
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    agent365:\n      extra:\n"
+            "        file_host_allowlist: []\n"
+        )
+        r = probe_file_transfer()
+        assert r.data["source"] == "profile-empty"
+        assert r.data["host_count"] == 0
+
+    def test_profile_config_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The documented profile source must NOT be misreported as disabled.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    agent365:\n"
+            "      extra:\n"
+            "        file_host_allowlist:\n"
+            "          - contoso.sharepoint.com\n"
+            "          - contoso-my.sharepoint.com\n"
+        )
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "profile"
+        assert r.data["host_count"] == 2
+
+    def test_indeterminate_when_no_config_and_no_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # no config.yaml
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "indeterminate"
+
+    def test_disabled_when_config_present_but_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    agent365:\n      enabled: true\n"
+        )
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "none"
+
+    def test_null_profile_key_falls_back_to_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # `file_host_allowlist:` (explicit null) is key_absent to the adapter → env.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "env.sharepoint.com")
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    agent365:\n      extra:\n"
+            "        file_host_allowlist:\n"
+        )
+        r = probe_file_transfer()
+        assert r.data["source"] == "env"
+
+    def test_scalar_misconfig_reads_as_empty(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Red-team catch: a scalar value must not crash the probe (list(int)).
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    agent365:\n      extra:\n"
+            "        file_host_allowlist: 5\n"
+        )
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "profile-empty"
+
+    def test_multiplex_reports_indeterminate(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Red-team catch: under multiplex, only the default profile is visible, so
+        # a determinate verdict would mislead — report indeterminate.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "env.sharepoint.com")
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  multiplex_profiles: true\n  platforms:\n    agent365:\n"
+            "      extra:\n        file_host_allowlist:\n          - d.sharepoint.com\n"
+        )
+        r = probe_file_transfer()
+        assert r.data["source"] == "indeterminate-multiplex"
 
 
 # ---------------------------------------------------------------------------

@@ -85,6 +85,15 @@ gateway:
       extra:
         slug: inbox-helper
         port: 3978
+        # #76 file transfer (Teams 1:1). REQUIRED to enable files — the tenant's
+        # exact SharePoint/OneDrive host(s). Unset ⇒ file transfer is disabled
+        # (fail-closed) and outbound files degrade to a text notice. A
+        # *.sharepoint.com suffix is NOT trusted (customer-registrable), so the
+        # tenant host must be pinned exactly. Profile-scoped: with
+        # gateway.multiplex_profiles each profile pins its OWN tenant here.
+        file_host_allowlist:
+          - contoso.sharepoint.com
+          - contoso-my.sharepoint.com
 ```
 
 Required env vars (already populated by the wrapper's
@@ -94,6 +103,10 @@ Required env vars (already populated by the wrapper's
 - `A365_APP_ID`
 - `AA_INSTANCE_ID`
 - `HERMES_BRIDGE_PORT` (optional; default `3978`)
+- `A365_FILE_HOST_ALLOWLIST` (optional single-profile fallback for
+  `extra.file_host_allowlist`; comma-separated exact hosts, e.g.
+  `contoso.sharepoint.com,contoso-my.sharepoint.com`). Required to enable #76
+  file transfer; unset ⇒ files degrade to text (fail-closed).
 
 ## Slice plan
 

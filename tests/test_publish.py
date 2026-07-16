@@ -637,7 +637,8 @@ class TestTransformManifestToCopilotChat:
                 "scopes": ["personal"],
                 "supportsCalling": False,
                 "supportsVideo": False,
-                "supportsFiles": False,
+                # #76c — Teams file transfer both directions (personal scope).
+                "supportsFiles": True,
                 "isNotificationOnly": False,
                 "commandLists": [
                     {
