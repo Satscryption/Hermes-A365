@@ -219,10 +219,11 @@ wheels = [
 
 [[package]]
 name = "hermes-a365"
-version = "0.8.1"
+version = "0.8.4"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },
+    { name = "pyyaml" },
 ]
 
 [package.optional-dependencies]
@@ -253,6 +254,7 @@ requires-dist = [
     { name = "pyjwt", extras = ["crypto"], marker = "extra == 'dev'", specifier = ">=2.8" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
+    { name = "pyyaml", specifier = ">=6.0" },
     { name = "ruff", marker = "extra == 'dev'", specifier = ">=0.5" },
     { name = "uvicorn", marker = "extra == 'dev'", specifier = ">=0.30" },
     { name = "uvicorn", extras = ["standard"], marker = "extra == 'bridge'", specifier = ">=0.30" },

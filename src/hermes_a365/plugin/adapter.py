@@ -730,7 +730,15 @@ class Agent365Adapter(BasePlatformAdapter):
         _fha = extra.get("file_host_allowlist")
         if _fha is None:
             _fha = os.environ.get("A365_FILE_HOST_ALLOWLIST", "")
-        _fha_items = _fha.split(",") if isinstance(_fha, str) else list(_fha or [])
+        if isinstance(_fha, str):
+            _fha_items: list[Any] = _fha.split(",")
+        elif isinstance(_fha, (list, tuple)):
+            _fha_items = list(_fha)
+        else:
+            # Misconfig (e.g. `file_host_allowlist: 5` / `true` / a mapping) — a
+            # non-str/non-list is not a host list. Fail-closed (empty) rather than
+            # crashing plugin load on ``list(<scalar>)``.
+            _fha_items = []
         self._file_host_allowlist: tuple[str, ...] = tuple(
             str(h).strip().lower() for h in _fha_items if str(h).strip()
         )

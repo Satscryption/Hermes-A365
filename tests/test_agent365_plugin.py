@@ -6398,6 +6398,16 @@ class TestOutboundFiles:
         a = _make_adapter(monkeypatch, file_host_allowlist=["profile.sharepoint.com"])
         assert a._file_host_allowlist == ("profile.sharepoint.com",)
 
+    @pytest.mark.parametrize("bad", [5, True, {"a": 1}, 3.2])
+    def test_file_host_allowlist_scalar_misconfig_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch, bad: Any
+    ) -> None:
+        # Red-team catch: a non-str/non-list value must NOT crash plugin load
+        # (`list(<scalar>)` → TypeError); it fails closed to an empty allowlist.
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        a = _make_adapter(monkeypatch, file_host_allowlist=bad)
+        assert a._file_host_allowlist == ()
+
     def test_two_profiles_reject_each_others_host(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
