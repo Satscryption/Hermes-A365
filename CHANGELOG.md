@@ -4,7 +4,7 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.4] — Unreleased (pending #89 terminal walk)
+## [0.8.4] — Unreleased (#89 walk complete 2026-07-16)
 
 Milestone v0.8.4 — **rich Teams / Copilot Chat surfaces on the #18 invoke
 foundation**: file transfer both directions (#76), interactive approval/clarify
@@ -55,14 +55,36 @@ live tenant before this ships; the entry is held Unreleased until then.
   runtimes) and optional `citations` / `feedback` handling; existing serve callers
   are unaffected unless they opt in.
 
+### Validated (#89 walk, 2026-07-16 — Copilot Chat / Path B)
+
+- **#77 interactive cards — the load-bearing check:** an Adaptive Card
+  `Action.Submit` **renders and resolves on Copilot Chat** end-to-end
+  (`/reset` → slash-confirm card → click → `tools.slash_confirm.resolve` →
+  follow-up posted; the submit is intercepted by the route, never dispatched to
+  the agent loop).
+- **#73b citations** render as numbered clickable references (validated by
+  bench-posting the real `build_ai_message_entity` wire format).
+- **#73c feedbackLoop** renders (thumbs + form). **#82** continuation deep link
+  renders on degraded CC replies. Plain text turns round-trip on Path B.
+- **#82 fix (walk-caught):** `_handoff_deep_link` now targets the Teams-routable
+  BF/messaging bot id (`bf_app_id or blueprint_app_id`), not the CEA blueprint —
+  the walk caught the blueprint variant opening the wrong bot in Teams.
+
+### Not yet live-validated (tracked in #116)
+
+- **#76c FileConsent→OneDrive accept**, **personal BF streaming**, and the
+  **#73c feedback reaction round-trip** are personal-Teams-1:1-only and were
+  blocked by an environmental personal-1:1 message-delivery gap on the fresh walk
+  bot (channel + Copilot delivered fine; personal DM did not). All three remain
+  unit-tested + wire-format-sound. The Copilot Chat feedback caveat (reaction not
+  surfaced to the developer) was **confirmed live**. Provisioning finding: the CEA
+  `bots` block requires an Azure Bot Service (#117).
+
 ### Notes
 
 - Full agent-session import across a #82 handoff is a Hermes-core concern (a
   conversation-import hook) and is flagged upstream — the adapter owns only the
   token lifecycle + deep link.
-- Feedback-loop delivery on Copilot Chat carries a documented Microsoft caveat
-  (the reaction may not be surfaced to the developer there); the Teams 1:1 surface
-  still delivers it. To be confirmed on the #89 walk.
 
 ## [0.8.3] — 2026-07-06
 
