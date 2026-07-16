@@ -716,16 +716,23 @@ class Agent365Adapter(BasePlatformAdapter):
             "A365_HANDOFF_LINK", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
 
-        # R2-P1 — EXACT tenant SharePoint/OneDrive hosts allowed as inbound file
-        # downloadUrl / outbound uploadUrl destinations. Comma-separated in
-        # A365_FILE_HOST_ALLOWLIST (e.g. "contoso.sharepoint.com,contoso-my.
-        # sharepoint.com"). Empty ⇒ fail-closed: file transfer is refused until the
-        # operator pins the tenant host(s) — a `*.sharepoint.com` suffix would
-        # accept an attacker-owned tenant's session (customer-registrable zone).
+        # R2/R3-P1 — EXACT tenant SharePoint/OneDrive hosts allowed as inbound file
+        # downloadUrl / outbound uploadUrl destinations. Empty ⇒ fail-closed: file
+        # transfer degrades to a text fallback until the operator pins the tenant
+        # host(s) — a `*.sharepoint.com` suffix would accept an attacker-owned
+        # tenant's session (customer-registrable zone).
+        #
+        # R3-P1: sourced from the PROFILE config (``extra.file_host_allowlist`` —
+        # a list or a comma-separated string) first, so multiplexed profiles
+        # (gateway.multiplex_profiles) each pin their OWN tenant rather than
+        # sharing a process-env union. ``A365_FILE_HOST_ALLOWLIST`` is the
+        # single-profile compatibility fallback.
+        _fha = extra.get("file_host_allowlist")
+        if _fha is None:
+            _fha = os.environ.get("A365_FILE_HOST_ALLOWLIST", "")
+        _fha_items = _fha.split(",") if isinstance(_fha, str) else list(_fha or [])
         self._file_host_allowlist: tuple[str, ...] = tuple(
-            h.strip().lower()
-            for h in os.environ.get("A365_FILE_HOST_ALLOWLIST", "").split(",")
-            if h.strip()
+            str(h).strip().lower() for h in _fha_items if str(h).strip()
         )
 
         # #73(c) — message-id -> {reaction, feedback, ...} captured from
@@ -2694,6 +2701,25 @@ class Agent365Adapter(BasePlatformAdapter):
             reply["text"] = text
         return reply
 
+    async def _file_text_fallback(
+        self,
+        chat_id: str,
+        file_name: str,
+        caption: str,
+        reply_to: str | None,
+        metadata: dict[str, Any] | None,
+    ) -> SendResult:
+        """Degrade a file delivery to a plain-text notice (📎 name) via ``send``.
+        Used when file consent isn't available: non-personal chats, or no pinned
+        tenant host (R3-P1) — so the agent still communicates the file rather than
+        offering a consent flow that can't complete."""
+        text = f"📎 {file_name}"
+        if caption:
+            text = f"{caption}\n{text}"
+        return await self.send(
+            chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
+        )
+
     async def _send_file_consent(
         self,
         chat_id: str,
@@ -2720,11 +2746,21 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.info(
                 "agent365 send_file: non-personal chat %s → text fallback", chat_id
             )
-            text = f"📎 {file_name}"
-            if caption:
-                text = f"{caption}\n{text}"
-            return await self.send(
-                chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
+            return await self._file_text_fallback(
+                chat_id, file_name, caption, reply_to, metadata
+            )
+        # R3-P1: if no tenant host is pinned, file transfer is disabled — degrade
+        # to the text fallback BEFORE offering a FileConsentCard that can never
+        # complete (the accept-time upload would be refused by the empty
+        # allowlist, leaving the user with a dead-end consent flow).
+        if not self._file_host_allowlist:
+            logger.warning(
+                "agent365 send_file: A365_FILE_HOST_ALLOWLIST / "
+                "extra.file_host_allowlist unset → text fallback (file transfer "
+                "disabled; pin the tenant SharePoint/OneDrive host to enable)"
+            )
+            return await self._file_text_fallback(
+                chat_id, file_name, caption, reply_to, metadata
             )
         if self._http_client is None or self._bridge_cfg is None:
             msg = "agent365 send_file: adapter not connected"

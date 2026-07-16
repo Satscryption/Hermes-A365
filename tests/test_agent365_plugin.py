@@ -6374,6 +6374,75 @@ class TestOutboundFiles:
             await a.send_document("conv-1", str(f))
         assert len(a._pending_file_uploads) == 3
 
+    # ── R3-P1: profile-scoped host allowlist + fail-before-offer ──────────
+
+    def test_file_host_allowlist_from_profile_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # extra.file_host_allowlist (list) is read + normalised (lower/strip).
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        a = _make_adapter(
+            monkeypatch, file_host_allowlist=["Contoso.SharePoint.com", " x ", ""]
+        )
+        assert a._file_host_allowlist == ("contoso.sharepoint.com", "x")
+
+    def test_file_host_allowlist_env_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "env.sharepoint.com")
+        a = _make_adapter(monkeypatch)  # no profile extra
+        assert a._file_host_allowlist == ("env.sharepoint.com",)
+
+    def test_profile_config_beats_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "env.sharepoint.com")
+        a = _make_adapter(monkeypatch, file_host_allowlist=["profile.sharepoint.com"])
+        assert a._file_host_allowlist == ("profile.sharepoint.com",)
+
+    def test_two_profiles_reject_each_others_host(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Multiplex safety: profile A's pin must not accept profile B's tenant host.
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        a = _make_adapter(monkeypatch, file_host_allowlist=["tenant-a.sharepoint.com"])
+        b = _make_adapter(monkeypatch, file_host_allowlist=["tenant-b.sharepoint.com"])
+        url_a = "https://tenant-a.sharepoint.com/up"
+        url_b = "https://tenant-b.sharepoint.com/up"
+        assert adapter_mod._is_allowed_file_host(url_a, a._file_host_allowlist)
+        assert not adapter_mod._is_allowed_file_host(url_b, a._file_host_allowlist)
+        assert adapter_mod._is_allowed_file_host(url_b, b._file_host_allowlist)
+        assert not adapter_mod._is_allowed_file_host(url_a, b._file_host_allowlist)
+
+    @pytest.mark.asyncio
+    async def test_send_document_empty_allowlist_text_fallback_no_card(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # R3-P1: no pinned tenant host → text fallback, and NO FileConsentCard is
+        # offered (a consent flow that could never complete is never presented).
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        self._connect(a)
+        a._file_host_allowlist = ()  # empty ⇒ fail-closed
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"data")
+
+        result = await a.send_document("conv-1", str(f))
+        assert result.success is True  # text fallback delivered
+        assert a._pending_file_uploads == {}  # no consent recorded
+        reply = send_reply.await_args.kwargs["reply"]
+        atts = reply.get("attachments") or []
+        assert all(
+            att.get("contentType") != adapter_mod._FILE_CONSENT_CONTENT_TYPE
+            for att in atts
+        )
+        assert "r.pdf" in (reply.get("text") or "")
+
 
 # ---------------------------------------------------------------------------
 # #73(b/c) — citations + feedback loop (plugin send path + invoke children)

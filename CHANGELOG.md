@@ -56,13 +56,16 @@ hook.
 
 ### Security hardening (PR #119 review, rounds 1–2)
 
-- **File-transfer hosts are pinned to the deployment's own tenant** via
-  `A365_FILE_HOST_ALLOWLIST` (exact hostnames, e.g.
-  `contoso.sharepoint.com,contoso-my.sharepoint.com`). A `*.sharepoint.com`
-  suffix is **not** trusted — that zone is customer-registrable, so a suffix
-  match would accept an attacker-owned tenant's upload/download session. Empty ⇒
-  **fail-closed**: inbound file download + outbound upload are refused until the
-  operator configures the host(s).
+- **File-transfer hosts are pinned to the deployment's own tenant**, sourced from
+  the **profile config** `extra.file_host_allowlist` (list or comma-separated) so
+  multiplexed profiles each pin their OWN tenant rather than sharing a process-env
+  union; `A365_FILE_HOST_ALLOWLIST` is the single-profile fallback. Exact
+  hostnames only (e.g. `contoso.sharepoint.com,contoso-my.sharepoint.com`) — a
+  `*.sharepoint.com` suffix is **not** trusted (customer-registrable zone → an
+  attacker-owned tenant's session would match). **Empty ⇒ fail-closed:** outbound
+  files degrade to a **text notice** *before* a FileConsentCard is offered (never
+  a consent flow that can't complete), and inbound file downloads are refused.
+  `doctor` reports whether a host is pinned.
 - **Inbound download URLs validated before any fetch** (same #100 body-field
   threat model). Image `contentUrl` (which receives the reply bearer) is pinned
   to the Bot Framework connector allowlist; https-only, IP-literal / private /

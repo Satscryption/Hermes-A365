@@ -368,6 +368,31 @@ def probe_local_config() -> ProbeResult:
     )
 
 
+def probe_file_transfer() -> ProbeResult:
+    """#76 file transfer is fail-closed on host allowlisting (R2/R3). Report
+    whether a tenant SharePoint/OneDrive host is pinned via
+    ``A365_FILE_HOST_ALLOWLIST`` (the profile's ``extra.file_host_allowlist`` is
+    the preferred source but isn't visible from the env alone). Unset ⇒ files are
+    disabled and degrade to a text notice — not an error, just off."""
+    raw = os.environ.get("A365_FILE_HOST_ALLOWLIST", "")
+    hosts = [h.strip() for h in raw.split(",") if h.strip()]
+    if hosts:
+        return ProbeResult(
+            "file_transfer",
+            _OK,
+            f"#76 file transfer enabled — {len(hosts)} pinned tenant host(s)",
+            {"host_count": len(hosts)},
+        )
+    return ProbeResult(
+        "file_transfer",
+        _OK,
+        "#76 file transfer disabled (fail-closed) — set A365_FILE_HOST_ALLOWLIST "
+        "or the profile's extra.file_host_allowlist to the tenant "
+        "SharePoint/OneDrive host(s) to enable; outbound files degrade to text",
+        {"host_count": 0},
+    )
+
+
 def probe_hermes_harness() -> ProbeResult:
     binary = shutil.which("hermes")
     if not binary:
@@ -430,6 +455,7 @@ def run_all_probes(
         probes.append(probe_network())
     probes.append(probe_keychain())
     probes.append(probe_local_config())
+    probes.append(probe_file_transfer())
     if bot_service_sidecar_path is None:
         bot_service_sidecar_path = Path.cwd() / bot_service.SIDECAR_FILENAME
     if generated_config_path is None:
