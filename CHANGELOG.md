@@ -4,13 +4,18 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [0.8.4] — Unreleased (#89 walk complete 2026-07-16)
+## [0.8.4] — Unreleased (#89 walk ran 2026-07-16; three lanes carried to #116)
 
 Milestone v0.8.4 — **rich Teams / Copilot Chat surfaces on the #18 invoke
 foundation**: file transfer both directions (#76), interactive approval/clarify
-cards (#77), outbound AI-content entities (#73), and Copilot→Teams handoff
-(#82). The single terminal arc walk (#89) validates all four together on the
-live tenant before this ships; the entry is held Unreleased until then.
+cards (#77), outbound AI-content entities (#73), and a Copilot→Teams handoff
+**foundation** (#82). The terminal arc walk (#89) exercised these on the live
+tenant and **validated the load-bearing card/entity paths on Copilot Chat**;
+three personal-Teams-1:1-only lanes (#76c FileConsent accept, personal
+streaming, #73c reaction round-trip) were blocked by an environmental
+personal-1:1 delivery gap and are carried to **#116**. **#89 stays open** until
+that lane completes; **#82 stays open** pending a Hermes-core session-import
+hook.
 
 ### Added
 
@@ -41,10 +46,29 @@ live tenant before this ships; the entry is held Unreleased until then.
   on). `message/submitAction` + `message/fetchTask` land as per-name invoke
   children; the reaction is recorded keyed by the replied message id (Teams stores
   nothing).
-- **#82 — Copilot→Teams handoff.** A `handoff/action` invoke child mints/resolves
-  continuation tokens (in-memory map), and a policy-gated **"continue in Teams"**
-  deep link (env **`A365_HANDOFF_LINK`**, default off) is appended to degraded
-  coalesced-from-stream Copilot Chat replies.
+- **#82 — Copilot→Teams handoff (foundation only).** A `handoff/action` invoke
+  child mints/validates/consumes continuation tokens (in-memory map), and a
+  policy-gated **"continue in Teams"** deep link (env **`A365_HANDOFF_LINK`**,
+  default off) is appended to degraded coalesced-from-stream Copilot Chat replies.
+  It does **not** yet import the Copilot session into the Teams turn — that needs
+  a Hermes-core conversation-import hook, so **#82 remains open** tracking that
+  dependency (this release ships the token lifecycle + deep link only).
+
+### Security hardening (PR #119 review)
+
+- **Inbound attachment download URLs are validated before any fetch** (same #100
+  activity-body threat model). Image `contentUrl` (which receives the reply
+  bearer) is pinned to the Bot Framework connector allowlist; file `downloadUrl`
+  to Microsoft SharePoint/OneDrive hosts. IP-literal / private / link-local hosts
+  and non-https URLs are rejected, and redirects are not followed — closing a
+  bearer-exfil / SSRF path.
+- **Outbound `fileConsent/invoke` is bound + validated.** The pending consent is
+  bound to the conversation + user that received the card and verified on accept;
+  the `uploadInfo.uploadUrl` is allowlisted to SharePoint/OneDrive before any
+  bytes are read or POSTed; and the file is re-stat'd at accept time (reject
+  empty / over-cap / changed-since-offer) so a raced or swapped file can't be
+  uploaded. `_pending_file_uploads` is now capped, TTL-expired, and cleared on
+  disconnect.
 
 ### Changed
 
@@ -82,9 +106,13 @@ live tenant before this ships; the entry is held Unreleased until then.
 
 ### Notes
 
-- Full agent-session import across a #82 handoff is a Hermes-core concern (a
-  conversation-import hook) and is flagged upstream — the adapter owns only the
-  token lifecycle + deep link.
+- **#82 and #89 are NOT closed by this release.** #82 ships the handoff
+  foundation only (token lifecycle + deep link); full session import needs a
+  Hermes-core conversation-import hook. #89's terminal-walk acceptance (both paths
+  × all three surfaces) is incomplete — the three personal-1:1 lanes are tracked
+  in #116, and #89 stays open until they are validated.
+- Provisioning finding: the CEA `bots` block requires an Azure Bot Service
+  resource; the Path A blueprint alone yields "Invalid bot" in Teams (#117).
 
 ## [0.8.3] — 2026-07-06
 

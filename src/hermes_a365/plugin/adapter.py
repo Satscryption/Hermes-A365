@@ -62,6 +62,7 @@ without requiring the harness on PYTHONPATH.
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import logging
 import mimetypes
@@ -72,6 +73,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -119,6 +121,48 @@ _FILE_CONSENT_INVOKE = "fileConsent/invoke"
 # Single-PUT upload cap (the OneDrive session accepts one range for the whole
 # file well above this); chunked upload for larger files is a follow-up.
 _MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024
+# Review-F3 — a FileConsentCard the user never answers is stale after this; the
+# pending entry is also popped on accept/decline and bounded by _MAX_CORRELATOR_ENTRIES.
+_PENDING_UPLOAD_TTL_SEC = 3600.0
+
+# Review-F1/F2 — trust-boundary allowlists for file transfer (same #100 threat
+# model: activity-body URLs are attacker-influencable). Inbound image
+# ``contentUrl`` is served by the Bot Framework *connector* and receives the
+# reply bearer, so it is pinned to the connector allowlist
+# (``DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES``); inbound file ``downloadUrl``
+# and the outbound OneDrive ``uploadUrl`` live on SharePoint/OneDrive hosts.
+# ``.sharepoint.com``/``.sharepoint.us`` are Microsoft-owned zones (tenant
+# subdomains are the user's own tenant); ``.svc.ms`` is the SharePoint
+# file-service used for download/upload sessions.
+_SHAREPOINT_HOST_SUFFIXES: tuple[str, ...] = (
+    ".sharepoint.com",
+    ".sharepoint.us",
+    ".sharepoint-df.com",
+    ".svc.ms",
+)
+
+
+def _is_safe_fetch_url(url: str, suffixes: tuple[str, ...]) -> bool:
+    """Review-F1/F2: True iff ``url`` is an https URL on an allowlisted Microsoft
+    host and NOT an IP literal — the precondition before we attach a bearer to it
+    (image download) or POST local bytes to it (upload). Reuses the bridge's
+    fail-closed ``_is_trusted_service_url`` shape-matcher (https + non-registrable
+    suffix / exact-host pin), then rejects IP-literal hosts outright as
+    defence-in-depth against a private/link-local SSRF or bearer-exfil path.
+    Fail-closed on anything malformed or off-allowlist."""
+    bridge = _import_bridge()
+    if not bridge._is_trusted_service_url(url, suffixes):
+        return False
+    try:
+        host = (urlparse(url).hostname or "").rstrip(".")
+    except ValueError:
+        return False
+    try:
+        ipaddress.ip_address(host)
+        return False  # a named allowlisted host is never an IP literal
+    except ValueError:
+        return True
+
 
 # #73(c)/#82 — bound the per-lifetime feedback / handoff-token correlator maps
 # so a long-running gateway can't grow them without limit (feedback is
@@ -1073,8 +1117,18 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._http_client is None:
             return None
         try:
-            resp = await self._http_client.get(url, headers=headers or {}, timeout=30.0)
-            resp.raise_for_status()
+            # Review-F1: follow_redirects=False — a 3xx to an off-allowlist host
+            # must NOT re-target the (bearer-bearing) request past the validated
+            # URL. Require an explicit 2xx; treat a redirect as a failed download.
+            resp = await self._http_client.get(
+                url, headers=headers or {}, timeout=30.0, follow_redirects=False
+            )
+            status_code = int(getattr(resp, "status_code", 0) or 0)
+            if status_code < 200 or status_code >= 300:
+                logger.warning(
+                    "agent365 inbound media non-2xx (%s) for %.60s", status_code, url
+                )
+                return None
             data = resp.content
         except Exception as e:
             logger.warning("agent365 inbound media download failed (%.60s): %s", url, e)
@@ -1113,6 +1167,15 @@ class Agent365Adapter(BasePlatformAdapter):
         # Collision-free, path-traversal-safe base from the (validated) activity
         # id — never interpolate the user-supplied file name into the path.
         base = re.sub(r"[^A-Za-z0-9._-]", "_", str(activity.get("id") or "att"))[:64]
+        # Review-F1: the connector allowlist gates where the reply bearer may be
+        # sent (image contentUrls). Prefer the operator-configured suffixes; fall
+        # back to the bridge default so validation is never silently disabled.
+        bridge = _import_bridge()
+        connector_suffixes = (
+            self._bridge_cfg.trusted_service_url_suffixes
+            if self._bridge_cfg is not None
+            else bridge.DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
+        )
         image_bearer: str | None = None  # minted once, lazily, for image contentUrls
         for i, att in enumerate(attachments):
             if not isinstance(att, dict):
@@ -1122,6 +1185,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 url = att.get("contentUrl")
                 if not isinstance(url, str) or not url or url.startswith("data:"):
                     continue  # inline data: URIs carry bytes directly — deferred
+                # Review-F1: never mint/send the reply bearer to a body-supplied
+                # host that isn't the Bot Framework connector (SSRF / bearer exfil).
+                if not _is_safe_fetch_url(url, connector_suffixes):
+                    logger.warning(
+                        "agent365 inbound image contentUrl off connector allowlist; "
+                        "skipped (%.60s)", url
+                    )
+                    continue
                 if image_bearer is None:
                     image_bearer = await self._reply_bearer(activity, validated_path)
                 if image_bearer is None:
@@ -1143,6 +1214,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not isinstance(url, str) or not url:
                     continue
                 # downloadUrl is a pre-authenticated SharePoint/OneDrive link.
+                # Review-F1: pin it to Microsoft file-service hosts before the GET
+                # (no bearer here, but an off-allowlist / private host is SSRF).
+                if not _is_safe_fetch_url(url, _SHAREPOINT_HOST_SUFFIXES):
+                    logger.warning(
+                        "agent365 inbound file downloadUrl off SharePoint allowlist; "
+                        "skipped (%.60s)", url
+                    )
+                    continue
                 file_type = str(content.get("fileType") or "").lower()
                 ext = f".{file_type}" if file_type and file_type.isalnum() else ".bin"
                 path = await self._download_inbound_media(
@@ -1324,6 +1403,8 @@ class Agent365Adapter(BasePlatformAdapter):
         # #73(c)/#82 — drop per-lifetime correlator maps on disconnect.
         self._feedback_by_message_id.clear()
         self._handoff_tokens.clear()
+        # Review-F3 — drop pending file-consent offers on disconnect too.
+        self._pending_file_uploads.clear()
         self._mark_disconnected()
 
     # ── Outbound ──────────────────────────────────────────────────────────
@@ -2627,8 +2708,21 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.error("agent365 send_file consent card failed: %s", e)
             return SendResult(success=False, error=str(e))
         # Record the pending upload only AFTER the card is accepted by BF — a
-        # failed send leaves no consent the user can act on.
-        self._pending_file_uploads[consent_id] = {"path": safe_path, "name": file_name}
+        # failed send leaves no consent the user can act on. Review-F2/F3: bind it
+        # to the conversation + user that received the card and stamp the offered
+        # size + time, so acceptance can verify the invoke came back on the same
+        # conversation/user and the file hasn't grown/changed since the offer.
+        conv_id = str(conv.get("id") or "")
+        user_id = str((inbound.get("from") or {}).get("id") or "")
+        self._pending_file_uploads[consent_id] = {
+            "path": safe_path,
+            "name": file_name,
+            "size": size,
+            "conversation_id": conv_id,
+            "user_id": user_id,
+            "created_at": time.time(),
+        }
+        _bound_map(self._pending_file_uploads)
         return SendResult(success=True, message_id=consent_id)
 
     async def send_document(
@@ -2702,11 +2796,38 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return invoke.InvokeResponse(status=200, body={})
 
+        # Review-F2: bind the accept to the conversation + user that received the
+        # card. A valid consentId replayed on a different conversation/user (or a
+        # guessed id) must NOT drive an upload.
+        act_conv = str((activity.get("conversation") or {}).get("id") or "")
+        act_user = str((activity.get("from") or {}).get("id") or "")
+        if act_conv != pending.get("conversation_id") or act_user != pending.get(
+            "user_id"
+        ):
+            logger.warning(
+                "agent365 fileConsent accept conversation/user mismatch consent=%s",
+                consent_id[:8],
+            )
+            return invoke.InvokeResponse(status=200, body={})
+
+        # Review-F3: a consent the user answers long after the offer is stale.
+        if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
+            logger.warning("agent365 fileConsent accept expired consent=%s", consent_id[:8])
+            return invoke.InvokeResponse(status=200, body={})
+
         upload_info = value.get("uploadInfo")
         upload_info = upload_info if isinstance(upload_info, dict) else {}
         upload_url = str(upload_info.get("uploadUrl") or "")
         if not upload_url or self._http_client is None:
             logger.warning("agent365 fileConsent accept missing uploadUrl/client")
+            return invoke.InvokeResponse(status=200, body={})
+        # Review-F2: never POST local file bytes to a body-supplied host that
+        # isn't a Microsoft OneDrive/SharePoint upload endpoint (SSRF).
+        if not _is_safe_fetch_url(upload_url, _SHAREPOINT_HOST_SUFFIXES):
+            logger.warning(
+                "agent365 fileConsent uploadUrl off SharePoint allowlist; refused "
+                "(%.60s)", upload_url
+            )
             return invoke.InvokeResponse(status=200, body={})
 
         # Re-validate at upload time — the file may have been removed between the
@@ -2715,6 +2836,25 @@ class Agent365Adapter(BasePlatformAdapter):
         if safe_path is None:
             logger.warning("agent365 fileConsent accept: file no longer available")
             return invoke.InvokeResponse(status=200, body={})
+        # Review-F3: re-stat BEFORE reading. Reject empty / over-cap / changed
+        # files (a file that grew or shrank since the offer no longer matches the
+        # sizeInBytes the user consented to) — and never read an over-cap file
+        # into memory.
+        try:
+            cur_size = os.path.getsize(safe_path)
+        except OSError as e:
+            logger.warning("agent365 fileConsent stat failed: %s", e)
+            return invoke.InvokeResponse(status=200, body={})
+        if cur_size <= 0 or cur_size > _MAX_OUTBOUND_FILE_BYTES:
+            logger.warning("agent365 fileConsent file size %d out of range", cur_size)
+            return invoke.InvokeResponse(status=200, body={})
+        if cur_size != int(pending.get("size") or -1):
+            logger.warning(
+                "agent365 fileConsent file changed since offer (%d != %s)",
+                cur_size,
+                pending.get("size"),
+            )
+            return invoke.InvokeResponse(status=200, body={})
         try:
             data = Path(safe_path).read_bytes()
         except OSError as e:
@@ -2722,11 +2862,10 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.InvokeResponse(status=200, body={})
 
         size = len(data)
-        if size <= 0:
-            # File truncated to empty between the offer and the Accept — the
-            # OneDrive range header (bytes 0--1/0) would be malformed. Ack
-            # gracefully rather than send a doomed request.
-            logger.warning("agent365 fileConsent: file empty at upload time")
+        if size <= 0 or size != cur_size:
+            # Raced to empty/changed between stat and read — bail rather than send
+            # a malformed Content-Range.
+            logger.warning("agent365 fileConsent: file changed between stat and read")
             return invoke.InvokeResponse(status=200, body={})
         try:
             put_resp = await self._http_client.put(
@@ -2737,6 +2876,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     "Content-Range": f"bytes 0-{size - 1}/{size}",
                 },
                 timeout=60.0,
+                follow_redirects=False,  # Review-F2: no redirect off the validated host
             )
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
             if status_code < 200 or status_code >= 300:
@@ -2874,14 +3014,16 @@ class Agent365Adapter(BasePlatformAdapter):
     async def _handle_handoff_action(
         self, ctx: invoke.InvokeContext
     ) -> invoke.InvokeResponse:
-        """#82: ``handoff/action`` — the user clicked a continuation deep link,
-        so Teams opened a 1:1 and handed us the token. Resolve it back to the
-        originating Copilot Chat session so the Teams turn can inherit context.
+        """#82 (foundation only): ``handoff/action`` — the user clicked a
+        continuation deep link, so Teams opened a 1:1 and handed us the token.
 
-        The token→session map is resolved here; full agent-session import is a
-        Hermes-core concern (a conversation-import hook) and is flagged upstream
-        — for now we ack so Teams completes the handoff, and record the linkage.
-        Always 200 (Teams reads non-200 as a failed handoff)."""
+        Scope of THIS handler: validate + consume the continuation token (reject
+        unknown/spoofed) and ack so Teams completes the handoff. It does **not**
+        yet bridge the Copilot session into the Teams conversation — the agent
+        lands in a fresh Teams turn. Actual session-context import needs a
+        Hermes-core conversation-import hook that does not exist yet; #82 stays
+        open, tracking that dependency, until it does. Always 200 (Teams reads a
+        non-200 as a failed handoff)."""
         token = str(ctx.value.get("continuation") or "")
         origin = self._handoff_tokens.pop(token, None) if token else None
         if origin is None:

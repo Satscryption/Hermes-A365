@@ -14,6 +14,7 @@ import asyncio
 import importlib
 import json
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from enum import Enum
@@ -5558,15 +5559,20 @@ class TestInboundMedia:
         a = _make_adapter(monkeypatch)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
+        # Review-F1: real connector allowlist so the download URL validator runs.
+        a._bridge_cfg.trusted_service_url_suffixes = (
+            adapter_mod._import_bridge().DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
+        )
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
         return a
 
     @staticmethod
-    def _resp(content: bytes) -> Any:
+    def _resp(content: bytes, status_code: int = 200) -> Any:
         r = MagicMock()
         r.content = content
+        r.status_code = status_code
         r.raise_for_status = MagicMock(return_value=None)
         return r
 
@@ -5590,7 +5596,10 @@ class TestInboundMedia:
                 {
                     "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
                     "name": "../../evil.pdf",  # user-controlled — must not reach the path
-                    "content": {"downloadUrl": "https://sp/dl", "fileType": "pdf"},
+                    "content": {
+                        "downloadUrl": "https://contoso.sharepoint.com/dl",
+                        "fileType": "pdf",
+                    },
                 }
             ],
         }
@@ -5619,7 +5628,7 @@ class TestInboundMedia:
         activity = {
             "id": "act-img",
             "attachments": [
-                {"contentType": "image/png", "contentUrl": "https://smba/att/1"}
+                {"contentType": "image/png", "contentUrl": "https://smba.trafficmanager.net/att/1"}
             ],
         }
         urls, types, mt = await a._extract_inbound_media(activity, validated_path="A")
@@ -5646,7 +5655,7 @@ class TestInboundMedia:
             "attachments": [
                 {
                     "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
-                    "content": {"downloadUrl": "https://sp/x"},
+                    "content": {"downloadUrl": "https://contoso.sharepoint.com/x"},
                 }
             ],
         }
@@ -5664,12 +5673,85 @@ class TestInboundMedia:
             "attachments": [
                 {
                     "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
-                    "content": {"downloadUrl": "https://sp/x"},
+                    "content": {"downloadUrl": "https://contoso.sharepoint.com/x"},
                 }
             ],
         }
         out = await a._extract_inbound_media(activity, validated_path="A")
         assert out == ([], [], adapter_mod.MessageType.TEXT)
+
+    # ── Review-F1: hostile download URLs are rejected before any GET ──────
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "bad_url",
+        [
+            "http://contoso.sharepoint.com/x",  # not https
+            "https://evil.example.com/x",  # off-allowlist host
+            "https://169.254.169.254/latest",  # link-local IP (SSRF)
+            "https://127.0.0.1/x",  # loopback IP
+            "https://sharepoint.com.attacker.net/x",  # suffix-spoof
+        ],
+    )
+    async def test_inbound_file_hostile_url_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_url: str
+    ) -> None:
+        a = self._adapter(monkeypatch, tmp_path)
+        a._http_client.get = AsyncMock(return_value=self._resp(b"DATA"))
+        activity = {
+            "id": "a",
+            "attachments": [
+                {
+                    "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
+                    "content": {"downloadUrl": bad_url},
+                }
+            ],
+        }
+        out = await a._extract_inbound_media(activity, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)
+        # No GET — the URL was rejected before the request.
+        assert a._http_client.get.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_inbound_image_offhost_never_mints_bearer(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # The reply bearer must NOT be minted/sent for an off-connector contentUrl.
+        a = self._adapter(monkeypatch, tmp_path)
+        a._http_client.get = AsyncMock(return_value=self._resp(b"PNG"))
+        bridge = adapter_mod._import_bridge()
+        mint = AsyncMock(return_value=("BEARER", "A"))
+        monkeypatch.setattr(bridge, "acquire_reply_token", mint)
+        activity = {
+            "id": "a",
+            "attachments": [
+                {"contentType": "image/png", "contentUrl": "https://evil.example.com/x"}
+            ],
+        }
+        out = await a._extract_inbound_media(activity, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)
+        assert mint.await_count == 0  # bearer never minted for an off-allowlist host
+        assert a._http_client.get.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_inbound_download_redirect_not_followed(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = self._adapter(monkeypatch, tmp_path)
+        a._http_client.get = AsyncMock(return_value=self._resp(b"", status_code=302))
+        activity = {
+            "id": "a",
+            "attachments": [
+                {
+                    "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
+                    "content": {"downloadUrl": "https://contoso.sharepoint.com/x"},
+                }
+            ],
+        }
+        out = await a._extract_inbound_media(activity, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)  # 3xx → dropped
+        # follow_redirects disabled on the request.
+        assert a._http_client.get.await_args.kwargs.get("follow_redirects") is False
 
     def test_activity_to_event_populates_media(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5701,6 +5783,9 @@ class TestOutboundFiles:
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
 
+    # Review-F2: a SharePoint/OneDrive host that passes the upload-URL allowlist.
+    _GOOD_UPLOAD = "https://contoso-my.sharepoint.com/personal/u/_layouts/upload"
+
     def _consent_activity(
         self,
         *,
@@ -5717,6 +5802,28 @@ class TestOutboundFiles:
             val["uploadInfo"] = upload_info
         act["value"] = val
         return act
+
+    @staticmethod
+    def _seed_pending(
+        a: Any,
+        f: Path,
+        *,
+        consent_id: str = "c1",
+        conv_id: str = "conv-1",
+        user_id: str = "user-1",
+        size: int | None = None,
+        created_at: float | None = None,
+    ) -> None:
+        # Review-F2/F3: a well-formed pending entry bound to the _consent_activity
+        # default conversation ("conv-1") + user ("user-1").
+        a._pending_file_uploads[consent_id] = {
+            "path": str(f),
+            "name": f.name,
+            "size": f.stat().st_size if size is None else size,
+            "conversation_id": conv_id,
+            "user_id": user_id,
+            "created_at": time.time() if created_at is None else created_at,
+        }
 
     # ── outbound: FileConsentCard ─────────────────────────────────────────
 
@@ -5867,15 +5974,15 @@ class TestOutboundFiles:
         f = tmp_path / "report.pdf"
         payload = b"the-actual-pdf-bytes"
         f.write_bytes(payload)
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "report.pdf"}
+        self._seed_pending(a, f)
         a._http_client.put = AsyncMock(return_value=MagicMock(status_code=201))
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         upload_info = {
-            "uploadUrl": "https://onedrive.example/upload/session",
-            "contentUrl": "https://sp.example/report.pdf",
+            "uploadUrl": self._GOOD_UPLOAD,
+            "contentUrl": "https://contoso.sharepoint.com/report.pdf",
             "name": "report.pdf",
             "uniqueId": "drive-item-1",
             "fileType": "pdf",
@@ -5949,7 +6056,7 @@ class TestOutboundFiles:
         self._connect(a)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        self._seed_pending(a, f)
         a._http_client.put = AsyncMock()
         resp = await a._handle_file_consent(
             self._consent_activity(upload_info=None), validated_path="A"
@@ -5966,7 +6073,7 @@ class TestOutboundFiles:
         self._connect(a)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"data")
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        self._seed_pending(a, f)
         a._http_client.put = AsyncMock(return_value=MagicMock(status_code=500))
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -5974,7 +6081,11 @@ class TestOutboundFiles:
 
         resp = await a._handle_file_consent(
             self._consent_activity(
-                upload_info={"uploadUrl": "https://x/y", "contentUrl": "c", "name": "x"}
+                upload_info={
+                    "uploadUrl": self._GOOD_UPLOAD,
+                    "contentUrl": "c",
+                    "name": "x",
+                }
             ),
             validated_path="A",
         )
@@ -6000,7 +6111,8 @@ class TestOutboundFiles:
         self._connect(a)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"pdf")
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "r.pdf"}
+        # Route body arrives on conv-fc from the _make_inbound default user.
+        self._seed_pending(a, f, conv_id="conv-fc")
         a._http_client.put = AsyncMock(return_value=MagicMock(status_code=201))
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -6012,8 +6124,8 @@ class TestOutboundFiles:
             "action": "accept",
             "context": {"consentId": "c1"},
             "uploadInfo": {
-                "uploadUrl": "https://x/up",
-                "contentUrl": "https://x/c",
+                "uploadUrl": self._GOOD_UPLOAD,
+                "contentUrl": "https://contoso.sharepoint.com/c",
                 "name": "r.pdf",
                 "uniqueId": "u",
                 "fileType": "pdf",
@@ -6028,6 +6140,114 @@ class TestOutboundFiles:
         assert a._handled_events == []
         assert a._http_client.put.await_count == 1
         assert "c1" not in a._pending_file_uploads
+
+    # ── Review-F2/F3: accept-path trust boundary + resource limits ────────
+
+    async def _accept_and_assert_no_put(
+        self, a: Any, monkeypatch: pytest.MonkeyPatch, activity: dict[str, Any]
+    ) -> None:
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        resp = await a._handle_file_consent(activity, validated_path="A")
+        assert resp.status == 200
+        assert a._http_client.put.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_accept_conversation_mismatch_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"data")
+        # Pending bound to conv-1; the accept arrives on a DIFFERENT conversation.
+        self._seed_pending(a, f, conv_id="conv-1")
+        a._http_client.put = AsyncMock()
+        act = self._consent_activity(
+            upload_info={"uploadUrl": self._GOOD_UPLOAD}, conv_id="conv-OTHER"
+        )
+        await self._accept_and_assert_no_put(a, monkeypatch, act)
+        assert "c1" not in a._pending_file_uploads  # spent even on refusal
+
+    @pytest.mark.asyncio
+    async def test_accept_offhost_upload_url_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"data")
+        self._seed_pending(a, f)
+        a._http_client.put = AsyncMock()
+        # Attacker-controlled upload destination — bytes must never be POSTed.
+        act = self._consent_activity(
+            upload_info={"uploadUrl": "https://evil.example.com/collect"}
+        )
+        await self._accept_and_assert_no_put(a, monkeypatch, act)
+
+    @pytest.mark.asyncio
+    async def test_accept_private_ip_upload_url_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"data")
+        self._seed_pending(a, f)
+        a._http_client.put = AsyncMock()
+        act = self._consent_activity(
+            upload_info={"uploadUrl": "https://169.254.169.254/latest/meta-data"}
+        )
+        await self._accept_and_assert_no_put(a, monkeypatch, act)
+
+    @pytest.mark.asyncio
+    async def test_accept_file_grew_since_offer_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"small")
+        self._seed_pending(a, f, size=5)
+        # File grew after the offer (size mismatch → refuse; user consented to 5B).
+        f.write_bytes(b"a much larger payload than offered")
+        a._http_client.put = AsyncMock()
+        act = self._consent_activity(upload_info={"uploadUrl": self._GOOD_UPLOAD})
+        await self._accept_and_assert_no_put(a, monkeypatch, act)
+
+    @pytest.mark.asyncio
+    async def test_accept_expired_consent_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"data")
+        # Offered well beyond the TTL.
+        self._seed_pending(
+            a, f, created_at=time.time() - adapter_mod._PENDING_UPLOAD_TTL_SEC - 10
+        )
+        a._http_client.put = AsyncMock()
+        act = self._consent_activity(upload_info={"uploadUrl": self._GOOD_UPLOAD})
+        await self._accept_and_assert_no_put(a, monkeypatch, act)
+
+    @pytest.mark.asyncio
+    async def test_send_file_consent_bounds_pending_map(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_CORRELATOR_ENTRIES", 3)
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"data")
+        for _ in range(6):
+            await a.send_document("conv-1", str(f))
+        assert len(a._pending_file_uploads) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -6522,7 +6742,14 @@ class TestCorrelatorBounds:
         a._bf_token_cache = MagicMock()
         f = tmp_path / "empty.bin"
         f.write_bytes(b"")
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "empty.bin"}
+        a._pending_file_uploads["c1"] = {
+            "path": str(f),
+            "name": "empty.bin",
+            "size": 0,
+            "conversation_id": "conv-1",
+            "user_id": "",
+            "created_at": time.time(),
+        }
         a._http_client.put = AsyncMock()
         activity = {
             "type": "invoke",
@@ -6530,7 +6757,9 @@ class TestCorrelatorBounds:
             "value": {
                 "action": "accept",
                 "context": {"consentId": "c1"},
-                "uploadInfo": {"uploadUrl": "https://x/up"},
+                "uploadInfo": {
+                    "uploadUrl": "https://contoso-my.sharepoint.com/up"
+                },
             },
             "conversation": {"id": "conv-1"},
         }
@@ -6546,6 +6775,8 @@ class TestCorrelatorBounds:
         a = _make_adapter(monkeypatch)
         a._feedback_by_message_id["m"] = {"reaction": "like"}
         a._handoff_tokens["t"] = {"conversation_id": "c"}
+        a._pending_file_uploads["c1"] = {"path": "/x", "name": "x"}
         await a.disconnect()
         assert a._feedback_by_message_id == {}
         assert a._handoff_tokens == {}
+        assert a._pending_file_uploads == {}
