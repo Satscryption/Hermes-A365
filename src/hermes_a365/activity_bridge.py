@@ -85,9 +85,16 @@ import urllib.request
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
-from ._common import parse_env, tcp_reachable, validate_slug
+from ._common import (
+    parse_env,
+    tcp_reachable,
+    validate_slug,
+)
+from ._common import (
+    quote_path_segment as _quote_path_segment_common,
+)
 
 # Slice 19b — `serve` mode dependencies. Optional extras: operators
 # who only need `verify` can install without them. We bind the names
@@ -197,16 +204,14 @@ def _resolve_hermes_home() -> Path:
 def _quote_path_segment(value: str) -> str:
     """Percent-encode a single URL path segment (#103 / M4).
 
-    Inbound conversation / activity ids arrive from the webhook body and get
-    interpolated into the outbound Bot Framework REST URL. Encoding each
-    segment with ``safe=""`` neutralises ``/``, ``?``, ``#`` and ``..`` so a
-    hostile id cannot alter the request path or smuggle a query/fragment. Bot
-    Framework accepts percent-encoded path segments (the official SDKs quote
-    conversation ids); a Teams conv id like ``19:abc@thread.tacv2`` becomes
-    ``19%3Aabc%40thread.tacv2``. The plugin adapter imports this helper so both
-    runtimes encode identically.
+    Thin wrapper over :func:`hermes_a365._common.quote_path_segment` (the
+    single source of truth, shared with the plugin adapter and bot_service
+    so all outbound-URL builders encode identically). Neutralises ``/``,
+    ``?``, ``#`` and — unlike a bare ``quote(safe="")`` — a literal ``.``/
+    ``..`` dot-segment. A Teams conv id like ``19:abc@thread.tacv2`` becomes
+    ``19%3Aabc%40thread.tacv2``.
     """
-    return quote(value, safe="")
+    return _quote_path_segment_common(value)
 
 
 def load_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:

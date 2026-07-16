@@ -7043,6 +7043,18 @@ class TestConversationsActivitiesUrl:
         assert "?" not in url
         assert "#" not in url
 
+    def test_bare_dotdot_id_is_neutralised(self) -> None:
+        # A conv id of exactly ".." must not render a live dot-segment that
+        # URL normalisation collapses (…/conversations/../activities →
+        # …/activities). quote(safe="") alone leaves ".." unchanged.
+        url = adapter_mod._conversations_activities_url(
+            "https://smba.trafficmanager.net/amer", ".."
+        )
+        assert url == (
+            "https://smba.trafficmanager.net/amer/v3/conversations/%2E%2E/activities"
+        )
+        assert "/../" not in url
+
     @pytest.mark.asyncio
     async def test_proactive_send_uses_encoded_conv_id(
         self, monkeypatch: pytest.MonkeyPatch

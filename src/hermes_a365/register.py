@@ -519,6 +519,8 @@ def report_missing_secret_warning(
         f"d=json.loads(p.read_text());"
         f"d['agentBlueprintClientSecret']=getpass.getpass('client secret: ');"
         f"t=p.with_suffix(p.suffix+'.tmp');"
+        # Pre-unlink a stale/planted temp so O_EXCL can't lock out a retry.
+        f"(os.remove(t) if os.path.lexists(t) else None);"
         f"fd=os.open(t,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);"
         f"os.write(fd,(json.dumps(d,indent=2,sort_keys=True)+chr(10)).encode());"
         f"os.close(fd);"

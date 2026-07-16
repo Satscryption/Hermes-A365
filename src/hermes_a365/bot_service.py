@@ -30,7 +30,7 @@ from typing import Any, Literal, Protocol
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-from ._common import parse_env, slugify
+from ._common import parse_env, quote_path_segment, slugify
 
 SIDECAR_FILENAME = "a365.bot-service.config.json"
 SIDECAR_SCHEMA_VERSION = 1
@@ -1344,7 +1344,7 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
         # response; percent-encode it so it can't break out of the path segment
         # or smuggle a query/fragment into the probe URL.
         "https://directline.botframework.com/v3/directline/conversations/"
-        f"{quote(conversation_id, safe='')}/activities",
+        f"{quote_path_segment(conversation_id)}/activities",
         token=token,
         body={
             "type": "message",

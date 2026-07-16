@@ -934,6 +934,31 @@ class TestReportMissingSecretWarning:
         assert on_disk["agentBlueprintClientSecret"] == "PASTED-FAKE-SECRET"
         assert (path.stat().st_mode & 0o777) == 0o600
 
+    def test_patch_hint_tolerates_stale_temp(self, tmp_path: Path) -> None:
+        # A leftover .tmp from a prior failed manual run must not lock out
+        # the retry via O_EXCL — the one-liner pre-unlinks it.
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        stale = path.with_suffix(path.suffix + ".tmp")
+        stale.write_text("stale junk from a crashed prior attempt")
+        msg = report_missing_secret_warning("bp-app-id", path)
+        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln)
+        code = line.split('python3 -c "', 1)[1].rsplit('"', 1)[0]
+        proc = subprocess.run(
+            [sys.executable, "-c", code, str(path)],
+            input="RETRY-SECRET\n",
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
+            "RETRY-SECRET"
+        )
+        assert not stale.exists()
+
 
 class TestWriteOwnerOnlyTextAtomic:
     """#112 / CS-004 — the exclusive-create atomic writer used for

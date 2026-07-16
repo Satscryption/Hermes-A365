@@ -256,6 +256,12 @@ class TestLocalConfig:
         # confirm status never reads/returns it — the raw candidate is skipped
         # while the benign slugified fallback ("victim") is probed harmlessly.
         _seed_skill_env(tmp_path)
+        # The agents root MUST exist or the OS can't resolve the ".." probe
+        # path (stat through a missing dir → ENOENT), which would make this
+        # test pass even with the validate_slug guard removed. With it
+        # present, the traversal genuinely resolves to the planted victim, so
+        # a neutered guard here would leak and fail the test.
+        (tmp_path / "agents").mkdir(exist_ok=True)
         victim_dir = tmp_path.parent / "victim"
         victim_dir.mkdir(exist_ok=True)
         (victim_dir / ".env").write_text("AA_INSTANCE_ID=leak\n")
@@ -265,6 +271,7 @@ class TestLocalConfig:
             assert result.state in {"warn", "ok"}
             assert "leak" not in result.detail
             assert "agent_env" not in result.data
+            assert result.data.get("aa_instance_id") != "leak"
         finally:
             (victim_dir / ".env").unlink(missing_ok=True)
             victim_dir.rmdir()

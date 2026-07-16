@@ -230,12 +230,22 @@ def log_event(log_path: Path | None, event: dict[str, Any]) -> None:
     # Higher parents (~/.hermes, agents/) are managed by the hermes_cli
     # install, so leave them alone.
     os.chmod(log_path.parent, 0o700)
-    # O_CREAT's mode only applies at creation, so fchmod repairs a
-    # pre-existing loose file BEFORE we append to it.
-    fd = os.open(log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
-    os.fchmod(fd, 0o600)
-    with os.fdopen(fd, "a") as f:
-        f.write(line + "\n")
+    # O_NOFOLLOW: never open through a pre-planted symlink at the log path
+    # (which we'd then fchmod 0600 — an attacker-chosen file). O_CREAT's
+    # mode only applies at creation, so fchmod repairs a pre-existing loose
+    # file BEFORE we append. The fd is guarded so a failing fchmod (EPERM on
+    # a foreign-owned file) can't leak the descriptor.
+    fd = os.open(
+        log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY | os.O_NOFOLLOW, 0o600
+    )
+    try:
+        os.fchmod(fd, 0o600)
+        fh = os.fdopen(fd, "a")
+    except BaseException:
+        os.close(fd)
+        raise
+    with fh:
+        fh.write(line + "\n")
 
 
 # ---------------------------------------------------------------------------

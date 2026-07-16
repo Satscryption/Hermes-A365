@@ -21,11 +21,44 @@ import pytest
 from hermes_a365._common import (
     deep_diff,
     ensure_contained,
+    quote_path_segment,
     render_diff_human,
     safe_run,
     slugify,
     validate_slug,
 )
+
+
+class TestQuotePathSegment:
+    """#103/M4: percent-encode an id as an inert single path segment."""
+
+    @pytest.mark.parametrize(
+        "value,expected",
+        [
+            ("19:abc@thread.tacv2", "19%3Aabc%40thread.tacv2"),
+            ("19:abc", "19%3Aabc"),
+            ("plain-id", "plain-id"),
+            ("a/b", "a%2Fb"),
+            ("a?b#c", "a%3Fb%23c"),
+        ],
+    )
+    def test_encodes_reserved(self, value: str, expected: str) -> None:
+        assert quote_path_segment(value) == expected
+
+    @pytest.mark.parametrize("value,expected", [("..", "%2E%2E"), (".", "%2E")])
+    def test_neutralises_bare_dot_segments(self, value: str, expected: str) -> None:
+        # A bare '.'/'..' id is the gap a plain quote(safe="") misses: '.'
+        # is RFC-3986 unreserved, so it survives encoding and renders a live
+        # dot-segment that URL normalisation collapses (shifting the target).
+        out = quote_path_segment(value)
+        assert out == expected
+        assert "." not in out
+
+    def test_dot_inside_id_is_left_alone(self) -> None:
+        # Only an id that IS exactly '.'/'..' is dangerous; dots elsewhere
+        # are fine (they can't form a dot-segment once '/' is encoded).
+        assert quote_path_segment("thread.tacv2") == "thread.tacv2"
+        assert quote_path_segment("..x") == "..x"
 
 
 class TestSlugify:

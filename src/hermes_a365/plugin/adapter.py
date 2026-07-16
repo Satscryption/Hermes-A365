@@ -75,7 +75,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -93,7 +93,7 @@ from gateway.platforms.base import (  # noqa: E402
 from gateway.session import SessionSource  # noqa: E402
 
 from hermes_a365 import invoke  # noqa: E402
-from hermes_a365._common import validate_slug  # noqa: E402
+from hermes_a365._common import quote_path_segment, validate_slug  # noqa: E402
 
 # Plugin-local imports — these don't depend on the Hermes harness.
 from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
@@ -521,7 +521,10 @@ def _conversations_activities_url(service_url: str, conv_id: str) -> str:
     stays attached. BF accepts encoded segments (Teams ids like
     ``19:abc@thread.tacv2`` become ``19%3Aabc%40thread.tacv2``).
     """
-    return f"{service_url}/v3/conversations/{quote(str(conv_id), safe='')}/activities"
+    return (
+        f"{service_url}/v3/conversations/"
+        f"{quote_path_segment(str(conv_id))}/activities"
+    )
 
 
 def _import_bridge() -> Any:

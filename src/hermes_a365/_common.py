@@ -13,6 +13,7 @@ import socket
 import subprocess
 from importlib import resources
 from pathlib import Path
+from urllib.parse import quote
 
 import jinja2
 
@@ -133,6 +134,23 @@ def validate_slug(slug: str) -> str:
             f"agent slug must not contain path separators or NUL: {slug!r}"
         )
     return slug
+
+
+def quote_path_segment(value: str) -> str:
+    """Percent-encode ``value`` as a single, inert URL path segment (#103 / M4).
+
+    Inbound conversation / activity ids are interpolated into outbound Bot
+    Framework REST URLs. ``quote(safe="")`` neutralises ``/``, ``?``, ``#``
+    — but ``.`` is RFC-3986 *unreserved*, so a bare ``.`` or ``..`` id
+    survives encoding and still renders a live dot-segment that URL
+    normalisation collapses (``…/conversations/../activities`` →
+    ``…/activities``), shifting the request target on the trusted host.
+    Percent-encode those dots too so no id can contribute a dot-segment.
+    """
+    seg = quote(value, safe="")
+    if seg in (".", ".."):
+        seg = seg.replace(".", "%2E")
+    return seg
 
 
 def ensure_contained(path: Path, root: Path) -> None:

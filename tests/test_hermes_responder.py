@@ -209,6 +209,44 @@ class TestLogEvent:
         assert json.loads(lines[0])["conversation_id"] == "old"
         assert json.loads(lines[1])["conversation_id"] == "new"
 
+    def test_fchmod_failure_does_not_leak_fd(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # If fchmod raises (EPERM on a foreign-owned but writable log), the
+        # descriptor from os.open must still be closed — else the long-lived
+        # responder leaks one fd per inbound message until exhaustion.
+        slug_dir = tmp_path / "agents" / "x"
+        slug_dir.mkdir(parents=True)
+        log_path = slug_dir / "responder.log"
+
+        def boom(fd: int, mode: int) -> None:
+            raise PermissionError("simulated EPERM")
+
+        monkeypatch.setattr(os, "fchmod", boom)
+        before = len(os.listdir("/dev/fd")) if os.path.isdir("/dev/fd") else None
+        for _ in range(20):
+            with pytest.raises(PermissionError):
+                log_event(log_path, {"conversation_id": "x", "type": "message"})
+        if before is not None:
+            after = len(os.listdir("/dev/fd"))
+            # Allow small jitter from the listdir fd itself; a real leak would
+            # be ~20.
+            assert after - before <= 2
+
+    def test_symlinked_log_path_is_refused(self, tmp_path: Path) -> None:
+        # O_NOFOLLOW: a pre-planted symlink at the log path must not be
+        # opened (and then fchmod'd) — that would let an attacker retarget
+        # the 0600 chmod at an arbitrary owner-owned file.
+        slug_dir = tmp_path / "agents" / "x"
+        slug_dir.mkdir(parents=True)
+        victim = tmp_path / "victim.txt"
+        victim.write_text("untouched")
+        log_path = slug_dir / "responder.log"
+        log_path.symlink_to(victim)
+        with pytest.raises(OSError):
+            log_event(log_path, {"conversation_id": "x", "type": "message"})
+        assert victim.read_text() == "untouched"
+
 
 # ---------------------------------------------------------------------------
 # FastAPI app — TestClient
