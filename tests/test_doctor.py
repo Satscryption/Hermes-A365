@@ -22,6 +22,7 @@ from hermes_a365.doctor import (
     probe_a365_cli,
     probe_az_cli,
     probe_custom_client_app,
+    probe_file_transfer,
     probe_hermes_harness,
     probe_keychain,
     probe_local_config,
@@ -326,6 +327,64 @@ class TestProbeLocalConfig:
         r = probe_local_config()
         assert r.state == "ok"
         assert ".env: 2 keys" in r.detail
+
+
+# ---------------------------------------------------------------------------
+# probe_file_transfer (#76 / R4)
+# ---------------------------------------------------------------------------
+
+
+class TestProbeFileTransfer:
+    def test_env_fallback_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "contoso.sharepoint.com")
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "env"
+        assert r.data["host_count"] == 1
+
+    def test_profile_config_enabled(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The documented profile source must NOT be misreported as disabled.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n"
+            "  platforms:\n"
+            "    agent365:\n"
+            "      extra:\n"
+            "        file_host_allowlist:\n"
+            "          - contoso.sharepoint.com\n"
+            "          - contoso-my.sharepoint.com\n"
+        )
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "profile"
+        assert r.data["host_count"] == 2
+
+    def test_indeterminate_when_no_config_and_no_env(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))  # no config.yaml
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "indeterminate"
+
+    def test_disabled_when_config_present_but_unset(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
+        (tmp_path / "config.yaml").write_text(
+            "gateway:\n  platforms:\n    agent365:\n      enabled: true\n"
+        )
+        r = probe_file_transfer()
+        assert r.state == "ok"
+        assert r.data["source"] == "none"
 
 
 # ---------------------------------------------------------------------------

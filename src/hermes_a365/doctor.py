@@ -368,28 +368,79 @@ def probe_local_config() -> ProbeResult:
     )
 
 
+def _agent365_file_hosts_from_config() -> list[str] | None:
+    """Read ``gateway.platforms.agent365.extra.file_host_allowlist`` from the
+    default ``$HERMES_HOME/config.yaml``. Returns the (possibly empty) host list,
+    or None when the file / parser / key is unavailable (so the caller reports
+    indeterminate rather than a false 'disabled'). Only the DEFAULT profile's
+    config is visible here — multiplex profiles under ``profiles/<name>/`` are not
+    inspected."""
+    home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
+    cfg = home / "config.yaml"
+    if not cfg.exists():
+        return None
+    try:
+        import yaml
+
+        data = yaml.safe_load(cfg.read_text()) or {}
+    except Exception:
+        return None  # pyyaml absent / unparseable → indeterminate
+    node = data
+    for key in ("gateway", "platforms", "agent365", "extra"):
+        node = node.get(key) if isinstance(node, dict) else None
+        if node is None:
+            return []  # config readable, key absent → definitely not set here
+    raw = node.get("file_host_allowlist") if isinstance(node, dict) else None
+    if raw is None:
+        return []
+    items = raw.split(",") if isinstance(raw, str) else list(raw or [])
+    return [str(h).strip() for h in items if str(h).strip()]
+
+
 def probe_file_transfer() -> ProbeResult:
-    """#76 file transfer is fail-closed on host allowlisting (R2/R3). Report
-    whether a tenant SharePoint/OneDrive host is pinned via
-    ``A365_FILE_HOST_ALLOWLIST`` (the profile's ``extra.file_host_allowlist`` is
-    the preferred source but isn't visible from the env alone). Unset ⇒ files are
-    disabled and degrade to a text notice — not an error, just off."""
+    """#76 file transfer is fail-closed on host allowlisting (R2/R3/R4). Report
+    whether a tenant SharePoint/OneDrive host is pinned — checking the profile
+    source (``extra.file_host_allowlist`` in the default config.yaml) as well as
+    the ``A365_FILE_HOST_ALLOWLIST`` env fallback, so a correctly profile-configured
+    deployment isn't misreported as disabled. Never an error — file transfer is
+    optional; when nothing is checkable the state is reported *indeterminate*, not
+    disabled."""
     raw = os.environ.get("A365_FILE_HOST_ALLOWLIST", "")
-    hosts = [h.strip() for h in raw.split(",") if h.strip()]
-    if hosts:
+    env_hosts = [h.strip() for h in raw.split(",") if h.strip()]
+    if env_hosts:
         return ProbeResult(
             "file_transfer",
             _OK,
-            f"#76 file transfer enabled — {len(hosts)} pinned tenant host(s)",
-            {"host_count": len(hosts)},
+            f"#76 file transfer enabled via A365_FILE_HOST_ALLOWLIST — "
+            f"{len(env_hosts)} pinned tenant host(s)",
+            {"source": "env", "host_count": len(env_hosts)},
+        )
+    cfg_hosts = _agent365_file_hosts_from_config()
+    if cfg_hosts is None:
+        return ProbeResult(
+            "file_transfer",
+            _OK,
+            "#76 file transfer state indeterminate — no A365_FILE_HOST_ALLOWLIST "
+            "and config.yaml is unreadable here; the profile's "
+            "extra.file_host_allowlist may still enable it",
+            {"source": "indeterminate", "host_count": 0},
+        )
+    if cfg_hosts:
+        return ProbeResult(
+            "file_transfer",
+            _OK,
+            f"#76 file transfer enabled via profile extra.file_host_allowlist — "
+            f"{len(cfg_hosts)} pinned tenant host(s)",
+            {"source": "profile", "host_count": len(cfg_hosts)},
         )
     return ProbeResult(
         "file_transfer",
         _OK,
-        "#76 file transfer disabled (fail-closed) — set A365_FILE_HOST_ALLOWLIST "
-        "or the profile's extra.file_host_allowlist to the tenant "
-        "SharePoint/OneDrive host(s) to enable; outbound files degrade to text",
-        {"host_count": 0},
+        "#76 file transfer disabled (fail-closed) in env + the default profile — "
+        "set extra.file_host_allowlist (per profile) or A365_FILE_HOST_ALLOWLIST to "
+        "the tenant SharePoint/OneDrive host(s); other multiplex profiles are not "
+        "inspected here",
+        {"source": "none", "host_count": 0},
     )
 
 
