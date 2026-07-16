@@ -6995,30 +6995,62 @@ class TestCorrelatorBounds:
 
 
 class TestSlugIngestion:
-    """#103 / M9 — a traversal-shaped slug from config/env must not steer
-    the agents-dir path joins; plugin load falls back to '' (default dir)
-    instead of crashing."""
+    """#103 / M9 + review P2 — an EXPLICITLY configured traversal-shaped
+    slug is rejected fail-closed (the adapter refuses to construct) rather
+    than silently routing to the shared 'default' profile state. A
+    genuinely absent slug still resolves to 'default'."""
 
     def test_benign_slug_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch, slug="inbox-helper")
         assert a.slug == "inbox-helper"
 
-    @pytest.mark.parametrize("bad", ["../escape", "a/b", "..", "a\\b"])
-    def test_traversal_slug_dropped_fail_closed(
+    @pytest.mark.parametrize("bad", ["../escape", "a/b", "..", "a\\b", ".", "x\x00y"])
+    def test_explicit_traversal_slug_rejected(
         self, monkeypatch: pytest.MonkeyPatch, bad: str
     ) -> None:
-        a = _make_adapter(monkeypatch, slug=bad)
-        assert a.slug == ""
-        # The registry path must have routed to the 'default' agent dir,
-        # not wherever the traversal pointed.
-        assert a._conversations_path.parent.name == "default"
+        # Fail closed: an invalid configured slug must not instantiate an
+        # adapter (and therefore cannot read/write the default profile).
+        with pytest.raises(ValueError):
+            _make_adapter(monkeypatch, slug=bad)
 
-    def test_traversal_agent_identity_env_dropped(
+    def test_explicit_traversal_agent_identity_rejected(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("AGENT_IDENTITY", "../../tmp/evil")
+        with pytest.raises(ValueError):
+            _make_adapter(monkeypatch, slug=None)
+
+    def test_absent_slug_resolves_to_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # No extra slug + no AGENT_IDENTITY → the supported single-profile
+        # 'default' dir (missing-slug behaviour is preserved).
+        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
         a = _make_adapter(monkeypatch, slug=None)
         assert a.slug == ""
+        assert a._conversations_path.parent.name == "default"
+
+    def test_validate_config_rejects_explicit_invalid_slug(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
+        monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
+        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+        good = _StubPlatformConfig(extra={"slug": "inbox-helper"})
+        bad = _StubPlatformConfig(extra={"slug": "../evil"})
+        absent = _StubPlatformConfig(extra={})
+        assert adapter_mod.validate_config(good) is True
+        assert adapter_mod.validate_config(absent) is True
+        assert adapter_mod.validate_config(bad) is False
+
+    def test_two_invalid_profiles_cannot_share_default(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The multiplex hazard the review flags: neither invalid profile
+        # may construct, so they can't collide on default/ durable state.
+        for bad in ("../p1", "../p2"):
+            with pytest.raises(ValueError):
+                _make_adapter(monkeypatch, slug=bad)
 
 
 class TestConversationsActivitiesUrl:

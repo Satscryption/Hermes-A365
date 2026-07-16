@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import stat
 import subprocess
 import sys
@@ -901,15 +902,34 @@ class TestReportMissingSecretWarning:
         assert "getpass" in msg
         assert "O_EXCL" in msg
 
+    @staticmethod
+    def _patch_argv(msg: str) -> list[str]:
+        """Recover the manual patch command's argv by tokenising the
+        rendered shell line exactly as a POSIX shell would (shlex.split).
+
+        Review P1: the whole command is rendered with shlex.join, so this
+        round-trips to ``['python3', '-c', <code>, <config-path>]`` — and
+        the path survives as one token even with spaces/metacharacters.
+        """
+        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln).strip()
+        return shlex.split(line)
+
     def test_patch_hint_command_is_valid_python(self, tmp_path: Path) -> None:
-        # The old hint's backslash-escaped quotes were a shell→python
-        # syntax trap; pin that the emitted one-liner actually compiles.
         msg = report_missing_secret_warning(
             "bp-app-id", tmp_path / "a365.generated.config.json"
         )
-        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln)
-        code = line.split('python3 -c "', 1)[1].rsplit('"', 1)[0]
-        compile(code, "<hint>", "exec")
+        argv = self._patch_argv(msg)
+        assert argv[0] == "python3" and argv[1] == "-c"
+        compile(argv[2], "<hint>", "exec")
+
+    def test_patch_hint_path_is_one_token_with_spaces(self, tmp_path: Path) -> None:
+        # Review P1: a config path with a space must not shell-split into
+        # multiple argv entries (which would make sys.argv[1] wrong).
+        path = tmp_path / "weird dir" / "a365.generated.config.json"
+        msg = report_missing_secret_warning("bp-app-id", path)
+        argv = self._patch_argv(msg)
+        assert argv[-1] == str(path)
+        assert len(argv) == 4
 
     def test_patch_hint_patches_via_stdin_prompt(self, tmp_path: Path) -> None:
         # Run the emitted one-liner for real: the secret arrives on stdin
@@ -920,10 +940,9 @@ class TestReportMissingSecretWarning:
             {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
         )
         msg = report_missing_secret_warning("bp-app-id", path)
-        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln)
-        code = line.split('python3 -c "', 1)[1].rsplit('"', 1)[0]
+        argv = self._patch_argv(msg)
         proc = subprocess.run(
-            [sys.executable, "-c", code, str(path)],
+            [sys.executable, *argv[1:]],
             input="PASTED-FAKE-SECRET\n",
             text=True,
             capture_output=True,
@@ -944,10 +963,9 @@ class TestReportMissingSecretWarning:
         stale = path.with_suffix(path.suffix + ".tmp")
         stale.write_text("stale junk from a crashed prior attempt")
         msg = report_missing_secret_warning("bp-app-id", path)
-        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln)
-        code = line.split('python3 -c "', 1)[1].rsplit('"', 1)[0]
+        argv = self._patch_argv(msg)
         proc = subprocess.run(
-            [sys.executable, "-c", code, str(path)],
+            [sys.executable, *argv[1:]],
             input="RETRY-SECRET\n",
             text=True,
             capture_output=True,
@@ -958,6 +976,43 @@ class TestReportMissingSecretWarning:
             "RETRY-SECRET"
         )
         assert not stale.exists()
+
+    def test_rendered_command_survives_a_real_shell(self, tmp_path: Path) -> None:
+        # Review P1, the load-bearing test: execute the ACTUAL rendered
+        # shell command (not the extracted code) with a config path that
+        # contains a space AND a shell metacharacter, through a real shell.
+        # shlex.join must have quoted it so pasting neither splits the path
+        # nor executes the injected `touch INJECTED`.
+        cfg_dir = tmp_path / "weird dir; touch INJECTED"
+        cfg_dir.mkdir(parents=True)
+        path = cfg_dir / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None}
+            )
+            + "\n"
+        )
+        msg = report_missing_secret_warning("bp-app-id", path)
+        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln).strip()
+        # Use the test interpreter but STILL exercise shell tokenisation of
+        # the rendered line (swap only the leading program token).
+        run_line = line.replace("python3", shlex.quote(sys.executable), 1)
+        proc = subprocess.run(
+            run_line,
+            shell=True,  # deliberate: prove the rendered line is shell-safe
+            input="SHELL-SECRET\n",
+            text=True,
+            capture_output=True,
+            timeout=30,
+            cwd=tmp_path,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
+            "SHELL-SECRET"
+        )
+        # The `; touch INJECTED` inside the path must NOT have executed.
+        assert not (tmp_path / "INJECTED").exists()
+        assert not (cfg_dir / "INJECTED").exists()
 
 
 class TestWriteOwnerOnlyTextAtomic:

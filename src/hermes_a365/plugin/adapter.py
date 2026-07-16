@@ -561,19 +561,17 @@ class Agent365Adapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
 
         # Connection / runtime config
+        # #103/M9 + review P2: an EXPLICITLY configured slug must be
+        # path-safe. Fail closed (refuse to construct the adapter) on an
+        # invalid one — falling back to "" would route this profile's
+        # durable state to ~/.hermes/agents/default/, where under multiplex
+        # two invalid profiles (or an invalid one + a real "default")
+        # would share and clobber conversations.json / bridge.log /
+        # bridge.pid. A genuinely absent slug still resolves to "default".
         _slug_raw = str(extra.get("slug") or os.getenv("AGENT_IDENTITY") or "")
-        try:
-            self.slug: str = validate_slug(_slug_raw) if _slug_raw else ""
-        except ValueError:
-            # #103 / M9: a traversal-shaped slug would steer every
-            # agents-dir path join below (conversations.json, bridge
-            # log/pid). Fail closed to the "default" agent dir rather
-            # than crashing plugin load.
-            logger.warning(
-                "agent365 slug %r is not path-safe; ignoring it and using "
-                "the 'default' agent dir",
-                _slug_raw,
-            )
+        if _slug_raw:
+            self.slug: str = validate_slug(_slug_raw)
+        else:
             self.slug = ""
         self.host: str = str(extra.get("host") or "127.0.0.1")
         self.port: int = int(
@@ -3936,11 +3934,27 @@ def check_requirements() -> bool:
 def validate_config(config: Any) -> bool:
     """Plugin loader pre-flight check. We accept any config that has
     `A365_TENANT_ID` + `A365_APP_ID` available either via env or
-    ``extra``."""
+    ``extra`` — and, if a slug is explicitly configured, that it is
+    path-safe."""
     extra = getattr(config, "extra", {}) or {}
     tenant = os.getenv("A365_TENANT_ID") or extra.get("tenant_id")
     app = os.getenv("A365_APP_ID") or extra.get("app_id")
-    return bool(tenant and app)
+    if not (tenant and app):
+        return False
+    # Review P2: reject an explicitly configured non-path-safe slug at
+    # pre-flight (mirrors __init__'s fail-closed guard) rather than let the
+    # adapter route to the shared "default" profile state.
+    slug_raw = str(extra.get("slug") or os.getenv("AGENT_IDENTITY") or "")
+    if slug_raw:
+        try:
+            validate_slug(slug_raw)
+        except ValueError:
+            logger.warning(
+                "agent365 configured slug %r is not path-safe; refusing to load",
+                slug_raw,
+            )
+            return False
+    return True
 
 
 def is_connected(config: Any) -> bool:

@@ -513,19 +513,26 @@ def report_missing_secret_warning(
     """
     display_name = default_recovery_display_name()
     az_cmd = shlex.join(_build_recovery_argv(blueprint_app_id, display_name))
-    patch_hint = (
-        f'    python3 -c "import getpass,json,os,pathlib,sys;'
-        f"p=pathlib.Path(sys.argv[1]);"
-        f"d=json.loads(p.read_text());"
-        f"d['agentBlueprintClientSecret']=getpass.getpass('client secret: ');"
-        f"t=p.with_suffix(p.suffix+'.tmp');"
-        # Pre-unlink a stale/planted temp so O_EXCL can't lock out a retry.
-        f"(os.remove(t) if os.path.lexists(t) else None);"
-        f"fd=os.open(t,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);"
-        f"os.write(fd,(json.dumps(d,indent=2,sort_keys=True)+chr(10)).encode());"
-        f"os.close(fd);"
-        f'os.replace(t,p)" {generated_config_path}'
+    # Reads the secret from a hidden getpass prompt (never argv), pre-unlinks
+    # a stale/planted temp so O_EXCL can't lock out a retry, and writes 0600
+    # before any bytes (#112/#113).
+    patch_code = (
+        "import getpass,json,os,pathlib,sys;"
+        "p=pathlib.Path(sys.argv[1]);"
+        "d=json.loads(p.read_text());"
+        "d['agentBlueprintClientSecret']=getpass.getpass('client secret: ');"
+        "t=p.with_suffix(p.suffix+'.tmp');"
+        "(os.remove(t) if os.path.lexists(t) else None);"
+        "fd=os.open(t,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);"
+        "os.write(fd,(json.dumps(d,indent=2,sort_keys=True)+chr(10)).encode());"
+        "os.close(fd);"
+        "os.replace(t,p)"
     )
+    # Render the WHOLE command (program, -c, code, and the config path) as a
+    # single shlex.join'd argv so a config path with spaces or shell
+    # metacharacters is safely quoted — pasting it can't split the path or
+    # execute injected commands (review P1). Never splice the path in raw.
+    patch_cmd = shlex.join(["python3", "-c", patch_code, str(generated_config_path)])
     return (
         f"[warn] CLI minted a credential on app {blueprint_app_id} but "
         f"did not persist it locally — known regression (#14).\n"
@@ -534,7 +541,7 @@ def report_missing_secret_warning(
         f"  or recover by hand — mint, then paste at the hidden prompt; "
         f"never put the secret on the command line:\n"
         f"    {az_cmd}\n"
-        f"{patch_hint}"
+        f"    {patch_cmd}"
     )
 
 
