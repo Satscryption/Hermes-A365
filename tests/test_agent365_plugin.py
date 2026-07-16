@@ -6987,3 +6987,228 @@ class TestCorrelatorBounds:
         assert a._feedback_by_message_id == {}
         assert a._handoff_tokens == {}
         assert a._pending_file_uploads == {}
+
+
+# ---------------------------------------------------------------------------
+# v0.8.5 — #103 M9/M4: slug safety + outbound URL path-segment encoding
+# ---------------------------------------------------------------------------
+
+
+class TestSlugIngestion:
+    """#103 / M9 — a traversal-shaped slug from config/env must not steer
+    the agents-dir path joins; plugin load falls back to '' (default dir)
+    instead of crashing."""
+
+    def test_benign_slug_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        a = _make_adapter(monkeypatch, slug="inbox-helper")
+        assert a.slug == "inbox-helper"
+
+    @pytest.mark.parametrize("bad", ["../escape", "a/b", "..", "a\\b"])
+    def test_traversal_slug_dropped_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch, bad: str
+    ) -> None:
+        a = _make_adapter(monkeypatch, slug=bad)
+        assert a.slug == ""
+        # The registry path must have routed to the 'default' agent dir,
+        # not wherever the traversal pointed.
+        assert a._conversations_path.parent.name == "default"
+
+    def test_traversal_agent_identity_env_dropped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("AGENT_IDENTITY", "../../tmp/evil")
+        a = _make_adapter(monkeypatch, slug=None)
+        assert a.slug == ""
+
+
+class TestConversationsActivitiesUrl:
+    """#103 / M4 — conversation ids are percent-encoded as single path
+    segments in every outbound BF URL the adapter builds."""
+
+    def test_teams_style_id_encoded(self) -> None:
+        url = adapter_mod._conversations_activities_url(
+            "https://smba.trafficmanager.net/amer", "19:abc@thread.tacv2"
+        )
+        assert url == (
+            "https://smba.trafficmanager.net/amer/v3/conversations/"
+            "19%3Aabc%40thread.tacv2/activities"
+        )
+
+    def test_hostile_id_cannot_shift_the_path(self) -> None:
+        url = adapter_mod._conversations_activities_url(
+            "https://smba.trafficmanager.net/amer", "../x?y=1#frag"
+        )
+        tail = url.split("/v3/conversations/", 1)[1]
+        assert tail == "..%2Fx%3Fy%3D1%23frag/activities"
+        assert "?" not in url
+        assert "#" not in url
+
+    @pytest.mark.asyncio
+    async def test_proactive_send_uses_encoded_conv_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # End-to-end through send()'s proactive fallback: the POSTed URL
+        # carries the percent-encoded conversation id while the JSON body
+        # keeps the raw id (only the URL is an injection surface).
+        conv_id = "19:abc@thread.tacv2;messageid=1"
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                {
+                    "type": "message",
+                    "id": "act-prior",
+                    "channelId": "msteams",
+                    "serviceUrl": "https://smba.trafficmanager.net/x/",
+                    "conversation": {
+                        "id": conv_id,
+                        "conversationType": "personal",
+                        "tenantId": "t",
+                    },
+                    "from": {"id": "u"},
+                    "recipient": {
+                        "id": "a",
+                        "agenticAppId": "aa",
+                        "agenticUserId": "au",
+                    },
+                }
+            )
+        )
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.json = MagicMock(return_value={"id": "pid"})
+        a._http_client = MagicMock()
+        a._http_client.post = AsyncMock(return_value=mock_resp)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "A"))
+        )
+
+        result = await a.send(chat_id=conv_id, content="proactive ping")
+        assert result.success is True
+        url = a._http_client.post.await_args.args[0]
+        assert url.endswith(
+            "/v3/conversations/19%3Aabc%40thread.tacv2%3Bmessageid%3D1/activities"
+        )
+        assert "19:abc@" not in url
+        body = a._http_client.post.await_args.kwargs["json"]
+        assert body["conversation"]["id"] == conv_id
+
+
+# ---------------------------------------------------------------------------
+# v0.8.5 — #110 CS-002: permissive parent .env cannot silently receive secret
+# ---------------------------------------------------------------------------
+
+
+class TestGateEnvSecretWrite:
+    """#110 / CS-002 — the wizard checks (and repairs or refuses) the
+    parent .env mode before A365_BLUEPRINT_CLIENT_SECRET is saved. The
+    prompt/print hooks are injected, so no hermes_cli harness needed."""
+
+    @staticmethod
+    def _hooks(answers: list[bool]):
+        calls: dict[str, list[str]] = {"prompts": [], "warnings": []}
+
+        def prompt_yes_no(question: str, default: bool = False) -> bool:
+            calls["prompts"].append(question)
+            return answers.pop(0)
+
+        def print_warning(msg: str) -> None:
+            calls["warnings"].append(msg)
+
+        return prompt_yes_no, print_warning, calls
+
+    def test_missing_env_passes_without_prompts(self, tmp_path: Path) -> None:
+        # Fresh file: save_env_value hardens on create, nothing to gate.
+        prompt_yes_no, print_warning, calls = self._hooks([])
+        ok = adapter_mod._gate_env_secret_write(
+            tmp_path / ".env", prompt_yes_no=prompt_yes_no, print_warning=print_warning
+        )
+        assert ok is True
+        assert calls["prompts"] == []
+        assert calls["warnings"] == []
+
+    def test_owner_only_env_passes_silently(self, tmp_path: Path) -> None:
+        env = tmp_path / ".env"
+        env.write_text("EXISTING=1\n")
+        env.chmod(0o600)
+        prompt_yes_no, print_warning, calls = self._hooks([])
+        ok = adapter_mod._gate_env_secret_write(
+            env, prompt_yes_no=prompt_yes_no, print_warning=print_warning
+        )
+        assert ok is True
+        assert calls["prompts"] == []
+
+    def test_permissive_env_hardened_with_consent(self, tmp_path: Path) -> None:
+        env = tmp_path / ".env"
+        env.write_text("EXISTING=1\n")
+        env.chmod(0o644)
+        prompt_yes_no, print_warning, calls = self._hooks([True])
+        ok = adapter_mod._gate_env_secret_write(
+            env, prompt_yes_no=prompt_yes_no, print_warning=print_warning
+        )
+        assert ok is True
+        assert (env.stat().st_mode & 0o777) == 0o600
+        # The warning names the current mode.
+        assert any("644" in w for w in calls["warnings"])
+
+    def test_permissive_env_refused_when_both_declined(self, tmp_path: Path) -> None:
+        # The regression the issue pins: a pre-existing permissive .env
+        # cannot SILENTLY receive the secret — declining the repair and
+        # the explicit override refuses the write and leaves the file be.
+        env = tmp_path / ".env"
+        env.write_text("EXISTING=1\n")
+        env.chmod(0o644)
+        prompt_yes_no, print_warning, calls = self._hooks([False, False])
+        ok = adapter_mod._gate_env_secret_write(
+            env, prompt_yes_no=prompt_yes_no, print_warning=print_warning
+        )
+        assert ok is False
+        assert (env.stat().st_mode & 0o777) == 0o644
+        assert len(calls["prompts"]) == 2
+
+    def test_permissive_env_explicit_override_names_mode(
+        self, tmp_path: Path
+    ) -> None:
+        env = tmp_path / ".env"
+        env.write_text("EXISTING=1\n")
+        env.chmod(0o644)
+        prompt_yes_no, print_warning, calls = self._hooks([False, True])
+        ok = adapter_mod._gate_env_secret_write(
+            env, prompt_yes_no=prompt_yes_no, print_warning=print_warning
+        )
+        assert ok is True
+        # Override consent question names the mode and the risk.
+        assert "644" in calls["prompts"][1]
+        assert "ANYWAY" in calls["prompts"][1]
+
+    def test_group_readable_640_is_gated_too(self, tmp_path: Path) -> None:
+        env = tmp_path / ".env"
+        env.write_text("EXISTING=1\n")
+        env.chmod(0o640)
+        prompt_yes_no, print_warning, _calls = self._hooks([True])
+        ok = adapter_mod._gate_env_secret_write(
+            env, prompt_yes_no=prompt_yes_no, print_warning=print_warning
+        )
+        assert ok is True
+        assert (env.stat().st_mode & 0o777) == 0o600
+
+    def test_chmod_failure_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env = tmp_path / ".env"
+        env.write_text("EXISTING=1\n")
+        env.chmod(0o644)
+
+        def boom(path: object, mode: int) -> None:
+            raise OSError("simulated chmod failure")
+
+        prompt_yes_no, print_warning, calls = self._hooks([True])
+        monkeypatch.setattr(adapter_mod.os, "chmod", boom)
+        ok = adapter_mod._gate_env_secret_write(
+            env, prompt_yes_no=prompt_yes_no, print_warning=print_warning
+        )
+        assert ok is False
+        assert any("chmod failed" in w for w in calls["warnings"])

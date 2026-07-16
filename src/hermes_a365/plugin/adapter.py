@@ -69,12 +69,13 @@ import logging
 import mimetypes
 import os
 import re
+import stat
 import time
 import uuid
 from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import quote, urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -92,6 +93,7 @@ from gateway.platforms.base import (  # noqa: E402
 from gateway.session import SessionSource  # noqa: E402
 
 from hermes_a365 import invoke  # noqa: E402
+from hermes_a365._common import validate_slug  # noqa: E402
 
 # Plugin-local imports — these don't depend on the Hermes harness.
 from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
@@ -509,6 +511,19 @@ def _should_dispatch(activity: dict[str, Any]) -> bool:
     return True
 
 
+def _conversations_activities_url(service_url: str, conv_id: str) -> str:
+    """``{serviceUrl}/v3/conversations/{id}/activities`` with the id encoded.
+
+    #103 / M4: conversation ids come from inbound activities (or a
+    registry seeded by them); percent-encoding the id as a single path
+    segment stops ``/``, ``?``, ``#``, or ``../`` inside it from
+    shifting the request target on the trusted host while the bearer
+    stays attached. BF accepts encoded segments (Teams ids like
+    ``19:abc@thread.tacv2`` become ``19%3Aabc%40thread.tacv2``).
+    """
+    return f"{service_url}/v3/conversations/{quote(str(conv_id), safe='')}/activities"
+
+
 def _import_bridge() -> Any:
     """Import the bridge module on demand. Returns the module object."""
     from hermes_a365 import activity_bridge
@@ -543,7 +558,20 @@ class Agent365Adapter(BasePlatformAdapter):
         extra = getattr(config, "extra", {}) or {}
 
         # Connection / runtime config
-        self.slug: str = str(extra.get("slug") or os.getenv("AGENT_IDENTITY") or "")
+        _slug_raw = str(extra.get("slug") or os.getenv("AGENT_IDENTITY") or "")
+        try:
+            self.slug: str = validate_slug(_slug_raw) if _slug_raw else ""
+        except ValueError:
+            # #103 / M9: a traversal-shaped slug would steer every
+            # agents-dir path join below (conversations.json, bridge
+            # log/pid). Fail closed to the "default" agent dir rather
+            # than crashing plugin load.
+            logger.warning(
+                "agent365 slug %r is not path-safe; ignoring it and using "
+                "the 'default' agent dir",
+                _slug_raw,
+            )
+            self.slug = ""
         self.host: str = str(extra.get("host") or "127.0.0.1")
         self.port: int = int(
             os.getenv("HERMES_BRIDGE_PORT") or extra.get("port") or _DEFAULT_PORT
@@ -2335,7 +2363,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "entities": [dict(bridge.AI_GENERATED_CONTENT_ENTITY)],
         }
         service_url = target["service_url"].rstrip("/")
-        url = f"{service_url}/v3/conversations/{target['conversation_id']}/activities"
+        url = _conversations_activities_url(service_url, target["conversation_id"])
 
         try:
             resp = await self._http_client.post(
@@ -2407,7 +2435,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 }
             ],
         }
-        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+        url = _conversations_activities_url(service_url, conv_id)
         try:
             token, _path = await bridge.acquire_reply_token(
                 client=self._http_client,
@@ -2483,7 +2511,7 @@ class Agent365Adapter(BasePlatformAdapter):
             raise RuntimeError(
                 "agent365 _post_activity: serviceUrl / conversation.id missing"
             )
-        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+        url = _conversations_activities_url(service_url, conv_id)
         token, _path = await bridge.acquire_reply_token(
             client=self._http_client,
             cfg=self._bridge_cfg,
@@ -3570,7 +3598,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 edit_message: serviceUrl or conversation.id missing",
             )
-        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+        url = _conversations_activities_url(service_url, conv_id)
 
         try:
             token, _path = await bridge.acquire_reply_token(
@@ -3720,7 +3748,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 }
             ],
         }
-        url = f"{service_url}/v3/conversations/{conv_id}/activities"
+        url = _conversations_activities_url(service_url, conv_id)
         try:
             bridge = _import_bridge()
             token, _path = await bridge.acquire_reply_token(
@@ -4294,6 +4322,60 @@ def _detect_drift(
     return drift
 
 
+def _gate_env_secret_write(
+    env_path: Path,
+    *,
+    prompt_yes_no: Any,
+    print_warning: Any,
+) -> bool:
+    """CS-002 (#110): may ``env_path`` receive the blueprint client secret?
+
+    The parent hermes_cli ``save_env_value`` deliberately *preserves* a
+    pre-existing ``.env``'s mode (it only hardens files it creates), so
+    by the time the wizard writes ``A365_BLUEPRINT_CLIENT_SECRET`` an
+    already-permissive file (e.g. 0644) would silently stay permissive.
+
+    Gate: a group/world-readable ``.env`` is offered a chmod-600 repair;
+    declining that requires an explicit second confirmation that names
+    the current mode and the risk. Anything else — stat failure, both
+    prompts declined — refuses the write (fail-closed). A missing file
+    passes: ``save_env_value`` hardens fresh files on create.
+
+    Prompt/print hooks are injected so tests don't need the hermes_cli
+    harness. Returns True when the secret write may proceed.
+    """
+    try:
+        mode = stat.S_IMODE(env_path.stat().st_mode)
+    except FileNotFoundError:
+        return True
+    except OSError as e:
+        print_warning(
+            f"Could not check permissions on {env_path} ({e}); refusing to "
+            "write the secret there."
+        )
+        return False
+    if not (mode & 0o077):
+        return True
+    print_warning(
+        f"{env_path} is group/world-readable (mode {mode:03o}) — the "
+        "blueprint client secret would be readable by other local users."
+    )
+    if prompt_yes_no(f"chmod 600 {env_path} before saving the secret?", True):
+        try:
+            os.chmod(env_path, 0o600)
+        except OSError as e:
+            print_warning(f"chmod failed ({e}); refusing to write the secret.")
+            return False
+        return True
+    return bool(
+        prompt_yes_no(
+            f"Save the secret into {env_path} at mode {mode:03o} ANYWAY? "
+            "(any local reader of the file can recover it)",
+            False,
+        )
+    )
+
+
 def interactive_setup() -> None:
     """``hermes gateway setup --platform agent365`` wizard.
 
@@ -4319,6 +4401,7 @@ def interactive_setup() -> None:
     from pathlib import Path
 
     from hermes_cli.setup import (
+        get_env_path,
         get_env_value,
         print_header,
         print_info,
@@ -4516,6 +4599,15 @@ def interactive_setup() -> None:
         )
 
     if slug:
+        try:
+            validate_slug(slug)
+        except ValueError as e:
+            # #103 / M9: AGENT_IDENTITY feeds every agents-dir path join.
+            print_warning(
+                f"Slug {slug!r} is not path-safe ({e}); not saving it. "
+                "Re-run the wizard with a plain slug (letters/digits/hyphens)."
+            )
+            return
         save_env_value("AGENT_IDENTITY", slug)
 
     # 5. Bridge port.
@@ -4540,8 +4632,20 @@ def interactive_setup() -> None:
             "(writes plaintext to ~/.hermes/.env — keychain-only is slice #19)",
             True,
         ):
-            save_env_value("A365_BLUEPRINT_CLIENT_SECRET", detected_secret)
-            print_success("Secret bootstrap saved to ~/.hermes/.env")
+            # #110 / CS-002: never add the secret to a permissive .env.
+            if _gate_env_secret_write(
+                get_env_path(),
+                prompt_yes_no=prompt_yes_no,
+                print_warning=print_warning,
+            ):
+                save_env_value("A365_BLUEPRINT_CLIENT_SECRET", detected_secret)
+                print_success("Secret bootstrap saved to ~/.hermes/.env")
+            else:
+                print_info(
+                    "Secret NOT saved. Fix the .env permissions (chmod 600) "
+                    "and re-run the wizard, or export "
+                    "A365_BLUEPRINT_CLIENT_SECRET in the gateway shell."
+                )
         else:
             print_info(
                 "Skipped. Export A365_BLUEPRINT_CLIENT_SECRET in the gateway "
@@ -4558,7 +4662,19 @@ def interactive_setup() -> None:
             password=True,
         )
         if manual_secret:
-            save_env_value("A365_BLUEPRINT_CLIENT_SECRET", manual_secret)
+            # #110 / CS-002: same gate on the manual-paste branch.
+            if _gate_env_secret_write(
+                get_env_path(),
+                prompt_yes_no=prompt_yes_no,
+                print_warning=print_warning,
+            ):
+                save_env_value("A365_BLUEPRINT_CLIENT_SECRET", manual_secret)
+            else:
+                print_info(
+                    "Secret NOT saved. Fix the .env permissions (chmod 600) "
+                    "and re-run the wizard, or export "
+                    "A365_BLUEPRINT_CLIENT_SECRET in the gateway shell."
+                )
 
     # 7. Allow-all toggle.
     print()

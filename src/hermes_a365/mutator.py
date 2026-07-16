@@ -118,6 +118,7 @@ class Mutator(Protocol):
         *,
         timeout: float = 900.0,
         stdin_input: str | None = None,
+        sensitive: bool = False,
     ) -> RunResult: ...
 
 
@@ -157,18 +158,31 @@ class A365CliMutator:
         *,
         timeout: float = 900.0,
         stdin_input: str | None = None,
+        sensitive: bool = False,
     ) -> RunResult:
         if not self.available:
             raise CliInvocationError(argv, -1, f"{A365_CLI_BINARY} not on PATH")
-        returncode, combined = _run_streaming(
-            argv, timeout=timeout, stdin_input=stdin_input
-        )
+        if sensitive:
+            try:
+                returncode, combined = _run_captured(
+                    argv, timeout=timeout, stdin_input=stdin_input
+                )
+            except subprocess.TimeoutExpired:
+                # Drop the captured partial output — it may hold the secret.
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from None
+        else:
+            returncode, combined = _run_streaming(
+                argv, timeout=timeout, stdin_input=stdin_input
+            )
         if returncode != 0:
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
+            # Sensitive runs never surface raw output in exceptions —
+            # callers print those messages (#111 / CS-003).
+            detail = _SENSITIVE_OUTPUT_SUPPRESSED if sensitive else stripped
             if match:
-                raise AADSTSError(match.group(0), stripped)
-            raise CliInvocationError(argv, returncode, stripped)
+                raise AADSTSError(match.group(0), detail)
+            raise CliInvocationError(argv, returncode, detail)
         return RunResult(
             argv=list(argv),
             returncode=returncode,
@@ -178,8 +192,41 @@ class A365CliMutator:
 
 
 # ---------------------------------------------------------------------------
-# Streaming subprocess helper
+# Subprocess helpers — streaming (default) and captured (sensitive)
 # ---------------------------------------------------------------------------
+
+_SENSITIVE_OUTPUT_SUPPRESSED = (
+    "<output suppressed: sensitive command may emit credential material>"
+)
+
+
+def _run_captured(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdin_input: str | None = None,
+) -> tuple[int, str]:
+    """Run ``argv`` to completion with output captured, never echoed.
+
+    Secret-aware sibling of :func:`_run_streaming` (#111 / CS-003): the
+    child's merged stdout/stderr goes only into the returned string —
+    nothing is written to the parent's stdout — so credential material
+    in the command output (e.g. ``az ad app credential reset -o json``)
+    can't land in terminals, CI logs, or session transcripts.
+
+    Trade-off: interactive prompts from the child are invisible, so this
+    path is only for non-interactive commands (the recovery path runs
+    against an already-cached ``az login``).
+    """
+    completed = subprocess.run(
+        argv,
+        input=stdin_input,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        timeout=timeout,
+    )
+    return completed.returncode, completed.stdout or ""
 
 
 def _run_streaming(

@@ -250,6 +250,33 @@ class TestLocalConfig:
         assert "Hermes Inbox Helper" in result.detail
         assert "hermes-inbox-helper" in result.detail
 
+    def test_traversal_agent_name_does_not_read_outside_root(self, tmp_path: Path) -> None:
+        # #103/M9: a read-only probe must never be steered outside the agents
+        # root. Plant a victim .env where "../../victim/.env" would land and
+        # confirm status never reads/returns it — the raw candidate is skipped
+        # while the benign slugified fallback ("victim") is probed harmlessly.
+        _seed_skill_env(tmp_path)
+        victim_dir = tmp_path.parent / "victim"
+        victim_dir.mkdir(exist_ok=True)
+        (victim_dir / ".env").write_text("AA_INSTANCE_ID=leak\n")
+        try:
+            result = gather_local_config(tmp_path, "../../victim")
+            # Does not crash; does not surface the out-of-root secret.
+            assert result.state in {"warn", "ok"}
+            assert "leak" not in result.detail
+            assert "agent_env" not in result.data
+        finally:
+            (victim_dir / ".env").unlink(missing_ok=True)
+            victim_dir.rmdir()
+
+    def test_pure_dotdot_agent_name_is_rejected_cleanly(self, tmp_path: Path) -> None:
+        # slugify("..") == "" so no benign fallback exists; status must warn
+        # about an invalid slug rather than probe "~/.hermes/agents/../.env".
+        _seed_skill_env(tmp_path)
+        result = gather_local_config(tmp_path, "..")
+        assert result.state == "warn"
+        assert "not a valid agent slug" in result.detail
+
 
 # ---------------------------------------------------------------------------
 # _classify_scopes_output
@@ -462,6 +489,16 @@ class TestActivityBridge:
         result = gather_activity_bridge(tmp_path, "inbox-helper")
         assert result.state == "error"
         assert "stale" in result.detail
+
+    @pytest.mark.parametrize("agent_name", ["../../etc", "..", "a/b", "x\x00y"])
+    def test_traversal_agent_name_refused_without_probe(
+        self, agent_name: str, tmp_path: Path
+    ) -> None:
+        # #103/M9: read-only probe — a traversal-shaped agent_name must not be
+        # joined into the pidfile path; status reports missing, no crash.
+        result = gather_activity_bridge(tmp_path, agent_name)
+        assert result.state == "missing"
+        assert "not a valid agent slug" in result.detail
 
 
 # ---------------------------------------------------------------------------

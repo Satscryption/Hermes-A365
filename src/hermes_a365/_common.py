@@ -7,6 +7,7 @@ lookup works for both editable installs and wheels.
 
 from __future__ import annotations
 
+import os
 import re
 import socket
 import subprocess
@@ -62,6 +63,36 @@ def tcp_reachable(host: str, *, port: int = 443, timeout: float = 3.0) -> bool:
         return False
 
 
+def write_owner_only_text_atomic(path: Path, text: str) -> None:
+    """Atomically write ``text`` to ``path``, owner-only (0600) from birth.
+
+    Secret-safe ordering (#112 / CS-004): the temp file is created with
+    ``O_CREAT | O_EXCL`` at mode 0600 *before* any bytes are written, so
+    under a permissive umask (e.g. 022) neither the temp file nor the
+    final path is ever group/world-readable while it holds secret
+    material — ``os.replace`` carries the 0600 mode to the final path.
+    ``O_EXCL`` also refuses to write through a pre-planted temp file or
+    symlink (the write fails closed instead); a stale temp left by a
+    crashed prior run is removed first.
+    """
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    try:
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -81,6 +112,42 @@ def slugify(name: str) -> str:
         should reject)
     """
     return _SLUG_NON_ALNUM_RE.sub("-", name.lower()).strip("-")
+
+
+def validate_slug(slug: str) -> str:
+    """Return ``slug`` iff it is safe to join under ``~/.hermes/agents/``.
+
+    Guards the agent-dir path joins against traversal (#103 / M9): the
+    slug must be a non-empty single relative path component — no
+    separators, no ``.``/``..``, no NUL. Raises :class:`ValueError`
+    otherwise. Deliberately looser than :func:`slugify` (existing
+    operator slugs may carry case or dots); this is a safety gate at the
+    filesystem boundary, not a normalizer.
+    """
+    if not slug:
+        raise ValueError("agent slug must be non-empty")
+    if slug in (".", ".."):
+        raise ValueError(f"agent slug must not be a dot component: {slug!r}")
+    if "/" in slug or "\\" in slug or "\x00" in slug:
+        raise ValueError(
+            f"agent slug must not contain path separators or NUL: {slug!r}"
+        )
+    return slug
+
+
+def ensure_contained(path: Path, root: Path) -> None:
+    """Raise :class:`ValueError` unless ``path`` resolves inside ``root``.
+
+    Belt-and-braces companion to :func:`validate_slug` (#103 / M9) for
+    the destructive primitives (env writes, cleanup unlink/rmdir):
+    resolves symlinks on both sides, so a traversal-shaped or
+    symlinked path that escapes the agents root fails closed before
+    any write or delete happens.
+    """
+    resolved = path.resolve()
+    root_resolved = root.resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"{path} escapes {root}")
 
 
 def parse_env(text: str) -> dict[str, str]:

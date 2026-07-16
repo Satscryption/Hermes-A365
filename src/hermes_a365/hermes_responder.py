@@ -42,6 +42,7 @@ import argparse
 import contextlib
 import json
 import os
+import secrets
 import sys
 from collections import deque
 from dataclasses import dataclass, field
@@ -54,14 +55,17 @@ from typing import Any, Literal
 try:
     from fastapi import Body as _Body
     from fastapi import FastAPI as _FastAPI
+    from fastapi import Header as _Header
     from fastapi import HTTPException as _HTTPException
     from fastapi.responses import JSONResponse as _JSONResponse
 except ImportError:  # pragma: no cover
     _Body = None  # type: ignore[assignment]
     _FastAPI = None  # type: ignore[assignment]
+    _Header = None  # type: ignore[assignment]
     _HTTPException = None  # type: ignore[assignment]
     _JSONResponse = None  # type: ignore[assignment]
 
+from ._common import validate_slug
 from .emit_card import GreetingInputs, emit_greeting
 
 DEFAULT_PORT = 9090
@@ -87,13 +91,24 @@ class ResponderConfig:
     canned_response_file: Path | None = None
     slug: str | None = None
     debug_endpoints: bool = False
+    # #114 (CS-006): shared secret gating the debug /history endpoint.
+    # Never sourced from argv — resolved from env / auto-generated in cmd_serve.
+    history_token: str | None = None
     history_max: int = DEFAULT_HISTORY_MAX
     log_path: Path | None = None  # resolved from slug if given
 
 
 def resolve_log_path(slug: str | None) -> Path | None:
+    """Log path under the agents root, or ``None`` when no slug given.
+
+    The slug is validated before the path join (#103 / M9) — a
+    traversal-shaped ``--slug`` must not steer ``log_event``'s
+    mkdir/append primitives outside ``$HERMES_HOME/agents/``.
+    ``ValueError`` propagates to the CLI.
+    """
     if not slug:
         return None
+    validate_slug(slug)
     home = Path(os.environ.get("HERMES_HOME") or os.path.expanduser("~/.hermes"))
     return home / "agents" / slug / "responder.log"
 
@@ -198,13 +213,28 @@ def render_invoke_response(activity: dict[str, Any]) -> dict[str, Any]:
 
 
 def log_event(log_path: Path | None, event: dict[str, Any]) -> None:
+    """Append one JSON line to the responder log (or stdout).
+
+    #115 (CS-007): raw M365 message text lands in this file, so the
+    slug dir and log file are owner-only (0o700 / 0o600) from birth and
+    repaired on every write — a pre-existing loose dir or file (older
+    build, permissive umask) is tightened before this call writes.
+    """
     line = json.dumps({"ts": datetime.now(UTC).isoformat(), **event})
     if log_path is None:
         sys.stdout.write(line + "\n")
         sys.stdout.flush()
         return
     log_path.parent.mkdir(parents=True, exist_ok=True)
-    with log_path.open("a") as f:
+    # Create-or-repair the slug dir owner-only every call (cheap syscall).
+    # Higher parents (~/.hermes, agents/) are managed by the hermes_cli
+    # install, so leave them alone.
+    os.chmod(log_path.parent, 0o700)
+    # O_CREAT's mode only applies at creation, so fchmod repairs a
+    # pre-existing loose file BEFORE we append to it.
+    fd = os.open(log_path, os.O_APPEND | os.O_CREAT | os.O_WRONLY, 0o600)
+    os.fchmod(fd, 0o600)
+    with os.fdopen(fd, "a") as f:
         f.write(line + "\n")
 
 
@@ -215,9 +245,7 @@ def log_event(log_path: Path | None, event: dict[str, Any]) -> None:
 
 def make_app(cfg: ResponderConfig, *, store: ConversationStore | None = None) -> Any:
     if _FastAPI is None:
-        raise ResponderConfigError(
-            "fastapi/uvicorn not installed; run `uv sync --extra bridge`"
-        )
+        raise ResponderConfigError("fastapi/uvicorn not installed; run `uv sync --extra bridge`")
     if store is None:
         store = ConversationStore(history_max=cfg.history_max)
     if cfg.mode == "canned" and cfg.canned_response_file is None:
@@ -277,10 +305,28 @@ def make_app(cfg: ResponderConfig, *, store: ConversationStore | None = None) ->
         )
         return _JSONResponse(reply)
 
-    if cfg.debug_endpoints:
+    # #114 (CS-006): the debug history endpoint returns raw stored
+    # conversation activity (M365 message text), so it's an authenticated
+    # local-only diagnostic surface. Fail closed — if the flag is on but no
+    # token was resolved, the route is simply not registered.
+    if cfg.debug_endpoints and cfg.history_token:
+        history_token = cfg.history_token
 
         @app.get("/history/{conversation_id}")
-        async def history(conversation_id: str) -> dict[str, Any]:
+        async def history(
+            conversation_id: str,
+            x_hermes_history_token: str | None = _Header(default=None),
+        ) -> dict[str, Any]:
+            if x_hermes_history_token is None:
+                raise _HTTPException(
+                    status_code=401, detail="missing X-Hermes-History-Token header"
+                )
+            # Encode both sides — compare_digest raises on unicode str.
+            if not secrets.compare_digest(
+                x_hermes_history_token.encode("utf-8"),
+                history_token.encode("utf-8"),
+            ):
+                raise _HTTPException(status_code=403, detail="invalid history token")
             return {
                 "conversation_id": conversation_id,
                 "activities": store.for_conv(conversation_id),
@@ -321,7 +367,13 @@ def main(argv: list[str] | None = None) -> int:
     serve.add_argument(
         "--debug-endpoints",
         action="store_true",
-        help="enable GET /history/<conversation-id> for inspection. Off by default.",
+        help=(
+            "enable GET /history/<conversation-id>, an authenticated local-only "
+            "diagnostic that returns raw conversation activity. Requires the "
+            "X-Hermes-History-Token header; the token is read from "
+            "$HERMES_RESPONDER_HISTORY_TOKEN or auto-generated and printed to "
+            "stderr once at startup. Off by default."
+        ),
     )
     serve.add_argument(
         "--history-max",
@@ -339,6 +391,28 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _resolve_history_token(debug_enabled: bool) -> str | None:
+    """Resolve the debug /history endpoint token (#114 / CS-006).
+
+    Never accepts the token via argv (#113 bans argv secrets across this
+    release): reads ``HERMES_RESPONDER_HISTORY_TOKEN`` if set and non-empty,
+    else auto-generates one and prints it ONCE to stderr so the operator can
+    copy it into their ``X-Hermes-History-Token`` request header. Returns
+    ``None`` when debug endpoints are disabled.
+    """
+    if not debug_enabled:
+        return None
+    token = os.environ.get("HERMES_RESPONDER_HISTORY_TOKEN") or ""
+    if token:
+        return token
+    token = secrets.token_urlsafe(32)
+    print(
+        f"[debug] history endpoint enabled; token (X-Hermes-History-Token header): {token}",
+        file=sys.stderr,
+    )
+    return token
+
+
 def cmd_serve(args: argparse.Namespace) -> int:
     if _FastAPI is None:
         print(
@@ -352,6 +426,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         canned_response_file=args.canned_response_file,
         slug=args.slug,
         debug_endpoints=args.debug_endpoints,
+        history_token=_resolve_history_token(args.debug_endpoints),
         history_max=args.history_max,
         log_path=resolve_log_path(args.slug),
     )

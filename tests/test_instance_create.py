@@ -60,6 +60,30 @@ class TestInstanceCreateInputs:
         with pytest.raises(ValueError, match=field_name):
             _inputs(**{field_name: ""})
 
+    @pytest.mark.parametrize("slug", ["../../tmp/x", "/etc", "..", "a/b", "x\x00y"])
+    def test_traversal_slug_rejected_at_construction(self, slug: str, tmp_path: Path) -> None:
+        # #103/M9: a traversal-shaped slug is refused before any plan is built,
+        # so nothing is created under (or outside) the agents root.
+        with pytest.raises(ValueError):
+            _inputs(slug=slug)
+        assert not (tmp_path / "agents").exists()
+
+
+class TestSlugTraversalApplyGuard:
+    """#103/M9: belt-and-braces ensure_contained at write time."""
+
+    def test_apply_refuses_env_path_outside_agents_root(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        # Simulate a plan whose env_path escapes the agents root (e.g. built
+        # bypassing InstanceCreateInputs validation, or via a symlinked dir).
+        victim = tmp_path / "victim.env"
+        plan.env_path = victim
+        with pytest.raises(ValueError):
+            apply_instance_plan(plan)
+        # Fail-closed: the escaping write never happened.
+        assert not victim.exists()
+
 
 # ---------------------------------------------------------------------------
 # Skill env preconditions

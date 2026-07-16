@@ -14,10 +14,18 @@ tests (``tests/test_doctor.py``).
 from __future__ import annotations
 
 import sys
+from pathlib import Path
 
 import pytest
 
-from hermes_a365._common import deep_diff, render_diff_human, safe_run, slugify
+from hermes_a365._common import (
+    deep_diff,
+    ensure_contained,
+    render_diff_human,
+    safe_run,
+    slugify,
+    validate_slug,
+)
 
 
 class TestSlugify:
@@ -42,6 +50,74 @@ class TestSlugify:
         # Caller is responsible for rejecting empty slugs.
         assert slugify("---") == ""
         assert slugify("   ") == ""
+
+
+class TestValidateSlug:
+    """#103/M9: the filesystem-boundary gate for agent-dir slugs."""
+
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "../x",
+            "a/b",
+            "..",
+            ".",
+            "",
+            "a\\b",
+            "x\x00y",
+            "/etc",
+            "../../tmp/x",
+        ],
+    )
+    def test_traversal_slugs_raise(self, slug: str) -> None:
+        with pytest.raises(ValueError):
+            validate_slug(slug)
+
+    @pytest.mark.parametrize(
+        "slug",
+        [
+            "inbox-helper",
+            "R10",
+            "foo.bar",
+            "Hermes Inbox Helper",
+            "hermes-inbox-helper",
+        ],
+    )
+    def test_benign_slugs_pass_and_round_trip(self, slug: str) -> None:
+        # validate_slug returns the slug unchanged when safe.
+        assert validate_slug(slug) == slug
+
+
+class TestEnsureContained:
+    """#103/M9: destructive-primitive containment guard."""
+
+    def test_inside_passes(self, tmp_path: Path) -> None:
+        root = tmp_path / "agents"
+        root.mkdir()
+        # No exception for a path resolving inside the root.
+        ensure_contained(root / "inbox-helper" / ".env", root)
+
+    def test_root_itself_passes(self, tmp_path: Path) -> None:
+        root = tmp_path / "agents"
+        root.mkdir()
+        ensure_contained(root, root)
+
+    def test_dotdot_escape_raises(self, tmp_path: Path) -> None:
+        root = tmp_path / "agents"
+        root.mkdir()
+        with pytest.raises(ValueError):
+            ensure_contained(root / ".." / "outside.env", root)
+
+    def test_symlink_pointing_outside_raises(self, tmp_path: Path) -> None:
+        root = tmp_path / "agents"
+        root.mkdir()
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        link = root / "escape"
+        link.symlink_to(outside)
+        # The symlinked child resolves outside the root — must fail closed.
+        with pytest.raises(ValueError):
+            ensure_contained(link / "victim.env", root)
 
 
 class TestDeepDiff:

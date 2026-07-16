@@ -164,6 +164,25 @@ class TestCleanupInputs:
         inp = CleanupInputs(agent_name="Hermes Inbox Helper", slug="custom-slug")
         assert inp.resolved_slug == "custom-slug"
 
+    @pytest.mark.parametrize("slug", ["../../tmp/x", "/etc", "..", "a/b", "x\x00y"])
+    def test_resolved_slug_rejects_traversal_override(self, slug: str) -> None:
+        # #103/M9: the explicit --slug is returned verbatim and joined into
+        # ~/.hermes/agents/<slug>/ for deletion — a traversal value is refused.
+        with pytest.raises(ValueError):
+            _ = CleanupInputs(agent_name="x", slug=slug).resolved_slug
+
+    def test_build_plan_refuses_traversal_slug_without_touching_fs(self, tmp_path: Path) -> None:
+        # A victim outside the agents root must be untouched when a hostile
+        # --slug is rejected before the plan is built.
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not delete")
+        with pytest.raises(ValueError):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="x", slug="../../victim.txt"),
+                hermes_home=tmp_path / "agents",
+            )
+        assert victim.read_text() == "do not delete"
+
 
 # ---------------------------------------------------------------------------
 # _parse_kinds
@@ -356,6 +375,23 @@ class TestApplyCleanup:
         # Local .env was removed; agent dir reaped.
         assert not (tmp_path / "agents" / "inbox-helper" / ".env").exists()
         assert not (tmp_path / "agents" / "inbox-helper").exists()
+
+    def test_apply_refuses_to_delete_outside_agents_root(self, tmp_path: Path) -> None:
+        # #103/M9: belt-and-braces — even if an escaping path reaches the
+        # deletion list (symlinked agent dir, hand-built plan), apply must fail
+        # closed with a clear error rather than unlink outside the agents root.
+        victim = tmp_path / "victim.txt"
+        victim.write_text("do not delete")
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        plan.local_paths = [victim]
+        with pytest.raises(CleanupError, match="outside the agents root"):
+            apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
+        # Fail-closed: the victim outside the agents root survived.
+        assert victim.read_text() == "do not delete"
 
     def test_subset_only_runs_selected_kinds(self, tmp_path: Path) -> None:
         _seed_agent_dir(tmp_path)

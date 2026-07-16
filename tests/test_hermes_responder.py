@@ -9,6 +9,8 @@ log-line emission, CLI startup-validation, and the FastAPI app via
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -20,6 +22,7 @@ from hermes_a365.hermes_responder import (
     ConversationStore,
     ResponderConfig,
     ResponderConfigError,
+    _resolve_history_token,
     log_event,
     main,
     make_app,
@@ -101,9 +104,7 @@ class TestConversationStore:
     def test_append_and_retrieve(self) -> None:
         store = ConversationStore()
         store.append("conv-1", {"in": {"text": "a"}, "out": {"text": "A"}})
-        assert store.for_conv("conv-1") == [
-            {"in": {"text": "a"}, "out": {"text": "A"}}
-        ]
+        assert store.for_conv("conv-1") == [{"in": {"text": "a"}, "out": {"text": "A"}}]
 
     def test_history_capped(self) -> None:
         store = ConversationStore(history_max=3)
@@ -142,6 +143,16 @@ class TestResolveLogPath:
         path = resolve_log_path("inbox-helper")
         assert path == tmp_path / "agents" / "inbox-helper" / "responder.log"
 
+    @pytest.mark.parametrize("bad", ["../escape", "a/b", "..", ".", "a\\b"])
+    def test_traversal_shaped_slug_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad: str
+    ) -> None:
+        # #103 / M9: --slug feeds log_event's mkdir/append primitives;
+        # a traversal-shaped value must fail before the path join.
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        with pytest.raises(ValueError):
+            resolve_log_path(bad)
+
 
 # ---------------------------------------------------------------------------
 # log_event
@@ -160,12 +171,43 @@ class TestLogEvent:
             assert payload["conversation_id"] == "c1"
             assert "ts" in payload
 
-    def test_no_path_writes_to_stdout(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_no_path_writes_to_stdout(self, capsys: pytest.CaptureFixture[str]) -> None:
         log_event(None, {"type": "message", "text_in": "hi"})
         out = capsys.readouterr().out
         assert json.loads(out.strip())["text_in"] == "hi"
+
+    def test_fresh_dir_and_file_are_owner_only(self, tmp_path: Path) -> None:
+        # #115 (CS-007): even under a permissive umask the slug dir and
+        # log file must be created owner-only (M365 message text lands here).
+        log_path = tmp_path / "agents" / "x" / "responder.log"
+        old = os.umask(0o022)
+        try:
+            log_event(log_path, {"conversation_id": "c1", "type": "message"})
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(log_path.parent.stat().st_mode) == 0o700
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+
+    def test_repairs_pre_existing_loose_modes(self, tmp_path: Path) -> None:
+        # A dir/file left world-readable by an older build must be tightened
+        # on the next write, and the existing content preserved (append).
+        slug_dir = tmp_path / "agents" / "x"
+        slug_dir.mkdir(parents=True)
+        log_path = slug_dir / "responder.log"
+        log_path.write_text(json.dumps({"conversation_id": "old"}) + "\n")
+        slug_dir.chmod(0o755)
+        log_path.chmod(0o644)
+        old = os.umask(0o022)
+        try:
+            log_event(log_path, {"conversation_id": "new", "type": "message"})
+        finally:
+            os.umask(old)
+        assert stat.S_IMODE(slug_dir.stat().st_mode) == 0o700
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
+        lines = log_path.read_text().splitlines()
+        assert len(lines) == 2
+        assert json.loads(lines[0])["conversation_id"] == "old"
+        assert json.loads(lines[1])["conversation_id"] == "new"
 
 
 # ---------------------------------------------------------------------------
@@ -263,9 +305,7 @@ class TestServeApp:
         # Bridge already filters these, but be defensive.
         app = make_app(ResponderConfig(mode="echo"))
         with TestClient(app) as client:
-            r = client.post(
-                "/respond", json=_envelope(activity_type="conversationUpdate")
-            )
+            r = client.post("/respond", json=_envelope(activity_type="conversationUpdate"))
         assert r.status_code == 200
         assert r.json() == {"text": ""}
 
@@ -275,12 +315,32 @@ class TestServeApp:
             r = client.get("/history/conv-1")
         assert r.status_code == 404
 
-    def test_history_endpoint_on_with_flag(self) -> None:
+    def test_history_endpoint_fail_closed_without_token(self) -> None:
+        # #114 (CS-006): flag on but no token → route not registered.
         app = make_app(ResponderConfig(mode="echo", debug_endpoints=True))
+        with TestClient(app) as client:
+            r = client.get("/history/conv-1")
+        assert r.status_code == 404
+
+    def test_history_endpoint_missing_header_401(self) -> None:
+        app = make_app(ResponderConfig(mode="echo", debug_endpoints=True, history_token="tok"))
+        with TestClient(app) as client:
+            r = client.get("/history/conv-1")
+        assert r.status_code == 401
+
+    def test_history_endpoint_wrong_token_403(self) -> None:
+        app = make_app(ResponderConfig(mode="echo", debug_endpoints=True, history_token="tok"))
+        with TestClient(app) as client:
+            r = client.get("/history/conv-1", headers={"X-Hermes-History-Token": "nope"})
+        assert r.status_code == 403
+
+    def test_history_endpoint_on_with_token(self) -> None:
+        app = make_app(ResponderConfig(mode="echo", debug_endpoints=True, history_token="tok"))
+        headers = {"X-Hermes-History-Token": "tok"}
         with TestClient(app) as client:
             client.post("/respond", json=_envelope(text="one", conv_id="conv-1"))
             client.post("/respond", json=_envelope(text="two", conv_id="conv-1"))
-            r = client.get("/history/conv-1")
+            r = client.get("/history/conv-1", headers=headers)
         assert r.status_code == 200
         history = r.json()["activities"]
         assert len(history) == 2
@@ -302,6 +362,8 @@ class TestServeApp:
         payload = json.loads(lines[0])
         assert payload["text_in"] == "hi"
         assert payload["channel"] == "msteams"
+        # #115 (CS-007): the log holding M365 text is owner-only.
+        assert stat.S_IMODE(log_path.stat().st_mode) == 0o600
 
 
 # ---------------------------------------------------------------------------
@@ -310,9 +372,7 @@ class TestServeApp:
 
 
 class TestCli:
-    def test_canned_without_file_exits_2(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_canned_without_file_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
         rc = main(["serve", "--mode", "canned"])
         assert rc == 2
         assert "canned-response-file is required" in capsys.readouterr().err
@@ -320,3 +380,43 @@ class TestCli:
     def test_invalid_mode_rejected_by_argparse(self) -> None:
         with pytest.raises(SystemExit):
             main(["serve", "--mode", "bogus"])
+
+
+# ---------------------------------------------------------------------------
+# _resolve_history_token — #114 (CS-006)
+# ---------------------------------------------------------------------------
+
+
+class TestResolveHistoryToken:
+    def test_disabled_returns_none(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HERMES_RESPONDER_HISTORY_TOKEN", "from-env")
+        assert _resolve_history_token(False) is None
+
+    def test_uses_env_var_when_set(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("HERMES_RESPONDER_HISTORY_TOKEN", "from-env")
+        assert _resolve_history_token(True) == "from-env"
+        # An operator-supplied token is not echoed to stderr.
+        assert "from-env" not in capsys.readouterr().err
+
+    def test_empty_env_var_falls_back_to_generation(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HERMES_RESPONDER_HISTORY_TOKEN", "")
+        token = _resolve_history_token(True)
+        assert token
+        assert len(token) >= 32
+
+    def test_generates_and_prints_once(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.delenv("HERMES_RESPONDER_HISTORY_TOKEN", raising=False)
+        token = _resolve_history_token(True)
+        assert token is not None
+        assert len(token) >= 32
+        err = capsys.readouterr().err
+        assert "X-Hermes-History-Token" in err
+        assert token in err
+
+    def test_generated_tokens_are_unique(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("HERMES_RESPONDER_HISTORY_TOKEN", raising=False)
+        assert _resolve_history_token(True) != _resolve_history_token(True)

@@ -1340,7 +1340,11 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
             f"Direct Line omitted conversationId: {conversation}",
         )
     status, response = _http_json(
-        f"https://directline.botframework.com/v3/directline/conversations/{conversation_id}/activities",
+        # #103/L8: conversation_id comes from the Direct Line start-conversation
+        # response; percent-encode it so it can't break out of the path segment
+        # or smuggle a query/fragment into the probe URL.
+        "https://directline.botframework.com/v3/directline/conversations/"
+        f"{quote(conversation_id, safe='')}/activities",
         token=token,
         body={
             "type": "message",
