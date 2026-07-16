@@ -62,7 +62,13 @@ jobs:
     runs-on: ubuntu-latest
     # M12: publish only from a v* tag ref. A `workflow_dispatch` against a
     # branch ref (or any non-tag ref) stops here, so repo writers cannot
-    # publish arbitrary branch contents to PyPI via OIDC.
+    # publish arbitrary branch contents to PyPI via OIDC. NOTE: this is a
+    # ref-NAME guard only — it does not attest commit provenance, so a
+    # repo-writer who pushes a malicious `v*` tag could still publish. That
+    # higher-privilege threat (compromised/insider maintainer) is out of
+    # scope for this guard; close it with a protected GitHub `environment:`
+    # carrying required-reviewer rules on this job (configure the rules in
+    # repo settings first — an unconfigured `environment:` is a no-op gate).
     if: startsWith(github.ref, 'refs/tags/v')
     # Uses PyPI Trusted Publisher (OIDC) — no PYPI_API_TOKEN secret.
     # One-time setup: register the project on pypi.org and add this
