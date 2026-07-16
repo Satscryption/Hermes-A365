@@ -11,6 +11,7 @@ upstream Hermes uses for its own unit tests of platform plugins.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import json
 import sys
@@ -5550,6 +5551,32 @@ class TestInvokeRoute:
         assert ctx.user_upn == "u@x"
 
 
+class _StreamCM:
+    """Async-context-manager stand-in for ``httpx.AsyncClient.stream(...)`` — the
+    streaming download path (R2-P1). ``async with client.stream(...) as resp``."""
+
+    def __init__(self, resp: Any) -> None:
+        self._resp = resp
+
+    async def __aenter__(self) -> Any:
+        return self._resp
+
+    async def __aexit__(self, *exc: Any) -> bool:
+        return False
+
+
+def _stream_cm(content: bytes, *, status_code: int = 200, headers: dict | None = None) -> Any:
+    resp = MagicMock()
+    resp.status_code = status_code
+    resp.headers = headers or {}
+
+    async def _aiter() -> Any:
+        yield content
+
+    resp.aiter_bytes = _aiter
+    return _StreamCM(resp)
+
+
 class TestInboundMedia:
     """#76(a/b) — Teams inbound attachments downloaded into the media cache and
     surfaced on MessageEvent.media_urls / media_types."""
@@ -5563,18 +5590,22 @@ class TestInboundMedia:
         a._bridge_cfg.trusted_service_url_suffixes = (
             adapter_mod._import_bridge().DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
         )
+        # R2-P1: exact tenant host allowlist so inbound file downloads are allowed.
+        a._file_host_allowlist = ("contoso.sharepoint.com",)
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
         return a
 
     @staticmethod
-    def _resp(content: bytes, status_code: int = 200) -> Any:
-        r = MagicMock()
-        r.content = content
-        r.status_code = status_code
-        r.raise_for_status = MagicMock(return_value=None)
-        return r
+    def _stream(
+        a: Any, content: bytes, *, status_code: int = 200, headers: dict | None = None
+    ) -> Any:
+        """Wire the streaming download mock; return the stream MagicMock for
+        call-arg assertions."""
+        cm = _stream_cm(content, status_code=status_code, headers=headers)
+        a._http_client.stream = MagicMock(return_value=cm)
+        return a._http_client.stream
 
     @pytest.mark.asyncio
     async def test_no_attachments_is_text(
@@ -5589,7 +5620,7 @@ class TestInboundMedia:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = self._adapter(monkeypatch, tmp_path)
-        a._http_client.get = AsyncMock(return_value=self._resp(b"PDFDATA"))
+        stream = self._stream(a, b"PDFDATA")
         activity = {
             "id": "act:9",  # ':' must be sanitised out of the cache filename
             "attachments": [
@@ -5613,14 +5644,14 @@ class TestInboundMedia:
         assert p.parent == a._media_cache_dir()
         assert ".." not in p.name and "evil" not in p.name
         # Pre-authenticated downloadUrl fetched WITHOUT an auth header.
-        assert not a._http_client.get.await_args.kwargs.get("headers")
+        assert not stream.call_args.kwargs.get("headers")
 
     @pytest.mark.asyncio
     async def test_inbound_image_downloads_with_reply_bearer(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = self._adapter(monkeypatch, tmp_path)
-        a._http_client.get = AsyncMock(return_value=self._resp(b"PNGDATA"))
+        stream = self._stream(a, b"PNGDATA")
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(
             bridge, "acquire_reply_token", AsyncMock(return_value=("BEARER", "A"))
@@ -5639,8 +5670,7 @@ class TestInboundMedia:
         assert p.suffix == ".png"
         # contentUrl fetched WITH the reply bearer.
         assert (
-            a._http_client.get.await_args.kwargs["headers"]["Authorization"]
-            == "Bearer BEARER"
+            stream.call_args.kwargs["headers"]["Authorization"] == "Bearer BEARER"
         )
 
     @pytest.mark.asyncio
@@ -5649,7 +5679,7 @@ class TestInboundMedia:
     ) -> None:
         a = self._adapter(monkeypatch, tmp_path)
         big = b"x" * (adapter_mod._MAX_INBOUND_MEDIA_BYTES + 1)
-        a._http_client.get = AsyncMock(return_value=self._resp(big))
+        self._stream(a, big)
         activity = {
             "id": "a",
             "attachments": [
@@ -5667,7 +5697,7 @@ class TestInboundMedia:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = self._adapter(monkeypatch, tmp_path)
-        a._http_client.get = AsyncMock(side_effect=RuntimeError("boom"))
+        a._http_client.stream = MagicMock(side_effect=RuntimeError("boom"))
         activity = {
             "id": "a",
             "attachments": [
@@ -5680,7 +5710,7 @@ class TestInboundMedia:
         out = await a._extract_inbound_media(activity, validated_path="A")
         assert out == ([], [], adapter_mod.MessageType.TEXT)
 
-    # ── Review-F1: hostile download URLs are rejected before any GET ──────
+    # ── Review-F1 / R2-P1: hostile download URLs rejected before any fetch ─
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -5691,13 +5721,16 @@ class TestInboundMedia:
             "https://169.254.169.254/latest",  # link-local IP (SSRF)
             "https://127.0.0.1/x",  # loopback IP
             "https://sharepoint.com.attacker.net/x",  # suffix-spoof
+            # R2-P1: a DIFFERENT tenant's SharePoint host (customer-registrable
+            # zone) — rejected because the configured host is contoso.sharepoint.com.
+            "https://attacker-tenant.sharepoint.com/x",
         ],
     )
     async def test_inbound_file_hostile_url_rejected(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, bad_url: str
     ) -> None:
         a = self._adapter(monkeypatch, tmp_path)
-        a._http_client.get = AsyncMock(return_value=self._resp(b"DATA"))
+        stream = self._stream(a, b"DATA")
         activity = {
             "id": "a",
             "attachments": [
@@ -5709,8 +5742,8 @@ class TestInboundMedia:
         }
         out = await a._extract_inbound_media(activity, validated_path="A")
         assert out == ([], [], adapter_mod.MessageType.TEXT)
-        # No GET — the URL was rejected before the request.
-        assert a._http_client.get.await_count == 0
+        # No fetch — the URL was rejected before the request.
+        assert stream.call_count == 0
 
     @pytest.mark.asyncio
     async def test_inbound_image_offhost_never_mints_bearer(
@@ -5718,7 +5751,7 @@ class TestInboundMedia:
     ) -> None:
         # The reply bearer must NOT be minted/sent for an off-connector contentUrl.
         a = self._adapter(monkeypatch, tmp_path)
-        a._http_client.get = AsyncMock(return_value=self._resp(b"PNG"))
+        stream = self._stream(a, b"PNG")
         bridge = adapter_mod._import_bridge()
         mint = AsyncMock(return_value=("BEARER", "A"))
         monkeypatch.setattr(bridge, "acquire_reply_token", mint)
@@ -5731,14 +5764,14 @@ class TestInboundMedia:
         out = await a._extract_inbound_media(activity, validated_path="A")
         assert out == ([], [], adapter_mod.MessageType.TEXT)
         assert mint.await_count == 0  # bearer never minted for an off-allowlist host
-        assert a._http_client.get.await_count == 0
+        assert stream.call_count == 0
 
     @pytest.mark.asyncio
     async def test_inbound_download_redirect_not_followed(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = self._adapter(monkeypatch, tmp_path)
-        a._http_client.get = AsyncMock(return_value=self._resp(b"", status_code=302))
+        stream = self._stream(a, b"", status_code=302)
         activity = {
             "id": "a",
             "attachments": [
@@ -5751,7 +5784,59 @@ class TestInboundMedia:
         out = await a._extract_inbound_media(activity, validated_path="A")
         assert out == ([], [], adapter_mod.MessageType.TEXT)  # 3xx → dropped
         # follow_redirects disabled on the request.
-        assert a._http_client.get.await_args.kwargs.get("follow_redirects") is False
+        assert stream.call_args.kwargs.get("follow_redirects") is False
+
+    @pytest.mark.asyncio
+    async def test_inbound_oversized_content_length_rejected(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # R2-P1: an oversized Content-Length is rejected up front (no body read).
+        monkeypatch.setattr(adapter_mod, "_MAX_INBOUND_MEDIA_BYTES", 100)
+        a = self._adapter(monkeypatch, tmp_path)
+        self._stream(a, b"x" * 10, headers={"Content-Length": "999999"})
+        activity = {
+            "id": "a",
+            "attachments": [
+                {
+                    "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
+                    "content": {"downloadUrl": "https://contoso.sharepoint.com/x"},
+                }
+            ],
+        }
+        out = await a._extract_inbound_media(activity, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)
+
+    @pytest.mark.asyncio
+    async def test_inbound_stream_aborts_early_over_cap(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # R2-P1: a body exceeding the cap is aborted mid-stream, NOT fully consumed.
+        monkeypatch.setattr(adapter_mod, "_MAX_INBOUND_MEDIA_BYTES", 100)
+        a = self._adapter(monkeypatch, tmp_path)
+        consumed = {"chunks": 0}
+
+        async def _aiter() -> Any:
+            for _ in range(10):  # would be 10 chunks (600 B) if fully consumed
+                consumed["chunks"] += 1
+                yield b"x" * 60
+
+        resp = MagicMock()
+        resp.status_code = 200
+        resp.headers = {}  # no Content-Length → streamed-bound path
+        resp.aiter_bytes = _aiter
+        a._http_client.stream = MagicMock(return_value=_StreamCM(resp))
+        activity = {
+            "id": "a",
+            "attachments": [
+                {
+                    "contentType": adapter_mod._TEAMS_FILE_DOWNLOAD_INFO,
+                    "content": {"downloadUrl": "https://contoso.sharepoint.com/x"},
+                }
+            ],
+        }
+        out = await a._extract_inbound_media(activity, validated_path="A")
+        assert out == ([], [], adapter_mod.MessageType.TEXT)  # over cap → dropped
+        assert consumed["chunks"] < 10  # aborted after MAX+1, not fully consumed
 
     def test_activity_to_event_populates_media(
         self, monkeypatch: pytest.MonkeyPatch
@@ -5782,6 +5867,8 @@ class TestOutboundFiles:
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
+        # R2-P1: configured tenant OneDrive host so uploads to _GOOD_UPLOAD pass.
+        a._file_host_allowlist = ("contoso-my.sharepoint.com",)
 
     # Review-F2: a SharePoint/OneDrive host that passes the upload-URL allowlist.
     _GOOD_UPLOAD = "https://contoso-my.sharepoint.com/personal/u/_layouts/upload"
@@ -5811,17 +5898,22 @@ class TestOutboundFiles:
         consent_id: str = "c1",
         conv_id: str = "conv-1",
         user_id: str = "user-1",
+        service_url: str = "https://smba.trafficmanager.net/amer/x/",
         size: int | None = None,
+        sha256: str | None = None,
         created_at: float | None = None,
     ) -> None:
-        # Review-F2/F3: a well-formed pending entry bound to the _consent_activity
-        # default conversation ("conv-1") + user ("user-1").
+        # Review-F2/F3 + R2-P2: a well-formed pending entry bound to the
+        # _consent_activity default conversation/user/serviceUrl + the file digest.
+        raw = f.read_bytes()
         a._pending_file_uploads[consent_id] = {
             "path": str(f),
             "name": f.name,
-            "size": f.stat().st_size if size is None else size,
+            "size": len(raw) if size is None else size,
+            "sha256": hashlib.sha256(raw).hexdigest() if sha256 is None else sha256,
             "conversation_id": conv_id,
             "user_id": user_id,
+            "service_url": service_url,
             "created_at": time.time() if created_at is None else created_at,
         }
 
@@ -5947,7 +6039,7 @@ class TestOutboundFiles:
         f.write_bytes(b"more than four bytes")
         result = await a.send_document("conv-1", str(f))
         assert result.success is False
-        assert "out of range" in (result.error or "")
+        assert "over-cap" in (result.error or "")
         assert send_reply.await_count == 0
         assert a._pending_file_uploads == {}
 
@@ -6229,6 +6321,39 @@ class TestOutboundFiles:
         )
         a._http_client.put = AsyncMock()
         act = self._consent_activity(upload_info={"uploadUrl": self._GOOD_UPLOAD})
+        await self._accept_and_assert_no_put(a, monkeypatch, act)
+
+    @pytest.mark.asyncio
+    async def test_accept_same_size_content_swap_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # R2-P2: a same-size replacement passes the size check but the SHA-256
+        # binding catches it — the offered content is not uploaded.
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"AAAAA")
+        self._seed_pending(a, f)  # digest bound to b"AAAAA"
+        f.write_bytes(b"BBBBB")  # same size, different bytes
+        a._http_client.put = AsyncMock()
+        act = self._consent_activity(upload_info={"uploadUrl": self._GOOD_UPLOAD})
+        await self._accept_and_assert_no_put(a, monkeypatch, act)
+
+    @pytest.mark.asyncio
+    async def test_accept_attacker_tenant_upload_url_refused(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # R2-P1: a DIFFERENT tenant's SharePoint host is refused even though it
+        # matches the *.sharepoint.com shape — configured host is contoso-my.
+        a = _make_adapter(monkeypatch)
+        self._connect(a)  # allowlist = contoso-my.sharepoint.com
+        f = tmp_path / "r.pdf"
+        f.write_bytes(b"data")
+        self._seed_pending(a, f)
+        a._http_client.put = AsyncMock()
+        act = self._consent_activity(
+            upload_info={"uploadUrl": "https://attacker-tenant.sharepoint.com/up"}
+        )
         await self._accept_and_assert_no_put(a, monkeypatch, act)
 
     @pytest.mark.asyncio
@@ -6740,14 +6865,17 @@ class TestCorrelatorBounds:
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
+        a._file_host_allowlist = ("contoso-my.sharepoint.com",)
         f = tmp_path / "empty.bin"
         f.write_bytes(b"")
         a._pending_file_uploads["c1"] = {
             "path": str(f),
             "name": "empty.bin",
             "size": 0,
+            "sha256": hashlib.sha256(b"").hexdigest(),
             "conversation_id": "conv-1",
             "user_id": "",
+            "service_url": "",
             "created_at": time.time(),
         }
         a._http_client.put = AsyncMock()

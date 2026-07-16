@@ -62,6 +62,7 @@ without requiring the harness on PYTHONPATH.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import json
 import logging
@@ -127,29 +128,29 @@ _PENDING_UPLOAD_TTL_SEC = 3600.0
 
 # Review-F1/F2 — trust-boundary allowlists for file transfer (same #100 threat
 # model: activity-body URLs are attacker-influencable). Inbound image
-# ``contentUrl`` is served by the Bot Framework *connector* and receives the
-# reply bearer, so it is pinned to the connector allowlist
-# (``DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES``); inbound file ``downloadUrl``
-# and the outbound OneDrive ``uploadUrl`` live on SharePoint/OneDrive hosts.
-# ``.sharepoint.com``/``.sharepoint.us`` are Microsoft-owned zones (tenant
-# subdomains are the user's own tenant); ``.svc.ms`` is the SharePoint
-# file-service used for download/upload sessions.
-_SHAREPOINT_HOST_SUFFIXES: tuple[str, ...] = (
-    ".sharepoint.com",
-    ".sharepoint.us",
-    ".sharepoint-df.com",
-    ".svc.ms",
-)
+# ``contentUrl`` is served by the Bot Framework *connector* and receives the reply
+# bearer, so it is pinned to the connector allowlist
+# (``DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES``) via ``_is_safe_fetch_url``.
+#
+# R2-P1: SharePoint/OneDrive file hosts (inbound ``downloadUrl`` + outbound
+# ``uploadUrl``) are NOT pinned by a ``.sharepoint.com`` suffix — that zone is
+# CUSTOMER-registrable (Microsoft documents that a requested SharePoint domain may
+# already belong to another tenant), so a suffix match would accept an
+# attacker-owned tenant's upload session and exfiltrate the user's file. They must
+# be pinned to the deployment's own tenant hosts, supplied EXACTLY via
+# ``A365_FILE_HOST_ALLOWLIST`` (comma-separated, e.g.
+# ``contoso.sharepoint.com,contoso-my.sharepoint.com``). Empty ⇒ fail-closed: file
+# transfer is refused until the operator configures the tenant host(s).
 
 
 def _is_safe_fetch_url(url: str, suffixes: tuple[str, ...]) -> bool:
     """Review-F1/F2: True iff ``url`` is an https URL on an allowlisted Microsoft
-    host and NOT an IP literal — the precondition before we attach a bearer to it
-    (image download) or POST local bytes to it (upload). Reuses the bridge's
-    fail-closed ``_is_trusted_service_url`` shape-matcher (https + non-registrable
-    suffix / exact-host pin), then rejects IP-literal hosts outright as
-    defence-in-depth against a private/link-local SSRF or bearer-exfil path.
-    Fail-closed on anything malformed or off-allowlist."""
+    host and NOT an IP literal — the precondition before we attach the reply bearer
+    to an inbound image ``contentUrl``. Reuses the bridge's fail-closed
+    ``_is_trusted_service_url`` shape-matcher (https + non-registrable suffix /
+    exact-host pin), then rejects IP-literal hosts as defence-in-depth. Used for
+    the *connector* allowlist only — NOT for SharePoint file hosts (see
+    ``_is_allowed_file_host``). Fail-closed on anything malformed / off-allowlist."""
     bridge = _import_bridge()
     if not bridge._is_trusted_service_url(url, suffixes):
         return False
@@ -162,6 +163,42 @@ def _is_safe_fetch_url(url: str, suffixes: tuple[str, ...]) -> bool:
         return False  # a named allowlisted host is never an IP literal
     except ValueError:
         return True
+
+
+def _is_allowed_file_host(url: str, allowed_hosts: tuple[str, ...]) -> bool:
+    """R2-P1: True iff ``url`` is https and its hostname is an EXACT match for one
+    of the operator-configured tenant SharePoint/OneDrive hosts. Exact-match (not
+    suffix) because ``*.sharepoint.com`` is customer-registrable — a suffix match
+    would accept an attacker-owned tenant's upload/download session. Empty
+    ``allowed_hosts`` ⇒ False (fail-closed: file transfer disabled until
+    configured)."""
+    if not allowed_hosts:
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    if parsed.scheme != "https":
+        return False
+    host = (parsed.hostname or "").lower().rstrip(".")
+    return bool(host) and host in allowed_hosts
+
+
+def _read_file_bounded(path: str, max_bytes: int) -> bytes | None:
+    """R2-P2: read at most ``max_bytes`` from ``path`` through a single open
+    descriptor, returning None if the file exceeds the cap (read ``max_bytes+1``
+    and check) or can't be read. One fd + a hard bound closes the
+    getsize()-then-read TOCTOU: the bytes returned are exactly what we hash and
+    upload, and a file that grew past the cap is rejected rather than allocated
+    unbounded."""
+    try:
+        with open(path, "rb") as fh:
+            data = fh.read(max_bytes + 1)
+    except OSError:
+        return None
+    if len(data) > max_bytes:
+        return None
+    return data
 
 
 # #73(c)/#82 — bound the per-lifetime feedback / handoff-token correlator maps
@@ -679,6 +716,18 @@ class Agent365Adapter(BasePlatformAdapter):
             "A365_HANDOFF_LINK", "0"
         ).strip().lower() in ("1", "true", "yes", "on")
 
+        # R2-P1 — EXACT tenant SharePoint/OneDrive hosts allowed as inbound file
+        # downloadUrl / outbound uploadUrl destinations. Comma-separated in
+        # A365_FILE_HOST_ALLOWLIST (e.g. "contoso.sharepoint.com,contoso-my.
+        # sharepoint.com"). Empty ⇒ fail-closed: file transfer is refused until the
+        # operator pins the tenant host(s) — a `*.sharepoint.com` suffix would
+        # accept an attacker-owned tenant's session (customer-registrable zone).
+        self._file_host_allowlist: tuple[str, ...] = tuple(
+            h.strip().lower()
+            for h in os.environ.get("A365_FILE_HOST_ALLOWLIST", "").split(",")
+            if h.strip()
+        )
+
         # #73(c) — message-id -> {reaction, feedback, ...} captured from
         # ``message/submitAction`` feedback invokes. Teams stores nothing, so we
         # keep the latest reaction per replied message (in-memory, per-lifetime).
@@ -1116,29 +1165,46 @@ class Agent365Adapter(BasePlatformAdapter):
         caller-sanitised — it is joined onto the cache dir."""
         if self._http_client is None:
             return None
+        cap = _MAX_INBOUND_MEDIA_BYTES
         try:
-            # Review-F1: follow_redirects=False — a 3xx to an off-allowlist host
-            # must NOT re-target the (bearer-bearing) request past the validated
-            # URL. Require an explicit 2xx; treat a redirect as a failed download.
-            resp = await self._http_client.get(
-                url, headers=headers or {}, timeout=30.0, follow_redirects=False
-            )
-            status_code = int(getattr(resp, "status_code", 0) or 0)
-            if status_code < 200 or status_code >= 300:
-                logger.warning(
-                    "agent365 inbound media non-2xx (%s) for %.60s", status_code, url
-                )
-                return None
-            data = resp.content
+            # R2-P1: stream + bound. Never buffer resp.content (an allowed endpoint
+            # could return an arbitrarily large body → memory exhaustion). Reject an
+            # oversized Content-Length up front, then read incrementally and abort
+            # once we exceed the cap — without consuming the rest of the body.
+            # Review-F1: follow_redirects=False + explicit 2xx so a 3xx can't
+            # re-target the (bearer-bearing) request past the validated URL.
+            async with self._http_client.stream(
+                "GET", url, headers=headers or {}, timeout=30.0, follow_redirects=False
+            ) as resp:
+                status_code = int(getattr(resp, "status_code", 0) or 0)
+                if status_code < 200 or status_code >= 300:
+                    logger.warning(
+                        "agent365 inbound media non-2xx (%s) for %.60s", status_code, url
+                    )
+                    return None
+                clen = resp.headers.get("Content-Length") if resp.headers else None
+                if clen is not None:
+                    try:
+                        if int(clen) > cap:
+                            logger.warning(
+                                "agent365 inbound media Content-Length %s over cap; "
+                                "dropped", clen
+                            )
+                            return None
+                    except ValueError:
+                        pass  # unparseable — fall through to the streamed bound
+                buf = bytearray()
+                async for chunk in resp.aiter_bytes():
+                    buf += chunk
+                    if len(buf) > cap:
+                        logger.warning(
+                            "agent365 inbound media over %d-byte cap while streaming; "
+                            "aborted", cap
+                        )
+                        return None
+                data = bytes(buf)
         except Exception as e:
             logger.warning("agent365 inbound media download failed (%.60s): %s", url, e)
-            return None
-        if len(data) > _MAX_INBOUND_MEDIA_BYTES:
-            logger.warning(
-                "agent365 inbound media over %d-byte cap (%d); dropped",
-                _MAX_INBOUND_MEDIA_BYTES,
-                len(data),
-            )
             return None
         try:
             cache_dir = self._media_cache_dir()
@@ -1214,12 +1280,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not isinstance(url, str) or not url:
                     continue
                 # downloadUrl is a pre-authenticated SharePoint/OneDrive link.
-                # Review-F1: pin it to Microsoft file-service hosts before the GET
-                # (no bearer here, but an off-allowlist / private host is SSRF).
-                if not _is_safe_fetch_url(url, _SHAREPOINT_HOST_SUFFIXES):
+                # R2-P1: pin it to the configured tenant hosts (exact match) before
+                # the GET — a `*.sharepoint.com` suffix would accept another
+                # customer's tenant. Empty allowlist ⇒ fail-closed.
+                if not _is_allowed_file_host(url, self._file_host_allowlist):
                     logger.warning(
-                        "agent365 inbound file downloadUrl off SharePoint allowlist; "
-                        "skipped (%.60s)", url
+                        "agent365 inbound file downloadUrl not on the configured "
+                        "tenant host allowlist; skipped (%.60s)", url
                     )
                     continue
                 file_type = str(content.get("fileType") or "").lower()
@@ -2671,14 +2738,22 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = f"agent365 send_file: unsafe or missing path for {file_name!r}"
             logger.warning(msg)
             return SendResult(success=False, error=msg)
-        try:
-            size = os.path.getsize(safe_path)
-        except OSError as e:
-            return SendResult(success=False, error=str(e))
-        if size <= 0 or size > _MAX_OUTBOUND_FILE_BYTES:
-            msg = f"agent365 send_file: size {size} out of range for {file_name!r}"
+        # R2-P2: read the offered bytes ONCE through a bounded descriptor and bind
+        # the consent to their SHA-256, so the accept-time upload can prove it is
+        # sending exactly the content the user consented to. A same-size
+        # replacement or a post-offer grow is caught by the digest / bound, not a
+        # bare getsize() (which the TOCTOU exploited).
+        offered = _read_file_bounded(safe_path, _MAX_OUTBOUND_FILE_BYTES)
+        if offered is None:
+            msg = f"agent365 send_file: unreadable or over-cap file for {file_name!r}"
             logger.warning(msg)
             return SendResult(success=False, error=msg)
+        size = len(offered)
+        if size <= 0:
+            msg = f"agent365 send_file: empty file for {file_name!r}"
+            logger.warning(msg)
+            return SendResult(success=False, error=msg)
+        digest = hashlib.sha256(offered).hexdigest()
 
         self._conversations.mark_used(chat_id)
         consent_id = uuid.uuid4().hex
@@ -2708,18 +2783,25 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.error("agent365 send_file consent card failed: %s", e)
             return SendResult(success=False, error=str(e))
         # Record the pending upload only AFTER the card is accepted by BF — a
-        # failed send leaves no consent the user can act on. Review-F2/F3: bind it
-        # to the conversation + user that received the card and stamp the offered
-        # size + time, so acceptance can verify the invoke came back on the same
-        # conversation/user and the file hasn't grown/changed since the offer.
-        conv_id = str(conv.get("id") or "")
-        user_id = str((inbound.get("from") or {}).get("id") or "")
+        # failed send leaves no consent the user can act on.
+        #
+        # Security model (Review-F2 / R2-P1): the primary boundary is the
+        # unguessable single-use ``consent_id`` (uuid4, minted here, sent ONLY in
+        # this card to this conversation, popped once) presented by a
+        # JWT-validated platform caller. The stored conversation/user/serviceUrl
+        # are body-derived and are checked at accept as *consistency*
+        # defence-in-depth, NOT as authenticated identity (BF service tokens carry
+        # no end-user claim — see ``_handle_file_consent``). ``sha256`` binds the
+        # accept to the exact offered content.
         self._pending_file_uploads[consent_id] = {
             "path": safe_path,
             "name": file_name,
             "size": size,
-            "conversation_id": conv_id,
-            "user_id": user_id,
+            "sha256": digest,
+            "conversation_id": str(conv.get("id") or ""),
+            "user_id": str((inbound.get("from") or {}).get("id") or ""),
+            "service_url": str(inbound.get("serviceUrl") or ""),
+            "validated_path": self._validated_path_for_inbound(inbound),
             "created_at": time.time(),
         }
         _bound_map(self._pending_file_uploads)
@@ -2796,16 +2878,25 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return invoke.InvokeResponse(status=200, body={})
 
-        # Review-F2: bind the accept to the conversation + user that received the
-        # card. A valid consentId replayed on a different conversation/user (or a
-        # guessed id) must NOT drive an upload.
+        # Review-F2 / R2-P1 — capability model, not authenticated-user check.
+        # The real boundary is: (1) this handler is only reached AFTER inbound-JWT
+        # validation (a legitimate platform caller), and (2) ``consent_id`` is an
+        # unguessable uuid4 we minted, sent only in this card, and popped once. The
+        # conversation / user / serviceUrl comparisons below are body-derived (BF
+        # service tokens carry no end-user claim) and serve as CONSISTENCY
+        # defence-in-depth — a valid consentId replayed onto a different
+        # conversation still won't upload. They are NOT claimed as authenticated
+        # identity.
         act_conv = str((activity.get("conversation") or {}).get("id") or "")
         act_user = str((activity.get("from") or {}).get("id") or "")
-        if act_conv != pending.get("conversation_id") or act_user != pending.get(
-            "user_id"
+        act_surl = str(activity.get("serviceUrl") or "")
+        if (
+            act_conv != pending.get("conversation_id")
+            or act_user != pending.get("user_id")
+            or act_surl != pending.get("service_url")
         ):
             logger.warning(
-                "agent365 fileConsent accept conversation/user mismatch consent=%s",
+                "agent365 fileConsent accept context mismatch consent=%s",
                 consent_id[:8],
             )
             return invoke.InvokeResponse(status=200, body={})
@@ -2821,51 +2912,36 @@ class Agent365Adapter(BasePlatformAdapter):
         if not upload_url or self._http_client is None:
             logger.warning("agent365 fileConsent accept missing uploadUrl/client")
             return invoke.InvokeResponse(status=200, body={})
-        # Review-F2: never POST local file bytes to a body-supplied host that
-        # isn't a Microsoft OneDrive/SharePoint upload endpoint (SSRF).
-        if not _is_safe_fetch_url(upload_url, _SHAREPOINT_HOST_SUFFIXES):
+        # R2-P1: only POST bytes to an EXACT configured tenant SharePoint/OneDrive
+        # host — a `*.sharepoint.com` suffix would accept an attacker-owned tenant's
+        # upload session (customer-registrable zone). Empty allowlist ⇒ refuse.
+        if not _is_allowed_file_host(upload_url, self._file_host_allowlist):
             logger.warning(
-                "agent365 fileConsent uploadUrl off SharePoint allowlist; refused "
-                "(%.60s)", upload_url
+                "agent365 fileConsent uploadUrl not on the configured tenant host "
+                "allowlist; refused (%.60s)", upload_url
             )
             return invoke.InvokeResponse(status=200, body={})
 
-        # Re-validate at upload time — the file may have been removed between the
-        # offer and the Accept; never trust the stored path blindly.
+        # Re-validate the path (may have been removed since the offer).
         safe_path = self.validate_media_delivery_path(str(pending.get("path") or ""))
         if safe_path is None:
             logger.warning("agent365 fileConsent accept: file no longer available")
             return invoke.InvokeResponse(status=200, body={})
-        # Review-F3: re-stat BEFORE reading. Reject empty / over-cap / changed
-        # files (a file that grew or shrank since the offer no longer matches the
-        # sizeInBytes the user consented to) — and never read an over-cap file
-        # into memory.
-        try:
-            cur_size = os.path.getsize(safe_path)
-        except OSError as e:
-            logger.warning("agent365 fileConsent stat failed: %s", e)
+        # R2-P2: read the current bytes ONCE through a bounded descriptor, then
+        # verify size + SHA-256 against the offer. A file that grew past the cap,
+        # shrank, or was swapped for same-size different content since the offer is
+        # rejected — the bytes we upload are provably the ones the user consented
+        # to, closing the getsize()-then-read TOCTOU.
+        data = _read_file_bounded(safe_path, _MAX_OUTBOUND_FILE_BYTES)
+        if data is None:
+            logger.warning("agent365 fileConsent: file unreadable or over-cap at accept")
             return invoke.InvokeResponse(status=200, body={})
-        if cur_size <= 0 or cur_size > _MAX_OUTBOUND_FILE_BYTES:
-            logger.warning("agent365 fileConsent file size %d out of range", cur_size)
-            return invoke.InvokeResponse(status=200, body={})
-        if cur_size != int(pending.get("size") or -1):
-            logger.warning(
-                "agent365 fileConsent file changed since offer (%d != %s)",
-                cur_size,
-                pending.get("size"),
-            )
-            return invoke.InvokeResponse(status=200, body={})
-        try:
-            data = Path(safe_path).read_bytes()
-        except OSError as e:
-            logger.warning("agent365 fileConsent read failed: %s", e)
-            return invoke.InvokeResponse(status=200, body={})
-
         size = len(data)
-        if size <= 0 or size != cur_size:
-            # Raced to empty/changed between stat and read — bail rather than send
-            # a malformed Content-Range.
-            logger.warning("agent365 fileConsent: file changed between stat and read")
+        if size <= 0 or size != int(pending.get("size") or -1):
+            logger.warning("agent365 fileConsent: size changed since offer")
+            return invoke.InvokeResponse(status=200, body={})
+        if hashlib.sha256(data).hexdigest() != pending.get("sha256"):
+            logger.warning("agent365 fileConsent: content changed since offer (digest)")
             return invoke.InvokeResponse(status=200, body={})
         try:
             put_resp = await self._http_client.put(

@@ -54,21 +54,34 @@ hook.
   a Hermes-core conversation-import hook, so **#82 remains open** tracking that
   dependency (this release ships the token lifecycle + deep link only).
 
-### Security hardening (PR #119 review)
+### Security hardening (PR #119 review, rounds 1–2)
 
-- **Inbound attachment download URLs are validated before any fetch** (same #100
-  activity-body threat model). Image `contentUrl` (which receives the reply
-  bearer) is pinned to the Bot Framework connector allowlist; file `downloadUrl`
-  to Microsoft SharePoint/OneDrive hosts. IP-literal / private / link-local hosts
-  and non-https URLs are rejected, and redirects are not followed — closing a
-  bearer-exfil / SSRF path.
-- **Outbound `fileConsent/invoke` is bound + validated.** The pending consent is
-  bound to the conversation + user that received the card and verified on accept;
-  the `uploadInfo.uploadUrl` is allowlisted to SharePoint/OneDrive before any
-  bytes are read or POSTed; and the file is re-stat'd at accept time (reject
-  empty / over-cap / changed-since-offer) so a raced or swapped file can't be
-  uploaded. `_pending_file_uploads` is now capped, TTL-expired, and cleared on
-  disconnect.
+- **File-transfer hosts are pinned to the deployment's own tenant** via
+  `A365_FILE_HOST_ALLOWLIST` (exact hostnames, e.g.
+  `contoso.sharepoint.com,contoso-my.sharepoint.com`). A `*.sharepoint.com`
+  suffix is **not** trusted — that zone is customer-registrable, so a suffix
+  match would accept an attacker-owned tenant's upload/download session. Empty ⇒
+  **fail-closed**: inbound file download + outbound upload are refused until the
+  operator configures the host(s).
+- **Inbound download URLs validated before any fetch** (same #100 body-field
+  threat model). Image `contentUrl` (which receives the reply bearer) is pinned
+  to the Bot Framework connector allowlist; https-only, IP-literal / private /
+  link-local hosts rejected, redirects not followed — closing a bearer-exfil /
+  SSRF path.
+- **Inbound download is streamed + hard-bounded** — an oversized `Content-Length`
+  is refused up front and the body is aborted after `MAX+1` bytes rather than
+  buffered whole, so an allowed endpoint can't exhaust memory.
+- **Outbound `fileConsent/invoke` is a capability flow, honestly scoped.** The
+  security boundary is the JWT-validated platform caller plus the unguessable
+  single-use `consentId` (uuid4, minted by us, sent only in the card, popped
+  once); conversation / user / serviceUrl are checked as consistency
+  defence-in-depth (BF service tokens carry no end-user claim, so this is **not**
+  authenticated-user verification). The `uploadUrl` is pinned to the configured
+  tenant host, and the offered bytes are read once through a bounded descriptor
+  and bound by **SHA-256** — a file that grew, shrank, or was swapped for
+  same-size different content since the offer is rejected (closes the
+  stat-then-read TOCTOU). `_pending_file_uploads` is capped, TTL-expired, and
+  cleared on disconnect.
 
 ### Changed
 
