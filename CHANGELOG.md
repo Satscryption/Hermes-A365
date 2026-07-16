@@ -21,12 +21,17 @@ walk-free. All secret material in tests is fake; no live Azure/tenant calls.
   client secret can't land in terminals, CI logs, or transcripts. A non-zero
   sensitive run raises with the raw output suppressed (AADSTS detection still
   works); a timeout drops the captured partial.
-- **#112 (CS-004) — recovered secret is owner-only from birth.** A new
+- **#112 (CS-004) — secret-bearing files are owner-only from birth.** A new
   `write_owner_only_text_atomic` helper creates the temp file with
-  `O_CREAT|O_EXCL` at mode 0600 *before* any secret bytes are written and
-  `os.replace`s it into place, so under a permissive umask neither the temp
-  nor the final generated config is ever group/world-readable. `O_EXCL` +
-  pre-unlink also refuses a pre-planted temp/symlink.
+  `O_CREAT|O_EXCL` at the target mode *before* any secret bytes are written
+  and `os.replace`s it into place, so under a permissive umask neither the
+  temp nor the final file is ever group/world-readable. `O_EXCL` +
+  pre-unlink also refuses a pre-planted temp/symlink. Every atomic writer in
+  the package now routes through it — the recovery-path generated config,
+  the per-agent `.env` (which carries `A365_BF_CLIENT_SECRET` under Path B;
+  the agent dir is tightened to 0700 too), and the bot-service config — so
+  the old write-then-chmod window is closed everywhere, not just on the
+  recovery path.
 - **#113 (CS-005) — manual recovery no longer puts the secret in argv.** The
   by-hand patch hint reads the secret from a hidden `getpass` prompt (never a
   command-line argument → no shell history / process-list exposure) and writes

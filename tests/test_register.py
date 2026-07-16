@@ -974,6 +974,22 @@ class TestWriteOwnerOnlyTextAtomic:
         finally:
             os.umask(old)
 
+    def test_creates_missing_parent_dirs(self, tmp_path: Path) -> None:
+        target = tmp_path / "a" / "b" / "cfg.json"
+        write_owner_only_text_atomic(target, "x\n")
+        assert target.read_text() == "x\n"
+
+    def test_mode_override_exact_under_umask_027(self, tmp_path: Path) -> None:
+        # The mode must be forced exactly (fchmod), not just requested via
+        # O_CREAT which the umask can further clear (0640 & ~027 == 0600).
+        old = os.umask(0o027)
+        try:
+            target = tmp_path / "cfg.json"
+            write_owner_only_text_atomic(target, "x\n", mode=0o640)
+            assert (target.stat().st_mode & 0o777) == 0o640
+        finally:
+            os.umask(old)
+
     def test_tightens_a_permissive_existing_file(self, tmp_path: Path) -> None:
         target = tmp_path / "cfg.json"
         target.write_text("{}")

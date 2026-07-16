@@ -64,22 +64,28 @@ def tcp_reachable(host: str, *, port: int = 443, timeout: float = 3.0) -> bool:
         return False
 
 
-def write_owner_only_text_atomic(path: Path, text: str) -> None:
-    """Atomically write ``text`` to ``path``, owner-only (0600) from birth.
+def write_owner_only_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
+    """Atomically write ``text`` to ``path``, owner-only (``mode``) from birth.
 
     Secret-safe ordering (#112 / CS-004): the temp file is created with
-    ``O_CREAT | O_EXCL`` at mode 0600 *before* any bytes are written, so
-    under a permissive umask (e.g. 022) neither the temp file nor the
-    final path is ever group/world-readable while it holds secret
-    material — ``os.replace`` carries the 0600 mode to the final path.
+    ``O_CREAT | O_EXCL`` at ``mode`` (default 0600) *before* any bytes are
+    written, so under a permissive umask (e.g. 022) neither the temp file
+    nor the final path is ever group/world-readable while it holds secret
+    material — ``os.replace`` carries the mode to the final path.
     ``O_EXCL`` also refuses to write through a pre-planted temp file or
     symlink (the write fails closed instead); a stale temp left by a
-    crashed prior run is removed first.
+    crashed prior run is removed first. Parent directories are created if
+    absent. This is the single owner-only atomic writer every
+    secret-bearing file in the package should route through.
     """
+    path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
     tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
     try:
+        # O_EXCL created the file at `mode`, but the umask may have cleared
+        # bits (e.g. request 0640 under umask 027 → 0600); force it exact.
+        os.fchmod(fd, mode)
         fh = os.fdopen(fd, "w", encoding="utf-8")
     except BaseException:
         os.close(fd)

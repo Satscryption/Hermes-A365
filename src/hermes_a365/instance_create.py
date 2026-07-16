@@ -26,7 +26,12 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from ._common import ensure_contained, parse_env, validate_slug
+from ._common import (
+    ensure_contained,
+    parse_env,
+    validate_slug,
+    write_owner_only_text_atomic,
+)
 from .render_instance_env import InstanceEnvInputs, render_instance_env
 
 _HERMES_HOME_ENV = "HERMES_HOME"
@@ -97,19 +102,17 @@ def _load_existing_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:
 
 
 def write_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
-    """Write ``text`` to ``path`` via tmp + rename. Creates parents.
+    """Write ``text`` to ``path`` owner-only via O_EXCL temp + rename.
 
-    ``mode`` defaults to 0o600 (slice 18x — owner-only) so we don't leak
+    ``mode`` defaults to 0o600 (owner-only). The agent ``.env`` carries
     operator metadata (email, AAD object id, instance id, OTLP endpoint)
-    via world-readable umask defaults. The agent .env doesn't contain
-    secrets by design, but tightening it here also protects any future
-    secret-bearing file the activity bridge writes.
+    **and, under Path B, the live ``A365_BF_CLIENT_SECRET``** — so the
+    secret-safe O_EXCL-first ordering (#112 / CS-004) matters here: the
+    temp is created at ``mode`` before any bytes are written, closing the
+    permissive-umask window where the old write-then-chmod left the secret
+    briefly group/world-readable at a predictable ``<slug>/.env.tmp`` path.
     """
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    write_owner_only_text_atomic(path, text, mode=mode)
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +298,9 @@ def apply_instance_plan(plan: InstancePlan) -> InstanceCreateResult:
     # agent dir or a plan built bypassing InstanceCreateInputs validation).
     ensure_contained(plan.env_path, plan.env_root)
     write_text_atomic(plan.env_path, rendered)
+    # #112/CS-004: the agent dir holds a 0600 .env that may carry the BF
+    # client secret; tighten the dir to 0700 too so it isn't world-listable.
+    os.chmod(plan.env_path.parent, 0o700)
     realised_id = plan.desired_env_inputs.aa_instance_id
     assert realised_id is not None  # __post_init__ guarantees this
     return InstanceCreateResult(

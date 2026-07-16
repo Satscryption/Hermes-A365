@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -302,6 +303,32 @@ class TestWriteTextAtomic:
         write_text_atomic(target, "K=V\n", mode=0o644)
         assert (target.stat().st_mode & 0o777) == 0o644
 
+    def test_owner_only_from_birth_under_umask_022(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #112/CS-004: the agent .env can carry A365_BF_CLIENT_SECRET; the
+        # temp must be 0600 at the moment of replace, never a permissive
+        # window a local reader could race. Spy on os.replace to capture the
+        # temp's mode just before it becomes the final file.
+        import os as _os
+
+        old = _os.umask(0o022)
+        try:
+            seen: dict[str, int] = {}
+            real_replace = _os.replace
+
+            def spy(src: object, dst: object) -> None:
+                seen["tmp"] = stat.S_IMODE(_os.stat(src).st_mode)  # type: ignore[arg-type]
+                real_replace(src, dst)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(_os, "replace", spy)
+            target = tmp_path / "agents" / "x" / ".env"
+            write_text_atomic(target, "A365_BF_CLIENT_SECRET=bf-secret\n")
+            assert seen["tmp"] == 0o600
+            assert (target.stat().st_mode & 0o777) == 0o600
+        finally:
+            _os.umask(old)
+
 
 # ---------------------------------------------------------------------------
 # apply_instance_plan
@@ -339,9 +366,13 @@ class TestApplyInstance:
         plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
         apply_instance_plan(plan)
 
-        text = (tmp_path / "agents" / "inbox-helper" / ".env").read_text()
+        env_path = tmp_path / "agents" / "inbox-helper" / ".env"
+        text = env_path.read_text()
         assert "A365_BF_APP_ID=11111111-1111-1111-1111-111111111111\n" in text
         assert "A365_BF_CLIENT_SECRET=bf-secret\n" in text
+        # #112/CS-004: the secret-bearing .env is 0600 and its dir 0700.
+        assert (env_path.stat().st_mode & 0o777) == 0o600
+        assert (env_path.parent.stat().st_mode & 0o777) == 0o700
 
     @pytest.mark.parametrize(
         ("key", "expected_line", "unexpected_key"),
