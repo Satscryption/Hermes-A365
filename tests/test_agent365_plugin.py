@@ -6382,6 +6382,20 @@ class TestHandoff:
         assert "continuation=" in link
         token = link.split("continuation=")[1]
         assert a._handoff_tokens[token]["conversation_id"] == "conv-cc"
+        # #89 walk fix: the deep link must target the Teams-routable BF/messaging
+        # bot id (the app that owns the Teams channel), not the CEA blueprint.
+        assert f"28:{a.bf_app_id}" in link
+
+    def test_mint_handoff_link_falls_back_to_blueprint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Single-identity deployment (no separate BF app) → blueprint id is used.
+        a = _make_adapter(monkeypatch)
+        a.bf_app_id = ""
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-cc2"))
+        )
+        link = a._mint_handoff_link("conv-cc2", reason="test")
         assert f"28:{a.blueprint_app_id}" in link
 
     def test_mint_handoff_link_unknown_conv(

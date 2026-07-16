@@ -2823,8 +2823,13 @@ class Agent365Adapter(BasePlatformAdapter):
     def _handoff_deep_link(self, token: str) -> str:
         """#82: the Copilot→Teams continuation deep link. Clicking it opens a
         Teams 1:1 with this bot and fires a ``handoff/action`` invoke carrying
-        ``token``. ``28:<botId>`` is the bot's messaging id."""
-        bot_id = self.blueprint_app_id or ""
+        ``token``. ``28:<botId>`` must be the **Teams-routable messaging bot id**
+        — the Path B / Bot Framework app that owns the Teams channel — NOT the
+        Path A CEA blueprint. For the standard split identity these differ, and
+        the #89 walk (2026-07-16) caught the blueprint variant opening the wrong
+        bot in Teams. Fall back to the blueprint only when no BF app is set (the
+        single-identity deployment where they coincide)."""
+        bot_id = self.bf_app_id or self.blueprint_app_id or ""
         return (
             "https://teams.microsoft.com/l/chat/0/0"
             f"?users=28:{bot_id}&continuation={token}"
