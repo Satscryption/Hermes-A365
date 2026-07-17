@@ -7,11 +7,13 @@ lookup works for both editable installs and wheels.
 
 from __future__ import annotations
 
+import os
 import re
 import socket
 import subprocess
 from importlib import resources
 from pathlib import Path
+from urllib.parse import quote
 
 import jinja2
 
@@ -62,6 +64,42 @@ def tcp_reachable(host: str, *, port: int = 443, timeout: float = 3.0) -> bool:
         return False
 
 
+def write_owner_only_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
+    """Atomically write ``text`` to ``path``, owner-only (``mode``) from birth.
+
+    Secret-safe ordering (#112 / CS-004): the temp file is created with
+    ``O_CREAT | O_EXCL`` at ``mode`` (default 0600) *before* any bytes are
+    written, so under a permissive umask (e.g. 022) neither the temp file
+    nor the final path is ever group/world-readable while it holds secret
+    material — ``os.replace`` carries the mode to the final path.
+    ``O_EXCL`` also refuses to write through a pre-planted temp file or
+    symlink (the write fails closed instead); a stale temp left by a
+    crashed prior run is removed first. Parent directories are created if
+    absent. This is the single owner-only atomic writer every
+    secret-bearing file in the package should route through.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    try:
+        # O_EXCL created the file at `mode`, but the umask may have cleared
+        # bits (e.g. request 0640 under umask 027 → 0600); force it exact.
+        os.fchmod(fd, mode)
+        fh = os.fdopen(fd, "w", encoding="utf-8")
+    except BaseException:
+        os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+    try:
+        with fh:
+            fh.write(text)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+
+
 _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
 
 
@@ -81,6 +119,59 @@ def slugify(name: str) -> str:
         should reject)
     """
     return _SLUG_NON_ALNUM_RE.sub("-", name.lower()).strip("-")
+
+
+def validate_slug(slug: str) -> str:
+    """Return ``slug`` iff it is safe to join under ``~/.hermes/agents/``.
+
+    Guards the agent-dir path joins against traversal (#103 / M9): the
+    slug must be a non-empty single relative path component — no
+    separators, no ``.``/``..``, no NUL. Raises :class:`ValueError`
+    otherwise. Deliberately looser than :func:`slugify` (existing
+    operator slugs may carry case or dots); this is a safety gate at the
+    filesystem boundary, not a normalizer.
+    """
+    if not slug:
+        raise ValueError("agent slug must be non-empty")
+    if slug in (".", ".."):
+        raise ValueError(f"agent slug must not be a dot component: {slug!r}")
+    if "/" in slug or "\\" in slug or "\x00" in slug:
+        raise ValueError(
+            f"agent slug must not contain path separators or NUL: {slug!r}"
+        )
+    return slug
+
+
+def quote_path_segment(value: str) -> str:
+    """Percent-encode ``value`` as a single, inert URL path segment (#103 / M4).
+
+    Inbound conversation / activity ids are interpolated into outbound Bot
+    Framework REST URLs. ``quote(safe="")`` neutralises ``/``, ``?``, ``#``
+    — but ``.`` is RFC-3986 *unreserved*, so a bare ``.`` or ``..`` id
+    survives encoding and still renders a live dot-segment that URL
+    normalisation collapses (``…/conversations/../activities`` →
+    ``…/activities``), shifting the request target on the trusted host.
+    Percent-encode those dots too so no id can contribute a dot-segment.
+    """
+    seg = quote(value, safe="")
+    if seg in (".", ".."):
+        seg = seg.replace(".", "%2E")
+    return seg
+
+
+def ensure_contained(path: Path, root: Path) -> None:
+    """Raise :class:`ValueError` unless ``path`` resolves inside ``root``.
+
+    Belt-and-braces companion to :func:`validate_slug` (#103 / M9) for
+    the destructive primitives (env writes, cleanup unlink/rmdir):
+    resolves symlinks on both sides, so a traversal-shaped or
+    symlinked path that escapes the agents root fails closed before
+    any write or delete happens.
+    """
+    resolved = path.resolve()
+    root_resolved = root.resolve()
+    if resolved != root_resolved and not resolved.is_relative_to(root_resolved):
+        raise ValueError(f"{path} escapes {root}")
 
 
 def parse_env(text: str) -> dict[str, str]:

@@ -158,6 +158,92 @@ class TestRunStreamingStdin:
 
 
 # ---------------------------------------------------------------------------
+# Sensitive (captured) runs — #111 / CS-003
+# ---------------------------------------------------------------------------
+
+
+class TestSensitiveRun:
+    """`run(..., sensitive=True)` captures output without echoing it.
+
+    Real-subprocess tests (no patching) — the point is what reaches the
+    parent's actual stdout/stderr, so `capfd` watches the file
+    descriptors themselves. All secret material is fake.
+    """
+
+    def test_sensitive_output_not_echoed(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        m = A365CliMutator()
+        m.available = True
+        result = m.run(
+            [sys.executable, "-c", "print('SECRET-MARKER-123')"], sensitive=True
+        )
+        out, err = capfd.readouterr()
+        assert "SECRET-MARKER-123" not in out
+        assert "SECRET-MARKER-123" not in err
+        assert "SECRET-MARKER-123" in result.stdout
+
+    def test_default_run_still_streams(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        # Pin the contrast: the non-sensitive path deliberately echoes
+        # in real time (device-code prompts, CLI progress — slice 18j).
+        m = A365CliMutator()
+        m.available = True
+        m.run([sys.executable, "-c", "print('VISIBLE-MARKER-456')"])
+        out, _ = capfd.readouterr()
+        assert "VISIBLE-MARKER-456" in out
+
+    def test_sensitive_failure_detail_suppressed(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        # A failing sensitive command may have already emitted credential
+        # material; the exception text callers print must not carry it.
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            m.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "print('SECRET-MARKER-789'); raise SystemExit(3)",
+                ],
+                sensitive=True,
+            )
+        assert "SECRET-MARKER-789" not in str(excinfo.value)
+        assert "suppressed" in str(excinfo.value)
+        out, err = capfd.readouterr()
+        assert "SECRET-MARKER-789" not in out + err
+
+    def test_sensitive_aadsts_code_still_surfaced(self) -> None:
+        # AADSTS detection keeps working on the captured output; only the
+        # raw detail is withheld from the exception.
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(AADSTSError) as excinfo:
+            m.run(
+                [
+                    sys.executable,
+                    "-c",
+                    "print('AADSTS500011 blah SECRET-MARKER-000'); raise SystemExit(1)",
+                ],
+                sensitive=True,
+            )
+        assert excinfo.value.code == "AADSTS500011"
+        assert "SECRET-MARKER-000" not in str(excinfo.value)
+
+    def test_sensitive_stdin_input_threads_through(self) -> None:
+        m = A365CliMutator()
+        m.available = True
+        result = m.run(
+            [sys.executable, "-c", "print(input().strip().upper())"],
+            stdin_input="quiet\n",
+            sensitive=True,
+        )
+        assert "QUIET" in result.stdout
+
+
+# ---------------------------------------------------------------------------
 # Mutator protocol
 # ---------------------------------------------------------------------------
 
@@ -176,6 +262,7 @@ class _FakeMutator:
         *,
         timeout: float = 60.0,
         stdin_input: str | None = None,
+        sensitive: bool = False,
     ) -> RunResult:
         self.calls.append(list(argv))
         if self.scripted:

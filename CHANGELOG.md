@@ -4,6 +4,76 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.5] — 2026-07-16
+
+Security point release — no new surfaces, no walk. Closes the eight
+confirmed local-hardening findings from the 2026-07-11 Codex Security deep
+scan (CS-002…CS-007) and the multi-model adversarial red-team (M9/M4/L7/L8,
+M12/M13/M14) that were small-diff, unit-testable with fake material, and
+walk-free. All secret material in tests is fake; no live Azure/tenant calls.
+
+### Security
+
+- **#111 (CS-003) — recovery no longer streams the minted secret to stdout.**
+  `az ad app credential reset` now runs through a captured, secret-aware
+  subprocess path (`Mutator.run(..., sensitive=True)`) whose merged
+  stdout/stderr never touches the parent's stdout — so the freshly minted
+  client secret can't land in terminals, CI logs, or transcripts. A non-zero
+  sensitive run raises with the raw output suppressed (AADSTS detection still
+  works); a timeout drops the captured partial.
+- **#112 (CS-004) — secret-bearing files are owner-only from birth.** A new
+  `write_owner_only_text_atomic` helper creates the temp file with
+  `O_CREAT|O_EXCL` at the target mode *before* any secret bytes are written
+  and `os.replace`s it into place, so under a permissive umask neither the
+  temp nor the final file is ever group/world-readable. `O_EXCL` +
+  pre-unlink also refuses a pre-planted temp/symlink. Every atomic writer in
+  the package now routes through it — the recovery-path generated config,
+  the per-agent `.env` (which carries `A365_BF_CLIENT_SECRET` under Path B;
+  the agent dir is tightened to 0700 too), and the bot-service config — so
+  the old write-then-chmod window is closed everywhere, not just on the
+  recovery path.
+- **#113 (CS-005) — manual recovery no longer puts the secret in argv.** The
+  by-hand patch hint reads the secret from a hidden `getpass` prompt (never a
+  command-line argument → no shell history / process-list exposure) and writes
+  it with the same exclusive-create 0600 ordering.
+- **#110 (CS-002) — the setup wizard won't add the blueprint secret to a
+  permissive parent `.env`.** Before saving `A365_BLUEPRINT_CLIENT_SECRET`
+  (both the generated-secret and manual-paste branches) it checks the `.env`
+  mode; a group/world-readable file is offered a chmod-600 repair, and
+  declining requires an explicit second confirmation that names the current
+  mode and the risk. Stat/chmod failure fails closed.
+- **#115 (CS-007) — reference responder log is owner-only.** `log_event`
+  chmods the per-agent dir to 0700 and opens the log with
+  `O_APPEND|O_CREAT` at 0600 + `fchmod` (repairs a pre-existing loose file
+  before the write), so M365 message text isn't persisted world-readable.
+- **#114 (CS-006) — debug history endpoint requires a diagnostic token.**
+  With `--debug-endpoints`, `GET /history/{id}` now needs an
+  `X-Hermes-History-Token` header (`secrets.compare_digest`; missing → 401,
+  wrong → 403). The token comes from `HERMES_RESPONDER_HISTORY_TOKEN` or is
+  auto-generated and printed once to stderr (never via argv). Flag-on but no
+  token ⇒ the route is not registered (fail-closed).
+- **#103 (M9) — agent-slug path traversal closed.** A `validate_slug` gate
+  rejects `..`, separators, and NUL on every slug that feeds an
+  `~/.hermes/agents/<slug>/` path join (instance-create, cleanup, bridge,
+  responder, plugin adapter, status); the destructive cleanup unlink/rmdir
+  and instance-create write are additionally `ensure_contained` under the
+  agents root before touching disk.
+- **#103 (M4/L8) — outbound BF URL path segments are percent-encoded.** Every
+  `…/v3/conversations/{id}/activities` build in the bridge and plugin adapter,
+  plus the Direct Line probe URL, now `quote(seg, safe="")`s the id so a `/`,
+  `?`, `#`, or `../` inside an inbound-derived conversation/activity id can't
+  shift the request target while the bearer stays attached.
+- **#103 (L7) — dedupe key made non-injectable.** The idempotency key is now a
+  length-prefixed join, so a Teams conversation id containing `:` can no longer
+  collide with another `(conv, activity)` pair.
+- **#104 (M12/M13/M14) — `publish.yml` supply-chain hardening.** Build and
+  publish are split so the build toolchain never runs while the PyPI OIDC
+  credential is in scope; the publish job is guarded by an
+  `if: startsWith(github.ref, 'refs/tags/v')` so `workflow_dispatch` from a
+  branch can't publish; every action is pinned to a full commit SHA; and the
+  build toolchain (`build`/`hatchling` + deps) is installed hash-pinned via
+  `--require-hashes` with `--no-isolation`.
+
 ## [0.8.4] — 2026-07-16
 
 Milestone v0.8.4 — **rich Teams / Copilot Chat surfaces on the #18 invoke

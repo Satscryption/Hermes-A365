@@ -41,7 +41,6 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
-import os
 import shlex
 import sys
 import time
@@ -50,6 +49,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ._common import write_owner_only_text_atomic
 from .a365_config import A365Config, merge, read, write_atomic
 from .mutator import (
     AADSTS_CONSENT_REQUIRED,
@@ -445,10 +445,12 @@ def auto_recover_secret(
 
     Caller must have already confirmed the missing-secret state via
     :func:`detect_missing_secret`. On success the file is rewritten
-    atomically and chmodded to ``0o600``. Failures (az invocation
-    error, az output without ``.password``, file not on disk) leave
-    the generated config untouched and return an outcome with
-    ``recovered=False`` plus a paste-ready recovery hint.
+    atomically, owner-only from birth (#112 / CS-004). The reset runs
+    ``sensitive=True`` so the minted secret in az's JSON output is never
+    echoed to stdout (#111 / CS-003). Failures (az invocation error, az
+    output without ``.password``, file not on disk) leave the generated
+    config untouched and return an outcome with ``recovered=False`` plus
+    a paste-ready recovery hint.
     """
     argv = _build_recovery_argv(blueprint_app_id, display_name)
     paste_cmd = shlex.join(argv)
@@ -457,7 +459,7 @@ def auto_recover_secret(
     )
 
     try:
-        run = mutator.run(argv)
+        run = mutator.run(argv, sensitive=True)
     except CliInvocationError as e:
         outcome.messages.append(
             f"[recover] `az ad app credential reset` failed: {e}; "
@@ -484,10 +486,9 @@ def auto_recover_secret(
         return outcome
 
     data["agentBlueprintClientSecret"] = new_secret
-    tmp = generated_config_path.with_suffix(generated_config_path.suffix + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n")
-    os.replace(tmp, generated_config_path)
-    os.chmod(generated_config_path, 0o600)
+    write_owner_only_text_atomic(
+        generated_config_path, json.dumps(data, indent=2, sort_keys=True) + "\n"
+    )
 
     outcome.recovered = True
     outcome.messages.append(
@@ -504,25 +505,43 @@ def report_missing_secret_warning(
     """Operator-facing warning when detection fires without auto-recovery.
 
     Carries the exact paste-ready commands, mirroring the operator tone
-    of the slice 19g/h orphan recovery hints.
+    of the slice 19g/h orphan recovery hints. The manual patch command
+    reads the secret from a hidden ``getpass`` prompt — never from argv,
+    which would land it in shell history and the process list (#113 /
+    CS-005) — and writes it with the same exclusive-create 0600 ordering
+    as the automatic path (#112).
     """
     display_name = default_recovery_display_name()
     az_cmd = shlex.join(_build_recovery_argv(blueprint_app_id, display_name))
-    patch_hint = (
-        f'    python3 -c "import json,os,pathlib,sys;'
-        f"p=pathlib.Path(sys.argv[1]);"
-        f"d=json.loads(p.read_text());"
-        f"d[\\'agentBlueprintClientSecret\\']=sys.argv[2];"
-        f"p.write_text(json.dumps(d,indent=2,sort_keys=True)+chr(10));"
-        f'os.chmod(p, 0o600)" {generated_config_path} <paste-password>'
+    # Reads the secret from a hidden getpass prompt (never argv), pre-unlinks
+    # a stale/planted temp so O_EXCL can't lock out a retry, and writes 0600
+    # before any bytes (#112/#113).
+    patch_code = (
+        "import getpass,json,os,pathlib,sys;"
+        "p=pathlib.Path(sys.argv[1]);"
+        "d=json.loads(p.read_text());"
+        "d['agentBlueprintClientSecret']=getpass.getpass('client secret: ');"
+        "t=p.with_suffix(p.suffix+'.tmp');"
+        "(os.remove(t) if os.path.lexists(t) else None);"
+        "fd=os.open(t,os.O_CREAT|os.O_EXCL|os.O_WRONLY,0o600);"
+        "os.write(fd,(json.dumps(d,indent=2,sort_keys=True)+chr(10)).encode());"
+        "os.close(fd);"
+        "os.replace(t,p)"
     )
+    # Render the WHOLE command (program, -c, code, and the config path) as a
+    # single shlex.join'd argv so a config path with spaces or shell
+    # metacharacters is safely quoted — pasting it can't split the path or
+    # execute injected commands (review P1). Never splice the path in raw.
+    patch_cmd = shlex.join(["python3", "-c", patch_code, str(generated_config_path)])
     return (
         f"[warn] CLI minted a credential on app {blueprint_app_id} but "
         f"did not persist it locally — known regression (#14).\n"
-        f"  recover (mint + paste manually):\n"
+        f"  preferred: re-run with --auto-recover-secret (mints + persists "
+        f"without echoing the secret).\n"
+        f"  or recover by hand — mint, then paste at the hidden prompt; "
+        f"never put the secret on the command line:\n"
         f"    {az_cmd}\n"
-        f"{patch_hint}\n"
-        f"  or re-run with --auto-recover-secret to do this automatically."
+        f"    {patch_cmd}"
     )
 
 

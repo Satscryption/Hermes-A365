@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import stat
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,30 @@ class TestInstanceCreateInputs:
     def test_required_fields_must_be_nonempty(self, field_name: str) -> None:
         with pytest.raises(ValueError, match=field_name):
             _inputs(**{field_name: ""})
+
+    @pytest.mark.parametrize("slug", ["../../tmp/x", "/etc", "..", "a/b", "x\x00y"])
+    def test_traversal_slug_rejected_at_construction(self, slug: str, tmp_path: Path) -> None:
+        # #103/M9: a traversal-shaped slug is refused before any plan is built,
+        # so nothing is created under (or outside) the agents root.
+        with pytest.raises(ValueError):
+            _inputs(slug=slug)
+        assert not (tmp_path / "agents").exists()
+
+
+class TestSlugTraversalApplyGuard:
+    """#103/M9: belt-and-braces ensure_contained at write time."""
+
+    def test_apply_refuses_env_path_outside_agents_root(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        # Simulate a plan whose env_path escapes the agents root (e.g. built
+        # bypassing InstanceCreateInputs validation, or via a symlinked dir).
+        victim = tmp_path / "victim.env"
+        plan.env_path = victim
+        with pytest.raises(ValueError):
+            apply_instance_plan(plan)
+        # Fail-closed: the escaping write never happened.
+        assert not victim.exists()
 
 
 # ---------------------------------------------------------------------------
@@ -278,6 +303,32 @@ class TestWriteTextAtomic:
         write_text_atomic(target, "K=V\n", mode=0o644)
         assert (target.stat().st_mode & 0o777) == 0o644
 
+    def test_owner_only_from_birth_under_umask_022(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #112/CS-004: the agent .env can carry A365_BF_CLIENT_SECRET; the
+        # temp must be 0600 at the moment of replace, never a permissive
+        # window a local reader could race. Spy on os.replace to capture the
+        # temp's mode just before it becomes the final file.
+        import os as _os
+
+        old = _os.umask(0o022)
+        try:
+            seen: dict[str, int] = {}
+            real_replace = _os.replace
+
+            def spy(src: object, dst: object) -> None:
+                seen["tmp"] = stat.S_IMODE(_os.stat(src).st_mode)  # type: ignore[arg-type]
+                real_replace(src, dst)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(_os, "replace", spy)
+            target = tmp_path / "agents" / "x" / ".env"
+            write_text_atomic(target, "A365_BF_CLIENT_SECRET=bf-secret\n")
+            assert seen["tmp"] == 0o600
+            assert (target.stat().st_mode & 0o777) == 0o600
+        finally:
+            _os.umask(old)
+
 
 # ---------------------------------------------------------------------------
 # apply_instance_plan
@@ -315,9 +366,13 @@ class TestApplyInstance:
         plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
         apply_instance_plan(plan)
 
-        text = (tmp_path / "agents" / "inbox-helper" / ".env").read_text()
+        env_path = tmp_path / "agents" / "inbox-helper" / ".env"
+        text = env_path.read_text()
         assert "A365_BF_APP_ID=11111111-1111-1111-1111-111111111111\n" in text
         assert "A365_BF_CLIENT_SECRET=bf-secret\n" in text
+        # #112/CS-004: the secret-bearing .env is 0600 and its dir 0700.
+        assert (env_path.stat().st_mode & 0o777) == 0o600
+        assert (env_path.parent.stat().st_mode & 0o777) == 0o700
 
     @pytest.mark.parametrize(
         ("key", "expected_line", "unexpected_key"),

@@ -30,7 +30,12 @@ from typing import Any, Literal, Protocol
 from urllib import error, request
 from urllib.parse import quote, urlparse
 
-from ._common import parse_env, slugify
+from ._common import (
+    parse_env,
+    quote_path_segment,
+    slugify,
+    write_owner_only_text_atomic,
+)
 
 SIDECAR_FILENAME = "a365.bot-service.config.json"
 SIDECAR_SCHEMA_VERSION = 1
@@ -101,11 +106,10 @@ def _load_operator_env(hermes_home: Path | None = None) -> dict[str, str]:
 
 
 def _write_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(text)
-    os.chmod(tmp, mode)
-    os.replace(tmp, path)
+    # #112/CS-004: O_EXCL-first owner-only write (no permissive-umask window).
+    # These files carry the bot's msaAppId + config, not a secret, but they
+    # route through the same hardened writer for consistency.
+    write_owner_only_text_atomic(path, text, mode=mode)
 
 
 _LOOPBACK_HOSTS = frozenset({"localhost", "127.0.0.1", "::1"})
@@ -1340,7 +1344,11 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
             f"Direct Line omitted conversationId: {conversation}",
         )
     status, response = _http_json(
-        f"https://directline.botframework.com/v3/directline/conversations/{conversation_id}/activities",
+        # #103/L8: conversation_id comes from the Direct Line start-conversation
+        # response; percent-encode it so it can't break out of the path segment
+        # or smuggle a query/fragment into the probe URL.
+        "https://directline.botframework.com/v3/directline/conversations/"
+        f"{quote_path_segment(conversation_id)}/activities",
         token=token,
         body={
             "type": "message",

@@ -30,6 +30,7 @@ from hermes_a365.bot_service import (
     build_parser,
     build_update_endpoint_plan,
     derive_bot_name,
+    directline_runtime_probe,
     resolve_default_region,
     verify_bot_service,
 )
@@ -661,6 +662,65 @@ def test_extract_directline_secret_falls_back_to_resource_properties() -> None:
 def test_extract_directline_secret_raises_when_no_secret_anywhere() -> None:
     with pytest.raises(BotServiceError, match="not present in az output"):
         _extract_directline_secret({"properties": {"sites": [{"siteName": "x"}]}})
+
+
+def test_directline_probe_percent_encodes_conversation_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # #103/L8: the conversationId comes from the Direct Line
+    # start-conversation response and is interpolated into the activities
+    # probe URL. Percent-encode it so a hostile id can't inject path
+    # structure, a query, or a fragment.
+    from hermes_a365 import bot_service
+
+    cfg = BotServiceConfig(
+        schemaVersion=1,
+        subscriptionId=SUBSCRIPTION_ID,
+        resourceGroup="hermes-a365-bots",
+        botName="hermes-inbox-helper-bot",
+        armResourceId=(
+            "/subscriptions/sub/resourceGroups/rg/providers/"
+            "Microsoft.BotService/botServices/bot"
+        ),
+        msaAppId=BF_APP_ID,
+        tenantId=TENANT_ID,
+        messagingEndpoint="https://example.test/api/messages",
+        channelsEnabled=["webchat", "directline"],
+        createdAt="2026-05-18T12:30:00Z",
+        resourceGroupManaged=False,
+    )
+
+    class _SecretRunner:
+        def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+            return CommandResult(
+                argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}})
+            )
+
+    urls: list[str] = []
+
+    def _fake_http_json(
+        url: str,
+        *,
+        token: str,
+        body: dict[str, Any] | None = None,
+        timeout: float = 20.0,
+    ) -> tuple[int, dict[str, Any]]:
+        urls.append(url)
+        if url.endswith("/v3/directline/conversations"):
+            return 200, {"conversationId": "abc?../x#y", "token": "conv-token"}
+        return 200, {}
+
+    monkeypatch.setattr(bot_service, "_http_json", _fake_http_json)
+    result = directline_runtime_probe(cfg, _SecretRunner())
+
+    assert result.status == "OK"
+    # Second call is the activities POST carrying the conversation id.
+    activities_url = urls[1]
+    assert "abc%3F..%2Fx%23y" in activities_url
+    after = activities_url.split("/conversations/", 1)[1]
+    assert "?" not in after
+    assert "#" not in after
+    assert "../" not in after
 
 
 def test_verify_errors_when_teams_terms_not_accepted(tmp_path: Path) -> None:

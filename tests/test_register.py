@@ -3,15 +3,22 @@
 from __future__ import annotations
 
 import json
+import os
+import shlex
+import stat
+import subprocess
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import pytest
 
+from hermes_a365._common import write_owner_only_text_atomic
 from hermes_a365.a365_config import CONFIG_FILENAME
 from hermes_a365.mutator import (
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
+    A365CliMutator,
     AADSTSError,
     CliInvocationError,
     RunResult,
@@ -48,6 +55,7 @@ class FakeMutator:
     available: bool = True
     calls: list[list[str]] = field(default_factory=list)
     scripted: list[RunResult | Exception] = field(default_factory=list)
+    sensitive_flags: list[bool] = field(default_factory=list)
 
     def run(
         self,
@@ -55,8 +63,10 @@ class FakeMutator:
         *,
         timeout: float = 60.0,
         stdin_input: str | None = None,
+        sensitive: bool = False,
     ) -> RunResult:
         self.calls.append(list(argv))
+        self.sensitive_flags.append(sensitive)
         if self.scripted:
             nxt = self.scripted.pop(0)
             if isinstance(nxt, Exception):
@@ -429,6 +439,22 @@ def _write_generated(tmp_path: Path, payload: dict[str, object]) -> Path:
     return p
 
 
+def _install_az_shim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str
+) -> None:
+    """Put a fake ``az`` on PATH whose body is ``script`` (sh).
+
+    Lets CS-003 tests drive the *real* ``A365CliMutator`` subprocess
+    paths with fake credential material — no live Azure involved.
+    """
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    shim = bin_dir / "az"
+    shim.write_text("#!/bin/sh\n" + script + "\n")
+    shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+
 class TestDetectMissingSecret:
     """The bug shape: `agentBlueprintId` populated, secret null/empty.
 
@@ -563,6 +589,116 @@ class TestAutoRecoverSecret:
             path, "bp-app-id", mutator=mutator, display_name="recovery-test"
         )
         assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_credential_reset_runs_sensitive(self, tmp_path: Path) -> None:
+        # CS-003 (#111): the reset's output IS the secret, so the call
+        # must take the captured (non-streaming) mutator path.
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        mutator = FakeMutator(
+            scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
+        )
+        auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        assert mutator.sensitive_flags == [True]
+
+    def test_secret_never_reaches_stdout_with_real_mutator(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+    ) -> None:
+        # CS-003 (#111) end-to-end: fake `az` emits the minted secret on
+        # its stdout; the real A365CliMutator must not echo one byte of
+        # it to the parent's stdout/stderr (terminals, CI logs,
+        # transcripts) while the config still gets patched.
+        marker = "FAKE-MINTED-SECRET-xK9"
+        _install_az_shim(
+            tmp_path,
+            monkeypatch,
+            f"echo '{{\"appId\": \"bp-app-id\", \"password\": \"{marker}\"}}'",
+        )
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")  # skip __init__ probing
+        mutator = A365CliMutator()
+        mutator.available = True  # bypass the a365-on-PATH check; az is the shim
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        out, err = capfd.readouterr()
+        assert marker not in out
+        assert marker not in err
+        assert outcome.recovered is True
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == marker
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_failed_reset_never_leaks_output(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+    ) -> None:
+        # CS-003 (#111) failure path: az can emit credential material and
+        # STILL exit non-zero; the error surfaced to the operator (and
+        # printed via outcome.messages) must carry none of it.
+        marker = "FAKE-PARTIAL-SECRET-zQ2"
+        _install_az_shim(tmp_path, monkeypatch, f"echo 'oops {marker}'; exit 3")
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        mutator = A365CliMutator()
+        mutator.available = True
+        outcome = auto_recover_secret(
+            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+        )
+        out, err = capfd.readouterr()
+        assert marker not in out
+        assert marker not in err
+        assert outcome.recovered is False
+        assert all(marker not in m for m in outcome.messages)
+        # the by-hand az hint still gets through
+        assert any("az ad app credential reset" in m for m in outcome.messages)
+
+    def test_temp_file_owner_only_under_umask_022(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # CS-004 (#112): the temp file must already be 0600 at the moment
+        # of the atomic replace — i.e. before the secret ever sat on disk
+        # at a permissive mode. Captured via an os.replace spy.
+        old = os.umask(0o022)
+        try:
+            seen: dict[str, int] = {}
+            real_replace = os.replace
+
+            def spy_replace(src: object, dst: object) -> None:
+                seen["tmp_mode"] = stat.S_IMODE(os.stat(src).st_mode)  # type: ignore[arg-type]
+                real_replace(src, dst)  # type: ignore[arg-type]
+
+            monkeypatch.setattr(os, "replace", spy_replace)
+            path = _write_generated(
+                tmp_path,
+                {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+            )
+            mutator = FakeMutator(
+                scripted=[
+                    RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")
+                ]
+            )
+            auto_recover_secret(
+                path, "bp-app-id", mutator=mutator, display_name="recovery-test"
+            )
+            assert seen["tmp_mode"] == 0o600
+            assert (path.stat().st_mode & 0o777) == 0o600
+        finally:
+            os.umask(old)
 
     def test_preserves_other_fields(self, tmp_path: Path) -> None:
         path = _write_generated(
@@ -746,6 +882,208 @@ class TestReportMissingSecretWarning:
         path = tmp_path / "a365.generated.config.json"
         msg = report_missing_secret_warning("bp-app-id", path)
         assert str(path) in msg
+
+    def test_no_argv_secret_sink(self, tmp_path: Path) -> None:
+        # CS-005 (#113): guidance must never tell the operator to put the
+        # secret on a command line — argv lands in shell history and the
+        # process list.
+        msg = report_missing_secret_warning(
+            "bp-app-id", tmp_path / "a365.generated.config.json"
+        )
+        assert "<paste-password>" not in msg
+        assert "sys.argv[2]" not in msg
+
+    def test_patch_hint_uses_hidden_prompt_and_exclusive_create(
+        self, tmp_path: Path
+    ) -> None:
+        msg = report_missing_secret_warning(
+            "bp-app-id", tmp_path / "a365.generated.config.json"
+        )
+        assert "getpass" in msg
+        assert "O_EXCL" in msg
+
+    @staticmethod
+    def _patch_argv(msg: str) -> list[str]:
+        """Recover the manual patch command's argv by tokenising the
+        rendered shell line exactly as a POSIX shell would (shlex.split).
+
+        Review P1: the whole command is rendered with shlex.join, so this
+        round-trips to ``['python3', '-c', <code>, <config-path>]`` — and
+        the path survives as one token even with spaces/metacharacters.
+        """
+        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln).strip()
+        return shlex.split(line)
+
+    def test_patch_hint_command_is_valid_python(self, tmp_path: Path) -> None:
+        msg = report_missing_secret_warning(
+            "bp-app-id", tmp_path / "a365.generated.config.json"
+        )
+        argv = self._patch_argv(msg)
+        assert argv[0] == "python3" and argv[1] == "-c"
+        compile(argv[2], "<hint>", "exec")
+
+    def test_patch_hint_path_is_one_token_with_spaces(self, tmp_path: Path) -> None:
+        # Review P1: a config path with a space must not shell-split into
+        # multiple argv entries (which would make sys.argv[1] wrong).
+        path = tmp_path / "weird dir" / "a365.generated.config.json"
+        msg = report_missing_secret_warning("bp-app-id", path)
+        argv = self._patch_argv(msg)
+        assert argv[-1] == str(path)
+        assert len(argv) == 4
+
+    def test_patch_hint_patches_via_stdin_prompt(self, tmp_path: Path) -> None:
+        # Run the emitted one-liner for real: the secret arrives on stdin
+        # (getpass falls back to stdin without a tty), never argv, and
+        # the file ends up owner-only.
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        msg = report_missing_secret_warning("bp-app-id", path)
+        argv = self._patch_argv(msg)
+        proc = subprocess.run(
+            [sys.executable, *argv[1:]],
+            input="PASTED-FAKE-SECRET\n",
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        on_disk = json.loads(path.read_text())
+        assert on_disk["agentBlueprintClientSecret"] == "PASTED-FAKE-SECRET"
+        assert (path.stat().st_mode & 0o777) == 0o600
+
+    def test_patch_hint_tolerates_stale_temp(self, tmp_path: Path) -> None:
+        # A leftover .tmp from a prior failed manual run must not lock out
+        # the retry via O_EXCL — the one-liner pre-unlinks it.
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        stale = path.with_suffix(path.suffix + ".tmp")
+        stale.write_text("stale junk from a crashed prior attempt")
+        msg = report_missing_secret_warning("bp-app-id", path)
+        argv = self._patch_argv(msg)
+        proc = subprocess.run(
+            [sys.executable, *argv[1:]],
+            input="RETRY-SECRET\n",
+            text=True,
+            capture_output=True,
+            timeout=30,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
+            "RETRY-SECRET"
+        )
+        assert not stale.exists()
+
+    def test_rendered_command_survives_a_real_shell(self, tmp_path: Path) -> None:
+        # Review P1, the load-bearing test: execute the ACTUAL rendered
+        # shell command (not the extracted code) with a config path that
+        # contains a space AND a shell metacharacter, through a real shell.
+        # shlex.join must have quoted it so pasting neither splits the path
+        # nor executes the injected `touch INJECTED`.
+        cfg_dir = tmp_path / "weird dir; touch INJECTED"
+        cfg_dir.mkdir(parents=True)
+        path = cfg_dir / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None}
+            )
+            + "\n"
+        )
+        msg = report_missing_secret_warning("bp-app-id", path)
+        line = next(ln for ln in msg.splitlines() if "python3 -c" in ln).strip()
+        # Use the test interpreter but STILL exercise shell tokenisation of
+        # the rendered line (swap only the leading program token).
+        run_line = line.replace("python3", shlex.quote(sys.executable), 1)
+        proc = subprocess.run(
+            run_line,
+            shell=True,  # deliberate: prove the rendered line is shell-safe
+            input="SHELL-SECRET\n",
+            text=True,
+            capture_output=True,
+            timeout=30,
+            cwd=tmp_path,
+        )
+        assert proc.returncode == 0, proc.stderr
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
+            "SHELL-SECRET"
+        )
+        # The `; touch INJECTED` inside the path must NOT have executed.
+        assert not (tmp_path / "INJECTED").exists()
+        assert not (cfg_dir / "INJECTED").exists()
+
+
+class TestWriteOwnerOnlyTextAtomic:
+    """#112 / CS-004 — the exclusive-create atomic writer used for
+    secret-bearing JSON: 0600 from birth, no permissive window."""
+
+    def test_creates_owner_only_under_umask_022(self, tmp_path: Path) -> None:
+        old = os.umask(0o022)
+        try:
+            target = tmp_path / "cfg.json"
+            write_owner_only_text_atomic(target, '{"s": 1}\n')
+            assert target.read_text() == '{"s": 1}\n'
+            assert (target.stat().st_mode & 0o777) == 0o600
+        finally:
+            os.umask(old)
+
+    def test_creates_missing_parent_dirs(self, tmp_path: Path) -> None:
+        target = tmp_path / "a" / "b" / "cfg.json"
+        write_owner_only_text_atomic(target, "x\n")
+        assert target.read_text() == "x\n"
+
+    def test_mode_override_exact_under_umask_027(self, tmp_path: Path) -> None:
+        # The mode must be forced exactly (fchmod), not just requested via
+        # O_CREAT which the umask can further clear (0640 & ~027 == 0600).
+        old = os.umask(0o027)
+        try:
+            target = tmp_path / "cfg.json"
+            write_owner_only_text_atomic(target, "x\n", mode=0o640)
+            assert (target.stat().st_mode & 0o777) == 0o640
+        finally:
+            os.umask(old)
+
+    def test_tightens_a_permissive_existing_file(self, tmp_path: Path) -> None:
+        target = tmp_path / "cfg.json"
+        target.write_text("{}")
+        target.chmod(0o644)
+        write_owner_only_text_atomic(target, '{"s": 2}\n')
+        assert (target.stat().st_mode & 0o777) == 0o600
+        assert target.read_text() == '{"s": 2}\n'
+
+    def test_replaces_stale_temp_file(self, tmp_path: Path) -> None:
+        target = tmp_path / "cfg.json"
+        stale = tmp_path / "cfg.json.tmp"
+        stale.write_text("stale")
+        write_owner_only_text_atomic(target, "fresh\n")
+        assert target.read_text() == "fresh\n"
+        assert not stale.exists()
+
+    def test_stale_temp_symlink_is_not_followed(self, tmp_path: Path) -> None:
+        # A pre-planted symlink at the temp path must not route the
+        # secret bytes into the symlink's target (O_EXCL + pre-unlink).
+        victim = tmp_path / "victim.txt"
+        victim.write_text("untouched")
+        target = tmp_path / "cfg.json"
+        (tmp_path / "cfg.json.tmp").symlink_to(victim)
+        write_owner_only_text_atomic(target, "secret\n")
+        assert victim.read_text() == "untouched"
+        assert target.read_text() == "secret\n"
+
+    def test_no_temp_left_when_replace_fails(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        def boom(src: object, dst: object) -> None:
+            raise OSError("simulated replace failure")
+
+        monkeypatch.setattr(os, "replace", boom)
+        target = tmp_path / "cfg.json"
+        with pytest.raises(OSError, match="simulated"):
+            write_owner_only_text_atomic(target, "x")
+        assert not (tmp_path / "cfg.json.tmp").exists()
+        assert not target.exists()
 
 
 class TestRecoveryDisplayName:

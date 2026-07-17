@@ -1,5 +1,10 @@
 name: Publish to PyPI
 
+# Supply-chain hardening (#104): build and publish are SPLIT so the build
+# toolchain never runs with the OIDC publish credential in scope (M13); all
+# actions are pinned to full commit SHAs (M14); the publish job only fires
+# for v* tag refs, so `workflow_dispatch` from a branch cannot publish (M12).
+
 on:
   push:
     tags:
@@ -7,34 +12,35 @@ on:
   # Manual trigger — backup for when push-tag trigger is unavailable
   # (e.g. account-wide Actions scheduler bug 2026-05-26). Allows
   # `gh workflow run publish.yml --ref v0.x.y` to publish a tag
-  # that didn't auto-fire publish.yml on tag push. NOTE: PyPI
-  # Trusted Publisher (OIDC) may need a separate trust entry for
-  # `workflow_dispatch` events; verify with a test publish to
-  # TestPyPI first if relying on this path.
+  # that didn't auto-fire publish.yml on tag push. Dispatching on a
+  # BRANCH ref builds but does not publish (see the publish job's
+  # tag-ref guard). NOTE: PyPI Trusted Publisher (OIDC) may need a
+  # separate trust entry for `workflow_dispatch` events; verify with
+  # a test publish to TestPyPI first if relying on this path.
   workflow_dispatch:
 
 jobs:
-  build-and-publish:
+  build:
     runs-on: ubuntu-latest
-    # Uses PyPI Trusted Publisher (OIDC) — no PYPI_API_TOKEN secret.
-    # One-time setup: register the project on pypi.org and add this
-    # repo + workflow as a Trusted Publisher under "Manage > Publishing".
+    # Deliberately NO id-token permission here: the build toolchain must
+    # not execute while the PyPI OIDC credential is mintable (M13).
     permissions:
-      id-token: write
       contents: read
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.11"
 
-      - name: Install build tooling
-        run: python -m pip install --upgrade build
+      - name: Install pinned build toolchain
+        run: python -m pip install --require-hashes -r .github/workflows/publish-requirements.txt
 
       - name: Build sdist + wheel
-        run: python -m build
+        # --no-isolation: use the hash-pinned hatchling above instead of
+        # letting `build` resolve an unpinned backend at build time.
+        run: python -m build --no-isolation
 
       - name: Sanity-check artefacts
         run: |
@@ -44,5 +50,37 @@ jobs:
             && echo "Package data present ✓" \
             || (echo "Missing package data in wheel!" && exit 1)
 
+      - name: Upload artefacts for the publish job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    # M12: publish only from a v* tag ref. A `workflow_dispatch` against a
+    # branch ref (or any non-tag ref) stops here, so repo writers cannot
+    # publish arbitrary branch contents to PyPI via OIDC. NOTE: this is a
+    # ref-NAME guard only — it does not attest commit provenance, so a
+    # repo-writer who pushes a malicious `v*` tag could still publish. That
+    # higher-privilege threat (compromised/insider maintainer) is out of
+    # scope for this guard; close it with a protected GitHub `environment:`
+    # carrying required-reviewer rules on this job (configure the rules in
+    # repo settings first — an unconfigured `environment:` is a no-op gate).
+    if: startsWith(github.ref, 'refs/tags/v')
+    # Uses PyPI Trusted Publisher (OIDC) — no PYPI_API_TOKEN secret.
+    # One-time setup: register the project on pypi.org and add this
+    # repo + workflow as a Trusted Publisher under "Manage > Publishing".
+    permissions:
+      id-token: write
+    steps:
+      - name: Download built artefacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
       - name: Publish to PyPI
-        uses: pypa/gh-action-pypi-publish@release/v1
+        uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0

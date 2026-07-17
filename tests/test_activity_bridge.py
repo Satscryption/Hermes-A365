@@ -150,6 +150,19 @@ class TestLoadAgentEnv:
         assert env["A365_APP_ID"] == "8b563a20-2fac-4210-8210-df139c61e8b7"
         assert env["AA_INSTANCE_ID"] == "550e8400-e29b-41d4-a716-446655440000"
 
+    @pytest.mark.parametrize("slug", ["../../tmp/x", "/etc", "..", "a/b", "x\x00y"])
+    def test_traversal_slug_refused(self, slug: str, tmp_path: Path) -> None:
+        # #103/M9: a traversal-shaped slug is refused (ValueError) before the
+        # agents-path join, so nothing outside the agents root is read. Plant a
+        # secret where a "../.." would land and confirm it's never returned.
+        victim = tmp_path.parent / "victim.env"
+        victim.write_text("SECRET=leak\n")
+        try:
+            with pytest.raises(ValueError):
+                load_agent_env(tmp_path, slug)
+        finally:
+            victim.unlink(missing_ok=True)
+
 
 # ---------------------------------------------------------------------------
 # load_generated_config
@@ -1939,6 +1952,20 @@ class TestLoadBridgeConfig:
                 generated_config_path=path,
             )
 
+    @pytest.mark.parametrize("slug", ["../../tmp/x", "/etc", "..", "a/b", "x\x00y"])
+    def test_traversal_slug_refused(self, slug: str, tmp_path: Path) -> None:
+        # #103/M9: refuse a traversal slug before any path join (agent_dir /
+        # bridge.log / bridge.pid). No pid/log file is created anywhere.
+        with pytest.raises(ValueError):
+            load_bridge_config(
+                slug=slug,
+                webhook_url="http://hook",
+                hermes_home=tmp_path,
+                generated_config_path=tmp_path / "a365.generated.config.json",
+            )
+        assert not list(tmp_path.rglob("bridge.pid"))
+        assert not list(tmp_path.rglob("bridge.log"))
+
     def test_happy_path(self, tmp_path: Path) -> None:
         _seed_agent_env(tmp_path)
         path = tmp_path / "a365.generated.config.json"
@@ -2151,6 +2178,32 @@ class TestServeApp:
         assert "/v3/conversations/conv-1/activities/1234" in reply_url
         assert capture["reply"][0]["body"]["text"] == "hi back"
 
+    def test_reply_url_percent_encodes_inbound_ids(self) -> None:
+        # #103/M4: conv id / activity id come from the inbound webhook body and
+        # are interpolated into the outbound BF URL. A Teams-shaped conv id and
+        # a hostile activity id must be percent-encoded so they can't inject
+        # path structure, a query, or a fragment.
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        activity = _inbound_message_activity(conv_id="19:abc@thread.tacv2")
+        activity["id"] = "../x?y#z"
+        with _client_for(
+            cfg, capture=capture, webhook_response={"text": "hi back"}
+        ) as client:
+            r = client.post("/api/messages", json=activity)
+        assert r.status_code == 200
+        assert len(capture["reply"]) == 1
+        reply_url = capture["reply"][0]["url"]
+        # Encoded forms present for both segments.
+        assert "19%3Aabc%40thread.tacv2" in reply_url
+        assert "..%2Fx%3Fy%23z" in reply_url
+        # No raw path/query/fragment injection after the conversations/ segment.
+        after = reply_url.split("/v3/conversations/", 1)[1]
+        assert "../" not in after
+        assert "?" not in after
+        assert "#" not in after
+
     @pytest.mark.parametrize("reply_status", [401, 500])
     def test_message_reply_post_failure_does_not_report_replied(
         self, reply_status: int
@@ -2336,7 +2389,8 @@ class TestServeApp:
 class TestActivityDeliveryId:
     def test_extracts_conv_and_activity_id(self) -> None:
         a = _inbound_message_activity()
-        assert _activity_delivery_id(a) == "conv-1:1234"
+        # #103/L7: key is length-prefixed on conv ("conv-1" is 6 chars).
+        assert _activity_delivery_id(a) == "6:conv-1:1234"
 
     def test_missing_conversation_returns_none(self) -> None:
         a = _inbound_message_activity()
@@ -2352,6 +2406,17 @@ class TestActivityDeliveryId:
         a = _inbound_message_activity()
         a["conversation"] = "not-a-dict"
         assert _activity_delivery_id(a) is None
+
+    def test_colon_in_conv_id_does_not_collide(self) -> None:
+        # #103/L7: Teams conv ids carry literal ':'. Without length-prefixing,
+        # ("19:abc","123") and ("19","abc:123") would both key "19:abc:123".
+        a1 = {"conversation": {"id": "19:abc"}, "id": "123"}
+        a2 = {"conversation": {"id": "19"}, "id": "abc:123"}
+        k1 = _activity_delivery_id(a1)
+        k2 = _activity_delivery_id(a2)
+        assert k1 == "6:19:abc:123"
+        assert k2 == "2:19:abc:123"
+        assert k1 != k2
 
 
 class TestIdempotencyCache:

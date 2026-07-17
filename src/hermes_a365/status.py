@@ -49,7 +49,7 @@ from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from . import bot_service, bot_service_diagnostics
-from ._common import parse_env, safe_run, slugify
+from ._common import parse_env, safe_run, slugify, validate_slug
 
 ComponentState = Literal["ok", "warn", "error", "missing", "skipped"]
 OverallState = Literal["ok", "partial", "broken", "uninitialized"]
@@ -268,21 +268,38 @@ def gather_local_config(hermes_home: Path, agent_name: str | None) -> StatusComp
         if derived and derived != agent_name:
             candidates.append(derived)
 
-        agent_env_file: Path | None = None
+        # #103/M9: this is a read-only probe — never crash status. Silently
+        # drop any candidate that isn't a safe single path component so a
+        # traversal-shaped agent_name ("../../etc") can't steer the read
+        # outside ~/.hermes/agents/. The slugify fallback stays as a benign
+        # candidate (slugify can't emit separators).
+        safe_candidates: list[str] = []
         for candidate in candidates:
+            try:
+                validate_slug(candidate)
+            except ValueError:
+                continue
+            safe_candidates.append(candidate)
+
+        agent_env_file: Path | None = None
+        for candidate in safe_candidates:
             probe = hermes_home / "agents" / candidate / ".env"
             if probe.exists():
                 agent_env_file = probe
                 break
 
         if agent_env_file is None:
-            tried = " or ".join(
-                str(hermes_home / "agents" / c / ".env") for c in candidates
-            )
+            if safe_candidates:
+                tried = " or ".join(
+                    str(hermes_home / "agents" / c / ".env") for c in safe_candidates
+                )
+                detail = f"agent .env missing: tried {tried}"
+            else:
+                detail = f"agent name {agent_name!r} is not a valid agent slug"
             return StatusComponent(
                 "local_config",
                 _WARN,
-                f"agent .env missing: tried {tried}",
+                detail,
                 data,
             )
         try:
@@ -316,6 +333,19 @@ def _process_alive(pid: int) -> bool:
 
 def gather_activity_bridge(hermes_home: Path, agent_name: str) -> StatusComponent:
     """Inspect the activity-bridge PID file (if any)."""
+    # #103/M9: read-only probe — refuse to join a traversal-shaped agent_name
+    # into the pidfile path rather than crash status. A normal display name
+    # (spaces allowed) still passes validate_slug; only path components like
+    # "..", "a/b" or NUL are rejected.
+    try:
+        validate_slug(agent_name)
+    except ValueError:
+        return StatusComponent(
+            "activity_bridge",
+            _MISSING,
+            f"agent name {agent_name!r} is not a valid agent slug; no bridge pidfile probed",
+            {"agent_name": agent_name},
+        )
     pid_file = hermes_home / "agents" / agent_name / "bridge.pid"
     if not pid_file.exists():
         return StatusComponent(

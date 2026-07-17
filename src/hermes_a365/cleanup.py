@@ -37,7 +37,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import bot_service
-from ._common import slugify
+from ._common import ensure_contained, slugify, validate_slug
 from .mutator import AADSTSError, CliInvocationError, Mutator, get_mutator
 
 CleanupKind = Literal["bot-service", "azure", "instance", "blueprint"]
@@ -112,9 +112,16 @@ class CleanupInputs:
         ``agent_name``. This is the fix for the 2026-05-05 walkthrough's
         bug #12 — the wrapper used to look at
         ``~/.hermes/agents/Hermes Inbox Helper/`` literally.
+
+        #103/M9: the explicit ``--slug`` is returned VERBATIM and then
+        joined into ``~/.hermes/agents/<slug>/`` for local-artefact
+        deletion, so a traversal-shaped value would steer unlink/rmdir
+        outside the agents root. Validate it here (the slugify fallback
+        can never produce separators, so only the explicit branch needs
+        the gate). Raises :class:`ValueError` on an unsafe slug.
         """
         if self.slug:
-            return self.slug
+            return validate_slug(self.slug)
         return slugify(self.agent_name)
 
 
@@ -395,7 +402,17 @@ def apply_cleanup_plan(
             if oid not in result.orphan_user_ids:
                 result.orphan_user_ids.append(oid)
 
+    # #103/M9: every unlink/rmdir target must resolve inside the agents root.
+    # ``resolved_slug`` already rejects traversal slugs, so this is
+    # belt-and-braces (also catches a symlinked agent dir pointing outside):
+    # fail closed with a clear operator error rather than deleting an
+    # arbitrary path the CLI cleanup should never touch.
+    agents_root = hermes_home / "agents"
     for path in plan.local_paths:
+        try:
+            ensure_contained(path, agents_root)
+        except ValueError as e:
+            raise CleanupError(f"refusing to delete a path outside the agents root: {e}") from e
         try:
             path.unlink()
         except FileNotFoundError:
@@ -405,6 +422,10 @@ def apply_cleanup_plan(
 
     # Best-effort agent dir reaper.
     agent_dir = _agent_dir(hermes_home, plan.inputs.resolved_slug)
+    try:
+        ensure_contained(agent_dir, agents_root)
+    except ValueError as e:
+        raise CleanupError(f"refusing to rmdir a path outside the agents root: {e}") from e
     if agent_dir.exists() and not any(agent_dir.iterdir()):
         agent_dir.rmdir()
         result.messages.append(f"[apply] removed empty dir {agent_dir}")
@@ -598,7 +619,13 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
-    plan = build_cleanup_plan(inputs)
+    try:
+        # #103/M9: building the plan resolves ``resolved_slug`` (which rejects
+        # traversal-shaped ``--slug`` values); surface that as a clean rc=2.
+        plan = build_cleanup_plan(inputs)
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     sys.stdout.write(plan.render_human() + "\n")
 
     if not args.apply:
@@ -628,6 +655,10 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     except bot_service.BotServiceError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except CleanupError as e:
+        # #103/M9: ensure_contained refused an unlink/rmdir outside the agents root.
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 

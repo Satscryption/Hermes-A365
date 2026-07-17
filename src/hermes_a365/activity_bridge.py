@@ -87,7 +87,14 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 
-from ._common import parse_env, tcp_reachable
+from ._common import (
+    parse_env,
+    tcp_reachable,
+    validate_slug,
+)
+from ._common import (
+    quote_path_segment as _quote_path_segment_common,
+)
 
 # Slice 19b — `serve` mode dependencies. Optional extras: operators
 # who only need `verify` can install without them. We bind the names
@@ -194,11 +201,28 @@ def _resolve_hermes_home() -> Path:
     return Path(os.path.expanduser(raw))
 
 
+def _quote_path_segment(value: str) -> str:
+    """Percent-encode a single URL path segment (#103 / M4).
+
+    Thin wrapper over :func:`hermes_a365._common.quote_path_segment` (the
+    single source of truth, shared with the plugin adapter and bot_service
+    so all outbound-URL builders encode identically). Neutralises ``/``,
+    ``?``, ``#`` and — unlike a bare ``quote(safe="")`` — a literal ``.``/
+    ``..`` dot-segment. A Teams conv id like ``19:abc@thread.tacv2`` becomes
+    ``19%3Aabc%40thread.tacv2``.
+    """
+    return _quote_path_segment_common(value)
+
+
 def load_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:
     """Read ``~/.hermes/agents/<slug>/.env`` into a dict.
 
     Raises :class:`BridgeConfigError` if the file is absent or unparseable.
     """
+    # #103/M9: ``slug`` is joined into the agents path; reject traversal-shaped
+    # values before the join so a hostile slug can't read outside the agents
+    # root. ValueError is surfaced cleanly by the verify probe / serve CLI.
+    validate_slug(slug)
     path = hermes_home / "agents" / slug / ".env"
     if not path.exists():
         raise BridgeConfigError(
@@ -297,7 +321,9 @@ def acquire_token(
 def probe_local_config(hermes_home: Path, slug: str) -> tuple[ProbeResult, dict[str, str]]:
     try:
         env = load_agent_env(hermes_home, slug)
-    except BridgeConfigError as e:
+    except (BridgeConfigError, ValueError) as e:
+        # #103/M9: a traversal-shaped slug raises ValueError from validate_slug;
+        # surface it as an error probe rather than crashing verify.
         return (
             ProbeResult("local_config", _ERROR, str(e)),
             {},
@@ -909,6 +935,10 @@ def load_bridge_config(
     may need to re-run ``register --apply`` or
     ``az ad app credential reset`` to get a working secret back.
     """
+    # #103/M9: fail closed on a traversal-shaped slug before any path join
+    # (``agent_dir``, log/pid writes below). ``load_agent_env`` re-checks, but
+    # guarding here keeps the function safe when called directly.
+    validate_slug(slug)
     agent_env = load_agent_env(hermes_home, slug)
     gen = load_generated_config(generated_config_path)
 
@@ -1012,6 +1042,14 @@ def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
     activities (``conversationUpdate``, ``typing``) sometimes lack
     ``id``, and we'd rather always-deliver them than risk dropping
     legitimate traffic.
+
+    #103/L7: a plain ``f"{conv}:{activity_id}"`` join is ambiguous because
+    Teams conversation ids contain literal ``:`` — ``("19:abc", "123")`` and
+    ``("19", "abc:123")`` would both render ``"19:abc:123"`` and collide,
+    letting one delivery suppress an unrelated one. Length-prefixing ``conv``
+    (``f"{len(conv)}:{conv}:{activity_id}"``) makes the boundary unambiguous:
+    the reader knows exactly how many chars ``conv`` occupies, so no two
+    distinct pairs can produce the same key.
     """
     conv = (activity.get("conversation") or {}).get("id") if isinstance(
         activity.get("conversation"), dict
@@ -1019,7 +1057,7 @@ def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
     activity_id = activity.get("id")
     if not conv or not activity_id:
         return None
-    return f"{conv}:{activity_id}"
+    return f"{len(conv)}:{conv}:{activity_id}"
 
 
 def _is_trusted_service_url(url: str, suffixes: tuple[str, ...]) -> bool:
@@ -2205,7 +2243,16 @@ async def send_reply(
             f"reply target incomplete: serviceUrl={service_url!r}, "
             f"conversationId={conv_id!r}, activityId={activity_id!r}"
         )
-    url = f"{service_url}/v3/conversations/{conv_id}/activities/{activity_id}"
+    # #103/M4: conv_id / activity_id come straight from the inbound webhook
+    # body — percent-encode each path segment so a hostile id can't break out
+    # of the path (``/``), append a query/fragment (``?`` / ``#``), or traverse
+    # (``..``) the outbound Bot Framework REST URL. ``service_url`` is the
+    # trusted, allowlist-checked base and is NOT a single segment, so it is
+    # left intact.
+    url = (
+        f"{service_url}/v3/conversations/{_quote_path_segment(conv_id)}"
+        f"/activities/{_quote_path_segment(activity_id)}"
+    )
     if bf_cache is None:
         bf_cache = _BfTokenCache()
     token, _path = await acquire_reply_token(
@@ -2494,7 +2541,8 @@ def cmd_serve(args: argparse.Namespace) -> int:
             ),
             skip_jwt_validation=bool(args.no_jwt_validation),
         )
-    except BridgeConfigError as e:
+    except (BridgeConfigError, ValueError) as e:
+        # #103/M9: ValueError comes from validate_slug refusing a traversal slug.
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
