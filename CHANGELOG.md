@@ -12,20 +12,18 @@ this heading is dated at release.
 
 ### Security / docs
 
-- **#100 / #107 — inbound trust-boundary residuals closed as documented.** The
+- **#100 regression locks / #107 client-side characterization.** The
   #100 hardening (H1/H1-tenant/M1/M2/L4) shipped in v0.8.2; a scoping deep-read
-  confirmed it live at the v0.8.5 tip. The two residuals are now closed on an
-  honest basis rather than a speculative fix: **#107** — a client-side assert of
-  `recipient.agenticUserId` against the inbound JWT is **infeasible** (A365
-  inbound tokens are service tokens with no `sub`/`oid`), so the Entra `user_fic`
-  server-side backstop is documented at the mint site and locked by a regression
-  test that drives the real mint and asserts it stays claims-blind (mints under
-  the *body* agenticUserId), so wiring JWT claims into the mint trips a re-review;
-  **#100 M3**
-  (dedupe pre-seed) is redesign-blocked (the `azp` key is a verified no-op on
-  Path A) and re-tagged to #86 (v0.9.3), with a behaviour-lock test recording the
-  current suppress-on-pre-seed semantics. Also corrected a stale module docstring
-  that still advertised the pre-M2 `serviceUrl` allowlist.
+  confirmed it live at the v0.8.5 tip. **#107** — no currently validated inbound
+  claim is documented as `recipient.agenticUserId`; `sub`/`oid`, when present on
+  app-only tokens, identify the authenticated caller/subject rather than the
+  agentic user. The mint-site documentation and tests now characterize the body-
+  driven `user_fic` request and verify token-endpoint rejection fails closed.
+  Live positive/negative Entra validation remains required by #107/#123.
+  **#100 M3** (dedupe pre-seed) remains unresolved and is explicitly owned by #86
+  (v0.9.3); a signed-token route test records the current suppress-on-pre-seed
+  behavior. Also corrected a stale module docstring that still advertised the
+  pre-M2 `serviceUrl` allowlist.
 
 ### Tests
 

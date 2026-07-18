@@ -1646,18 +1646,19 @@ async def acquire_outbound_token(
         )
 
     # #107 (agenticUserId axis) — the THIRD body-supplied identity field,
-    # recipient.agenticUserId, is deliberately NOT asserted client-side here, unlike
-    # agenticAppId (H1) and tenantId (H1/tenant) above. There is nothing to assert it
-    # against: the A365 inbound token is a SERVICE token (azp = the platform Messaging
-    # Bot SP) carrying NO end-user claim — no `sub`, no `oid` (see validate_inbound_jwt
-    # and the _make_token test fixture). agenticUserId is instead backstopped
-    # SERVER-SIDE by Entra's user-FIC grant in acquire_user_fic_token below: Entra
-    # issues the delegated token only if the azp-allowlisted platform is authorised to
-    # act for that user. The #106 review and #107 verified a client-side assert is
-    # infeasible on this token model. If the inbound token shape ever grows an end-user
-    # claim, revisit and pin agenticUserId to it here. (Locked by
-    # test_107_mint_takes_user_axis_from_body_not_a_jwt_claim, which drives the real
-    # mint and asserts this function stays claims-blind + mints under the body user.)
+    # recipient.agenticUserId, is not asserted client-side here, unlike agenticAppId
+    # (H1) and tenantId (H1/tenant) above. No currently validated inbound claim is
+    # documented as the agentic-user identity. In particular, `sub` and `oid` may be
+    # present on an app-only token but identify the authenticated caller/service
+    # principal, not recipient.agenticUserId. Equating either claim with the body user
+    # would therefore reject valid traffic without establishing the intended binding.
+    #
+    # The final Entra user-FIC exchange is expected to enforce whether this agent
+    # identity may act for the requested user. Unit tests characterize the body-to-
+    # user_id mapping and verify that a token-endpoint rejection fails closed; they do
+    # not prove the server-side policy. #107 remains open until #123 records live
+    # positive and negative user-FIC probes. If Microsoft documents an inbound claim
+    # that identifies the agentic user, bind recipient.agenticUserId to it here.
     #
     # Tier-2: per-user access token at the target scope. Key on the full identity
     # tuple (matching _FmiCache) — a (user, scope)-only key would collide across

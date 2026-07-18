@@ -1056,6 +1056,7 @@ class TestPeekUnverifiedIss:
 def _agentic_token_handler(
     *,
     capture: list[dict[str, Any]] | None = None,
+    allowed_user_id: str | None = None,
 ) -> Callable[[httpx.Request], httpx.Response]:
     """Build an httpx mock handler that fakes all three stages of the
     A365 agentic chain. Each request appends a small dict to
@@ -1092,6 +1093,11 @@ def _agentic_token_handler(
         ):
             return httpx.Response(200, json={"access_token": "T2", "expires_in": 3600})
         if params.get("grant_type") == "user_fic":
+            if allowed_user_id is not None and params.get("user_id") != allowed_user_id:
+                return httpx.Response(
+                    401,
+                    json={"error": "unauthorized_client", "error_description": "denied"},
+                )
             return httpx.Response(
                 200, json={"access_token": "FINAL", "expires_in": 3600}
             )
@@ -1293,35 +1299,16 @@ class TestAcquireOutboundToken:
         (key,) = user.by_key
         assert key == ("tenant-1", "blueprint-app-id", "user-A", APX_PRODUCTION_SCOPE)
 
-    async def test_107_mint_takes_user_axis_from_body_not_a_jwt_claim(self) -> None:
-        # #107 (won't-assert lock) — the user axis of the mint (agenticUserId)
-        # is deliberately NOT bound to an inbound-JWT claim, unlike the app-id
-        # (H1) and tenant (H1/tenant) axes. A365 inbound tokens are service
-        # tokens with no `sub`/`oid`, so there is nothing to pin against; the
-        # axis is taken from the body and backstopped server-side by Entra's
-        # user-FIC grant. This LOCKS that decision by driving the real mint:
-        #
-        #   1. acquire_outbound_token's signature carries no claims/token param
-        #      (it is claims-blind by construction), and
-        #   2. the user_fic POST mints under the *body* agenticUserId verbatim.
-        #
-        # If a future change threads validated claims into the mint to pin the
-        # user axis, (1) breaks; if it swaps the body value for a claim, (2)
-        # breaks. Either way the #107 decision gets a deliberate re-review.
-        import inspect
-
-        params = set(inspect.signature(acquire_outbound_token).parameters)
-        assert "claims" not in params and "token" not in params, (
-            "acquire_outbound_token grew a claims/token param — the #107 "
-            "won't-assert decision for agenticUserId must be revisited"
-        )
-
+    async def test_107_mint_maps_body_user_to_user_fic_request(self) -> None:
+        # Client-side characterization only: no documented validated claim maps
+        # to agenticUserId, so the mint sends the body value to Entra as user_id.
+        # The live positive/negative authorization proof remains in #107/#123.
         a = _inbound_message_activity(agentic_user_id="body-supplied-user-x")
         capture: list[dict[str, Any]] = []
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
         ) as client:
-            await acquire_outbound_token(
+            token = await acquire_outbound_token(
                 client=client,
                 cfg=_cfg(),
                 activity=a,
@@ -1331,6 +1318,33 @@ class TestAcquireOutboundToken:
         user_fic = [c for c in capture if c["grant_type"] == "user_fic"]
         assert len(user_fic) == 1
         assert user_fic[0]["user_id"] == "body-supplied-user-x"
+        assert all(c["user_id"] is None for c in capture if c not in user_fic)
+        assert token == "FINAL"
+
+    async def test_107_user_fic_rejection_propagates_fail_closed(self) -> None:
+        # This mock does not prove Entra's policy; it verifies the local half of
+        # the boundary: a denied user_fic exchange never yields a bearer token.
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(
+                _agentic_token_handler(
+                    capture=capture, allowed_user_id="configured-agentic-user"
+                )
+            )
+        ) as client:
+            with pytest.raises(httpx.HTTPStatusError):
+                await acquire_outbound_token(
+                    client=client,
+                    cfg=_cfg(),
+                    activity=_inbound_message_activity(
+                        agentic_user_id="unauthorized-agentic-user"
+                    ),
+                    fmi_cache=_FmiCache(),
+                    user_cache=_UserTokenCache(),
+                )
+        user_fic = [c for c in capture if c["grant_type"] == "user_fic"]
+        assert len(user_fic) == 1
+        assert user_fic[0]["user_id"] == "unauthorized-agentic-user"
 
 
 # ---------------------------------------------------------------------------
@@ -2486,33 +2500,6 @@ class TestIdempotencyCache:
         assert "fresh" in cache.seen
         assert "probe" in cache.seen
 
-    def test_m3_preseed_suppresses_delivery__known_residual_deferred_to_86(
-        self,
-    ) -> None:
-        # #100/M3 (dedupe pre-seed) is a KNOWN, redesign-blocked residual,
-        # re-tagged to #86 (v0.9.3). This test LOCKS the current behaviour so
-        # the eventual redesign is a deliberate, visible change rather than a
-        # silent one: the dedupe key is body-only (`{len(conv)}:{conv}:{id}`),
-        # so a caller who pre-seeds a victim's (conversation, activity) id can
-        # make the genuine delivery look like a duplicate and be dropped.
-        #
-        # This is NOT a live-fix — the parent #100 hardening (H1/H1-tenant/M1/
-        # M2/L4) shipped in v0.8.2 and backstops exploitability (a pre-seed
-        # needs a platform-issued token for our blueprint+tenant AND predicting
-        # the server-assigned activityId; impact is suppression/availability,
-        # not integrity/exfil). A real fix needs a per-delivery server signal
-        # (#86 activity-bridge redesign).
-        cache = _IdempotencyCache(ttl_seconds=3600.0)
-        key = _activity_delivery_id(
-            {"conversation": {"id": "conv-victim"}, "id": "act-42"}
-        )
-        assert key is not None
-        # Attacker pre-seeds the key…
-        assert cache.is_duplicate(key, now=100.0) is False
-        # …so the victim's genuine delivery is (currently) suppressed.
-        assert cache.is_duplicate(key, now=101.0) is True
-
-
 class TestServeAppDedupe:
     def test_duplicate_delivery_short_circuits_webhook(self) -> None:
         cfg = _cfg()
@@ -2530,6 +2517,59 @@ class TestServeAppDedupe:
         # Webhook + reply only fired once across both POSTs.
         assert len(capture["webhook"]) == 1
         assert len(capture["reply"]) == 1
+
+    def test_m3_authenticated_preseed_suppresses_later_delivery__known_residual(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        # #100/M3 is an unresolved availability residual owned by #86. Drive
+        # the real route with a valid platform token: two different activities
+        # sharing the body-derived (conversation.id, activity.id) key collide,
+        # so the later legitimate delivery never reaches the webhook.
+        priv, jwk = rsa_keypair
+        cfg = _cfg()
+        cfg.tenant_id = TEST_TENANT_ID
+        cfg.blueprint_client_id = "bot-app-id"
+        preseed_token = _make_token(
+            priv, aud=cfg.blueprint_client_id, extra={"jti": "preseed-token"}
+        )
+        victim_token = _make_token(
+            priv, aud=cfg.blueprint_client_id, extra={"jti": "victim-token"}
+        )
+
+        preseed = _inbound_message_activity(conv_id="conv-victim")
+        victim = _inbound_message_activity(
+            conv_id="conv-victim", agentic_user_id="victim-agentic-user"
+        )
+        for activity in (preseed, victim):
+            activity["id"] = "predicted-activity-id"
+            activity["conversation"]["tenantId"] = TEST_TENANT_ID
+            activity["recipient"]["tenantId"] = TEST_TENANT_ID
+            activity["recipient"]["agenticAppId"] = cfg.blueprint_client_id
+        preseed["type"] = "conversationUpdate"
+        preseed["from"] = {"id": "preseed-caller"}
+        victim["from"] = {"id": "victim-caller"}
+        victim["text"] = "legitimate delivery"
+
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(cfg, capture=capture, jwk=jwk) as client:
+            unauthenticated = client.post("/api/messages", json=preseed)
+            first = client.post(
+                "/api/messages",
+                json=preseed,
+                headers={"Authorization": f"Bearer {preseed_token}"},
+            )
+            second = client.post(
+                "/api/messages",
+                json=victim,
+                headers={"Authorization": f"Bearer {victim_token}"},
+            )
+
+        assert unauthenticated.status_code == 401
+        assert first.status_code == 200
+        assert first.json()["status"] == "acked"
+        assert second.status_code == 200
+        assert second.json()["status"] == "duplicate"
+        assert capture == {"webhook": [], "reply": [], "token": []}
 
     def test_deduped_invoke_returns_benign_ack_not_marker(self) -> None:
         # #96 — a deduped *invoke* must not return the {status:duplicate} marker
