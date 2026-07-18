@@ -676,6 +676,35 @@ class TestValidateInboundJwt:
         assert claims["azp"] == TEST_APX_AZP
         assert claims["iss"] == TEST_AAD_ISSUER
 
+    async def test_agentic_user_id_axis_backstopped_not_asserted(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        # #107: the A365 inbound token is a SERVICE token — the caller is the
+        # platform Messaging Bot SP (`azp`), and it carries NO end-user claim
+        # (no `sub`, no `oid`). So recipient.agenticUserId (the third
+        # body-supplied identity axis) cannot be pinned to the JWT client-side
+        # the way agenticAppId (H1) and tenantId (H1/tenant) are — there is
+        # nothing to compare it against. It is backstopped server-side by
+        # Entra's user-FIC grant instead (see acquire_outbound_token).
+        #
+        # This LOCKS the token-model assumption: if the A365 inbound token
+        # ever grows an end-user claim, this test trips and the "won't-assert"
+        # decision for #107 must be revisited (pin agenticUserId to the claim).
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id")
+        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
+            claims = await validate_inbound_jwt(
+                token=token,
+                tenant_id=TEST_TENANT_ID,
+                expected_app_id="bot-app-id",
+                client=client,
+                cache=_JwksCache(),
+            )
+        assert "sub" not in claims, "token model changed — revisit #107"
+        assert "oid" not in claims, "token model changed — revisit #107"
+        # The validated caller is the platform SP, not the end user.
+        assert claims["azp"] == TEST_APX_AZP
+
     async def test_wrong_audience_rejected(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
@@ -2446,6 +2475,32 @@ class TestIdempotencyCache:
         assert "old" not in cache.seen
         assert "fresh" in cache.seen
         assert "probe" in cache.seen
+
+    def test_m3_preseed_suppresses_delivery__known_residual_deferred_to_86(
+        self,
+    ) -> None:
+        # #100/M3 (dedupe pre-seed) is a KNOWN, redesign-blocked residual,
+        # re-tagged to #86 (v0.9.3). This test LOCKS the current behaviour so
+        # the eventual redesign is a deliberate, visible change rather than a
+        # silent one: the dedupe key is body-only (`{len(conv)}:{conv}:{id}`),
+        # so a caller who pre-seeds a victim's (conversation, activity) id can
+        # make the genuine delivery look like a duplicate and be dropped.
+        #
+        # This is NOT a live-fix — the parent #100 hardening (H1/H1-tenant/M1/
+        # M2/L4) shipped in v0.8.2 and backstops exploitability (a pre-seed
+        # needs a platform-issued token for our blueprint+tenant AND predicting
+        # the server-assigned activityId; impact is suppression/availability,
+        # not integrity/exfil). A real fix needs a per-delivery server signal
+        # (#86 activity-bridge redesign).
+        cache = _IdempotencyCache(ttl_seconds=3600.0)
+        key = _activity_delivery_id(
+            {"conversation": {"id": "conv-victim"}, "id": "act-42"}
+        )
+        assert key is not None
+        # Attacker pre-seeds the key…
+        assert cache.is_duplicate(key, now=100.0) is False
+        # …so the victim's genuine delivery is (currently) suppressed.
+        assert cache.is_duplicate(key, now=101.0) is True
 
 
 class TestServeAppDedupe:

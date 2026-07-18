@@ -4,6 +4,36 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — Unreleased
+
+Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
+Gated by the #123 focused hardening walk. Entries accumulate here per PR and
+this heading is dated at release.
+
+### Security / docs
+
+- **#100 / #107 — inbound trust-boundary residuals closed as documented.** The
+  #100 hardening (H1/H1-tenant/M1/M2/L4) shipped in v0.8.2; a scoping deep-read
+  confirmed it live at the v0.8.5 tip. The two residuals are now closed on an
+  honest basis rather than a speculative fix: **#107** — a client-side assert of
+  `recipient.agenticUserId` against the inbound JWT is **infeasible** (A365
+  inbound tokens are service tokens with no `sub`/`oid`), so the Entra `user_fic`
+  server-side backstop is documented at the mint site and locked by a regression
+  test that trips if the token model ever grows an end-user claim; **#100 M3**
+  (dedupe pre-seed) is redesign-blocked (the `azp` key is a verified no-op on
+  Path A) and re-tagged to #86 (v0.9.3), with a behaviour-lock test recording the
+  current suppress-on-pre-seed semantics. Also corrected a stale module docstring
+  that still advertised the pre-M2 `serviceUrl` allowlist.
+
+### Tests
+
+- **#118 — test suite is hermetic under `pytest-randomly`.** An autouse
+  `conftest` fixture gives every test a fresh `$HOME`/`$HERMES_HOME`, so adapter
+  tests that use the default conversations path no longer read/write the real
+  `~/.hermes` or leak registry state across tests. Fixes the order-dependent
+  `TestPruneConversations` flake and stops the suite polluting the developer's
+  home dir.
+
 ## [0.8.5] — 2026-07-16
 
 Security point release — no new surfaces, no walk. Closes the eight

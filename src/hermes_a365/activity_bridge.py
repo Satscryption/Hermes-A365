@@ -46,14 +46,18 @@ Auth wiring (validated end-to-end against the satscryption tenant
   retries. Default TTL 1h via ``BridgeConfig.idempotency_ttl_seconds``.
   Activities without an ``id`` (some channel-control flows) bypass
   dedupe — better to over-deliver than to silently drop on missing id.
-- **Inbound serviceUrl gate** (slice 19j): the inbound activity's
-  ``serviceUrl`` must be HTTPS with a hostname ending in one of
-  ``BridgeConfig.trusted_service_url_suffixes`` before the bridge
-  mints any outbound bearer. Default suffixes:
-  ``.trafficmanager.net`` (the load-bearing one — observed on real
-  Teams traffic), ``.botframework.com``, ``.botframework.us``,
-  ``.cloud.microsoft``, ``.azure.com``. Empty allowlist refuses all
-  (treated as a config bug).
+- **Inbound serviceUrl gate** (slice 19j, hardened by #100/M2): the
+  inbound activity's ``serviceUrl`` must be HTTPS and its hostname must
+  shape-match one of ``BridgeConfig.trusted_service_url_suffixes``
+  before the bridge mints any outbound bearer. The shipped defaults
+  (``DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES``) are
+  ``smba.trafficmanager.net`` (an **exact host** — bare
+  ``.trafficmanager.net`` is customer-registrable, so it is NOT a broad
+  suffix), ``.botframework.com``, ``.botframework.us``, and
+  ``.cloud.microsoft``. ``.azure.com`` is deliberately absent (also
+  registrable + unattested by real traffic). Empty allowlist refuses
+  all (treated as a config bug). See the constant's own comment for the
+  full rationale.
 - **Outbound auth** (slice 19e, supersedes the pre-19e BF
   ``client_credentials`` flow that AADSTS82001'd for A365 agentic
   apps — see issue #6 for the upstream defect): three-stage agentic
@@ -1641,6 +1645,19 @@ async def acquire_outbound_token(
             "mint an outbound token against a body-supplied tenant"
         )
 
+    # #107 (agenticUserId axis) — the THIRD body-supplied identity field,
+    # recipient.agenticUserId, is deliberately NOT asserted client-side here, unlike
+    # agenticAppId (H1) and tenantId (H1/tenant) above. There is nothing to assert it
+    # against: the A365 inbound token is a SERVICE token (azp = the platform Messaging
+    # Bot SP) carrying NO end-user claim — no `sub`, no `oid` (see validate_inbound_jwt
+    # and the _make_token test fixture). agenticUserId is instead backstopped
+    # SERVER-SIDE by Entra's user-FIC grant in acquire_user_fic_token below: Entra
+    # issues the delegated token only if the azp-allowlisted platform is authorised to
+    # act for that user. The #106 review and #107 verified a client-side assert is
+    # infeasible on this token model. If the inbound token shape ever grows an end-user
+    # claim, revisit and pin agenticUserId to it here. (Locked by
+    # test_agentic_user_id_axis_backstopped_not_asserted.)
+    #
     # Tier-2: per-user access token at the target scope. Key on the full identity
     # tuple (matching _FmiCache) — a (user, scope)-only key would collide across
     # agent identities (#100-M1).
