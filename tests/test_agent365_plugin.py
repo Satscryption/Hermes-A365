@@ -1602,6 +1602,32 @@ class TestLifecycleCapture:
             assert r.status_code == 200, r.text
         assert len(a._seen_inbounds_this_lifetime) <= 3
 
+    def test_seen_inbounds_bound_never_evicts_the_current_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # L2 (#105) routing invariant: the bound must never evict the chat
+        # just received — send()'s reply-vs-proactive gate keys off its
+        # membership in _seen_inbounds_this_lifetime, so evicting it would
+        # misroute THIS turn's response to sendToConversation.
+        monkeypatch.setattr(adapter_mod, "_MAX_SEEN_INBOUNDS", 4)
+        a = _make_adapter(monkeypatch)
+        # Fill the seen-set to the cap with unrelated chats.
+        for i in range(4):
+            a._seen_inbounds_this_lifetime.add(f"other-{i}")
+        assert len(a._seen_inbounds_this_lifetime) == 4
+        client = self._client(a, monkeypatch)
+        body = _make_inbound(
+            path="B", conv_id="fresh-chat", activity_id="act-fresh"
+        )
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.status_code == 200, r.text
+        # The just-received chat is retained (so send() takes the reply path,
+        # not proactive) and the cap still holds.
+        assert "fresh-chat" in a._seen_inbounds_this_lifetime
+        assert len(a._seen_inbounds_this_lifetime) <= 4
+
 
 class TestServeAppAgentsChannelFilter:
     """Route-level coverage for the slice 19q filter — same shape

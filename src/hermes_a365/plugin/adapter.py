@@ -1161,11 +1161,20 @@ class Agent365Adapter(BasePlatformAdapter):
                 # has captured an inbound for this chat. Drives the
                 # send() gate that picks replyToActivity vs
                 # sendToConversation. Per-lifetime, not persisted.
-                self._seen_inbounds_this_lifetime.add(ref.conversation_id)
-                # L2 (#105): bound the set. set.pop() drops an arbitrary
-                # element — fine here (see _MAX_SEEN_INBOUNDS).
-                while len(self._seen_inbounds_this_lifetime) > _MAX_SEEN_INBOUNDS:
-                    self._seen_inbounds_this_lifetime.pop()
+                seen = self._seen_inbounds_this_lifetime
+                seen.add(ref.conversation_id)
+                # L2 (#105): bound the set, but NEVER evict the chat we just
+                # received — the send() gate above routes reply-vs-proactive
+                # off its membership, so evicting it would misroute THIS turn's
+                # response to sendToConversation. Trim arbitrary OTHER entries
+                # down to the cap (set.pop() can't hit a discarded key).
+                if len(seen) > _MAX_SEEN_INBOUNDS:
+                    seen.discard(ref.conversation_id)
+                    # ``and seen`` guards the degenerate cap<=0 case (would
+                    # otherwise pop() an empty set → KeyError).
+                    while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
+                        seen.pop()
+                    seen.add(ref.conversation_id)
                 self._persist_conversations()
 
             # Build event + dispatch through Hermes' loop.
