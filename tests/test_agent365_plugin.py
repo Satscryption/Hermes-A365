@@ -1529,6 +1529,79 @@ class TestLifecycleCapture:
         assert "conv-rm" not in a._conversations
         assert "conv-rm" not in a._seen_inbounds_this_lifetime
 
+    def test_evict_tears_down_stream_and_coalesced_state(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # L3 (#105): uninstall must drop live stream / coalesced-reply /
+        # coalesced-status slots for the chat AND cancel their watchdog tasks,
+        # so no debounce later fires a doomed POST into the evicted chat. An
+        # unrelated chat's state must survive.
+        a = _make_adapter(monkeypatch)
+        seed = _make_inbound(path="B", conv_id="conv-rm")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
+        a._seen_inbounds_this_lifetime.add("conv-rm")
+
+        a._active_stream_by_chat["conv-rm"] = "sid-1"
+        a._streams["sid-1"] = {"bf_stream_id": "sid-1"}
+        reply_task = MagicMock()
+        a._active_coalesced_reply_by_chat["conv-rm"] = "mid-1"
+        a._coalesced_replies["mid-1"] = {"content": "partial"}
+        a._coalesced_reply_tasks["mid-1"] = reply_task
+        status_task = MagicMock()
+        a._coalesced_status["status:conv-rm:s1"] = {"chat_id": "conv-rm", "lines": []}
+        a._coalesced_status_tasks["status:conv-rm:s1"] = status_task
+
+        # Unrelated chat — must be untouched.
+        other_task = MagicMock()
+        a._active_coalesced_reply_by_chat["conv-other"] = "mid-other"
+        a._coalesced_replies["mid-other"] = {"content": "keep"}
+        a._coalesced_reply_tasks["mid-other"] = other_task
+
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="conv-rm", type="installationUpdate", action="remove"
+        )
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.json() == {"status": "acked", "lifecycle": "evict"}
+
+        assert "conv-rm" not in a._active_stream_by_chat
+        assert "sid-1" not in a._streams
+        assert "conv-rm" not in a._active_coalesced_reply_by_chat
+        assert "mid-1" not in a._coalesced_replies
+        assert "mid-1" not in a._coalesced_reply_tasks
+        reply_task.cancel.assert_called_once()
+        assert "status:conv-rm:s1" not in a._coalesced_status
+        assert "status:conv-rm:s1" not in a._coalesced_status_tasks
+        status_task.cancel.assert_called_once()
+
+        # Unrelated chat's coalesced state + watchdog survive.
+        assert a._coalesced_replies["mid-other"] == {"content": "keep"}
+        assert "conv-other" in a._active_coalesced_reply_by_chat
+        other_task.cancel.assert_not_called()
+
+    def test_seen_inbounds_set_stays_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # L2 (#105): the per-lifetime seen-set can't grow without limit on a
+        # long-running gateway. With a low cap, posting more distinct chats
+        # than the cap keeps the set bounded.
+        monkeypatch.setattr(adapter_mod, "_MAX_SEEN_INBOUNDS", 3)
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        for i in range(8):
+            body = _make_inbound(
+                path="B", conv_id=f"conv-{i}", activity_id=f"act-{i}"
+            )
+            r = client.post(
+                "/api/messages",
+                json=body,
+                headers={"Authorization": "Bearer pretend"},
+            )
+            assert r.status_code == 200, r.text
+        assert len(a._seen_inbounds_this_lifetime) <= 3
+
 
 class TestServeAppAgentsChannelFilter:
     """Route-level coverage for the slice 19q filter — same shape
@@ -2595,6 +2668,46 @@ class TestConversationRef:
         payload["future_field_we_dont_know_about"] = "ok"
         ref = adapter_mod.ConversationRef.from_dict(payload)
         assert ref.conversation_id == "conv-1"
+
+    @pytest.mark.parametrize("bad_raw", ["oops", ["a", "b"], 42, None, True])
+    def test_from_dict_coerces_non_dict_raw_to_empty(self, bad_raw: Any) -> None:
+        # M10 (#105): a corrupted / hand-edited conversations.json may carry a
+        # non-dict `raw`. It must not round-trip as-is — downstream send/edit/
+        # proactive paths call `raw.get(...)` and would AttributeError,
+        # permanently breaking that conversation. Coerced to {}.
+        ref = adapter_mod.ConversationRef.from_dict(
+            {"conversation_id": "c", "service_url": "https://x/", "raw": bad_raw}
+        )
+        assert ref.raw == {}
+
+    def test_corrupt_raw_survives_registry_load(self, tmp_path: Path) -> None:
+        # M10 (#105) end-to-end: a persisted registry with a non-dict `raw`
+        # loads cleanly and the entry is usable — ref.raw is {} so the
+        # `raw.get(...)` calls that used to crash are safe.
+        import json
+
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        path = tmp_path / "convs.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "conversations": [
+                        {
+                            "conversation_id": "conv-corrupt",
+                            "service_url": "https://x/",
+                            "raw": "not-a-dict",
+                        }
+                    ],
+                }
+            )
+        )
+        reg = ConversationRegistry.load(path)
+        ref = reg.get("conv-corrupt")
+        assert ref is not None
+        assert ref.raw == {}
+        assert ref.raw.get("conversation") is None  # the call that used to crash
 
 
 class TestConversationRegistry:

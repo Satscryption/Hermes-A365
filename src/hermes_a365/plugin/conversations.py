@@ -71,7 +71,13 @@ class ConversationRef:
         # back to their dataclass defaults.
         valid = {f for f in cls.__dataclass_fields__}
         kwargs = {k: v for k, v in payload.items() if k in valid}
-        kwargs.setdefault("raw", payload.get("raw") or {})
+        # M10 (#105): a corrupted / hand-edited conversations.json can carry a
+        # non-dict ``raw`` (e.g. ``"raw": "oops"``). It round-trips through
+        # ``load()`` and then crashes the first send/edit/proactive path with
+        # ``AttributeError`` on ``raw.get(...)``, breaking that conversation
+        # permanently. Coerce any non-dict (or absent) ``raw`` to ``{}``.
+        if not isinstance(kwargs.get("raw"), dict):
+            kwargs["raw"] = {}
         # Required fields
         kwargs.setdefault("conversation_id", payload.get("conversation_id", ""))
         kwargs.setdefault("service_url", payload.get("service_url", ""))

@@ -25,6 +25,22 @@ this heading is dated at release.
   behavior. Also corrected a stale module docstring that still advertised the
   pre-M2 `serviceUrl` allowlist.
 
+### Reliability (#105)
+
+- **M10 — a corrupt conversation registry no longer permanently breaks a chat.**
+  `ConversationRef.from_dict` now coerces a non-dict `raw` (from a
+  hand-edited/corrupted `conversations.json`) to `{}`, so the next
+  send/edit/proactive path can't `AttributeError` on `raw.get(...)`.
+- **L3 — lifecycle evict tears down live stream/coalesced state.** On uninstall,
+  the adapter now drops the chat's stream, coalesced-reply, and coalesced-status
+  slots and **cancels their debounce watchdog tasks** — so a watchdog can no
+  longer fire a doomed POST into a conversation the tenant removed the agent
+  from. Unrelated chats are untouched.
+- **L2 — the per-lifetime "seen this chat" set is bounded** (`_MAX_SEEN_INBOUNDS`),
+  so a long-running gateway can't grow it without limit.
+
+  (H4 coalesced-reply drop and M11 registry growth land in later #105 PRs.)
+
 ### Tests
 
 - **#118 — test suite is hermetic under randomized order.** An autouse
