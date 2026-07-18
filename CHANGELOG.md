@@ -19,7 +19,9 @@ this heading is dated at release.
   `recipient.agenticUserId` against the inbound JWT is **infeasible** (A365
   inbound tokens are service tokens with no `sub`/`oid`), so the Entra `user_fic`
   server-side backstop is documented at the mint site and locked by a regression
-  test that trips if the token model ever grows an end-user claim; **#100 M3**
+  test that drives the real mint and asserts it stays claims-blind (mints under
+  the *body* agenticUserId), so wiring JWT claims into the mint trips a re-review;
+  **#100 M3**
   (dedupe pre-seed) is redesign-blocked (the `azp` key is a verified no-op on
   Path A) and re-tagged to #86 (v0.9.3), with a behaviour-lock test recording the
   current suppress-on-pre-seed semantics. Also corrected a stale module docstring

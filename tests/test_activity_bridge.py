@@ -676,35 +676,6 @@ class TestValidateInboundJwt:
         assert claims["azp"] == TEST_APX_AZP
         assert claims["iss"] == TEST_AAD_ISSUER
 
-    async def test_agentic_user_id_axis_backstopped_not_asserted(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
-    ) -> None:
-        # #107: the A365 inbound token is a SERVICE token — the caller is the
-        # platform Messaging Bot SP (`azp`), and it carries NO end-user claim
-        # (no `sub`, no `oid`). So recipient.agenticUserId (the third
-        # body-supplied identity axis) cannot be pinned to the JWT client-side
-        # the way agenticAppId (H1) and tenantId (H1/tenant) are — there is
-        # nothing to compare it against. It is backstopped server-side by
-        # Entra's user-FIC grant instead (see acquire_outbound_token).
-        #
-        # This LOCKS the token-model assumption: if the A365 inbound token
-        # ever grows an end-user claim, this test trips and the "won't-assert"
-        # decision for #107 must be revisited (pin agenticUserId to the claim).
-        priv, jwk = rsa_keypair
-        token = _make_token(priv, aud="bot-app-id")
-        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
-            claims = await validate_inbound_jwt(
-                token=token,
-                tenant_id=TEST_TENANT_ID,
-                expected_app_id="bot-app-id",
-                client=client,
-                cache=_JwksCache(),
-            )
-        assert "sub" not in claims, "token model changed — revisit #107"
-        assert "oid" not in claims, "token model changed — revisit #107"
-        # The validated caller is the platform SP, not the end user.
-        assert claims["azp"] == TEST_APX_AZP
-
     async def test_wrong_audience_rejected(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
@@ -1321,6 +1292,45 @@ class TestAcquireOutboundToken:
             )
         (key,) = user.by_key
         assert key == ("tenant-1", "blueprint-app-id", "user-A", APX_PRODUCTION_SCOPE)
+
+    async def test_107_mint_takes_user_axis_from_body_not_a_jwt_claim(self) -> None:
+        # #107 (won't-assert lock) — the user axis of the mint (agenticUserId)
+        # is deliberately NOT bound to an inbound-JWT claim, unlike the app-id
+        # (H1) and tenant (H1/tenant) axes. A365 inbound tokens are service
+        # tokens with no `sub`/`oid`, so there is nothing to pin against; the
+        # axis is taken from the body and backstopped server-side by Entra's
+        # user-FIC grant. This LOCKS that decision by driving the real mint:
+        #
+        #   1. acquire_outbound_token's signature carries no claims/token param
+        #      (it is claims-blind by construction), and
+        #   2. the user_fic POST mints under the *body* agenticUserId verbatim.
+        #
+        # If a future change threads validated claims into the mint to pin the
+        # user axis, (1) breaks; if it swaps the body value for a claim, (2)
+        # breaks. Either way the #107 decision gets a deliberate re-review.
+        import inspect
+
+        params = set(inspect.signature(acquire_outbound_token).parameters)
+        assert "claims" not in params and "token" not in params, (
+            "acquire_outbound_token grew a claims/token param — the #107 "
+            "won't-assert decision for agenticUserId must be revisited"
+        )
+
+        a = _inbound_message_activity(agentic_user_id="body-supplied-user-x")
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(),
+                activity=a,
+                fmi_cache=_FmiCache(),
+                user_cache=_UserTokenCache(),
+            )
+        user_fic = [c for c in capture if c["grant_type"] == "user_fic"]
+        assert len(user_fic) == 1
+        assert user_fic[0]["user_id"] == "body-supplied-user-x"
 
 
 # ---------------------------------------------------------------------------

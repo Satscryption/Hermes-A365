@@ -1656,7 +1656,8 @@ async def acquire_outbound_token(
     # act for that user. The #106 review and #107 verified a client-side assert is
     # infeasible on this token model. If the inbound token shape ever grows an end-user
     # claim, revisit and pin agenticUserId to it here. (Locked by
-    # test_agentic_user_id_axis_backstopped_not_asserted.)
+    # test_107_mint_takes_user_axis_from_body_not_a_jwt_claim, which drives the real
+    # mint and asserts this function stays claims-blind + mints under the body user.)
     #
     # Tier-2: per-user access token at the target scope. Key on the full identity
     # tuple (matching _FmiCache) — a (user, scope)-only key would collide across
