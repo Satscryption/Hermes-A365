@@ -48,6 +48,9 @@ bridge = [
 dev = [
   "pytest>=8.0",
   "pytest-asyncio>=0.24",
+  # #118: auto-shuffles test order on every run (the plugin self-activates
+  # on install), so order-dependent state is caught in CI, not just by luck.
+  "pytest-randomly>=3.15",
   "ruff>=0.5",
   # Bridge stack is installed in dev too so tests can exercise it.
   "fastapi>=0.115",

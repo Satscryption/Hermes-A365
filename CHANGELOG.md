@@ -29,12 +29,14 @@ this heading is dated at release.
 
 ### Tests
 
-- **#118 — test suite is hermetic under `pytest-randomly`.** An autouse
+- **#118 — test suite is hermetic under randomized order.** An autouse
   `conftest` fixture gives every test a fresh `$HOME`/`$HERMES_HOME`, so adapter
   tests that use the default conversations path no longer read/write the real
   `~/.hermes` or leak registry state across tests. Fixes the order-dependent
   `TestPruneConversations` flake and stops the suite polluting the developer's
-  home dir.
+  home dir. `pytest-randomly` is now a declared `dev` dependency, so the guard
+  is **live** — CI's plain `uv run pytest` auto-shuffles order on every run, and
+  a future order-dependent test fails instead of passing by luck.
 
 ## [0.8.5] — 2026-07-16
 
