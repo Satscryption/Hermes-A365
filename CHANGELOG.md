@@ -4,6 +4,38 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] — Unreleased
+
+Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
+Gated by the #123 focused hardening walk. Entries accumulate here per PR and
+this heading is dated at release.
+
+### Security / docs
+
+- **#100 regression locks / #107 client-side characterization.** The
+  #100 hardening (H1/H1-tenant/M1/M2/L4) shipped in v0.8.2; a scoping deep-read
+  confirmed it live at the v0.8.5 tip. **#107** — no currently validated inbound
+  claim is documented as `recipient.agenticUserId`; `sub`/`oid`, when present on
+  app-only tokens, identify the authenticated caller/subject rather than the
+  agentic user. The mint-site documentation and tests now characterize the body-
+  driven `user_fic` request and verify token-endpoint rejection fails closed.
+  Live positive/negative Entra validation remains required by #107/#123.
+  **#100 M3** (dedupe pre-seed) remains unresolved and is explicitly owned by #86
+  (v0.9.3); a signed-token route test records the current suppress-on-pre-seed
+  behavior. Also corrected a stale module docstring that still advertised the
+  pre-M2 `serviceUrl` allowlist.
+
+### Tests
+
+- **#118 — test suite is hermetic under randomized order.** An autouse
+  `conftest` fixture gives every test a fresh `$HOME`/`$HERMES_HOME`, so adapter
+  tests that use the default conversations path no longer read/write the real
+  `~/.hermes` or leak registry state across tests. Fixes the order-dependent
+  `TestPruneConversations` flake and stops the suite polluting the developer's
+  home dir. `pytest-randomly` is now a declared `dev` dependency, so the guard
+  is **live** — CI's plain `uv run pytest` auto-shuffles order on every run, and
+  a future order-dependent test fails instead of passing by luck.
+
 ## [0.8.5] — 2026-07-16
 
 Security point release — no new surfaces, no walk. Closes the eight
