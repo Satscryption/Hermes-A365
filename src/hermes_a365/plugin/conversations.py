@@ -30,7 +30,7 @@ import os
 import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 logger = logging.getLogger(__name__)
 
@@ -74,28 +74,155 @@ class ConversationRef:
         # M10 (#105): a corrupted / hand-edited conversations.json can carry a
         # non-dict ``raw`` (e.g. ``"raw": "oops"``). It round-trips through
         # ``load()`` and then crashes the first send/edit/proactive path with
-        # ``AttributeError`` on ``raw.get(...)``, breaking that conversation
-        # permanently. Coerce any non-dict (or absent) ``raw`` to ``{}``.
-        if not isinstance(kwargs.get("raw"), dict):
+        # ``AttributeError`` on ``raw.get(...)``, breaking that conversation.
+        # M11 (#105) review: M10 only guards a *non-dict* raw — a PRE-M11 file
+        # (full untrimmed raw) or a corrupted one can carry a *dict* raw that is
+        # oversized or nested arbitrarily deep, which would later RecursionError
+        # ``to_payload()``/save (outside the save's ``OSError`` guard) and
+        # permanently break persistence. Re-project a dict raw through the SAME
+        # size-bounded allowlist the inbound path uses: this bounds it AND
+        # preserves the identity/routing keys (so a pinned proactive target
+        # keeps working across an upgrade), falling to ``{}`` only when the raw
+        # is unroutable/corrupt. ``_project_cached_raw`` fails closed on
+        # ``RecursionError`` internally, so a deep raw never reaches ``asdict``.
+        raw_val = kwargs.get("raw")
+        if isinstance(raw_val, dict):
+            kwargs["raw"] = cls._project_cached_raw(raw_val) or {}
+        else:
             kwargs["raw"] = {}
         # Required fields
         kwargs.setdefault("conversation_id", payload.get("conversation_id", ""))
         kwargs.setdefault("service_url", payload.get("service_url", ""))
         return cls(**kwargs)
 
+    # M11 (#105): the cached ``raw`` is an ALLOWLIST projection of the inbound
+    # activity — only the top-level keys the outbound/mint paths read (verified
+    # against a full consumer trace). Everything else — attachments,
+    # channelData, text, and any *unknown* vendor field — is dropped, so no
+    # valid inbound can create an arbitrarily large durable entry (a denylist
+    # would let unknown large keys through; bounded storage is M11's goal).
+    _RAW_KEEP_TOP = frozenset(
+        {"conversation", "serviceUrl", "recipient", "from", "id", "channelId", "type"}
+    )
+    # Backstop for nested bloat: if a KEPT dict (conversation/from/recipient)
+    # still carries an oversized nested value, fall back to a minimal subkey
+    # projection so per-entry size is bounded regardless of nesting.
+    _RAW_MAX_BYTES = 16384
+    # ClassVar → not a @dataclass field. Kept dict → subkeys to retain when the
+    # allowlisted raw overflows _RAW_MAX_BYTES.
+    _RAW_MIN_PROJECTION: ClassVar[dict[str, tuple[str, ...]]] = {
+        "conversation": ("id", "tenantId", "conversationType", "name"),
+        "recipient": ("id", "name", "agenticAppId", "agenticUserId", "tenantId"),
+        "from": ("id", "name"),
+    }
+
+    @staticmethod
+    def _fits(payload: dict[str, Any], ceiling: int) -> bool:
+        """True iff ``payload`` serializes within ``ceiling`` bytes under the
+        same serialization *flags* ``write_payload`` uses.
+
+        Measured with ``indent=2, sort_keys=True`` (matching ``write_payload``)
+        — NOT a compact dump — because indentation cost grows with nesting
+        depth, so a deeply-nested kept sub-object can be tiny compact yet
+        balloon the on-disk artifact. This measures ``payload`` **standalone**;
+        on disk the projection is nested a few levels deeper (so ~+6 bytes/line)
+        and its routing scalars are also duplicated into the top-level
+        ``ConversationRef`` fields, so the whole on-disk entry runs ~2x this
+        figure — a small constant multiple, not unbounded. A payload that can't
+        be serialized or bounded — ``TypeError``/``ValueError`` (incl. a circular
+        ref) or ``RecursionError`` (pathological nesting depth) — fails closed as
+        over-ceiling, so the caller falls back to the flat minimal projection
+        (or rejects)."""
+        try:
+            return (
+                len(json.dumps(payload, indent=2, sort_keys=True, default=str))
+                <= ceiling
+            )
+        except (TypeError, ValueError, RecursionError):
+            return False
+
+    @classmethod
+    def _project_cached_raw(cls, activity: dict[str, Any]) -> dict[str, Any] | None:
+        """Build the size-bounded cached ``raw`` (#105/M11), or ``None`` when
+        even the minimal routing projection can't fit ``_RAW_MAX_BYTES``.
+
+        Order: (1) allowlist the top-level keys the outbound paths read and
+        return that if it fits; (2) if a kept dict still carries an oversized
+        nested value, fall back to a minimal identity-only subkey projection;
+        (3) if even that overflows — a retained identity field (a routing id/URL
+        such as ``id``/``serviceUrl``/``conversation.id``, *or* a retained
+        display name such as ``conversation.name``/``from.name``) is itself
+        unreasonably large — return ``None`` so ``from_activity`` rejects the
+        activity as unroutable. We never truncate (trimming an id/URL would
+        silently retarget a reply or token; the minimal projection is
+        all-or-nothing), so an oversized identity field is a hard reject.
+        The return is a projection whose **standalone** serialized size is
+        ``<= _RAW_MAX_BYTES`` (or ``None``); since every top-level
+        ``ConversationRef`` field is drawn from these same projected keys, an
+        accepted ref's whole on-disk entry is bounded to a small constant
+        multiple of that ceiling (see ``_fits``) — bounded, never unbounded."""
+        raw = {k: v for k, v in activity.items() if k in cls._RAW_KEEP_TOP}
+        if cls._fits(raw, cls._RAW_MAX_BYTES):
+            return raw
+        out: dict[str, Any] = {}
+        for key, subkeys in cls._RAW_MIN_PROJECTION.items():
+            src = activity.get(key)
+            if isinstance(src, dict):
+                out[key] = {k: src[k] for k in subkeys if k in src}
+        for scalar in ("serviceUrl", "id", "channelId", "type"):
+            if scalar in activity:
+                out[scalar] = activity[scalar]
+        if cls._fits(out, cls._RAW_MAX_BYTES):
+            return out
+        return None  # a retained identity field too large → reject, never trim
+
     @classmethod
     def from_activity(cls, activity: dict[str, Any]) -> ConversationRef | None:
         """Build a ``ConversationRef`` from an inbound BF activity.
 
-        Returns ``None`` when the activity is missing the load-bearing
-        ``conversation.id`` — the caller should treat that as
-        un-routable rather than persist a bad entry.
+        Returns ``None`` when the activity is un-routable — the caller treats
+        that as ack-and-skip rather than persisting a bad entry. Two cases:
+        the load-bearing ``conversation.id`` is missing, or the minimal identity
+        projection can't fit ``_RAW_MAX_BYTES`` (any retained identity field is
+        unreasonably large — the routing ids/URL *or* a retained display name
+        like ``conversation.name``/``from.name``; #105/M11 review). We reject
+        rather than truncate, since trimming an id/URL would silently retarget
+        replies/tokens.
         """
         conv = activity.get("conversation") or {}
         if not isinstance(conv, dict):
             return None
         conv_id = conv.get("id")
         if not conv_id:
+            return None
+        # M11 (#105): build the size-bounded PROJECTION first — a *new* dict,
+        # never the passed-in activity (the capturing turn still reads it for
+        # media/text extraction). ``None`` means the minimal identity projection
+        # is itself over-ceiling (a routing id/URL or a retained display name is
+        # oversized) → reject the whole activity, which also bounds the
+        # top-level fields below (all drawn from these same projected keys).
+        raw = cls._project_cached_raw(activity)
+        if raw is None:
+            sender = activity.get("from") if isinstance(activity.get("from"), dict) else {}
+            recip = (
+                activity.get("recipient")
+                if isinstance(activity.get("recipient"), dict)
+                else {}
+            )
+            logger.warning(
+                "agent365 conversations: identity projection exceeds %d bytes — "
+                "rejecting as unroutable rather than persisting an unbounded "
+                "entry (byte-lengths conv.id=%d conv.name=%d serviceUrl=%d "
+                "from.id=%d from.name=%d recipient.name=%d activity.id=%d)",
+                cls._RAW_MAX_BYTES,
+                len(str(conv_id)),
+                len(str(conv.get("name") or "")),
+                len(str(activity.get("serviceUrl") or "")),
+                len(str(sender.get("id") or "")),
+                len(str(sender.get("name") or "")),
+                len(str(recip.get("name") or "")),
+                len(str(activity.get("id") or "")),
+            )
             return None
         sender = activity.get("from") or {}
         if not isinstance(sender, dict):
@@ -115,7 +242,7 @@ class ConversationRef:
             user_name=str(sender.get("name") or "") or None,
             tenant_id=str(conv.get("tenantId") or "") or None,
             last_inbound_activity_id=str(activity.get("id") or "") or None,
-            raw=activity,
+            raw=raw,
         )
 
 
@@ -283,6 +410,42 @@ class ConversationRegistry:
             del self._by_id[cid]
         return len(to_drop)
 
+    def enforce_cap(
+        self,
+        max_entries: int | None,
+        *,
+        active_conversation_ids: set[str] | None = None,
+    ) -> int:
+        """#105/M11: bound the registry size so a long-running gateway can't
+        grow it (and its on-disk save) without limit.
+
+        When over ``max_entries``, drop the **least-recently-used** entries
+        (by ``last_used_at``; a ``None`` stamp — e.g. loaded-from-disk,
+        never touched this run — sorts oldest so those go first) until within
+        cap or nothing droppable remains. Never drops a **pinned** entry or
+        one whose ``conversation_id`` is in ``active_conversation_ids`` (a
+        Hermes turn is in flight for it — the caller supplies these in the
+        registry's own conversation-id space, NOT session-key space).
+        ``max_entries`` ``None`` disables the cap. Returns the number
+        removed; does not save.
+        """
+        if max_entries is None or len(self._by_id) <= max_entries:
+            return 0
+        active = active_conversation_ids or set()
+        candidates = sorted(
+            (
+                r
+                for r in self._by_id.values()
+                if not r.pinned and r.conversation_id not in active
+            ),
+            key=lambda r: (r.last_used_at if r.last_used_at is not None else 0.0),
+        )
+        overflow = len(self._by_id) - max_entries
+        to_drop = [r.conversation_id for r in candidates[:overflow]]
+        for cid in to_drop:
+            del self._by_id[cid]
+        return len(to_drop)
+
     def items(self) -> list[ConversationRef]:
         return list(self._by_id.values())
 
@@ -318,7 +481,10 @@ class ConversationRegistry:
             return cls()
         try:
             payload = json.loads(raw)
-        except json.JSONDecodeError as e:
+        except (json.JSONDecodeError, RecursionError) as e:
+            # RecursionError: a corrupted / hand-edited file nested past the
+            # interpreter limit (#105/M11 review). Treat as unparseable — an
+            # empty registry beats crashing adapter construction.
             logger.warning("agent365 conversations: json parse failed for %s: %s", path, e)
             return cls()
         if not isinstance(payload, dict):
@@ -326,8 +492,18 @@ class ConversationRegistry:
         return cls.from_payload(payload)
 
     def save(self, path: Path) -> None:
-        """Write atomically: tmpfile in same dir → fsync → os.replace.
-        Same-dir is required so ``os.replace`` is atomic on POSIX."""
+        """Serialize the current registry and write it atomically."""
+        self.write_payload(path, self.to_payload())
+
+    @staticmethod
+    def write_payload(path: Path, payload: dict[str, Any]) -> None:
+        """Write a pre-built ``payload`` atomically: tmpfile in same dir →
+        fsync → os.replace (same-dir is required so ``os.replace`` is atomic
+        on POSIX).
+
+        Split out of :meth:`save` so an async caller can build the payload
+        snapshot on the event loop (no concurrent mutation of ``_by_id``) and
+        then run this blocking serialize+write in an executor (#105/M11)."""
         path.parent.mkdir(parents=True, exist_ok=True)
         # NamedTemporaryFile with delete=False so we can rename outside
         # the with-block.
@@ -339,7 +515,7 @@ class ConversationRegistry:
             delete=False,
             encoding="utf-8",
         ) as tmp:
-            json.dump(self.to_payload(), tmp, indent=2, sort_keys=True)
+            json.dump(payload, tmp, indent=2, sort_keys=True)
             tmp.flush()
             os.fsync(tmp.fileno())
             tmp_path = Path(tmp.name)

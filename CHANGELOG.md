@@ -37,9 +37,58 @@ this heading is dated at release.
   longer fire a doomed POST into a conversation the tenant removed the agent
   from. Unrelated chats are untouched.
 - **L2 — the per-lifetime "seen this chat" set is bounded** (`_MAX_SEEN_INBOUNDS`),
-  so a long-running gateway can't grow it without limit.
+  so a long-running gateway can't grow it without limit (the bound never evicts
+  the chat just received, preserving its reply-vs-proactive routing).
+- **M11 — the durable conversation registry is bounded, trimmed, and saved off
+  the event loop.** Three parts: (1) `ConversationRegistry.enforce_cap` bounds it
+  (`_MAX_REGISTRY_ENTRIES = 10000`) with LRU eviction that skips pinned entries,
+  the current turn's reply target, and any conversation whose Hermes turn is in
+  flight — **including a turn suspended awaiting a human approval/clarify**,
+  since the base runs the turn in a background task whose `_active_sessions`
+  guard spans the whole turn. That guard is session-key-keyed, so it's bridged
+  into the registry's conversation-id space via `_session_key_to_conv`
+  (`_active_conversation_ids()`); the previous bare-id comparison never matched
+  and was a no-op, corrected here for both cap and `prune`. Wired in after
+  **both** the message-dispatch upsert and the lifecycle-capture upsert, so a
+  gateway spammed with install/bot-added lifecycle events (which never reach the
+  agent loop) can't grow the registry without bound either. (2) the cached `raw`
+  is now an **allowlist with a byte ceiling**, not a denylist: it keeps only the
+  small identity/routing keys the outbound/mint paths read
+  (`conversation`/`serviceUrl`/`recipient`/`from`/`id`/`channelId`/`type`) and
+  drops everything else — so an unknown or future oversized field can't bloat a
+  cache entry the way a fixed strip-list would miss. If even the kept projection
+  exceeds `_RAW_MAX_BYTES` (16 KiB), it falls back to a minimal per-key subset,
+  bounding an oversized nested blob under an otherwise-retained object; and if
+  even that can't fit — any retained identity field (a routing id/URL such as
+  `id`/`serviceUrl`/`conversation.id`, *or* a retained display name such as
+  `conversation.name`/`from.name`) is itself unreasonably large — `from_activity`
+  rejects the whole activity as unroutable rather than truncate (the minimal
+  projection is all-or-nothing; trimming an id/URL would silently retarget a
+  reply or token). The size gate measures the
+  projection under the same serialization flags `write_payload` uses
+  (`indent=2, sort_keys=True`) — not a compact dump — so a deeply-nested kept
+  sub-object, cheap compact but quadratically expensive indented, can't slip
+  past the ceiling; such a payload falls back to the flat minimal projection.
+  Every accepted `ConversationRef` carries a projection whose standalone
+  serialized size is `<= _RAW_MAX_BYTES`; nested in the file and with its
+  routing scalars duplicated into the top-level fields, the whole on-disk entry
+  is bounded to a small constant multiple (~2x) of that — bounded, not
+  unbounded (down from the pre-M11 ~MB entries). The registry load path is
+  hardened to match: a `raw` read from disk (a pre-M11 untrimmed entry or a
+  corrupted/hand-edited one) is re-projected through the same bounded allowlist
+  — preserving its identity/routing keys while dropping oversized/deeply-nested
+  bloat, so `to_payload()`/save can't later `RecursionError` — extending the M10
+  non-dict coercion; and a parse that exceeds the recursion limit yields an
+  empty registry rather than crashing adapter construction. This cuts per-entry
+  size from ~MB to bytes; (3)
+  `_persist_conversations` snapshots the
+  payload on the loop then runs the blocking serialize+fsync+replace in an
+  executor, so a large save no longer stalls inbound processing. The locked write
+  is `asyncio.shield`-ed and serialized under a lock, so cancelling an in-flight
+  older save (e.g. on shutdown) can't let its executor thread `os.replace` a stale
+  snapshot over a newer one — saves land strictly in order.
 
-  (H4 coalesced-reply drop and M11 registry growth land in later #105 PRs.)
+  (H4 coalesced-reply drop lands in a later, walk-gated #105 PR.)
 
 ### Tests
 
