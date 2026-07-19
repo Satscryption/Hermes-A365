@@ -209,6 +209,12 @@ def _read_file_bounded(path: str, max_bytes: int) -> bytes | None:
 # dropped past the cap (dict preserves insertion order).
 _MAX_CORRELATOR_ENTRIES = 2048
 
+# L2 (#105): cap the per-lifetime "seen this chat" set so a long-running
+# gateway can't grow it without limit. Generous — it only holds chat-id
+# strings and drives first-message detection; over-cap eviction just re-treats
+# an old chat as "first" once (one extra greeting).
+_MAX_SEEN_INBOUNDS = 8192
+
 # #77 — interactive-UI cards. Approve/deny, slash-confirm, and clarify prompts
 # render as Adaptive Cards whose buttons are ``Action.Submit`` (documented CC-
 # supported; both surfaces). A click returns an inbound ``message`` activity
@@ -1103,10 +1109,15 @@ class Agent365Adapter(BasePlatformAdapter):
                     # (install-then-proactive-without-a-user-message) was missed.
                     ref.validated_path = validated_path
                     if lifecycle_action == "evict":
+                        # L3 (#105): tear down live stream/coalesced state +
+                        # cancel watchdogs first, so no debounce task fires a
+                        # doomed POST after the tenant uninstalled us. Runs
+                        # regardless of whether the registry held the ref.
+                        self._teardown_chat_state(ref.conversation_id)
+                        self._seen_inbounds_this_lifetime.discard(
+                            ref.conversation_id
+                        )
                         if self._conversations.evict(ref.conversation_id):
-                            self._seen_inbounds_this_lifetime.discard(
-                                ref.conversation_id
-                            )
                             self._persist_conversations()
                     else:  # "upsert" — capture-if-missing only.
                         # A lifecycle activity has no replyToActivity-able
@@ -1150,7 +1161,20 @@ class Agent365Adapter(BasePlatformAdapter):
                 # has captured an inbound for this chat. Drives the
                 # send() gate that picks replyToActivity vs
                 # sendToConversation. Per-lifetime, not persisted.
-                self._seen_inbounds_this_lifetime.add(ref.conversation_id)
+                seen = self._seen_inbounds_this_lifetime
+                seen.add(ref.conversation_id)
+                # L2 (#105): bound the set, but NEVER evict the chat we just
+                # received — the send() gate above routes reply-vs-proactive
+                # off its membership, so evicting it would misroute THIS turn's
+                # response to sendToConversation. Trim arbitrary OTHER entries
+                # down to the cap (set.pop() can't hit a discarded key).
+                if len(seen) > _MAX_SEEN_INBOUNDS:
+                    seen.discard(ref.conversation_id)
+                    # ``and seen`` guards the degenerate cap<=0 case (would
+                    # otherwise pop() an empty set → KeyError).
+                    while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
+                        seen.pop()
+                    seen.add(ref.conversation_id)
                 self._persist_conversations()
 
             # Build event + dispatch through Hermes' loop.
@@ -3861,6 +3885,40 @@ class Agent365Adapter(BasePlatformAdapter):
         # a content stream's slot (or vice versa).
         if self._active_stream_by_chat.get(chat_id) == message_id:
             self._active_stream_by_chat.pop(chat_id, None)
+
+    def _teardown_chat_state(self, chat_id: str) -> None:
+        """L3 (#105): drop every live stream / coalesced-reply / coalesced-status
+        slot for ``chat_id`` and cancel their debounce watchdog tasks.
+
+        Called on lifecycle **evict** (uninstall). Without this, the registry
+        ref is dropped but the coalesced-reply / status watchdogs keep running
+        and later fire a doomed POST into a conversation the tenant already
+        removed the agent from. Pops are no-ops when a slot is absent, so it's
+        safe to call unconditionally."""
+        # Streaming slot.
+        sid = self._active_stream_by_chat.pop(chat_id, None)
+        if sid is not None:
+            self._streams.pop(sid, None)
+        # Coalesced-reply slot + its watchdog.
+        mid = self._active_coalesced_reply_by_chat.pop(chat_id, None)
+        if mid is not None:
+            self._coalesced_replies.pop(mid, None)
+            task = self._coalesced_reply_tasks.pop(mid, None)
+            if task is not None:
+                task.cancel()
+        # Coalesced-status slots (keyed ``status:{chat}:{status_key}``) + their
+        # watchdogs. Match on the stored chat_id, not a key prefix, since a
+        # Teams chat id itself contains ':'.
+        status_keys = [
+            k
+            for k, st in self._coalesced_status.items()
+            if isinstance(st, dict) and st.get("chat_id") == chat_id
+        ]
+        for k in status_keys:
+            self._coalesced_status.pop(k, None)
+            task = self._coalesced_status_tasks.pop(k, None)
+            if task is not None:
+                task.cancel()
 
     @staticmethod
     def _extract_error_message(resp: Any) -> str:
