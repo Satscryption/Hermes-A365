@@ -160,6 +160,19 @@ def _install_gateway_stubs() -> None:
     config.PlatformConfig = _StubPlatformConfig
     session.SessionSource = _StubSessionSource
 
+    def _stub_build_session_key(
+        source, *, group_sessions_per_user=True, thread_sessions_per_user=False
+    ):
+        # Deterministic, non-crashing stand-in for the real build_session_key
+        # (#105/M11): enough for _session_key_for to compute a key. Tests that
+        # exercise the in-flight guard inject _active_sessions +
+        # _session_key_to_conv directly rather than relying on this shape.
+        ct = getattr(source, "chat_type", "dm")
+        cid = getattr(source, "chat_id", "")
+        return f"agent:main:agent365:{ct}:{cid}"
+
+    session.build_session_key = _stub_build_session_key
+
     sys.modules["gateway"] = gateway
     sys.modules["gateway.platforms"] = platforms
     sys.modules["gateway.platforms.base"] = base
@@ -901,6 +914,192 @@ class TestMessagesRoute:
         assert ref.last_inbound_activity_id == "aaa"
         assert ref.raw["id"] == "aaa"
 
+    def test_oversized_identity_is_acked_without_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An unroutable identity must stop before media work or Hermes."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+
+        body = _make_inbound(
+            conv_id="conv-unroutable-new",
+            activity_id="x" * 40_000,
+        )
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        assert a._conversations.get("conv-unroutable-new") is None
+        assert "conv-unroutable-new" not in a._seen_inbounds_this_lifetime
+        extract_media.assert_not_awaited()
+
+    def test_unroutable_turn_does_not_reuse_cached_activity(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A rejected turn must not dispatch against an older reply target."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        cached = _make_inbound(
+            conv_id="conv-unroutable-cached",
+            activity_id="activity-before-reject",
+        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(cached))
+        a._seen_inbounds_this_lifetime.add("conv-unroutable-cached")
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        body = _make_inbound(
+            conv_id="conv-unroutable-cached",
+            activity_id="x" * 40_000,
+        )
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        ref = a._conversations.get("conv-unroutable-cached")
+        assert ref is not None
+        assert ref.last_inbound_activity_id == "activity-before-reject"
+        assert ref.raw["id"] == "activity-before-reject"
+
+    @pytest.mark.parametrize("bad_conversation", [{}, {"id": 123}])
+    def test_invalid_conversation_id_is_acked_without_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        bad_conversation: dict[str, Any],
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+        body = _make_inbound()
+        body["conversation"] = bad_conversation
+
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        assert len(a._conversations) == 0
+        extract_media.assert_not_awaited()
+
+    @pytest.mark.parametrize("bad_activity_id", [None, 123])
+    def test_invalid_activity_id_is_acked_without_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        bad_activity_id: Any,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+        body = _make_inbound(conv_id="conv-invalid-activity-id")
+        if bad_activity_id is None:
+            body.pop("id")
+        else:
+            body["id"] = bad_activity_id
+
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        assert a._conversations.get("conv-invalid-activity-id") is None
+        extract_media.assert_not_awaited()
+
+    def test_repeated_unroutable_delivery_never_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+        body = _make_inbound(
+            conv_id="conv-unroutable-repeat",
+            activity_id="x" * 40_000,
+        )
+        client = TestClient(a.build_app())
+        headers = {"Authorization": "Bearer pretend"}
+
+        first = client.post("/api/messages", json=body, headers=headers)
+        second = client.post("/api/messages", json=body, headers=headers)
+
+        assert first.status_code == second.status_code == 200
+        assert first.json() == {"status": "acked", "reason": "unroutable"}
+        assert second.json() == {"status": "duplicate"}
+        assert a._handled_events == []
+        assert a._conversations.get("conv-unroutable-repeat") is None
+        extract_media.assert_not_awaited()
+
     def test_duplicate_delivery_short_circuits(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1529,6 +1728,67 @@ class TestLifecycleCapture:
         assert "conv-rm" not in a._conversations
         assert "conv-rm" not in a._seen_inbounds_this_lifetime
 
+    def test_installation_remove_evicts_despite_oversized_activity_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        seed = _make_inbound(path="B", conv_id="conv-rm-oversized")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
+        a._seen_inbounds_this_lifetime.add("conv-rm-oversized")
+        teardown = MagicMock(wraps=a._teardown_chat_state)
+        monkeypatch.setattr(a, "_teardown_chat_state", teardown)
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="conv-rm-oversized",
+            id="x" * 40_000,
+            type="installationUpdate",
+            action="remove",
+        )
+
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+
+        assert r.json() == {"status": "acked", "lifecycle": "evict"}
+        assert a._handled_events == []
+        teardown.assert_called_once_with("conv-rm-oversized")
+        assert "conv-rm-oversized" not in a._conversations
+        assert "conv-rm-oversized" not in a._seen_inbounds_this_lifetime
+
+    def test_plugin_honors_non_default_idempotency_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch, idempotency_max_entries=2)
+        a.build_app()
+        assert a._idempotency_cache.max_entries == 2
+        assert a._make_bridge_config().idempotency_max_entries == 2
+
+    def test_plugin_bool_idempotency_cap_falls_back_not_one(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # #105 review: platform `extra` is the ONLY place this cap is
+        # operator-supplied, and `idempotency_max_entries: true` is a plausible
+        # mis-entry. The adapter must NOT pre-coerce it — `int(True)` is 1,
+        # which would silently near-destroy dedupe (any interleaved delivery
+        # evicts the previous entry) and bypass the cache's own normalization.
+        from hermes_a365.activity_bridge import DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
+        caplog.set_level("WARNING")
+        a = _make_adapter(monkeypatch, idempotency_max_entries=True)
+        a.build_app()
+        assert a._idempotency_cache.max_entries == DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+        assert "not an integer" in caplog.text
+
+    def test_plugin_float_idempotency_cap_falls_back_not_truncated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same class: 3.7 must not silently become a cap of 3.
+        from hermes_a365.activity_bridge import DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
+        a = _make_adapter(monkeypatch, idempotency_max_entries=3.7)
+        a.build_app()
+        assert a._idempotency_cache.max_entries == DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
     def test_evict_tears_down_stream_and_coalesced_state(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1627,6 +1887,124 @@ class TestLifecycleCapture:
         # not proactive) and the cap still holds.
         assert "fresh-chat" in a._seen_inbounds_this_lifetime
         assert len(a._seen_inbounds_this_lifetime) <= 4
+
+    def test_registry_cap_enforced_on_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # M11 (#105): the durable registry is bounded on the dispatch hot
+        # path. With a low cap, posting more distinct chats than the cap keeps
+        # the registry bounded (enforce_cap is wired in after upsert).
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 3)
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        for i in range(8):
+            body = _make_inbound(
+                path="B", conv_id=f"reg-{i}", activity_id=f"act-{i}"
+            )
+            r = client.post(
+                "/api/messages",
+                json=body,
+                headers={"Authorization": "Bearer pretend"},
+            )
+            assert r.status_code == 200, r.text
+        assert len(a._conversations) <= 3
+        # The most-recent chat survives (LRU keeps newest).
+        assert "reg-7" in a._conversations
+
+    def test_registry_cap_skips_in_flight_conversation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # M11 (#105): enforce_cap must not evict a conversation whose turn is
+        # in flight — bridged from the base's whole-turn _active_sessions
+        # (session-key space) to the registry's conversation-id space via
+        # _session_key_to_conv — even when it's the stale/LRU entry. This is
+        # the fix for the session-key-vs-conversation-id mismatch that made the
+        # active guard a no-op (and covers a turn suspended on a human, whose
+        # _active_sessions guard is still held).
+        import asyncio as _asyncio
+
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        for cid in ("stale-inflight", "stale-idle"):
+            a._conversations.upsert(
+                adapter_mod.ConversationRef(
+                    conversation_id=cid, service_url="https://x/"
+                ),
+                now=1000.0,  # both ancient / LRU
+            )
+        # A turn is in flight for "stale-inflight": the base holds its session
+        # guard, and we have the session_key → conversation_id mapping.
+        a._active_sessions["sk:stale-inflight"] = _asyncio.Event()
+        a._session_key_to_conv["sk:stale-inflight"] = "stale-inflight"
+
+        client = self._client(a, monkeypatch)
+        # A fresh inbound pushes the registry over cap (2) → enforce_cap runs.
+        body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.status_code == 200, r.text
+        # The in-flight stale entry survived; the idle stale one was evicted.
+        assert "stale-inflight" in a._conversations
+        assert "stale-idle" not in a._conversations
+        assert len(a._conversations) <= 2
+
+    def test_registry_cap_never_evicts_current_turn_when_saturated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # M11 (#105): if pinned/in-flight entries already fill the cap, the
+        # just-upserted CURRENT-turn reply target must not be evicted — better
+        # to sit over cap than lose the in-progress reply. (Recency alone
+        # doesn't protect it when it's the sole non-pinned/non-active
+        # candidate; the current id is added to the protected set explicitly.)
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        for cid in ("pin-0", "pin-1"):
+            a._conversations.upsert(
+                adapter_mod.ConversationRef(
+                    conversation_id=cid, service_url="https://x/"
+                ),
+                now=1000.0,
+            )
+            a._conversations.pin(cid)
+
+        client = self._client(a, monkeypatch)
+        body = _make_inbound(path="B", conv_id="current-turn", activity_id="act-c")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+        assert r.status_code == 200, r.text
+        # Current-turn entry survives (its reply target); pinned entries too.
+        assert "current-turn" in a._conversations
+
+    def test_registry_cap_enforced_on_lifecycle_capture(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # M11 (#105) review: the cap is wired after the LIFECYCLE upsert too,
+        # not just the message-dispatch upsert. A gateway spammed with
+        # installation/bot-added lifecycle events (which never reach the agent
+        # loop) must not grow the durable registry without bound. Fill past a
+        # small cap via lifecycle activities and confirm the newest lifecycle
+        # target survives while the registry stays bounded.
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 3)
+        a = _make_adapter(monkeypatch)
+        client = self._client(a, monkeypatch)
+        for i in range(8):
+            body = self._lifecycle_body(
+                conv_id=f"lc-{i}",
+                id=f"cu-{i}",
+                type="conversationUpdate",
+                membersAdded=[{"id": "agent-1"}],
+            )
+            r = client.post(
+                "/api/messages",
+                json=body,
+                headers={"Authorization": "Bearer pretend"},
+            )
+            assert r.json() == {"status": "acked", "lifecycle": "upsert"}
+        assert len(a._conversations) <= 3
+        # The most-recent lifecycle target survives (LRU keeps newest).
+        assert "lc-7" in a._conversations
 
 
 class TestServeAppAgentsChannelFilter:
@@ -2734,6 +3112,288 @@ class TestConversationRef:
         assert ref is not None
         assert ref.raw == {}
         assert ref.raw.get("conversation") is None  # the call that used to crash
+
+    def test_from_dict_reprojects_deep_raw_preserving_routing(
+        self, tmp_path: Path
+    ) -> None:
+        # M11 (#105) review: M10 guards a NON-dict raw, but a PRE-M11 / corrupted
+        # file can carry a *dict* raw nested arbitrarily deep. The READ side
+        # re-projects it through the same size-bounded allowlist: the deep bloat
+        # is dropped (so to_payload()/asdict() can't RecursionError on the next
+        # save) while the identity/routing subkeys are PRESERVED (a pinned
+        # proactive target keeps working across an upgrade).
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        deep: Any = "leaf"
+        for _ in range(500):
+            deep = {"n": deep}
+        ref = ConversationRef.from_dict(
+            {
+                "conversation_id": "conv-deep",
+                "service_url": "https://x/",
+                "raw": {
+                    "conversation": {"id": "conv-deep", "bloat": deep},
+                    "serviceUrl": "https://x/",
+                },
+            }
+        )
+        # Routing preserved, deep bloat gone, whole raw bounded.
+        assert ref.raw["conversation"]["id"] == "conv-deep"
+        assert "bloat" not in ref.raw["conversation"]
+        assert len(json.dumps(ref.raw, default=str)) < 16_384
+        # And a full registry round-trip (save → load) doesn't crash.
+        reg = ConversationRegistry()
+        reg.upsert(ref)
+        path = tmp_path / "c.json"
+        reg.save(path)  # asdict() over the flattened raw — no recursion
+        assert ConversationRegistry.load(path).get("conv-deep") is not None
+
+    def test_from_dict_coerces_unroutable_oversized_raw_to_empty(self) -> None:
+        # M11 (#105) review: when even the minimal identity projection can't
+        # fit — any retained identity field, here the display name
+        # conversation.name (the projection is all-or-nothing) — the read side
+        # coerces raw to {} rather than admit an unbounded entry.
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        ref = ConversationRef.from_dict(
+            {
+                "conversation_id": "conv-big",
+                "service_url": "https://x/",
+                "raw": {"conversation": {"id": "conv-big", "name": "x" * 40_000}},
+            }
+        )
+        assert ref.raw == {}
+
+    def test_load_survives_recursionerror_on_parse(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # M11 (#105) review: a file nested past the interpreter recursion limit
+        # makes json.loads itself raise RecursionError (only JSONDecodeError was
+        # caught) — that must yield an empty registry, not crash adapter
+        # construction.
+        from hermes_a365.plugin import conversations as _conv_mod
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        path = tmp_path / "c.json"
+        path.write_text('{"schema": 1, "conversations": []}')
+
+        def _boom(*_a: object, **_k: object) -> object:
+            raise RecursionError("maximum recursion depth exceeded")
+
+        monkeypatch.setattr(_conv_mod.json, "loads", _boom)
+        reg = ConversationRegistry.load(path)
+        assert len(reg) == 0
+
+    def test_from_activity_trims_large_keys_from_cached_raw(self) -> None:
+        # M11 (#105): the cached raw drops large inbound-only keys
+        # (attachments/channelData/…) but keeps whole the identity + routing
+        # dicts the outbound/mint paths echo/read.
+        import copy as _copy
+
+        activity = _make_inbound()
+        activity["attachments"] = [{"contentType": "image/png", "contentUrl": "x"}]
+        activity["channelData"] = {"big": "x" * 1000}
+        activity["entities"] = [{"type": "mention"}]
+        activity["text"] = "hello there"
+        activity["value"] = {"cardAction": "y"}
+        original = _copy.deepcopy(activity)
+
+        ref = adapter_mod.ConversationRef.from_activity(activity)
+        assert ref is not None
+        # Large inbound-only keys stripped from the cache…
+        for k in ("attachments", "channelData", "entities", "text", "value"):
+            assert k not in ref.raw
+        # …identity / routing keys kept WHOLE (echoed into outbound).
+        assert ref.raw["conversation"] == activity["conversation"]
+        assert ref.raw["recipient"] == activity["recipient"]
+        assert ref.raw["from"] == activity["from"]
+        assert ref.raw["serviceUrl"] == activity["serviceUrl"]
+        assert ref.raw["id"] == activity["id"]
+        # Constraint: the PASSED-IN activity is not mutated — the capturing
+        # turn still reads attachments/text for media/mention extraction.
+        assert activity == original
+
+    def test_from_activity_drops_unknown_oversized_top_level_field(self) -> None:
+        # M11 (#105) review: the cache is an ALLOWLIST, not a denylist — an
+        # unknown top-level key (any size, any future BF field) is never
+        # cached, so a large unforeseen payload can't bloat the registry.
+        activity = _make_inbound()
+        activity["extensionData"] = {"blob": "x" * 40_000}
+
+        ref = adapter_mod.ConversationRef.from_activity(activity)
+        assert ref is not None
+        assert "extensionData" not in ref.raw
+        # Identity/routing still cached whole (kept set stays small).
+        assert ref.raw["conversation"] == activity["conversation"]
+        assert ref.raw["from"] == activity["from"]
+
+    def test_from_activity_bounds_oversized_nested_field(self) -> None:
+        # M11 (#105) review: even a RETAINED top-level object (conversation)
+        # can't smuggle unbounded bytes in — when the kept projection exceeds
+        # the byte ceiling the cache falls back to a minimal per-key subset,
+        # dropping the bloat while keeping the routing subkeys.
+        activity = _make_inbound()
+        activity["conversation"]["description"] = "x" * 40_000
+
+        ref = adapter_mod.ConversationRef.from_activity(activity)
+        assert ref is not None
+        conv = ref.raw["conversation"]
+        # Bloat dropped; the id/tenantId routing subkeys survive.
+        assert conv.get("description") is None
+        assert conv["id"] == activity["conversation"]["id"]
+        assert conv.get("tenantId") == activity["conversation"].get("tenantId")
+        # Whole cached raw is bounded well under the huge inbound.
+        assert len(json.dumps(ref.raw, default=str)) < 16_384
+
+    def test_from_activity_rejects_oversized_required_scalar(self) -> None:
+        # M11 (#105) re-review: a routing-critical *scalar* that is itself
+        # oversized (here the activity `id`) can't be shrunk by any projection.
+        # We must NOT truncate it (that would silently retarget the reply), so
+        # from_activity rejects the whole activity as unroutable → no unbounded
+        # durable entry, and no oversized top-level ConversationRef fields.
+        activity = _make_inbound(activity_id="x" * 40_000)
+        assert adapter_mod.ConversationRef.from_activity(activity) is None
+
+    def test_from_activity_rejects_oversized_nested_routing_value(self) -> None:
+        # M11 (#105) re-review: an oversized value under a RETAINED routing
+        # subkey (conversation.id — which is also the top-level
+        # conversation_id) survives the minimal projection, so the projection
+        # still can't fit the ceiling → reject rather than truncate the id.
+        activity = _make_inbound()
+        activity["conversation"]["id"] = "c" * 40_000
+        assert adapter_mod.ConversationRef.from_activity(activity) is None
+
+    def test_from_activity_rejects_oversized_service_url(self) -> None:
+        # M11 (#105) re-review: same shape for serviceUrl — an oversized URL is
+        # rejected, never truncated (truncation would misroute the outbound
+        # POST / token audience).
+        activity = _make_inbound(service_url="https://x/" + "y" * 40_000)
+        assert adapter_mod.ConversationRef.from_activity(activity) is None
+
+    def test_from_activity_bounds_deeply_nested_kept_object(self) -> None:
+        # M11 (#105) re-review: a deeply-nested value under a RETAINED object is
+        # cheap COMPACT but balloons under indent=2 on disk (indentation cost
+        # grows with depth). The size gate measures the persisted (indented)
+        # form, so the whole-conversation fast path is rejected and the flat
+        # minimal projection (which drops the nested value) is used instead.
+        activity = _make_inbound()
+        deep: Any = "leaf"
+        for _ in range(300):
+            deep = [deep]  # 300-deep nested list: tiny compact, huge indented
+        activity["conversation"]["topic"] = deep
+
+        ref = adapter_mod.ConversationRef.from_activity(activity)
+        assert ref is not None
+        # The deep value was dropped by the minimal projection…
+        assert "topic" not in ref.raw["conversation"]
+        assert ref.raw["conversation"]["id"] == activity["conversation"]["id"]
+        # …and the persisted (indented) form is within the ceiling.
+        indented = json.dumps(ref.raw, indent=2, sort_keys=True, default=str)
+        assert len(indented) <= 16_384
+
+    def test_accepted_cached_raw_always_within_ceiling(self) -> None:
+        # M11 (#105) re-review invariant: EVERY accepted ref's raw, serialized
+        # THE WAY IT IS PERSISTED (indent=2, sort_keys — matching write_payload),
+        # is <= _RAW_MAX_BYTES — the hard per-entry ON-DISK storage bound. Spans
+        # small/normal, dropped-nested-bloat, deep-nesting, and boundary cases;
+        # oversized routing fields are rejected (None) rather than accepted.
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        ceiling = ConversationRef._RAW_MAX_BYTES
+        cases = [
+            _make_inbound(),  # normal
+            _make_inbound(path="B"),  # classic BF shape
+            _make_inbound(text="hi", conv_id="c2", activity_id="a2"),
+        ]
+        # Oversized non-routing nested bloat → accepted but bounded (dropped).
+        bloat = _make_inbound(conv_id="c3", activity_id="a3")
+        bloat["conversation"]["description"] = "z" * 40_000
+        bloat["channelData"] = {"blob": "z" * 40_000}
+        cases.append(bloat)
+        # Deeply-nested kept object → accepted, nested value dropped.
+        deep_case = _make_inbound(conv_id="c4", activity_id="a4")
+        _deep: Any = "leaf"
+        for _ in range(250):
+            _deep = [_deep]
+        deep_case["conversation"]["topic"] = _deep
+        cases.append(deep_case)
+        # Oversized routing scalar → rejected (None), never accepted oversized.
+        oversized = _make_inbound(activity_id="q" * 40_000)
+
+        for act in cases:
+            ref = ConversationRef.from_activity(act)
+            assert ref is not None
+            # Bound the PERSISTED (indented) form — the actual on-disk artifact.
+            on_disk = json.dumps(ref.raw, indent=2, sort_keys=True, default=str)
+            assert len(on_disk) <= ceiling
+        assert ConversationRef.from_activity(oversized) is None
+
+
+class TestRegistryEnforceCap:
+    """#105/M11 — ConversationRegistry.enforce_cap bounds the registry with
+    pin/active-aware LRU eviction."""
+
+    @staticmethod
+    def _reg(n: int):
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        reg = ConversationRegistry()
+        for i in range(n):
+            # last_used_at ascending: conv-0 is oldest, conv-(n-1) newest.
+            reg.upsert(
+                ConversationRef(conversation_id=f"conv-{i}", service_url="https://x/"),
+                now=1000.0 + i,
+            )
+        return reg
+
+    def test_no_cap_when_within_limit(self) -> None:
+        reg = self._reg(5)
+        assert reg.enforce_cap(10) == 0
+        assert len(reg) == 5
+
+    def test_none_max_disables_cap(self) -> None:
+        reg = self._reg(5)
+        assert reg.enforce_cap(None) == 0
+        assert len(reg) == 5
+
+    def test_evicts_least_recently_used_down_to_cap(self) -> None:
+        reg = self._reg(10)
+        dropped = reg.enforce_cap(4)
+        assert dropped == 6
+        assert len(reg) == 4
+        # The 4 most-recently-used survive; the oldest are gone.
+        assert "conv-0" not in reg
+        assert "conv-5" not in reg
+        assert "conv-9" in reg and "conv-6" in reg
+
+    def test_never_evicts_pinned_even_if_oldest(self) -> None:
+        reg = self._reg(6)
+        reg.pin("conv-0")  # oldest, but pinned
+        reg.enforce_cap(3)
+        assert "conv-0" in reg  # pinned survives
+        assert len(reg) == 3
+
+    def test_never_evicts_active_conversation(self) -> None:
+        reg = self._reg(6)
+        # conv-1 is old but has a Hermes turn in flight (by conversation id).
+        reg.enforce_cap(3, active_conversation_ids={"conv-1"})
+        assert "conv-1" in reg
+        assert len(reg) == 3
+
+    def test_pinned_over_cap_are_all_kept(self) -> None:
+        # If everything droppable is pinned, the registry may stay over cap
+        # rather than evict a pinned entry.
+        reg = self._reg(5)
+        for i in range(5):
+            reg.pin(f"conv-{i}")
+        assert reg.enforce_cap(2) == 0
+        assert len(reg) == 5
 
 
 class TestConversationRegistry:
@@ -5097,7 +5757,6 @@ class TestPruneConversations:
     async def test_invokes_registry_prune_with_active_session_keys(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        import asyncio
 
         from hermes_a365.plugin.conversations import ConversationRef
 
@@ -5121,7 +5780,14 @@ class TestPruneConversations:
         # Override last_used_at after upsert (which auto-stamps to now).
         a._conversations._by_id["active-chat"].last_used_at = 1000.0
         a._conversations._by_id["stale-chat"].last_used_at = 1000.0
-        a._active_sessions["active-chat"] = asyncio.Event()
+        # #105: prune protects in-flight turns in the registry's
+        # conversation-id space — bridged from the base's whole-turn
+        # _active_sessions (prefixed session-key space, which never matched the
+        # registry's bare ids) via _session_key_to_conv.
+        import asyncio as _asyncio
+
+        a._active_sessions["sk:active-chat"] = _asyncio.Event()
+        a._session_key_to_conv["sk:active-chat"] = "active-chat"
 
         # Patch registry.prune_old_entries to observe the args without
         # double-invoking the real prune. (Wrap rather than replace so
@@ -5170,13 +5836,119 @@ class TestPruneConversations:
         )
         a._conversations._by_id["stale"].last_used_at = 1000.0  # ancient
         # Persist initial state so we can confirm the post-prune save.
-        a._persist_conversations()
+        await a._persist_conversations()
 
         dropped = await a.prune_conversations()
         assert dropped == 1
         # Round-trip from disk: the dropped entry isn't there.
         reloaded = ConversationRegistry.load(conv_path)
         assert "stale" not in reloaded
+
+    @pytest.mark.asyncio
+    async def test_concurrent_persists_serialize_freshest_wins(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # M11 (#105): off-loop saves are serialized by _persist_lock, so a
+        # later (fresher) snapshot's write always lands AFTER an earlier one's
+        # — an older snapshot can't os.replace over a newer one and silently
+        # stale/drop entries on disk. Force the first write to be slow so that
+        # WITHOUT the lock the older {A} snapshot would land last.
+        import asyncio as _asyncio
+        import time as _time
+
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        conv_path = tmp_path / "c.json"
+        a = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        real_write = ConversationRegistry.write_payload
+        calls = {"n": 0}
+
+        def slow_write(path: Path, payload: Any) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                _time.sleep(0.25)  # the first (older) snapshot's write is slow
+            real_write(path, payload)
+
+        monkeypatch.setattr(
+            ConversationRegistry, "write_payload", staticmethod(slow_write)
+        )
+
+        a._conversations.upsert(
+            ConversationRef(conversation_id="A", service_url="https://x/")
+        )
+        t1 = _asyncio.create_task(a._persist_conversations())
+        await _asyncio.sleep(0.02)  # let t1 take the lock + start its slow write
+        a._conversations.upsert(
+            ConversationRef(conversation_id="B", service_url="https://x/")
+        )
+        t2 = _asyncio.create_task(a._persist_conversations())
+        await _asyncio.gather(t1, t2)
+
+        # Freshest state ({A,B}) is what's on disk — not the stale {A}.
+        reloaded = ConversationRegistry.load(conv_path)
+        assert "A" in reloaded and "B" in reloaded
+
+    @pytest.mark.asyncio
+    async def test_cancelled_older_write_still_orders_before_newer_save(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        # M11 (#105) review: _persist_conversations shields the locked write, so
+        # cancelling an in-flight older save (e.g. on shutdown) must NOT let its
+        # executor thread os.replace AFTER a newer save landed. The shield keeps
+        # the cancelled older write holding _persist_lock until it completes, so
+        # a newer save serializes strictly after it and wins on disk. Without the
+        # shield the cancel would release the lock, the newer save would replace
+        # first, then the still-running older thread would clobber it with stale
+        # {A}.
+        import asyncio as _asyncio
+        import time as _time
+
+        from hermes_a365.plugin.conversations import (
+            ConversationRef,
+            ConversationRegistry,
+        )
+
+        conv_path = tmp_path / "c.json"
+        a = _make_adapter(monkeypatch, conversations_path=str(conv_path))
+        real_write = ConversationRegistry.write_payload
+        calls = {"n": 0}
+
+        def slow_write(path: Path, payload: Any) -> None:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                _time.sleep(0.25)  # the first (older) snapshot's write is slow
+            real_write(path, payload)
+
+        monkeypatch.setattr(
+            ConversationRegistry, "write_payload", staticmethod(slow_write)
+        )
+
+        a._conversations.upsert(
+            ConversationRef(conversation_id="A", service_url="https://x/")
+        )
+        t1 = _asyncio.create_task(a._persist_conversations())
+        await _asyncio.sleep(0.02)  # let t1 take the lock + start its slow write
+        a._conversations.upsert(
+            ConversationRef(conversation_id="B", service_url="https://x/")
+        )
+        t2 = _asyncio.create_task(a._persist_conversations())
+        # Cancel the OLDER save's awaiter mid-write; the shielded inner keeps
+        # running to completion, still holding the lock.
+        t1.cancel()
+        with pytest.raises(_asyncio.CancelledError):
+            await t1
+        await t2
+        # Let the shielded (detached) older write finish its os.replace.
+        while calls["n"] < 2:
+            await _asyncio.sleep(0.01)
+        await _asyncio.sleep(0.05)
+
+        # Newer snapshot ({A,B}) is what survives on disk — not stale {A}.
+        reloaded = ConversationRegistry.load(conv_path)
+        assert "A" in reloaded and "B" in reloaded
 
     @pytest.mark.asyncio
     async def test_does_not_save_when_nothing_dropped(

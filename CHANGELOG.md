@@ -37,9 +37,108 @@ this heading is dated at release.
   longer fire a doomed POST into a conversation the tenant removed the agent
   from. Unrelated chats are untouched.
 - **L2 — the per-lifetime "seen this chat" set is bounded** (`_MAX_SEEN_INBOUNDS`),
-  so a long-running gateway can't grow it without limit.
+  so a long-running gateway can't grow it without limit (the bound never evicts
+  the chat just received, preserving its reply-vs-proactive routing).
+- **M11 — the durable conversation registry is bounded, trimmed, and saved off
+  the event loop.** Three parts: (1) `ConversationRegistry.enforce_cap` bounds it
+  (`_MAX_REGISTRY_ENTRIES = 10000`) with LRU eviction that skips pinned entries,
+  the current turn's reply target, and any conversation whose Hermes turn is in
+  flight — **including a turn suspended awaiting a human approval/clarify**,
+  since the base runs the turn in a background task whose `_active_sessions`
+  guard spans the whole turn. That guard is session-key-keyed, so it's bridged
+  into the registry's conversation-id space via `_session_key_to_conv`
+  (`_active_conversation_ids()`); the previous bare-id comparison never matched
+  and was a no-op, corrected here for both cap and `prune`. Wired in after
+  **both** the message-dispatch upsert and the lifecycle-capture upsert, so a
+  gateway spammed with install/bot-added lifecycle events (which never reach the
+  agent loop) can't grow the registry without bound either. (2) the cached `raw`
+  is now an **allowlist with a byte ceiling**, not a denylist: it keeps only the
+  small identity/routing keys the outbound/mint paths read
+  (`conversation`/`serviceUrl`/`recipient`/`from`/`id`/`channelId`/`type`) and
+  drops everything else — so an unknown or future oversized field can't bloat a
+  cache entry the way a fixed strip-list would miss. If even the kept projection
+  exceeds `_RAW_MAX_BYTES` (16 KiB), it falls back to a minimal per-key subset,
+  bounding an oversized nested blob under an otherwise-retained object; and if
+  even that can't fit — any retained identity field (a routing id/URL such as
+  `id`/`serviceUrl`/`conversation.id`, *or* a retained display name such as
+  `conversation.name`/`from.name`) is itself unreasonably large — `from_activity`
+  rejects the whole activity as unroutable rather than truncate (the minimal
+  projection is all-or-nothing; trimming an id/URL would silently retarget a
+  reply or token). The authenticated webhook acknowledges that permanent
+  rejection and exits before media extraction or agent dispatch, so a new chat
+  cannot start a turn without an outbound target and an existing chat cannot
+  reply against its previously cached activity. Dispatchable messages with a
+  missing or non-string activity id follow the same acknowledgement path;
+  lifecycle/control activities may still omit ids because they exit earlier and
+  never require a reply target. The size gate measures the
+  projection under the same serialization flags `write_payload` uses
+  (`indent=2, sort_keys=True`) — not a compact dump — so a deeply-nested kept
+  sub-object, cheap compact but quadratically expensive indented, can't slip
+  past the ceiling; such a payload falls back to the flat minimal projection.
+  Every accepted `ConversationRef` carries a projection whose standalone
+  serialized size is `<= _RAW_MAX_BYTES`; nested in the file and with its
+  routing scalars duplicated into the top-level fields, the whole on-disk entry
+  is bounded to a small constant multiple (~2x) of that — bounded, not
+  unbounded (down from the pre-M11 ~MB entries). The registry load path is
+  hardened to match: a `raw` read from disk (a pre-M11 untrimmed entry or a
+  corrupted/hand-edited one) is re-projected through the same bounded allowlist
+  — preserving its identity/routing keys while dropping oversized/deeply-nested
+  bloat, so `to_payload()`/save can't later `RecursionError` — extending the M10
+  non-dict coercion; and a parse that exceeds the recursion limit yields an
+  empty registry rather than crashing adapter construction. This cuts per-entry
+  size from ~MB to bytes. The inbound retry cache is hardened at the same trust
+  boundary: it stores fixed-size SHA-256 delivery-key digests instead of raw
+  caller-controlled conversation/activity ids and enforces a 10,000-entry cap
+  in addition to its TTL. The cap is explicit in `BridgeConfig`; effective
+  retry retention is the configured TTL or capacity, whichever is reached
+  first, rather than an unbounded promise under sustained volume. Plugin
+  deployments can tune the same cap through platform `extra` as
+  `idempotency_max_entries` — note it is a **cap, not an "unlimited" knob**: a
+  non-positive value *disables* dedupe (every connector retry re-delivers), an
+  oversized one is clamped, and a non-integer one falls back to the default —
+  each logged as a startup warning rather than applied silently. The dedupe
+  check itself is amortized **O(1)** (front-expiry + front-eviction on an
+  insertion-ordered dict): it runs on the inbound request coroutine in both
+  runtimes, so the previous rebuild-the-dict-per-call plus `min()` scan made
+  filling the cache quadratic (~10s for 20k entries) and put a per-request
+  scan on the hot path. The serve runtime also no longer fails open on an
+  activity it cannot build a delivery key for (missing/non-string ids): such an
+  activity is un-dedupable *and* un-repliable, so it is acked without
+  forwarding instead of re-firing the non-idempotent operator webhook on every
+  retry. **Invokes are exempt**, as a deliberate trade-off: an invoke's response
+  is the HTTP body of the same POST, so acking one here would hand Teams a blank
+  invokeResponse and break the interaction — worse than not deduping it. The
+  cost is real (serve's invoke "handler" is the operator webhook, which may be
+  non-idempotent, so a retry of an id-less invoke re-forwards) but unreachable
+  for well-formed traffic, since BF stamps `id` on every real invoke. The plugin
+  also routes invokes ahead of its dedupe, though there the exemption is free
+  rather than a trade-off, because its invoke registry is local and idempotent.
+  Surfaced while
+  making that exemption load-bearing, a **pre-existing** serve defect is fixed
+  alongside it (present before this branch, not a regression from it): the
+  webhook-error handler called `send_reply` for invokes too, which for an
+  id-less invoke raised and returned **HTTP 502** — read by Teams as the
+  invokeResponse status ("unable to reach app") — with the `serviceUrl` echoed
+  in the body, and for an invoke *with* ids POSTed an unsolicited error card
+  into the chat and returned the `{"status": …}` wrapper marker as the
+  invokeResponse body (the shape #96/#97 exist to avoid). Invokes now degrade
+  to the benign empty ack. The plugin also no longer pre-coerces the `extra`
+  cap: `int(True)` is `1`, which would have silently set a cap of one —
+  near-destroying dedupe — and bypassed the shared normalization; the operator
+  value is passed through untouched for the cache to validate. Lifecycle
+  uninstall cleanup is also independent
+  of full reference projection: once the authenticated activity supplies a
+  string conversation id, registry/live-state eviction still runs even if an
+  unrelated oversized field makes the activity unsuitable for persistence;
+  (3)
+  `_persist_conversations` snapshots the
+  payload on the loop then runs the blocking serialize+fsync+replace in an
+  executor, so a large save no longer stalls inbound processing. The locked write
+  is `asyncio.shield`-ed and serialized under a lock, so cancelling an in-flight
+  older save (e.g. on shutdown) can't let its executor thread `os.replace` a stale
+  snapshot over a newer one — saves land strictly in order.
 
-  (H4 coalesced-reply drop and M11 registry growth land in later #105 PRs.)
+  (H4 coalesced-reply drop lands in a later, walk-gated #105 PR.)
 
 ### Tests
 

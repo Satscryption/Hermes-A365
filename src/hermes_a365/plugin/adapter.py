@@ -90,7 +90,7 @@ from gateway.platforms.base import (  # noqa: E402
     MessageType,
     SendResult,
 )
-from gateway.session import SessionSource  # noqa: E402
+from gateway.session import SessionSource, build_session_key  # noqa: E402
 
 from hermes_a365 import invoke  # noqa: E402
 from hermes_a365._common import quote_path_segment, validate_slug  # noqa: E402
@@ -214,6 +214,11 @@ _MAX_CORRELATOR_ENTRIES = 2048
 # strings and drives first-message detection; over-cap eviction just re-treats
 # an old chat as "first" once (one extra greeting).
 _MAX_SEEN_INBOUNDS = 8192
+
+# M11 (#105): cap the durable conversation registry so it (and its on-disk
+# save) can't grow without limit. Over-cap → LRU eviction skipping pinned +
+# in-flight sessions (see ConversationRegistry.enforce_cap).
+_MAX_REGISTRY_ENTRIES = 10000
 
 # #77 — interactive-UI cards. Approve/deny, slash-confirm, and clarify prompts
 # render as Adaptive Cards whose buttons are ``Action.Submit`` (documented CC-
@@ -645,6 +650,22 @@ class Agent365Adapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             self._conversations_prune_max_age_days = 30.0
 
+        # #105 review follow-up: hard memory bound for the in-memory inbound
+        # retry cache. Platform ``extra`` is the plugin's supported config
+        # surface — and the ONLY place this cap is operator-supplied.
+        #
+        # Deliberately NOT coerced here: ``int(True)`` is 1 and ``int(3.7)`` is
+        # 3, so coercing would silently turn a plausible mis-entry
+        # (``idempotency_max_entries: true``) into a cap of 1 — which
+        # near-destroys dedupe — and would pre-empt the normalization in
+        # ``_IdempotencyCache.__post_init__``, the one place both runtimes
+        # share. Pass the operator's value through untouched and let the cache
+        # validate, clamp, and warn. Absent → the shipped default.
+        raw_idempotency_cap = extra.get("idempotency_max_entries")
+        self._idempotency_max_entries: Any = (
+            10_000 if raw_idempotency_cap is None else raw_idempotency_cap
+        )
+
         # Lazily-built runtime objects (populated in connect()).
         self._http_client: Any = None
         self._jwks_cache: Any = None  # AAD-v2 / A365 path (slice 19f)
@@ -697,6 +718,24 @@ class Agent365Adapter(BasePlatformAdapter):
         # path. Surfaced during the v0.5.0 soak (2026-05-13); see #27
         # for the gating finding the registry-raw-as-gate logic missed.
         self._seen_inbounds_this_lifetime: set[str] = set()
+
+        # M11 (#105): bridge the base's whole-turn in-flight signal
+        # (`_active_sessions`, keyed by session key) into the registry's
+        # conversation-id space. Recorded at dispatch: session_key → the
+        # conversation_id it belongs to. `_active_conversation_ids()`
+        # intersects this with the live `_active_sessions` so the registry
+        # cap/prune never evict a conversation whose turn is running — which,
+        # since the base runs the turn in a background task that outlives
+        # handle_message, includes turns suspended awaiting a human
+        # approval/clarify. Self-cleans mappings whose session has ended.
+        self._session_key_to_conv: dict[str, str] = {}
+
+        # M11 (#105): serialize registry saves. _persist_conversations builds
+        # its snapshot AND runs the off-loop write while holding this lock, so
+        # two concurrent inbounds can't let an older snapshot's os.replace land
+        # after a newer one's (which would silently stale/drop entries on disk).
+        # The lock is async — the event loop keeps serving during a write.
+        self._persist_lock = asyncio.Lock()
 
         # Slice 19s-bis follow-up — Hermes' stream consumer can call
         # ``edit_message`` more than once with the same ``message_id``
@@ -848,6 +887,7 @@ class Agent365Adapter(BasePlatformAdapter):
             pid_path=pid_path,
             bf_app_id=self.bf_app_id,
             bf_client_secret=self.bf_client_secret,
+            idempotency_max_entries=self._idempotency_max_entries,
         )
 
     # ── FastAPI app construction (separated for testability) ──────────────
@@ -875,6 +915,11 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._idempotency_cache is None:
             self._idempotency_cache = bridge._IdempotencyCache(
                 ttl_seconds=bridge.DEFAULT_IDEMPOTENCY_TTL_SECONDS,
+                max_entries=getattr(
+                    self._bridge_cfg,
+                    "idempotency_max_entries",
+                    self._idempotency_max_entries,
+                ),
             )
 
         @app.get("/healthz")
@@ -1099,7 +1144,27 @@ class Agent365Adapter(BasePlatformAdapter):
             # Out of the agent loop either way — ack-and-bail.
             lifecycle_action = _lifecycle_registry_action(activity)
             if lifecycle_action is not None:
-                ref = ConversationRef.from_activity(activity)
+                conv = activity.get("conversation")
+                lifecycle_conv_id = (
+                    conv.get("id")
+                    if isinstance(conv, dict) and isinstance(conv.get("id"), str)
+                    else None
+                )
+                ref = None
+                if lifecycle_action == "evict":
+                    # Uninstall needs only the validated conversation id. Do
+                    # not make cleanup depend on projecting unrelated fields:
+                    # an oversized activity id/name must not leave stale
+                    # registry, stream, or watchdog state behind.
+                    if lifecycle_conv_id:
+                        self._teardown_chat_state(lifecycle_conv_id)
+                        self._seen_inbounds_this_lifetime.discard(
+                            lifecycle_conv_id
+                        )
+                        if self._conversations.evict(lifecycle_conv_id):
+                            await self._persist_conversations()
+                else:
+                    ref = ConversationRef.from_activity(activity)
                 if ref is not None:
                     # L4 (#100, #106 review follow-up): stamp the JWT-validated
                     # path on lifecycle-captured refs too, so a later proactive
@@ -1108,36 +1173,20 @@ class Agent365Adapter(BasePlatformAdapter):
                     # branch below already stamps it; the lifecycle capture path
                     # (install-then-proactive-without-a-user-message) was missed.
                     ref.validated_path = validated_path
-                    if lifecycle_action == "evict":
-                        # L3 (#105): tear down live stream/coalesced state +
-                        # cancel watchdogs first, so no debounce task fires a
-                        # doomed POST after the tenant uninstalled us. Runs
-                        # regardless of whether the registry held the ref.
-                        self._teardown_chat_state(ref.conversation_id)
-                        self._seen_inbounds_this_lifetime.discard(
-                            ref.conversation_id
-                        )
-                        if self._conversations.evict(ref.conversation_id):
-                            self._persist_conversations()
-                    else:  # "upsert" — capture-if-missing only.
-                        # A lifecycle activity has no replyToActivity-able
-                        # id and no agentic ids, so it must NEVER overwrite a
-                        # richer captured user-message ref: doing so would
-                        # corrupt the cached reply target (send() would
-                        # replyToActivity against a non-message id) and
-                        # downgrade the proactive path (Path A -> B/unknown).
-                        # Only create a new entry, or fill one that has no
-                        # usable raw. A subsequent real user message refreshes
-                        # the entry via the normal dispatch path below.
-                        existing = self._conversations.get(ref.conversation_id)
-                        if existing is None or not existing.raw:
-                            self._conversations.upsert(ref)
-                            self._persist_conversations()
+                    # "upsert" — capture-if-missing only. A lifecycle activity
+                    # has no replyToActivity-able id and no agentic ids, so it
+                    # must NEVER overwrite a richer captured user-message ref.
+                    existing = self._conversations.get(ref.conversation_id)
+                    if existing is None or not existing.raw:
+                        self._conversations.upsert(ref)
+                        # M11 (#105): lifecycle capture is a growth path too.
+                        self._enforce_registry_cap(ref.conversation_id)
+                        await self._persist_conversations()
                 logger.info(
                     "inbound lifecycle type=%s action=%s conv=%s",
                     str(activity.get("type") or ""),
                     lifecycle_action,
-                    ref.conversation_id if ref is not None else "?(no conv.id)",
+                    lifecycle_conv_id or "?(no conv.id)",
                 )
                 return JSONResponse({"status": "acked", "lifecycle": lifecycle_action})
 
@@ -1148,34 +1197,60 @@ class Agent365Adapter(BasePlatformAdapter):
             if not _should_dispatch(activity):
                 return JSONResponse({"status": "acked"})
 
+            # Dispatchable messages need a real activity id: the steady-state
+            # outbound path replies to that activity. Lifecycle/control events
+            # may legitimately omit it, but they have already acked above.
+            activity_id = activity.get("id")
+            if not isinstance(activity_id, str) or not activity_id:
+                logger.warning(
+                    "inbound acked without dispatch: missing or invalid activity id"
+                )
+                return JSONResponse({"status": "acked", "reason": "unroutable"})
+
             # Slice 19o — upsert into the durable registry. ``send()``,
             # ``send_typing()``, and ``send_image()`` all look up by
             # ``conversation.id`` here.
             ref = ConversationRef.from_activity(activity)
-            if ref is not None:
-                # L4 (#100): stamp the validated path so later decoupled mints
-                # off this ref bind to it, not the body.
-                ref.validated_path = validated_path
-                self._conversations.upsert(ref)
-                # Slice 19x-e (#27): record that this gateway lifetime
-                # has captured an inbound for this chat. Drives the
-                # send() gate that picks replyToActivity vs
-                # sendToConversation. Per-lifetime, not persisted.
-                seen = self._seen_inbounds_this_lifetime
+            if ref is None:
+                # M11 (#105) review follow-up: from_activity() rejects a
+                # missing conversation id or an identity projection that
+                # cannot fit the durable-entry ceiling. Ack the webhook so BF
+                # does not retry a permanently unroutable payload, but stop
+                # before media extraction and the agent loop. Dispatching here
+                # would either leave a new chat with no outbound target or let
+                # an existing chat reply against its previously cached activity.
+                logger.warning(
+                    "inbound acked without dispatch: unroutable conversation "
+                    "reference type=%s",
+                    str(activity.get("type") or ""),
+                )
+                return JSONResponse({"status": "acked", "reason": "unroutable"})
+
+            # L4 (#100): stamp the validated path so later decoupled mints
+            # off this ref bind to it, not the body.
+            ref.validated_path = validated_path
+            self._conversations.upsert(ref)
+            # Slice 19x-e (#27): record that this gateway lifetime
+            # has captured an inbound for this chat. Drives the
+            # send() gate that picks replyToActivity vs
+            # sendToConversation. Per-lifetime, not persisted.
+            seen = self._seen_inbounds_this_lifetime
+            seen.add(ref.conversation_id)
+            # L2 (#105): bound the set, but NEVER evict the chat we just
+            # received — the send() gate above routes reply-vs-proactive
+            # off its membership, so evicting it would misroute THIS turn's
+            # response to sendToConversation. Trim arbitrary OTHER entries
+            # down to the cap (set.pop() can't hit a discarded key).
+            if len(seen) > _MAX_SEEN_INBOUNDS:
+                seen.discard(ref.conversation_id)
+                # ``and seen`` guards the degenerate cap<=0 case (would
+                # otherwise pop() an empty set → KeyError).
+                while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
+                    seen.pop()
                 seen.add(ref.conversation_id)
-                # L2 (#105): bound the set, but NEVER evict the chat we just
-                # received — the send() gate above routes reply-vs-proactive
-                # off its membership, so evicting it would misroute THIS turn's
-                # response to sendToConversation. Trim arbitrary OTHER entries
-                # down to the cap (set.pop() can't hit a discarded key).
-                if len(seen) > _MAX_SEEN_INBOUNDS:
-                    seen.discard(ref.conversation_id)
-                    # ``and seen`` guards the degenerate cap<=0 case (would
-                    # otherwise pop() an empty set → KeyError).
-                    while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
-                        seen.pop()
-                    seen.add(ref.conversation_id)
-                self._persist_conversations()
+            # M11 (#105): bound the registry on the hot growth path.
+            self._enforce_registry_cap(ref.conversation_id)
+            await self._persist_conversations()
 
             # Build event + dispatch through Hermes' loop.
             # #76 — download any inbound attachments (images/files) into the
@@ -1185,6 +1260,16 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             event = self._activity_to_event(activity, media=media)
             await self.handle_message(event)
+            # M11 (#105): `handle_message` spawns the real turn as a base
+            # background task and returns — the turn (incl. any approval/clarify
+            # suspend) outlives this call. Record session_key → conversation_id
+            # so `_active_conversation_ids()` can see this conversation as
+            # in-flight (via the base's live `_active_sessions`) for the WHOLE
+            # turn and keep the registry cap/prune from evicting its reply
+            # target underneath it.
+            sk = self._session_key_for(event)
+            if sk is not None:
+                self._session_key_to_conv[sk] = ref.conversation_id
             return JSONResponse({"status": "dispatched"})
 
         return app
@@ -1544,27 +1629,95 @@ class Agent365Adapter(BasePlatformAdapter):
 
     # ── Outbound ──────────────────────────────────────────────────────────
 
-    def _persist_conversations(self) -> None:
-        """Best-effort save of the registry. Persistence failures are
-        logged but never block message processing — the in-memory
-        copy still works for this run."""
+    def _session_key_for(self, event: Any) -> str | None:
+        """Compute ``event``'s base session key exactly as
+        ``BasePlatformAdapter.handle_message`` does, so this conversation can
+        be found in the base's ``_active_sessions`` (which is session-key
+        keyed). Returns ``None`` if it can't be computed — the caller then
+        falls back to recency-only protection (#105/M11)."""
         try:
-            self._conversations.save(self._conversations_path)
-        except OSError as e:
-            logger.warning(
-                "agent365 conversations: save failed for %s: %s",
-                self._conversations_path,
-                e,
+            extra = getattr(self.config, "extra", {}) or {}
+            return build_session_key(
+                event.source,
+                group_sessions_per_user=extra.get("group_sessions_per_user", True),
+                thread_sessions_per_user=extra.get(
+                    "thread_sessions_per_user", False
+                ),
             )
+        except Exception:
+            return None
+
+    def _active_conversation_ids(self) -> set[str]:
+        """Conversation ids whose Hermes turn is currently in flight — the set
+        the registry cap/prune must not evict (#105/M11).
+
+        The base's ``_active_sessions`` guard spans the whole background turn,
+        including a turn suspended awaiting a human approval/clarify, but is
+        keyed by session key. Bridge it to the registry's conversation-id space
+        via ``_session_key_to_conv`` (recorded at dispatch), self-cleaning any
+        mapping whose session has since ended."""
+        active_sks = set(getattr(self, "_active_sessions", {}) or {})
+        for sk in [k for k in self._session_key_to_conv if k not in active_sks]:
+            self._session_key_to_conv.pop(sk, None)
+        return set(self._session_key_to_conv.values())
+
+    def _enforce_registry_cap(self, current_conversation_id: str) -> None:
+        """M11 (#105): bound the durable registry after a growth-capable
+        upsert. LRU-evict down to ``_MAX_REGISTRY_ENTRIES``, never dropping a
+        pinned entry, a conversation whose Hermes turn is in flight, or the
+        conversation just upserted (``current_conversation_id`` — this turn's
+        reply target). Shared by the dispatch AND lifecycle-capture upserts so
+        every growth path is bounded."""
+        self._conversations.enforce_cap(
+            _MAX_REGISTRY_ENTRIES,
+            active_conversation_ids=(
+                self._active_conversation_ids() | {current_conversation_id}
+            ),
+        )
+
+    async def _persist_conversations(self) -> None:
+        """Best-effort save of the registry, OFF the event loop (#105/M11).
+
+        The registry snapshot (``to_payload``) is built on the loop thread —
+        so ``_by_id`` is never mutated mid-iteration — then the blocking
+        serialize + fsync + os.replace runs in the default executor. This
+        keeps a large save (~0.6s at 20k entries in the pre-M11 shape) from
+        stalling inbound processing. Failures are logged, never raised.
+
+        The locked write is ``asyncio.shield``-ed: cancelling the caller (e.g.
+        on shutdown) must NOT release ``_persist_lock`` while the executor
+        thread is still writing — otherwise a newer save could acquire the
+        lock and ``os.replace`` first, then this older worker overwrites it
+        (#105/M11). Shield lets the inner locked write run to completion,
+        holding the lock, even when this coroutine is cancelled."""
+        await asyncio.shield(self._locked_persist())
+
+    async def _locked_persist(self) -> None:
+        """The serialized snapshot+write half of :meth:`_persist_conversations`
+        — held under ``_persist_lock`` for its whole duration so saves land in
+        order. Run only via the shielded wrapper above."""
+        async with self._persist_lock:
+            payload = self._conversations.to_payload()
+            path = self._conversations_path
+            registry_cls = type(self._conversations)
+            try:
+                await asyncio.get_event_loop().run_in_executor(
+                    None, registry_cls.write_payload, path, payload
+                )
+            except OSError as e:
+                logger.warning(
+                    "agent365 conversations: save failed for %s: %s",
+                    path,
+                    e,
+                )
 
     async def prune_conversations(self) -> int:
         """Slice 19x-d (#4): drop stale ConversationRegistry entries.
 
         Mirrors Hermes' ``SessionStore.prune_old_entries`` shape —
-        skips entries that are operator-pinned, in
-        ``BasePlatformAdapter._active_sessions``, or have no
-        ``last_used_at`` stamp. Threshold is
-        ``extra.conversations_prune_max_age_days`` (default 30).
+        skips entries that are operator-pinned, have a Hermes turn in flight
+        (``_active_conversation_ids``), or have no ``last_used_at`` stamp.
+        Threshold is ``extra.conversations_prune_max_age_days`` (default 30).
 
         Operators wire this from cron (no built-in periodic loop;
         keeping it one-shot avoids adding a maintenance-task pattern
@@ -1573,13 +1726,17 @@ class Agent365Adapter(BasePlatformAdapter):
 
         Returns the number of entries removed.
         """
-        active_keys = set(self._active_sessions.keys())
+        # #105: pass the in-flight set in the registry's conversation-id space
+        # (base `_active_sessions` is keyed by prefixed session keys, which the
+        # registry's bare-conversation_id comparison never matches — a
+        # long-standing no-op the M11 work corrected).
+        active_keys = self._active_conversation_ids()
         dropped = self._conversations.prune_old_entries(
             max_age_days=self._conversations_prune_max_age_days,
             active_session_keys=active_keys,
         )
         if dropped > 0:
-            self._persist_conversations()
+            await self._persist_conversations()
             logger.info(
                 "agent365 prune_conversations: dropped %d stale entry(ies); "
                 "%d remain.",
