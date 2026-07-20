@@ -1763,6 +1763,32 @@ class TestLifecycleCapture:
         assert a._idempotency_cache.max_entries == 2
         assert a._make_bridge_config().idempotency_max_entries == 2
 
+    def test_plugin_bool_idempotency_cap_falls_back_not_one(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # #105 review: platform `extra` is the ONLY place this cap is
+        # operator-supplied, and `idempotency_max_entries: true` is a plausible
+        # mis-entry. The adapter must NOT pre-coerce it — `int(True)` is 1,
+        # which would silently near-destroy dedupe (any interleaved delivery
+        # evicts the previous entry) and bypass the cache's own normalization.
+        from hermes_a365.activity_bridge import DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
+        caplog.set_level("WARNING")
+        a = _make_adapter(monkeypatch, idempotency_max_entries=True)
+        a.build_app()
+        assert a._idempotency_cache.max_entries == DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+        assert "not an integer" in caplog.text
+
+    def test_plugin_float_idempotency_cap_falls_back_not_truncated(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Same class: 3.7 must not silently become a cap of 3.
+        from hermes_a365.activity_bridge import DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
+        a = _make_adapter(monkeypatch, idempotency_max_entries=3.7)
+        a.build_app()
+        assert a._idempotency_cache.max_entries == DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
     def test_evict_tears_down_stream_and_coalesced_state(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

@@ -652,17 +652,19 @@ class Agent365Adapter(BasePlatformAdapter):
 
         # #105 review follow-up: hard memory bound for the in-memory inbound
         # retry cache. Platform ``extra`` is the plugin's supported config
-        # surface; non-positive values disable retention while malformed
-        # values use the shipped default.
+        # surface — and the ONLY place this cap is operator-supplied.
+        #
+        # Deliberately NOT coerced here: ``int(True)`` is 1 and ``int(3.7)`` is
+        # 3, so coercing would silently turn a plausible mis-entry
+        # (``idempotency_max_entries: true``) into a cap of 1 — which
+        # near-destroys dedupe — and would pre-empt the normalization in
+        # ``_IdempotencyCache.__post_init__``, the one place both runtimes
+        # share. Pass the operator's value through untouched and let the cache
+        # validate, clamp, and warn. Absent → the shipped default.
         raw_idempotency_cap = extra.get("idempotency_max_entries")
-        try:
-            self._idempotency_max_entries = (
-                int(raw_idempotency_cap)
-                if raw_idempotency_cap is not None
-                else 10_000
-            )
-        except (TypeError, ValueError):
-            self._idempotency_max_entries = 10_000
+        self._idempotency_max_entries: Any = (
+            10_000 if raw_idempotency_cap is None else raw_idempotency_cap
+        )
 
         # Lazily-built runtime objects (populated in connect()).
         self._http_client: Any = None

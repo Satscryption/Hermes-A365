@@ -2531,6 +2531,182 @@ class TestIdempotencyCache:
         assert cache.is_duplicate("a", now=103.0) is False
         assert len(cache.seen) == 2
 
+    def test_is_duplicate_mutates_in_place_without_rebuilding(self) -> None:
+        # #105 review: the check runs on the inbound request coroutine in both
+        # runtimes, so it must not rebuild/scan the whole cache per call (the
+        # prior prune-on-check comprehension reassigned self.seen every time,
+        # making a full cache fill quadratic). Dict identity is a deterministic
+        # proxy for "mutated in place, never re-created".
+        cache = _IdempotencyCache(ttl_seconds=60.0)
+        original = cache.seen
+        for i in range(50):
+            cache.is_duplicate(f"k{i}", now=100.0 + i)
+        assert cache.seen is original
+
+    def test_filling_to_capacity_is_not_quadratic(self) -> None:
+        # #105 review perf guard: the prior O(n)-per-call prune + O(n) min()
+        # eviction made filling 20k entries take ~10s. The amortized-O(1) path
+        # is milliseconds; a generous ceiling catches a quadratic regression
+        # without being timing-flaky.
+        import time as _time
+
+        cache = _IdempotencyCache(ttl_seconds=3600.0, max_entries=20_000)
+        started = _time.monotonic()
+        for i in range(20_000):
+            cache.is_duplicate(f"k{i}", now=1000.0 + i * 0.001)
+        assert _time.monotonic() - started < 5.0
+        assert len(cache.seen) == 20_000
+
+    def test_non_positive_cap_disables_dedupe_loudly(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # #105 review: max_entries<=0 DISABLES dedupe (it is a cap, not an
+        # "unlimited" knob). Behaviour is retained but must never be silent.
+        caplog.set_level("WARNING")
+        cache = _IdempotencyCache(ttl_seconds=60.0, max_entries=0)
+        assert "DISABLED" in caplog.text
+        # Nothing is retained, so a genuine retry re-delivers.
+        assert cache.is_duplicate("k", now=100.0) is False
+        assert cache.is_duplicate("k", now=101.0) is False
+        assert len(cache.seen) == 0
+
+    def test_oversized_cap_is_clamped_with_warning(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # #105 review: a fat-fingered operator cap is clamped in the one place
+        # both runtimes construct the cache, and the clamp is logged.
+        from hermes_a365.activity_bridge import MAX_IDEMPOTENCY_MAX_ENTRIES
+
+        caplog.set_level("WARNING")
+        cache = _IdempotencyCache(max_entries=MAX_IDEMPOTENCY_MAX_ENTRIES + 1)
+        assert cache.max_entries == MAX_IDEMPOTENCY_MAX_ENTRIES
+        assert "clamping" in caplog.text
+
+    def test_non_integer_cap_falls_back_to_default(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # #105 review: a non-int cap can arrive from either config path (a
+        # malformed `extra` value, or a config object whose attribute lookup
+        # always succeeds). Fall back instead of raising on first comparison.
+        from hermes_a365.activity_bridge import DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
+        caplog.set_level("WARNING")
+        cache = _IdempotencyCache(max_entries="lots")  # type: ignore[arg-type]
+        assert cache.max_entries == DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+        assert "not an integer" in caplog.text
+        # Still functions as a normal bounded cache.
+        assert cache.is_duplicate("k", now=100.0) is False
+        assert cache.is_duplicate("k", now=101.0) is True
+
+    def test_bool_cap_is_not_treated_as_one(self) -> None:
+        # bool is an int subclass; True must not silently mean "cap of 1".
+        from hermes_a365.activity_bridge import DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
+        cache = _IdempotencyCache(max_entries=True)  # type: ignore[arg-type]
+        assert cache.max_entries == DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+
+
+class TestServeAppUnroutable:
+    """#105 review — serve must not fail open on an un-dedupable activity.
+
+    ``_activity_delivery_id`` returns None for a missing/non-string
+    conversation or activity id, which SKIPS dedupe. The plugin route got a
+    compensating ``unroutable`` ack; without the same guard here every BF
+    connector retry would re-fire the (non-idempotent) operator webhook.
+    """
+
+    def test_non_string_activity_id_acked_without_forwarding(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        activity = _inbound_message_activity()
+        activity["id"] = {"nested": "not-a-string"}
+        with _client_for(
+            cfg, capture=capture, webhook_response={"text": "hi back"}
+        ) as client:
+            r1 = client.post("/api/messages", json=activity)
+            r2 = client.post("/api/messages", json=activity)
+        assert r1.status_code == 200
+        assert r1.json() == {"status": "acked", "reason": "unroutable"}
+        assert r2.json() == {"status": "acked", "reason": "unroutable"}
+        # Never forwarded — so a retry storm can't re-fire the webhook.
+        assert capture["webhook"] == []
+        assert capture["reply"] == []
+
+    def test_invoke_is_exempt_from_the_unroutable_guard(self) -> None:
+        # #105 review: an invoke's response is the HTTP body of this same POST,
+        # so it needs neither a delivery key nor a replyToActivity target, and
+        # its handlers are synchronous/idempotent. The plugin services invokes
+        # ahead of its own dedupe + unroutable guard, so serve must too — an
+        # id-less invoke must still be forwarded and return the real
+        # invokeResponse body, NOT a blank ack. (An earlier revision of this
+        # guard sat above the invoke unwrap and silently blanked these.)
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        activity = _inbound_message_activity()
+        activity["type"] = "invoke"
+        activity.pop("id", None)
+        with _client_for(
+            cfg, capture=capture, webhook_response={"text": "hi back"}
+        ) as client:
+            r = client.post("/api/messages", json=activity)
+        assert r.status_code == 200
+        assert len(capture["webhook"]) == 1  # forwarded, not dropped
+        assert r.json() is not None
+
+    def test_invoke_webhook_error_degrades_to_benign_ack(self) -> None:
+        # #105 review: an invoke's reply is the HTTP body of THIS request, so
+        # the out-of-band error card is wrong for it — send_reply hard-requires
+        # serviceUrl/conversation.id/id and raised for an id-less invoke,
+        # returning 502 (which Teams reads as "unable to reach app") with the
+        # serviceUrl echoed in the body. Degrade to the benign empty ack.
+        # (Pre-dates this branch; the invoke exemption makes it load-bearing.)
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        activity = _inbound_message_activity()
+        activity["type"] = "invoke"
+        activity.pop("id", None)
+        with _client_for(
+            cfg, capture=capture, webhook_status=500
+        ) as client:
+            r = client.post("/api/messages", json=activity)
+        assert r.status_code == 200
+        assert r.json() is None
+        # No unsolicited error card posted into the conversation.
+        assert capture["reply"] == []
+
+    def test_invoke_with_ids_webhook_error_posts_no_card_and_no_marker(self) -> None:
+        # The same handler previously POSTed an unsolicited error card AND
+        # returned the {"status": "webhook_error"} wrapper as the invokeResponse
+        # body — the exact shape the dedupe branch exists to avoid (#96/#97).
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        activity = _inbound_message_activity()
+        activity["type"] = "invoke"
+        with _client_for(
+            cfg, capture=capture, webhook_status=500
+        ) as client:
+            r = client.post("/api/messages", json=activity)
+        assert r.status_code == 200
+        assert r.json() is None
+        assert capture["reply"] == []
+
+    def test_routable_activity_still_forwards(self) -> None:
+        # Guard against over-blocking: a normal activity is unaffected.
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(
+            cfg, capture=capture, webhook_response={"text": "hi back"}
+        ) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+        assert r.json()["status"] == "replied"
+        assert len(capture["webhook"]) == 1
+
+
 class TestServeAppDedupe:
     def test_duplicate_delivery_short_circuits_webhook(self) -> None:
         cfg = _cfg()

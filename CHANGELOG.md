@@ -93,7 +93,40 @@ this heading is dated at release.
   retry retention is the configured TTL or capacity, whichever is reached
   first, rather than an unbounded promise under sustained volume. Plugin
   deployments can tune the same cap through platform `extra` as
-  `idempotency_max_entries`. Lifecycle uninstall cleanup is also independent
+  `idempotency_max_entries` — note it is a **cap, not an "unlimited" knob**: a
+  non-positive value *disables* dedupe (every connector retry re-delivers), an
+  oversized one is clamped, and a non-integer one falls back to the default —
+  each logged as a startup warning rather than applied silently. The dedupe
+  check itself is amortized **O(1)** (front-expiry + front-eviction on an
+  insertion-ordered dict): it runs on the inbound request coroutine in both
+  runtimes, so the previous rebuild-the-dict-per-call plus `min()` scan made
+  filling the cache quadratic (~10s for 20k entries) and put a per-request
+  scan on the hot path. The serve runtime also no longer fails open on an
+  activity it cannot build a delivery key for (missing/non-string ids): such an
+  activity is un-dedupable *and* un-repliable, so it is acked without
+  forwarding instead of re-firing the non-idempotent operator webhook on every
+  retry. **Invokes are exempt**, as a deliberate trade-off: an invoke's response
+  is the HTTP body of the same POST, so acking one here would hand Teams a blank
+  invokeResponse and break the interaction — worse than not deduping it. The
+  cost is real (serve's invoke "handler" is the operator webhook, which may be
+  non-idempotent, so a retry of an id-less invoke re-forwards) but unreachable
+  for well-formed traffic, since BF stamps `id` on every real invoke. The plugin
+  also routes invokes ahead of its dedupe, though there the exemption is free
+  rather than a trade-off, because its invoke registry is local and idempotent.
+  Surfaced while
+  making that exemption load-bearing, a **pre-existing** serve defect is fixed
+  alongside it (present before this branch, not a regression from it): the
+  webhook-error handler called `send_reply` for invokes too, which for an
+  id-less invoke raised and returned **HTTP 502** — read by Teams as the
+  invokeResponse status ("unable to reach app") — with the `serviceUrl` echoed
+  in the body, and for an invoke *with* ids POSTed an unsolicited error card
+  into the chat and returned the `{"status": …}` wrapper marker as the
+  invokeResponse body (the shape #96/#97 exist to avoid). Invokes now degrade
+  to the benign empty ack. The plugin also no longer pre-coerces the `extra`
+  cap: `int(True)` is `1`, which would have silently set a cap of one —
+  near-destroying dedupe — and bypassed the shared normalization; the operator
+  value is passed through untouched for the cache to validate. Lifecycle
+  uninstall cleanup is also independent
   of full reference projection: once the authenticated activity supplies a
   string conversation id, registry/live-state eviction still runs even if an
   unrelated oversized field makes the activity unsuitable for persistence;

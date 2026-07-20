@@ -46,8 +46,13 @@ Auth wiring (validated end-to-end against the satscryption tenant
   retries. Delivery keys are retained as fixed-size SHA-256 digests. Defaults
   are 1h and 10,000 entries via ``BridgeConfig``; capacity eviction can shorten
   the effective retry window under sustained high delivery volume.
-  Activities without an ``id`` (some channel-control flows) bypass
-  dedupe — better to over-deliver than to silently drop on missing id.
+  Activities with no usable ``(conversationId, activityId)`` pair bypass
+  dedupe, and the call sites decide what that means (#105): channel-control
+  flows ack early; invokes are still serviced (their response is the HTTP
+  body of the same POST, and the plugin likewise routes invokes ahead of
+  dedupe); anything else serve would forward-and-reply-to is acked WITHOUT
+  forwarding, since it is both un-dedupable and un-repliable and would
+  otherwise re-fire the operator webhook on every retry.
 - **Inbound serviceUrl gate** (slice 19j, hardened by #100/M2): the
   inbound activity's ``serviceUrl`` must be HTTPS and its hostname must
   shape-match one of ``BridgeConfig.trusted_service_url_suffixes``
@@ -83,6 +88,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import logging
 import os
 import socket
 import sys
@@ -829,6 +835,8 @@ JWT_BEARER_ASSERTION_TYPE = (
     "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 )
 
+logger = logging.getLogger(__name__)
+
 # JWKS cache TTL per Microsoft's published guidance (refresh at least daily).
 JWKS_CACHE_TTL_SECONDS = 24 * 3600
 
@@ -840,7 +848,17 @@ DEFAULT_IDEMPOTENCY_TTL_SECONDS = 3600.0
 # Bound the retry cache by count as well as time. Delivery ids are stored as
 # fixed-size digests, so neither a burst of unique activities nor one oversized
 # identity can retain unbounded caller-controlled strings for the full TTL.
+#
+# NOTE the inversion (#105 review): this is a *cap*, not a "0 means unlimited"
+# knob — a NON-POSITIVE value DISABLES retention entirely, so nothing is
+# remembered and every BF connector retry re-delivers (duplicate turns and
+# duplicate user-visible replies). Both runtimes log a startup WARNING when
+# that is in effect so it is never a silent setting.
 DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 10_000
+# Sanity ceiling for an operator-supplied cap (#105 review). The dedupe check
+# is amortized O(1), but each retained entry still costs memory; clamping keeps
+# a fat-fingered value from silently committing the process to it.
+MAX_IDEMPOTENCY_MAX_ENTRIES = 1_000_000
 
 # Slice 19j / #100-M2: only POST outbound replies to ``serviceUrl`` hosts on
 # this allowlist. The bridge mints a user-FIC bearer for the Messaging Bot API SP
@@ -920,7 +938,10 @@ class BridgeConfig:
     # Slice 19i: TTL for in-memory dedupe of inbound activities.
     idempotency_ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
     # Slice 19i / #105: effective retention is TTL or capacity, whichever is
-    # reached first; deployments can raise this hard memory bound as needed.
+    # reached first; deployments can raise this hard memory bound (clamped to
+    # ``MAX_IDEMPOTENCY_MAX_ENTRIES``). A NON-POSITIVE value DISABLES dedupe —
+    # it does NOT mean "unlimited" — so every connector retry re-delivers;
+    # that case is logged as a startup WARNING.
     idempotency_max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
     # Slice 19j: DNS suffixes acceptable on the inbound `serviceUrl`.
     trusted_service_url_suffixes: tuple[str, ...] = (
@@ -1021,18 +1042,66 @@ class _JwksCache:
 # adapted from NousResearch/hermes-agent#10037.
 @dataclass
 class _IdempotencyCache:
-    """TTL/count-bounded dedupe of ``conversationId:activityId`` pairs."""
+    """TTL/count-bounded dedupe of ``conversationId:activityId`` pairs.
+
+    Effective retention is TTL **or** capacity, whichever is reached first, so
+    a sustained burst of unique deliveries can shorten the retry window below
+    ``ttl_seconds``. ``max_entries <= 0`` DISABLES dedupe outright (it is a cap,
+    not a "0 means unlimited" knob) — every retry then re-delivers; callers log
+    a startup WARNING for that case rather than letting it pass silently.
+    """
 
     seen: dict[str, float] = field(default_factory=dict)
     ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
     max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
 
+    def __post_init__(self) -> None:
+        # #105 review: normalize + de-silence the operator-tunable cap here, in
+        # the one place BOTH runtimes construct the cache, so neither can drift.
+        # A non-integer cap can reach us from either config path (a malformed
+        # `extra` value, or a config object whose attribute lookup always
+        # succeeds); fall back rather than let it explode on first compare.
+        # bool is an int subclass but `True` never means "cap of 1".
+        if not isinstance(self.max_entries, int) or isinstance(self.max_entries, bool):
+            logger.warning(
+                "inbound idempotency cap %r is not an integer; using default %d",
+                self.max_entries,
+                DEFAULT_IDEMPOTENCY_MAX_ENTRIES,
+            )
+            self.max_entries = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+        if self.max_entries > MAX_IDEMPOTENCY_MAX_ENTRIES:
+            logger.warning(
+                "inbound idempotency cap %d exceeds the supported ceiling; "
+                "clamping to %d",
+                self.max_entries,
+                MAX_IDEMPOTENCY_MAX_ENTRIES,
+            )
+            self.max_entries = MAX_IDEMPOTENCY_MAX_ENTRIES
+        elif self.max_entries <= 0:
+            logger.warning(
+                "inbound idempotency dedupe DISABLED (max_entries=%d). This is "
+                "a cap, not an 'unlimited' setting: nothing is remembered, so "
+                "every BF connector retry re-delivers and can produce duplicate "
+                "replies. Set a positive value to re-enable.",
+                self.max_entries,
+            )
+
     def is_duplicate(self, delivery_id: str, *, now: float | None = None) -> bool:
         """Return True if ``delivery_id`` was seen within the TTL.
 
         Side effect: records ``delivery_id`` as seen on first call and
-        prunes expired entries opportunistically. Pure-function callers
-        should use :meth:`peek` instead.
+        prunes expired entries opportunistically.
+
+        Runs in **amortized O(1)** (#105 review): this is called synchronously
+        from the inbound request coroutine in both runtimes, so it must not
+        scan the cache. Expiry pops from the FRONT (``dict`` preserves
+        insertion order and production always stamps ``now=time.time()``, so
+        insertion order is timestamp order) and each entry is popped at most
+        once; capacity eviction pops the front too, which is why no ``min()``
+        scan is needed. Correctness does not depend on the prune being
+        exhaustive — a stale entry that survives (only reachable when a caller
+        passes a non-monotonic ``now``, i.e. tests) is still rejected by the
+        per-hit TTL check below.
         """
         import time as _time
 
@@ -1042,20 +1111,25 @@ class _IdempotencyCache:
         cache_key = hashlib.sha256(
             delivery_id.encode("utf-8", errors="surrogatepass")
         ).hexdigest()
-        # Prune-on-check bounds old entries; max_entries also bounds a burst of
-        # unique deliveries within one TTL window.
-        self.seen = {
-            key: seen_at
-            for key, seen_at in self.seen.items()
-            if cur - seen_at < self.ttl_seconds
-        }
-        if cache_key in self.seen:
+        # Drop expired entries from the front — O(1) amortized, not a full scan.
+        while self.seen:
+            oldest_key = next(iter(self.seen))
+            if cur - self.seen[oldest_key] < self.ttl_seconds:
+                break
+            del self.seen[oldest_key]
+        seen_at = self.seen.get(cache_key)
+        if seen_at is not None and cur - seen_at < self.ttl_seconds:
             return True
+        # Absent or expired: drop any stale copy so the re-insert below lands at
+        # the END, keeping insertion order aligned with recency.
+        self.seen.pop(cache_key, None)
         if self.max_entries <= 0:
+            # Retention disabled — every delivery is treated as new. Loudly
+            # flagged at startup (see the adapter/bridge cap wiring); dedupe
+            # off means BF connector retries re-deliver.
             return False
         while len(self.seen) >= self.max_entries:
-            oldest = min(self.seen, key=self.seen.__getitem__)
-            del self.seen[oldest]
+            del self.seen[next(iter(self.seen))]
         self.seen[cache_key] = cur
         return False
 
@@ -1063,10 +1137,11 @@ class _IdempotencyCache:
 def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
     """Compose the dedupe key from an inbound activity.
 
-    Returns ``None`` when either id is missing or is not a string —
-    channel-control activities (``conversationUpdate``, ``typing``) sometimes
-    lack ``id``, and we'd rather always-deliver them than risk dropping
-    legitimate traffic.
+    Returns ``None`` when either id is missing or is not a string — some
+    channel-control activities (``conversationUpdate``, ``typing``) legitimately
+    lack ``id``. ``None`` means only "not dedupable"; it carries no delivery
+    policy, because the two runtimes now differ on what to do about it (#105) —
+    see the call sites in :func:`make_app` and the plugin adapter route.
 
     #103/L7: a plain ``f"{conv}:{activity_id}"`` join is ambiguous because
     Teams conversation ids contain literal ``:`` — ``("19:abc", "123")`` and
@@ -2476,6 +2551,36 @@ def make_app(
         if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
             return _JSONResponse({"status": "acked"})
 
+        # #105 review: a *forwarded-and-replied-to* activity we could not build
+        # a delivery key for (missing / non-string conversation or activity id)
+        # is BOTH un-dedupable — the dedupe above was skipped, so every
+        # connector retry would re-fire the non-idempotent operator webhook —
+        # and un-repliable, since ``send_reply`` needs those ids for its
+        # replyToActivity target. Ack without forwarding.
+        #
+        # INVOKE IS EXEMPT, as a deliberate trade-off rather than a free win.
+        # An invoke's response is the HTTP body of this same POST (see the
+        # unwrap below), so it needs no reply target — acking it here would
+        # hand Teams a blank invokeResponse and break the interaction outright,
+        # which is strictly worse than the cost of not deduping it. That cost
+        # is real: serve's invoke "handler" is the arbitrary OPERATOR WEBHOOK,
+        # which may be non-idempotent (the very reason the dedupe above
+        # exists), so a connector retry of an id-less invoke re-forwards. We
+        # accept it because it is unreachable for well-formed traffic — BF
+        # stamps ``id`` on every real invoke — and because dedupe is skipped
+        # for these regardless of what we do here. NOTE this reasoning is
+        # serve-specific: the plugin also routes invokes ahead of its dedupe,
+        # but its invoke registry is LOCAL and idempotent, so the same
+        # exemption is free there and merely a trade-off here.
+        # Channel-control flows that legitimately lack an id already bailed.
+        if delivery_id is None and activity_type != "invoke":
+            logger.warning(
+                "inbound acked without forwarding: unroutable activity "
+                "(missing or non-string conversation/activity id) type=%s",
+                activity_type,
+            )
+            return _JSONResponse({"status": "acked", "reason": "unroutable"})
+
         # Forward to operator webhook.
         envelope = build_webhook_envelope(activity, cfg)
         try:
@@ -2483,6 +2588,25 @@ def make_app(
                 envelope=envelope, cfg=cfg, client=http_client
             )
         except Exception as e:
+            # An invoke's reply is the HTTP body of THIS request (#96/#97), so
+            # the out-of-band error card is wrong for it three ways: send_reply
+            # hard-requires serviceUrl/conversation.id/id and raises for an
+            # id-less invoke → 502 (which Teams reads as the invokeResponse
+            # status, i.e. "unable to reach app") with the serviceUrl echoed in
+            # the body; for an invoke WITH ids it POSTs an unsolicited error
+            # card into the chat and then returns the {"status": ...} wrapper
+            # marker as the invokeResponse body — the exact shape the dedupe
+            # branch above exists to avoid. Degrade to the same benign empty
+            # 200 ack that dedupe branch already returns (#96) — serve's
+            # established shape for "no real invokeResponse to give". This is
+            # NOT the plugin's shape: adapter.py answers a failed invoke with
+            # 500 + {"error": ...} (and 200 + {} for a fileConsent crash), a
+            # cross-runtime divergence left as-is here rather than widened.
+            # (Pre-dates this branch; surfaced by the #105 review because the
+            # invoke exemption above makes this path load-bearing.)
+            if activity_type == "invoke":
+                logger.warning("invoke webhook error: %s", e)
+                return _JSONResponse(None, status_code=200)
             error_reply = render_reply_activity(
                 activity,
                 {"text": "", "card": render_error_card(f"Webhook error: {e}")},
