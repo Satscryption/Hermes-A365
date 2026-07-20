@@ -2557,6 +2557,23 @@ class TestIdempotencyCache:
         assert _time.monotonic() - started < 5.0
         assert len(cache.seen) == 20_000
 
+    def test_implicit_clock_is_monotonic_across_wall_clock_rollback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Front-only expiry requires insertion order to match timestamp order.
+        # Wall time can roll backwards; make any wall-clock access fail so this
+        # regression proves the production path depends only on monotonic time.
+        import time as _time
+
+        def _wall_clock_must_not_be_used() -> float:
+            raise AssertionError("idempotency cache used wall time")
+
+        monkeypatch.setattr(_time, "time", _wall_clock_must_not_be_used)
+        cache = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
+
+        assert cache.is_duplicate("a") is False
+        assert cache.is_duplicate("a") is True
+
     def test_non_positive_cap_disables_dedupe_loudly(
         self, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -2635,12 +2652,12 @@ class TestServeAppUnroutable:
 
     def test_invoke_is_exempt_from_the_unroutable_guard(self) -> None:
         # #105 review: an invoke's response is the HTTP body of this same POST,
-        # so it needs neither a delivery key nor a replyToActivity target, and
-        # its handlers are synchronous/idempotent. The plugin services invokes
-        # ahead of its own dedupe + unroutable guard, so serve must too — an
-        # id-less invoke must still be forwarded and return the real
-        # invokeResponse body, NOT a blank ack. (An earlier revision of this
-        # guard sat above the invoke unwrap and silently blanked these.)
+        # so it needs neither a delivery key nor a replyToActivity target. The
+        # exemption is a deliberate trade-off in serve: the arbitrary operator
+        # webhook may be non-idempotent, but blank-acking here would break the
+        # interaction outright. The plugin also services invokes ahead of its
+        # guard, though its local registry is idempotent. An id-less invoke must
+        # still return the real invokeResponse body, not a blank ack.
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}

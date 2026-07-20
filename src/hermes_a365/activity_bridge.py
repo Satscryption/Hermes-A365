@@ -1095,7 +1095,7 @@ class _IdempotencyCache:
         Runs in **amortized O(1)** (#105 review): this is called synchronously
         from the inbound request coroutine in both runtimes, so it must not
         scan the cache. Expiry pops from the FRONT (``dict`` preserves
-        insertion order and production always stamps ``now=time.time()``, so
+        insertion order and production stamps ``now=time.monotonic()``, so
         insertion order is timestamp order) and each entry is popped at most
         once; capacity eviction pops the front too, which is why no ``min()``
         scan is needed. Correctness does not depend on the prune being
@@ -1105,7 +1105,11 @@ class _IdempotencyCache:
         """
         import time as _time
 
-        cur = now if now is not None else _time.time()
+        # Monotonic time is load-bearing for the front-expiry ordering. Wall
+        # time can move backwards after an NTP/host-clock correction, leaving
+        # an expired entry behind a newer front entry; capacity eviction could
+        # then discard a live key while retaining the expired one.
+        cur = now if now is not None else _time.monotonic()
         # Store a fixed-size digest rather than the caller-controlled raw ids.
         # ``surrogatepass`` keeps hashing total for any string JSON may decode.
         cache_key = hashlib.sha256(
