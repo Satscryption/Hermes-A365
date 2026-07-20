@@ -182,18 +182,18 @@ class ConversationRef:
 
         Returns ``None`` when the activity is un-routable — the caller treats
         that as ack-and-skip rather than persisting a bad entry. Two cases:
-        the load-bearing ``conversation.id`` is missing, or the minimal identity
-        projection can't fit ``_RAW_MAX_BYTES`` (any retained identity field is
-        unreasonably large — the routing ids/URL *or* a retained display name
-        like ``conversation.name``/``from.name``; #105/M11 review). We reject
-        rather than truncate, since trimming an id/URL would silently retarget
-        replies/tokens.
+        the load-bearing ``conversation.id`` is missing/not a string, or the
+        minimal identity projection can't fit ``_RAW_MAX_BYTES`` (any retained
+        identity field is unreasonably large — the routing ids/URL *or* a
+        retained display name like ``conversation.name``/``from.name``;
+        #105/M11 review). We reject rather than truncate, since trimming an
+        id/URL would silently retarget replies/tokens.
         """
         conv = activity.get("conversation") or {}
         if not isinstance(conv, dict):
             return None
         conv_id = conv.get("id")
-        if not conv_id:
+        if not isinstance(conv_id, str) or not conv_id:
             return None
         # M11 (#105): build the size-bounded PROJECTION first — a *new* dict,
         # never the passed-in activity (the capturing turn still reads it for

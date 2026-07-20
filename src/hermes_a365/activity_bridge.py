@@ -41,9 +41,11 @@ Auth wiring (validated end-to-end against the satscryption tenant
   it carries our ``aud``. ``BridgeConfig.inbound_azp_allowlist``
   defaults to ``(5a807f24-c9de-44ee-a3a7-329e88a00ffc,)`` — the
   Messaging Bot API SP, the same SP we already target for outbound.
-- **Inbound idempotency** (slice 19i): TTL-keyed dedupe on
+- **Inbound idempotency** (slice 19i): TTL/capacity-keyed dedupe on
   ``(conversationId, activityId)`` short-circuits BF / A365 connector
-  retries. Default TTL 1h via ``BridgeConfig.idempotency_ttl_seconds``.
+  retries. Delivery keys are retained as fixed-size SHA-256 digests. Defaults
+  are 1h and 10,000 entries via ``BridgeConfig``; capacity eviction can shorten
+  the effective retry window under sustained high delivery volume.
   Activities without an ``id`` (some channel-control flows) bypass
   dedupe — better to over-deliver than to silently drop on missing id.
 - **Inbound serviceUrl gate** (slice 19j, hardened by #100/M2): the
@@ -79,6 +81,7 @@ CLI use::
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import socket
@@ -834,6 +837,10 @@ JWKS_CACHE_TTL_SECONDS = 24 * 3600
 # upper bound on Microsoft's connector retry window we've observed in
 # the wild. Configurable via ``BridgeConfig.idempotency_ttl_seconds``.
 DEFAULT_IDEMPOTENCY_TTL_SECONDS = 3600.0
+# Bound the retry cache by count as well as time. Delivery ids are stored as
+# fixed-size digests, so neither a burst of unique activities nor one oversized
+# identity can retain unbounded caller-controlled strings for the full TTL.
+DEFAULT_IDEMPOTENCY_MAX_ENTRIES = 10_000
 
 # Slice 19j / #100-M2: only POST outbound replies to ``serviceUrl`` hosts on
 # this allowlist. The bridge mints a user-FIC bearer for the Messaging Bot API SP
@@ -912,6 +919,9 @@ class BridgeConfig:
     inbound_azp_allowlist: tuple[str, ...] = DEFAULT_INBOUND_AZP_ALLOWLIST
     # Slice 19i: TTL for in-memory dedupe of inbound activities.
     idempotency_ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
+    # Slice 19i / #105: effective retention is TTL or capacity, whichever is
+    # reached first; deployments can raise this hard memory bound as needed.
+    idempotency_max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
     # Slice 19j: DNS suffixes acceptable on the inbound `serviceUrl`.
     trusted_service_url_suffixes: tuple[str, ...] = (
         DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
@@ -1011,10 +1021,11 @@ class _JwksCache:
 # adapted from NousResearch/hermes-agent#10037.
 @dataclass
 class _IdempotencyCache:
-    """TTL-keyed dedupe of ``conversationId:activityId`` pairs."""
+    """TTL/count-bounded dedupe of ``conversationId:activityId`` pairs."""
 
     seen: dict[str, float] = field(default_factory=dict)
     ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
+    max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
 
     def is_duplicate(self, delivery_id: str, *, now: float | None = None) -> bool:
         """Return True if ``delivery_id`` was seen within the TTL.
@@ -1026,25 +1037,35 @@ class _IdempotencyCache:
         import time as _time
 
         cur = now if now is not None else _time.time()
-        # Prune-on-check keeps the dict bounded even on long-running
-        # bridges with many short conversations.
+        # Store a fixed-size digest rather than the caller-controlled raw ids.
+        # ``surrogatepass`` keeps hashing total for any string JSON may decode.
+        cache_key = hashlib.sha256(
+            delivery_id.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        # Prune-on-check bounds old entries; max_entries also bounds a burst of
+        # unique deliveries within one TTL window.
         self.seen = {
             key: seen_at
             for key, seen_at in self.seen.items()
             if cur - seen_at < self.ttl_seconds
         }
-        if delivery_id in self.seen:
+        if cache_key in self.seen:
             return True
-        self.seen[delivery_id] = cur
+        if self.max_entries <= 0:
+            return False
+        while len(self.seen) >= self.max_entries:
+            oldest = min(self.seen, key=self.seen.__getitem__)
+            del self.seen[oldest]
+        self.seen[cache_key] = cur
         return False
 
 
 def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
     """Compose the dedupe key from an inbound activity.
 
-    Returns ``None`` when either id is missing — channel-control
-    activities (``conversationUpdate``, ``typing``) sometimes lack
-    ``id``, and we'd rather always-deliver them than risk dropping
+    Returns ``None`` when either id is missing or is not a string —
+    channel-control activities (``conversationUpdate``, ``typing``) sometimes
+    lack ``id``, and we'd rather always-deliver them than risk dropping
     legitimate traffic.
 
     #103/L7: a plain ``f"{conv}:{activity_id}"`` join is ambiguous because
@@ -1059,7 +1080,9 @@ def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
         activity.get("conversation"), dict
     ) else None
     activity_id = activity.get("id")
-    if not conv or not activity_id:
+    if not isinstance(conv, str) or not conv:
+        return None
+    if not isinstance(activity_id, str) or not activity_id:
         return None
     return f"{len(conv)}:{conv}:{activity_id}"
 
@@ -2345,7 +2368,10 @@ def make_app(
     if bf_cache is None:
         bf_cache = _BfTokenCache()
     if idempotency_cache is None:
-        idempotency_cache = _IdempotencyCache(ttl_seconds=cfg.idempotency_ttl_seconds)
+        idempotency_cache = _IdempotencyCache(
+            ttl_seconds=cfg.idempotency_ttl_seconds,
+            max_entries=cfg.idempotency_max_entries,
+        )
 
     app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}")
 

@@ -914,6 +914,192 @@ class TestMessagesRoute:
         assert ref.last_inbound_activity_id == "aaa"
         assert ref.raw["id"] == "aaa"
 
+    def test_oversized_identity_is_acked_without_dispatch(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """An unroutable identity must stop before media work or Hermes."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+
+        body = _make_inbound(
+            conv_id="conv-unroutable-new",
+            activity_id="x" * 40_000,
+        )
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        assert a._conversations.get("conv-unroutable-new") is None
+        assert "conv-unroutable-new" not in a._seen_inbounds_this_lifetime
+        extract_media.assert_not_awaited()
+
+    def test_unroutable_turn_does_not_reuse_cached_activity(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """A rejected turn must not dispatch against an older reply target."""
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        cached = _make_inbound(
+            conv_id="conv-unroutable-cached",
+            activity_id="activity-before-reject",
+        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(cached))
+        a._seen_inbounds_this_lifetime.add("conv-unroutable-cached")
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        body = _make_inbound(
+            conv_id="conv-unroutable-cached",
+            activity_id="x" * 40_000,
+        )
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        ref = a._conversations.get("conv-unroutable-cached")
+        assert ref is not None
+        assert ref.last_inbound_activity_id == "activity-before-reject"
+        assert ref.raw["id"] == "activity-before-reject"
+
+    @pytest.mark.parametrize("bad_conversation", [{}, {"id": 123}])
+    def test_invalid_conversation_id_is_acked_without_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        bad_conversation: dict[str, Any],
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+        body = _make_inbound()
+        body["conversation"] = bad_conversation
+
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        assert len(a._conversations) == 0
+        extract_media.assert_not_awaited()
+
+    @pytest.mark.parametrize("bad_activity_id", [None, 123])
+    def test_invalid_activity_id_is_acked_without_dispatch(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        bad_activity_id: Any,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+        body = _make_inbound(conv_id="conv-invalid-activity-id")
+        if bad_activity_id is None:
+            body.pop("id")
+        else:
+            body["id"] = bad_activity_id
+
+        r = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert r.status_code == 200
+        assert r.json() == {"status": "acked", "reason": "unroutable"}
+        assert a._handled_events == []
+        assert a._conversations.get("conv-invalid-activity-id") is None
+        extract_media.assert_not_awaited()
+
+    def test_repeated_unroutable_delivery_never_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+        body = _make_inbound(
+            conv_id="conv-unroutable-repeat",
+            activity_id="x" * 40_000,
+        )
+        client = TestClient(a.build_app())
+        headers = {"Authorization": "Bearer pretend"}
+
+        first = client.post("/api/messages", json=body, headers=headers)
+        second = client.post("/api/messages", json=body, headers=headers)
+
+        assert first.status_code == second.status_code == 200
+        assert first.json() == {"status": "acked", "reason": "unroutable"}
+        assert second.json() == {"status": "duplicate"}
+        assert a._handled_events == []
+        assert a._conversations.get("conv-unroutable-repeat") is None
+        extract_media.assert_not_awaited()
+
     def test_duplicate_delivery_short_circuits(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -1541,6 +1727,41 @@ class TestLifecycleCapture:
         assert a._handled_events == []
         assert "conv-rm" not in a._conversations
         assert "conv-rm" not in a._seen_inbounds_this_lifetime
+
+    def test_installation_remove_evicts_despite_oversized_activity_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        seed = _make_inbound(path="B", conv_id="conv-rm-oversized")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
+        a._seen_inbounds_this_lifetime.add("conv-rm-oversized")
+        teardown = MagicMock(wraps=a._teardown_chat_state)
+        monkeypatch.setattr(a, "_teardown_chat_state", teardown)
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="conv-rm-oversized",
+            id="x" * 40_000,
+            type="installationUpdate",
+            action="remove",
+        )
+
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+        )
+
+        assert r.json() == {"status": "acked", "lifecycle": "evict"}
+        assert a._handled_events == []
+        teardown.assert_called_once_with("conv-rm-oversized")
+        assert "conv-rm-oversized" not in a._conversations
+        assert "conv-rm-oversized" not in a._seen_inbounds_this_lifetime
+
+    def test_plugin_honors_non_default_idempotency_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch, idempotency_max_entries=2)
+        a.build_app()
+        assert a._idempotency_cache.max_entries == 2
+        assert a._make_bridge_config().idempotency_max_entries == 2
 
     def test_evict_tears_down_stream_and_coalesced_state(
         self, monkeypatch: pytest.MonkeyPatch

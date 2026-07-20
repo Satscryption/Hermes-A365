@@ -64,7 +64,13 @@ this heading is dated at release.
   `conversation.name`/`from.name`) is itself unreasonably large — `from_activity`
   rejects the whole activity as unroutable rather than truncate (the minimal
   projection is all-or-nothing; trimming an id/URL would silently retarget a
-  reply or token). The size gate measures the
+  reply or token). The authenticated webhook acknowledges that permanent
+  rejection and exits before media extraction or agent dispatch, so a new chat
+  cannot start a turn without an outbound target and an existing chat cannot
+  reply against its previously cached activity. Dispatchable messages with a
+  missing or non-string activity id follow the same acknowledgement path;
+  lifecycle/control activities may still omit ids because they exit earlier and
+  never require a reply target. The size gate measures the
   projection under the same serialization flags `write_payload` uses
   (`indent=2, sort_keys=True`) — not a compact dump — so a deeply-nested kept
   sub-object, cheap compact but quadratically expensive indented, can't slip
@@ -80,7 +86,18 @@ this heading is dated at release.
   bloat, so `to_payload()`/save can't later `RecursionError` — extending the M10
   non-dict coercion; and a parse that exceeds the recursion limit yields an
   empty registry rather than crashing adapter construction. This cuts per-entry
-  size from ~MB to bytes; (3)
+  size from ~MB to bytes. The inbound retry cache is hardened at the same trust
+  boundary: it stores fixed-size SHA-256 delivery-key digests instead of raw
+  caller-controlled conversation/activity ids and enforces a 10,000-entry cap
+  in addition to its TTL. The cap is explicit in `BridgeConfig`; effective
+  retry retention is the configured TTL or capacity, whichever is reached
+  first, rather than an unbounded promise under sustained volume. Plugin
+  deployments can tune the same cap through platform `extra` as
+  `idempotency_max_entries`. Lifecycle uninstall cleanup is also independent
+  of full reference projection: once the authenticated activity supplies a
+  string conversation id, registry/live-state eviction still runs even if an
+  unrelated oversized field makes the activity unsuitable for persistence;
+  (3)
   `_persist_conversations` snapshots the
   payload on the loop then runs the blocking serialize+fsync+replace in an
   executor, so a large save no longer stalls inbound processing. The locked write

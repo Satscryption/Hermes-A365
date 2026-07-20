@@ -2455,6 +2455,15 @@ class TestActivityDeliveryId:
         a.pop("id")
         assert _activity_delivery_id(a) is None
 
+    @pytest.mark.parametrize(
+        ("field", "value"),
+        [("conversation", {"id": 123}), ("id", 123)],
+    )
+    def test_non_string_identity_returns_none(self, field: str, value: Any) -> None:
+        a = _inbound_message_activity()
+        a[field] = value
+        assert _activity_delivery_id(a) is None
+
     def test_non_dict_conversation_returns_none(self) -> None:
         a = _inbound_message_activity()
         a["conversation"] = "not-a-dict"
@@ -2476,7 +2485,9 @@ class TestIdempotencyCache:
     def test_first_call_records_and_returns_false(self) -> None:
         cache = _IdempotencyCache()
         assert cache.is_duplicate("conv-1:abc", now=100.0) is False
-        assert "conv-1:abc" in cache.seen
+        assert "conv-1:abc" not in cache.seen
+        assert len(cache.seen) == 1
+        assert len(next(iter(cache.seen))) == 64
 
     def test_second_call_within_ttl_returns_true(self) -> None:
         cache = _IdempotencyCache(ttl_seconds=60.0)
@@ -2491,14 +2502,34 @@ class TestIdempotencyCache:
         assert cache.is_duplicate("k", now=160.0) is False
 
     def test_prune_drops_expired_entries_on_check(self) -> None:
+        import hashlib
+
         cache = _IdempotencyCache(ttl_seconds=60.0)
         cache.is_duplicate("old", now=100.0)
         cache.is_duplicate("fresh", now=190.0)
         # Time has moved well past the old entry's TTL by the third call.
         cache.is_duplicate("probe", now=200.0)
-        assert "old" not in cache.seen
-        assert "fresh" in cache.seen
-        assert "probe" in cache.seen
+        assert hashlib.sha256(b"old").hexdigest() not in cache.seen
+        assert len(cache.seen) == 2
+
+    def test_oversized_delivery_id_is_stored_as_fixed_size_digest(self) -> None:
+        cache = _IdempotencyCache()
+        raw = "conv:" + "x" * 40_000
+        assert cache.is_duplicate(raw, now=100.0) is False
+        stored = next(iter(cache.seen))
+        assert stored != raw
+        assert len(stored) == 64
+        assert cache.is_duplicate(raw, now=101.0) is True
+
+    def test_entry_cap_evicts_oldest_digest(self) -> None:
+        cache = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
+        assert cache.is_duplicate("a", now=100.0) is False
+        assert cache.is_duplicate("b", now=101.0) is False
+        assert cache.is_duplicate("c", now=102.0) is False
+        assert len(cache.seen) == 2
+        # The oldest entry was evicted, so it is admitted as new.
+        assert cache.is_duplicate("a", now=103.0) is False
+        assert len(cache.seen) == 2
 
 class TestServeAppDedupe:
     def test_duplicate_delivery_short_circuits_webhook(self) -> None:

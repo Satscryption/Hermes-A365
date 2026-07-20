@@ -650,6 +650,20 @@ class Agent365Adapter(BasePlatformAdapter):
         except (ValueError, TypeError):
             self._conversations_prune_max_age_days = 30.0
 
+        # #105 review follow-up: hard memory bound for the in-memory inbound
+        # retry cache. Platform ``extra`` is the plugin's supported config
+        # surface; non-positive values disable retention while malformed
+        # values use the shipped default.
+        raw_idempotency_cap = extra.get("idempotency_max_entries")
+        try:
+            self._idempotency_max_entries = (
+                int(raw_idempotency_cap)
+                if raw_idempotency_cap is not None
+                else 10_000
+            )
+        except (TypeError, ValueError):
+            self._idempotency_max_entries = 10_000
+
         # Lazily-built runtime objects (populated in connect()).
         self._http_client: Any = None
         self._jwks_cache: Any = None  # AAD-v2 / A365 path (slice 19f)
@@ -871,6 +885,7 @@ class Agent365Adapter(BasePlatformAdapter):
             pid_path=pid_path,
             bf_app_id=self.bf_app_id,
             bf_client_secret=self.bf_client_secret,
+            idempotency_max_entries=self._idempotency_max_entries,
         )
 
     # ── FastAPI app construction (separated for testability) ──────────────
@@ -898,6 +913,11 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._idempotency_cache is None:
             self._idempotency_cache = bridge._IdempotencyCache(
                 ttl_seconds=bridge.DEFAULT_IDEMPOTENCY_TTL_SECONDS,
+                max_entries=getattr(
+                    self._bridge_cfg,
+                    "idempotency_max_entries",
+                    self._idempotency_max_entries,
+                ),
             )
 
         @app.get("/healthz")
@@ -1122,7 +1142,27 @@ class Agent365Adapter(BasePlatformAdapter):
             # Out of the agent loop either way — ack-and-bail.
             lifecycle_action = _lifecycle_registry_action(activity)
             if lifecycle_action is not None:
-                ref = ConversationRef.from_activity(activity)
+                conv = activity.get("conversation")
+                lifecycle_conv_id = (
+                    conv.get("id")
+                    if isinstance(conv, dict) and isinstance(conv.get("id"), str)
+                    else None
+                )
+                ref = None
+                if lifecycle_action == "evict":
+                    # Uninstall needs only the validated conversation id. Do
+                    # not make cleanup depend on projecting unrelated fields:
+                    # an oversized activity id/name must not leave stale
+                    # registry, stream, or watchdog state behind.
+                    if lifecycle_conv_id:
+                        self._teardown_chat_state(lifecycle_conv_id)
+                        self._seen_inbounds_this_lifetime.discard(
+                            lifecycle_conv_id
+                        )
+                        if self._conversations.evict(lifecycle_conv_id):
+                            await self._persist_conversations()
+                else:
+                    ref = ConversationRef.from_activity(activity)
                 if ref is not None:
                     # L4 (#100, #106 review follow-up): stamp the JWT-validated
                     # path on lifecycle-captured refs too, so a later proactive
@@ -1131,41 +1171,20 @@ class Agent365Adapter(BasePlatformAdapter):
                     # branch below already stamps it; the lifecycle capture path
                     # (install-then-proactive-without-a-user-message) was missed.
                     ref.validated_path = validated_path
-                    if lifecycle_action == "evict":
-                        # L3 (#105): tear down live stream/coalesced state +
-                        # cancel watchdogs first, so no debounce task fires a
-                        # doomed POST after the tenant uninstalled us. Runs
-                        # regardless of whether the registry held the ref.
-                        self._teardown_chat_state(ref.conversation_id)
-                        self._seen_inbounds_this_lifetime.discard(
-                            ref.conversation_id
-                        )
-                        if self._conversations.evict(ref.conversation_id):
-                            await self._persist_conversations()
-                    else:  # "upsert" — capture-if-missing only.
-                        # A lifecycle activity has no replyToActivity-able
-                        # id and no agentic ids, so it must NEVER overwrite a
-                        # richer captured user-message ref: doing so would
-                        # corrupt the cached reply target (send() would
-                        # replyToActivity against a non-message id) and
-                        # downgrade the proactive path (Path A -> B/unknown).
-                        # Only create a new entry, or fill one that has no
-                        # usable raw. A subsequent real user message refreshes
-                        # the entry via the normal dispatch path below.
-                        existing = self._conversations.get(ref.conversation_id)
-                        if existing is None or not existing.raw:
-                            self._conversations.upsert(ref)
-                            # M11 (#105): lifecycle capture is a growth path too
-                            # — bound it, or repeated installs grow the registry
-                            # past the cap without ever hitting the dispatch
-                            # branch.
-                            self._enforce_registry_cap(ref.conversation_id)
-                            await self._persist_conversations()
+                    # "upsert" — capture-if-missing only. A lifecycle activity
+                    # has no replyToActivity-able id and no agentic ids, so it
+                    # must NEVER overwrite a richer captured user-message ref.
+                    existing = self._conversations.get(ref.conversation_id)
+                    if existing is None or not existing.raw:
+                        self._conversations.upsert(ref)
+                        # M11 (#105): lifecycle capture is a growth path too.
+                        self._enforce_registry_cap(ref.conversation_id)
+                        await self._persist_conversations()
                 logger.info(
                     "inbound lifecycle type=%s action=%s conv=%s",
                     str(activity.get("type") or ""),
                     lifecycle_action,
-                    ref.conversation_id if ref is not None else "?(no conv.id)",
+                    lifecycle_conv_id or "?(no conv.id)",
                 )
                 return JSONResponse({"status": "acked", "lifecycle": lifecycle_action})
 
@@ -1176,36 +1195,60 @@ class Agent365Adapter(BasePlatformAdapter):
             if not _should_dispatch(activity):
                 return JSONResponse({"status": "acked"})
 
+            # Dispatchable messages need a real activity id: the steady-state
+            # outbound path replies to that activity. Lifecycle/control events
+            # may legitimately omit it, but they have already acked above.
+            activity_id = activity.get("id")
+            if not isinstance(activity_id, str) or not activity_id:
+                logger.warning(
+                    "inbound acked without dispatch: missing or invalid activity id"
+                )
+                return JSONResponse({"status": "acked", "reason": "unroutable"})
+
             # Slice 19o — upsert into the durable registry. ``send()``,
             # ``send_typing()``, and ``send_image()`` all look up by
             # ``conversation.id`` here.
             ref = ConversationRef.from_activity(activity)
-            if ref is not None:
-                # L4 (#100): stamp the validated path so later decoupled mints
-                # off this ref bind to it, not the body.
-                ref.validated_path = validated_path
-                self._conversations.upsert(ref)
-                # Slice 19x-e (#27): record that this gateway lifetime
-                # has captured an inbound for this chat. Drives the
-                # send() gate that picks replyToActivity vs
-                # sendToConversation. Per-lifetime, not persisted.
-                seen = self._seen_inbounds_this_lifetime
+            if ref is None:
+                # M11 (#105) review follow-up: from_activity() rejects a
+                # missing conversation id or an identity projection that
+                # cannot fit the durable-entry ceiling. Ack the webhook so BF
+                # does not retry a permanently unroutable payload, but stop
+                # before media extraction and the agent loop. Dispatching here
+                # would either leave a new chat with no outbound target or let
+                # an existing chat reply against its previously cached activity.
+                logger.warning(
+                    "inbound acked without dispatch: unroutable conversation "
+                    "reference type=%s",
+                    str(activity.get("type") or ""),
+                )
+                return JSONResponse({"status": "acked", "reason": "unroutable"})
+
+            # L4 (#100): stamp the validated path so later decoupled mints
+            # off this ref bind to it, not the body.
+            ref.validated_path = validated_path
+            self._conversations.upsert(ref)
+            # Slice 19x-e (#27): record that this gateway lifetime
+            # has captured an inbound for this chat. Drives the
+            # send() gate that picks replyToActivity vs
+            # sendToConversation. Per-lifetime, not persisted.
+            seen = self._seen_inbounds_this_lifetime
+            seen.add(ref.conversation_id)
+            # L2 (#105): bound the set, but NEVER evict the chat we just
+            # received — the send() gate above routes reply-vs-proactive
+            # off its membership, so evicting it would misroute THIS turn's
+            # response to sendToConversation. Trim arbitrary OTHER entries
+            # down to the cap (set.pop() can't hit a discarded key).
+            if len(seen) > _MAX_SEEN_INBOUNDS:
+                seen.discard(ref.conversation_id)
+                # ``and seen`` guards the degenerate cap<=0 case (would
+                # otherwise pop() an empty set → KeyError).
+                while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
+                    seen.pop()
                 seen.add(ref.conversation_id)
-                # L2 (#105): bound the set, but NEVER evict the chat we just
-                # received — the send() gate above routes reply-vs-proactive
-                # off its membership, so evicting it would misroute THIS turn's
-                # response to sendToConversation. Trim arbitrary OTHER entries
-                # down to the cap (set.pop() can't hit a discarded key).
-                if len(seen) > _MAX_SEEN_INBOUNDS:
-                    seen.discard(ref.conversation_id)
-                    # ``and seen`` guards the degenerate cap<=0 case (would
-                    # otherwise pop() an empty set → KeyError).
-                    while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
-                        seen.pop()
-                    seen.add(ref.conversation_id)
-                # M11 (#105): bound the registry on the hot growth path.
-                self._enforce_registry_cap(ref.conversation_id)
-                await self._persist_conversations()
+            # M11 (#105): bound the registry on the hot growth path.
+            self._enforce_registry_cap(ref.conversation_id)
+            await self._persist_conversations()
 
             # Build event + dispatch through Hermes' loop.
             # #76 — download any inbound attachments (images/files) into the
@@ -1222,10 +1265,9 @@ class Agent365Adapter(BasePlatformAdapter):
             # in-flight (via the base's live `_active_sessions`) for the WHOLE
             # turn and keep the registry cap/prune from evicting its reply
             # target underneath it.
-            if ref is not None:
-                sk = self._session_key_for(event)
-                if sk is not None:
-                    self._session_key_to_conv[sk] = ref.conversation_id
+            sk = self._session_key_for(event)
+            if sk is not None:
+                self._session_key_to_conv[sk] = ref.conversation_id
             return JSONResponse({"status": "dispatched"})
 
         return app
