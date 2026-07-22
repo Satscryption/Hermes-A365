@@ -50,7 +50,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ._common import active_az_tenant, resolve_expected_tenant, write_owner_only_text_atomic
+from ._common import (
+    TenantResolutionError,
+    active_az_tenant,
+    resolve_expected_tenant,
+    tenant_ids_match,
+    write_owner_only_text_atomic,
+)
 from .a365_config import A365Config, merge, read, write_atomic
 from .mutator import (
     AADSTS_CONSENT_REQUIRED,
@@ -268,6 +274,7 @@ def apply_register_plan(
     retries: int = DEFAULT_RETRIES,
     backoff: float = DEFAULT_BACKOFF_SECONDS,
     sleep_fn: Callable[[float], None] = time.sleep,
+    config_path: Path | None = None,
 ) -> ApplyResult:
     """Run each step in order. Stop on a consent-required defer; propagate
     other AADSTS errors and any non-AADSTS CLI failures.
@@ -298,7 +305,13 @@ def apply_register_plan(
                 "unverifiable session. Run `az login --tenant "
                 f"{expected_tenant}` and re-try."
             )
-        if active.lower() != expected_tenant.lower():
+        try:
+            tenant_matches = tenant_ids_match(
+                active, expected_tenant, source="--tenant-id or A365_TENANT_ID"
+            )
+        except TenantResolutionError as e:
+            raise RegisterError(str(e)) from e
+        if not tenant_matches:
             raise RegisterError(
                 f"active az tenant {active} does not match the pinned tenant "
                 f"{expected_tenant}; refusing to provision into the wrong "
@@ -307,6 +320,13 @@ def apply_register_plan(
         result.messages.append(
             f"[apply] tenant pin OK: active az tenant matches {expected_tenant}"
         )
+
+    # Keep the local config mutation behind the same tenant preflight as the
+    # cloud steps. A mismatch/unverifiable session must leave existing config
+    # untouched so a failed command cannot steer a later run at the rejected
+    # tenant.
+    if config_path is not None:
+        update_config_for_agent(config_path, plan.inputs)
 
     for i, step in enumerate(plan.steps):
         try:
@@ -701,14 +721,13 @@ def run(args: argparse.Namespace) -> int:
         sys.stdout.write("\nNo mutations. Re-run with --apply to execute.\n")
         return 0
 
-    update_config_for_agent(args.config, inputs)
-
     try:
         result = apply_register_plan(
             plan,
             mutator=get_mutator(),
             retries=args.retries,
             backoff=args.backoff,
+            config_path=args.config,
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)

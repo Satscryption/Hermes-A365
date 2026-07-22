@@ -1125,7 +1125,9 @@ class TestTenantPinnedProvisioning:
     _PINNED = "aaaa1111-0000-0000-0000-000000000001"
     _OTHER = "bbbb2222-0000-0000-0000-000000000002"
 
-    def test_apply_refuses_on_tenant_mismatch_before_any_step(self) -> None:
+    def test_apply_refuses_on_tenant_mismatch_before_any_step(
+        self, tmp_path: Path
+    ) -> None:
         # M7 (#102): the a365 CLI auto-detects its tenant from the ambient az
         # session, so provisioning under a mismatched login would create the
         # blueprint/permissions in the WRONG tenant. Refuse before step one.
@@ -1134,12 +1136,27 @@ class TestTenantPinnedProvisioning:
         )
         mutator = FakeMutator(scripted=[_account_show_result(self._OTHER)])
 
+        config_path = tmp_path / "a365.config.json"
+        config_path.write_text('{"tenantId":"original-tenant"}\n')
+
         with pytest.raises(RegisterError, match="does not match the pinned tenant"):
-            apply_register_plan(plan, mutator=mutator)
+            apply_register_plan(plan, mutator=mutator, config_path=config_path)
 
         assert mutator.calls == [
             ["az", "account", "show", "-o", "json", "--only-show-errors"]
         ]
+        assert json.loads(config_path.read_text())["tenantId"] == "original-tenant"
+
+    def test_domain_alias_gets_canonical_guid_migration_error(self) -> None:
+        plan = build_register_plan(
+            RegisterInputs(
+                agent_name="Inbox Helper", tenant_id="contoso.onmicrosoft.com"
+            )
+        )
+        mutator = FakeMutator(scripted=[_account_show_result(self._PINNED)])
+
+        with pytest.raises(RegisterError, match="not a canonical tenant GUID"):
+            apply_register_plan(plan, mutator=mutator)
 
     def test_apply_refuses_when_session_unverifiable(self) -> None:
         plan = build_register_plan(
@@ -1165,6 +1182,23 @@ class TestTenantPinnedProvisioning:
         assert mutator.calls[1][0] == "a365"
         assert result.completed  # steps actually ran after the pre-flight
         assert any("tenant pin OK" in m for m in result.messages)
+
+    def test_matching_preflight_updates_config_before_steps(self, tmp_path: Path) -> None:
+        plan = build_register_plan(
+            RegisterInputs(agent_name="Inbox Helper", tenant_id=self._PINNED)
+        )
+        mutator = FakeMutator(scripted=[_account_show_result(self._PINNED)])
+        config_path = tmp_path / "a365.config.json"
+        config_path.write_text('{"tenantId":"old"}\n')
+
+        result = apply_register_plan(
+            plan, mutator=mutator, config_path=config_path
+        )
+
+        config = json.loads(config_path.read_text())
+        assert config["tenantId"] == self._PINNED
+        assert config["agentBlueprintDisplayName"] == "Inbox Helper Blueprint"
+        assert result.completed
 
     def test_apply_skips_preflight_without_pin(self) -> None:
         # Unpinned inputs (fresh setup / direct API caller): behaviour — and

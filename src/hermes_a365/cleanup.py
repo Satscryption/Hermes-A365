@@ -38,10 +38,12 @@ from typing import Literal
 
 from . import bot_service
 from ._common import (
+    TenantResolutionError,
     active_az_tenant,
     ensure_contained,
     resolve_expected_tenant,
     slugify,
+    tenant_ids_match,
     validate_slug,
 )
 from .mutator import AADSTSError, CliInvocationError, Mutator, get_mutator
@@ -410,24 +412,17 @@ def apply_cleanup_plan(
     if generated_config_path is None:
         generated_config_path = Path.cwd() / "a365.generated.config.json"
     snapshot_instance_id = _snapshot_agent_instance_id(generated_config_path)
-    # Dedupe + canonical-case the union of (snapshot, operator-supplied).
-    # #102 L6: ids typed by the OPERATOR (--orphan-instance-id) carry typo
-    # risk the snapshot path doesn't — the snapshot id came from this agent's
-    # own generated config, so it is associated by construction. Track which
-    # candidates are operator-supplied; purging those requires the id to be
-    # re-typed via --confirm-orphan (double entry — the wrapper has no
-    # validated Graph READ of agentInstances to verify ownership server-side,
-    # and the DELETE permission the operator may lack applies to a GET too).
+    # Dedupe + canonical-case the union of snapshot and operator-supplied ids.
+    # #102 L6: every candidate requires --confirm-orphan before deletion. The
+    # snapshot file is selected by working directory and has no agent binding,
+    # so treating it as trusted would preserve the wrong-directory footgun.
     candidate_instance_ids: list[str] = []
     if snapshot_instance_id is not None:
         candidate_instance_ids.append(snapshot_instance_id.lower())
-    operator_supplied_instance_ids: set[str] = set()
     for oid in additional_orphan_instance_ids:
         normalised = oid.strip().lower()
         if not normalised:
             continue
-        if normalised != (snapshot_instance_id or "").lower():
-            operator_supplied_instance_ids.add(normalised)
         if normalised not in candidate_instance_ids:
             candidate_instance_ids.append(normalised)
     confirmed_instance_ids = {
@@ -445,9 +440,12 @@ def apply_cleanup_plan(
     # nothing to compare against — but say so loudly. (The bot-service step is
     # independently safe: its az calls pin the sidecar's subscriptionId, and a
     # subscription belongs to exactly one tenant.)
-    expected_tenant, tenant_source = resolve_expected_tenant(
-        hermes_home, plan.inputs.tenant_id
-    )
+    try:
+        expected_tenant, tenant_source = resolve_expected_tenant(
+            hermes_home, plan.inputs.tenant_id
+        )
+    except TenantResolutionError as e:
+        raise CleanupError(str(e)) from e
     if expected_tenant is None:
         result.messages.append(
             "[apply] WARNING: no tenant pin (--tenant-id absent and no "
@@ -464,7 +462,13 @@ def apply_cleanup_plan(
                 "destructive cleanup against an unverifiable session. "
                 "Run `az login --tenant <tenant>` and re-try."
             )
-        if active.lower() != expected_tenant.lower():
+        try:
+            tenant_matches = tenant_ids_match(
+                active, expected_tenant, source=tenant_source
+            )
+        except TenantResolutionError as e:
+            raise CleanupError(str(e)) from e
+        if not tenant_matches:
             raise CleanupError(
                 f"active az tenant {active} does not match the pinned tenant "
                 f"{expected_tenant} ({tenant_source}); refusing to tear down "
@@ -600,19 +604,17 @@ def apply_cleanup_plan(
                 f"{instance_id}; recover with: {recovery}"
             )
             continue
-        # #102 L6: an operator-typed id must be re-typed to be DELETED — a
-        # typo'd GUID would otherwise delete an unrelated tenant instance.
-        # Snapshot-derived ids are exempt (associated by construction).
-        if (
-            instance_id in operator_supplied_instance_ids
-            and instance_id not in confirmed_instance_ids
-        ):
+        # #102 L6: every id must be re-typed to be DELETED. A snapshot from
+        # ./a365.generated.config.json is selected by working directory and is
+        # not cryptographically or structurally bound to --agent-name, so it
+        # carries the same wrong-directory risk as an operator-supplied id.
+        if instance_id not in confirmed_instance_ids:
             result.orphan_instances_remaining.append(instance_id)
             result.messages.append(
-                f"[apply] refusing to purge operator-supplied instance "
+                f"[apply] refusing to purge agentRegistry instance "
                 f"{instance_id} without --confirm-orphan {instance_id} "
-                "(double-entry guard: a typo'd id would delete an unrelated "
-                "instance). Re-run with both flags to purge it."
+                "(double-entry guard: a typo or stale generated config would "
+                "delete an unrelated instance). Re-run with confirmation to purge it."
             )
             continue
         try:
@@ -736,13 +738,13 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         default=[],
         metavar="GUID",
         help=(
-            "re-type an --orphan-instance-id value to authorise its Graph "
-            "DELETE under --purge-orphans. Double-entry guard: a typo'd "
+            "re-type an orphan instance id to authorise its Graph DELETE "
+            "under --purge-orphans. Double-entry guard: a typo'd "
             "instance id would delete an UNRELATED agentRegistry instance, "
             "and the wrapper has no Graph read with which to verify "
-            "ownership. Snapshot-derived ids (from "
-            "a365.generated.config.json) need no confirmation. May be "
-            "repeated."
+            "ownership. Snapshot-derived ids from a365.generated.config.json "
+            "also require confirmation because that file is selected by the "
+            "working directory, not bound to --agent-name. May be repeated."
         ),
     )
     return parser

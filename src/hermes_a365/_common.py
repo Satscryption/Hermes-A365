@@ -16,8 +16,13 @@ from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from urllib.parse import quote
+from uuid import UUID
 
 import jinja2
+
+
+class TenantResolutionError(ValueError):
+    """Raised when a configured tenant pin cannot be read or compared safely."""
 
 
 def templates_dir() -> Path:
@@ -211,14 +216,50 @@ def resolve_expected_tenant(
     if explicit and explicit.strip():
         return explicit.strip(), "--tenant-id"
     env_file = hermes_home / ".env"
-    if env_file.exists():
-        try:
-            tenant = parse_env(env_file.read_text()).get("A365_TENANT_ID", "").strip()
-        except OSError:
-            tenant = ""
-        if tenant:
-            return tenant, f"{env_file} A365_TENANT_ID"
+    try:
+        env_text = env_file.read_text()
+    except FileNotFoundError:
+        return None, "unpinned"
+    except OSError as e:
+        raise TenantResolutionError(
+            f"could not read tenant pin from {env_file}: {e}; refusing to fall back "
+            "to the ambient az/a365 tenant"
+        ) from e
+    tenant = parse_env(env_text).get("A365_TENANT_ID", "").strip()
+    if tenant:
+        return tenant, f"{env_file} A365_TENANT_ID"
     return None, "unpinned"
+
+
+def tenant_ids_match(active: str, expected: str, *, source: str) -> bool:
+    """Compare tenant pins without treating a domain alias as a wrong tenant.
+
+    ``az account show`` returns a canonical tenant GUID, while older Hermes
+    state and the a365 CLI may accept values such as ``contoso.onmicrosoft.com``.
+    We cannot prove an alias maps to the active GUID from ``account show``
+    alone, so fail with a migration instruction rather than return a false
+    mismatch or weaken the guard. UUID spelling variants are canonicalized.
+    """
+    active_value = active.strip()
+    expected_value = expected.strip()
+    if active_value.lower() == expected_value.lower():
+        return True
+    try:
+        expected_uuid = UUID(expected_value)
+    except ValueError as e:
+        raise TenantResolutionError(
+            f"tenant pin {expected_value!r} from {source} is not a canonical tenant GUID, "
+            "so it cannot be safely compared with az account show. Replace it with the "
+            "GUID from `az account show --query tenantId -o tsv` and re-try."
+        ) from e
+    try:
+        active_uuid = UUID(active_value)
+    except ValueError as e:
+        raise TenantResolutionError(
+            f"az account show returned a non-GUID tenantId {active_value!r}; refusing to "
+            "act against an unverifiable tenant"
+        ) from e
+    return active_uuid == expected_uuid
 
 
 def active_az_tenant(run_fn: Callable[[list[str]], object]) -> str | None:

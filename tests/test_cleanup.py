@@ -800,6 +800,7 @@ class TestApplyCleanupOrphanInstance:
             hermes_home=tmp_path,
             purge_orphans=True,
             generated_config_path=cfg_path,
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
         )
 
         assert result.orphan_instances_purged == [_TEST_INSTANCE_ID]
@@ -837,6 +838,7 @@ class TestApplyCleanupOrphanInstance:
             hermes_home=tmp_path,
             purge_orphans=True,
             generated_config_path=cfg_path,
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
         )
 
         assert result.orphan_instances_purged == []
@@ -1050,6 +1052,30 @@ class TestTenantPinnedTeardown:
         with pytest.raises(CleanupError, match="unverifiable"):
             apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
 
+    def test_unreadable_env_refuses_before_any_step(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text(f"A365_TENANT_ID={self._PINNED}\n")
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        original_read_text = Path.read_text
+
+        def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path == env_file:
+                raise PermissionError("denied")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", guarded_read_text)
+        mutator = FakeMutator()
+
+        with pytest.raises(CleanupError, match="refusing to fall back"):
+            apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+        assert mutator.calls == []
+
     def test_apply_proceeds_when_tenant_matches(self, tmp_path: Path) -> None:
         self._pin_env(tmp_path, self._PINNED)
         _seed_agent_dir(tmp_path)
@@ -1222,9 +1248,9 @@ class TestOrphanConfirmGate:
             call[:2] == ["az", "rest"] and "DELETE" in call for call in mutator.calls
         )
 
-    def test_snapshot_id_purged_without_confirmation(self, tmp_path: Path) -> None:
-        # The snapshot id came from THIS agent's own generated config —
-        # associated by construction, no double entry needed.
+    def test_snapshot_id_requires_confirmation(self, tmp_path: Path) -> None:
+        # The generated config is selected by cwd and carries no agent-name
+        # binding, so a stale/wrong-directory snapshot needs double entry too.
         _seed_agent_dir(tmp_path)
         cfg_path = _seed_generated_config(tmp_path, instance_id=_TEST_INSTANCE_ID)
         plan = build_cleanup_plan(
@@ -1237,7 +1263,9 @@ class TestOrphanConfirmGate:
             purge_orphans=True,
             generated_config_path=cfg_path,
         )
-        assert result.orphan_instances_purged == [_TEST_INSTANCE_ID.lower()]
+        assert result.orphan_instances_purged == []
+        assert result.orphan_instances_remaining == [_TEST_INSTANCE_ID.lower()]
+        assert any("--confirm-orphan" in m for m in result.messages)
 
     def test_confirm_orphan_is_case_insensitive(self, tmp_path: Path) -> None:
         _seed_agent_dir(tmp_path)

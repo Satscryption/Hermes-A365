@@ -77,6 +77,10 @@ this heading is dated at release.
   the a365 subcommands additionally carry an explicit `--tenant-id`
   (visible in the plan) instead of auto-detecting. With no pin available
   anywhere (fresh setup), behaviour is unchanged but a warning says so.
+  An existing but unreadable operator env now fails closed instead of silently
+  downgrading to that warning path. Tenant pins are compared as canonical
+  GUIDs; legacy domain aliases receive a migration instruction because
+  `az account show` cannot prove their equivalence from its GUID-only output.
   (The bot-service step was already tenant-safe transitively: its az calls
   pin the sidecar's subscription, and a subscription belongs to exactly one
   tenant.)
@@ -92,17 +96,16 @@ this heading is dated at release.
   workflows: a scoped run that previously removed the whole agent dir now
   leaves `.env` behind by design — run a full (default-kinds) cleanup to
   reap it.
-- **L6 — purging an operator-typed orphan instance id requires double entry.**
+- **L6 — purging any orphan instance id requires double entry.**
   `--orphan-instance-id <GUID>` + `--purge-orphans` issues a Graph DELETE on
   `agentRegistry/agentInstances/<GUID>`; a typo'd GUID would delete an
   **unrelated** instance, and the wrapper has no validated Graph *read* of
   that resource with which to verify ownership (the CLI creates instances
-  server-side; nothing in-tree has ever fetched one). Operator-supplied ids
-  must therefore be re-typed via the new repeatable `--confirm-orphan <GUID>`
-  to be deleted; unconfirmed ids are surfaced and left remaining with a
-  precise re-run hint. Snapshot-derived ids (from this agent's own
-  `a365.generated.config.json`) are associated by construction and need no
-  confirmation.
+  server-side; nothing in-tree has ever fetched one). Every id must therefore
+  be re-typed via the new repeatable `--confirm-orphan <GUID>` to be deleted;
+  unconfirmed ids are surfaced and left remaining with a precise re-run hint.
+  Snapshot-derived ids are included because `a365.generated.config.json` is
+  selected by working directory and carries no binding to `--agent-name`.
 
   (M15 is split out to #127.)
 

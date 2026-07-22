@@ -19,14 +19,51 @@ from pathlib import Path
 import pytest
 
 from hermes_a365._common import (
+    TenantResolutionError,
     deep_diff,
     ensure_contained,
     quote_path_segment,
     render_diff_human,
+    resolve_expected_tenant,
     safe_run,
     slugify,
+    tenant_ids_match,
     validate_slug,
 )
+
+
+class TestTenantPinHelpers:
+    def test_unreadable_existing_env_fails_closed(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text("A365_TENANT_ID=tenant\n")
+        original_read_text = Path.read_text
+
+        def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path == env_file:
+                raise PermissionError("denied")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", guarded_read_text)
+
+        with pytest.raises(TenantResolutionError, match="refusing to fall back"):
+            resolve_expected_tenant(tmp_path, None)
+
+    def test_uuid_spelling_variants_match(self) -> None:
+        assert tenant_ids_match(
+            "2699fca3-dac6-40a2-bcea-62ce05e2ee9b",
+            "{2699FCA3DAC640A2BCEA62CE05E2EE9B}",
+            source="test",
+        )
+
+    def test_domain_alias_requires_guid_migration(self) -> None:
+        with pytest.raises(TenantResolutionError, match="not a canonical tenant GUID"):
+            tenant_ids_match(
+                "2699fca3-dac6-40a2-bcea-62ce05e2ee9b",
+                "contoso.onmicrosoft.com",
+                source="A365_TENANT_ID",
+            )
 
 
 class TestQuotePathSegment:
