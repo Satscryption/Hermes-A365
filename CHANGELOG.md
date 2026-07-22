@@ -59,7 +59,12 @@ this heading is dated at release.
   sidecar was provisioned for) at the moment the operator is told what to
   type. This binding also applies when the top-level `cleanup` orchestrator
   drives the bot-service step; its plan and confirmation summary show the same
-  sidecar-selected target that apply uses.
+  sidecar-selected target that apply uses. Because the orchestrator now parses
+  the sidecar at plan time, a **dry-run requires a loadable bot-service
+  sidecar** whenever `bot-service` is in `--kinds` (the default): a corrupt
+  sidecar fails the dry-run with its specific load error instead of rendering
+  a plan the apply could never execute. Preview the other kinds around a
+  broken sidecar with `--kinds azure,instance,blueprint`.
 
   (WP4–WP6 — tenant-pinned teardown, scoped-artefact gating, orphan-ownership
   check — land in the next #102 PR; M15 is split out to #127.)
