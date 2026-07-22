@@ -7,15 +7,22 @@ lookup works for both editable installs and wheels.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import socket
 import subprocess
+from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from urllib.parse import quote
+from uuid import UUID
 
 import jinja2
+
+
+class TenantResolutionError(ValueError):
+    """Raised when a configured tenant pin cannot be read or compared safely."""
 
 
 def templates_dir() -> Path:
@@ -193,6 +200,101 @@ def parse_env(text: str) -> dict[str, str]:
             v = v[1:-1]
         out[k] = v
     return out
+
+
+def resolve_expected_tenant(
+    hermes_home: Path, explicit: str | None
+) -> tuple[str | None, str]:
+    """#102 M7: which tenant destructive/provisioning CLI runs must bind to.
+
+    Precedence: an explicit ``--tenant-id`` wins; else the persisted
+    ``A365_TENANT_ID`` from ``<hermes_home>/.env`` (the operator env
+    ``status``/``doctor`` already treat as authoritative); else ``None`` —
+    meaning the caller has nothing to pin against and must say so rather than
+    silently trusting the ambient az/a365 session. Returns ``(tenant, source)``
+    where ``source`` is operator-readable provenance for messages."""
+    if explicit and explicit.strip():
+        return explicit.strip(), "--tenant-id"
+    env_file = hermes_home / ".env"
+    try:
+        env_text = env_file.read_text()
+    except FileNotFoundError:
+        return None, "unpinned"
+    except OSError as e:
+        raise TenantResolutionError(
+            f"could not read tenant pin from {env_file}: {e}; refusing to fall back "
+            "to the ambient az/a365 tenant"
+        ) from e
+    tenant = parse_env(env_text).get("A365_TENANT_ID", "").strip()
+    if tenant:
+        return tenant, f"{env_file} A365_TENANT_ID"
+    return None, "unpinned"
+
+
+def tenant_ids_match(active: str, expected: str, *, source: str) -> bool:
+    """Compare tenant pins without treating a domain alias as a wrong tenant.
+
+    ``az account show`` returns a canonical tenant GUID, while older Hermes
+    state and the a365 CLI may accept values such as ``contoso.onmicrosoft.com``.
+    We cannot prove an alias maps to the active GUID from ``account show``
+    alone, so fail with a migration instruction rather than return a false
+    mismatch or weaken the guard. UUID spelling variants are canonicalized.
+    """
+    active_value = active.strip()
+    expected_value = expected.strip()
+    if active_value.lower() == expected_value.lower():
+        return True
+    try:
+        expected_uuid = UUID(expected_value)
+    except ValueError as e:
+        raise TenantResolutionError(
+            f"tenant pin {expected_value!r} from {source} is not a canonical tenant GUID, "
+            "so it cannot be safely compared with az account show. Replace it with the "
+            "GUID from `az account show --query tenantId -o tsv` and re-try."
+        ) from e
+    try:
+        active_uuid = UUID(active_value)
+    except ValueError as e:
+        raise TenantResolutionError(
+            f"az account show returned a non-GUID tenantId {active_value!r}; refusing to "
+            "act against an unverifiable tenant"
+        ) from e
+    return active_uuid == expected_uuid
+
+
+def active_az_tenant(run_fn: Callable[[list[str]], object]) -> str | None:
+    """#102 M7: the ambient az session's ``tenantId``, or ``None`` when it
+    cannot be determined (az missing, not logged in, unparseable output).
+
+    ``run_fn`` executes an argv and returns an object with ``stdout`` (the
+    caller's mutator/runner seam — kept as a callable so this module stays
+    free of the mutator dependency). Callers enforcing a tenant pin MUST
+    treat ``None`` as fail-closed: an unverifiable session is not a match.
+
+    Parsing is TOLERANT of leading noise (#102 review): the production
+    mutator merges stderr into stdout, so ``az -o json`` output is routinely
+    prefixed by benign az notices (upgrade-available WARNING, preview
+    banners). A strict ``json.loads`` would fail-close a session whose
+    tenant actually matches. ``--only-show-errors`` suppresses most of the
+    noise at the source; the first-balanced-object decode handles the rest
+    (mirroring ``register._extract_first_json_object``'s documented lesson
+    about this exact stream shape)."""
+    try:
+        result = run_fn(["az", "account", "show", "-o", "json", "--only-show-errors"])
+    except Exception:
+        return None
+    stdout = str(getattr(result, "stdout", "") or "")
+    start = stdout.find("{")
+    if start < 0:
+        return None
+    try:
+        data, _end = json.JSONDecoder().raw_decode(stdout[start:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    tenant = str(data.get("tenantId") or "").strip()
+    return tenant or None
 
 
 def deep_diff(

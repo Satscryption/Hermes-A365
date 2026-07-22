@@ -391,6 +391,28 @@ class TestPlanRender:
         assert "hermes-inbox-helper-bot" in confirmation
         assert "--confirm=inbox-helper" in confirmation
 
+    def test_dry_run_surfaces_snapshot_orphan_confirmation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _seed_generated_config(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        args = build_parser().parse_args(
+            ["--agent-name", "inbox-helper", "--kinds", "instance"]
+        )
+
+        assert run(args) == 0
+
+        output = capsys.readouterr().out
+        assert _TEST_INSTANCE_ID.lower() in output
+        assert (
+            f"--purge-orphans --confirm-orphan {_TEST_INSTANCE_ID.lower()}"
+            in output
+        )
+
 
 # ---------------------------------------------------------------------------
 # apply_cleanup_plan
@@ -758,6 +780,24 @@ class TestSnapshotAgentInstanceId:
         cfg.write_text("{not valid json")
         assert _snapshot_agent_instance_id(cfg) is None
 
+    def test_plan_surfaces_snapshot_id_and_confirmation_flag(
+        self, tmp_path: Path
+    ) -> None:
+        cfg = _seed_generated_config(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+            hermes_home=tmp_path,
+            generated_config_path=cfg,
+        )
+
+        assert plan.orphan_instance_ids == (_TEST_INSTANCE_ID.lower(),)
+        rendered = plan.render_human()
+        assert _TEST_INSTANCE_ID.lower() in rendered
+        assert (
+            f"--purge-orphans --confirm-orphan {_TEST_INSTANCE_ID.lower()}"
+            in rendered
+        )
+
 
 class TestApplyCleanupOrphanInstance:
     def test_orphan_instance_surfaced_with_recovery_hint(
@@ -800,6 +840,7 @@ class TestApplyCleanupOrphanInstance:
             hermes_home=tmp_path,
             purge_orphans=True,
             generated_config_path=cfg_path,
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
         )
 
         assert result.orphan_instances_purged == [_TEST_INSTANCE_ID]
@@ -837,6 +878,7 @@ class TestApplyCleanupOrphanInstance:
             hermes_home=tmp_path,
             purge_orphans=True,
             generated_config_path=cfg_path,
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
         )
 
         assert result.orphan_instances_purged == []
@@ -891,6 +933,8 @@ class TestApplyCleanupAdditionalOrphanInstance:
     def test_manual_id_purged_with_az_rest_when_purge_on(
         self, tmp_path: Path
     ) -> None:
+        # #102 L6: operator-supplied ids need double entry — the id must be
+        # re-typed via --confirm-orphan for the DELETE to run.
         _seed_agent_dir(tmp_path)
         plan = build_cleanup_plan(
             CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
@@ -903,6 +947,7 @@ class TestApplyCleanupAdditionalOrphanInstance:
             purge_orphans=True,
             generated_config_path=tmp_path / "nope.json",
             additional_orphan_instance_ids=(self._AITEAMMATE_INSTANCE,),
+            confirmed_orphan_instance_ids=(self._AITEAMMATE_INSTANCE,),
         )
         assert result.orphan_instances_purged == [self._AITEAMMATE_INSTANCE]
         assert mutator.calls[-1] == [
@@ -982,3 +1027,442 @@ class TestApplyCleanupAdditionalOrphanInstance:
 
 def test_kinds_constant_pinned() -> None:
     assert CLEANUP_KINDS == ("bot-service", "azure", "instance", "blueprint")
+
+
+# ---------------------------------------------------------------------------
+# #102 WP4 — tenant-pinned teardown (M7)
+# ---------------------------------------------------------------------------
+
+
+def _account_show_result(tenant: str) -> RunResult:
+    return RunResult(
+        argv=["az", "account", "show", "-o", "json", "--only-show-errors"],
+        returncode=0,
+        stdout=json.dumps({"tenantId": tenant, "id": "sub-1"}),
+        stderr="",
+    )
+
+
+class TestTenantPinnedTeardown:
+    _PINNED = "aaaa1111-0000-0000-0000-000000000001"
+    _OTHER = "bbbb2222-0000-0000-0000-000000000002"
+
+    @staticmethod
+    def _pin_env(tmp_path: Path, tenant: str) -> None:
+        (tmp_path / ".env").write_text(f"A365_TENANT_ID={tenant}\n")
+
+    def test_apply_refuses_on_tenant_mismatch_before_any_step(
+        self, tmp_path: Path
+    ) -> None:
+        # M7 (#102): the ambient az/a365 session decides which tenant the
+        # a365 subcommands and az orphan paths hit. A mismatch must refuse
+        # BEFORE any destructive step — cloud untouched, local files intact.
+        self._pin_env(tmp_path, self._PINNED)
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(
+                agent_name="inbox-helper", kinds=("azure", "instance", "blueprint")
+            ),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator(scripted=[_account_show_result(self._OTHER)])
+
+        with pytest.raises(CleanupError, match="does not match the pinned tenant"):
+            apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+        # Only the verification call ran — no a365 step, no deletion.
+        assert mutator.calls == [
+            ["az", "account", "show", "-o", "json", "--only-show-errors"]
+        ]
+        assert (tmp_path / "agents" / "inbox-helper" / ".env").exists()
+
+    def test_apply_refuses_when_session_unverifiable(self, tmp_path: Path) -> None:
+        # M7 (#102): a pin exists but az account show fails — an unverifiable
+        # session is NOT a match; fail closed.
+        self._pin_env(tmp_path, self._PINNED)
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator(
+            scripted=[CliInvocationError(["az", "account", "show"], 1, "boom")]
+        )
+
+        with pytest.raises(CleanupError, match="unverifiable"):
+            apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+    def test_unreadable_env_refuses_before_any_step(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        env_file = tmp_path / ".env"
+        env_file.write_text(f"A365_TENANT_ID={self._PINNED}\n")
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        original_read_text = Path.read_text
+
+        def guarded_read_text(path: Path, *args: object, **kwargs: object) -> str:
+            if path == env_file:
+                raise PermissionError("denied")
+            return original_read_text(path, *args, **kwargs)
+
+        monkeypatch.setattr(Path, "read_text", guarded_read_text)
+        mutator = FakeMutator()
+
+        with pytest.raises(CleanupError, match="refusing to fall back"):
+            apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+        assert mutator.calls == []
+
+    def test_apply_proceeds_when_tenant_matches(self, tmp_path: Path) -> None:
+        self._pin_env(tmp_path, self._PINNED)
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator(scripted=[_account_show_result(self._PINNED)])
+
+        result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+        assert mutator.calls[0] == [
+            "az", "account", "show", "-o", "json", "--only-show-errors"
+        ]
+        assert mutator.calls[1][:2] == ["a365", "cleanup"]
+        assert any("tenant pin OK" in m for m in result.messages)
+
+    def test_tenant_compare_is_case_insensitive(self, tmp_path: Path) -> None:
+        self._pin_env(tmp_path, self._PINNED.upper())
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator(scripted=[_account_show_result(self._PINNED.lower())])
+        result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert any("tenant pin OK" in m for m in result.messages)
+
+    def test_apply_warns_and_proceeds_without_any_pin(self, tmp_path: Path) -> None:
+        # No --tenant-id and no A365_TENANT_ID in <hermes_home>/.env: nothing
+        # to compare against — proceed (fresh-setup compat) but say so, and
+        # crucially make NO az account show call (keeps the behaviour, and
+        # the mutator scripting, of every pre-M7 caller unchanged).
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator()
+
+        result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+        assert mutator.calls[0][:2] == ["a365", "cleanup"]
+        assert any("WARNING: no tenant pin" in m for m in result.messages)
+
+    def test_explicit_tenant_id_wins_over_env_pin(self, tmp_path: Path) -> None:
+        # Explicit --tenant-id (inputs.tenant_id) takes precedence over the
+        # persisted env value for the assert.
+        self._pin_env(tmp_path, self._OTHER)
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(
+                agent_name="inbox-helper",
+                tenant_id=self._PINNED,
+                kinds=("blueprint",),
+            ),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator(scripted=[_account_show_result(self._PINNED)])
+        result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert any("tenant pin OK" in m for m in result.messages)
+
+
+# ---------------------------------------------------------------------------
+# #102 WP5 — scoped-artefact gating (M8)
+# ---------------------------------------------------------------------------
+
+
+class TestScopedArtefactGating:
+    def test_scoped_blueprint_run_preserves_env_and_agent_dir(
+        self, tmp_path: Path
+    ) -> None:
+        # M8 (#102) regression: the agent .env is CROSS-KIND (instance id,
+        # blueprint app id, Path B bot ids). A --kinds=blueprint run used to
+        # wipe it and rmdir the agent dir, orphaning still-billing infra with
+        # no local trace. Now only blueprint.json (single-owner) leaves.
+        agent_dir = _seed_agent_dir(tmp_path, with_env=True, with_blueprint_cache=True)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+
+        result = apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
+
+        assert (agent_dir / ".env").exists()
+        assert not (agent_dir / "blueprint.json").exists()
+        assert agent_dir.exists()
+        assert [p.name for p in result.local_paths_removed] == ["blueprint.json"]
+
+    def test_subset_plan_local_paths_exclude_env(self, tmp_path: Path) -> None:
+        # Build-side honesty: the dry-run listing must not name artefacts a
+        # scoped run may not touch.
+        _seed_agent_dir(tmp_path, with_env=True, with_blueprint_cache=True)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        names = [p.name for p in plan.local_paths]
+        assert names == ["blueprint.json"]
+        assert ".env" not in plan.render_human()
+
+    def test_agent_dir_survives_scoped_run_even_when_left_empty(
+        self, tmp_path: Path
+    ) -> None:
+        # The rmdir gate keys on ALL kinds having been torn down — an empty
+        # dir after a scoped run still anchors the agent's identity namespace.
+        agent_dir = _seed_agent_dir(
+            tmp_path, with_env=False, with_blueprint_cache=True
+        )
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+
+        apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
+
+        assert agent_dir.exists()
+        assert not any(agent_dir.iterdir())
+
+    def test_full_run_still_reaps_env_and_dir(self, tmp_path: Path) -> None:
+        # Full teardown (all four kinds) keeps the pre-M8 behaviour: .env and
+        # the emptied agent dir are removed. Bot-service kind included via a
+        # missing sidecar (config=None -> no-op step that still completes).
+        agent_dir = _seed_agent_dir(tmp_path, with_env=True, with_blueprint_cache=True)
+        plan = build_cleanup_plan(
+            CleanupInputs(
+                agent_name="inbox-helper",
+                bot_service_sidecar_path=tmp_path / "absent-sidecar.json",
+            ),
+            hermes_home=tmp_path,
+        )
+
+        result = apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
+
+        assert not (agent_dir / ".env").exists()
+        assert not agent_dir.exists()
+        assert set(result.completed) == set(CLEANUP_KINDS)
+
+
+# ---------------------------------------------------------------------------
+# #102 WP6 — orphan-ownership double entry (L6)
+# ---------------------------------------------------------------------------
+
+
+class TestOrphanConfirmGate:
+    _MANUAL = "11111111-2222-3333-4444-555555555555"
+
+    def test_operator_id_refused_without_confirm(self, tmp_path: Path) -> None:
+        # L6 (#102): a typo'd --orphan-instance-id would DELETE an unrelated
+        # agentRegistry instance. Purging an operator-typed id now requires
+        # re-typing it via --confirm-orphan; unconfirmed ids stay remaining.
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        mutator = FakeMutator()
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=tmp_path / "nope.json",
+            additional_orphan_instance_ids=(self._MANUAL,),
+        )
+
+        assert result.orphan_instances_purged == []
+        assert result.orphan_instances_remaining == [self._MANUAL]
+        assert any("--confirm-orphan" in m for m in result.messages)
+        assert not any(
+            call[:2] == ["az", "rest"] and "DELETE" in call for call in mutator.calls
+        )
+
+    def test_snapshot_id_requires_confirmation(self, tmp_path: Path) -> None:
+        # The generated config is selected by cwd and carries no agent-name
+        # binding, so a stale/wrong-directory snapshot needs double entry too.
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path, instance_id=_TEST_INSTANCE_ID)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=cfg_path,
+        )
+        assert result.orphan_instances_purged == []
+        assert result.orphan_instances_remaining == [_TEST_INSTANCE_ID.lower()]
+        assert any(
+            f"--orphan-instance-id {_TEST_INSTANCE_ID.lower()}" in m
+            and f"--confirm-orphan {_TEST_INSTANCE_ID.lower()}" in m
+            for m in result.messages
+        )
+
+    def test_plan_candidate_survives_source_disappearing_before_apply(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path, instance_id=_TEST_INSTANCE_ID)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"),
+            hermes_home=tmp_path,
+            generated_config_path=cfg_path,
+        )
+        cfg_path.unlink()
+        mutator = FakeMutator()
+
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=cfg_path,
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+        )
+
+        assert result.orphan_instances_purged == [_TEST_INSTANCE_ID.lower()]
+        assert mutator.calls[-1][-1].endswith(_TEST_INSTANCE_ID.lower())
+
+    def test_unmatched_confirmation_refuses_before_cleanup(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        missing_config = tmp_path / "nope.json"
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"),
+            hermes_home=tmp_path,
+            generated_config_path=missing_config,
+        )
+        mutator = FakeMutator()
+
+        with pytest.raises(CleanupError, match="did not match an orphan candidate"):
+            apply_cleanup_plan(
+                plan,
+                mutator=mutator,
+                hermes_home=tmp_path,
+                purge_orphans=True,
+                generated_config_path=missing_config,
+                confirmed_orphan_instance_ids=(self._MANUAL,),
+            )
+
+        assert mutator.calls == []
+
+    def test_second_pass_requires_candidate_and_confirmation(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        missing_config = tmp_path / "a365.generated.config.json"
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"),
+            hermes_home=tmp_path,
+            generated_config_path=missing_config,
+            additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+        )
+
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=missing_config,
+            additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+        )
+
+        assert result.orphan_instances_purged == [_TEST_INSTANCE_ID.lower()]
+
+    def test_confirm_orphan_is_case_insensitive(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=tmp_path / "nope.json",
+            additional_orphan_instance_ids=(self._MANUAL.upper(),),
+            confirmed_orphan_instance_ids=(self._MANUAL.lower(),),
+        )
+        assert result.orphan_instances_purged == [self._MANUAL.lower()]
+
+    def test_cli_parser_accepts_repeated_confirm_orphan(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--agent-name",
+                "inbox-helper",
+                "--orphan-instance-id",
+                self._MANUAL,
+                "--confirm-orphan",
+                self._MANUAL,
+                "--confirm-orphan",
+                "99999999-8888-7777-6666-555555555555",
+            ]
+        )
+        assert args.confirm_orphan == [
+            self._MANUAL,
+            "99999999-8888-7777-6666-555555555555",
+        ]
+
+
+class TestTenantPinRound1Fixes:
+    """#102 M7 red-team round-1 regressions."""
+
+    _PINNED = "aaaa1111-0000-0000-0000-000000000001"
+
+    def test_tenant_verify_tolerates_az_warning_prefix(self, tmp_path: Path) -> None:
+        # The production mutator merges stderr into stdout, so `az -o json`
+        # output is routinely prefixed by benign az notices (upgrade WARNING,
+        # preview banners). A strict json.loads fail-closed a session whose
+        # tenant MATCHED the pin. The parse is now first-balanced-object.
+        (tmp_path / ".env").write_text(f"A365_TENANT_ID={self._PINNED}\n")
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
+            hermes_home=tmp_path,
+        )
+        noisy = RunResult(
+            argv=["az", "account", "show", "-o", "json", "--only-show-errors"],
+            returncode=0,
+            stdout=(
+                "WARNING: You have 2 updates available. Consider updating "
+                "your CLI installation with 'az upgrade'\n"
+                + json.dumps({"tenantId": self._PINNED, "id": "sub-1"})
+            ),
+            stderr="",
+        )
+        mutator = FakeMutator(scripted=[noisy])
+
+        result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+        assert any("tenant pin OK" in m for m in result.messages)
+
+    def test_empty_kinds_tuple_full_teardown_includes_local_artefacts(
+        self, tmp_path: Path
+    ) -> None:
+        # #102 review: kinds=() normalizes to "all four" for the CLOUD steps,
+        # so the local-artefact scope must see the same normalization — a full
+        # cloud teardown that removed zero local files would strand state.
+        _seed_agent_dir(tmp_path, with_env=True, with_blueprint_cache=True)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=()),
+            hermes_home=tmp_path,
+        )
+        names = {p.name for p in plan.local_paths}
+        assert ".env" in names
+        assert "blueprint.json" in names
+        assert len(plan.steps) == len(CLEANUP_KINDS)

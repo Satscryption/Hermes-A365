@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import datetime as _dt
 import json
+import os
 import shlex
 import sys
 import time
@@ -49,7 +50,13 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from ._common import write_owner_only_text_atomic
+from ._common import (
+    TenantResolutionError,
+    active_az_tenant,
+    resolve_expected_tenant,
+    tenant_ids_match,
+    write_owner_only_text_atomic,
+)
 from .a365_config import A365Config, merge, read, write_atomic
 from .mutator import (
     AADSTS_CONSENT_REQUIRED,
@@ -267,10 +274,59 @@ def apply_register_plan(
     retries: int = DEFAULT_RETRIES,
     backoff: float = DEFAULT_BACKOFF_SECONDS,
     sleep_fn: Callable[[float], None] = time.sleep,
+    config_path: Path | None = None,
 ) -> ApplyResult:
     """Run each step in order. Stop on a consent-required defer; propagate
-    other AADSTS errors and any non-AADSTS CLI failures."""
+    other AADSTS errors and any non-AADSTS CLI failures.
+
+    #102 M7: when ``plan.inputs.tenant_id`` carries a pin (the CLI layer
+    resolves it from ``--tenant-id`` or the operator env's ``A365_TENANT_ID``
+    before building inputs), the active az session tenant is asserted to
+    match BEFORE any provisioning step — the a365 CLI auto-detects its tenant
+    from that session, so a mismatched login would provision the agent into
+    the wrong tenant. Unpinned inputs (direct API callers, fresh setups with
+    nothing to compare against) keep the previous behaviour."""
     result = ApplyResult(plan=plan)
+
+    expected_tenant = (plan.inputs.tenant_id or "").strip()
+    if not expected_tenant:
+        result.messages.append(
+            "[apply] WARNING: no tenant pin (--tenant-id absent and no "
+            "A365_TENANT_ID resolved) — provisioning against the ambient "
+            "az/a365 session tenant"
+        )
+    if expected_tenant:
+        active = active_az_tenant(lambda argv: mutator.run(argv))
+        if active is None:
+            raise RegisterError(
+                "could not verify the active az tenant (az account show failed "
+                f"or returned no tenantId) while a tenant pin exists "
+                f"({expected_tenant}); refusing to provision against an "
+                "unverifiable session. Run `az login --tenant "
+                f"{expected_tenant}` and re-try."
+            )
+        try:
+            tenant_matches = tenant_ids_match(
+                active, expected_tenant, source="--tenant-id or A365_TENANT_ID"
+            )
+        except TenantResolutionError as e:
+            raise RegisterError(str(e)) from e
+        if not tenant_matches:
+            raise RegisterError(
+                f"active az tenant {active} does not match the pinned tenant "
+                f"{expected_tenant}; refusing to provision into the wrong "
+                f"tenant. Run `az login --tenant {expected_tenant}` and re-try."
+            )
+        result.messages.append(
+            f"[apply] tenant pin OK: active az tenant matches {expected_tenant}"
+        )
+
+    # Keep the local config mutation behind the same tenant preflight as the
+    # cloud steps. A mismatch/unverifiable session must leave existing config
+    # untouched so a failed command cannot steer a later run at the rejected
+    # tenant.
+    if config_path is not None:
+        update_config_for_agent(config_path, plan.inputs)
 
     for i, step in enumerate(plan.steps):
         try:
@@ -638,9 +694,16 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
 
 def run(args: argparse.Namespace) -> int:
     try:
+        # #102 M7: resolve the tenant pin up-front (explicit --tenant-id wins,
+        # else the operator env's A365_TENANT_ID) so every `a365 setup *` step
+        # carries --tenant-id and apply asserts the session matches.
+        hermes_home = Path(os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes"))
+        pinned_tenant, _tenant_source = resolve_expected_tenant(
+            hermes_home, args.tenant_id
+        )
         inputs = RegisterInputs(
             agent_name=args.agent_name,
-            tenant_id=args.tenant_id,
+            tenant_id=pinned_tenant,
             m365=args.m365,
             aiteammate=args.aiteammate,
             authmode=args.authmode,
@@ -658,14 +721,13 @@ def run(args: argparse.Namespace) -> int:
         sys.stdout.write("\nNo mutations. Re-run with --apply to execute.\n")
         return 0
 
-    update_config_for_agent(args.config, inputs)
-
     try:
         result = apply_register_plan(
             plan,
             mutator=get_mutator(),
             retries=args.retries,
             backoff=args.backoff,
+            config_path=args.config,
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
