@@ -37,7 +37,13 @@ from pathlib import Path
 from typing import Literal
 
 from . import bot_service
-from ._common import ensure_contained, slugify, validate_slug
+from ._common import (
+    active_az_tenant,
+    ensure_contained,
+    resolve_expected_tenant,
+    slugify,
+    validate_slug,
+)
 from .mutator import AADSTSError, CliInvocationError, Mutator, get_mutator
 
 CleanupKind = Literal["bot-service", "azure", "instance", "blueprint"]
@@ -70,15 +76,31 @@ def _agent_dir(hermes_home: Path, slug: str) -> Path:
     return hermes_home / "agents" / slug
 
 
-def _local_artefacts(hermes_home: Path, slug: str) -> list[Path]:
-    """Return existing local files we'd remove after cloud cleanup succeeds."""
-    candidates = [
-        _agent_dir(hermes_home, slug) / ".env",
-        # Legacy v0.1 caches that may linger on a fresh checkout.
-        _agent_dir(hermes_home, slug) / "blueprint.json",
-        _agent_dir(hermes_home, slug) / "bridge.pid",
-        _agent_dir(hermes_home, slug) / "bridge.log",
-    ]
+def _local_artefacts(
+    hermes_home: Path,
+    slug: str,
+    kinds: tuple[CleanupKind, ...] = CLEANUP_KINDS,
+) -> list[Path]:
+    """Return existing local files a cleanup scoped to ``kinds`` may remove.
+
+    #102 M8: the agent ``.env`` is a CROSS-KIND identity file — it carries
+    ``AA_INSTANCE_ID`` (instance), ``A365_APP_ID`` (blueprint), and the
+    Path B ``A365_BF_*`` pair (bot-service) — so no single kind owns it.
+    Removing it on a scoped run (e.g. ``--kinds=blueprint``) destroys the ids
+    for still-live, still-billing infra with no local trace. It (and the
+    runtime bridge files) therefore only leave with a FULL teardown;
+    ``blueprint.json`` is the one artefact with a single owner."""
+    agent_dir = _agent_dir(hermes_home, slug)
+    full_teardown = set(kinds) >= set(CLEANUP_KINDS)
+    candidates: list[Path] = []
+    if full_teardown:
+        candidates.append(agent_dir / ".env")
+    if "blueprint" in kinds:
+        # Legacy v0.1 cache that may linger on a fresh checkout.
+        candidates.append(agent_dir / "blueprint.json")
+    if full_teardown:
+        candidates.append(agent_dir / "bridge.pid")
+        candidates.append(agent_dir / "bridge.log")
     return [p for p in candidates if p.exists()]
 
 
@@ -230,7 +252,11 @@ def build_cleanup_plan(
     if hermes_home is None:
         hermes_home = _resolve_hermes_home()
 
+    # #102 review: normalize ONCE — an empty kinds tuple means "all four" for
+    # the cloud steps, so the local-artefact scope must see the same
+    # normalization or a full teardown would remove zero local files.
     requested = set(inputs.kinds) or set(CLEANUP_KINDS)
+    normalized_kinds = tuple(k for k in CLEANUP_KINDS if k in requested)
     steps: list[CleanupStep] = []
     for kind in CLEANUP_KINDS:  # canonical order
         if kind in requested:
@@ -254,7 +280,9 @@ def build_cleanup_plan(
     return CleanupPlan(
         inputs=inputs,
         steps=steps,
-        local_paths=_local_artefacts(hermes_home, inputs.resolved_slug),
+        # #102 M8: the plan (and so the dry-run listing) only names the
+        # artefacts this run's kinds may actually remove.
+        local_paths=_local_artefacts(hermes_home, inputs.resolved_slug, normalized_kinds),
         bot_service_plan=bot_service_plan,
     )
 
@@ -351,6 +379,7 @@ def apply_cleanup_plan(
     purge_orphans: bool = False,
     generated_config_path: Path | None = None,
     additional_orphan_instance_ids: tuple[str, ...] = (),
+    confirmed_orphan_instance_ids: tuple[str, ...] = (),
     bot_service_runner: bot_service.CommandRunner | None = None,
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
@@ -382,13 +411,69 @@ def apply_cleanup_plan(
         generated_config_path = Path.cwd() / "a365.generated.config.json"
     snapshot_instance_id = _snapshot_agent_instance_id(generated_config_path)
     # Dedupe + canonical-case the union of (snapshot, operator-supplied).
+    # #102 L6: ids typed by the OPERATOR (--orphan-instance-id) carry typo
+    # risk the snapshot path doesn't — the snapshot id came from this agent's
+    # own generated config, so it is associated by construction. Track which
+    # candidates are operator-supplied; purging those requires the id to be
+    # re-typed via --confirm-orphan (double entry — the wrapper has no
+    # validated Graph READ of agentInstances to verify ownership server-side,
+    # and the DELETE permission the operator may lack applies to a GET too).
     candidate_instance_ids: list[str] = []
     if snapshot_instance_id is not None:
         candidate_instance_ids.append(snapshot_instance_id.lower())
+    operator_supplied_instance_ids: set[str] = set()
     for oid in additional_orphan_instance_ids:
         normalised = oid.strip().lower()
-        if normalised and normalised not in candidate_instance_ids:
+        if not normalised:
+            continue
+        if normalised != (snapshot_instance_id or "").lower():
+            operator_supplied_instance_ids.add(normalised)
+        if normalised not in candidate_instance_ids:
             candidate_instance_ids.append(normalised)
+    confirmed_instance_ids = {
+        oid.strip().lower() for oid in confirmed_orphan_instance_ids if oid.strip()
+    }
+
+    # #102 M7: bind the WHOLE teardown to the persisted tenant BEFORE any
+    # destructive step. The a365 subcommands auto-detect their tenant from the
+    # ambient az session, and the two az orphan paths (`az ad user delete`,
+    # `az rest` Graph DELETE) have no per-call tenant flag at all — so the only
+    # sound enforcement is up-front: assert the active az tenant matches the
+    # expected one (explicit --tenant-id, else the operator env's
+    # A365_TENANT_ID), and refuse on mismatch or when the session can't be
+    # verified. With no pin available anywhere we proceed — a fresh setup has
+    # nothing to compare against — but say so loudly. (The bot-service step is
+    # independently safe: its az calls pin the sidecar's subscriptionId, and a
+    # subscription belongs to exactly one tenant.)
+    expected_tenant, tenant_source = resolve_expected_tenant(
+        hermes_home, plan.inputs.tenant_id
+    )
+    if expected_tenant is None:
+        result.messages.append(
+            "[apply] WARNING: no tenant pin (--tenant-id absent and no "
+            f"A365_TENANT_ID in {hermes_home / '.env'}) — proceeding against "
+            "the ambient az/a365 session tenant"
+        )
+    else:
+        active = active_az_tenant(lambda argv: mutator.run(argv))
+        if active is None:
+            raise CleanupError(
+                "could not verify the active az tenant (az account show "
+                f"failed or returned no tenantId) while a tenant pin exists "
+                f"({tenant_source} = {expected_tenant}); refusing to run "
+                "destructive cleanup against an unverifiable session. "
+                "Run `az login --tenant <tenant>` and re-try."
+            )
+        if active.lower() != expected_tenant.lower():
+            raise CleanupError(
+                f"active az tenant {active} does not match the pinned tenant "
+                f"{expected_tenant} ({tenant_source}); refusing to tear down "
+                "against the wrong tenant. Run `az login --tenant "
+                f"{expected_tenant}` (or pass --tenant-id) and re-try."
+            )
+        result.messages.append(
+            f"[apply] tenant pin OK: active az tenant matches {tenant_source}"
+        )
 
     for step in plan.steps:
         if step.kind == "bot-service":
@@ -442,13 +527,17 @@ def apply_cleanup_plan(
         result.local_paths_removed.append(path)
         result.messages.append(f"[apply] removed {path}")
 
-    # Best-effort agent dir reaper.
+    # Best-effort agent dir reaper. #102 M8: only when EVERY kind was torn
+    # down in this run — keyed on ``result.completed`` (what actually
+    # succeeded), not on what was requested, so a scoped run can never reap
+    # the directory that still anchors live-infra identity for other kinds.
     agent_dir = _agent_dir(hermes_home, plan.inputs.resolved_slug)
     try:
         ensure_contained(agent_dir, agents_root)
     except ValueError as e:
         raise CleanupError(f"refusing to rmdir a path outside the agents root: {e}") from e
-    if agent_dir.exists() and not any(agent_dir.iterdir()):
+    all_kinds_torn_down = set(result.completed) >= set(CLEANUP_KINDS)
+    if all_kinds_torn_down and agent_dir.exists() and not any(agent_dir.iterdir()):
         agent_dir.rmdir()
         result.messages.append(f"[apply] removed empty dir {agent_dir}")
 
@@ -509,6 +598,21 @@ def apply_cleanup_plan(
             result.messages.append(
                 f"[apply] orphaned agentRegistry instance: "
                 f"{instance_id}; recover with: {recovery}"
+            )
+            continue
+        # #102 L6: an operator-typed id must be re-typed to be DELETED — a
+        # typo'd GUID would otherwise delete an unrelated tenant instance.
+        # Snapshot-derived ids are exempt (associated by construction).
+        if (
+            instance_id in operator_supplied_instance_ids
+            and instance_id not in confirmed_instance_ids
+        ):
+            result.orphan_instances_remaining.append(instance_id)
+            result.messages.append(
+                f"[apply] refusing to purge operator-supplied instance "
+                f"{instance_id} without --confirm-orphan {instance_id} "
+                "(double-entry guard: a typo'd id would delete an unrelated "
+                "instance). Re-run with both flags to purge it."
             )
             continue
         try:
@@ -625,15 +729,39 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
             "`--purge-orphans` to issue the Graph DELETE."
         ),
     )
+    # #102 L6
+    parser.add_argument(
+        "--confirm-orphan",
+        action="append",
+        default=[],
+        metavar="GUID",
+        help=(
+            "re-type an --orphan-instance-id value to authorise its Graph "
+            "DELETE under --purge-orphans. Double-entry guard: a typo'd "
+            "instance id would delete an UNRELATED agentRegistry instance, "
+            "and the wrapper has no Graph read with which to verify "
+            "ownership. Snapshot-derived ids (from "
+            "a365.generated.config.json) need no confirmation. May be "
+            "repeated."
+        ),
+    )
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
     try:
         kinds = _parse_kinds(args.kinds)
+        # #102 M7 belt-and-braces: resolve the pinned tenant up-front so the
+        # a365 subcommands carry an explicit --tenant-id (visible in the plan)
+        # instead of auto-detecting from the ambient session. The apply-time
+        # pre-flight in apply_cleanup_plan remains the enforcement — it also
+        # covers the az orphan paths that have no per-call tenant flag.
+        pinned_tenant, _source = resolve_expected_tenant(
+            _resolve_hermes_home(), args.tenant_id
+        )
         inputs = CleanupInputs(
             agent_name=args.agent_name,
-            tenant_id=args.tenant_id,
+            tenant_id=pinned_tenant,
             kinds=kinds,
             slug=args.slug,
         )
@@ -672,6 +800,7 @@ def run(args: argparse.Namespace) -> int:
             hermes_home=_resolve_hermes_home(),
             purge_orphans=args.purge_orphans,
             additional_orphan_instance_ids=tuple(args.orphan_instance_id),
+            confirmed_orphan_instance_ids=tuple(args.confirm_orphan),
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)

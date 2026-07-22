@@ -66,8 +66,45 @@ this heading is dated at release.
   a plan the apply could never execute. Preview the other kinds around a
   broken sidecar with `--kinds azure,instance,blueprint`.
 
-  (WP4–WP6 — tenant-pinned teardown, scoped-artefact gating, orphan-ownership
-  check — land in the next #102 PR; M15 is split out to #127.)
+- **M7 — teardown and provisioning are tenant-pinned.** `cleanup --apply` and
+  `register --apply` no longer trust whatever tenant the ambient az/a365
+  session happens to be logged into. Both resolve the expected tenant
+  (explicit `--tenant-id`, else the operator env's `A365_TENANT_ID` — the same
+  precedence `status` uses) and **refuse before any destructive/provisioning
+  step** when the active az session's tenant differs or cannot be verified.
+  This is enforced up-front because the two az orphan paths (`az ad user
+  delete`, the `az rest` Graph DELETE) have no per-call tenant flag at all;
+  the a365 subcommands additionally carry an explicit `--tenant-id`
+  (visible in the plan) instead of auto-detecting. With no pin available
+  anywhere (fresh setup), behaviour is unchanged but a warning says so.
+  (The bot-service step was already tenant-safe transitively: its az calls
+  pin the sidecar's subscription, and a subscription belongs to exactly one
+  tenant.)
+- **M8 — scoped cleanups only remove the artefacts they own.** The agent
+  `.env` is a cross-kind identity file (instance id, blueprint app id, and
+  the Path B bot ids), so a `--kinds=blueprint` run no longer wipes it — or
+  the agent directory — while other kinds' infra is still live and billing.
+  `.env` and the runtime bridge files leave only with a full teardown;
+  `blueprint.json` (single-owner) leaves with the blueprint kind. The
+  agent-dir reaper now requires **every** kind to have actually completed in
+  the run (keyed on succeeded steps, not requested ones). Dry-run listings
+  name only the artefacts the scoped run may touch. Note for scripted
+  workflows: a scoped run that previously removed the whole agent dir now
+  leaves `.env` behind by design — run a full (default-kinds) cleanup to
+  reap it.
+- **L6 — purging an operator-typed orphan instance id requires double entry.**
+  `--orphan-instance-id <GUID>` + `--purge-orphans` issues a Graph DELETE on
+  `agentRegistry/agentInstances/<GUID>`; a typo'd GUID would delete an
+  **unrelated** instance, and the wrapper has no validated Graph *read* of
+  that resource with which to verify ownership (the CLI creates instances
+  server-side; nothing in-tree has ever fetched one). Operator-supplied ids
+  must therefore be re-typed via the new repeatable `--confirm-orphan <GUID>`
+  to be deleted; unconfirmed ids are surfaced and left remaining with a
+  precise re-run hint. Snapshot-derived ids (from this agent's own
+  `a365.generated.config.json`) are associated by construction and need no
+  confirmation.
+
+  (M15 is split out to #127.)
 
 ### Reliability (#105)
 
