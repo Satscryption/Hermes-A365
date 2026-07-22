@@ -142,6 +142,17 @@ class CleanupPlan:
     inputs: CleanupInputs
     steps: list[CleanupStep]
     local_paths: list[Path] = field(default_factory=list)
+    bot_service_plan: bot_service.BotServiceCleanupPlan | None = None
+
+    def bot_service_target_summary(self) -> str | None:
+        if self.bot_service_plan is None or self.bot_service_plan.config is None:
+            return None
+        config = self.bot_service_plan.config
+        binding = config.agentName if config.agentName is not None else "unbound legacy sidecar"
+        return (
+            f"bot {config.botName!r} in resource group {config.resourceGroup!r} "
+            f"(subscription {config.subscriptionId}; provisioned for {binding!r})"
+        )
 
     def render_human(self) -> str:
         lines = [f"[plan] hermes a365 cleanup {self.inputs.agent_name}"]
@@ -159,6 +170,10 @@ class CleanupPlan:
                 # shlex.join (slice 18p, bug #7) keeps multi-word values
                 # like `--agent-name "Hermes Inbox Helper"` quoted.
                 lines.append(f"      $ {shlex.join(s.argv)}")
+                if s.kind == "bot-service":
+                    target = self.bot_service_target_summary()
+                    if target is not None:
+                        lines.append(f"      sidecar target: {target}")
         lines.append("  local files to remove (after cloud cleanup succeeds):")
         if not self.local_paths:
             lines.append("    (none)")
@@ -227,10 +242,20 @@ def build_cleanup_plan(
                 )
             )
 
+    bot_service_plan = None
+    if "bot-service" in requested:
+        bot_service_plan = bot_service.build_cleanup_plan(
+            bot_service.BotServiceCleanupInputs(
+                agent_name=inputs.agent_name,
+                sidecar_path=inputs.bot_service_sidecar_path,
+            )
+        )
+
     return CleanupPlan(
         inputs=inputs,
         steps=steps,
         local_paths=_local_artefacts(hermes_home, inputs.resolved_slug),
+        bot_service_plan=bot_service_plan,
     )
 
 
@@ -367,12 +392,9 @@ def apply_cleanup_plan(
 
     for step in plan.steps:
         if step.kind == "bot-service":
-            bs_plan = bot_service.build_cleanup_plan(
-                bot_service.BotServiceCleanupInputs(
-                    agent_name=plan.inputs.agent_name,
-                    sidecar_path=plan.inputs.bot_service_sidecar_path,
-                )
-            )
+            bs_plan = plan.bot_service_plan
+            if bs_plan is None:
+                raise CleanupError("bot-service cleanup step is missing its parsed target plan")
             bs_result = bot_service.apply_cleanup_plan(bs_plan, runner=bot_service_runner)
             result.completed.append(step.kind)
             blueprint_teardown_requested = "blueprint" in plan.inputs.kinds
@@ -623,14 +645,17 @@ def run(args: argparse.Namespace) -> int:
         # #103/M9: building the plan resolves ``resolved_slug`` (which rejects
         # traversal-shaped ``--slug`` values); surface that as a clean rc=2.
         plan = build_cleanup_plan(inputs)
-    except ValueError as e:
+    except (ValueError, bot_service.BotServiceError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     sys.stdout.write(plan.render_human() + "\n")
 
     if not args.apply:
+        target = plan.bot_service_target_summary()
+        target_text = f" Bot Service target: {target}." if target is not None else ""
         sys.stdout.write(
-            f"\nNo mutations. Re-run with --apply --confirm={args.agent_name} to tear down.\n"
+            f"\nNo mutations.{target_text} Re-run with --apply "
+            f"--confirm={args.agent_name} to tear down.\n"
         )
         return 0
 

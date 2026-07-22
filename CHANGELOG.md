@@ -48,16 +48,18 @@ this heading is dated at release.
   the group's current contents when a managed-group purge is requested, so the
   operator sees the blast radius before `--apply`.
 - **M6 — the cleanup sidecar is bound to its agent.** `bot-service create`
-  now stamps `agentName` into the sidecar (schema stays v1 — the field is
-  optional, so pre-M6 sidecars still load), and cleanup **refuses before any
-  deletion** when the sidecar names a different agent than
+  now stamps `agentName` into a v2 sidecar. The reader still accepts pre-M6 v1
+  sidecars with a warning, while older binaries reject v2 rather than silently
+  ignoring the binding. Cleanup **refuses before any deletion** when the
+  sidecar names a different agent than
   `--agent-name`/`--confirm` — the run-cleanup-in-the-wrong-directory footgun.
   A legacy sidecar without the binding proceeds on `--confirm` alone with a
   warning. The plan and the pre-`--apply` summary now surface the full
   deletion target (bot, resource group, subscription, and which agent the
   sidecar was provisioned for) at the moment the operator is told what to
   type. This binding also applies when the top-level `cleanup` orchestrator
-  drives the bot-service step.
+  drives the bot-service step; its plan and confirmation summary show the same
+  sidecar-selected target that apply uses.
 
   (WP4–WP6 — tenant-pinned teardown, scoped-artefact gating, orphan-ownership
   check — land in the next #102 PR; M15 is split out to #127.)

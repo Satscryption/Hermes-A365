@@ -38,7 +38,8 @@ from ._common import (
 )
 
 SIDECAR_FILENAME = "a365.bot-service.config.json"
-SIDECAR_SCHEMA_VERSION = 1
+SIDECAR_SCHEMA_VERSION = 2
+_SUPPORTED_SIDECAR_SCHEMA_VERSIONS = (1, SIDECAR_SCHEMA_VERSION)
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
 _BOT_SERVICE_NAMESPACE = "Microsoft.BotService"
@@ -217,12 +218,10 @@ class BotServiceConfig:
     channelsEnabled: list[str]
     createdAt: str
     resourceGroupManaged: bool = False
-    # #102 M6: which agent this sidecar was provisioned for. Optional (default
-    # None) so pre-existing v1 sidecars still load — schemaVersion stays 1
-    # because from_file strict-equality-checks it and a bump would brick every
-    # deployed sidecar. Absence follows the resourceGroupManaged precedent:
-    # resolve to the non-escalating path (cleanup proceeds with a warning);
-    # a PRESENT-but-mismatched value is a hard refusal before any deletion.
+    # #102 M6: which agent this sidecar was provisioned for. Optional in the
+    # in-memory model so pre-existing v1 sidecars still load; newly written v2
+    # sidecars require it. Old binaries reject v2 instead of silently ignoring
+    # the binding, while this reader keeps the v1 warning/migration path.
     agentName: str | None = None
 
     @classmethod
@@ -243,11 +242,23 @@ class BotServiceConfig:
         ]
         if missing:
             raise BotServiceError(f"{path} missing required keys: {missing}")
-        if raw.get("schemaVersion") != SIDECAR_SCHEMA_VERSION:
+        schema_version = raw.get("schemaVersion")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
+        ):
             raise BotServiceError(
-                f"{path} schemaVersion={raw.get('schemaVersion')!r}; "
-                f"expected {SIDECAR_SCHEMA_VERSION}"
+                f"{path} schemaVersion={schema_version!r}; expected one of "
+                f"{sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
             )
+        if schema_version == SIDECAR_SCHEMA_VERSION:
+            agent_name = raw.get("agentName")
+            if not isinstance(agent_name, str) or not agent_name.strip():
+                raise BotServiceError(
+                    f"{path} schemaVersion={SIDECAR_SCHEMA_VERSION} requires a non-empty "
+                    "agentName binding; refusing to load"
+                )
         # #102 H3/L5 review: a blank subscriptionId would silently UN-pin every
         # az call built from this config (_sub_args('') emits no flag), letting
         # cleanup/verify fall back to the ambient az subscription — the exact
@@ -684,13 +695,17 @@ def _resource_list(
         return None
     if result.returncode != 0:
         return None
+    if not result.stdout.strip():
+        return None
     try:
-        parsed = json.loads(result.stdout or "[]")
+        parsed = json.loads(result.stdout)
     except json.JSONDecodeError:
         return None
     if not isinstance(parsed, list):
         return None
-    return [item for item in parsed if isinstance(item, dict)]
+    if any(not isinstance(item, dict) for item in parsed):
+        return None
+    return parsed
 
 
 def _foreign_resources(

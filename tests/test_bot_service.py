@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from hermes_a365.bot_service import (
+    SIDECAR_SCHEMA_VERSION,
     BotServiceCleanupInputs,
     BotServiceConfig,
     BotServiceCreateInputs,
@@ -219,6 +220,7 @@ def test_create_apply_writes_0600_sidecar_and_enables_teams(tmp_path: Path) -> N
     mode = stat.S_IMODE(result.sidecar_path.stat().st_mode)
     assert mode == 0o600
     data = json.loads(result.sidecar_path.read_text())
+    assert data["schemaVersion"] == SIDECAR_SCHEMA_VERSION == 2
     assert data["msaAppId"] == BF_APP_ID
     assert data["tenantId"] == TENANT_ID
     assert data["messagingEndpoint"] == "https://example.test/api/messages"
@@ -735,6 +737,39 @@ def test_cleanup_purge_fails_closed_when_listing_fails(tmp_path: Path) -> None:
     assert "could not enumerate" in "\n".join(result.messages)
 
 
+class _RawResourceListRunner(FakeRunner):
+    def __init__(self, raw_resource_list: str) -> None:
+        super().__init__(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+        self.raw_resource_list = raw_resource_list
+
+    def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+        if argv[:3] == ["az", "resource", "list"]:
+            self.calls.append(list(argv))
+            return CommandResult(argv, 0, stdout=self.raw_resource_list)
+        return super().run(argv, timeout=timeout)
+
+
+@pytest.mark.parametrize("raw_resource_list", ["", "[null]", '[{"name":"ok"}, null]'])
+def test_cleanup_purge_fails_closed_on_untrustworthy_success_output(
+    tmp_path: Path, raw_resource_list: str
+) -> None:
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = _RawResourceListRunner(raw_resource_list)
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is False
+    assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+    assert "could not enumerate" in "\n".join(result.messages)
+
+
 def test_cleanup_plan_enumerates_group_contents_for_purge_dry_run(tmp_path: Path) -> None:
     # M5 (#102): with a runner, the PLAN (dry-run) lists the group's current
     # contents so the operator sees the blast radius before --apply.
@@ -853,8 +888,8 @@ def test_create_apply_writes_agent_name_into_sidecar(tmp_path: Path) -> None:
 
 
 def test_sidecar_from_file_accepts_legacy_without_agent_name(tmp_path: Path) -> None:
-    # M6 (#102): schemaVersion stays 1 and the field is optional, so a v1
-    # sidecar written before the field existed still loads (agentName=None).
+    # M6 (#102): the v2 reader retains an explicit compatibility path for a v1
+    # sidecar written before the binding existed (agentName=None).
     sidecar = _write_sidecar(tmp_path)
     raw = json.loads(sidecar.read_text())
     del raw["agentName"]
@@ -863,6 +898,21 @@ def test_sidecar_from_file_accepts_legacy_without_agent_name(tmp_path: Path) -> 
     cfg = BotServiceConfig.from_file(sidecar)
     assert cfg.agentName is None
     assert cfg.schemaVersion == 1
+
+
+@pytest.mark.parametrize("agent_name", [None, "", "  "])
+def test_v2_sidecar_requires_non_empty_agent_binding(
+    tmp_path: Path, agent_name: str | None
+) -> None:
+    sidecar = _write_sidecar(tmp_path, agent_name=agent_name)
+    raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = SIDECAR_SCHEMA_VERSION
+    if agent_name is None:
+        raw.pop("agentName", None)
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(BotServiceError, match="requires a non-empty agentName"):
+        BotServiceConfig.from_file(sidecar)
 
 
 def test_cleanup_plan_render_surfaces_target_and_binding(tmp_path: Path) -> None:
