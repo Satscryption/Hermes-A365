@@ -38,7 +38,8 @@ from ._common import (
 )
 
 SIDECAR_FILENAME = "a365.bot-service.config.json"
-SIDECAR_SCHEMA_VERSION = 1
+SIDECAR_SCHEMA_VERSION = 2
+_SUPPORTED_SIDECAR_SCHEMA_VERSIONS = (1, SIDECAR_SCHEMA_VERSION)
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
 _BOT_SERVICE_NAMESPACE = "Microsoft.BotService"
@@ -217,6 +218,11 @@ class BotServiceConfig:
     channelsEnabled: list[str]
     createdAt: str
     resourceGroupManaged: bool = False
+    # #102 M6: which agent this sidecar was provisioned for. Optional in the
+    # in-memory model so pre-existing v1 sidecars still load; newly written v2
+    # sidecars require it. Old binaries reject v2 instead of silently ignoring
+    # the binding, while this reader keeps the v1 warning/migration path.
+    agentName: str | None = None
 
     @classmethod
     def from_file(cls, path: Path) -> BotServiceConfig:
@@ -236,10 +242,35 @@ class BotServiceConfig:
         ]
         if missing:
             raise BotServiceError(f"{path} missing required keys: {missing}")
-        if raw.get("schemaVersion") != SIDECAR_SCHEMA_VERSION:
+        schema_version = raw.get("schemaVersion")
+        if (
+            not isinstance(schema_version, int)
+            or isinstance(schema_version, bool)
+            or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
+        ):
             raise BotServiceError(
-                f"{path} schemaVersion={raw.get('schemaVersion')!r}; "
-                f"expected {SIDECAR_SCHEMA_VERSION}"
+                f"{path} schemaVersion={schema_version!r}; expected one of "
+                f"{sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
+            )
+        if schema_version == SIDECAR_SCHEMA_VERSION:
+            agent_name = raw.get("agentName")
+            if not isinstance(agent_name, str) or not agent_name.strip():
+                raise BotServiceError(
+                    f"{path} schemaVersion={SIDECAR_SCHEMA_VERSION} requires a non-empty "
+                    "agentName binding; refusing to load"
+                )
+        # #102 H3/L5 review: a blank subscriptionId would silently UN-pin every
+        # az call built from this config (_sub_args('') emits no flag), letting
+        # cleanup/verify fall back to the ambient az subscription — the exact
+        # wrong-target failure the pinning exists to prevent. Provisioning can
+        # never write a blank id, so this only bites hand-edited/corrupted
+        # sidecars: fail closed at load rather than un-pin destructive calls.
+        if not str(raw.get("subscriptionId") or "").strip():
+            raise BotServiceError(
+                f"{path} has a blank subscriptionId; refusing to load — az calls "
+                "would silently target the CLI's ambient subscription. Restore "
+                "the provisioned subscription id (see the sidecar backup or "
+                "az bot show) and re-run."
             )
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in raw.items() if k in known})
@@ -392,6 +423,11 @@ class BotServiceCleanupPlan:
     inputs: BotServiceCleanupInputs
     config: BotServiceConfig | None
     sidecar_exists: bool
+    # #102 M5: best-effort plan-time enumeration of the group's contents so
+    # the operator sees the purge blast radius BEFORE --apply. None == not
+    # enumerated (no runner given / purge not requested / listing failed);
+    # the authoritative content re-check happens again at apply time.
+    resource_group_contents: list[str] | None = None
 
     def render_human(self) -> str:
         lines = [f"[plan] hermes a365 bot-service cleanup {self.inputs.agent_name}"]
@@ -400,14 +436,33 @@ class BotServiceCleanupPlan:
             lines.append("  bot resource:   (none; sidecar missing)")
             lines.append("  azure steps:    (none)")
         else:
+            # #102 M6: surface the full deletion target, not just the names —
+            # the sidecar is what picks these, so the operator must see them
+            # before typing --apply --confirm.
             lines.append(f"  resource group: {self.config.resourceGroup}")
             lines.append(f"  bot resource:   {self.config.botName}")
+            lines.append(f"  subscription:   {self.config.subscriptionId}")
+            if self.config.agentName is not None:
+                lines.append(f"  provisioned for: {self.config.agentName}")
+            else:
+                lines.append("  provisioned for: (unbound pre-M6 sidecar; no agentName)")
             lines.append("  azure steps:")
             lines.append("    - az bot msteams delete (best effort)")
             lines.append("    - az bot delete (skip if already gone)")
             if self.inputs.purge_resource_group:
                 if self.config.resourceGroupManaged:
-                    lines.append("    - az group delete (resourceGroupManaged=true)")
+                    lines.append(
+                        "    - az group delete (resourceGroupManaged=true; refused at "
+                        "apply if the group holds non-Hermes resources)"
+                    )
+                    if self.resource_group_contents is not None:
+                        if self.resource_group_contents:
+                            lines.append("      group contents now:")
+                            lines.extend(
+                                f"        - {item}" for item in self.resource_group_contents
+                            )
+                        else:
+                            lines.append("      group contents now: (empty)")
                 else:
                     lines.append("    - skip az group delete (resourceGroupManaged=false)")
             else:
@@ -496,13 +551,37 @@ def build_update_endpoint_plan(
     )
 
 
-def build_cleanup_plan(inputs: BotServiceCleanupInputs) -> BotServiceCleanupPlan:
+def build_cleanup_plan(
+    inputs: BotServiceCleanupInputs,
+    *,
+    runner: CommandRunner | None = None,
+) -> BotServiceCleanupPlan:
+    """Build the (dry-run) cleanup plan.
+
+    ``runner`` is optional (#102 M5): when given AND a managed-group purge is
+    requested, the plan enumerates the group's current contents (one read-only
+    az call) so the operator sees the blast radius before ``--apply``. Failure
+    to enumerate degrades to no listing — the apply-time guard re-checks
+    authoritatively either way. Existing callers that pass no runner (the
+    top-level cleanup orchestrator) are unchanged."""
     if not inputs.sidecar_path.exists():
         return BotServiceCleanupPlan(inputs=inputs, config=None, sidecar_exists=False)
+    config = BotServiceConfig.from_file(inputs.sidecar_path)
+    contents: list[str] | None = None
+    if runner is not None and inputs.purge_resource_group and config.resourceGroupManaged:
+        listed = _resource_list(
+            runner, config.resourceGroup, subscription_id=config.subscriptionId
+        )
+        if listed is not None:
+            contents = [
+                f"{item.get('type') or '(unknown type)'}/{item.get('name') or '(unnamed)'}"
+                for item in listed
+            ]
     return BotServiceCleanupPlan(
         inputs=inputs,
-        config=BotServiceConfig.from_file(inputs.sidecar_path),
+        config=config,
         sidecar_exists=True,
+        resource_group_contents=contents,
     )
 
 
@@ -534,9 +613,38 @@ def _is_not_found(result: CommandResult) -> bool:
     return any(marker in text for marker in _NOT_FOUND_MARKERS)
 
 
-def _bot_show(runner: CommandRunner, resource_group: str, bot_name: str) -> dict[str, Any] | None:
+def _sub_args(subscription_id: str | None) -> list[str]:
+    """#102 H3/L5: explicit ``--subscription`` for an az invocation.
+
+    Every az call that reads or mutates ARM resources must bind to the
+    RESOLVED subscription (create path: ``--subscription-id``/account; cleanup
+    path: the sidecar's persisted ``subscriptionId``) — never the CLI's ambient
+    default, which can silently differ and land resources in (or delete them
+    from) the wrong subscription. Appended at the END of argv so the
+    ``argv[:3]``/``argv[:4]`` prefix dispatch in tests and any operator
+    eyeballing of the leading verb stay stable. Empty/None yields no args
+    (az rejects ``--subscription ''``) — but note no PRODUCTION caller may
+    rely on that as a fallback: create resolves-or-raises
+    (``_resolve_subscription_id``) and cleanup/verify load-or-raise
+    (``from_file`` rejects a blank ``subscriptionId``), so an un-pinned call
+    can only arise from a caller that passed nothing at all."""
+    sub = str(subscription_id or "").strip()
+    return ["--subscription", sub] if sub else []
+
+
+def _bot_show(
+    runner: CommandRunner,
+    resource_group: str,
+    bot_name: str,
+    *,
+    subscription_id: str | None = None,
+) -> dict[str, Any] | None:
     result = runner.run(
-        ["az", "bot", "show", "--resource-group", resource_group, "--name", bot_name, "-o", "json"]
+        [
+            "az", "bot", "show", "--resource-group", resource_group, "--name", bot_name, "-o",
+            "json",
+            *_sub_args(subscription_id),
+        ]
     )
     if result.returncode != 0:
         if _is_not_found(result):
@@ -545,8 +653,15 @@ def _bot_show(runner: CommandRunner, resource_group: str, bot_name: str) -> dict
     return _json_from_result(result, "az bot show")
 
 
-def _group_show(runner: CommandRunner, resource_group: str) -> dict[str, Any] | None:
-    result = runner.run(["az", "group", "show", "--name", resource_group, "-o", "json"])
+def _group_show(
+    runner: CommandRunner,
+    resource_group: str,
+    *,
+    subscription_id: str | None = None,
+) -> dict[str, Any] | None:
+    result = runner.run(
+        ["az", "group", "show", "--name", resource_group, "-o", "json", *_sub_args(subscription_id)]
+    )
     if result.returncode != 0:
         if _is_not_found(result):
             return None
@@ -554,23 +669,84 @@ def _group_show(runner: CommandRunner, resource_group: str) -> dict[str, Any] | 
     return _json_from_result(result, "az group show")
 
 
+def _resource_list(
+    runner: CommandRunner,
+    resource_group: str,
+    *,
+    subscription_id: str | None = None,
+) -> list[dict[str, Any]] | None:
+    """#102 M5: enumerate a resource group's top-level contents.
+
+    Returns ``None`` when the listing FAILS — callers must treat that as
+    "contents unknown" and fail closed (skip the purge), never as "empty".
+    Failure includes RAISED failures, not just nonzero exits:
+    ``SubprocessRunner.run`` raises ``BotServiceError`` for a missing az
+    binary or a timeout, and letting that propagate would either crash a
+    dry-run that used to work offline or abort a cleanup mid-way after the
+    bot was already deleted."""
+    try:
+        result = runner.run(
+            [
+                "az", "resource", "list", "--resource-group", resource_group, "-o", "json",
+                *_sub_args(subscription_id),
+            ]
+        )
+    except BotServiceError:
+        return None
+    if result.returncode != 0:
+        return None
+    if not result.stdout.strip():
+        return None
+    try:
+        parsed = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(parsed, list):
+        return None
+    if any(not isinstance(item, dict) for item in parsed):
+        return None
+    return parsed
+
+
+def _foreign_resources(
+    resources: list[dict[str, Any]], config: BotServiceConfig
+) -> list[str]:
+    """#102 M5: which of a managed group's resources are NOT ours.
+
+    Provisioning puts exactly ONE top-level resource in a managed group — the
+    bot (``Microsoft.BotService/botServices/<botName>``; the Teams channel is a
+    child of it, not a group member). Everything else appeared after we created
+    the group and must not be destroyed by ``--purge-resource-group``. Matched
+    case-insensitively by ARM id against the sidecar's ``armResourceId``, with
+    a type+name fallback for the id-shape drifting. Returns human-readable
+    ``type/name`` labels for the refusal message."""
+    managed_id = (config.armResourceId or "").lower()
+    foreign: list[str] = []
+    for item in resources:
+        arm_id = str(item.get("id") or "").lower()
+        rtype = str(item.get("type") or "")
+        name = str(item.get("name") or "")
+        is_managed_bot = (managed_id and arm_id == managed_id) or (
+            rtype.lower() == "microsoft.botservice/botservices"
+            and name.lower() == config.botName.lower()
+        )
+        if not is_managed_bot:
+            foreign.append(f"{rtype or '(unknown type)'}/{name or '(unnamed)'}")
+    return foreign
+
+
 def _msteams_show(
     runner: CommandRunner,
     resource_group: str,
     bot_name: str,
+    *,
+    subscription_id: str | None = None,
 ) -> dict[str, Any] | None:
     result = runner.run(
         [
-            "az",
-            "bot",
-            "msteams",
-            "show",
-            "--resource-group",
-            resource_group,
-            "--name",
-            bot_name,
-            "-o",
-            "json",
+            "az", "bot", "msteams", "show", "--resource-group", resource_group, "--name", bot_name,
+            "-o", "json",
+            *_sub_args(subscription_id),
         ]
     )
     if result.returncode != 0:
@@ -580,17 +756,18 @@ def _msteams_show(
     return _json_from_result(result, "az bot msteams show")
 
 
-def _msteams_delete(runner: CommandRunner, resource_group: str, bot_name: str) -> bool:
+def _msteams_delete(
+    runner: CommandRunner,
+    resource_group: str,
+    bot_name: str,
+    *,
+    subscription_id: str | None = None,
+) -> bool:
     result = runner.run(
         [
-            "az",
-            "bot",
-            "msteams",
-            "delete",
-            "--resource-group",
-            resource_group,
-            "--name",
+            "az", "bot", "msteams", "delete", "--resource-group", resource_group, "--name",
             bot_name,
+            *_sub_args(subscription_id),
         ]
     )
     if result.returncode != 0:
@@ -743,24 +920,17 @@ def _app_id_drift_recovery_commands(
         "--apply",
     ]
     commands = [
+        # #102 H3: paste-ready recovery must pin the subscription too — the
+        # operator pasting these is exactly the person whose ambient az
+        # default may point elsewhere.
         [
-            "az",
-            "bot",
-            "msteams",
-            "delete",
-            "--resource-group",
-            inputs.resource_group,
-            "--name",
+            "az", "bot", "msteams", "delete", "--resource-group", inputs.resource_group, "--name",
             bot_name,
+            *_sub_args(subscription_id),
         ],
         [
-            "az",
-            "bot",
-            "delete",
-            "--resource-group",
-            inputs.resource_group,
-            "--name",
-            bot_name,
+            "az", "bot", "delete", "--resource-group", inputs.resource_group, "--name", bot_name,
+            *_sub_args(subscription_id),
         ],
         create_argv,
     ]
@@ -838,29 +1008,32 @@ def apply_create_plan(
     subscription_id = _resolve_subscription_id(inputs, account)
 
     messages: list[str] = []
+    # #102 H3: every ARM read/mutate below carries the RESOLVED subscription —
+    # provider registration is per-subscription, and group/bot creation would
+    # otherwise land in the CLI's ambient default while config/ARM ids
+    # reference the resolved one (orphaned cross-subscription resources).
     _require_success(
         runner.run(
-            ["az", "provider", "register", "--namespace", _BOT_SERVICE_NAMESPACE, "--wait"],
+            [
+                "az", "provider", "register", "--namespace", _BOT_SERVICE_NAMESPACE, "--wait",
+                *_sub_args(subscription_id),
+            ],
             timeout=300.0,
         ),
         "az provider register",
     )
     messages.append(f"[apply] registered provider {_BOT_SERVICE_NAMESPACE}")
 
-    existing_group = _group_show(runner, inputs.resource_group)
+    existing_group = _group_show(
+        runner, inputs.resource_group, subscription_id=subscription_id
+    )
     resource_group_managed = existing_group is None
     _require_success(
         runner.run(
             [
-                "az",
-                "group",
-                "create",
-                "--name",
-                inputs.resource_group,
-                "--location",
-                inputs.region,
-                "-o",
-                "json",
+                "az", "group", "create", "--name", inputs.resource_group, "--location",
+                inputs.region, "-o", "json",
+                *_sub_args(subscription_id),
             ]
         ),
         "az group create",
@@ -871,32 +1044,16 @@ def apply_create_plan(
         messages.append(f"[apply] reused resource group {inputs.resource_group}")
 
     created_bot = False
-    bot = _bot_show(runner, inputs.resource_group, bot_name)
+    bot = _bot_show(runner, inputs.resource_group, bot_name, subscription_id=subscription_id)
     if bot is None:
         bot = _json_from_result(
             runner.run(
                 [
-                    "az",
-                    "bot",
-                    "create",
-                    "--resource-group",
-                    inputs.resource_group,
-                    "--name",
-                    bot_name,
-                    "--app-type",
-                    "SingleTenant",
-                    "--appid",
-                    app_id,
-                    "--tenant-id",
-                    tenant_id,
-                    "--endpoint",
-                    inputs.endpoint,
-                    "--sku",
-                    inputs.sku,
-                    "--location",
-                    "global",
-                    "-o",
-                    "json",
+                    "az", "bot", "create", "--resource-group", inputs.resource_group, "--name",
+                    bot_name, "--app-type", "SingleTenant", "--appid", app_id, "--tenant-id",
+                    tenant_id, "--endpoint", inputs.endpoint, "--sku", inputs.sku, "--location",
+                    "global", "-o", "json",
+                    *_sub_args(subscription_id),
                 ],
                 timeout=300.0,
             ),
@@ -924,17 +1081,9 @@ def apply_create_plan(
             bot = _json_from_result(
                 runner.run(
                     [
-                        "az",
-                        "bot",
-                        "update",
-                        "--resource-group",
-                        inputs.resource_group,
-                        "--name",
-                        bot_name,
-                        "--endpoint",
-                        inputs.endpoint,
-                        "-o",
-                        "json",
+                        "az", "bot", "update", "--resource-group", inputs.resource_group, "--name",
+                        bot_name, "--endpoint", inputs.endpoint, "-o", "json",
+                        *_sub_args(subscription_id),
                     ]
                 ),
                 "az bot update",
@@ -944,26 +1093,23 @@ def apply_create_plan(
             messages.append(f"[apply] bot resource {bot_name} already matches")
 
     created_teams_channel = False
-    teams = _msteams_show(runner, inputs.resource_group, bot_name)
+    teams = _msteams_show(runner, inputs.resource_group, bot_name, subscription_id=subscription_id)
     if teams is None:
         _require_success(
             runner.run(
                 [
-                    "az",
-                    "bot",
-                    "msteams",
-                    "create",
-                    "--resource-group",
-                    inputs.resource_group,
-                    "--name",
-                    bot_name,
+                    "az", "bot", "msteams", "create", "--resource-group", inputs.resource_group,
+                    "--name", bot_name,
+                    *_sub_args(subscription_id),
                 ]
             ),
             "az bot msteams create",
         )
         created_teams_channel = True
         messages.append("[apply] created Microsoft Teams channel")
-        teams = _msteams_show(runner, inputs.resource_group, bot_name)
+        teams = _msteams_show(
+            runner, inputs.resource_group, bot_name, subscription_id=subscription_id
+        )
 
     patched_teams_terms = False
     if not _teams_terms_accepted(teams):
@@ -976,7 +1122,9 @@ def apply_create_plan(
         patched_teams_terms = True
         messages.append("[apply] accepted Microsoft Teams channel terms")
 
-    refreshed = _bot_show(runner, inputs.resource_group, bot_name) or bot
+    refreshed = (
+        _bot_show(runner, inputs.resource_group, bot_name, subscription_id=subscription_id) or bot
+    )
     channels = _enabled_channels(refreshed)
     if "msteams" not in channels:
         channels.append("msteams")
@@ -992,6 +1140,9 @@ def apply_create_plan(
         channelsEnabled=sorted(set(channels)),
         createdAt=now().astimezone(UTC).isoformat().replace("+00:00", "Z"),
         resourceGroupManaged=resource_group_managed,
+        # #102 M6: bind the sidecar to the agent it was provisioned for, so a
+        # later cleanup can refuse a sidecar that names a different agent.
+        agentName=inputs.agent_name,
     )
     _write_bot_service_config(inputs.sidecar_path, cfg)
     messages.append(f"[apply] wrote {inputs.sidecar_path} (mode 0600)")
@@ -1018,26 +1169,25 @@ def apply_enable_channel_plan(
     messages: list[str] = []
     channel_created = False
 
-    teams = _msteams_show(runner, config.resourceGroup, config.botName)
+    teams = _msteams_show(
+        runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
+    )
     if teams is None:
         _require_success(
             runner.run(
                 [
-                    "az",
-                    "bot",
-                    "msteams",
-                    "create",
-                    "--resource-group",
-                    config.resourceGroup,
-                    "--name",
-                    config.botName,
+                    "az", "bot", "msteams", "create", "--resource-group", config.resourceGroup,
+                    "--name", config.botName,
+                    *_sub_args(config.subscriptionId),
                 ]
             ),
             "az bot msteams create",
         )
         channel_created = True
         messages.append("[apply] created Microsoft Teams channel")
-        teams = _msteams_show(runner, config.resourceGroup, config.botName)
+        teams = _msteams_show(
+            runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
+        )
     else:
         messages.append("[apply] Microsoft Teams channel already enabled")
 
@@ -1081,7 +1231,9 @@ def apply_update_endpoint_plan(
     inputs = plan.inputs
     messages: list[str] = []
 
-    bot = _bot_show(runner, config.resourceGroup, config.botName)
+    bot = _bot_show(
+        runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
+    )
     if bot is None:
         raise BotServiceError(f"{config.botName} not found in {config.resourceGroup}")
 
@@ -1091,17 +1243,9 @@ def apply_update_endpoint_plan(
         bot = _json_from_result(
             runner.run(
                 [
-                    "az",
-                    "bot",
-                    "update",
-                    "--resource-group",
-                    config.resourceGroup,
-                    "--name",
-                    config.botName,
-                    "--endpoint",
-                    inputs.url,
-                    "-o",
-                    "json",
+                    "az", "bot", "update", "--resource-group", config.resourceGroup, "--name",
+                    config.botName, "--endpoint", inputs.url, "-o", "json",
+                    *_sub_args(config.subscriptionId),
                 ]
             ),
             "az bot update",
@@ -1161,26 +1305,55 @@ def apply_cleanup_plan(
         record_blueprint_preserved()
         return result
 
-    bot = _bot_show(runner, config.resourceGroup, config.botName)
+    # #102 M6: refuse BEFORE any deletion when the sidecar names a different
+    # agent — the classic footgun is running cleanup for agent X from a
+    # directory holding agent Y's sidecar, which would delete Y's bot (and,
+    # under --purge-resource-group, Y's whole managed group). `--confirm` only
+    # matches --agent-name, so without this binding the sidecar's targets are
+    # never tied to what the operator confirmed. A legacy sidecar with no
+    # agentName proceeds with a warning (pre-M6 files can't be bound
+    # retroactively; the resourceGroup/botName targets are surfaced in the
+    # plan and the pre-apply summary instead).
+    if config.agentName is not None and config.agentName != inputs.agent_name:
+        raise BotServiceError(
+            f"sidecar {inputs.sidecar_path} was provisioned for agent "
+            f"{config.agentName!r}, not {inputs.agent_name!r}; it targets "
+            f"bot {config.botName!r} in resource group {config.resourceGroup!r} "
+            f"(subscription {config.subscriptionId}). Refusing to delete — "
+            "re-run with the matching --agent-name/--confirm, or point "
+            "--sidecar at the right file."
+        )
+    if config.agentName is None:
+        result.messages.append(
+            "[apply] WARNING: sidecar has no agentName binding (pre-M6 file); "
+            f"proceeding against bot {config.botName!r} in resource group "
+            f"{config.resourceGroup!r} on --confirm alone"
+        )
+
+    # #102 L5: every cleanup az call pins the sidecar's persisted
+    # subscriptionId — deletes must target the subscription the resources were
+    # provisioned in, never the CLI's ambient default.
+    subscription_id = config.subscriptionId
+    bot = _bot_show(
+        runner, config.resourceGroup, config.botName, subscription_id=subscription_id
+    )
     if bot is None:
         result.messages.append(
             f"[apply] no bot resource found: {config.resourceGroup}/{config.botName}"
         )
     else:
-        if _msteams_delete(runner, config.resourceGroup, config.botName):
+        if _msteams_delete(
+            runner, config.resourceGroup, config.botName, subscription_id=subscription_id
+        ):
             result.messages.append("[apply] deleted Microsoft Teams channel")
         # `az bot delete` is non-interactive (no confirm prompt) and rejects
         # `--yes`; only `--name` and `--resource-group` are accepted.
         _require_success(
             runner.run(
                 [
-                    "az",
-                    "bot",
-                    "delete",
-                    "--resource-group",
-                    config.resourceGroup,
-                    "--name",
+                    "az", "bot", "delete", "--resource-group", config.resourceGroup, "--name",
                     config.botName,
+                    *_sub_args(subscription_id),
                 ]
             ),
             "az bot delete",
@@ -1190,12 +1363,44 @@ def apply_cleanup_plan(
 
     if inputs.purge_resource_group:
         if config.resourceGroupManaged:
-            _require_success(
-                runner.run(["az", "group", "delete", "--name", config.resourceGroup, "--yes"]),
-                "az group delete",
+            # #102 M5: re-check the group's contents at apply time. We created
+            # this group holding exactly one top-level resource (the bot, now
+            # deleted above); anything else appeared later and is NOT ours to
+            # destroy. Skip the purge — never the whole cleanup — when foreign
+            # resources are present or the listing fails (contents unknown ==
+            # fail closed). The operator can delete the group manually once
+            # they have judged the leftovers.
+            leftovers = _resource_list(
+                runner, config.resourceGroup, subscription_id=subscription_id
             )
-            result.resource_group_deleted = True
-            result.messages.append(f"[apply] deleted managed resource group {config.resourceGroup}")
+            foreign = None if leftovers is None else _foreign_resources(leftovers, config)
+            if leftovers is None:
+                result.messages.append(
+                    f"[apply] skipped resource group purge for {config.resourceGroup}: "
+                    "could not enumerate its contents (az resource list failed); "
+                    "refusing to delete a group with unknown contents"
+                )
+            elif foreign:
+                listing = ", ".join(foreign)
+                result.messages.append(
+                    f"[apply] skipped resource group purge for {config.resourceGroup}: "
+                    f"it holds {len(foreign)} non-Hermes-managed resource(s) "
+                    f"[{listing}]; delete them (or the group) manually if intended"
+                )
+            else:
+                _require_success(
+                    runner.run(
+                        [
+                            "az", "group", "delete", "--name", config.resourceGroup, "--yes",
+                            *_sub_args(subscription_id),
+                        ]
+                    ),
+                    "az group delete",
+                )
+                result.resource_group_deleted = True
+                result.messages.append(
+                    f"[apply] deleted managed resource group {config.resourceGroup}"
+                )
         else:
             result.messages.append(
                 f"[apply] skipped resource group purge for {config.resourceGroup}: "
@@ -1218,18 +1423,14 @@ def apply_cleanup_plan(
 RuntimeProbe = Callable[[BotServiceConfig, CommandRunner], ProbeResult]
 
 
-def _provider_probe(runner: CommandRunner) -> ProbeResult:
+def _provider_probe(
+    runner: CommandRunner, *, subscription_id: str | None = None
+) -> ProbeResult:
     result = runner.run(
         [
-            "az",
-            "provider",
-            "show",
-            "--namespace",
-            _BOT_SERVICE_NAMESPACE,
-            "--query",
-            "registrationState",
-            "-o",
-            "tsv",
+            "az", "provider", "show", "--namespace", _BOT_SERVICE_NAMESPACE, "--query",
+            "registrationState", "-o", "tsv",
+            *_sub_args(subscription_id),
         ]
     )
     if result.returncode != 0:
@@ -1308,18 +1509,9 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
     secret_data = _json_from_result(
         runner.run(
             [
-                "az",
-                "bot",
-                "directline",
-                "show",
-                "--resource-group",
-                config.resourceGroup,
-                "--name",
-                config.botName,
-                "--with-secrets",
-                "true",
-                "-o",
-                "json",
+                "az", "bot", "directline", "show", "--resource-group", config.resourceGroup,
+                "--name", config.botName, "--with-secrets", "true", "-o", "json",
+                *_sub_args(config.subscriptionId),
             ]
         ),
         "az bot directline show",
@@ -1431,9 +1623,16 @@ def verify_bot_service(
     if generated_config_path is None:
         generated_config_path = Path.cwd() / "a365.generated.config.json"
     config = BotServiceConfig.from_file(sidecar_path)
-    results: list[ProbeResult] = [_provider_probe(runner)]
+    # #102 H3/L5: verify reads pin the sidecar's subscription too — probing
+    # the ambient subscription would report bogus missing/OK for the wrong
+    # target.
+    results: list[ProbeResult] = [
+        _provider_probe(runner, subscription_id=config.subscriptionId)
+    ]
 
-    bot = _bot_show(runner, config.resourceGroup, config.botName)
+    bot = _bot_show(
+        runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
+    )
     actual_bot_endpoint: str | None = None
     if bot is None:
         results.append(
@@ -1480,7 +1679,9 @@ def verify_bot_service(
         else:
             results.append(ProbeResult("auto_channels", "OK", "webchat + directline present"))
 
-    teams = _msteams_show(runner, config.resourceGroup, config.botName)
+    teams = _msteams_show(
+        runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
+    )
     if teams is None:
         results.append(
             ProbeResult(
@@ -1752,15 +1953,28 @@ def _run_cleanup(args: argparse.Namespace) -> int:
             sidecar_path=args.sidecar,
             purge_resource_group=args.purge_resource_group,
         )
-        plan = build_cleanup_plan(inputs)
+        # #102 M5: give the plan a real runner so a purge dry-run can
+        # enumerate the group's contents (build_cleanup_plan only issues the
+        # read-only listing when a managed-group purge is actually requested).
+        plan = build_cleanup_plan(inputs, runner=SubprocessRunner())
     except (ValueError, BotServiceError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
     sys.stdout.write(plan.render_human() + "\n")
     if not args.apply:
+        # #102 M6: restate the sidecar-selected deletion target next to the
+        # confirm instruction — the sidecar picks the target, so the operator
+        # must see it at the moment they are told what to type.
+        target = ""
+        if plan.config is not None:
+            target = (
+                f" This will delete bot {plan.config.botName!r} in resource group "
+                f"{plan.config.resourceGroup!r} (subscription "
+                f"{plan.config.subscriptionId})."
+            )
         sys.stdout.write(
-            f"\nNo mutations. Re-run with --apply --confirm={args.agent_name} "
+            f"\nNo mutations.{target} Re-run with --apply --confirm={args.agent_name} "
             "to clean up Bot Service.\n"
         )
         return 0

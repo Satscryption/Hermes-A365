@@ -11,6 +11,7 @@ from typing import Any
 import pytest
 
 from hermes_a365.bot_service import (
+    SIDECAR_SCHEMA_VERSION,
     BotServiceCleanupInputs,
     BotServiceConfig,
     BotServiceCreateInputs,
@@ -49,12 +50,18 @@ class FakeRunner:
         group_exists: bool = True,
         provider_state: str = "Registered",
         default_location: str | None = None,
+        group_resources: list[dict[str, Any]] | None = None,
+        resource_list_fails: bool = False,
     ) -> None:
         self.bot = bot
         self.teams = teams
         self.group_exists = group_exists
         self.provider_state = provider_state
         self.default_location = default_location
+        # #102 M5: what `az resource list -g` reports as the group's top-level
+        # contents. Default empty == "only ever held the (now-deleted) bot".
+        self.group_resources = list(group_resources or [])
+        self.resource_list_fails = resource_list_fails
         self.calls: list[list[str]] = []
 
     def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
@@ -80,6 +87,11 @@ class FakeRunner:
         if argv[:3] == ["az", "group", "delete"]:
             self.group_exists = False
             return self._ok({}, argv)
+        if argv[:3] == ["az", "resource", "list"]:
+            if self.resource_list_fails:
+                return CommandResult(argv, 1, stderr="listing failed")
+            # `az resource list` returns a JSON ARRAY, not an object.
+            return CommandResult(argv, 0, stdout=json.dumps(self.group_resources))
         if argv[:3] == ["az", "bot", "show"]:
             if self.bot is None:
                 return CommandResult(argv, 3, stderr="BotService not found")
@@ -208,6 +220,7 @@ def test_create_apply_writes_0600_sidecar_and_enables_teams(tmp_path: Path) -> N
     mode = stat.S_IMODE(result.sidecar_path.stat().st_mode)
     assert mode == 0o600
     data = json.loads(result.sidecar_path.read_text())
+    assert data["schemaVersion"] == SIDECAR_SCHEMA_VERSION == 2
     assert data["msaAppId"] == BF_APP_ID
     assert data["tenantId"] == TENANT_ID
     assert data["messagingEndpoint"] == "https://example.test/api/messages"
@@ -272,7 +285,12 @@ def test_verify_missing_sidecar_fails_cleanly(tmp_path: Path) -> None:
         verify_bot_service(tmp_path / "a365.bot-service.config.json", runner=FakeRunner())
 
 
-def _write_sidecar(tmp_path: Path, *, resource_group_managed: bool = False) -> Path:
+def _write_sidecar(
+    tmp_path: Path,
+    *,
+    resource_group_managed: bool = False,
+    agent_name: str | None = "Hermes Inbox Helper",
+) -> Path:
     path = tmp_path / "a365.bot-service.config.json"
     cfg = BotServiceConfig(
         schemaVersion=1,
@@ -286,6 +304,7 @@ def _write_sidecar(tmp_path: Path, *, resource_group_managed: bool = False) -> P
         channelsEnabled=["webchat", "directline", "msteams"],
         createdAt="2026-05-18T12:30:00Z",
         resourceGroupManaged=resource_group_managed,
+        agentName=agent_name,
     )
     path.write_text(cfg.to_json())
     return path
@@ -524,6 +543,484 @@ def test_cleanup_purge_resource_group_deletes_when_managed(tmp_path: Path) -> No
 
     assert result.resource_group_deleted is True
     assert any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+
+
+# ---------------------------------------------------------------------------
+# #102 WP1 — subscription pinning (H3 provisioning + L5 cleanup)
+# ---------------------------------------------------------------------------
+
+
+def test_create_apply_pins_subscription_on_every_az_call(tmp_path: Path) -> None:
+    # H3 (#102): provisioning must never act on the CLI's ambient default
+    # subscription. Every ARM read/mutate in the create flow carries the
+    # RESOLVED --subscription; `az account show` is the sole exception (it is
+    # what resolution reads).
+    runner = FakeRunner(bot=None, teams=None, group_exists=False)
+    plan = build_create_plan(
+        _inputs(tmp_path),
+        operator_env={"A365_BF_APP_ID": BF_APP_ID, "A365_TENANT_ID": TENANT_ID},
+    )
+
+    apply_create_plan(
+        plan,
+        runner=runner,
+        operator_env={"A365_BF_APP_ID": BF_APP_ID, "A365_TENANT_ID": TENANT_ID},
+        now=_now,
+    )
+
+    az_calls = [c for c in runner.calls if c[:1] == ["az"]]
+    assert az_calls, "no az calls captured"
+    for call in az_calls:
+        if call[:3] == ["az", "account", "show"]:
+            assert "--subscription" not in call
+            continue
+        if call[:3] == ["az", "rest", "--method"]:
+            # Pinned via the absolute management URL, not a flag.
+            url = FakeRunner._arg(call, "--url")
+            assert f"/subscriptions/{SUBSCRIPTION_ID}/" in url
+            continue
+        assert "--subscription" in call, f"unpinned az call: {call}"
+        assert FakeRunner._arg(call, "--subscription") == SUBSCRIPTION_ID
+
+
+def test_create_apply_pins_explicit_subscription_over_account(tmp_path: Path) -> None:
+    # H3 (#102): an explicit --subscription-id wins over the account default —
+    # and is what every provisioning call pins.
+    explicit = "44444444-4444-4444-4444-444444444444"
+    runner = FakeRunner(bot=None, teams=None, group_exists=False)
+    plan = build_create_plan(
+        _inputs(tmp_path, subscription_id=explicit),
+        operator_env={"A365_BF_APP_ID": BF_APP_ID, "A365_TENANT_ID": TENANT_ID},
+    )
+
+    apply_create_plan(
+        plan,
+        runner=runner,
+        operator_env={"A365_BF_APP_ID": BF_APP_ID, "A365_TENANT_ID": TENANT_ID},
+        now=_now,
+    )
+
+    group_create = next(c for c in runner.calls if c[:3] == ["az", "group", "create"])
+    bot_create = next(c for c in runner.calls if c[:3] == ["az", "bot", "create"])
+    assert FakeRunner._arg(group_create, "--subscription") == explicit
+    assert FakeRunner._arg(bot_create, "--subscription") == explicit
+
+
+def test_cleanup_apply_pins_sidecar_subscription_on_deletes(tmp_path: Path) -> None:
+    # L5 (#102): deletes bind to the sidecar's persisted subscriptionId, not
+    # the ambient az default — bot delete, msteams delete, and the purge's
+    # resource list + group delete all carry it.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    apply_cleanup_plan(plan, runner=runner)
+
+    for prefix in (
+        ["az", "bot", "show"],
+        ["az", "bot", "msteams", "delete"],
+        ["az", "bot", "delete"],
+        ["az", "resource", "list"],
+        ["az", "group", "delete"],
+    ):
+        matching = [c for c in runner.calls if c[: len(prefix)] == prefix]
+        assert matching, f"expected a {' '.join(prefix)} call"
+        for call in matching:
+            assert FakeRunner._arg(call, "--subscription") == SUBSCRIPTION_ID, (
+                f"unpinned cleanup call: {call}"
+            )
+
+
+# ---------------------------------------------------------------------------
+# #102 WP2 — resource-group blast-radius guard (M5)
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_purge_skips_when_group_holds_foreign_resources(tmp_path: Path) -> None:
+    # M5 (#102): a later-added unrelated resource must not be destroyed by the
+    # purge. The purge (not the whole cleanup) is skipped and the leftovers
+    # are named; bot deletion and sidecar backup still complete.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner(
+        bot=FakeRunner._bot(),
+        teams=FakeRunner._teams(),
+        group_resources=[
+            {
+                "id": (
+                    "/subscriptions/sub/resourceGroups/rg/providers"
+                    "/Microsoft.Storage/storageAccounts/prodlogs"
+                ),
+                "type": "Microsoft.Storage/storageAccounts",
+                "name": "prodlogs",
+            }
+        ],
+    )
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is False
+    assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+    joined = "\n".join(result.messages)
+    assert "Microsoft.Storage/storageAccounts/prodlogs" in joined
+    assert "non-Hermes-managed" in joined
+    # Cleanup itself still completed.
+    assert result.bot_deleted is True
+    assert result.sidecar_removed is True
+
+
+def test_cleanup_purge_proceeds_when_only_managed_bot_listed(tmp_path: Path) -> None:
+    # M5 (#102): the managed bot itself (e.g. its deletion still settling) is
+    # not a foreign resource — matched by the sidecar's armResourceId.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner(
+        bot=FakeRunner._bot(),
+        teams=FakeRunner._teams(),
+        group_resources=[
+            {
+                # Case differs from the sidecar's armResourceId on purpose —
+                # ARM ids are compared case-insensitively.
+                "id": (
+                    "/subscriptions/sub/resourceGroups/rg/providers"
+                    "/Microsoft.BotService/botServices/BOT"
+                ),
+                "type": "Microsoft.BotService/botServices",
+                "name": "hermes-inbox-helper-bot",
+            }
+        ],
+    )
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is True
+    assert any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+
+
+def test_cleanup_purge_fails_closed_when_listing_fails(tmp_path: Path) -> None:
+    # M5 (#102): unknown contents == do not delete. A failed listing skips the
+    # purge rather than treating the group as empty.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner(
+        bot=FakeRunner._bot(), teams=FakeRunner._teams(), resource_list_fails=True
+    )
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is False
+    assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+    assert "could not enumerate" in "\n".join(result.messages)
+
+
+class _RawResourceListRunner(FakeRunner):
+    def __init__(self, raw_resource_list: str) -> None:
+        super().__init__(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+        self.raw_resource_list = raw_resource_list
+
+    def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+        if argv[:3] == ["az", "resource", "list"]:
+            self.calls.append(list(argv))
+            return CommandResult(argv, 0, stdout=self.raw_resource_list)
+        return super().run(argv, timeout=timeout)
+
+
+@pytest.mark.parametrize("raw_resource_list", ["", "[null]", '[{"name":"ok"}, null]'])
+def test_cleanup_purge_fails_closed_on_untrustworthy_success_output(
+    tmp_path: Path, raw_resource_list: str
+) -> None:
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = _RawResourceListRunner(raw_resource_list)
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is False
+    assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+    assert "could not enumerate" in "\n".join(result.messages)
+
+
+def test_cleanup_plan_enumerates_group_contents_for_purge_dry_run(tmp_path: Path) -> None:
+    # M5 (#102): with a runner, the PLAN (dry-run) lists the group's current
+    # contents so the operator sees the blast radius before --apply.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner(
+        group_resources=[
+            {
+                "id": (
+                    "/subscriptions/sub/resourceGroups/rg/providers"
+                    "/Microsoft.KeyVault/vaults/prodkv"
+                ),
+                "type": "Microsoft.KeyVault/vaults",
+                "name": "prodkv",
+            }
+        ]
+    )
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        ),
+        runner=runner,
+    )
+
+    rendered = plan.render_human()
+    assert "Microsoft.KeyVault/vaults/prodkv" in rendered
+    assert "refused at" in rendered  # the guard is advertised in the plan
+
+
+def test_cleanup_plan_makes_no_az_calls_without_purge(tmp_path: Path) -> None:
+    # The plan stays offline unless a managed-group purge is actually
+    # requested — a plain cleanup dry-run must not start issuing az calls.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner()
+    build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper", sidecar_path=sidecar
+        ),
+        runner=runner,
+    )
+    assert runner.calls == []
+
+
+# ---------------------------------------------------------------------------
+# #102 WP3 — sidecar target binding (M6)
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_refuses_sidecar_bound_to_other_agent(tmp_path: Path) -> None:
+    # M6 (#102): running cleanup for agent X against agent Y's sidecar must
+    # refuse BEFORE any deletion, naming the sidecar's real targets.
+    sidecar = _write_sidecar(
+        tmp_path, resource_group_managed=True, agent_name="Other Agent"
+    )
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    with pytest.raises(BotServiceError) as excinfo:
+        apply_cleanup_plan(plan, runner=runner)
+
+    message = str(excinfo.value)
+    assert "Other Agent" in message
+    assert "hermes-inbox-helper-bot" in message
+    assert "hermes-a365-bots" in message
+    # Refused before ANY az mutation ran.
+    assert runner.calls == []
+    assert sidecar.exists()
+
+
+def test_cleanup_legacy_sidecar_without_agent_name_warns_and_proceeds(
+    tmp_path: Path,
+) -> None:
+    # M6 (#102) backward-compat: a pre-M6 sidecar (no agentName KEY at all)
+    # still cleans up on --confirm alone, with a warning — refusing would
+    # break every deployed sidecar.
+    sidecar = _write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    del raw["agentName"]
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.bot_deleted is True
+    assert any("no agentName binding" in m for m in result.messages)
+
+
+def test_create_apply_writes_agent_name_into_sidecar(tmp_path: Path) -> None:
+    # M6 (#102): provisioning stamps the binding the cleanup check reads.
+    runner = FakeRunner(bot=None, teams=None, group_exists=False)
+    plan = build_create_plan(
+        _inputs(tmp_path),
+        operator_env={"A365_BF_APP_ID": BF_APP_ID, "A365_TENANT_ID": TENANT_ID},
+    )
+
+    result = apply_create_plan(
+        plan,
+        runner=runner,
+        operator_env={"A365_BF_APP_ID": BF_APP_ID, "A365_TENANT_ID": TENANT_ID},
+        now=_now,
+    )
+
+    assert result.config.agentName == "Hermes Inbox Helper"
+    on_disk = json.loads(result.sidecar_path.read_text())
+    assert on_disk["agentName"] == "Hermes Inbox Helper"
+
+
+def test_sidecar_from_file_accepts_legacy_without_agent_name(tmp_path: Path) -> None:
+    # M6 (#102): the v2 reader retains an explicit compatibility path for a v1
+    # sidecar written before the binding existed (agentName=None).
+    sidecar = _write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    del raw["agentName"]
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+    cfg = BotServiceConfig.from_file(sidecar)
+    assert cfg.agentName is None
+    assert cfg.schemaVersion == 1
+
+
+@pytest.mark.parametrize("agent_name", [None, "", "  "])
+def test_v2_sidecar_requires_non_empty_agent_binding(
+    tmp_path: Path, agent_name: str | None
+) -> None:
+    sidecar = _write_sidecar(tmp_path, agent_name=agent_name)
+    raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = SIDECAR_SCHEMA_VERSION
+    if agent_name is None:
+        raw.pop("agentName", None)
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(BotServiceError, match="requires a non-empty agentName"):
+        BotServiceConfig.from_file(sidecar)
+
+
+def test_cleanup_plan_render_surfaces_target_and_binding(tmp_path: Path) -> None:
+    # M6 (#102): the plan (shown before the operator is told what to type for
+    # --confirm) names the subscription and which agent the sidecar was
+    # provisioned for.
+    sidecar = _write_sidecar(tmp_path)
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
+    )
+    rendered = plan.render_human()
+    assert SUBSCRIPTION_ID in rendered
+    assert "provisioned for: Hermes Inbox Helper" in rendered
+
+
+def test_verify_pins_sidecar_subscription_on_every_probe(tmp_path: Path) -> None:
+    # #102 review: the Teams-channel probe was the one verify read left
+    # unpinned — in a multi-subscription setup the bot probe queried the
+    # sidecar's subscription while the msteams probe queried the ambient one,
+    # yielding an incoherent (or falsely failing) verify report.
+    sidecar = _write_sidecar(tmp_path)
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+
+    verify_bot_service(sidecar, runner=runner)
+
+    for call in runner.calls:
+        assert "--subscription" in call, f"unpinned verify call: {call}"
+        assert FakeRunner._arg(call, "--subscription") == SUBSCRIPTION_ID
+
+
+def test_sidecar_with_blank_subscription_id_refuses_to_load(tmp_path: Path) -> None:
+    # #102 review: a blank subscriptionId would silently UN-pin every az call
+    # (_sub_args('') emits no flag) — cleanup would then delete against the
+    # ambient az subscription. Fail closed at load instead.
+    sidecar = _write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    raw["subscriptionId"] = "  "
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+
+    with pytest.raises(BotServiceError, match="blank subscriptionId"):
+        BotServiceConfig.from_file(sidecar)
+
+
+class _RaisingListRunner(FakeRunner):
+    """az resource list RAISES (missing binary / timeout), like
+    SubprocessRunner does — not just a nonzero exit."""
+
+    def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+        if argv[:3] == ["az", "resource", "list"]:
+            self.calls.append(list(argv))
+            raise BotServiceError("failed to run 'az': No such file or directory")
+        return super().run(argv, timeout=timeout)
+
+
+def test_cleanup_purge_fails_closed_when_listing_raises(tmp_path: Path) -> None:
+    # #102 review: SubprocessRunner RAISES BotServiceError for a missing az
+    # binary or timeout. The purge guard must treat that as contents-unknown
+    # (skip the purge) — not abort the cleanup mid-way after the bot was
+    # already deleted.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = _RaisingListRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is False
+    assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+    assert "could not enumerate" in "\n".join(result.messages)
+    # The rest of the cleanup still completed.
+    assert result.bot_deleted is True
+    assert result.sidecar_removed is True
+
+
+def test_cleanup_plan_survives_raising_listing(tmp_path: Path) -> None:
+    # #102 review: the CLI dry-run now passes a real SubprocessRunner for
+    # plan-time enumeration. On a machine without az, that runner RAISES —
+    # the plan must degrade to "no listing" (as before PR-D), not crash a
+    # dry-run that used to work offline.
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = _RaisingListRunner()
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        ),
+        runner=runner,
+    )
+    assert plan.resource_group_contents is None
+    assert "az group delete" in plan.render_human()  # plan still renders
+
+
+def test_validate_confirm_rejects_missing_and_mismatch() -> None:
+    # #102 review gap: bot_service._validate_confirm had no direct tests (the
+    # tested one belongs to cleanup.py).
+    from hermes_a365.bot_service import _validate_confirm
+
+    with pytest.raises(BotServiceError):
+        _validate_confirm("Hermes Inbox Helper", None)
+    with pytest.raises(BotServiceError):
+        _validate_confirm("Hermes Inbox Helper", "hermes inbox helper")
+    _validate_confirm("Hermes Inbox Helper", "Hermes Inbox Helper")
 
 
 def test_verify_warns_when_path_a_and_path_b_endpoints_drift(tmp_path: Path) -> None:

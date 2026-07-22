@@ -19,6 +19,8 @@ from hermes_a365.cleanup import (
     _validate_confirm,
     apply_cleanup_plan,
     build_cleanup_plan,
+    build_parser,
+    run,
 )
 from hermes_a365.mutator import AADSTSError, CliInvocationError, RunResult
 
@@ -110,28 +112,32 @@ def _seed_agent_dir(
     return agent_dir
 
 
-def _seed_bot_service_sidecar(tmp_path: Path) -> Path:
+def _seed_bot_service_sidecar(
+    tmp_path: Path,
+    *,
+    schema_version: int = 1,
+    agent_name: str | None = None,
+) -> Path:
     path = tmp_path / "a365.bot-service.config.json"
-    path.write_text(
-        json.dumps(
-            {
-                "schemaVersion": 1,
-                "subscriptionId": "sub-id",
-                "resourceGroup": "hermes-a365-bots",
-                "botName": "hermes-inbox-helper-bot",
-                "armResourceId": (
-                    "/subscriptions/sub/resourceGroups/rg/providers/"
-                    "Microsoft.BotService/botServices/bot"
-                ),
-                "msaAppId": "bot-app-id",
-                "tenantId": "tenant-id",
-                "messagingEndpoint": "https://example.test/api/messages",
-                "channelsEnabled": ["webchat", "directline", "msteams"],
-                "createdAt": "2026-05-18T12:30:00Z",
-                "resourceGroupManaged": False,
-            }
-        )
-    )
+    payload = {
+        "schemaVersion": schema_version,
+        "subscriptionId": "sub-id",
+        "resourceGroup": "hermes-a365-bots",
+        "botName": "hermes-inbox-helper-bot",
+        "armResourceId": (
+            "/subscriptions/sub/resourceGroups/rg/providers/"
+            "Microsoft.BotService/botServices/bot"
+        ),
+        "msaAppId": "bot-app-id",
+        "tenantId": "tenant-id",
+        "messagingEndpoint": "https://example.test/api/messages",
+        "channelsEnabled": ["webchat", "directline", "msteams"],
+        "createdAt": "2026-05-18T12:30:00Z",
+        "resourceGroupManaged": False,
+    }
+    if agent_name is not None:
+        payload["agentName"] = agent_name
+    path.write_text(json.dumps(payload))
     return path
 
 
@@ -347,6 +353,43 @@ class TestPlanRender:
     def test_human_says_none_when_no_local_files(self, tmp_path: Path) -> None:
         plan = build_cleanup_plan(CleanupInputs(agent_name="ghost"), hermes_home=tmp_path)
         assert "(none)" in plan.render_human()
+
+    def test_human_surfaces_bound_bot_service_target(self, tmp_path: Path) -> None:
+        sidecar = _seed_bot_service_sidecar(
+            tmp_path, schema_version=2, agent_name="inbox-helper"
+        )
+        plan = build_cleanup_plan(
+            CleanupInputs(
+                agent_name="inbox-helper",
+                kinds=("bot-service",),
+                bot_service_sidecar_path=sidecar,
+            ),
+            hermes_home=tmp_path,
+        )
+
+        text = plan.render_human()
+        assert "sidecar target:" in text
+        assert "hermes-inbox-helper-bot" in text
+        assert "hermes-a365-bots" in text
+        assert "subscription sub-id" in text
+        assert "provisioned for 'inbox-helper'" in text
+
+    def test_dry_run_repeats_bot_service_target_with_confirmation(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _seed_bot_service_sidecar(tmp_path, schema_version=2, agent_name="inbox-helper")
+        monkeypatch.chdir(tmp_path)
+        args = build_parser().parse_args(
+            ["--agent-name", "inbox-helper", "--kinds", "bot-service"]
+        )
+
+        assert run(args) == 0
+
+        output = capsys.readouterr().out
+        confirmation = output.split("No mutations.", maxsplit=1)[1]
+        assert "Bot Service target:" in confirmation
+        assert "hermes-inbox-helper-bot" in confirmation
+        assert "--confirm=inbox-helper" in confirmation
 
 
 # ---------------------------------------------------------------------------
