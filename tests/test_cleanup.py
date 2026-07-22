@@ -391,6 +391,28 @@ class TestPlanRender:
         assert "hermes-inbox-helper-bot" in confirmation
         assert "--confirm=inbox-helper" in confirmation
 
+    def test_dry_run_surfaces_snapshot_orphan_confirmation(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _seed_generated_config(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        args = build_parser().parse_args(
+            ["--agent-name", "inbox-helper", "--kinds", "instance"]
+        )
+
+        assert run(args) == 0
+
+        output = capsys.readouterr().out
+        assert _TEST_INSTANCE_ID.lower() in output
+        assert (
+            f"--purge-orphans --confirm-orphan {_TEST_INSTANCE_ID.lower()}"
+            in output
+        )
+
 
 # ---------------------------------------------------------------------------
 # apply_cleanup_plan
@@ -757,6 +779,24 @@ class TestSnapshotAgentInstanceId:
         cfg = tmp_path / "a365.generated.config.json"
         cfg.write_text("{not valid json")
         assert _snapshot_agent_instance_id(cfg) is None
+
+    def test_plan_surfaces_snapshot_id_and_confirmation_flag(
+        self, tmp_path: Path
+    ) -> None:
+        cfg = _seed_generated_config(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+            hermes_home=tmp_path,
+            generated_config_path=cfg,
+        )
+
+        assert plan.orphan_instance_ids == (_TEST_INSTANCE_ID.lower(),)
+        rendered = plan.render_human()
+        assert _TEST_INSTANCE_ID.lower() in rendered
+        assert (
+            f"--purge-orphans --confirm-orphan {_TEST_INSTANCE_ID.lower()}"
+            in rendered
+        )
 
 
 class TestApplyCleanupOrphanInstance:
@@ -1265,7 +1305,84 @@ class TestOrphanConfirmGate:
         )
         assert result.orphan_instances_purged == []
         assert result.orphan_instances_remaining == [_TEST_INSTANCE_ID.lower()]
-        assert any("--confirm-orphan" in m for m in result.messages)
+        assert any(
+            f"--orphan-instance-id {_TEST_INSTANCE_ID.lower()}" in m
+            and f"--confirm-orphan {_TEST_INSTANCE_ID.lower()}" in m
+            for m in result.messages
+        )
+
+    def test_plan_candidate_survives_source_disappearing_before_apply(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        cfg_path = _seed_generated_config(tmp_path, instance_id=_TEST_INSTANCE_ID)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"),
+            hermes_home=tmp_path,
+            generated_config_path=cfg_path,
+        )
+        cfg_path.unlink()
+        mutator = FakeMutator()
+
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=cfg_path,
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+        )
+
+        assert result.orphan_instances_purged == [_TEST_INSTANCE_ID.lower()]
+        assert mutator.calls[-1][-1].endswith(_TEST_INSTANCE_ID.lower())
+
+    def test_unmatched_confirmation_refuses_before_cleanup(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        missing_config = tmp_path / "nope.json"
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"),
+            hermes_home=tmp_path,
+            generated_config_path=missing_config,
+        )
+        mutator = FakeMutator()
+
+        with pytest.raises(CleanupError, match="did not match an orphan candidate"):
+            apply_cleanup_plan(
+                plan,
+                mutator=mutator,
+                hermes_home=tmp_path,
+                purge_orphans=True,
+                generated_config_path=missing_config,
+                confirmed_orphan_instance_ids=(self._MANUAL,),
+            )
+
+        assert mutator.calls == []
+
+    def test_second_pass_requires_candidate_and_confirmation(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        missing_config = tmp_path / "a365.generated.config.json"
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"),
+            hermes_home=tmp_path,
+            generated_config_path=missing_config,
+            additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+        )
+
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            generated_config_path=missing_config,
+            additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+            confirmed_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+        )
+
+        assert result.orphan_instances_purged == [_TEST_INSTANCE_ID.lower()]
 
     def test_confirm_orphan_is_case_insensitive(self, tmp_path: Path) -> None:
         _seed_agent_dir(tmp_path)

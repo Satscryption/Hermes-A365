@@ -78,9 +78,11 @@ this heading is dated at release.
   (visible in the plan) instead of auto-detecting. With no pin available
   anywhere (fresh setup), behaviour is unchanged but a warning says so.
   An existing but unreadable operator env now fails closed instead of silently
-  downgrading to that warning path. Tenant pins are compared as canonical
-  GUIDs; legacy domain aliases receive a migration instruction because
-  `az account show` cannot prove their equivalence from its GUID-only output.
+  downgrading to that warning path; this applies to the dry-run as well as
+  `--apply`, because the plan must not advertise a tenant it could not safely
+  resolve. Tenant pins are compared as canonical GUIDs; legacy domain aliases
+  receive a migration instruction because `az account show` cannot prove their
+  equivalence from its GUID-only output.
   (The bot-service step was already tenant-safe transitively: its az calls
   pin the sidecar's subscription, and a subscription belongs to exactly one
   tenant.)
@@ -103,9 +105,14 @@ this heading is dated at release.
   that resource with which to verify ownership (the CLI creates instances
   server-side; nothing in-tree has ever fetched one). Every id must therefore
   be re-typed via the new repeatable `--confirm-orphan <GUID>` to be deleted;
-  unconfirmed ids are surfaced and left remaining with a precise re-run hint.
-  Snapshot-derived ids are included because `a365.generated.config.json` is
-  selected by working directory and carries no binding to `--agent-name`.
+  unconfirmed ids are surfaced and left remaining. Snapshot-derived ids are
+  included because `a365.generated.config.json` is selected by working
+  directory and carries no binding to `--agent-name`. The dry-run plan captures
+  and prints those ids before the a365 cleanup can remove that file, together
+  with the exact `--confirm-orphan` flag needed on the first apply. A recovery
+  run after the file has gone must provide both `--orphan-instance-id <GUID>`
+  and `--confirm-orphan <GUID>`; unmatched confirmations now fail before any
+  cleanup step instead of silently succeeding without deleting the orphan.
 
   (M15 is split out to #127.)
 

@@ -167,6 +167,7 @@ class CleanupPlan:
     steps: list[CleanupStep]
     local_paths: list[Path] = field(default_factory=list)
     bot_service_plan: bot_service.BotServiceCleanupPlan | None = None
+    orphan_instance_ids: tuple[str, ...] = ()
 
     def bot_service_target_summary(self) -> str | None:
         if self.bot_service_plan is None or self.bot_service_plan.config is None:
@@ -204,6 +205,14 @@ class CleanupPlan:
         else:
             for p in self.local_paths:
                 lines.append(f"    - {p}")
+        if self.orphan_instance_ids:
+            lines.append("  orphan agentRegistry instances requiring double entry:")
+            for instance_id in self.orphan_instance_ids:
+                lines.append(f"    - {instance_id}")
+                lines.append(
+                    "      apply with: "
+                    f"--purge-orphans --confirm-orphan {instance_id}"
+                )
         return "\n".join(lines)
 
 
@@ -244,6 +253,8 @@ def build_cleanup_plan(
     inputs: CleanupInputs,
     *,
     hermes_home: Path | None = None,
+    generated_config_path: Path | None = None,
+    additional_orphan_instance_ids: tuple[str, ...] = (),
 ) -> CleanupPlan:
     """Compose the ordered list of CLI cleanup steps + local artefact list.
 
@@ -253,6 +264,8 @@ def build_cleanup_plan(
     """
     if hermes_home is None:
         hermes_home = _resolve_hermes_home()
+    if generated_config_path is None:
+        generated_config_path = Path.cwd() / "a365.generated.config.json"
 
     # #102 review: normalize ONCE — an empty kinds tuple means "all four" for
     # the cloud steps, so the local-artefact scope must see the same
@@ -286,6 +299,11 @@ def build_cleanup_plan(
         # artefacts this run's kinds may actually remove.
         local_paths=_local_artefacts(hermes_home, inputs.resolved_slug, normalized_kinds),
         bot_service_plan=bot_service_plan,
+        # Capture candidates while the generated config still exists so the
+        # dry-run tells the operator exactly what to double-enter on apply.
+        orphan_instance_ids=_collect_orphan_instance_ids(
+            generated_config_path, additional_orphan_instance_ids
+        ),
     )
 
 
@@ -354,6 +372,24 @@ def _snapshot_agent_instance_id(generated_config_path: Path) -> str | None:
     return None
 
 
+def _collect_orphan_instance_ids(
+    generated_config_path: Path,
+    additional_orphan_instance_ids: tuple[str, ...] = (),
+    existing: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    """Return the canonical, ordered union of discovered orphan candidates."""
+    candidates: list[str] = []
+    for oid in (*existing, _snapshot_agent_instance_id(generated_config_path) or ""):
+        normalized = oid.strip().lower()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    for oid in additional_orphan_instance_ids:
+        normalized = oid.strip().lower()
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return tuple(candidates)
+
+
 @dataclass
 class CleanupResult:
     plan: CleanupPlan
@@ -411,23 +447,30 @@ def apply_cleanup_plan(
 
     if generated_config_path is None:
         generated_config_path = Path.cwd() / "a365.generated.config.json"
-    snapshot_instance_id = _snapshot_agent_instance_id(generated_config_path)
-    # Dedupe + canonical-case the union of snapshot and operator-supplied ids.
+    # Carry plan-time candidates forward because the a365 CLI removes the
+    # generated config during cleanup. Re-read before mutation as well so a
+    # candidate appearing between plan and apply still fails safely.
     # #102 L6: every candidate requires --confirm-orphan before deletion. The
     # snapshot file is selected by working directory and has no agent binding,
     # so treating it as trusted would preserve the wrong-directory footgun.
-    candidate_instance_ids: list[str] = []
-    if snapshot_instance_id is not None:
-        candidate_instance_ids.append(snapshot_instance_id.lower())
-    for oid in additional_orphan_instance_ids:
-        normalised = oid.strip().lower()
-        if not normalised:
-            continue
-        if normalised not in candidate_instance_ids:
-            candidate_instance_ids.append(normalised)
+    candidate_instance_ids = list(
+        _collect_orphan_instance_ids(
+            generated_config_path,
+            additional_orphan_instance_ids,
+            plan.orphan_instance_ids,
+        )
+    )
     confirmed_instance_ids = {
         oid.strip().lower() for oid in confirmed_orphan_instance_ids if oid.strip()
     }
+    unmatched_confirmations = sorted(confirmed_instance_ids - set(candidate_instance_ids))
+    if unmatched_confirmations:
+        unmatched = ", ".join(unmatched_confirmations)
+        raise CleanupError(
+            f"--confirm-orphan value(s) did not match an orphan candidate: {unmatched}. "
+            "If a prior cleanup removed a365.generated.config.json, pass each id "
+            "again with --orphan-instance-id as well as --confirm-orphan."
+        )
 
     # #102 M7: bind the WHOLE teardown to the persisted tenant BEFORE any
     # destructive step. The a365 subcommands auto-detect their tenant from the
@@ -614,7 +657,9 @@ def apply_cleanup_plan(
                 f"[apply] refusing to purge agentRegistry instance "
                 f"{instance_id} without --confirm-orphan {instance_id} "
                 "(double-entry guard: a typo or stale generated config would "
-                "delete an unrelated instance). Re-run with confirmation to purge it."
+                "delete an unrelated instance). Re-run with "
+                f"--orphan-instance-id {instance_id} "
+                f"--confirm-orphan {instance_id} --purge-orphans to purge it."
             )
             continue
         try:
@@ -774,7 +819,10 @@ def run(args: argparse.Namespace) -> int:
     try:
         # #103/M9: building the plan resolves ``resolved_slug`` (which rejects
         # traversal-shaped ``--slug`` values); surface that as a clean rc=2.
-        plan = build_cleanup_plan(inputs)
+        plan = build_cleanup_plan(
+            inputs,
+            additional_orphan_instance_ids=tuple(args.orphan_instance_id),
+        )
     except (ValueError, bot_service.BotServiceError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
