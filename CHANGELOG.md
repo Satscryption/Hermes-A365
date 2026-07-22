@@ -25,6 +25,43 @@ this heading is dated at release.
   behavior. Also corrected a stale module docstring that still advertised the
   pre-M2 `serviceUrl` allowlist.
 
+### Destructive-CLI hardening (#102, WP1–WP3)
+
+- **H3/L5 — every `bot-service` az call pins its subscription.** Provisioning
+  resolves the subscription (`--subscription-id` or the account default) and
+  passes `--subscription <resolved>` on every ARM read/mutate — provider
+  registration, group create, bot create/update, Teams channel calls — so
+  resources can no longer land in the CLI's ambient default subscription while
+  config/ARM ids reference the resolved one (orphaned cross-subscription
+  resources). Cleanup and verify pin the sidecar's **persisted**
+  `subscriptionId` the same way, so deletes and probes target the subscription
+  the resources actually live in. The paste-ready app-id-drift recovery
+  commands carry the pin too. `az account show` (which resolution reads) and
+  the `az rest` Teams-terms PATCH (pinned via its absolute management URL) are
+  the deliberate exceptions.
+- **M5 — `--purge-resource-group` re-checks the group's contents before
+  deleting it.** Provisioning puts exactly one top-level resource in a managed
+  group (the bot), so at apply time the purge now runs `az resource list` and
+  **skips** the group delete — never the whole cleanup — when the group holds
+  anything else (each foreign resource is named in the message) or when the
+  listing fails (unknown contents fail closed). The dry-run plan enumerates
+  the group's current contents when a managed-group purge is requested, so the
+  operator sees the blast radius before `--apply`.
+- **M6 — the cleanup sidecar is bound to its agent.** `bot-service create`
+  now stamps `agentName` into the sidecar (schema stays v1 — the field is
+  optional, so pre-M6 sidecars still load), and cleanup **refuses before any
+  deletion** when the sidecar names a different agent than
+  `--agent-name`/`--confirm` — the run-cleanup-in-the-wrong-directory footgun.
+  A legacy sidecar without the binding proceeds on `--confirm` alone with a
+  warning. The plan and the pre-`--apply` summary now surface the full
+  deletion target (bot, resource group, subscription, and which agent the
+  sidecar was provisioned for) at the moment the operator is told what to
+  type. This binding also applies when the top-level `cleanup` orchestrator
+  drives the bot-service step.
+
+  (WP4–WP6 — tenant-pinned teardown, scoped-artefact gating, orphan-ownership
+  check — land in the next #102 PR; M15 is split out to #127.)
+
 ### Reliability (#105)
 
 - **M10 — a corrupt conversation registry no longer permanently breaks a chat.**
