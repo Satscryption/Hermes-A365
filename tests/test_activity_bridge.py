@@ -1997,7 +1997,29 @@ class TestLoadBridgeConfig:
                 }
             )
         )
-        with pytest.raises(BridgeConfigError, match="credential reset"):
+        with pytest.raises(BridgeConfigError, match="supplied none either"):
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="http://hook",
+                hermes_home=tmp_path,
+                generated_config_path=path,
+            )
+
+    def test_missing_secret_without_tenant_does_not_blame_the_provider(
+        self, tmp_path: Path
+    ) -> None:
+        # Round-6 finding: resolve_secret short-circuits on an empty tenant, so
+        # with no A365_TENANT_ID the provider is never consulted — the error
+        # must not claim it "supplied none", which sends the operator to
+        # re-mint / keychain-store a secret over a real config problem.
+        _seed_agent_env(tmp_path, A365_TENANT_ID="")
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {"agentBlueprintId": "bp-id", "agentBlueprintClientSecret": None}
+            )
+        )
+        with pytest.raises(BridgeConfigError, match="no A365_TENANT_ID was set"):
             load_bridge_config(
                 slug="inbox-helper",
                 webhook_url="http://hook",
@@ -3152,3 +3174,219 @@ class TestTokenFactory:
             await tf.for_app({"recipient": {}}, "some-resource")
         with pytest.raises(NotImplementedError):
             await tf.for_workiq(object())
+
+
+# ---------------------------------------------------------------------------
+# #19 — secrets-at-rest provider wiring on the `serve` runtime
+# ---------------------------------------------------------------------------
+
+
+class TestServeSecretsProviderWiring:
+    """The provider must actually be CONSULTED by load_bridge_config.
+
+    Unit-testing the provider in isolation proves nothing if the runtime
+    seams never call it — these drive the real loader.
+    """
+
+    _TENANT = "2699fca3-dac6-40a2-bcea-62ce05e2ee9b"  # matches _seed_agent_env
+
+    @staticmethod
+    def _provider(items: dict[tuple[str, str], str]):
+        from hermes_a365.secrets_provider import set_default_provider
+
+        class Fake:
+            name = "fake-store"
+
+            def __init__(self) -> None:
+                self.asked: list[tuple[str, str]] = []
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                self.asked.append((tenant, app_id))
+                return items.get((tenant, app_id))
+
+        fake = Fake()
+        set_default_provider(fake)
+        return fake
+
+    @pytest.fixture(autouse=True)
+    def _restore_provider(self):
+        from hermes_a365.secrets_provider import default_provider, set_default_provider
+
+        original = default_provider()
+        yield
+        set_default_provider(original)
+
+    def _gen(self, tmp_path: Path, *, secret: str) -> Path:
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text(
+            json.dumps(
+                {
+                    "agentBlueprintId": "blueprint-app-id",
+                    "agentBlueprintClientSecret": secret,
+                }
+            )
+        )
+        return path
+
+    def test_blueprint_secret_filled_from_provider_when_config_empty(
+        self, tmp_path: Path
+    ) -> None:
+        # #19 walk §5b: the generated config no longer carries the secret;
+        # the provider (keychain in production) supplies it after a restart.
+        _seed_agent_env(tmp_path)
+        self._provider({(self._TENANT, "blueprint-app-id"): "from-keychain"})
+
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="http://hook",
+            hermes_home=tmp_path,
+            generated_config_path=self._gen(tmp_path, secret=""),
+        )
+
+        assert cfg.blueprint_client_secret == "from-keychain"
+
+    def test_generated_config_secret_still_wins(self, tmp_path: Path) -> None:
+        # Rotation safety: a stale keychain entry must not beat the value
+        # `register --apply` just wrote into the generated config.
+        _seed_agent_env(tmp_path)
+        fake = self._provider({(self._TENANT, "blueprint-app-id"): "STALE"})
+
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="http://hook",
+            hermes_home=tmp_path,
+            generated_config_path=self._gen(tmp_path, secret="FRESH"),
+        )
+
+        assert cfg.blueprint_client_secret == "FRESH"
+        assert (self._TENANT, "blueprint-app-id") not in fake.asked
+
+    def test_bf_secret_filled_from_provider_when_env_empty(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_env(tmp_path, A365_BF_APP_ID="bf-app-id")  # no BF secret
+        self._provider({(self._TENANT, "bf-app-id"): "bf-from-keychain"})
+
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="http://hook",
+            hermes_home=tmp_path,
+            generated_config_path=self._gen(tmp_path, secret="sek"),
+        )
+
+        assert cfg.bf_client_secret == "bf-from-keychain"
+
+    def test_agent_env_bf_secret_still_wins(self, tmp_path: Path) -> None:
+        # #19 walk §5c: the documented .env fallback, deliberately selected.
+        _seed_agent_env(
+            tmp_path, A365_BF_APP_ID="bf-app-id", A365_BF_CLIENT_SECRET="from-env"
+        )
+        self._provider({(self._TENANT, "bf-app-id"): "from-keychain"})
+
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="http://hook",
+            hermes_home=tmp_path,
+            generated_config_path=self._gen(tmp_path, secret="sek"),
+        )
+
+        assert cfg.bf_client_secret == "from-env"
+
+    def test_path_a_only_operator_is_unaffected(self, tmp_path: Path) -> None:
+        # bf_app_id="" makes the (tenant, app) key unusable — must be a miss,
+        # not a crash, and must not change the Path A result.
+        _seed_agent_env(tmp_path)  # no BF identity at all
+        self._provider({})
+
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="http://hook",
+            hermes_home=tmp_path,
+            generated_config_path=self._gen(tmp_path, secret="sek"),
+        )
+
+        assert cfg.bf_app_id == ""
+        assert cfg.bf_client_secret == ""
+        assert cfg.blueprint_client_secret == "sek"
+
+    def test_verify_probe_accepts_a_provider_supplied_secret(
+        self, tmp_path: Path
+    ) -> None:
+        # Round-1 HIGH finding: `activity-bridge verify` is the docs-designated
+        # bridge preflight / CI gate, but it read the secret straight from the
+        # generated config. An operator who followed the README's keychain flow
+        # (store the secret, delete the plaintext line) got a hard ERROR on a
+        # healthy deployment — and the remediation text sent them to
+        # `register --apply`, which writes the plaintext secret back and
+        # shadows the keychain entry.
+        _seed_agent_env(tmp_path)
+        self._provider({(self._TENANT, "blueprint-app-id"): "from-keychain"})
+
+        probe, data = probe_generated_config(
+            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
+        )
+
+        assert probe.state != "error"
+        assert data["client_secret"] == "from-keychain"
+        assert "provider" in probe.detail
+
+    def test_verify_probe_still_errors_when_neither_tier_has_it(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_env(tmp_path)
+        self._provider({})
+
+        probe, data = probe_generated_config(
+            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
+        )
+
+        assert probe.state == "error"
+        assert data == {}
+        # The message must name both tiers so the operator knows the provider
+        # was consulted, not bypassed.
+        assert "provider" in probe.detail
+
+    def test_verify_probe_reports_the_generated_config_tier(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_env(tmp_path)
+        fake = self._provider({(self._TENANT, "blueprint-app-id"): "STALE"})
+
+        probe, data = probe_generated_config(
+            self._gen(tmp_path, secret="FRESH"), tenant_id=self._TENANT
+        )
+
+        assert data["client_secret"] == "FRESH"
+        assert "generated config" in probe.detail
+        assert fake.asked == []  # provider not consulted when plaintext present
+
+    @pytest.mark.parametrize("has_secret", [True, False])
+    def test_verify_survives_a_provider_written_to_the_documented_interface(
+        self, tmp_path: Path, has_secret: bool
+    ) -> None:
+        # Round-3 finding: both probe branches interpolated
+        # `default_provider().name` unguarded, so a provider implementing only
+        # the `resolve(tenant, app_id)` contract the README documented took
+        # down the bridge preflight with AttributeError — on exactly the
+        # keychain-only deployment this seam exists to support. run_verify
+        # does not wrap the probe, so it escaped as a raw traceback.
+        from hermes_a365.secrets_provider import set_default_provider
+
+        class ReadmeProvider:  # no `name` attribute at all
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                return "from-vault" if has_secret else None
+
+        _seed_agent_env(tmp_path)
+        set_default_provider(ReadmeProvider())
+
+        probe, data = probe_generated_config(
+            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
+        )
+
+        # Either branch must produce a probe result, never an exception.
+        assert "ReadmeProvider" in probe.detail
+        if has_secret:
+            assert probe.state != "error"
+            assert data["client_secret"] == "from-vault"
+        else:
+            assert probe.state == "error"

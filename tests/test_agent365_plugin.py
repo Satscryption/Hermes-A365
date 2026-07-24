@@ -8167,3 +8167,266 @@ class TestGateEnvSecretWrite:
         )
         assert ok is False
         assert any("chmod failed" in w for w in calls["warnings"])
+
+
+# ---------------------------------------------------------------------------
+# #19 — secrets-at-rest provider wiring on the gateway (plugin) runtime
+# ---------------------------------------------------------------------------
+
+
+class TestGatewaySecretsProviderWiring:
+    """The adapter must CONSULT the provider for both identities.
+
+    Drives the real adapter construction / `_ensure_secret` rather than the
+    provider in isolation — a passing unit test proves nothing if the
+    runtime seam never calls it.
+    """
+
+    _TENANT = "11111111-1111-1111-1111-111111111111"
+    _BLUEPRINT_APP = "22222222-2222-2222-2222-222222222222"
+    _BF_APP = "44444444-4444-4444-4444-444444444444"
+
+    @pytest.fixture(autouse=True)
+    def _restore_provider(self):
+        from hermes_a365.secrets_provider import default_provider, set_default_provider
+
+        original = default_provider()
+        yield
+        set_default_provider(original)
+
+    @staticmethod
+    def _provider(items: dict[tuple[str, str], str]):
+        from hermes_a365.secrets_provider import set_default_provider
+
+        class Fake:
+            name = "fake-store"
+
+            def __init__(self) -> None:
+                self.asked: list[tuple[str, str]] = []
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                self.asked.append((tenant, app_id))
+                return items.get((tenant, app_id))
+
+        fake = Fake()
+        set_default_provider(fake)
+        return fake
+
+    def test_bf_secret_filled_from_provider_when_env_empty(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #19 walk §5b, Path B on the gateway: no A365_BF_CLIENT_SECRET in
+        # env/config — the provider supplies it.
+        monkeypatch.delenv("A365_BF_CLIENT_SECRET", raising=False)
+        monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
+        self._provider({(self._TENANT, self._BF_APP): "bf-from-keychain"})
+
+        a = _make_adapter(monkeypatch)
+
+        assert a.bf_client_secret == "bf-from-keychain"
+
+    def test_env_bf_secret_still_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
+        monkeypatch.setenv("A365_BF_CLIENT_SECRET", "bf-from-env")
+        self._provider({(self._TENANT, self._BF_APP): "bf-from-keychain"})
+
+        a = _make_adapter(monkeypatch)
+
+        assert a.bf_client_secret == "bf-from-env"
+
+    def test_blueprint_secret_filled_from_provider_on_ensure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # _ensure_secret consults the provider only after env AND the
+        # generated config have both missed.
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        self._provider({(self._TENANT, self._BLUEPRINT_APP): "bp-from-keychain"})
+        a = _make_adapter(monkeypatch)
+        a.blueprint_client_secret = ""  # env miss
+        monkeypatch.setattr(a, "_load_secret_from_generated_config", lambda: "")
+
+        assert a._ensure_secret() == "bp-from-keychain"
+
+    def test_generated_config_blueprint_secret_still_wins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Rotation safety on the gateway path.
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        fake = self._provider({(self._TENANT, self._BLUEPRINT_APP): "STALE"})
+        a = _make_adapter(monkeypatch)
+        a.blueprint_client_secret = ""
+        monkeypatch.setattr(a, "_load_secret_from_generated_config", lambda: "FRESH")
+
+        assert a._ensure_secret() == "FRESH"
+        assert (self._TENANT, self._BLUEPRINT_APP) not in fake.asked
+
+    def test_path_a_only_adapter_unaffected_by_empty_bf_key(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # bf_app_id="" — unusable provider key must degrade to a miss.
+        monkeypatch.delenv("A365_BF_APP_ID", raising=False)
+        monkeypatch.delenv("A365_BF_CLIENT_SECRET", raising=False)
+        self._provider({})
+
+        a = _make_adapter(monkeypatch)
+
+        assert a.bf_app_id == ""
+        assert a.bf_client_secret == ""
+        assert a.blueprint_client_secret == "fake-secret"
+
+    def test_provider_secret_never_shadows_a_later_rotation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Round-1 finding: _ensure_secret used to write the provider result
+        # back into `blueprint_client_secret`, so the NEXT call short-circuited
+        # on the cached keychain value and a secret rotated into the generated
+        # config afterwards could never win — falsifying the rotation-safety
+        # property the precedence exists to provide.
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        self._provider({(self._TENANT, self._BLUEPRINT_APP): "from-keychain"})
+        a = _make_adapter(monkeypatch)
+        a.blueprint_client_secret = ""
+        rotated: dict[str, str] = {"value": ""}
+        monkeypatch.setattr(
+            a, "_load_secret_from_generated_config", lambda: rotated["value"]
+        )
+
+        # First call: generated config empty -> provider fills the miss.
+        assert a._ensure_secret() == "from-keychain"
+
+        # `register --apply` now rotates a fresh secret into the config.
+        rotated["value"] = "FRESH-ROTATED"
+
+        # It must win on the next call, not lose to the cached provider value.
+        assert a._ensure_secret() == "FRESH-ROTATED"
+
+    def test_transient_provider_failure_is_not_pinned_for_the_adapter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Round-3 finding: `resolve_secret` degrades a transient provider
+        # failure (keychain locked, backend down, lookup timed out) to the
+        # same "" a genuine miss returns. Caching that "" pinned the failure
+        # for this object's life, so a second `connect()` on the same adapter
+        # — an embedder retrying, rather than the gateway, which builds a
+        # fresh adapter per attempt — could never recover.
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+
+        calls: list[int] = []
+        available = {"value": False}
+
+        class Flaky:
+            name = "flaky-store"
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                calls.append(1)
+                if not available["value"]:
+                    raise RuntimeError("keychain locked")
+                return "recovered-secret"
+
+        from hermes_a365.secrets_provider import set_default_provider
+
+        set_default_provider(Flaky())
+        a = _make_adapter(monkeypatch)
+        a.blueprint_client_secret = ""
+        monkeypatch.setattr(a, "_load_secret_from_generated_config", lambda: "")
+
+        # First connect: the provider is down, so the read misses.
+        assert a._ensure_secret() == ""
+        assert len(calls) == 1
+
+        # Operator unlocks the keychain and the gateway reconnects onto this
+        # same adapter. The provider must be consulted again.
+        available["value"] = True
+        assert a._ensure_secret() == "recovered-secret"
+        assert len(calls) == 2
+
+        # A hit IS cached — no second subprocess per connect after success.
+        assert a._ensure_secret() == "recovered-secret"
+        assert len(calls) == 2
+
+    # -- round-2 regressions: the setup wizard's Microsoft#408 branch --------
+
+    def test_wizard_sees_a_secret_held_at_rest(self) -> None:
+        # Round-2 finding: `agentBlueprintClientSecret: null` in the generated
+        # config is the EXPECTED state once an operator moves the secret to
+        # rest. The wizard read that null as Microsoft#408 and told them to run
+        # `register --apply --auto-recover-secret`, which mints a NEW secret
+        # and orphans the stored one — the documented flow undone by the tool
+        # that documents it.
+        self._provider({(self._TENANT, self._BLUEPRINT_APP): "held-at-rest"})
+
+        found, reachable, label = adapter_mod._probe_secret_at_rest(
+            self._TENANT, self._BLUEPRINT_APP
+        )
+
+        assert (found, reachable, label) == (True, True, "fake-store")
+
+    def test_wizard_still_blames_408_when_nothing_holds_the_secret(self) -> None:
+        # The fix must not suppress the #408 advice on a genuinely empty
+        # store — that diagnosis is right when no tier has the credential.
+        self._provider({})
+
+        found, reachable, label = adapter_mod._probe_secret_at_rest(
+            self._TENANT, self._BLUEPRINT_APP
+        )
+
+        # Empty but ANSWERING: #408 is the right call here.
+        assert (found, reachable, label) == (False, True, "fake-store")
+
+    def test_wizard_at_rest_check_never_returns_the_secret(self) -> None:
+        # #5d: the wizard prints the provider LABEL on this branch. Keeping
+        # the value out of the return type makes that structural rather than
+        # a convention the next edit can quietly break.
+        self._provider({(self._TENANT, self._BLUEPRINT_APP): "sup3r-s3cret"})
+
+        result = adapter_mod._probe_secret_at_rest(
+            self._TENANT, self._BLUEPRINT_APP
+        )
+
+        assert result == (True, True, "fake-store")
+        assert "sup3r-s3cret" not in repr(result)
+
+    def test_wizard_actually_calls_the_at_rest_check(self) -> None:
+        # Round-3 mutation test: deleting the call site from
+        # `interactive_setup` — restoring the unconditional #408 warning —
+        # left the whole suite green, because the tests above exercise the
+        # helper in isolation. The wizard body can't be driven under bare
+        # pytest (it lazy-imports `hermes_cli`, which isn't installed), so
+        # pin the wiring at source level instead.
+        #
+        # Round 5: assert on text unique to EACH of the three branches, not
+        # just the helper name. An earlier version asserted a substring the
+        # miss branch also contained, so deleting the success branch kept it
+        # green.
+        import inspect
+
+        source = inspect.getsource(adapter_mod.interactive_setup)
+        assert "_probe_secret_at_rest" in source
+        # Each guard is a string that appears ONLY in its branch's print body,
+        # never in a comment — deleting any one branch fails this test. (An
+        # earlier version keyed the empty branch off "--auto-recover-secret",
+        # which also appears in a comment, so that branch was not pinned.)
+        assert "likely nothing to bootstrap" in source  # found
+        assert "could not be consulted" in source  # unreachable
+        assert "has nothing stored for this tenant/app" in source  # empty
+
+    def test_wizard_does_not_blame_408_when_the_provider_is_unreachable(
+        self,
+    ) -> None:
+        # Round-5 finding: every provider failure collapsed to "nothing
+        # stored", so a locked keychain sent the operator to
+        # `register --apply --auto-recover-secret` — minting a secret that
+        # then outranks the one they had stored all along. That is the exact
+        # harm this branch was added to prevent, reintroduced by the fix.
+        class Exploding:
+            name = "exploding"
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                raise RuntimeError("keychain locked")
+
+        found, reachable, label = adapter_mod._probe_secret_at_rest(
+            self._TENANT, self._BLUEPRINT_APP, provider=Exploding()
+        )
+
+        # Not found, but NOT evidence of an empty store.
+        assert (found, reachable, label) == (False, False, "exploding")

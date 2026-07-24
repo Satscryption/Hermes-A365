@@ -10,6 +10,81 @@ Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
 Gated by the #123 focused hardening walk. Entries accumulate here per PR and
 this heading is dated at release.
 
+### Secrets at rest (#19)
+
+- **A `SecretsProvider` seam now backs both client secrets.** New
+  `hermes_a365.secrets_provider` defines a `resolve(tenant, app_id)`
+  interface, ships a keychain-backed default (`KeychainSecretsProvider`,
+  wrapping the existing macOS `security` / Linux `secret-tool` module), and
+  exposes `set_default_provider(...)` so an embedding application can plug in
+  Vault / AWS Secrets Manager / Azure Key Vault / 1Password without this
+  package depending on any of them. It is wired into **every** secret read
+  that resolves a credential: the gateway adapter (Path A via
+  `_ensure_secret`, Path B at construction), the standalone `serve` bridge
+  (both identities in `load_bridge_config`), and `activity-bridge verify` —
+  the docs-designated bridge preflight / CI gate, which must agree with what
+  the runtime will actually use or it fails a healthy deployment. Its probe
+  now also reports which tier answered (`secret loaded from provider:
+  os-keychain` vs `from generated config`).
+- **Precedence: the existing plaintext source wins; the provider fills only a
+  miss.** Deliberate, and the reason this can land without a walk-gated
+  behaviour change: every operator today resolves secrets from
+  env / `~/.hermes/.env` / the per-agent `.env` / `a365.generated.config.json`,
+  and those values keep winning byte-for-byte. It is also rotation-safe — a
+  secret freshly written by `register --apply` can never be shadowed by a
+  stale keychain entry, which a keychain-primary ordering would have allowed.
+  An unavailable backend, a timeout, or an unusable key (Path-A-only operators
+  have `bf_app_id=""`, which the keychain's `account_name` rejects) degrades to
+  a miss rather than raising; a misbehaving third-party provider — one that
+  raises, or returns a non-`str` that would otherwise be carried into an OAuth
+  POST body — is caught and logged (never the value) rather than taking down a
+  credential read. Every keychain subprocess is now time-bounded: these run on
+  a credential read, and on the gateway that happens inside the asyncio event
+  loop, where a hung `security`/`secret-tool` would stall the loop rather than
+  one request. The gateway's Path A read caches a provider **hit** only: a
+  failed lookup is indistinguishable from a genuine miss (both `""`), so
+  caching one would pin a transient outage for the life of the adapter.
+  Re-consulting costs one keychain lookup per connect attempt, not per turn.
+  (The Path B BF secret is resolved once during adapter construction and is not
+  re-consulted; a provider outage at that moment means the adapter runs without
+  it until the gateway builds a new one, which it does on every reconnect.)
+- **This closes the gap where the keychain was write-only.** `keychain.py` has
+  shipped a store since v0.1 but **nothing ever read from it** — an operator
+  who stored a secret there got no benefit. The README claimed the wrapper
+  "mirrors the secret into the OS keychain"; that was never true and is now
+  corrected, along with the stale "per-agent `.env` never carries the secret"
+  bullet (it does carry `A365_BF_CLIENT_SECRET` on Path B deployments). A new
+  "Secrets at rest" section documents the store/remove/restore flow the #123
+  walk §5 exercises.
+- **The setup wizard no longer misdiagnoses the flow it now documents.**
+  `agentBlueprintClientSecret: null` in the generated config used to mean one
+  thing — the Microsoft#408 persistence regression — so the wizard printed that
+  diagnosis and told the operator to re-run
+  `register --apply --auto-recover-secret`. With a secret held at rest that null
+  is the *expected* state, and following that advice mints a **new** secret,
+  orphaning the stored one. The wizard now consults the provider first and
+  reports one of three things: a secret resolves at rest (noting that its
+  *validity* was not checked); the provider could not be consulted at all — a
+  locked or unavailable keychain, which is **not** evidence of an empty store
+  and so deliberately withholds the `--auto-recover-secret` advice; or the
+  store answered and is genuinely empty, which is when #408 is the right call.
+  The paste prompt is offered on all three, exactly as before #19: the provider
+  can only tell us a secret *exists*, never that it is the right one.
+- **A provider written to the documented interface can't break the preflight.**
+  `activity-bridge verify` interpolated `default_provider().name` unguarded, so
+  a third-party provider implementing only the `resolve(tenant, app_id)`
+  contract the README specified took the bridge preflight down with an
+  `AttributeError` — on precisely the keychain-only deployment the seam exists
+  to support, and unwrapped, so it escaped as a raw traceback rather than a
+  probe result. All four call sites now share one `provider_label()` helper
+  that falls back to the class name; `name` is documented as part of the
+  interface. `hermes a365 doctor`'s `--auto-recover-secret` advice is unaffected
+  — it keys off the detected `a365` CLI *version*, not off a null secret.
+- Remaining #19 stretch scope, explicitly **not** in this slice: making the
+  provider the *primary* store (routing `register --apply` rotation and the
+  setup wizard's plaintext writes through it) and shipping non-keychain
+  backends.
+
 ### Security / docs
 
 - **#100 regression locks / #107 client-side characterization.** The

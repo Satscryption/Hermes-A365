@@ -12,8 +12,13 @@ Inherits required values (``A365_APP_ID``, ``A365_TENANT_ID``,
 business-hours fields from a prior run are also preserved unless
 explicitly overridden on the command line.
 
-Secrets policy unchanged from v0.1: this file never contains the T2
-client secret. Runtime consumers fetch it from the OS keychain.
+Secrets policy: this file never contains the *blueprint* (T2) client
+secret — runtime consumers read that from ``a365.generated.config.json``,
+with the #19 secrets provider filling only a miss. It **does** carry
+``A365_BF_CLIENT_SECRET`` when a Path B identity is configured (see
+``write_text_atomic`` below, whose O_EXCL ordering exists for exactly
+that reason), and that plaintext value likewise outranks anything stored
+at rest.
 
 Default mode is dry-run; ``--apply`` performs the atomic write.
 """

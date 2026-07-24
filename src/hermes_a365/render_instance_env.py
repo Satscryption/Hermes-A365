@@ -2,11 +2,13 @@
 
 The output is the file written to ``~/.hermes/agents/<slug>/.env``.
 Note that the blueprint client secret is **never** written to this
-file; the activity bridge pulls it from the OS keychain (or, on macOS /
-Linux where DPAPI isn't available, from ``a365.generated.config.json``
-per slice 18i's gitignore). Path B's optional Bot Framework client
-secret is written here when configured because the gateway needs that
-per-agent runtime credential for BF S2S outbound.
+file; the activity bridge reads it from ``a365.generated.config.json``
+(per slice 18i's gitignore), falling back to the #19 secrets provider —
+the OS keychain by default — only when that file has no value. Path B's
+optional Bot Framework client secret **is** written here when
+configured, because the gateway needs that per-agent runtime credential
+for BF S2S outbound; it is subject to the same ordering, so a value in
+this file wins over anything stored at rest.
 
 Programmatic use::
 
