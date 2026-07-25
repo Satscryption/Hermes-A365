@@ -43,7 +43,12 @@ import logging
 from subprocess import TimeoutExpired
 from typing import Protocol, runtime_checkable
 
-from .keychain import KeychainBackend, KeychainError, get_secret
+from .keychain import (
+    KeychainBackend,
+    KeychainError,
+    KeychainTimeoutError,
+    get_secret,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -65,13 +70,6 @@ class SecretsProvider(Protocol):
     def resolve(self, tenant: str, app_id: str) -> str | None: ...
 
 
-# A well-formed key that no deployment stores under, so `backend_available`
-# exercises a real lookup without matching anything. Both components must
-# satisfy `account_name`'s validation.
-_PROBE_TENANT = "00000000-0000-0000-0000-000000000000"
-_PROBE_APP_ID = "00000000-0000-0000-0000-000000000000"
-
-
 class KeychainSecretsProvider:
     """Default provider: the OS keychain via :mod:`hermes_a365.keychain`.
 
@@ -87,34 +85,38 @@ class KeychainSecretsProvider:
     def __init__(self, backend: KeychainBackend | None = None) -> None:
         self._backend = backend
 
-    def backend_available(self) -> bool:
-        """Can this host's keychain actually be read right now?
+    def probe(self, tenant: str, app_id: str) -> tuple[bool, bool]:
+        """Probe one exact key, returning ``(found, reachable)``.
 
-        A miss from `resolve` is ambiguous — no backend binary, a locked
-        keychain, and a genuinely empty store all return None. Diagnostics
-        need to tell those apart (see `probe_provider`); a runtime credential
-        read does not, which is why this is separate.
+        Reachability must come from the target lookup itself. Probing an
+        unrelated sentinel after a target-specific denial can succeed and
+        falsely label the target store as empty, which makes the setup wizard
+        recommend minting over a credential that may still exist.
         """
         try:
-            get_secret(_PROBE_TENANT, _PROBE_APP_ID, backend=self._backend)
-        except (KeychainError, TimeoutExpired):
-            return False
+            found = get_secret(tenant, app_id, backend=self._backend)
+        except (KeychainError, ValueError):
+            return False, False
         except Exception:
-            return False
-        return True
+            return False, False
+        if found is None:
+            return False, True
+        if not isinstance(found, str):
+            return False, False
+        return bool(found), True
 
     def resolve(self, tenant: str, app_id: str) -> str | None:
         try:
             return get_secret(tenant, app_id, backend=self._backend)
+        except (KeychainTimeoutError, TimeoutExpired):
+            # The backend boundary has already replaced TimeoutExpired with a
+            # sanitized exception, so no secret-bearing argv can escape.
+            logger.warning("secrets provider: keychain lookup timed out")
+            return None
         except KeychainError as e:
             # No backend binary / unsupported platform. Expected on plenty
             # of hosts — debug, not warn, and never the secret value.
             logger.debug("secrets provider: keychain unavailable (%s)", e)
-            return None
-        except TimeoutExpired:
-            # A hung keychain (locked prompt, stuck D-Bus) must not stall a
-            # credential read — degrade to a miss like any other failure.
-            logger.warning("secrets provider: keychain lookup timed out")
             return None
         except ValueError as e:
             # account_name() rejects an empty/`/`-bearing tenant or app id.
@@ -166,20 +168,24 @@ def probe_provider(
         # resolve_secret short-circuits on an empty key, so the provider was
         # not consulted; that is not evidence about the store either way.
         return False, False, label
+    if isinstance(active, KeychainSecretsProvider):
+        found, reachable = active.probe(tenant, app_id)
+        return found, reachable, label
     try:
         found = active.resolve(tenant, app_id)
     except Exception:
         logger.warning("secrets provider %r raised while probing", label)
         return False, False, label
     if found is None:
-        # A miss here is genuinely "not stored" ONLY if the backend answered.
-        # KeychainSecretsProvider swallows an unavailable/locked/timed-out
-        # backend into the same None, so re-ask it directly when we can.
-        backend_ok = True
-        if isinstance(active, KeychainSecretsProvider):
-            backend_ok = active.backend_available()
-        return False, backend_ok, label
-    return bool(isinstance(found, str) and found), True, label
+        return False, True, label
+    if not isinstance(found, str):
+        logger.warning(
+            "secrets provider %r returned a %s while probing, not a str",
+            label,
+            type(found).__name__,
+        )
+        return False, False, label
+    return bool(found), True, label
 
 
 def provider_label(provider: object | None = None) -> str:

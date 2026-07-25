@@ -367,6 +367,28 @@ def test_probe_distinguishes_an_empty_store_from_an_unreachable_one() -> None:
     )
 
 
+def test_probe_uses_the_target_failure_not_an_unrelated_sentinel() -> None:
+    from hermes_a365.secrets_provider import probe_provider
+
+    target = account_name(TENANT, BF_APP)
+
+    class PerItemDenied(FakeBackend):
+        def get(self, account: str) -> str | None:
+            if account == target:
+                raise KeychainError("User interaction is not allowed")
+            return None
+
+    provider = KeychainSecretsProvider(PerItemDenied())
+
+    # A different key is readable, but that says nothing about whether the
+    # target item is absent. The wizard must withhold re-mint advice.
+    assert probe_provider(TENANT, BF_APP, provider=provider) == (
+        False,
+        False,
+        "os-keychain",
+    )
+
+
 def test_probe_treats_a_timed_out_backend_as_unreachable() -> None:
     from subprocess import TimeoutExpired
 
@@ -395,6 +417,22 @@ def test_probe_treats_a_raising_third_party_provider_as_unreachable() -> None:
     )
 
 
+def test_probe_treats_a_non_string_provider_result_as_unreachable() -> None:
+    from hermes_a365.secrets_provider import probe_provider
+
+    class Broken:
+        name = "broken"
+
+        def resolve(self, tenant: str, app_id: str) -> str | None:
+            return b"not-a-string"  # type: ignore[return-value]
+
+    assert probe_provider(TENANT, BF_APP, provider=Broken()) == (
+        False,
+        False,
+        "broken",
+    )
+
+
 def test_probe_reports_an_empty_key_as_not_consulted() -> None:
     # Path-A-only operators have bf_app_id="". resolve_secret short-circuits,
     # so the store was never asked — that is not evidence it is empty.
@@ -413,14 +451,14 @@ def test_probe_never_returns_the_secret() -> None:
     assert "sup3r-s3cret" not in repr(got)
 
 
-def test_probe_does_not_leak_a_secret_via_the_reachability_check() -> None:
-    # `backend_available` does a real lookup under a sentinel key. It must not
-    # collide with a deployment's key, and must not surface any stored value.
+def test_keychain_probe_never_returns_the_secret() -> None:
     backend = FakeBackend(items={account_name(TENANT, BF_APP): "sup3r-s3cret"})
     provider = KeychainSecretsProvider(backend)
 
-    assert provider.backend_available() is True
-    assert provider.resolve(TENANT, BF_APP) == "sup3r-s3cret"
+    got = provider.probe(TENANT, BF_APP)
+
+    assert got == (True, True)
+    assert "sup3r-s3cret" not in repr(got)
 
 
 def test_keychain_subprocesses_are_time_bounded() -> None:

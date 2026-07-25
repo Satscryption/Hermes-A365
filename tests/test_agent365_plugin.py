@@ -8219,20 +8219,28 @@ class TestGatewaySecretsProviderWiring:
         # env/config — the provider supplies it.
         monkeypatch.delenv("A365_BF_CLIENT_SECRET", raising=False)
         monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
-        self._provider({(self._TENANT, self._BF_APP): "bf-from-keychain"})
+        fake = self._provider(
+            {(self._TENANT, self._BF_APP): "bf-from-keychain"}
+        )
 
         a = _make_adapter(monkeypatch)
 
-        assert a.bf_client_secret == "bf-from-keychain"
+        # Construction runs on the gateway loop and must not perform sync I/O.
+        assert fake.asked == []
+        assert a._ensure_bf_secret() == "bf-from-keychain"
+        assert fake.asked == [(self._TENANT, self._BF_APP)]
 
     def test_env_bf_secret_still_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
         monkeypatch.setenv("A365_BF_CLIENT_SECRET", "bf-from-env")
-        self._provider({(self._TENANT, self._BF_APP): "bf-from-keychain"})
+        fake = self._provider(
+            {(self._TENANT, self._BF_APP): "bf-from-keychain"}
+        )
 
         a = _make_adapter(monkeypatch)
 
-        assert a.bf_client_secret == "bf-from-env"
+        assert a._ensure_bf_secret() == "bf-from-env"
+        assert fake.asked == []
 
     def test_blueprint_secret_filled_from_provider_on_ensure(
         self, monkeypatch: pytest.MonkeyPatch
@@ -8271,8 +8279,14 @@ class TestGatewaySecretsProviderWiring:
         a = _make_adapter(monkeypatch)
 
         assert a.bf_app_id == ""
-        assert a.bf_client_secret == ""
+        assert a._ensure_bf_secret() == ""
         assert a.blueprint_client_secret == "fake-secret"
+
+    def test_connect_offloads_secret_resolution_from_the_gateway_loop(self) -> None:
+        import inspect
+
+        source = inspect.getsource(adapter_mod.Agent365Adapter.connect)
+        assert "await asyncio.to_thread(self._make_bridge_config)" in source
 
     def test_provider_secret_never_shadows_a_later_rotation(
         self, monkeypatch: pytest.MonkeyPatch

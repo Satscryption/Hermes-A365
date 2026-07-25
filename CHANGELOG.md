@@ -38,16 +38,18 @@ this heading is dated at release.
   a miss rather than raising; a misbehaving third-party provider — one that
   raises, or returns a non-`str` that would otherwise be carried into an OAuth
   POST body — is caught and logged (never the value) rather than taking down a
-  credential read. Every keychain subprocess is now time-bounded: these run on
-  a credential read, and on the gateway that happens inside the asyncio event
-  loop, where a hung `security`/`secret-tool` would stall the loop rather than
-  one request. The gateway's Path A read caches a provider **hit** only: a
+  credential read. Every keychain subprocess is now time-bounded, and timeout
+  failures are converted at the backend boundary to a sanitized
+  `KeychainTimeoutError` so macOS's secret-bearing `security ... -w <secret>`
+  argv cannot escape through `TimeoutExpired`. Gateway provider reads are
+  deferred until connect and run in a worker thread, keeping a locked
+  `security`/`secret-tool` process off the shared asyncio loop. The gateway's
+  Path A read caches a provider **hit** only: a
   failed lookup is indistinguishable from a genuine miss (both `""`), so
   caching one would pin a transient outage for the life of the adapter.
-  Re-consulting costs one keychain lookup per connect attempt, not per turn.
-  (The Path B BF secret is resolved once during adapter construction and is not
-  re-consulted; a provider outage at that moment means the adapter runs without
-  it until the gateway builds a new one, which it does on every reconnect.)
+  Both Path A and Path B cache provider hits only; a miss is re-consulted on
+  the next connect. Re-consulting costs one keychain lookup per identity per
+  connect attempt, not per turn.
 - **This closes the gap where the keychain was write-only.** `keychain.py` has
   shipped a store since v0.1 but **nothing ever read from it** — an operator
   who stored a secret there got no benefit. The README claimed the wrapper
@@ -68,6 +70,8 @@ this heading is dated at release.
   locked or unavailable keychain, which is **not** evidence of an empty store
   and so deliberately withholds the `--auto-recover-secret` advice; or the
   store answered and is genuinely empty, which is when #408 is the right call.
+  Keychain reachability comes from the target lookup itself, never an unrelated
+  sentinel key that could succeed after a target-specific access denial.
   The paste prompt is offered on all three, exactly as before #19: the provider
   can only tell us a secret *exists*, never that it is the right one.
 - **A provider written to the documented interface can't break the preflight.**

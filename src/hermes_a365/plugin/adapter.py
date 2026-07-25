@@ -622,18 +622,13 @@ class Agent365Adapter(BasePlatformAdapter):
         self.bf_client_secret: str = os.getenv("A365_BF_CLIENT_SECRET") or str(
             extra.get("bf_client_secret") or ""
         )
-        # #19: fill a MISS from the secrets provider (OS keychain by
-        # default). env/config still win — see secrets_provider's module
-        # docstring for why the plaintext tier outranks the keychain.
-        self.bf_client_secret = _resolve_secret_at_rest(
-            self.tenant_id, self.bf_app_id, existing=self.bf_client_secret
-        )
-        # #19: provider-resolved blueprint secret, cached separately from
-        # `blueprint_client_secret` so the plaintext tiers are always
-        # re-checked first. Hits only — a falsy value means "not resolved
-        # yet", so a reconnect re-consults rather than inheriting a failed
-        # lookup (see `_ensure_secret`).
+        # #19: provider-resolved secrets are lazy and cached separately from
+        # their plaintext slots. Adapter construction runs synchronously on
+        # the gateway event loop, so it must never launch a keychain process.
+        # Both lookups happen from `_make_bridge_config`, which `connect`
+        # offloads to a worker thread.
         self._provider_secret: str = ""
+        self._provider_bf_secret: str = ""
 
         self._generated_config_path: Path = Path(
             extra.get("generated_config_path")
@@ -920,11 +915,24 @@ class Agent365Adapter(BasePlatformAdapter):
         self._provider_secret = found
         return found
 
+    def _ensure_bf_secret(self) -> str:
+        """Resolve the Path B secret with the same fill-a-miss contract."""
+        if self.bf_client_secret:
+            return self.bf_client_secret
+        if self._provider_bf_secret:
+            return self._provider_bf_secret
+        found = _resolve_secret_at_rest(
+            self.tenant_id, self.bf_app_id, existing=""
+        )
+        self._provider_bf_secret = found
+        return found
+
     def _make_bridge_config(self) -> Any:
         """Construct a `BridgeConfig` for the bridge helpers (token
         acquisition, JWT validation, send_reply)."""
         bridge = _import_bridge()
         secret = self._ensure_secret()
+        bf_secret = self._ensure_bf_secret()
         if not (self.tenant_id and self.blueprint_app_id and secret):
             raise RuntimeError(
                 "agent365 adapter is missing tenant_id / blueprint_app_id / "
@@ -942,7 +950,7 @@ class Agent365Adapter(BasePlatformAdapter):
             log_path=log_path,
             pid_path=pid_path,
             bf_app_id=self.bf_app_id,
-            bf_client_secret=self.bf_client_secret,
+            bf_client_secret=bf_secret,
             idempotency_max_entries=self._idempotency_max_entries,
         )
 
@@ -1586,7 +1594,11 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
 
         try:
-            self._bridge_cfg = self._make_bridge_config()
+            # Keychain providers are synchronous and may wait for an OS
+            # credential prompt up to their timeout. Keep that wait off the
+            # shared gateway loop so other platforms and the gateway connect
+            # watchdog continue to run.
+            self._bridge_cfg = await asyncio.to_thread(self._make_bridge_config)
         except RuntimeError as e:
             logger.error("agent365 adapter config error: %s", e)
             self._set_fatal_error("config_error", str(e), retryable=False)
