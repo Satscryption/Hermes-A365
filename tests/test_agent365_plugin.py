@@ -8358,6 +8358,48 @@ class TestGatewaySecretsProviderWiring:
         assert a._ensure_secret() == "recovered-secret"
         assert len(calls) == 2
 
+    def test_transient_bf_provider_failure_is_not_pinned_for_the_adapter(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Path B analog of the Path A lock above. `_ensure_bf_secret` caches a
+        # HIT only — the CHANGELOG claims "Both Path A and Path B cache
+        # provider hits only; a miss is re-consulted on the next connect", and
+        # without this test a regression that pinned a Path B miss (e.g. a
+        # None-init + `is not None` guard) would pass the whole suite green.
+        monkeypatch.delenv("A365_BF_CLIENT_SECRET", raising=False)
+        monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
+
+        calls: list[int] = []
+        available = {"value": False}
+
+        class Flaky:
+            name = "flaky-store"
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                calls.append(1)
+                if not available["value"]:
+                    raise RuntimeError("keychain locked")
+                return "bf-recovered"
+
+        from hermes_a365.secrets_provider import set_default_provider
+
+        set_default_provider(Flaky())
+        a = _make_adapter(monkeypatch)
+        a.bf_client_secret = ""  # env miss
+
+        # First connect: provider down -> miss, not pinned.
+        assert a._ensure_bf_secret() == ""
+        assert len(calls) == 1
+
+        # Reconnect onto the same adapter after the keychain unlocks.
+        available["value"] = True
+        assert a._ensure_bf_secret() == "bf-recovered"
+        assert len(calls) == 2
+
+        # A hit IS cached — no re-ask after success.
+        assert a._ensure_bf_secret() == "bf-recovered"
+        assert len(calls) == 2
+
     # -- round-2 regressions: the setup wizard's Microsoft#408 branch --------
 
     def test_wizard_sees_a_secret_held_at_rest(self) -> None:
