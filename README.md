@@ -175,22 +175,126 @@ this skill handles.** Where it lives + how to keep it that way:
 - **macOS / Linux operators**: DPAPI is Windows-only. The GA CLI
   writes the secret in plaintext (`agentBlueprintClientSecretProtected:
   false`). The wrapper tightens the file mode to `0600` after
-  `register --apply`, and the keychain shim in `hermes_a365.keychain`
-  mirrors the secret into the OS keychain (macOS Keychain or libsecret)
-  when available.
+  `register --apply`. To move a secret out of plaintext, store it in the
+  OS keychain yourself —
+  `python -m hermes_a365.keychain store --tenant <id> --app-id <id>` —
+  and remove it from the plaintext file; the runtime then resolves it
+  through the secrets provider (#19). Nothing mirrors secrets into the
+  keychain automatically: the plaintext source always wins where it is
+  present, so a rotated secret can never be shadowed by a stale keychain
+  entry. See "Secrets at rest" below.
 - **Source control**: the `.gitignore` blocks `a365.config.json*`,
   `*.generated.config.json*`, `a365.config.backup-*.json`, and
   `a365.generated.config.backup-*.json` (and any operator-suffixed
   variants like `…json.r5-cleared`). Don't override these.
 - **Per-agent `.env` at `~/.hermes/agents/<slug>/.env`** never carries
-  the secret — only tenant id, app id, and runtime metadata. Source it
-  into the gateway shell + export `A365_BLUEPRINT_CLIENT_SECRET`
-  separately (see [Operator setup](#operator-setup)).
+  the *blueprint* secret — only tenant id, app id, and runtime metadata.
+  Source it into the gateway shell + export
+  `A365_BLUEPRINT_CLIENT_SECRET` separately (see
+  [Operator setup](#operator-setup)). It **does** carry
+  `A365_BF_CLIENT_SECRET` when a Path B identity is configured
+  (`instance create` propagates it from the operator `.env`), so it is a
+  plaintext secret file on Path B deployments — mode `0600`, and a
+  candidate for keychain storage per "Secrets at rest".
 - **`microsoft/Agent365-devTools#408`** — the GA CLI sometimes drops
   the secret entirely (writes `agentBlueprintClientSecret: null` to
   disk despite reporting success). `register --apply --auto-recover-secret`
   detects this and runs `az ad app credential reset --append` to mint
   a fresh secret in-place. Use the flag whenever you're not on Windows.
+
+### Secrets at rest
+
+Both client secrets — `A365_BLUEPRINT_CLIENT_SECRET` (Path A) and
+`A365_BF_CLIENT_SECRET` (Path B, #36) — resolve through a pluggable
+provider (`hermes_a365.secrets_provider`, #19). Every read is two-tier:
+**the plaintext source for that site, then the provider.** Which plaintext
+source applies differs per runtime and identity — it is *not* one flat
+list:
+
+| Runtime | Identity | Plaintext tier (checked first) |
+|---|---|---|
+| Gateway plugin | Path A blueprint | `A365_BLUEPRINT_CLIENT_SECRET` env → platform `extra` → `a365.generated.config.json` |
+| Gateway plugin | Path B BF | `A365_BF_CLIENT_SECRET` env → platform `extra` |
+| `activity-bridge serve` | Path A blueprint | `a365.generated.config.json` only (never env) |
+| `activity-bridge serve` | Path B BF | per-agent `~/.hermes/agents/<slug>/.env` only |
+
+`activity-bridge verify` uses the same two-tier resolution as `serve`, so
+the preflight agrees with what the runtime will actually use.
+
+Note what "env" means in rows 1–2: it is the gateway process's
+*environment*, not one particular file. `hermes gateway run` sources your
+operator `~/.hermes/.env`, and the documented Path B start sequence also
+sources `~/.hermes/agents/<slug>/.env` — so on the **gateway** both files
+are runtime sources, as is any `export` in your shell. On **`serve`** the
+operator `~/.hermes/.env` is not a runtime source; there it only feeds
+provisioning (`instance create` copies the BF secret from it into the
+per-agent `.env`, which `serve` then reads directly).
+
+**The plaintext tier always wins; the provider fills only a miss.** That
+ordering is deliberate: it means enabling the provider cannot change which
+credential a running deployment uses, and a secret freshly rotated into
+the generated config by `register --apply` can never be shadowed by a
+stale keychain entry.
+
+To keep a secret out of plaintext:
+
+```bash
+python -m hermes_a365.keychain store --tenant <tenant-id> --app-id <app-id>
+```
+
+then clear the plaintext tier for your runtime and identity, per the table
+above. **The rule is what matters, not the list: the provider is consulted
+only when the plaintext tier is empty, so any surviving copy — in any file,
+or in the process environment by any route — keeps winning silently.** The
+usual places, which is not a guarantee of completeness:
+
+| Where | Applies to |
+|---|---|
+| `agentBlueprintClientSecret` in `a365.generated.config.json` | Both runtimes, Path A |
+| `A365_BF_CLIENT_SECRET` in `~/.hermes/agents/<slug>/.env` | `serve`; also the **gateway**, because the documented start sequence sources this file into the shell |
+| `A365_BLUEPRINT_CLIENT_SECRET` / `A365_BF_CLIENT_SECRET` in `~/.hermes/.env` | Gateway (`hermes gateway run` sources it) |
+| `extra.blueprint_client_secret` / `extra.bf_client_secret` under `gateway.platforms.agent365` in `~/.hermes/config.yaml` | Gateway — easy to miss |
+| Any `export` in your shell rc, launch script, or service unit | Gateway |
+
+For the **Path A blueprint secret on `serve`**, you can check rather than
+trust this list: `hermes a365 activity-bridge verify` reports which tier
+answered (`secret loaded from provider: os-keychain` vs `from generated
+config`). If it does not say the provider, a plaintext copy is still winning
+somewhere. That is the only automated check — `verify` does not report on the
+Path B BF secret, and the gateway has no equivalent report for either. For
+those, work the table.
+
+Two caveats. `hermes a365 instance create --apply` **re-writes**
+`A365_BF_CLIENT_SECRET` into the per-agent `.env` from your operator
+`~/.hermes/.env`, so clearing only the per-agent copy is undone the next time
+you run it. Clear the operator copy and the problem goes away for good: the
+key is one `instance create` manages, so with no source value it stops
+emitting the line entirely rather than preserving the old one. And removing a value
+stops it being *resolved*, not *recoverable*: it may survive in shell
+history, editor and `.env` backups, and — if `a365.generated.config.json`
+was copied rather than symlinked to its XDG location — in that second copy.
+Treat a secret that has been in plaintext as exposed, and rotate it with
+`register --apply` if that matters to you.
+
+The runtime then resolves it from the keychain on the next start. Put the
+line back to return to the plaintext tier. An unavailable keychain (no
+`security`/`secret-tool`, unsupported platform) is treated as a miss, not
+an error — Path-A-only operators with no Path B identity are unaffected.
+
+Note this section is the one place that asks you to leave
+`agentBlueprintClientSecret` null. Elsewhere this README treats a null there
+as the Microsoft#408 regression and tells you to pass
+`--auto-recover-secret`; that advice is for operators who have *not* moved
+the secret to rest. `hermes gateway setup --platform agent365` distinguishes
+the two by consulting the provider before reporting #408.
+
+Embedding applications can register a different backend
+(Vault / AWS Secrets Manager / Azure Key Vault / 1Password) with
+`secrets_provider.set_default_provider(...)`; the interface is
+`resolve(tenant, app_id) -> str | None` plus a `name: str` used in log and
+diagnostic lines (omit it and the class name is used instead). Making the provider the
+*primary* store — routing rotation and the setup wizard's writes through
+it — remains open on #19.
 
 ## What is A365?
 
@@ -572,12 +676,15 @@ until a concrete operator pain point surfaces — designing them in a
 vacuum risks getting the API surface wrong. Each issue body lists the
 explicit triggers that would re-prioritise it.
 
-- **[#19](../../issues/19)** — Pluggable secrets provider. Replace
-  `hermes_a365.keychain`'s OS-keychain shim with a `SecretsProvider`
-  interface so operators can plug Vault / AWS Secrets Manager /
-  Azure Key Vault / 1Password / etc. behind it. Defer until the
-  first non-OS-keychain ask, or until Hermes ships its own
-  abstraction we should consume rather than parallel.
+- **[#19](../../issues/19)** — Pluggable secrets provider. **Partly
+  shipped in v0.9.0**: `hermes_a365.secrets_provider` defines the
+  `SecretsProvider` interface, ships a keychain-backed default, and is
+  wired into both runtimes' secret reads (see "Secrets at rest").
+  Remaining stretch scope: making the provider the *primary* store —
+  routing `register --apply` rotation and the setup wizard's writes
+  through it — and shipping non-keychain backends (Vault / AWS Secrets
+  Manager / Azure Key Vault / 1Password), or consuming a Hermes-side
+  abstraction if one lands first.
 - **[#20](../../issues/20)** — Split `activity-bridge` into BF-wire
   library + reference runtimes. The standalone `serve` and the
   `Agent365Adapter` plugin are already thin wrappers around mostly

@@ -1,10 +1,16 @@
-"""hermes a365 secrets — OS-keychain wrapper for the T2 client secret.
+"""hermes a365 secrets — OS-keychain wrapper for the client secrets.
 
-Stores the agent blueprint client secret in the OS keychain under
-service ``hermes-a365`` with account ``<tenant>.<appId>``. The secret
-is **never** written to disk on a platform where the keychain backend
-is available; on macOS / Linux the GA CLI may also leave a copy in
-``a365.generated.config.json`` (DPAPI is Windows-only).
+Stores a client secret in the OS keychain under service ``hermes-a365``
+with account ``<tenant>.<appId>``. Both #19 identities are keyed this
+way: the Path A agent blueprint secret and the Path B Bot Framework one.
+
+Storing here is **opt-in and additive** — nothing mirrors a secret into
+the keychain automatically, and this store never removes the plaintext
+copies (``a365.generated.config.json``, ``~/.hermes/.env``, the per-agent
+``.env``, the gateway platform ``extra`` block). It is read back only as
+the *miss-fill* tier behind those plaintext sources: see
+``hermes_a365.secrets_provider``, where the existing plaintext value
+always wins so a stale keychain entry cannot shadow a rotation.
 
 Backends
 --------
@@ -48,9 +54,20 @@ SERVICE = "hermes-a365"
 # Platform-specific exit codes the backends rely on.
 _MACOS_NOT_FOUND = 44  # `security` returns 44 when the item doesn't exist
 
+# #19: bound every keychain subprocess. These now run on a runtime credential
+# read (the secrets provider), and on the gateway that read happens inside the
+# asyncio lifecycle. An un-timed `security`/`secret-tool` call that hangs
+# (locked keychain prompt, stuck D-Bus/gnome-keyring) could stall indefinitely.
+# Lookup timeouts become provider misses; CLI writes/deletes fail cleanly.
+_BACKEND_TIMEOUT_SECONDS = 10.0
+
 
 class KeychainError(RuntimeError):
     """Raised when a keychain operation fails for an unexpected reason."""
+
+
+class KeychainTimeoutError(KeychainError):
+    """Raised when an OS-keychain command exceeds the bounded timeout."""
 
 
 class KeychainBackend(Protocol):
@@ -61,6 +78,45 @@ class KeychainBackend(Protocol):
     def store(self, account: str, secret: str) -> None: ...
     def get(self, account: str) -> str | None: ...
     def delete(self, account: str) -> bool: ...
+
+
+def _run_keychain_command(
+    argv: list[str],
+    *,
+    input_text: str | None = None,
+    sensitive_argv_indices: tuple[int, ...] = (),
+) -> subprocess.CompletedProcess[str]:
+    """Run a keychain command and sanitize timeout failures.
+
+    On macOS the store command necessarily carries the secret in ``argv``.
+    ``subprocess.TimeoutExpired`` includes that argv in its message, so it
+    must never cross this boundary or an uncaught traceback can persist the
+    credential. The replacement exception contains only a fixed operation
+    label and is caught by the CLI as a normal ``KeychainError``.
+    """
+    try:
+        return subprocess.run(
+            argv,
+            input=input_text,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=_BACKEND_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # ``raise ... from None`` suppresses the context in a standard
+        # traceback, but exception collectors may still inspect it. Redact
+        # the original TimeoutExpired object and its shared argv list too.
+        for index in sensitive_argv_indices:
+            if -len(argv) <= index < len(argv):
+                argv[index] = "<redacted>"
+        exc.cmd = list(argv)
+        exc.args = (exc.cmd, exc.timeout)
+        exc.output = None
+        exc.stderr = None
+        raise KeychainTimeoutError(
+            f"OS-keychain operation timed out after {_BACKEND_TIMEOUT_SECONDS:g}s"
+        ) from None
 
 
 # ---------------------------------------------------------------------------
@@ -93,7 +149,7 @@ class MacOSBackend:
     def store(self, account: str, secret: str) -> None:
         # -U: update if exists. The secret is passed via -w (argv) — the only
         # interface `security` exposes for generic passwords.
-        proc = subprocess.run(
+        proc = _run_keychain_command(
             [
                 "security",
                 "add-generic-password",
@@ -105,9 +161,7 @@ class MacOSBackend:
                 "-w",
                 secret,
             ],
-            capture_output=True,
-            text=True,
-            check=False,
+            sensitive_argv_indices=(-1,),
         )
         if proc.returncode != 0:
             raise KeychainError(
@@ -117,7 +171,7 @@ class MacOSBackend:
 
     def get(self, account: str) -> str | None:
         # -w: print password to stdout
-        proc = subprocess.run(
+        proc = _run_keychain_command(
             [
                 "security",
                 "find-generic-password",
@@ -126,10 +180,7 @@ class MacOSBackend:
                 "-a",
                 account,
                 "-w",
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+            ]
         )
         if proc.returncode == 0:
             # Trailing newline is added by `security`; strip it.
@@ -141,7 +192,7 @@ class MacOSBackend:
         )
 
     def delete(self, account: str) -> bool:
-        proc = subprocess.run(
+        proc = _run_keychain_command(
             [
                 "security",
                 "delete-generic-password",
@@ -149,10 +200,7 @@ class MacOSBackend:
                 SERVICE,
                 "-a",
                 account,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+            ]
         )
         if proc.returncode == 0:
             return True
@@ -173,7 +221,7 @@ class LinuxBackend:
 
     def store(self, account: str, secret: str) -> None:
         # secret-tool reads the secret from stdin — preferred over argv.
-        proc = subprocess.run(
+        proc = _run_keychain_command(
             [
                 "secret-tool",
                 "store",
@@ -184,10 +232,7 @@ class LinuxBackend:
                 "account",
                 account,
             ],
-            input=secret,
-            capture_output=True,
-            text=True,
-            check=False,
+            input_text=secret,
         )
         if proc.returncode != 0:
             raise KeychainError(
@@ -195,7 +240,7 @@ class LinuxBackend:
             )
 
     def get(self, account: str) -> str | None:
-        proc = subprocess.run(
+        proc = _run_keychain_command(
             [
                 "secret-tool",
                 "lookup",
@@ -203,10 +248,7 @@ class LinuxBackend:
                 SERVICE,
                 "account",
                 account,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+            ]
         )
         # secret-tool prints the secret on stdout with no trailing newline
         # when found, exits 1 with empty stdout when missing.
@@ -223,7 +265,7 @@ class LinuxBackend:
         # entry existed. We probe with `get` first so the return value
         # matches the macOS backend's semantics.
         existed = self.get(account) is not None
-        proc = subprocess.run(
+        proc = _run_keychain_command(
             [
                 "secret-tool",
                 "clear",
@@ -231,10 +273,7 @@ class LinuxBackend:
                 SERVICE,
                 "account",
                 account,
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
+            ]
         )
         if proc.returncode != 0:
             raise KeychainError(

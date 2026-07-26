@@ -109,6 +109,10 @@ from ._common import (
     quote_path_segment as _quote_path_segment_common,
 )
 
+# #19: secrets-at-rest provider. Fills a MISS only — the plaintext
+# generated-config / per-agent .env values still win.
+from .secrets_provider import provider_label, resolve_secret
+
 # Slice 19b — `serve` mode dependencies. Optional extras: operators
 # who only need `verify` can install without them. We bind the names
 # to ``None`` if missing so the verify path imports cleanly; serve
@@ -364,22 +368,17 @@ def probe_local_config(hermes_home: Path, slug: str) -> tuple[ProbeResult, dict[
     )
 
 
-def probe_generated_config(path: Path) -> tuple[ProbeResult, dict[str, Any]]:
+def probe_generated_config(
+    path: Path, *, tenant_id: str = ""
+) -> tuple[ProbeResult, dict[str, Any]]:
     try:
         cfg = load_generated_config(path)
     except BridgeConfigError as e:
         return (ProbeResult("generated_config", _ERROR, str(e)), {})
     secret = cfg.get("agentBlueprintClientSecret")
     blueprint_id = cfg.get("agentBlueprintId")
-    if not secret:
-        return (
-            ProbeResult(
-                "generated_config",
-                _ERROR,
-                f"{path} has no agentBlueprintClientSecret; re-run `hermes a365 register --apply`",
-            ),
-            {},
-        )
+    # The id gate moves AHEAD of the secret gate (#19): the provider is keyed
+    # on (tenant, blueprint id), so we need the id resolved before we can ask.
     if not blueprint_id:
         return (
             ProbeResult(
@@ -389,13 +388,52 @@ def probe_generated_config(path: Path) -> tuple[ProbeResult, dict[str, Any]]:
             ),
             {},
         )
+    # #19: verify must see the SAME two-tier resolution the runtimes do.
+    # Without this, an operator who followed the documented keychain flow
+    # (store the secret, delete the plaintext line) got a hard ERROR from
+    # the bridge preflight on a perfectly healthy deployment — and the
+    # remediation text sent them to `register --apply`, which writes the
+    # plaintext secret back and shadows the keychain entry.
+    secret_source = "generated config"
+    if not secret:
+        secret = resolve_secret(tenant_id, str(blueprint_id), existing="")
+        if secret:
+            secret_source = f"provider: {provider_label()}"
+    if not secret:
+        # `resolve_secret` short-circuits on an empty tenant, so without one
+        # the provider was never actually consulted — say which happened
+        # rather than blaming a store that was never asked.
+        if tenant_id:
+            provider_note = (
+                f"and the secrets provider ({provider_label()}) had none for "
+                f"(tenant, {str(blueprint_id)[:8]}…)"
+            )
+        else:
+            provider_note = (
+                "and no tenant id was available, so the secrets provider "
+                f"({provider_label()}) could not be consulted — set "
+                "A365_TENANT_ID in the agent env"
+            )
+        return (
+            ProbeResult(
+                "generated_config",
+                _ERROR,
+                f"{path} has no agentBlueprintClientSecret {provider_note}; "
+                "re-run `hermes a365 register --apply`, or store it with "
+                "`python -m hermes_a365.keychain store`",
+            ),
+            {},
+        )
     # Permission audit: the file should be 0600. Slice 18i / 18x policy.
     try:
         mode = path.stat().st_mode & 0o777
     except OSError:
         mode = -1
     extra: dict[str, Any] = {"blueprint_id": blueprint_id, "mode": f"0{mode:o}"}
-    detail = f"appId={blueprint_id[:8]}… secret loaded (mode=0{mode:o})"
+    detail = (
+        f"appId={blueprint_id[:8]}… secret loaded from {secret_source} "
+        f"(mode=0{mode:o})"
+    )
     if mode >= 0 and (mode & 0o077):
         return (
             ProbeResult(
@@ -594,7 +632,10 @@ def run_verify(
     local_probe, agent_env = probe_local_config(hermes_home, slug)
     report.probes.append(local_probe)
 
-    gen_probe, gen_data = probe_generated_config(generated_config_path)
+    gen_probe, gen_data = probe_generated_config(
+        generated_config_path,
+        tenant_id=agent_env.get("A365_TENANT_ID", "") if agent_env else "",
+    )
     report.probes.append(gen_probe)
 
     if local_probe.state == _ERROR or gen_probe.state == _ERROR:
@@ -979,19 +1020,43 @@ def load_bridge_config(
 
     blueprint_client_id = gen.get("agentBlueprintId") or ""
     blueprint_secret = gen.get("agentBlueprintClientSecret") or ""
+    # #19: fill a MISS from the secrets-at-rest provider (OS keychain by
+    # default). The generated-config value still wins, so a secret rotated
+    # by `register --apply` can never be beaten by a stale keychain entry.
+    blueprint_secret = resolve_secret(
+        agent_env.get("A365_TENANT_ID", ""),
+        blueprint_client_id,
+        existing=blueprint_secret,
+    )
     if not blueprint_client_id:
         raise BridgeConfigError(
             f"{generated_config_path} has no agentBlueprintId; "
             "re-run `hermes a365 register --apply` first."
         )
     if not blueprint_secret:
+        # `resolve_secret` short-circuits on an empty tenant, so with no
+        # A365_TENANT_ID the provider was never actually consulted — do not
+        # blame a store that was never asked (mirrors probe_generated_config).
+        if agent_env.get("A365_TENANT_ID", ""):
+            provider_clause = (
+                f"and the secrets provider ({provider_label()}) supplied none "
+                "either. "
+            )
+        else:
+            provider_clause = (
+                "and no A365_TENANT_ID was set, so the secrets provider could "
+                "not be consulted (set it in the agent .env to enable the "
+                "at-rest tier). "
+            )
         raise BridgeConfigError(
-            f"{generated_config_path} has no agentBlueprintClientSecret. "
+            f"{generated_config_path} has no agentBlueprintClientSecret, "
+            f"{provider_clause}"
             "Common cause: `a365 publish` was run after `register` and "
             "clobbered the local secret. Recover by either re-running "
             "register --apply (with cleanup first) or `az ad app "
             "credential reset --id <blueprint-app-id>` and patching the "
-            "new secret into the generated config."
+            "new secret into the generated config — or store it at rest with "
+            "`python -m hermes_a365.keychain store`."
         )
 
     resolved_webhook = webhook_url or os.environ.get("HERMES_BRIDGE_WEBHOOK") or ""
@@ -1008,6 +1073,14 @@ def load_bridge_config(
     # a non-agentic Entra app.
     bf_app_id = agent_env.get("A365_BF_APP_ID", "")
     bf_client_secret = agent_env.get("A365_BF_CLIENT_SECRET", "")
+    # #19: same fill-a-miss contract for the Path B identity. Path-A-only
+    # operators have bf_app_id="" — the provider treats an empty key as a
+    # miss rather than raising.
+    bf_client_secret = resolve_secret(
+        agent_env.get("A365_TENANT_ID", ""),
+        bf_app_id,
+        existing=bf_client_secret,
+    )
     return BridgeConfig(
         slug=slug,
         tenant_id=agent_env["A365_TENANT_ID"],

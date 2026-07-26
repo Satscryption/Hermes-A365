@@ -95,6 +95,16 @@ from gateway.session import SessionSource, build_session_key  # noqa: E402
 from hermes_a365 import invoke  # noqa: E402
 from hermes_a365._common import quote_path_segment, validate_slug  # noqa: E402
 
+# #19: secrets-at-rest provider. Fills a MISS only — env/config/
+# generated-config values still win, so wiring it cannot change which
+# credential a running deployment uses.
+from hermes_a365.secrets_provider import (  # noqa: E402
+    probe_provider as _probe_provider,
+)
+from hermes_a365.secrets_provider import (  # noqa: E402
+    resolve_secret as _resolve_secret_at_rest,
+)
+
 # Plugin-local imports — these don't depend on the Hermes harness.
 from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 
@@ -612,6 +622,13 @@ class Agent365Adapter(BasePlatformAdapter):
         self.bf_client_secret: str = os.getenv("A365_BF_CLIENT_SECRET") or str(
             extra.get("bf_client_secret") or ""
         )
+        # #19: provider-resolved secrets are lazy and cached separately from
+        # their plaintext slots. Adapter construction runs synchronously on
+        # the gateway event loop, so it must never launch a keychain process.
+        # Both lookups happen from `_make_bridge_config`, which `connect`
+        # offloads to a worker thread.
+        self._provider_secret: str = ""
+        self._provider_bf_secret: str = ""
 
         self._generated_config_path: Path = Path(
             extra.get("generated_config_path")
@@ -862,13 +879,60 @@ class Agent365Adapter(BasePlatformAdapter):
         secret = self._load_secret_from_generated_config()
         if secret:
             self.blueprint_client_secret = secret
-        return self.blueprint_client_secret
+            return secret
+        # #19: the provider tier, consulted only after env AND the generated
+        # config have both missed.
+        #
+        # The result is cached in its OWN field, never written back into
+        # `blueprint_client_secret`. Writing it back would put a keychain
+        # value in the slot the plaintext tiers own, so the very next call
+        # would short-circuit on it and a secret rotated into the generated
+        # config afterwards could never win — falsifying the rotation-safety
+        # property this precedence exists to provide.
+        #
+        # Only a HIT is cached. `resolve_secret` degrades a transient provider
+        # failure — backend down, keychain locked, lookup timed out — to the
+        # same "" a genuine miss returns, so caching "" would pin that failure
+        # for the life of this object. Re-consulting instead costs one keychain
+        # subprocess per connect attempt, not per turn: `_make_bridge_config`
+        # has a single call site, in `connect`.
+        #
+        # This does not depend on how the gateway retries. It happens to build
+        # a fresh adapter per reconnect attempt, so a cached "" would be
+        # discarded anyway — but that is the harness's choice, not a contract
+        # this module can lean on, and an embedder calling `connect()` twice on
+        # one instance still recovers from a transient outage. Note the
+        # converse does not hold: a HIT is pinned for the object's life, so
+        # such an embedder will not see a secret rotated at rest until it
+        # builds a new adapter. That is the same trade the plaintext tiers
+        # make, and rotation into the generated config still wins immediately.
+        cached = self._provider_secret
+        if cached:
+            return cached
+        found = _resolve_secret_at_rest(
+            self.tenant_id, self.blueprint_app_id, existing=""
+        )
+        self._provider_secret = found
+        return found
+
+    def _ensure_bf_secret(self) -> str:
+        """Resolve the Path B secret with the same fill-a-miss contract."""
+        if self.bf_client_secret:
+            return self.bf_client_secret
+        if self._provider_bf_secret:
+            return self._provider_bf_secret
+        found = _resolve_secret_at_rest(
+            self.tenant_id, self.bf_app_id, existing=""
+        )
+        self._provider_bf_secret = found
+        return found
 
     def _make_bridge_config(self) -> Any:
         """Construct a `BridgeConfig` for the bridge helpers (token
         acquisition, JWT validation, send_reply)."""
         bridge = _import_bridge()
         secret = self._ensure_secret()
+        bf_secret = self._ensure_bf_secret()
         if not (self.tenant_id and self.blueprint_app_id and secret):
             raise RuntimeError(
                 "agent365 adapter is missing tenant_id / blueprint_app_id / "
@@ -886,7 +950,7 @@ class Agent365Adapter(BasePlatformAdapter):
             log_path=log_path,
             pid_path=pid_path,
             bf_app_id=self.bf_app_id,
-            bf_client_secret=self.bf_client_secret,
+            bf_client_secret=bf_secret,
             idempotency_max_entries=self._idempotency_max_entries,
         )
 
@@ -1530,7 +1594,11 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
 
         try:
-            self._bridge_cfg = self._make_bridge_config()
+            # Keychain providers are synchronous and may wait for an OS
+            # credential prompt up to their timeout. Keep that wait off the
+            # shared gateway loop so other platforms and the gateway connect
+            # watchdog continue to run.
+            self._bridge_cfg = await asyncio.to_thread(self._make_bridge_config)
         except RuntimeError as e:
             logger.error("agent365 adapter config error: %s", e)
             self._set_fatal_error("config_error", str(e), retryable=False)
@@ -4608,6 +4676,34 @@ def _gate_env_secret_write(
     )
 
 
+def _probe_secret_at_rest(
+    tenant: str,
+    app_id: str,
+    *,
+    provider: Any = None,
+) -> tuple[bool, bool, str]:
+    """#19: what does the secrets provider know about this identity?
+
+    The wizard's ``agentBlueprintClientSecret is null`` branch predates the
+    provider tier and reads a null there as Microsoft#408. Once an operator
+    has moved the secret to rest that null is the *expected* state, and the
+    remedy the wizard prints — ``register --apply --auto-recover-secret`` —
+    mints a fresh secret that then outranks the stored one.
+
+    Returns ``(found, reachable, label)``; never the secret itself. The
+    wizard only needs to know one exists, and #5d forbids the value reaching
+    a console line — keeping it out of the return type makes that structural.
+    ``reachable`` is what stops the fix from creating a worse bug than it
+    solves: a locked keychain must not be reported as an empty one, or the
+    operator is sent to re-mint over a credential they already have.
+
+    Extracted as a module-level helper for the same reason as
+    ``_gate_env_secret_write``: ``interactive_setup`` lazy-imports the
+    ``hermes_cli`` harness, which is not importable under bare ``pytest``.
+    """
+    return _probe_provider(tenant, app_id, provider=provider)
+
+
 def interactive_setup() -> None:
     """``hermes gateway setup --platform agent365`` wizard.
 
@@ -4884,11 +4980,41 @@ def interactive_setup() -> None:
                 "shell manually before `hermes gateway run`."
             )
     else:
-        print_warning(
-            "agentBlueprintClientSecret is null in generated config — "
-            "likely Microsoft#408 on this CLI release. Re-run "
-            "`hermes a365 register --apply --auto-recover-secret`."
-        )
+        # #19: a null here used to mean exactly one thing — Microsoft#408 —
+        # and the wizard said so. It can now also mean the operator moved the
+        # secret to rest, where `--auto-recover-secret` would mint a fresh one
+        # that outranks theirs. Consult the provider and report accordingly.
+        #
+        # The paste prompt is offered on every branch, as it was before #19:
+        # the provider tells us a secret EXISTS, never that it is the right
+        # one, and plaintext is what outranks a stale entry.
+        found, reachable, label = _probe_secret_at_rest(tenant, app)
+        if found:
+            print_success(
+                "agentBlueprintClientSecret is null in the generated config, "
+                f"but a secret for this tenant/app resolves from the secrets "
+                f"provider ({label}) — likely nothing to bootstrap. Its "
+                "validity was not checked; paste a replacement below only if "
+                "you know the stored one is stale."
+            )
+        elif not reachable:
+            # Do NOT print the #408 remedy here: the store may well hold the
+            # secret and we simply could not read it.
+            print_warning(
+                f"agentBlueprintClientSecret is null, and the secrets provider "
+                f"({label}) could not be consulted — an unavailable or locked "
+                "keychain, not necessarily an empty one. Fix that first "
+                "(`python -m hermes_a365.keychain get --tenant "
+                f"{tenant} --app-id {app}` should succeed) before assuming "
+                "the secret needs re-minting."
+            )
+        else:
+            print_warning(
+                f"agentBlueprintClientSecret is null and the secrets provider "
+                f"({label}) has nothing stored for this tenant/app — most "
+                "likely Microsoft#408 on this CLI release. Re-run "
+                "`hermes a365 register --apply --auto-recover-secret`."
+            )
         manual_secret = prompt(
             "Or paste the 40-char client secret now (skipped if blank)",
             password=True,
@@ -5000,7 +5126,8 @@ def interactive_setup() -> None:
         )
     print_info(
         "  - Source the per-agent .env into the gateway shell, export "
-        "A365_BLUEPRINT_CLIENT_SECRET, then `hermes gateway run`."
+        "A365_BLUEPRINT_CLIENT_SECRET (unless it resolves from the generated "
+        "config or the secrets provider), then `hermes gateway run`."
     )
 
 

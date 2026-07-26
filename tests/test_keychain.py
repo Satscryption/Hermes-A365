@@ -10,6 +10,7 @@ real keychain is never touched.
 from __future__ import annotations
 
 import subprocess
+import traceback
 from dataclasses import dataclass, field
 
 import pytest
@@ -19,6 +20,7 @@ from hermes_a365.keychain import (
     SERVICE,
     KeychainBackend,
     KeychainError,
+    KeychainTimeoutError,
     LinuxBackend,
     MacOSBackend,
     account_name,
@@ -154,6 +156,26 @@ class TestMacOSBackend:
         )
         with pytest.raises(KeychainError, match="add-generic-password failed"):
             MacOSBackend().store("acct", "shh")
+
+    def test_store_timeout_exception_never_contains_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "must-not-leak"
+
+        def timeout(
+            argv: list[str], **_kw: object
+        ) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=10.0)
+
+        monkeypatch.setattr(subprocess, "run", timeout)
+
+        with pytest.raises(KeychainTimeoutError) as exc_info:
+            MacOSBackend().store("acct", secret)
+
+        assert secret not in str(exc_info.value)
+        assert secret not in "".join(traceback.format_exception(exc_info.value))
+        assert secret not in str(exc_info.value.__context__)
+        assert "timed out" in str(exc_info.value)
 
     def test_get_strips_trailing_newline(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
@@ -347,6 +369,39 @@ class TestCLI:
         )
         assert rc == 0
         assert backend.data == {"contoso.abc": "from-stdin"}
+
+    def test_store_timeout_is_sanitized_and_returns_2(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        secret = "must-not-leak"
+        monkeypatch.setattr(secrets_mod, "get_backend", MacOSBackend)
+
+        def timeout(
+            argv: list[str], **_kw: object
+        ) -> subprocess.CompletedProcess[str]:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=10.0)
+
+        monkeypatch.setattr(subprocess, "run", timeout)
+
+        rc = main(
+            [
+                "store",
+                "--tenant",
+                "contoso",
+                "--app-id",
+                "abc",
+                "--secret",
+                secret,
+            ]
+        )
+
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert "timed out" in captured.err
+        assert secret not in captured.err
+        assert captured.out == ""
 
     def test_get_emits_secret_to_stdout(
         self,
