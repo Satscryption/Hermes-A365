@@ -91,6 +91,17 @@ this heading is dated at release.
 
 ### Security / docs
 
+- **#125 establishes the pre-v1 repository security baseline.** The public
+  security policy now defines supported versions, a private disclosure route,
+  response expectations, and coordinated disclosure guidance. Test and
+  dependency-review workflows run with explicit read-only permissions, and
+  every action is pinned to a full commit SHA. GitHub repository controls add
+  protected source/release refs, private vulnerability reporting, dependency
+  alerts and security updates, secret scanning with push protection, CodeQL
+  default setup, and dependency review for pull requests. The initial
+  Dependabot scan identified 15 advisories in the bridge lock; the lock and
+  package security floors now require fixed releases of Cryptography, PyJWT,
+  Starlette, and IDNA (with the compatible FastAPI floor).
 - **#100 regression locks / #107 client-side characterization.** The
   #100 hardening (H1/H1-tenant/M1/M2/L4) shipped in v0.8.2; a scoping deep-read
   confirmed it live at the v0.8.5 tip. **#107** — no currently validated inbound
