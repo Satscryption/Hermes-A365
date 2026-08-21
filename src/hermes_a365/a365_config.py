@@ -14,10 +14,11 @@ preserved on round-trip so a hand-edited file isn't clobbered.
 from __future__ import annotations
 
 import json
-import os
 from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any
+
+from ._common import write_owner_only_text_atomic
 
 CONFIG_FILENAME = "a365.config.json"
 
@@ -69,11 +70,8 @@ class A365Config:
 
 
 def write_atomic(path: Path, config: A365Config) -> None:
-    """Atomically write ``config`` to ``path`` (tmp + rename). Creates parents."""
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(path.suffix + ".tmp")
-    tmp.write_text(config.to_json_text())
-    os.replace(tmp, path)
+    """Atomically write through the hardened exclusive owner-only writer."""
+    write_owner_only_text_atomic(path, config.to_json_text())
 
 
 def read(path: Path) -> A365Config:

@@ -43,6 +43,7 @@ import datetime as _dt
 import json
 import os
 import shlex
+import stat
 import sys
 import time
 from collections.abc import Callable
@@ -290,36 +291,34 @@ def apply_register_plan(
 
     expected_tenant = (plan.inputs.tenant_id or "").strip()
     if not expected_tenant:
-        result.messages.append(
-            "[apply] WARNING: no tenant pin (--tenant-id absent and no "
-            "A365_TENANT_ID resolved) — provisioning against the ambient "
-            "az/a365 session tenant"
+        raise RegisterError(
+            "no canonical tenant pin was resolved; pass --tenant-id or set "
+            "A365_TENANT_ID before provisioning"
         )
-    if expected_tenant:
-        active = active_az_tenant(lambda argv: mutator.run(argv))
-        if active is None:
-            raise RegisterError(
-                "could not verify the active az tenant (az account show failed "
-                f"or returned no tenantId) while a tenant pin exists "
-                f"({expected_tenant}); refusing to provision against an "
-                "unverifiable session. Run `az login --tenant "
-                f"{expected_tenant}` and re-try."
-            )
-        try:
-            tenant_matches = tenant_ids_match(
-                active, expected_tenant, source="--tenant-id or A365_TENANT_ID"
-            )
-        except TenantResolutionError as e:
-            raise RegisterError(str(e)) from e
-        if not tenant_matches:
-            raise RegisterError(
-                f"active az tenant {active} does not match the pinned tenant "
-                f"{expected_tenant}; refusing to provision into the wrong "
-                f"tenant. Run `az login --tenant {expected_tenant}` and re-try."
-            )
-        result.messages.append(
-            f"[apply] tenant pin OK: active az tenant matches {expected_tenant}"
+    active = active_az_tenant(lambda argv: mutator.run(argv))
+    if active is None:
+        raise RegisterError(
+            "could not verify the active az tenant (az account show failed "
+            f"or returned no tenantId) while a tenant pin exists "
+            f"({expected_tenant}); refusing to provision against an "
+            "unverifiable session. Run `az login --tenant "
+            f"{expected_tenant}` and re-try."
         )
+    try:
+        tenant_matches = tenant_ids_match(
+            active, expected_tenant, source="--tenant-id or A365_TENANT_ID"
+        )
+    except TenantResolutionError as e:
+        raise RegisterError(str(e)) from e
+    if not tenant_matches:
+        raise RegisterError(
+            f"active az tenant {active} does not match the pinned tenant "
+            f"{expected_tenant}; refusing to provision into the wrong "
+            f"tenant. Run `az login --tenant {expected_tenant}` and re-try."
+        )
+    result.messages.append(
+        f"[apply] tenant pin OK: active az tenant matches {expected_tenant}"
+    )
 
     # Keep the local config mutation behind the same tenant preflight as the
     # cloud steps. A mismatch/unverifiable session must leave existing config
@@ -439,6 +438,19 @@ def detect_missing_secret(generated_config_path: Path) -> tuple[bool, str | None
     return is_missing, bp_id
 
 
+def _harden_generated_config(path: Path) -> None:
+    """Require the CLI's plaintext generated config to be a 0600 regular file."""
+    try:
+        st = path.lstat()
+    except OSError as exc:
+        raise RegisterError(f"generated config was not created at {path}: {exc}") from exc
+    if not stat.S_ISREG(st.st_mode) or path.is_symlink():
+        raise RegisterError(f"generated config {path} is not a regular non-symlink file")
+    os.chmod(path, 0o600)
+    if stat.S_IMODE(path.lstat().st_mode) != 0o600:
+        raise RegisterError(f"could not enforce mode 0600 on generated config {path}")
+
+
 def _extract_first_json_object(text: str) -> dict[str, Any] | None:
     """Find the first balanced JSON object in ``text`` and parse it.
 
@@ -496,6 +508,7 @@ def auto_recover_secret(
     *,
     mutator: Mutator,
     display_name: str,
+    expected_app_display_name: str | None = None,
 ) -> SecretRecoveryOutcome:
     """Mint a fresh credential via az + patch into the generated config.
 
@@ -513,6 +526,40 @@ def auto_recover_secret(
     outcome = SecretRecoveryOutcome(
         detected=True, recovered=False, blueprint_app_id=blueprint_app_id
     )
+
+    try:
+        initial_stat = generated_config_path.lstat()
+    except OSError as exc:
+        outcome.messages.append(f"[recover] generated config is unavailable: {exc}")
+        return outcome
+    if not stat.S_ISREG(initial_stat.st_mode) or generated_config_path.is_symlink():
+        outcome.messages.append("[recover] generated config is not a regular non-symlink file")
+        return outcome
+
+    try:
+        app_run = mutator.run(
+            ["az", "ad", "app", "show", "--id", blueprint_app_id, "-o", "json"]
+        )
+    except CliInvocationError as exc:
+        outcome.messages.append(f"[recover] could not verify the target Entra app: {exc}")
+        return outcome
+    app = _extract_first_json_object(app_run.stdout) or {}
+    if str(app.get("appId") or "").lower() != blueprint_app_id.lower() or not app.get("id"):
+        outcome.messages.append(
+            "[recover] target Entra app identity did not match generated config"
+        )
+        return outcome
+    if expected_app_display_name and app.get("displayName") != expected_app_display_name:
+        outcome.messages.append("[recover] target Entra app display name did not match the plan")
+        return outcome
+    try:
+        checked_stat = generated_config_path.lstat()
+    except OSError:
+        outcome.messages.append("[recover] generated config disappeared during target verification")
+        return outcome
+    if (checked_stat.st_dev, checked_stat.st_ino) != (initial_stat.st_dev, initial_stat.st_ino):
+        outcome.messages.append("[recover] generated config identity changed during verification")
+        return outcome
 
     try:
         run = mutator.run(argv, sensitive=True)
@@ -538,6 +585,18 @@ def auto_recover_secret(
             f"[recover] {generated_config_path} disappeared between "
             f"detection and recover; secret minted but not persisted. "
             f"Paste manually: {paste_cmd}"
+        )
+        return outcome
+    try:
+        final_stat = generated_config_path.lstat()
+    except OSError:
+        final_stat = None
+    if final_stat is None or (final_stat.st_dev, final_stat.st_ino) != (
+        initial_stat.st_dev,
+        initial_stat.st_ino,
+    ):
+        outcome.messages.append(
+            "[recover] generated config identity changed before persistence; secret not written"
         )
         return outcome
 
@@ -739,6 +798,13 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    if "blueprint" in result.completed:
+        try:
+            _harden_generated_config(Path(GENERATED_CONFIG_FILENAME))
+        except RegisterError as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+
     sys.stdout.write("\n" + "\n".join(result.messages) + "\n")
 
     # Slice 19s — surface (and optionally recover) the missing-secret state.
@@ -754,6 +820,7 @@ def run(args: argparse.Namespace) -> int:
                     bp_id,
                     mutator=get_mutator(),
                     display_name=default_recovery_display_name(),
+                    expected_app_display_name=f"{args.agent_name} Blueprint",
                 )
                 sys.stdout.write("\n" + "\n".join(outcome.messages) + "\n")
             else:

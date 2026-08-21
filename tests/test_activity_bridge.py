@@ -1702,7 +1702,7 @@ class TestAcquireReplyTokenDispatcher:
             tenant_id="tenant-1",
             blueprint_client_id="blueprint-app-id",
             blueprint_client_secret="blueprint-sek",
-            webhook_url="http://hook.test/responder",
+            webhook_url="https://hook.test/responder",
             log_path=Path("/tmp/x.log"),
             pid_path=Path("/tmp/x.pid"),
             bf_app_id="bf-app-id",
@@ -1775,7 +1775,7 @@ class TestAcquireReplyTokenDispatcher:
             tenant_id="tenant-1",
             blueprint_client_id="blueprint-app-id",
             blueprint_client_secret="blueprint-sek",
-            webhook_url="http://hook.test/responder",
+            webhook_url="https://hook.test/responder",
             log_path=Path("/tmp/x.log"),
             pid_path=Path("/tmp/x.pid"),
             bf_app_id="bf-app-id",
@@ -1823,7 +1823,7 @@ class TestAcquireReplyTokenDispatcher:
 # ---------------------------------------------------------------------------
 
 
-def _cfg(webhook_url: str = "http://hook.test/responder") -> BridgeConfig:
+def _cfg(webhook_url: str = "https://hook.test/responder") -> BridgeConfig:
     return BridgeConfig(
         slug="inbox-helper",
         tenant_id="tenant-1",
@@ -1832,6 +1832,7 @@ def _cfg(webhook_url: str = "http://hook.test/responder") -> BridgeConfig:
         webhook_url=webhook_url,
         log_path=Path("/tmp/x.log"),
         pid_path=Path("/tmp/x.pid"),
+        allow_all_users=True,
     )
 
 
@@ -2000,7 +2001,7 @@ class TestLoadBridgeConfig:
         with pytest.raises(BridgeConfigError, match="supplied none either"):
             load_bridge_config(
                 slug="inbox-helper",
-                webhook_url="http://hook",
+                webhook_url="https://hook",
                 hermes_home=tmp_path,
                 generated_config_path=path,
             )
@@ -2022,7 +2023,7 @@ class TestLoadBridgeConfig:
         with pytest.raises(BridgeConfigError, match="no A365_TENANT_ID was set"):
             load_bridge_config(
                 slug="inbox-helper",
-                webhook_url="http://hook",
+                webhook_url="https://hook",
                 hermes_home=tmp_path,
                 generated_config_path=path,
             )
@@ -2034,7 +2035,7 @@ class TestLoadBridgeConfig:
         with pytest.raises(ValueError):
             load_bridge_config(
                 slug=slug,
-                webhook_url="http://hook",
+                webhook_url="https://hook",
                 hermes_home=tmp_path,
                 generated_config_path=tmp_path / "a365.generated.config.json",
             )
@@ -2054,13 +2055,13 @@ class TestLoadBridgeConfig:
         )
         cfg = load_bridge_config(
             slug="inbox-helper",
-            webhook_url="http://hook",
+            webhook_url="https://hook",
             hermes_home=tmp_path,
             generated_config_path=path,
         )
         assert cfg.blueprint_client_id == "blueprint-app-id"
         assert cfg.blueprint_client_secret == "sek"
-        assert cfg.webhook_url == "http://hook"
+        assert cfg.webhook_url == "https://hook"
         # #36 defaults — empty when not set in agent .env.
         assert cfg.bf_app_id == ""
         assert cfg.bf_client_secret == ""
@@ -2087,7 +2088,7 @@ class TestLoadBridgeConfig:
         )
         cfg = load_bridge_config(
             slug="inbox-helper",
-            webhook_url="http://hook",
+            webhook_url="https://hook",
             hermes_home=tmp_path,
             generated_config_path=path,
         )
@@ -2110,14 +2111,14 @@ class TestLoadBridgeConfig:
                 }
             )
         )
-        monkeypatch.setenv("HERMES_BRIDGE_WEBHOOK", "http://from-env")
+        monkeypatch.setenv("HERMES_BRIDGE_WEBHOOK", "https://from-env")
         cfg = load_bridge_config(
             slug="inbox-helper",
             webhook_url=None,
             hermes_home=tmp_path,
             generated_config_path=path,
         )
-        assert cfg.webhook_url == "http://from-env"
+        assert cfg.webhook_url == "https://from-env"
 
 
 # ---------------------------------------------------------------------------
@@ -2135,7 +2136,7 @@ def _serve_handler_factory(
     jwk: dict[str, Any] | None = None,
 ) -> httpx.MockTransport:
     """Build a transport that handles ALL outbound HTTP the bridge makes:
-    - operator's webhook (POST http://hook.test/responder)
+    - operator's webhook (POST https://hook.test/responder)
     - BF outbound calls (POST {serviceUrl}/v3/conversations/.../activities/...)
     - AAD token endpoint
     - AAD-v2 JWKS discovery + keys (when jwk is provided, for JWT-validation tests)
@@ -2169,7 +2170,7 @@ def _serve_handler_factory(
             return httpx.Response(
                 200, json={"access_token": "T2", "expires_in": 3600}
             )
-        if url.startswith("http://hook.test/responder"):
+        if url.startswith("https://hook.test/responder"):
             capture["webhook"].append(json.loads(req.content))
             if webhook_status != 200:
                 return httpx.Response(webhook_status, json={"error": "boom"})
@@ -2467,7 +2468,9 @@ class TestActivityDeliveryId:
     def test_extracts_conv_and_activity_id(self) -> None:
         a = _inbound_message_activity()
         # #103/L7: key is length-prefixed on conv ("conv-1" is 6 chars).
-        assert _activity_delivery_id(a) == "6:conv-1:1234"
+        assert _activity_delivery_id(a) == (
+            "0:|0:|6:user-1|5:bot-1|6:conv-1|4:1234|7:message"
+        )
 
     def test_missing_conversation_returns_none(self) -> None:
         a = _inbound_message_activity()
@@ -2500,8 +2503,8 @@ class TestActivityDeliveryId:
         a2 = {"conversation": {"id": "19"}, "id": "abc:123"}
         k1 = _activity_delivery_id(a1)
         k2 = _activity_delivery_id(a2)
-        assert k1 == "6:19:abc:123"
-        assert k2 == "2:19:abc:123"
+        assert k1 == "0:|0:|0:|0:|6:19:abc|3:123|0:"
+        assert k2 == "0:|0:|0:|0:|2:19|7:abc:123|0:"
         assert k1 != k2
 
 
@@ -2766,13 +2769,11 @@ class TestServeAppDedupe:
         assert len(capture["webhook"]) == 1
         assert len(capture["reply"]) == 1
 
-    def test_m3_authenticated_preseed_suppresses_later_delivery__known_residual(
+    def test_principal_bound_key_prevents_authenticated_preseed(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
-        # #100/M3 is an unresolved availability residual owned by #86. Drive
-        # the real route with a valid platform token: two different activities
-        # sharing the body-derived (conversation.id, activity.id) key collide,
-        # so the later legitimate delivery never reaches the webhook.
+        # A control activity from one principal must not pre-seed the delivery
+        # key for a later message from another principal.
         priv, jwk = rsa_keypair
         cfg = _cfg()
         cfg.tenant_id = TEST_TENANT_ID
@@ -2816,8 +2817,8 @@ class TestServeAppDedupe:
         assert first.status_code == 200
         assert first.json()["status"] == "acked"
         assert second.status_code == 200
-        assert second.json()["status"] == "duplicate"
-        assert capture == {"webhook": [], "reply": [], "token": []}
+        assert second.json()["status"] == "no_reply"
+        assert len(capture["webhook"]) == 1
 
     def test_deduped_invoke_returns_benign_ack_not_marker(self) -> None:
         # #96 — a deduped *invoke* must not return the {status:duplicate} marker
@@ -3049,6 +3050,59 @@ class TestUpdateEndpointCli:
         assert rc == 2
         assert "must be HTTPS" in capsys.readouterr().err
 
+    def test_apply_fallback_carries_verified_tenant(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.mutator import CliInvocationError, RunResult
+
+        tenant = "aaaaaaaa-0000-0000-0000-000000000001"
+
+        class Mutator:
+            available = True
+
+            def __init__(self) -> None:
+                self.calls: list[list[str]] = []
+                self.primary_attempts = 0
+
+            def run(
+                self,
+                argv: list[str],
+                *,
+                timeout: float = 60.0,
+                stdin_input: str | None = None,
+            ) -> RunResult:
+                self.calls.append(list(argv))
+                if argv[:3] == ["az", "account", "show"]:
+                    return RunResult(argv, 0, json.dumps({"tenantId": tenant}), "")
+                if argv[:3] == ["a365", "setup", "blueprint"]:
+                    self.primary_attempts += 1
+                    if self.primary_attempts == 1:
+                        raise CliInvocationError(argv, 1, "already exists")
+                return RunResult(argv, 0, "", "")
+
+        mutator = Mutator()
+        monkeypatch.setattr("hermes_a365.mutator.get_mutator", lambda: mutator)
+
+        rc = main(
+            [
+                "update-endpoint",
+                "--agent-name",
+                "Hermes Inbox Helper",
+                "--url",
+                "https://example.trycloudflare.com/api/messages",
+                "--tenant-id",
+                tenant,
+                "--apply",
+            ]
+        )
+
+        assert rc == 0
+        cleanup = next(call for call in mutator.calls if call[:2] == ["a365", "cleanup"])
+        assert cleanup[cleanup.index("--tenant-id") + 1] == tenant
+        setup_calls = [call for call in mutator.calls if call[:3] == ["a365", "setup", "blueprint"]]
+        assert len(setup_calls) == 2
+        assert all(call[call.index("--tenant-id") + 1] == tenant for call in setup_calls)
+
 
 def _unverifiable_token(iss: str) -> str:
     """A JWT parseable enough for peek_unverified_iss; signature is fake (the
@@ -3240,7 +3294,7 @@ class TestServeSecretsProviderWiring:
 
         cfg = load_bridge_config(
             slug="inbox-helper",
-            webhook_url="http://hook",
+            webhook_url="https://hook",
             hermes_home=tmp_path,
             generated_config_path=self._gen(tmp_path, secret=""),
         )
@@ -3255,7 +3309,7 @@ class TestServeSecretsProviderWiring:
 
         cfg = load_bridge_config(
             slug="inbox-helper",
-            webhook_url="http://hook",
+            webhook_url="https://hook",
             hermes_home=tmp_path,
             generated_config_path=self._gen(tmp_path, secret="FRESH"),
         )
@@ -3271,7 +3325,7 @@ class TestServeSecretsProviderWiring:
 
         cfg = load_bridge_config(
             slug="inbox-helper",
-            webhook_url="http://hook",
+            webhook_url="https://hook",
             hermes_home=tmp_path,
             generated_config_path=self._gen(tmp_path, secret="sek"),
         )
@@ -3287,7 +3341,7 @@ class TestServeSecretsProviderWiring:
 
         cfg = load_bridge_config(
             slug="inbox-helper",
-            webhook_url="http://hook",
+            webhook_url="https://hook",
             hermes_home=tmp_path,
             generated_config_path=self._gen(tmp_path, secret="sek"),
         )
@@ -3302,7 +3356,7 @@ class TestServeSecretsProviderWiring:
 
         cfg = load_bridge_config(
             slug="inbox-helper",
-            webhook_url="http://hook",
+            webhook_url="https://hook",
             hermes_home=tmp_path,
             generated_config_path=self._gen(tmp_path, secret="sek"),
         )
@@ -3392,3 +3446,40 @@ class TestServeSecretsProviderWiring:
             assert data["client_secret"] == "from-vault"
         else:
             assert probe.state == "error"
+
+
+class TestSecurityRequestBoundary:
+    def test_oversized_body_is_rejected_before_json_or_auth(self) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        client = _client_for(_cfg(), capture=capture)
+
+        response = client.post(
+            "/api/messages",
+            content=b"x" * (1024 * 1024 + 1),
+            headers={"Content-Type": "application/json"},
+        )
+
+        assert response.status_code == 413
+        assert capture["webhook"] == []
+
+    def test_standalone_end_user_auth_precedes_webhook(self) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        cfg.allow_all_users = False
+        cfg.allowed_users = ("user-allowed",)
+        client = _client_for(cfg, capture=capture)
+
+        response = client.post("/api/messages", json=_inbound_message_activity())
+
+        assert response.status_code == 403
+        assert capture["webhook"] == []
+
+    def test_plain_http_webhook_requires_loopback_development_mode(self) -> None:
+        with pytest.raises(BridgeConfigError, match="must use https"):
+            make_app(_cfg("http://hook.test/responder"))
+
+        cfg = _cfg("http://127.0.0.1:9999/responder")
+        cfg.skip_jwt_validation = True
+        app = make_app(cfg, http_client=MagicMock())
+        assert app is not None

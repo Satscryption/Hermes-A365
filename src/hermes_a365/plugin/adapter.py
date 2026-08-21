@@ -62,6 +62,7 @@ without requiring the harness on PYTHONPATH.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import ipaddress
 import json
@@ -69,6 +70,7 @@ import logging
 import mimetypes
 import os
 import re
+import secrets
 import stat
 import time
 import uuid
@@ -122,6 +124,11 @@ from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 _TEAMS_FILE_DOWNLOAD_INFO = "application/vnd.microsoft.teams.file.download.info"
 # 25 MiB safety cap; the gateway enforces its own config-driven cap downstream.
 _MAX_INBOUND_MEDIA_BYTES = 25 * 1024 * 1024
+_MAX_INBOUND_ATTACHMENTS = 8
+_MAX_INBOUND_ACTIVITY_MEDIA_BYTES = 50 * 1024 * 1024
+_MEDIA_CACHE_QUOTA_BYTES = 256 * 1024 * 1024
+_MEDIA_CACHE_TTL_SEC = 24 * 3600.0
+_MEDIA_ACTIVITY_DEADLINE_SEC = 60.0
 
 # #76c — outbound Teams file transfer. A local file is offered via a
 # FileConsentCard; on Accept the user's ``fileConsent/invoke`` carries a
@@ -218,6 +225,9 @@ def _read_file_bounded(path: str, max_bytes: int) -> bytes | None:
 # default-on; unclicked handoff links are never popped). Oldest entry is
 # dropped past the cap (dict preserves insertion order).
 _MAX_CORRELATOR_ENTRIES = 2048
+_MAX_FEEDBACK_TEXT_BYTES = 2048
+_MAX_FEEDBACK_CACHE_BYTES = 256 * 1024
+_CARD_CAPABILITY_TTL_SEC = 900.0
 
 # L2 (#105): cap the per-lifetime "seen this chat" set so a long-running
 # gateway can't grow it without limit. Generous — it only holds chat-id
@@ -269,6 +279,15 @@ def _bound_map(m: dict[str, Any], cap: int | None = None) -> None:
     ``_MAX_CORRELATOR_ENTRIES`` (read at call time so it stays tunable)."""
     limit = _MAX_CORRELATOR_ENTRIES if cap is None else cap
     while len(m) > limit:
+        m.pop(next(iter(m)))
+
+
+def _bound_feedback_map(m: dict[str, dict[str, Any]]) -> None:
+    _bound_map(m)
+    while m and sum(
+        len(json.dumps(value, ensure_ascii=True, default=str).encode("utf-8"))
+        for value in m.values()
+    ) > _MAX_FEEDBACK_CACHE_BYTES:
         m.pop(next(iter(m)))
 
 
@@ -636,6 +655,15 @@ class Agent365Adapter(BasePlatformAdapter):
             or (Path.cwd() / "a365.generated.config.json")
         )
 
+        self._allowed_users: tuple[str, ...] = tuple(
+            value.strip().lower()
+            for value in os.environ.get("A365_ALLOWED_USERS", "").split(",")
+            if value.strip()
+        )
+        self._allow_all_users = os.environ.get(
+            "A365_ALLOW_ALL_USERS", ""
+        ).strip().lower() in {"1", "true", "yes", "on"}
+
         # Slice 19o — durable conversation registry keyed on
         # `conversation.id`. Persists to
         # `~/.hermes/agents/<slug>/conversations.json` so proactive
@@ -792,6 +820,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # ``_active_stream_by_chat``) — a gateway restart drops pending offers,
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
+        self._card_capabilities: dict[str, dict[str, Any]] = {}
 
         # #73(c) — feedback-loop opt-in. Default on; operators disable via
         # A365_FEEDBACK_LOOP=0. Gates the channelData.feedbackLoop stamp so the
@@ -968,6 +997,10 @@ class Agent365Adapter(BasePlatformAdapter):
         from fastapi.responses import JSONResponse
 
         app = FastAPI(title=f"agent365 adapter — {self.slug or 'default'}")
+        app.add_middleware(
+            bridge.BoundedRequestBodyMiddleware,
+            max_bytes=bridge.MAX_ACTIVITY_BODY_BYTES,
+        )
 
         # Caches are bound here so build_app() is callable from tests
         # without having to also call connect(). Production connect()
@@ -1001,29 +1034,10 @@ class Agent365Adapter(BasePlatformAdapter):
             activity: dict[str, Any] = Body(...),  # noqa: B008
             authorization: str | None = Header(default=None),
         ) -> Any:
-            # Request-level inbound observability. Previously the plugin
-            # logged nothing for non-dispatched POSTs (lifecycle, channel
-            # control, synthetic probes, gate rejections), making it
-            # impossible to tell from the log whether a given activity (e.g.
-            # an installationUpdate) even reached the endpoint. Log every
-            # inbound's shape-defining fields here, BEFORE any gate, so the
-            # full picture is visible. No token/secret is logged.
-            _in_conv = activity.get("conversation")
-            _in_conv = _in_conv if isinstance(_in_conv, dict) else {}
-            _in_from = activity.get("from")
-            _in_from = _in_from if isinstance(_in_from, dict) else {}
-            logger.info(
-                "inbound activity type=%s action=%s channelId=%s from=%s "
-                "convType=%s conv=%s membersAdded=%s membersRemoved=%s",
-                activity.get("type"),
-                activity.get("action"),
-                activity.get("channelId"),
-                _in_from.get("id"),
-                _in_conv.get("conversationType"),
-                _in_conv.get("id"),
-                bool(activity.get("membersAdded")),
-                bool(activity.get("membersRemoved")),
-            )
+            try:
+                bridge._validate_activity_structure(activity)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             # Slice 19j — serviceUrl gate before anything else.
             service_url = activity.get("serviceUrl") or ""
@@ -1039,12 +1053,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             if not bridge._is_trusted_service_url(service_url, trusted_suffixes):
                 logger.warning(
-                    "inbound 403 reason=untrusted-service-url url=%r",
-                    service_url,
+                    "inbound 403 reason=untrusted-service-url host=%s",
+                    bridge._safe_url_host(service_url),
                 )
                 raise HTTPException(
                     status_code=403,
-                    detail=f"untrusted serviceUrl: {service_url!r}",
+                    detail="untrusted serviceUrl",
                 )
 
             # Bearer presence check (shared by Path A and Path B).
@@ -1095,6 +1109,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         "inbound 403 path=B reason=%s", e
                     )
                     raise HTTPException(status_code=403, detail=str(e)) from e
+
             else:
                 logger.info("inbound path=A (iss=%r)", iss)
                 try:
@@ -1111,6 +1126,42 @@ class Agent365Adapter(BasePlatformAdapter):
                         "inbound 403 path=A reason=%s", e
                     )
                     raise HTTPException(status_code=403, detail=str(e)) from e
+
+            _in_conv = activity.get("conversation")
+            _in_conv = _in_conv if isinstance(_in_conv, dict) else {}
+            _in_from = activity.get("from")
+            _in_from = _in_from if isinstance(_in_from, dict) else {}
+            sender_id = bridge._canonical_activity_user(activity)
+            chat_type = str(_in_conv.get("conversationType") or "")
+            chat_id = str(_in_conv.get("id") or "")
+            auth_check = getattr(self, "_is_sender_authorized", None)
+            decision = (
+                auth_check(sender_id, chat_type, chat_id)
+                if callable(auth_check)
+                else None
+            )
+            if decision is None:
+                decision = bridge._activity_user_authorized(
+                    activity,
+                    allowed_users=self._allowed_users,
+                    allow_all=self._allow_all_users,
+                )
+            if not decision:
+                logger.warning("inbound 403 reason=unauthorized-end-user")
+                raise HTTPException(status_code=403, detail="end user is not authorized")
+
+            logger.info(
+                "inbound activity type=%s action=%s channelId=%s from=%s "
+                "convType=%s conv=%s membersAdded=%s membersRemoved=%s",
+                bridge._safe_log_field(activity.get("type")),
+                bridge._safe_log_field(activity.get("action")),
+                bridge._safe_log_field(activity.get("channelId")),
+                bridge._safe_log_field(_in_from.get("id")),
+                bridge._safe_log_field(_in_conv.get("conversationType")),
+                bridge._safe_log_field(_in_conv.get("id")),
+                bool(activity.get("membersAdded")),
+                bool(activity.get("membersRemoved")),
+            )
 
             # Slice 19w-a (#18) — invoke activities are a synchronous
             # request/response wire: the reply is the HTTP response of THIS POST
@@ -1178,7 +1229,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 return JSONResponse(resp.body, status_code=resp.status)
 
             # Slice 19i — dedupe (conversationId, activityId).
-            delivery_id = bridge._activity_delivery_id(activity)
+            delivery_id = bridge._activity_delivery_id(
+                activity,
+                validated_path=validated_path or "",
+                tenant_id=self.tenant_id,
+            )
             if delivery_id is not None and self._idempotency_cache.is_duplicate(
                 delivery_id
             ):
@@ -1348,6 +1403,37 @@ class Agent365Adapter(BasePlatformAdapter):
         home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
         return Path(home) / "platforms" / "agent365" / "media"
 
+    def _prepare_media_cache(self) -> Path:
+        cache_dir = self._media_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        os.chmod(cache_dir, 0o700)
+        now = time.time()
+        entries: list[tuple[float, int, Path]] = []
+        total = 0
+        for item in cache_dir.iterdir():
+            try:
+                st = item.lstat()
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode) or item.is_symlink():
+                continue
+            if now - st.st_mtime > _MEDIA_CACHE_TTL_SEC:
+                with contextlib.suppress(OSError):
+                    item.unlink()
+                continue
+            os.chmod(item, 0o600)
+            entries.append((st.st_mtime, st.st_size, item))
+            total += st.st_size
+        for _mtime, size, item in sorted(entries):
+            if total <= _MEDIA_CACHE_QUOTA_BYTES:
+                break
+            try:
+                item.unlink()
+                total -= size
+            except OSError:
+                pass
+        return cache_dir
+
     async def _reply_bearer(
         self, activity: dict[str, Any], validated_path: str | None
     ) -> str | None:
@@ -1374,15 +1460,25 @@ class Agent365Adapter(BasePlatformAdapter):
             return None
 
     async def _download_inbound_media(
-        self, url: str, *, headers: dict[str, str] | None, cache_name: str
-    ) -> str | None:
+        self, url: str, *, headers: dict[str, str] | None, extension: str, max_bytes: int
+    ) -> tuple[str, int] | None:
         """Download one inbound attachment into the media cache; return its local
         path or None. Best-effort (a failed download is logged + skipped so the
         text still dispatches) and size-capped. ``cache_name`` must be
         caller-sanitised — it is joined onto the cache dir."""
         if self._http_client is None:
             return None
-        cap = _MAX_INBOUND_MEDIA_BYTES
+        cap = min(_MAX_INBOUND_MEDIA_BYTES, max(0, max_bytes))
+        if cap <= 0:
+            return None
+        cache_dir = self._prepare_media_cache()
+        out = cache_dir / f"{secrets.token_hex(20)}{extension}"
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = -1
+        written = 0
+        completed = False
         try:
             # R2-P1: stream + bound. Never buffer resp.content (an allowed endpoint
             # could return an arbitrarily large body → memory exhaustion). Reject an
@@ -1396,7 +1492,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 status_code = int(getattr(resp, "status_code", 0) or 0)
                 if status_code < 200 or status_code >= 300:
                     logger.warning(
-                        "agent365 inbound media non-2xx (%s) for %.60s", status_code, url
+                        "agent365 inbound media non-2xx status=%s host=%s",
+                        status_code,
+                        _import_bridge()._safe_url_host(url),
                     )
                     return None
                 clen = resp.headers.get("Content-Length") if resp.headers else None
@@ -1410,28 +1508,36 @@ class Agent365Adapter(BasePlatformAdapter):
                             return None
                     except ValueError:
                         pass  # unparseable — fall through to the streamed bound
-                buf = bytearray()
+                fd = os.open(out, flags, 0o600)
                 async for chunk in resp.aiter_bytes():
-                    buf += chunk
-                    if len(buf) > cap:
+                    written += len(chunk)
+                    if written > cap:
                         logger.warning(
                             "agent365 inbound media over %d-byte cap while streaming; "
                             "aborted", cap
                         )
                         return None
-                data = bytes(buf)
+                    view = memoryview(chunk)
+                    while view:
+                        consumed = os.write(fd, view)
+                        view = view[consumed:]
+                os.fchmod(fd, 0o600)
+                os.fsync(fd)
+                completed = True
         except Exception as e:
-            logger.warning("agent365 inbound media download failed (%.60s): %s", url, e)
+            logger.warning(
+                "agent365 inbound media download failed host=%s error=%s",
+                _import_bridge()._safe_url_host(url),
+                type(e).__name__,
+            )
             return None
-        try:
-            cache_dir = self._media_cache_dir()
-            cache_dir.mkdir(parents=True, exist_ok=True)
-            out = cache_dir / cache_name
-            out.write_bytes(data)
-        except OSError as e:
-            logger.warning("agent365 inbound media cache write failed: %s", e)
-            return None
-        return str(out)
+        finally:
+            if fd >= 0:
+                os.close(fd)
+            if not completed:
+                with contextlib.suppress(OSError):
+                    out.unlink()
+        return (str(out), written) if completed and out.exists() else None
 
     async def _extract_inbound_media(
         self, activity: dict[str, Any], *, validated_path: str | None
@@ -1444,12 +1550,14 @@ class Agent365Adapter(BasePlatformAdapter):
         attachments = activity.get("attachments")
         if not isinstance(attachments, list) or not attachments:
             return [], [], MessageType.TEXT
+        if len(attachments) > _MAX_INBOUND_ATTACHMENTS:
+            logger.warning("agent365 inbound attachment count exceeds cap; attachments dropped")
+            return [], [], MessageType.TEXT
         media_urls: list[str] = []
         media_types: list[str] = []
         saw_image = saw_file = False
-        # Collision-free, path-traversal-safe base from the (validated) activity
-        # id — never interpolate the user-supplied file name into the path.
-        base = re.sub(r"[^A-Za-z0-9._-]", "_", str(activity.get("id") or "att"))[:64]
+        remaining = _MAX_INBOUND_ACTIVITY_MEDIA_BYTES
+        deadline = time.monotonic() + _MEDIA_ACTIVITY_DEADLINE_SEC
         # Review-F1: the connector allowlist gates where the reply bearer may be
         # sent (image contentUrls). Prefer the operator-configured suffixes; fall
         # back to the bridge default so validation is never silently disabled.
@@ -1460,7 +1568,10 @@ class Agent365Adapter(BasePlatformAdapter):
             else bridge.DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
         )
         image_bearer: str | None = None  # minted once, lazily, for image contentUrls
-        for i, att in enumerate(attachments):
+        for _i, att in enumerate(attachments):
+            if time.monotonic() > deadline or remaining <= 0:
+                logger.warning("agent365 inbound media activity budget exhausted")
+                break
             if not isinstance(att, dict):
                 continue
             ctype = str(att.get("contentType") or "")
@@ -1473,7 +1584,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not _is_safe_fetch_url(url, connector_suffixes):
                     logger.warning(
                         "agent365 inbound image contentUrl off connector allowlist; "
-                        "skipped (%.60s)", url
+                        "skipped host=%s", bridge._safe_url_host(url)
                     )
                     continue
                 if image_bearer is None:
@@ -1481,12 +1592,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 if image_bearer is None:
                     continue
                 ext = mimetypes.guess_extension(ctype.split(";", 1)[0]) or ".bin"
-                path = await self._download_inbound_media(
+                downloaded = await self._download_inbound_media(
                     url,
                     headers={"Authorization": f"Bearer {image_bearer}"},
-                    cache_name=f"{base}_{i}{ext}",
+                    extension=ext,
+                    max_bytes=remaining,
                 )
-                if path is not None:
+                if downloaded is not None:
+                    path, size = downloaded
+                    remaining -= size
                     media_urls.append(path)
                     media_types.append(ctype)
                     saw_image = True
@@ -1503,15 +1617,18 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not _is_allowed_file_host(url, self._file_host_allowlist):
                     logger.warning(
                         "agent365 inbound file downloadUrl not on the configured "
-                        "tenant host allowlist; skipped (%.60s)", url
+                        "tenant host allowlist; skipped host=%s",
+                        bridge._safe_url_host(url),
                     )
                     continue
                 file_type = str(content.get("fileType") or "").lower()
                 ext = f".{file_type}" if file_type and file_type.isalnum() else ".bin"
-                path = await self._download_inbound_media(
-                    url, headers=None, cache_name=f"{base}_{i}{ext}"
+                downloaded = await self._download_inbound_media(
+                    url, headers=None, extension=ext, max_bytes=remaining
                 )
-                if path is not None:
+                if downloaded is not None:
+                    path, size = downloaded
+                    remaining -= size
                     media_urls.append(path)
                     media_types.append(_TEAMS_FILE_DOWNLOAD_INFO)
                     saw_file = True
@@ -1693,6 +1810,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._handoff_tokens.clear()
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
+        self._card_capabilities.clear()
         self._mark_disconnected()
 
     # ── Outbound ──────────────────────────────────────────────────────────
@@ -3332,19 +3450,31 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.InvokeResponse(status=200, body={})
         action_value = value.get("actionValue")
         action_value = action_value if isinstance(action_value, dict) else {}
+        reaction = action_value.get("reaction")
+        if not isinstance(reaction, str) or reaction not in {"like", "dislike"}:
+            return invoke.InvokeResponse(status=200, body={})
+        feedback = action_value.get("feedback")
+        if feedback is not None and not isinstance(feedback, str):
+            return invoke.InvokeResponse(status=200, body={})
+        if isinstance(feedback, str):
+            encoded = feedback.encode("utf-8")
+            if len(encoded) > _MAX_FEEDBACK_TEXT_BYTES:
+                feedback = encoded[:_MAX_FEEDBACK_TEXT_BYTES].decode(
+                    "utf-8", errors="ignore"
+                )
         # The reply the reaction targets: Teams sets replyToId on the invoke.
         msg_id = str(ctx.activity.get("replyToId") or ctx.activity.get("id") or "")
         if msg_id:
             self._feedback_by_message_id[msg_id] = {
-                "reaction": str(action_value.get("reaction") or ""),
-                "feedback": action_value.get("feedback"),
+                "reaction": reaction,
+                "feedback": feedback,
                 "conversation_id": str(ctx.conv.get("id") or ""),
                 "user_oid": ctx.user_oid,
             }
-            _bound_map(self._feedback_by_message_id)
+            _bound_feedback_map(self._feedback_by_message_id)
         logger.info(
             "agent365 feedback reaction=%s msg=%s",
-            str(action_value.get("reaction") or "?"),
+            reaction,
             msg_id[:16],
         )
         return invoke.InvokeResponse(status=200, body={})
@@ -3505,13 +3635,21 @@ class Agent365Adapter(BasePlatformAdapter):
         already credential-redacted gateway-side. On click the route resolves via
         ``tools.approval.resolve_gateway_approval(session_key, choice)``."""
         text = f"**Approval required** — {description}\n\n`{command}`"
-        base = {"hermes_kind": _CARD_KIND_EXEC_APPROVAL, "session_key": session_key}
-        actions = [
-            ("Approve once", {**base, "choice": "once"}),
-            ("Approve for session", {**base, "choice": "session"}),
-            ("Always allow", {**base, "choice": "always"}),
-            ("Deny", {**base, "choice": "deny"}),
-        ]
+        inbound = self._cached_inbound_for(chat_id) or {}
+        conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
+        conv_type = str(conv.get("conversationType") or "") if isinstance(conv, dict) else ""
+        choices = [("Approve once", "once"), ("Deny", "deny")]
+        if conv_type == "personal":
+            choices[1:1] = [
+                ("Approve for session", "session"),
+                ("Always allow", "always"),
+            ]
+        actions = self._mint_card_capability_actions(
+            chat_id,
+            _CARD_KIND_EXEC_APPROVAL,
+            choices,
+            {"session_key": session_key},
+        )
         return await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
         )
@@ -3530,16 +3668,18 @@ class Agent365Adapter(BasePlatformAdapter):
         ``tools.slash_confirm.resolve(session_key, confirm_id, choice)`` and posts
         any follow-up text the resolver returns."""
         text = f"**{title}**\n\n{message}"
-        base = {
-            "hermes_kind": _CARD_KIND_SLASH_CONFIRM,
-            "session_key": session_key,
-            "confirm_id": confirm_id,
-        }
-        actions = [
-            ("Approve once", {**base, "choice": "once"}),
-            ("Always", {**base, "choice": "always"}),
-            ("Cancel", {**base, "choice": "cancel"}),
-        ]
+        inbound = self._cached_inbound_for(chat_id) or {}
+        conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
+        conv_type = str(conv.get("conversationType") or "") if isinstance(conv, dict) else ""
+        choices = [("Approve once", "once"), ("Cancel", "cancel")]
+        if conv_type == "personal":
+            choices.insert(1, ("Always", "always"))
+        actions = self._mint_card_capability_actions(
+            chat_id,
+            _CARD_KIND_SLASH_CONFIRM,
+            choices,
+            {"session_key": session_key, "confirm_id": confirm_id},
+        )
         return await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="slash_confirm"
         )
@@ -3575,32 +3715,52 @@ class Agent365Adapter(BasePlatformAdapter):
                 except Exception as e:  # gateway tools absent (tests) / import race
                     logger.warning("agent365 clarify mark_awaiting_text failed: %s", e)
             return result
-        actions: list[tuple[str, dict[str, Any]]] = [
-            (
-                str(choice),
-                {
-                    "hermes_kind": _CARD_KIND_CLARIFY,
-                    "clarify_id": clarify_id,
-                    "choice_text": str(choice),
-                },
-            )
-            for choice in choices
-        ]
-        actions.append(
-            (
-                "Something else",
-                {
-                    "hermes_kind": _CARD_KIND_CLARIFY,
-                    "clarify_id": clarify_id,
-                    "choice": "other",
-                },
-            )
+        card_choices = [(str(choice), str(choice)) for choice in choices]
+        card_choices.append(("Something else", "__other__"))
+        actions = self._mint_card_capability_actions(
+            chat_id,
+            _CARD_KIND_CLARIFY,
+            card_choices,
+            {"clarify_id": clarify_id, "session_key": session_key},
         )
         return await self._send_card(
             chat_id, self._action_submit_card(question, actions), log_context="clarify"
         )
 
     # ── #77 card-action routing (Action.Submit → gateway resolvers) ────────
+
+    def _mint_card_capability_actions(
+        self,
+        chat_id: str,
+        kind: str,
+        choices: list[tuple[str, str]],
+        resolver: dict[str, str],
+    ) -> list[tuple[str, dict[str, Any]]]:
+        inbound = self._cached_inbound_for(chat_id) or {}
+        bridge = _import_bridge()
+        nonce = secrets.token_urlsafe(24)
+        opaque_choices = {secrets.token_urlsafe(12): value for _, value in choices}
+        self._card_capabilities[nonce] = {
+            "kind": kind,
+            "conversation_id": chat_id,
+            "user_id": bridge._canonical_activity_user(inbound),
+            "tenant_id": self.tenant_id.lower(),
+            "created_at": time.monotonic(),
+            "resolver": dict(resolver),
+            "choices": opaque_choices,
+        }
+        _bound_map(self._card_capabilities)
+        return [
+            (
+                title,
+                {
+                    "hermes_kind": kind,
+                    "capability": nonce,
+                    "choice_id": opaque,
+                },
+            )
+            for (title, _value), opaque in zip(choices, opaque_choices, strict=True)
+        ]
 
     @staticmethod
     def _extract_card_action(activity: dict[str, Any]) -> dict[str, Any] | None:
@@ -3655,16 +3815,40 @@ class Agent365Adapter(BasePlatformAdapter):
         from fastapi.responses import JSONResponse
 
         kind = str(value.get("hermes_kind") or "")
+        nonce = str(value.get("capability") or "")
+        capability = self._card_capabilities.get(nonce) if nonce else None
+        conv = activity.get("conversation")
+        conv_id = str(conv.get("id") or "") if isinstance(conv, dict) else ""
+        user_id = _import_bridge()._canonical_activity_user(activity)
+        if (
+            capability is None
+            or time.monotonic() - float(capability.get("created_at", 0.0))
+            > _CARD_CAPABILITY_TTL_SEC
+            or capability.get("kind") != kind
+            or capability.get("conversation_id") != conv_id
+            or capability.get("user_id") != user_id
+            or capability.get("tenant_id") != self.tenant_id.lower()
+        ):
+            logger.warning("agent365 card action rejected: invalid or mismatched capability")
+            return JSONResponse({"status": "card_action_rejected"}, status_code=403)
+        choice = capability["choices"].get(str(value.get("choice_id") or ""))
+        if choice is None:
+            logger.warning("agent365 card action rejected: invalid choice")
+            return JSONResponse({"status": "card_action_rejected"}, status_code=403)
+        # Consume only after every binding and the opaque choice validate. A
+        # mismatched user must not be able to invalidate the owner's card.
+        self._card_capabilities.pop(nonce, None)
+        resolver = capability["resolver"]
         try:
             if kind == _CARD_KIND_EXEC_APPROVAL:
                 self._gw_resolve_approval(
-                    str(value.get("session_key") or ""), str(value.get("choice") or "")
+                    str(resolver.get("session_key") or ""), choice
                 )
             elif kind == _CARD_KIND_SLASH_CONFIRM:
                 follow = await self._gw_resolve_slash_confirm(
-                    str(value.get("session_key") or ""),
-                    str(value.get("confirm_id") or ""),
-                    str(value.get("choice") or ""),
+                    str(resolver.get("session_key") or ""),
+                    str(resolver.get("confirm_id") or ""),
+                    choice,
                 )
                 if follow:
                     # The resolver returns a follow-up (command result / cancelled
@@ -3673,13 +3857,11 @@ class Agent365Adapter(BasePlatformAdapter):
                         inbound=activity, content=str(follow), log_context="slash_confirm"
                     )
             elif kind == _CARD_KIND_CLARIFY:
-                clarify_id = str(value.get("clarify_id") or "")
-                if str(value.get("choice") or "") == "other":
+                clarify_id = str(resolver.get("clarify_id") or "")
+                if choice == "__other__":
                     self._gw_mark_awaiting_text(clarify_id)
                 else:
-                    self._gw_resolve_clarify(
-                        clarify_id, str(value.get("choice_text") or "")
-                    )
+                    self._gw_resolve_clarify(clarify_id, choice)
         except Exception as e:
             logger.error("agent365 card action (%s) resolve failed: %s", kind, e)
         return JSONResponse({"status": "card_action", "kind": kind})

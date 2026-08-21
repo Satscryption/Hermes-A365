@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -17,12 +18,16 @@ from hermes_a365.cleanup import (
     CleanupResult,
     _parse_kinds,
     _validate_confirm,
-    apply_cleanup_plan,
     build_cleanup_plan,
     build_parser,
     run,
 )
+from hermes_a365.cleanup import (
+    apply_cleanup_plan as _apply_cleanup_plan,
+)
 from hermes_a365.mutator import AADSTSError, CliInvocationError, RunResult
+
+_TEST_TENANT = "aaaaaaaa-0000-0000-0000-000000000001"
 
 # ---------------------------------------------------------------------------
 # FakeMutator (records argv lists)
@@ -48,12 +53,57 @@ class FakeMutator:
     ) -> RunResult:
         self.calls.append(list(argv))
         self.stdin_inputs.append(stdin_input)
+        if argv[:3] == ["az", "account", "show"]:
+            if self.scripted:
+                candidate = self.scripted[0]
+                candidate_argv = getattr(candidate, "argv", [])
+                if candidate_argv[:3] == ["az", "account", "show"]:
+                    self.scripted.pop(0)
+                    if isinstance(candidate, Exception):
+                        raise candidate
+                    return candidate
+            return RunResult(
+                argv=list(argv),
+                returncode=0,
+                stdout=json.dumps({"tenantId": _TEST_TENANT}),
+                stderr="",
+            )
         if self.scripted:
             nxt = self.scripted.pop(0)
             if isinstance(nxt, Exception):
                 raise nxt
             return nxt
         return RunResult(argv=list(argv), returncode=0, stdout="", stderr="")
+
+
+def apply_cleanup_plan(
+    plan: object,
+    *,
+    mutator: FakeMutator,
+    hermes_home: Path,
+    **kwargs: object,
+) -> CleanupResult:
+    """Give mutation tests an explicit tenant unless they exercise no-pin refusal."""
+    typed_plan = plan
+    if typed_plan.inputs.tenant_id is None:  # type: ignore[attr-defined]
+        env_path = hermes_home / ".env"
+        env_unreadable = False
+        try:
+            env_text = env_path.read_text() if env_path.exists() else ""
+        except OSError:
+            env_text = ""
+            env_unreadable = True
+        match = re.search(r"(?m)^A365_TENANT_ID=(.+)$", env_text)
+        if match is None and not env_unreadable:
+            typed_plan.inputs.tenant_id = _TEST_TENANT  # type: ignore[attr-defined]
+    previous_cwd = Path.cwd()
+    os.chdir(hermes_home)
+    try:
+        return _apply_cleanup_plan(  # type: ignore[arg-type]
+            typed_plan, mutator=mutator, hermes_home=hermes_home, **kwargs
+        )
+    finally:
+        os.chdir(previous_cwd)
 
 
 @dataclass
@@ -64,6 +114,12 @@ class FakeBotServiceRunner:
 
     def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
         self.calls.append(list(argv))
+        if argv[:3] == ["az", "account", "show"]:
+            return CommandResult(
+                argv,
+                0,
+                stdout=json.dumps({"id": "sub-id", "tenantId": "tenant-id"}),
+            )
         if argv[:3] == ["az", "bot", "show"]:
             if not self.bot_exists:
                 return CommandResult(argv, 3, stderr="BotService not found")
@@ -72,6 +128,11 @@ class FakeBotServiceRunner:
                 0,
                 stdout=json.dumps(
                     {
+                        "id": (
+                            "/subscriptions/sub-id/resourceGroups/hermes-a365-bots/"
+                            "providers/Microsoft.BotService/botServices/"
+                            "hermes-inbox-helper-bot"
+                        ),
                         "properties": {
                             "endpoint": "https://example.test/api/messages",
                             "msaAppId": "bot-app-id",
@@ -115,8 +176,8 @@ def _seed_agent_dir(
 def _seed_bot_service_sidecar(
     tmp_path: Path,
     *,
-    schema_version: int = 1,
-    agent_name: str | None = None,
+    schema_version: int = 2,
+    agent_name: str | None = "inbox-helper",
 ) -> Path:
     path = tmp_path / "a365.bot-service.config.json"
     payload = {
@@ -125,8 +186,8 @@ def _seed_bot_service_sidecar(
         "resourceGroup": "hermes-a365-bots",
         "botName": "hermes-inbox-helper-bot",
         "armResourceId": (
-            "/subscriptions/sub/resourceGroups/rg/providers/"
-            "Microsoft.BotService/botServices/bot"
+            "/subscriptions/sub-id/resourceGroups/hermes-a365-bots/providers/"
+            "Microsoft.BotService/botServices/hermes-inbox-helper-bot"
         ),
         "msaAppId": "bot-app-id",
         "tenantId": "tenant-id",
@@ -430,13 +491,22 @@ class TestApplyCleanup:
         assert result.completed == ["bot-service", "azure", "instance", "blueprint"]
         # Mutator received argv lists matching plan order.
         # Index 3 = subcommand (after `a365 cleanup -y`).
-        assert [argv[3] for argv in mutator.calls] == ["azure", "instance", "blueprint"]
+        cleanup_calls = [argv for argv in mutator.calls if argv[0] == "a365"]
+        assert [argv[3] for argv in cleanup_calls] == [
+            "azure",
+            "instance",
+            "blueprint",
+        ]
         # Slice 18w (bug #11 round-2): each step must be fed `y\n` so
         # the GA CLI's "Continue with X cleanup? (y/N):" prompt gets
         # answered. `-y` on the parent verb does NOT propagate to
         # subcommands — empirically verified during the 2026-05-05
         # round-2 walkthrough.
-        assert mutator.stdin_inputs == ["y\n", "y\n", "y\n"]
+        assert [
+            stdin
+            for argv, stdin in zip(mutator.calls, mutator.stdin_inputs, strict=True)
+            if argv[0] == "a365"
+        ] == ["y\n", "y\n", "y\n"]
         # Local .env was removed; agent dir reaped.
         assert not (tmp_path / "agents" / "inbox-helper" / ".env").exists()
         assert not (tmp_path / "agents" / "inbox-helper").exists()
@@ -467,7 +537,8 @@ class TestApplyCleanup:
         mutator = FakeMutator()
         result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
         assert result.completed == ["blueprint"]
-        assert [argv[3] for argv in mutator.calls] == ["blueprint"]
+        cleanup_calls = [argv for argv in mutator.calls if argv[0] == "a365"]
+        assert [argv[3] for argv in cleanup_calls] == ["blueprint"]
 
     def test_bot_service_runs_before_a365_cleanup_when_sidecar_present(
         self, tmp_path: Path
@@ -492,8 +563,14 @@ class TestApplyCleanup:
         )
 
         assert result.completed == ["bot-service", "azure", "instance", "blueprint"]
-        assert bot_runner.calls[0][:3] == ["az", "bot", "show"]
-        assert [argv[3] for argv in mutator.calls] == ["azure", "instance", "blueprint"]
+        assert bot_runner.calls[0][:3] == ["az", "account", "show"]
+        assert bot_runner.calls[1][:3] == ["az", "bot", "show"]
+        cleanup_calls = [argv for argv in mutator.calls if argv[0] == "a365"]
+        assert [argv[3] for argv in cleanup_calls] == [
+            "azure",
+            "instance",
+            "blueprint",
+        ]
         assert not sidecar.exists()
         assert not any("Blueprint Entra app" in message for message in result.messages)
         assert any(
@@ -521,7 +598,8 @@ class TestApplyCleanup:
         )
 
         assert result.completed == ["bot-service", "instance"]
-        assert [argv[3] for argv in mutator.calls] == ["instance"]
+        cleanup_calls = [argv for argv in mutator.calls if argv[0] == "a365"]
+        assert [argv[3] for argv in cleanup_calls] == ["instance"]
         assert any("Blueprint Entra app" in message for message in result.messages)
 
     def test_chmods_secret_bearing_backups_to_600(
@@ -1144,11 +1222,7 @@ class TestTenantPinnedTeardown:
         result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
         assert any("tenant pin OK" in m for m in result.messages)
 
-    def test_apply_warns_and_proceeds_without_any_pin(self, tmp_path: Path) -> None:
-        # No --tenant-id and no A365_TENANT_ID in <hermes_home>/.env: nothing
-        # to compare against — proceed (fresh-setup compat) but say so, and
-        # crucially make NO az account show call (keeps the behaviour, and
-        # the mutator scripting, of every pre-M7 caller unchanged).
+    def test_apply_refuses_without_any_pin(self, tmp_path: Path) -> None:
         _seed_agent_dir(tmp_path)
         plan = build_cleanup_plan(
             CleanupInputs(agent_name="inbox-helper", kinds=("blueprint",)),
@@ -1156,10 +1230,9 @@ class TestTenantPinnedTeardown:
         )
         mutator = FakeMutator()
 
-        result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
-
-        assert mutator.calls[0][:2] == ["a365", "cleanup"]
-        assert any("WARNING: no tenant pin" in m for m in result.messages)
+        with pytest.raises(CleanupError, match="no canonical tenant pin"):
+            _apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert mutator.calls == []
 
     def test_explicit_tenant_id_wins_over_env_pin(self, tmp_path: Path) -> None:
         # Explicit --tenant-id (inputs.tenant_id) takes precedence over the

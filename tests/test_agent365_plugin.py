@@ -217,6 +217,7 @@ def _make_adapter(monkeypatch: pytest.MonkeyPatch, **extra_overrides: Any) -> An
     monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
     monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
     monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
+    monkeypatch.setenv("A365_ALLOW_ALL_USERS", "1")
     extra = {"slug": "test-agent", "port": 0}
     extra.update(extra_overrides)
     cfg = _StubPlatformConfig(extra=extra)
@@ -257,6 +258,28 @@ def _make_inbound(
         "recipient": recipient,
         "text": text,
     }
+
+
+def _seed_card_capability(
+    adapter: Any,
+    activity: dict[str, Any],
+    *,
+    kind: str,
+    choice: str,
+    resolver: dict[str, str],
+) -> dict[str, str]:
+    nonce = "test-capability"
+    choice_id = "test-choice"
+    adapter._card_capabilities[nonce] = {
+        "kind": kind,
+        "conversation_id": (activity.get("conversation") or {}).get("id", ""),
+        "user_id": adapter_mod._import_bridge()._canonical_activity_user(activity),
+        "tenant_id": adapter.tenant_id.lower(),
+        "created_at": adapter_mod.time.monotonic(),
+        "resolver": resolver,
+        "choices": {choice_id: choice},
+    }
+    return {"hermes_kind": kind, "capability": nonce, "choice_id": choice_id}
 
 
 # ---------------------------------------------------------------------------
@@ -7512,11 +7535,15 @@ class TestInteractiveCards:
         att = reply["attachments"][0]
         assert att["contentType"] == "application/vnd.microsoft.card.adaptive"
         actions = att["content"]["actions"]
-        assert [act["data"]["choice"] for act in actions] == [
-            "once", "session", "always", "deny",
-        ]
+        assert all(
+            set(act["data"]) == {"hermes_kind", "capability", "choice_id"}
+            for act in actions
+        )
+        capability = a._card_capabilities[actions[0]["data"]["capability"]]
+        assert list(capability["choices"].values()) == ["once", "session", "always", "deny"]
+        assert capability["resolver"] == {"session_key": "sess-1"}
         assert all(act["data"]["hermes_kind"] == "exec_approval" for act in actions)
-        assert all(act["data"]["session_key"] == "sess-1" for act in actions)
+        assert all("session_key" not in act["data"] for act in actions)
         # A system approval card is NOT AI-generated content — no #73(a) entity.
         assert "entities" not in reply
 
@@ -7537,8 +7564,13 @@ class TestInteractiveCards:
         actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
             "actions"
         ]
-        assert [act["data"]["choice"] for act in actions] == ["once", "always", "cancel"]
-        assert all(act["data"]["confirm_id"] == "cfm-9" for act in actions)
+        capability = a._card_capabilities[actions[0]["data"]["capability"]]
+        assert list(capability["choices"].values()) == ["once", "always", "cancel"]
+        assert capability["resolver"] == {
+            "session_key": "sess-1",
+            "confirm_id": "cfm-9",
+        }
+        assert all("confirm_id" not in act["data"] for act in actions)
 
     @pytest.mark.asyncio
     async def test_send_clarify_with_choices(
@@ -7558,8 +7590,8 @@ class TestInteractiveCards:
             "actions"
         ]
         assert [act["title"] for act in actions] == ["Alpha", "Beta", "Something else"]
-        assert actions[0]["data"]["choice_text"] == "Alpha"
-        assert actions[-1]["data"]["choice"] == "other"
+        capability = a._card_capabilities[actions[0]["data"]["capability"]]
+        assert list(capability["choices"].values()) == ["Alpha", "Beta", "__other__"]
 
     @pytest.mark.asyncio
     async def test_send_clarify_open_ended_arms_text_intercept(
@@ -7613,12 +7645,48 @@ class TestInteractiveCards:
         a = _make_adapter(monkeypatch)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
-        activity = {"type": "message", "conversation": {"id": "conv-1"}}
-        value = {"hermes_kind": "exec_approval", "session_key": "sess-1", "choice": "always"}
+        activity = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="exec_approval",
+            choice="always",
+            resolver={"session_key": "sess-1"},
+        )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         assert json.loads(resp.body)["kind"] == "exec_approval"
         resolver.assert_called_once_with("sess-1", "always")
+
+    @pytest.mark.asyncio
+    async def test_card_capability_is_user_bound_single_use_and_resists_dos(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        owner = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            owner,
+            kind="exec_approval",
+            choice="once",
+            resolver={"session_key": "sess-1"},
+        )
+        attacker = _make_inbound(conv_id="conv-1")
+        attacker["from"] = {"id": "user-2", "name": "Other User"}
+
+        rejected = await a._handle_card_action(attacker, value)
+        assert rejected.status_code == 403
+        assert "test-capability" in a._card_capabilities
+        resolver.assert_not_called()
+
+        accepted = await a._handle_card_action(owner, value)
+        assert accepted.status_code == 200
+        resolver.assert_called_once_with("sess-1", "once")
+        replayed = await a._handle_card_action(owner, value)
+        assert replayed.status_code == 403
+        resolver.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_handle_card_action_slash_confirm_posts_followup(
@@ -7633,12 +7701,13 @@ class TestInteractiveCards:
             a, "_gw_resolve_slash_confirm", AsyncMock(return_value="Command ran.")
         )
         activity = _make_inbound(conv_id="conv-1")
-        value = {
-            "hermes_kind": "slash_confirm",
-            "session_key": "sess-1",
-            "confirm_id": "cfm-1",
-            "choice": "once",
-        }
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="slash_confirm",
+            choice="once",
+            resolver={"session_key": "sess-1", "confirm_id": "cfm-1"},
+        )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         # The resolver's follow-up text is posted as a reply.
@@ -7651,8 +7720,15 @@ class TestInteractiveCards:
         a = _make_adapter(monkeypatch)
         resolver = MagicMock(return_value=True)
         monkeypatch.setattr(a, "_gw_resolve_clarify", resolver)
-        value = {"hermes_kind": "clarify", "clarify_id": "clr-1", "choice_text": "Beta"}
-        resp = await a._handle_card_action({"type": "message"}, value)
+        activity = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="clarify",
+            choice="Beta",
+            resolver={"clarify_id": "clr-1"},
+        )
+        resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         resolver.assert_called_once_with("clr-1", "Beta")
 
@@ -7663,8 +7739,15 @@ class TestInteractiveCards:
         a = _make_adapter(monkeypatch)
         mark = MagicMock()
         monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
-        value = {"hermes_kind": "clarify", "clarify_id": "clr-1", "choice": "other"}
-        resp = await a._handle_card_action({"type": "message"}, value)
+        activity = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="clarify",
+            choice="__other__",
+            resolver={"clarify_id": "clr-1"},
+        )
+        resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         mark.assert_called_once_with("clr-1")
 
@@ -7683,11 +7766,13 @@ class TestInteractiveCards:
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
 
         body = _make_inbound(conv_id="conv-card", activity_id="ca-1", text="")
-        body["value"] = {
-            "hermes_kind": "exec_approval",
-            "session_key": "sess-1",
-            "choice": "deny",
-        }
+        body["value"] = _seed_card_capability(
+            a,
+            body,
+            kind="exec_approval",
+            choice="deny",
+            resolver={"session_key": "sess-1"},
+        )
         client = TestClient(a.build_app())
         r = client.post(
             "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
@@ -8486,3 +8571,36 @@ class TestGatewaySecretsProviderWiring:
 
         # Not found, but NOT evidence of an empty store.
         assert (found, reachable, label) == (False, False, "exploding")
+
+
+class TestSecurityAuthorizationOrder:
+    def test_unauthorized_user_is_rejected_before_media_or_state_side_effects(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        a._allow_all_users = False
+        a._allowed_users = ("user-allowed",)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+
+        response = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=_make_inbound(conv_id="conv-unauthorized"),
+            headers={"Authorization": "Bearer pretend"},
+        )
+
+        assert response.status_code == 403
+        extract_media.assert_not_awaited()
+        assert a._handled_events == []
+        assert not (tmp_path / "conversations.json").exists()

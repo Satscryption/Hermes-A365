@@ -51,6 +51,11 @@ AADSTS_TOKEN_EXPIRED = "AADSTS70043"
 _AADSTS_RE = re.compile(r"AADSTS\d{4,7}")
 
 
+def _owner_only_child_setup() -> None:
+    """POSIX child hook: secret-producing CLIs create files under umask 077."""
+    os.umask(0o077)
+
+
 # ---------------------------------------------------------------------------
 # Errors
 # ---------------------------------------------------------------------------
@@ -225,6 +230,7 @@ def _run_captured(
         stderr=subprocess.STDOUT,
         text=True,
         timeout=timeout,
+        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
     )
     return completed.returncode, completed.stdout or ""
 
@@ -266,6 +272,7 @@ def _run_streaming(
         stderr=subprocess.STDOUT,
         text=True,
         bufsize=1,
+        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
     )
     if stdin_input is not None:
         assert proc.stdin is not None

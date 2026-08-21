@@ -14,16 +14,17 @@ always wins so a stale keychain entry cannot shadow a rotation.
 
 Backends
 --------
-- macOS: ``security`` command (Security framework)
+- macOS: opt-in ``security`` command fallback (disabled by default because
+  the command exposes stored values in process metadata)
 - Linux: ``secret-tool`` (libsecret)
 - Windows: not supported in v0.1 (per SPEC §10 Q3)
 
 Trade-off note
 --------------
-``security add-generic-password`` only accepts the secret via ``-w`` (argv),
-making it briefly visible in the process table during the call. This is the
-platform-standard interface; mitigations are short runtime and immediate
-exit. The Linux backend pipes the secret via stdin, which is preferred.
+``security add-generic-password`` only accepts the secret via ``-w`` (argv).
+That backend therefore requires the explicit
+``HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1`` opt-in. The Linux backend
+pipes the secret via stdin.
 
 Programmatic use::
 
@@ -36,7 +37,7 @@ CLI use::
 
     python -m hermes_a365.keychain store --tenant=… --app-id=… --secret -   # stdin
     python -m hermes_a365.keychain store --tenant=… --app-id=…              # interactive prompt
-    python -m hermes_a365.keychain get    --tenant=… --app-id=…
+    python -m hermes_a365.keychain get    --tenant=… --app-id=… --output-fd=3
     python -m hermes_a365.keychain delete --tenant=… --app-id=…
 """
 
@@ -44,9 +45,11 @@ from __future__ import annotations
 
 import argparse
 import getpass
+import os
 import shutil
 import subprocess
 import sys
+import warnings
 from typing import Protocol
 
 SERVICE = "hermes-a365"
@@ -296,6 +299,19 @@ def get_backend() -> KeychainBackend:
     if sys.platform == "darwin":
         if not shutil.which("security"):
             raise KeychainError("`security` command not found on PATH (macOS)")
+        if os.environ.get("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "").lower() not in {
+            "1", "true", "yes", "on"
+        }:
+            raise KeychainError(
+                "the macOS `security` CLI exposes stored values in process metadata; "
+                "set HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1 to opt in"
+            )
+        warnings.warn(
+            "using the opt-in macOS security CLI backend; secret values may be visible "
+            "in child process metadata",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         return MacOSBackend()
     if sys.platform.startswith("linux"):
         if not shutil.which("secret-tool"):
@@ -351,13 +367,13 @@ def _read_secret_arg(value: str | None, *, prompt_label: str) -> str:
     """Resolve the secret value for the ``store`` subcommand.
 
     - ``--secret -`` → read from stdin (everything up to EOF, trailing newline trimmed)
-    - ``--secret <value>`` → use the literal value
+    - literal argv values are rejected because process metadata is observable
     - omitted → interactive ``getpass`` prompt
     """
     if value == "-":
         return sys.stdin.read().rstrip("\n")
     if value is not None:
-        return value
+        raise ValueError("literal --secret values are refused; use --secret - or the prompt")
     return getpass.getpass(f"secret for {prompt_label}: ")
 
 
@@ -377,9 +393,14 @@ def _cmd_get(args: argparse.Namespace, backend: KeychainBackend) -> int:
     if value is None:
         print(f"not found: {args.tenant}.{args.app_id}", file=sys.stderr)
         return 1
-    sys.stdout.write(value)
-    if not value.endswith("\n"):
-        sys.stdout.write("\n")
+    if args.output_fd is None or args.output_fd <= 2:
+        print(
+            "ERROR: --output-fd must be an inherited descriptor greater than 2; "
+            "secrets are not written to standard streams",
+            file=sys.stderr,
+        )
+        return 2
+    os.write(args.output_fd, value.encode("utf-8"))
     return 0
 
 
@@ -409,7 +430,10 @@ def _build_parser() -> argparse.ArgumentParser:
         help="secret value, or '-' to read from stdin (default: interactive prompt)",
     )
 
-    sub.add_parser("get", parents=[common], help="retrieve a secret to stdout")
+    p_get = sub.add_parser(
+        "get", parents=[common], help="retrieve a secret to an inherited file descriptor"
+    )
+    p_get.add_argument("--output-fd", type=int, help="already-open inherited output fd")
     sub.add_parser("delete", parents=[common], help="remove a secret")
     return parser
 
@@ -420,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         backend = get_backend()
-    except KeychainError as e:
+    except (KeychainError, ValueError, OSError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
@@ -431,10 +455,7 @@ def main(argv: list[str] | None = None) -> int:
             return _cmd_get(args, backend)
         if args.cmd == "delete":
             return _cmd_delete(args, backend)
-    except KeychainError as e:
-        print(f"ERROR: {e}", file=sys.stderr)
-        return 2
-    except ValueError as e:
+    except (KeychainError, ValueError, OSError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 

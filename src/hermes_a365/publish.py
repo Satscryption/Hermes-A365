@@ -22,15 +22,173 @@ Default mode is dry-run; ``--apply`` runs ``a365 publish`` for real.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
 import shlex
+import shutil
+import stat
 import sys
+import tempfile
 import uuid
+import zipfile
+from contextlib import ExitStack
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
+from ._common import (
+    TenantResolutionError,
+    active_az_tenant,
+    resolve_expected_tenant,
+    tenant_ids_match,
+)
 from .mutator import AADSTSError, CliInvocationError, Mutator, RunResult, get_mutator
 
 ADMIN_CENTRE_URL = "https://admin.microsoft.com/"
+
+
+class PublishError(RuntimeError):
+    pass
+
+
+_ZIP_MAX_MEMBERS = 128
+_ZIP_MAX_MANIFEST_BYTES = 1024 * 1024
+_ZIP_MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024
+_ZIP_MAX_COMPRESSION_RATIO = 100
+
+
+def _regular_nonsymlink(path: Path) -> bool:
+    try:
+        mode = path.lstat().st_mode
+    except OSError:
+        return False
+    return stat.S_ISREG(mode) and not stat.S_ISLNK(mode)
+
+
+def _open_regular_nofollow(path: Path) -> tuple[int, os.stat_result]:
+    try:
+        before = path.lstat()
+    except OSError as exc:
+        raise OSError("path is not a regular non-symlink file") from exc
+    if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+        raise OSError("path is not a regular non-symlink file")
+    flags = os.O_RDONLY
+    if hasattr(os, "O_NOFOLLOW"):
+        flags |= os.O_NOFOLLOW
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        raise OSError("path is not a regular non-symlink file") from exc
+    try:
+        st = os.fstat(fd)
+        if (
+            not stat.S_ISREG(st.st_mode)
+            or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
+        ):
+            raise OSError("path is not a stable regular non-symlink file")
+        return fd, st
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def _validated_zip_infos(zf: zipfile.ZipFile) -> list[zipfile.ZipInfo]:
+    infos = zf.infolist()
+    if len(infos) > _ZIP_MAX_MEMBERS:
+        raise ValueError("manifest archive has too many members")
+    seen: set[str] = set()
+    total = 0
+    manifest_count = 0
+    for info in infos:
+        name = info.filename
+        parts = Path(name).parts
+        if not name or name.startswith(("/", "\\")) or ".." in parts or "\\" in name:
+            raise ValueError("manifest archive contains an unsafe member path")
+        folded = name.casefold()
+        if folded in seen:
+            raise ValueError("manifest archive contains duplicate member names")
+        seen.add(folded)
+        if stat.S_ISLNK((info.external_attr >> 16) & 0xFFFF):
+            raise ValueError("manifest archive contains a symbolic link")
+        total += info.file_size
+        if total > _ZIP_MAX_TOTAL_UNCOMPRESSED:
+            raise ValueError("manifest archive exceeds the uncompressed-size limit")
+        if info.compress_size == 0 and info.file_size:
+            raise ValueError("manifest archive contains an invalid compressed member")
+        if info.compress_size and info.file_size / info.compress_size > _ZIP_MAX_COMPRESSION_RATIO:
+            raise ValueError("manifest archive exceeds the compression-ratio limit")
+        if name == "manifest.json":
+            manifest_count += 1
+            if info.file_size > _ZIP_MAX_MANIFEST_BYTES:
+                raise ValueError("manifest.json exceeds the size limit")
+    if manifest_count != 1:
+        raise ValueError("manifest archive must contain exactly one manifest.json")
+    return infos
+
+
+def _rewrite_manifest_zip(zp: Path, manifest_blob: bytes, *, drop: set[str] | None = None) -> None:
+    if len(manifest_blob) > _ZIP_MAX_MANIFEST_BYTES:
+        raise OSError("rewritten manifest exceeds the size limit")
+    dropped = drop or set()
+    tmp_path: Path | None = None
+    source_fd = -1
+    try:
+        source_fd, _ = _open_regular_nofollow(zp)
+        with tempfile.NamedTemporaryFile(
+            dir=str(zp.parent), prefix=zp.name + ".", suffix=".tmp", delete=False
+        ) as tmp:
+            os.fchmod(tmp.fileno(), 0o600)
+            tmp_path = Path(tmp.name)
+        with os.fdopen(source_fd, "rb") as source_file:
+            source_fd = -1
+            with zipfile.ZipFile(source_file, "r") as source, zipfile.ZipFile(
+                tmp_path, "w", zipfile.ZIP_DEFLATED
+            ) as target:
+                infos = _validated_zip_infos(source)
+                target.writestr("manifest.json", manifest_blob)
+                for info in infos:
+                    if info.filename == "manifest.json" or info.filename in dropped:
+                        continue
+                    with source.open(info) as src, target.open(info.filename, "w") as dst:
+                        shutil.copyfileobj(src, dst, length=1024 * 1024)
+        with tmp_path.open("rb") as fh:
+            os.fsync(fh.fileno())
+        os.replace(tmp_path, zp)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
+
+
+def _copy_regular_file_atomic(source: Path, destination: Path) -> None:
+    if destination.exists() and not _regular_nonsymlink(destination):
+        raise OSError("destination is not a regular non-symlink file")
+    tmp_path: Path | None = None
+    source_fd = -1
+    try:
+        source_fd, _ = _open_regular_nofollow(source)
+        with os.fdopen(source_fd, "rb") as src:
+            source_fd = -1
+            with tempfile.NamedTemporaryFile(
+                dir=str(destination.parent), prefix=destination.name + ".", delete=False
+            ) as dst:
+                os.fchmod(dst.fileno(), 0o600)
+                tmp_path = Path(dst.name)
+                shutil.copyfileobj(src, dst, length=1024 * 1024)
+                dst.flush()
+                os.fsync(dst.fileno())
+        os.replace(tmp_path, destination)
+    except BaseException:
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        raise
+    finally:
+        if source_fd >= 0:
+            os.close(source_fd)
 
 # Defensive parser: when the CLI emits a "Created package:" / "Wrote zip:" /
 # similar line, grab the path. The exact wording isn't pinned in v1.1.171 yet,
@@ -246,20 +404,65 @@ def _zip_manifest_dir(manifest_dir: str) -> str | None:
     newer CLI's extract-and-stop output. Returns the zip path, or ``None``
     when the directory is missing or carries no ``manifest.json``. Files are
     written flat (the CLI extracts manifest.json + icons at the dir root)."""
-    import zipfile
-    from pathlib import Path
-
     d = Path(manifest_dir)
-    if not d.is_dir() or not (d / "manifest.json").is_file():
-        return None
     zip_path = d.with_name(d.name + ".zip")
-    try:
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for f in sorted(d.iterdir()):
-                if f.is_file():
-                    zf.write(f, arcname=f.name)
-    except OSError:
+    if zip_path.exists() and not _regular_nonsymlink(zip_path):
         return None
+    tmp_path: Path | None = None
+    directory_fd = -1
+    try:
+        dir_flags = os.O_RDONLY
+        if hasattr(os, "O_DIRECTORY"):
+            dir_flags |= os.O_DIRECTORY
+        if hasattr(os, "O_NOFOLLOW"):
+            dir_flags |= os.O_NOFOLLOW
+        directory_fd = os.open(d, dir_flags)
+        names = sorted(os.listdir(directory_fd))
+        if "manifest.json" not in names or len(names) > _ZIP_MAX_MEMBERS:
+            return None
+        with ExitStack() as stack:
+            sources: list[tuple[str, Any, os.stat_result]] = []
+            total = 0
+            for name in names:
+                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+                if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
+                    return None
+                fd = os.open(
+                    name,
+                    os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
+                    dir_fd=directory_fd,
+                )
+                source = stack.enter_context(os.fdopen(fd, "rb"))
+                st = os.fstat(source.fileno())
+                if (
+                    not stat.S_ISREG(st.st_mode)
+                    or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
+                ):
+                    return None
+                total += st.st_size
+                if total > _ZIP_MAX_TOTAL_UNCOMPRESSED:
+                    return None
+                sources.append((name, source, st))
+            with tempfile.NamedTemporaryFile(dir=str(d.parent), delete=False) as tmp:
+                os.fchmod(tmp.fileno(), 0o600)
+                tmp_path = Path(tmp.name)
+            with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                for name, source, st in sources:
+                    info = zipfile.ZipInfo(name)
+                    info.compress_type = zipfile.ZIP_DEFLATED
+                    info.external_attr = (stat.S_IFREG | stat.S_IMODE(st.st_mode)) << 16
+                    with zf.open(info, "w") as destination:
+                        shutil.copyfileobj(source, destination, length=1024 * 1024)
+        with zipfile.ZipFile(tmp_path, "r") as zf:
+            _validated_zip_infos(zf)
+        os.replace(tmp_path, zip_path)
+    except (OSError, ValueError, zipfile.BadZipFile):
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
+        return None
+    finally:
+        if directory_fd >= 0:
+            os.close(directory_fd)
     return str(zip_path)
 
 
@@ -332,24 +535,16 @@ def _patch_manifest_name_short(zip_path: str) -> tuple[str, str] | None:
     patch (e.g. missing zip file). Best-effort: any I/O failure leaves
     the original zip untouched and reports ``None``.
     """
-    import json
-    import tempfile
-    import zipfile
-    from pathlib import Path
-
     zp = Path(zip_path)
-    if not zp.is_file():
+    if not _regular_nonsymlink(zp):
         return None
 
     try:
         with zipfile.ZipFile(zp, "r") as zf:
-            names = zf.namelist()
-            if "manifest.json" not in names:
-                return None
+            _validated_zip_infos(zf)
             with zf.open("manifest.json") as fh:
                 manifest = json.load(fh)
-            other_files = {n: zf.read(n) for n in names if n != "manifest.json"}
-    except (OSError, zipfile.BadZipFile, json.JSONDecodeError):
+    except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
         return None
 
     name_block = manifest.get("name") if isinstance(manifest.get("name"), dict) else None
@@ -365,23 +560,9 @@ def _patch_manifest_name_short(zip_path: str) -> tuple[str, str] | None:
     name_block["short"] = new_short
     new_manifest = json.dumps(manifest, indent=2).encode("utf-8")
 
-    # Re-zip via a temp file in the same dir, then atomic-rename. Keeps
-    # the original on disk if anything fails mid-flight.
     try:
-        with tempfile.NamedTemporaryFile(
-            dir=str(zp.parent), prefix=zp.name + ".", suffix=".tmp", delete=False
-        ) as tmp:
-            tmp_path = Path(tmp.name)
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("manifest.json", new_manifest)
-            for name, blob in other_files.items():
-                zf.writestr(name, blob)
-        tmp_path.replace(zp)
-    except OSError:
-        import contextlib
-
-        with contextlib.suppress(Exception):
-            tmp_path.unlink(missing_ok=True)  # type: ignore[name-defined]
+        _rewrite_manifest_zip(zp, new_manifest)
+    except (OSError, ValueError, zipfile.BadZipFile):
         return None
 
     return (short, new_short)
@@ -563,29 +744,18 @@ def _patch_manifest_to_copilot_chat(
     determine bot id). Best-effort: any I/O failure leaves the original
     zip untouched.
     """
-    import json
-    import tempfile
-    import zipfile
-    from pathlib import Path
-
     zp = Path(zip_path)
-    if not zp.is_file():
+    if not _regular_nonsymlink(zp):
         return None
     try:
         with zipfile.ZipFile(zp, "r") as zf:
-            names = zf.namelist()
-            if "manifest.json" not in names:
-                return None
+            infos = _validated_zip_infos(zf)
+            names = [info.filename for info in infos]
             with zf.open("manifest.json") as fh:
                 manifest = json.load(fh)
             sidecars = _agentic_template_sidecar_files(manifest)
             dropped_sidecars = sidecars.intersection(names)
-            other_files = {
-                n: zf.read(n)
-                for n in names
-                if n != "manifest.json" and n not in dropped_sidecars
-            }
-    except (OSError, zipfile.BadZipFile, json.JSONDecodeError):
+    except (OSError, ValueError, zipfile.BadZipFile, json.JSONDecodeError):
         return None
 
     bot_id = bot_id_override or _extract_bot_id_from_manifest(manifest)
@@ -603,23 +773,9 @@ def _patch_manifest_to_copilot_chat(
     )
     blob = json.dumps(new_manifest, indent=2).encode("utf-8")
 
-    tmp_path: Path | None = None
     try:
-        with tempfile.NamedTemporaryFile(
-            dir=str(zp.parent), prefix=zp.name + ".", suffix=".tmp", delete=False
-        ) as tmp:
-            tmp_path = Path(tmp.name)
-        with zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            zf.writestr("manifest.json", blob)
-            for name, b in other_files.items():
-                zf.writestr(name, b)
-        tmp_path.replace(zp)
-    except OSError:
-        import contextlib
-
-        if tmp_path is not None:
-            with contextlib.suppress(Exception):
-                tmp_path.unlink(missing_ok=True)
+        _rewrite_manifest_zip(zp, blob, drop=dropped_sidecars)
+    except (OSError, ValueError, zipfile.BadZipFile):
         return None
 
     summary = {
@@ -647,8 +803,22 @@ def apply_publish_plan(
     """Run ``a365 publish``; surface the produced artefact (zip or
     registered instance) appropriate to the flow."""
     from pathlib import Path
-    from shutil import copyfile
 
+    expected_tenant = (plan.inputs.tenant_id or "").strip()
+    if not expected_tenant:
+        raise PublishError(
+            "no canonical tenant pin was resolved; pass --tenant-id or set "
+            "A365_TENANT_ID before publishing"
+        )
+    active = active_az_tenant(lambda argv: mutator.run(argv))
+    if active is None:
+        raise PublishError("could not verify the active Azure tenant")
+    try:
+        matches = tenant_ids_match(active, expected_tenant, source="publish tenant pin")
+    except TenantResolutionError as exc:
+        raise PublishError(str(exc)) from exc
+    if not matches:
+        raise PublishError("active Azure tenant does not match the publish tenant pin")
     run = mutator.run(plan.step.argv, timeout=_PUBLISH_APPLY_TIMEOUT_SECONDS)
     package_path: str | None = None
     copilot_chat_package_path: str | None = None
@@ -694,7 +864,7 @@ def apply_publish_plan(
                 sibling = orig.with_name(
                     orig.stem + _COPILOT_CHAT_ZIP_INFIX + orig.suffix
                 )
-                copyfile(orig, sibling)
+                _copy_regular_file_atomic(orig, sibling)
                 copilot_chat_target: str | None = str(sibling)
                 package_path = emitted_zip
             elif plan.inputs.copilot_chat:
@@ -887,9 +1057,15 @@ def _parse_prompt_starter(spec: str) -> dict[str, str]:
 
 def run(args: argparse.Namespace) -> int:
     try:
+        hermes_home = Path(os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes"))
+        tenant_id, _source = resolve_expected_tenant(hermes_home, args.tenant_id)
+        if tenant_id is None:
+            raise ValueError(
+                "no canonical tenant pin was resolved; pass --tenant-id or set A365_TENANT_ID"
+            )
         inputs = PublishInputs(
             agent_name=args.agent_name,
-            tenant_id=args.tenant_id,
+            tenant_id=tenant_id,
             aiteammate=args.aiteammate,
             copilot_chat=args.copilot_chat,
             bot_id=args.bot_id,
@@ -919,6 +1095,9 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
         return 2
     except CliInvocationError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
+    except PublishError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
