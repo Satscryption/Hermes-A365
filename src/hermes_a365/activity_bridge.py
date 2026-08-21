@@ -2475,8 +2475,12 @@ async def send_reply(
 
 
 def _reply_failed_response(error: Exception) -> Any:
+    if isinstance(error, ReplyPostError):
+        logger.warning("reply POST failed: HTTP %s", error.status_code)
+    else:
+        logger.warning("reply POST failed: %s", type(error).__name__)
     return _JSONResponse(
-        {"status": "reply_failed", "error": str(error)},
+        {"status": "reply_failed"},
         status_code=502,
     )
 
@@ -2682,11 +2686,15 @@ def make_app(
             # (Pre-dates this branch; surfaced by the #105 review because the
             # invoke exemption above makes this path load-bearing.)
             if activity_type == "invoke":
-                logger.warning("invoke webhook error: %s", e)
+                logger.warning("invoke webhook error: %s", type(e).__name__)
                 return _JSONResponse(None, status_code=200)
+            logger.warning("operator webhook error: %s", type(e).__name__)
             error_reply = render_reply_activity(
                 activity,
-                {"text": "", "card": render_error_card(f"Webhook error: {e}")},
+                {
+                    "text": "",
+                    "card": render_error_card("The agent backend could not be reached."),
+                },
             )
             try:
                 await send_reply(

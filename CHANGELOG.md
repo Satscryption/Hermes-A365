@@ -101,7 +101,10 @@ this heading is dated at release.
   default setup, and dependency review for pull requests. The initial
   Dependabot scan identified 15 advisories in the bridge lock; the lock and
   package security floors now require fixed releases of Cryptography, PyJWT,
-  Starlette, and IDNA (with the compatible FastAPI floor).
+  Starlette, and IDNA (with the compatible FastAPI floor). Initial CodeQL
+  triage also removed exception text and upstream response excerpts from the
+  externally visible `reply_failed` response; sanitized diagnostics remain in
+  server logs.
 - **#100 regression locks / #107 client-side characterization.** The
   #100 hardening (H1/H1-tenant/M1/M2/L4) shipped in v0.8.2; a scoping deep-read
   confirmed it live at the v0.8.5 tip. **#107** — no currently validated inbound

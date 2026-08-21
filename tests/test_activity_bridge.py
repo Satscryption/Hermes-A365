@@ -2298,12 +2298,12 @@ class TestServeApp:
 
         assert r.status_code == 502
         payload = r.json()
-        assert payload["status"] == "reply_failed"
-        assert f"HTTP {reply_status}" in payload["error"]
-        assert body in payload["error"]
+        assert payload == {"status": "reply_failed"}
+        assert f"HTTP {reply_status}" not in r.text
+        assert body not in r.text
         assert len(capture["reply"]) == 1
 
-    def test_message_reply_post_failure_bounds_response_excerpt(self) -> None:
+    def test_message_reply_post_failure_does_not_expose_response_excerpt(self) -> None:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         long_body = "x" * 600
@@ -2317,10 +2317,9 @@ class TestServeApp:
         ) as client:
             r = client.post("/api/messages", json=_inbound_message_activity())
 
-        error = r.json()["error"]
-        assert "x" * 500 in error
-        assert "x" * 501 not in error
-        assert error.endswith("...")
+        assert r.status_code == 502
+        assert r.json() == {"status": "reply_failed"}
+        assert "x" not in r.text
 
     def test_message_with_card_response(self) -> None:
         cfg = _cfg()
@@ -2435,7 +2434,10 @@ class TestServeApp:
         # An error card was sent back to the user via serviceUrl reply.
         assert len(capture["reply"]) == 1
         attachments = capture["reply"][0]["body"]["attachments"]
-        assert attachments[0]["content"]["type"] == "AdaptiveCard"
+        card = attachments[0]["content"]
+        assert card["type"] == "AdaptiveCard"
+        assert card["body"][1]["text"] == "The agent backend could not be reached."
+        assert "hook.test" not in str(card)
 
     def test_jwt_missing_returns_401(self) -> None:
         cfg = _cfg()  # JWT validation enabled
