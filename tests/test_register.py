@@ -33,7 +33,6 @@ from hermes_a365.register import (
     RegisterPlan,
     RegisterStep,
     SecretRecoveryOutcome,
-    apply_register_plan,
     auto_recover_secret,
     build_parser,
     build_register_plan,
@@ -43,6 +42,11 @@ from hermes_a365.register import (
     run,
     update_config_for_agent,
 )
+from hermes_a365.register import (
+    apply_register_plan as _apply_register_plan,
+)
+
+_TEST_TENANT = "aaaa1111-0000-0000-0000-000000000001"
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -68,12 +72,61 @@ class FakeMutator:
     ) -> RunResult:
         self.calls.append(list(argv))
         self.sensitive_flags.append(sensitive)
+        if argv[:3] == ["az", "account", "show"]:
+            if self.scripted:
+                candidate = self.scripted[0]
+                candidate_argv = getattr(candidate, "argv", [])
+                if candidate_argv[:3] == ["az", "account", "show"]:
+                    self.scripted.pop(0)
+                    if isinstance(candidate, Exception):
+                        raise candidate
+                    return candidate
+            return RunResult(
+                argv=list(argv),
+                returncode=0,
+                stdout=json.dumps({"tenantId": _TEST_TENANT}),
+                stderr="",
+            )
+        if argv[:4] == ["az", "ad", "app", "show"]:
+            if self.scripted:
+                candidate = self.scripted[0]
+                candidate_argv = getattr(candidate, "argv", [])
+                if candidate_argv[:4] == ["az", "ad", "app", "show"]:
+                    self.scripted.pop(0)
+                    if isinstance(candidate, Exception):
+                        raise candidate
+                    return candidate
+            app_id = argv[argv.index("--id") + 1]
+            return RunResult(
+                argv=list(argv),
+                returncode=0,
+                stdout=json.dumps(
+                    {
+                        "appId": app_id,
+                        "id": "00000000-0000-0000-0000-000000000001",
+                        "displayName": "Inbox Helper Blueprint",
+                    }
+                ),
+                stderr="",
+            )
         if self.scripted:
             nxt = self.scripted.pop(0)
             if isinstance(nxt, Exception):
                 raise nxt
             return nxt
         return RunResult(argv=list(argv), returncode=0, stdout="", stderr="")
+
+
+def apply_register_plan(
+    plan: RegisterPlan,
+    *,
+    mutator: FakeMutator | A365CliMutator,
+    **kwargs: object,
+) -> ApplyResult:
+    """Give mutation tests an explicit tenant unless they exercise no-pin refusal."""
+    if plan.inputs.tenant_id is None:
+        plan.inputs.tenant_id = _TEST_TENANT
+    return _apply_register_plan(plan, mutator=mutator, **kwargs)  # type: ignore[arg-type]
 
 
 class _SleepRecorder:
@@ -251,9 +304,13 @@ class TestApplyHappyPath:
         assert result.consent_deferred is False
         assert result.not_run == []
         # Mutator received argv lists matching the plan steps in order.
-        assert [argv[2] for argv in mutator.calls] == ["blueprint", "permissions", "permissions"]
-        # Three calls total.
-        assert len(mutator.calls) == 3
+        step_calls = [argv for argv in mutator.calls if argv[0] == "a365"]
+        assert [argv[2] for argv in step_calls] == [
+            "blueprint",
+            "permissions",
+            "permissions",
+        ]
+        assert len(step_calls) == 3
 
     def test_messages_capture_each_step(self) -> None:
         plan = build_register_plan(RegisterInputs(agent_name="x"))
@@ -451,7 +508,15 @@ def _install_az_shim(
     bin_dir = tmp_path / "bin"
     bin_dir.mkdir(exist_ok=True)
     shim = bin_dir / "az"
-    shim.write_text("#!/bin/sh\n" + script + "\n")
+    shim.write_text(
+        "#!/bin/sh\n"
+        "if [ \"$1 $2 $3\" = \"ad app show\" ]; then\n"
+        "  printf '%s\\n' '{\"appId\":\"bp-app-id\",\"id\":\"obj-id\"}'\n"
+        "  exit 0\n"
+        "fi\n"
+        + script
+        + "\n"
+    )
     shim.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
 
@@ -549,7 +614,7 @@ class TestAutoRecoverSecret:
             path, "bp-app-id", mutator=mutator, display_name="recovery-test"
         )
         assert mutator.calls, "az should have been invoked"
-        argv = mutator.calls[0]
+        argv = mutator.calls[1]
         assert argv[:5] == ["az", "ad", "app", "credential", "reset"]
         assert "--append" in argv
         assert "--id" in argv and argv[argv.index("--id") + 1] == "bp-app-id"
@@ -604,7 +669,7 @@ class TestAutoRecoverSecret:
         auto_recover_secret(
             path, "bp-app-id", mutator=mutator, display_name="recovery-test"
         )
-        assert mutator.sensitive_flags == [True]
+        assert mutator.sensitive_flags == [False, True]
 
     def test_secret_never_reaches_stdout_with_real_mutator(
         self,
@@ -1200,22 +1265,13 @@ class TestTenantPinnedProvisioning:
         assert config["agentBlueprintDisplayName"] == "Inbox Helper Blueprint"
         assert result.completed
 
-    def test_apply_skips_preflight_without_pin(self) -> None:
-        # Unpinned inputs (fresh setup / direct API caller): behaviour — and
-        # every existing caller's mutator scripting — is unchanged.
+    def test_apply_refuses_without_pin(self) -> None:
         plan = build_register_plan(RegisterInputs(agent_name="Inbox Helper"))
         mutator = FakeMutator()
 
-        apply_register_plan(plan, mutator=mutator)
-
-        assert all(call[0] == "a365" for call in mutator.calls)
-
-    def test_apply_warns_when_unpinned(self) -> None:
-        # #102 review: the unpinned path must SAY the tenant guard is
-        # inactive (matching cleanup), not skip silently.
-        plan = build_register_plan(RegisterInputs(agent_name="Inbox Helper"))
-        result = apply_register_plan(plan, mutator=FakeMutator())
-        assert any("WARNING: no tenant pin" in m for m in result.messages)
+        with pytest.raises(RegisterError, match="no canonical tenant pin"):
+            _apply_register_plan(plan, mutator=mutator)
+        assert mutator.calls == []
 
     def test_tenant_verify_tolerates_az_warning_prefix(self) -> None:
         # Same stream-shape lesson as register._extract_first_json_object:
@@ -1235,3 +1291,55 @@ class TestTenantPinnedProvisioning:
         mutator = FakeMutator(scripted=[noisy])
         result = apply_register_plan(plan, mutator=mutator)
         assert any("tenant pin OK" in m for m in result.messages)
+
+
+class TestSecurityRecoveryBinding:
+    def test_recovery_refuses_app_id_substitution_before_reset(self, tmp_path: Path) -> None:
+        path = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        app_show = RunResult(
+            argv=["az", "ad", "app", "show", "--id", "bp-app-id"],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "appId": "attacker-app-id",
+                    "id": "00000000-0000-0000-0000-000000000099",
+                }
+            ),
+            stderr="",
+        )
+        mutator = FakeMutator(scripted=[app_show])
+
+        outcome = auto_recover_secret(
+            path,
+            "bp-app-id",
+            mutator=mutator,
+            display_name="recovery-test",
+        )
+
+        assert outcome.recovered is False
+        assert "identity did not match" in outcome.messages[0]
+        assert len(mutator.calls) == 1
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] is None
+
+    def test_recovery_refuses_symlinked_generated_config(self, tmp_path: Path) -> None:
+        victim = _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        link = tmp_path / "linked-generated.json"
+        link.symlink_to(victim)
+        mutator = FakeMutator()
+
+        outcome = auto_recover_secret(
+            link,
+            "bp-app-id",
+            mutator=mutator,
+            display_name="recovery-test",
+        )
+
+        assert outcome.recovered is False
+        assert "non-symlink" in outcome.messages[0]
+        assert mutator.calls == []

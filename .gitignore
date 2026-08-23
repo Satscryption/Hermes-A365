@@ -15,7 +15,10 @@
 # stray `git add .` can't ship a tenant-shaped artefact.
 a365.config.json*
 a365.generated.config.json*
+a365.config*.json*
+a365.generated.config*.json*
 a365.bot-service.config.json*
+a365.bot-service.config*.json*
 *.generated.config.json*
 # Newcomers seed `a365.config.json` from this template — keep it tracked.
 !a365.config.json.example
@@ -26,6 +29,11 @@ a365.generated.config.backup-*.json
 # under ./manifest/ as a build artefact (slice 19g, walkthrough finding).
 # Regenerated each publish — keep it out of git.
 manifest/
+# Local exports and archives frequently bundle generated configs or OAuth state.
+# Release artefacts belong under ignored dist/; root archives are operator-only.
+/*.zip
+/*-archive-*
+/*-memory-export.md
 
 # Python
 __pycache__/

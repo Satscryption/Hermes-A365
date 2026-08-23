@@ -134,6 +134,10 @@ def _mock_completed(
 
 
 class TestMacOSBackend:
+    @pytest.fixture(autouse=True)
+    def _opt_in_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "1")
+
     def test_store_invokes_security_add(self, monkeypatch: pytest.MonkeyPatch) -> None:
         recorded: list[list[str]] = []
 
@@ -283,12 +287,25 @@ class TestLinuxBackend:
 class TestGetBackend:
     def test_macos_picks_macos_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(secrets_mod.sys, "platform", "darwin")
+        monkeypatch.delenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", raising=False)
         monkeypatch.setattr(
             secrets_mod.shutil,
             "which",
             lambda binary: "/usr/bin/security" if binary == "security" else None,
         )
         assert get_backend().name == "macos-security"
+
+    def test_macos_backend_requires_explicit_unsafe_opt_in_only_for_writes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(secrets_mod.sys, "platform", "darwin")
+        monkeypatch.delenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", raising=False)
+        monkeypatch.setattr(secrets_mod.shutil, "which", lambda _binary: "/usr/bin/security")
+        backend = get_backend()
+        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _mock_completed(0, stdout="shh"))
+        assert backend.get("acct") == "shh"
+        with pytest.raises(KeychainError, match="add-generic-password"):
+            backend.store("acct", "new-secret")
 
     def test_macos_missing_security_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(secrets_mod.sys, "platform", "darwin")
@@ -328,7 +345,7 @@ class TestCLI:
         monkeypatch.setattr(secrets_mod, "get_backend", lambda: backend)
         return backend
 
-    def test_store_via_explicit_value(
+    def test_store_rejects_explicit_value(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
     ) -> None:
         backend = self._patch_backend(monkeypatch)
@@ -343,10 +360,10 @@ class TestCLI:
                 "shh",
             ]
         )
-        assert rc == 0
-        assert backend.data == {"contoso.abc": "shh"}
+        assert rc == 2
+        assert backend.data == {}
         err = capsys.readouterr().err
-        assert "stored" in err
+        assert "literal --secret values are refused" in err
         assert "shh" not in err  # secret must never appear in user-facing output
 
     def test_store_via_stdin(
@@ -376,6 +393,7 @@ class TestCLI:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         secret = "must-not-leak"
+        monkeypatch.setenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "1")
         monkeypatch.setattr(secrets_mod, "get_backend", MacOSBackend)
 
         def timeout(
@@ -384,6 +402,7 @@ class TestCLI:
             raise subprocess.TimeoutExpired(cmd=argv, timeout=10.0)
 
         monkeypatch.setattr(subprocess, "run", timeout)
+        monkeypatch.setattr(secrets_mod.sys, "stdin", _StringIO(secret + "\n"))
 
         rc = main(
             [
@@ -393,7 +412,7 @@ class TestCLI:
                 "--app-id",
                 "abc",
                 "--secret",
-                secret,
+                "-",
             ]
         )
 
@@ -403,17 +422,41 @@ class TestCLI:
         assert secret not in captured.err
         assert captured.out == ""
 
-    def test_get_emits_secret_to_stdout(
+    def test_get_writes_only_to_inherited_nonstandard_fd(
         self,
         monkeypatch: pytest.MonkeyPatch,
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         backend = self._patch_backend(monkeypatch)
         backend.data["contoso.abc"] = "shh"
-        rc = main(["get", "--tenant", "contoso", "--app-id", "abc"])
-        out = capsys.readouterr().out
+        writes: list[tuple[int, bytes]] = []
+        monkeypatch.setattr(secrets_mod.os, "write", lambda fd, data: writes.append((fd, data)))
+        rc = main(
+            ["get", "--tenant", "contoso", "--app-id", "abc", "--output-fd", "9"]
+        )
+        captured = capsys.readouterr()
         assert rc == 0
-        assert out.rstrip("\n") == "shh"
+        assert writes == [(9, b"shh")]
+        assert captured.out == ""
+        assert "shh" not in captured.err
+
+    @pytest.mark.parametrize("fd", [0, 1, 2])
+    def test_get_rejects_standard_stream_descriptors(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+        fd: int,
+    ) -> None:
+        backend = self._patch_backend(monkeypatch)
+        backend.data["contoso.abc"] = "shh"
+        rc = main(
+            ["get", "--tenant", "contoso", "--app-id", "abc", "--output-fd", str(fd)]
+        )
+        captured = capsys.readouterr()
+        assert rc == 2
+        assert captured.out == ""
+        assert "standard streams" in captured.err
+        assert "shh" not in captured.err
 
     def test_get_missing_exits_1(
         self,

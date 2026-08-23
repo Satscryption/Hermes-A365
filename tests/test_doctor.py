@@ -274,6 +274,7 @@ class TestProbeKeychain:
             r = probe_keychain()
         assert r.state == "ok"
         assert "Security framework" in r.detail
+        assert "writes require" in r.detail
 
     def test_linux_secret_tool_present_ok(self) -> None:
         with (
@@ -327,6 +328,19 @@ class TestProbeLocalConfig:
         r = probe_local_config()
         assert r.state == "ok"
         assert ".env: 2 keys" in r.detail
+        assert r.data["tenant_pinned"] is True
+
+    def test_env_without_tenant_pin_errors(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / ".env").write_text("A365_APP_ID=a\n")
+
+        r = probe_local_config()
+
+        assert r.state == "error"
+        assert "no canonical tenant pin was resolved" in r.detail
+        assert r.data["tenant_pinned"] is False
 
 
 # ---------------------------------------------------------------------------

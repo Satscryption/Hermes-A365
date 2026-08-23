@@ -40,10 +40,14 @@ agent365 = "hermes_a365.plugin"
 # stack. Optional so operators who only run setup/cleanup wrappers can
 # install with no extras.
 bridge = [
-  "fastapi>=0.115",
+  # Security floors established while triaging #125's initial Dependabot scan.
+  "cryptography>=50.0.0",
+  "fastapi>=0.141.1",
   "uvicorn[standard]>=0.30",
   "httpx>=0.27",
-  "pyjwt[crypto]>=2.8",
+  "idna>=3.15",
+  "pyjwt[crypto]>=2.13.0",
+  "starlette>=1.3.1",
 ]
 dev = [
   "pytest>=8.0",
@@ -53,9 +57,12 @@ dev = [
   "pytest-randomly>=3.15",
   "ruff>=0.5",
   # Bridge stack is installed in dev too so tests can exercise it.
-  "fastapi>=0.115",
+  "cryptography>=50.0.0",
+  "fastapi>=0.141.1",
   "httpx>=0.27",
-  "pyjwt[crypto]>=2.8",
+  "idna>=3.15",
+  "pyjwt[crypto]>=2.13.0",
+  "starlette>=1.3.1",
   "uvicorn>=0.30",
 ]
 

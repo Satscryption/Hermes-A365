@@ -31,6 +31,8 @@ def test_invoke_response_fields() -> None:
         ("groupChat", "B", "copilot_chat"),  # Copilot Chat arrives on Path B
         ("groupChat", "A", "group"),  # a genuine Teams group is not Path B
         ("groupChat", "unknown", "group"),  # default is NOT copilot_chat
+        ("PERSONAL", "B", "dm"),
+        ("CHANNEL", "B", "channel"),
         (None, "A", "dm"),  # missing conversationType -> personal -> dm
     ],
 )
@@ -47,6 +49,12 @@ def test_classify_chat_type_non_dict_conversation_degrades(bad_conv: object) -> 
     # A truthy non-dict conversation must not crash (C1 regression guard) —
     # `or {}` only catches falsy values, so an isinstance guard is required.
     assert invoke.classify_chat_type({"conversation": bad_conv}, "B") == "dm"
+
+
+def test_classify_chat_type_unknown_explicit_value_is_fail_closed_group() -> None:
+    for explicit_value in ("futureSurface", "", "   "):
+        activity = {"conversation": {"conversationType": explicit_value}}
+        assert invoke.classify_chat_type(activity, "B") == "group"
 
 
 # ---------------------------------------------------------------------------

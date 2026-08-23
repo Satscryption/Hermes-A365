@@ -10,13 +10,18 @@ from hermes_a365.mutator import AADSTSError, CliInvocationError, RunResult
 from hermes_a365.publish import (
     _PUBLISH_APPLY_TIMEOUT_SECONDS,
     ADMIN_CENTRE_URL,
+    PublishError,
     PublishInputs,
     PublishPlan,
     PublishResult,
     _extract_package_path,
-    apply_publish_plan,
     build_publish_plan,
 )
+from hermes_a365.publish import (
+    apply_publish_plan as _apply_publish_plan,
+)
+
+_TEST_TENANT = "aaaaaaaa-0000-0000-0000-000000000001"
 
 # ---------------------------------------------------------------------------
 # FakeMutator
@@ -39,12 +44,33 @@ class FakeMutator:
     ) -> RunResult:
         self.calls.append(list(argv))
         self.call_timeouts.append(timeout)
+        if argv[:3] == ["az", "account", "show"]:
+            if self.scripted:
+                candidate = self.scripted[0]
+                candidate_argv = getattr(candidate, "argv", [])
+                if candidate_argv[:3] == ["az", "account", "show"]:
+                    self.scripted.pop(0)
+                    if isinstance(candidate, Exception):
+                        raise candidate
+                    return candidate
+            return RunResult(
+                argv=list(argv),
+                returncode=0,
+                stdout='{"tenantId":"aaaaaaaa-0000-0000-0000-000000000001"}',
+                stderr="",
+            )
         if self.scripted:
             nxt = self.scripted.pop(0)
             if isinstance(nxt, Exception):
                 raise nxt
             return nxt
         return RunResult(argv=list(argv), returncode=0, stdout="", stderr="")
+
+
+def apply_publish_plan(plan: PublishPlan, *, mutator: FakeMutator) -> PublishResult:
+    if plan.inputs.tenant_id is None:
+        plan.inputs.tenant_id = _TEST_TENANT
+    return _apply_publish_plan(plan, mutator=mutator)
 
 
 # ---------------------------------------------------------------------------
@@ -200,7 +226,15 @@ class TestApplyPublish:
         plan = build_publish_plan(PublishInputs(agent_name="inbox-helper"))
         mutator = FakeMutator()
         apply_publish_plan(plan, mutator=mutator)
-        assert mutator.calls == [["a365", "publish", "--agent-name", "inbox-helper"]]
+        publish_calls = [argv for argv in mutator.calls if argv[0] == "a365"]
+        assert publish_calls == [["a365", "publish", "--agent-name", "inbox-helper"]]
+
+    def test_direct_apply_refuses_unpinned_plan(self) -> None:
+        plan = build_publish_plan(PublishInputs(agent_name="inbox-helper"))
+        mutator = FakeMutator()
+        with pytest.raises(PublishError, match="no canonical tenant pin"):
+            _apply_publish_plan(plan, mutator=mutator)
+        assert mutator.calls == []
 
     def test_surfaces_package_path_when_visible_aiteammate(self) -> None:
         # Slice 18t (bug #14): zip extraction only runs in AI Teammate flow.
@@ -281,7 +315,12 @@ class TestApplyPublishPlanTimeout:
         plan = build_publish_plan(PublishInputs(agent_name="x"))
         mutator = FakeMutator()
         apply_publish_plan(plan, mutator=mutator)
-        assert mutator.call_timeouts == [_PUBLISH_APPLY_TIMEOUT_SECONDS]
+        publish_timeouts = [
+            timeout
+            for argv, timeout in zip(mutator.calls, mutator.call_timeouts, strict=True)
+            if argv[0] == "a365"
+        ]
+        assert publish_timeouts == [_PUBLISH_APPLY_TIMEOUT_SECONDS]
 
     def test_timeout_constant_is_generous_enough_for_device_code(self) -> None:
         # Microsoft device-code lifetime is 15 min = 900 s. Anything below
@@ -470,7 +509,7 @@ class TestApplyPublishPlanIntegration:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         # Build a real-shaped zip the FakeMutator will "produce".
         zp = tmp_path / "manifest.zip"
@@ -500,7 +539,7 @@ class TestApplyPublishPlanIntegration:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = tmp_path / "manifest.zip"
         with zipfile.ZipFile(zp, "w") as zf:
@@ -1005,7 +1044,7 @@ class TestApplyPublishPlanCopilotChat:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(
             tmp_path,
@@ -1071,7 +1110,7 @@ class TestApplyPublishPlanCopilotChat:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         d = self._seed_manifest_dir(
             tmp_path,
@@ -1120,6 +1159,35 @@ class TestApplyPublishPlanCopilotChat:
             # name.short truncated 32 -> <= 30 at a word boundary.
             assert m["name"]["short"] == "Hermes Inbox Helper R8"
 
+    def test_packages_bounded_nested_regular_manifest_assets(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import _zip_manifest_dir
+
+        d = tmp_path / "manifest"
+        nested = d / "assets" / "icons"
+        nested.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({"manifestVersion": "1.27"}))
+        (nested / "color.png").write_bytes(b"png")
+
+        package = _zip_manifest_dir(str(d))
+
+        assert package is not None
+        with zipfile.ZipFile(package) as zf:
+            assert set(zf.namelist()) == {"manifest.json", "assets/icons/color.png"}
+
+    def test_extracted_manifest_packaging_failure_is_explicit(self, tmp_path):
+        d = tmp_path / "manifest"
+        d.mkdir()
+        (d / "not-a-manifest.txt").write_text("no manifest")
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, bot_id="bot-id")
+        )
+
+        with pytest.raises(PublishError, match="could not be packaged safely"):
+            apply_publish_plan(plan, mutator=self._scripted_template_extract(str(d)))
+
     def test_extract_manifest_dir_parses_both_phrasings(self):
         from hermes_a365.publish import _extract_manifest_dir
 
@@ -1137,7 +1205,7 @@ class TestApplyPublishPlanCopilotChat:
         import uuid
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(
             tmp_path,
@@ -1187,7 +1255,7 @@ class TestApplyPublishPlanCopilotChat:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(
             tmp_path,
@@ -1220,7 +1288,7 @@ class TestApplyPublishPlanCopilotChat:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(
             tmp_path,
@@ -1243,7 +1311,7 @@ class TestApplyPublishPlanCopilotChat:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(
             tmp_path,
@@ -1276,7 +1344,7 @@ class TestApplyPublishPlanCopilotChat:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(
             tmp_path,
@@ -1296,7 +1364,7 @@ class TestApplyPublishPlanCopilotChat:
         import json
         import zipfile
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(
             tmp_path,
@@ -1318,7 +1386,7 @@ class TestApplyPublishPlanCopilotChat:
         assert any("truncated name.short" in msg for msg in result.messages)
 
     def test_transform_failure_surfaces_warning(self, tmp_path):
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         # Manifest with no resolvable bot id and no override.
         zp = self._seed_manifest_zip(tmp_path, {"name": {"short": "X", "full": "X"}})
@@ -1333,7 +1401,7 @@ class TestApplyPublishPlanCopilotChat:
     def test_transform_failure_rolls_back_sibling_in_both_mode(self, tmp_path):
         from pathlib import Path
 
-        from hermes_a365.publish import apply_publish_plan, build_publish_plan
+        from hermes_a365.publish import build_publish_plan
 
         zp = self._seed_manifest_zip(tmp_path, {"name": {"short": "X", "full": "X"}})
         plan = build_publish_plan(
@@ -1347,3 +1415,48 @@ class TestApplyPublishPlanCopilotChat:
         # Sibling was rolled back.
         sibling = Path(zp).with_name(Path(zp).stem + ".copilot-chat.zip")
         assert not sibling.exists()
+
+
+class TestSecurityManifestArchives:
+    def test_manifest_rewrite_refuses_symlink_archive(self, tmp_path) -> None:
+        import zipfile
+
+        from hermes_a365.publish import _rewrite_manifest_zip
+
+        victim = tmp_path / "victim.zip"
+        with zipfile.ZipFile(victim, "w") as zf:
+            zf.writestr("manifest.json", b"{}")
+        link = tmp_path / "manifest.zip"
+        link.symlink_to(victim)
+
+        with pytest.raises(OSError, match="non-symlink"):
+            _rewrite_manifest_zip(link, b"{}")
+        with zipfile.ZipFile(victim) as zf:
+            assert zf.read("manifest.json") == b"{}"
+
+    def test_manifest_rewrite_refuses_high_ratio_zip_bomb(self, tmp_path) -> None:
+        import zipfile
+
+        from hermes_a365.publish import _rewrite_manifest_zip
+
+        archive = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(archive, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("manifest.json", b"{}")
+            zf.writestr("payload.bin", b"A" * (1024 * 1024))
+
+        with pytest.raises(ValueError, match="compression-ratio"):
+            _rewrite_manifest_zip(archive, b"{}")
+
+    def test_manifest_rewrite_refuses_traversal_member(self, tmp_path) -> None:
+        import zipfile
+
+        from hermes_a365.publish import _rewrite_manifest_zip
+
+        archive = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(archive, "w") as zf:
+            zf.writestr("manifest.json", b"{}")
+            zf.writestr("../outside.txt", b"owned")
+
+        with pytest.raises(ValueError, match="unsafe member path"):
+            _rewrite_manifest_zip(archive, b"{}")
+        assert not (tmp_path.parent / "outside.txt").exists()

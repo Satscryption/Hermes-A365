@@ -324,6 +324,7 @@ class BotServiceEnableChannelInputs:
     agent_name: str
     channel: str = "msteams"
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
+    legacy_binding_confirmation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
@@ -339,6 +340,15 @@ class BotServiceEnableChannelPlan:
     config: BotServiceConfig
 
     def render_human(self) -> str:
+        legacy_note = (
+            []
+            if self.config.schemaVersion == SIDECAR_SCHEMA_VERSION
+            else [
+                "  legacy binding:",
+                "    - apply requires "
+                f"--confirm-legacy-binding={self.inputs.agent_name!r}",
+            ]
+        )
         return "\n".join(
             [
                 f"[plan] hermes a365 bot-service enable-channel {self.inputs.agent_name}",
@@ -346,6 +356,7 @@ class BotServiceEnableChannelPlan:
                 f"  resource group: {self.config.resourceGroup}",
                 f"  bot resource:   {self.config.botName}",
                 f"  sidecar:        {self.inputs.sidecar_path}",
+                *legacy_note,
                 "  azure steps:",
                 "    - az bot msteams show",
                 "    - az bot msteams create (skip if already enabled)",
@@ -369,6 +380,7 @@ class BotServiceUpdateEndpointInputs:
     url: str
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
     allow_local: bool = False
+    legacy_binding_confirmation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
@@ -382,6 +394,15 @@ class BotServiceUpdateEndpointPlan:
     config: BotServiceConfig
 
     def render_human(self) -> str:
+        legacy_note = (
+            []
+            if self.config.schemaVersion == SIDECAR_SCHEMA_VERSION
+            else [
+                "  legacy binding:",
+                "    - apply requires "
+                f"--confirm-legacy-binding={self.inputs.agent_name!r}",
+            ]
+        )
         return "\n".join(
             [
                 f"[plan] hermes a365 bot-service update-endpoint {self.inputs.agent_name}",
@@ -390,6 +411,7 @@ class BotServiceUpdateEndpointPlan:
                 f"  current URL:     {self.config.messagingEndpoint}",
                 f"  new URL:         {self.inputs.url}",
                 f"  sidecar:        {self.inputs.sidecar_path}",
+                *legacy_note,
                 "  azure step:",
                 "    - az bot update --endpoint <new-url> (skip if already current)",
                 "  note:",
@@ -807,6 +829,49 @@ def _bot_resource_id(
     )
 
 
+def _verify_sidecar_target(
+    runner: CommandRunner,
+    config: BotServiceConfig,
+    *,
+    agent_name: str,
+    require_live: bool = True,
+) -> dict[str, Any] | None:
+    """Bind every mutation to the persisted tenant and immutable live identities."""
+    if config.agentName is not None and config.agentName != agent_name:
+        raise BotServiceError(
+            f"sidecar belongs to agent {config.agentName!r}, not {agent_name!r}; "
+            f"refusing target {config.resourceGroup}/{config.botName}"
+        )
+    account = _account_show(runner)
+    active_tenant = str(account.get("tenantId") or "").strip().lower()
+    if not active_tenant or active_tenant != config.tenantId.strip().lower():
+        raise BotServiceError(
+            "active Azure tenant does not match the sidecar tenant; refusing mutation"
+        )
+    bot = _bot_show(
+        runner,
+        config.resourceGroup,
+        config.botName,
+        subscription_id=config.subscriptionId,
+    )
+    if bot is None:
+        if require_live:
+            raise BotServiceError(
+                f"bound bot {config.resourceGroup}/{config.botName} was not found"
+            )
+        return None
+    live_id = str(bot.get("id") or "").strip()
+    if not live_id:
+        raise BotServiceError(
+            "live bot response omitted its ARM resource id; refusing mutation"
+        )
+    if live_id.lower() != config.armResourceId.strip().lower():
+        raise BotServiceError("live bot ARM resource id does not match the sidecar binding")
+    if _bot_app_id(bot).lower() != config.msaAppId.strip().lower():
+        raise BotServiceError("live bot msaAppId does not match the sidecar binding")
+    return bot
+
+
 def _enabled_channels(bot: dict[str, Any]) -> list[str]:
     props = _bot_properties(bot)
     raw = props.get("enabledChannels") or bot.get("enabledChannels") or []
@@ -983,6 +1048,54 @@ def _backup_sidecar_path(path: Path, *, now: datetime) -> Path:
     if path.name.endswith(".json"):
         return path.with_name(f"{path.name[:-5]}.backup-{stamp}.json")
     return path.with_name(f"{path.name}.backup-{stamp}")
+
+
+def _bind_legacy_sidecar(
+    config: BotServiceConfig,
+    *,
+    agent_name: str,
+    path: Path,
+    messages: list[str],
+    confirmation: str | None,
+) -> BotServiceConfig:
+    """Upgrade verified v1 state immediately before its first successful rewrite."""
+    if config.schemaVersion == SIDECAR_SCHEMA_VERSION:
+        return config
+    _validate_legacy_binding_confirmation(
+        config, agent_name=agent_name, confirmation=confirmation
+    )
+    backup = _backup_sidecar_path(path, now=datetime.now(UTC))
+    _write_text_atomic(backup, path.read_text(), mode=0o600)
+    messages.append(f"[apply] backed up legacy sidecar to {backup}")
+    messages.append(f"[apply] migrated legacy sidecar binding to agent {agent_name}")
+    return BotServiceConfig(
+        **{
+            **config.__dict__,
+            "schemaVersion": SIDECAR_SCHEMA_VERSION,
+            "agentName": agent_name,
+        }
+    )
+
+
+def _validate_legacy_binding_confirmation(
+    config: BotServiceConfig,
+    *,
+    agent_name: str,
+    confirmation: str | None,
+) -> None:
+    """Require an explicit name acknowledgement before mutating a v1 target."""
+    if config.schemaVersion == SIDECAR_SCHEMA_VERSION:
+        return
+    if confirmation != agent_name:
+        target = (
+            f"{config.subscriptionId}/{config.resourceGroup}/{config.botName} "
+            f"(app {config.msaAppId})"
+        )
+        raise BotServiceError(
+            "schema-v1 sidecar has no agent-name binding; live identity checks "
+            f"resolved target {target}. Re-run with "
+            f"--confirm-legacy-binding={agent_name!r} to bind it to this agent"
+        )
 
 
 def apply_create_plan(
@@ -1169,6 +1282,15 @@ def apply_enable_channel_plan(
     messages: list[str] = []
     channel_created = False
 
+    _verify_sidecar_target(
+        runner, config, agent_name=inputs.agent_name, require_live=True
+    )
+    _validate_legacy_binding_confirmation(
+        config,
+        agent_name=inputs.agent_name,
+        confirmation=inputs.legacy_binding_confirmation,
+    )
+
     teams = _msteams_show(
         runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
     )
@@ -1202,9 +1324,16 @@ def apply_enable_channel_plan(
         patched_teams_terms = True
         messages.append("[apply] accepted Microsoft Teams channel terms")
 
+    bound = _bind_legacy_sidecar(
+        config,
+        agent_name=inputs.agent_name,
+        path=inputs.sidecar_path,
+        messages=messages,
+        confirmation=inputs.legacy_binding_confirmation,
+    )
     updated = BotServiceConfig(
         **{
-            **config.__dict__,
+            **bound.__dict__,
             "channelsEnabled": _with_channel(config.channelsEnabled, inputs.channel),
         }
     )
@@ -1231,11 +1360,15 @@ def apply_update_endpoint_plan(
     inputs = plan.inputs
     messages: list[str] = []
 
-    bot = _bot_show(
-        runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
+    bot = _verify_sidecar_target(
+        runner, config, agent_name=inputs.agent_name, require_live=True
     )
-    if bot is None:
-        raise BotServiceError(f"{config.botName} not found in {config.resourceGroup}")
+    assert bot is not None
+    _validate_legacy_binding_confirmation(
+        config,
+        agent_name=inputs.agent_name,
+        confirmation=inputs.legacy_binding_confirmation,
+    )
 
     current = _bot_endpoint(bot)
     endpoint_updated = False
@@ -1256,9 +1389,16 @@ def apply_update_endpoint_plan(
         messages.append("[apply] Bot Service endpoint already current")
 
     channels = sorted({*_enabled_channels(bot), *config.channelsEnabled})
+    bound = _bind_legacy_sidecar(
+        config,
+        agent_name=inputs.agent_name,
+        path=inputs.sidecar_path,
+        messages=messages,
+        confirmation=inputs.legacy_binding_confirmation,
+    )
     updated = BotServiceConfig(
         **{
-            **config.__dict__,
+            **bound.__dict__,
             "messagingEndpoint": inputs.url,
             "channelsEnabled": sorted({str(c).lower() for c in channels if c}),
         }
@@ -1305,37 +1445,19 @@ def apply_cleanup_plan(
         record_blueprint_preserved()
         return result
 
-    # #102 M6: refuse BEFORE any deletion when the sidecar names a different
-    # agent — the classic footgun is running cleanup for agent X from a
-    # directory holding agent Y's sidecar, which would delete Y's bot (and,
-    # under --purge-resource-group, Y's whole managed group). `--confirm` only
-    # matches --agent-name, so without this binding the sidecar's targets are
-    # never tied to what the operator confirmed. A legacy sidecar with no
-    # agentName proceeds with a warning (pre-M6 files can't be bound
-    # retroactively; the resourceGroup/botName targets are surfaced in the
-    # plan and the pre-apply summary instead).
-    if config.agentName is not None and config.agentName != inputs.agent_name:
-        raise BotServiceError(
-            f"sidecar {inputs.sidecar_path} was provisioned for agent "
-            f"{config.agentName!r}, not {inputs.agent_name!r}; it targets "
-            f"bot {config.botName!r} in resource group {config.resourceGroup!r} "
-            f"(subscription {config.subscriptionId}). Refusing to delete — "
-            "re-run with the matching --agent-name/--confirm, or point "
-            "--sidecar at the right file."
-        )
-    if config.agentName is None:
-        result.messages.append(
-            "[apply] WARNING: sidecar has no agentName binding (pre-M6 file); "
-            f"proceeding against bot {config.botName!r} in resource group "
-            f"{config.resourceGroup!r} on --confirm alone"
-        )
-
+    # Refuse BEFORE any deletion when the sidecar is legacy or belongs to
+    # another agent. The classic footgun is running cleanup for agent X from a
+    # directory holding agent Y's sidecar, which would delete Y's bot and, with
+    # --purge-resource-group, potentially Y's whole managed group.
     # #102 L5: every cleanup az call pins the sidecar's persisted
     # subscriptionId — deletes must target the subscription the resources were
     # provisioned in, never the CLI's ambient default.
     subscription_id = config.subscriptionId
-    bot = _bot_show(
-        runner, config.resourceGroup, config.botName, subscription_id=subscription_id
+    bot = _verify_sidecar_target(
+        runner,
+        config,
+        agent_name=inputs.agent_name,
+        require_live=False,
     )
     if bot is None:
         result.messages.append(
@@ -1362,7 +1484,13 @@ def apply_cleanup_plan(
         result.messages.append(f"[apply] deleted bot resource {config.botName}")
 
     if inputs.purge_resource_group:
-        if config.resourceGroupManaged:
+        if bot is None:
+            result.messages.append(
+                f"[apply] skipped resource group purge for {config.resourceGroup}: "
+                "the bound bot is missing, so the sidecar target cannot be "
+                "verified against a live ARM identity"
+            )
+        elif config.resourceGroupManaged:
             # #102 M5: re-check the group's contents at apply time. We created
             # this group holding exactly one top-level resource (the bot, now
             # deleted above); anything else appeared later and is NOT ours to
@@ -1779,6 +1907,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     )
     enable.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
     enable.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
+    enable.add_argument(
+        "--confirm-legacy-binding",
+        metavar="AGENT_NAME",
+        help="required to bind a verified schema-v1 sidecar; must equal --agent-name",
+    )
 
     endpoint = subs.add_parser(
         "update-endpoint",
@@ -1795,6 +1928,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     )
     endpoint.add_argument("--sidecar", type=Path, default=Path.cwd() / SIDECAR_FILENAME)
     endpoint.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
+    endpoint.add_argument(
+        "--confirm-legacy-binding",
+        metavar="AGENT_NAME",
+        help="required to bind a verified schema-v1 sidecar; must equal --agent-name",
+    )
     endpoint.add_argument(
         "--allow-local",
         action="store_true",
@@ -1886,6 +2024,7 @@ def _run_enable_channel(args: argparse.Namespace) -> int:
             agent_name=args.agent_name,
             channel=args.channel,
             sidecar_path=args.sidecar,
+            legacy_binding_confirmation=args.confirm_legacy_binding,
         )
         plan = build_enable_channel_plan(inputs)
     except (ValueError, BotServiceError) as e:
@@ -1913,6 +2052,7 @@ def _run_update_endpoint(args: argparse.Namespace) -> int:
             url=args.url,
             sidecar_path=args.sidecar,
             allow_local=args.allow_local,
+            legacy_binding_confirmation=args.confirm_legacy_binding,
         )
         plan = build_update_endpoint_plan(inputs)
     except (ValueError, BotServiceError) as e:

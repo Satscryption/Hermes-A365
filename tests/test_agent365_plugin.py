@@ -217,6 +217,7 @@ def _make_adapter(monkeypatch: pytest.MonkeyPatch, **extra_overrides: Any) -> An
     monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
     monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
     monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
+    monkeypatch.setenv("A365_ALLOW_ALL_USERS", "1")
     extra = {"slug": "test-agent", "port": 0}
     extra.update(extra_overrides)
     cfg = _StubPlatformConfig(extra=extra)
@@ -257,6 +258,28 @@ def _make_inbound(
         "recipient": recipient,
         "text": text,
     }
+
+
+def _seed_card_capability(
+    adapter: Any,
+    activity: dict[str, Any],
+    *,
+    kind: str,
+    choice: str,
+    resolver: dict[str, str],
+) -> dict[str, str]:
+    nonce = "test-capability"
+    choice_id = "test-choice"
+    adapter._card_capabilities[nonce] = {
+        "kind": kind,
+        "conversation_id": (activity.get("conversation") or {}).get("id", ""),
+        "user_id": adapter_mod._import_bridge()._canonical_activity_user(activity),
+        "tenant_id": adapter.tenant_id.lower(),
+        "created_at": adapter_mod.time.monotonic(),
+        "resolver": resolver,
+        "choices": {choice_id: choice},
+    }
+    return {"hermes_kind": kind, "capability": nonce, "choice_id": choice_id}
 
 
 # ---------------------------------------------------------------------------
@@ -895,7 +918,7 @@ class TestMessagesRoute:
         r = client.post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "dispatched"
@@ -940,7 +963,7 @@ class TestMessagesRoute:
         r = TestClient(a.build_app()).post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
 
         assert r.status_code == 200
@@ -980,7 +1003,7 @@ class TestMessagesRoute:
         r = TestClient(a.build_app()).post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
 
         assert r.status_code == 200
@@ -1018,7 +1041,7 @@ class TestMessagesRoute:
         r = TestClient(a.build_app()).post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
 
         assert r.status_code == 200
@@ -1057,7 +1080,7 @@ class TestMessagesRoute:
         r = TestClient(a.build_app()).post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
 
         assert r.status_code == 200
@@ -1088,7 +1111,7 @@ class TestMessagesRoute:
             activity_id="x" * 40_000,
         )
         client = TestClient(a.build_app())
-        headers = {"Authorization": "Bearer pretend"}
+        headers = {"Authorization": "Bearer a.b.c"}
 
         first = client.post("/api/messages", json=body, headers=headers)
         second = client.post("/api/messages", json=body, headers=headers)
@@ -1115,7 +1138,7 @@ class TestMessagesRoute:
         a._http_client = MagicMock()
         client = TestClient(a.build_app())
         body = _make_inbound()
-        headers = {"Authorization": "Bearer pretend"}
+        headers = {"Authorization": "Bearer a.b.c"}
         r1 = client.post("/api/messages", json=body, headers=headers)
         r2 = client.post("/api/messages", json=body, headers=headers)
         assert r1.json()["status"] == "dispatched"
@@ -1141,7 +1164,7 @@ class TestMessagesRoute:
         r = client.post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
         assert r.json()["status"] == "acked"
@@ -1153,7 +1176,7 @@ class TestMessagesRoutePathBDispatch:
     dispatches to ``validate_inbound_jwt_bf`` for Path B (classic Bot
     Framework) tokens, or ``validate_inbound_jwt`` for Path A (A365 /
     AAD-v2) tokens. The peek is a routing hint only — both validators
-    still do real signature checks, so a malformed ``Bearer pretend``
+    still do real signature checks, so a malformed ``Bearer a.b.c``
     falls through to the A365 path (preserved pre-#34 behaviour)."""
 
     @staticmethod
@@ -1281,14 +1304,10 @@ class TestMessagesRoutePathBDispatch:
         a365_validator.assert_awaited_once()
         bf_validator.assert_not_awaited()
 
-    def test_unparseable_token_defaults_to_a365(
+    def test_unparseable_token_is_rejected_before_validator_dispatch(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """``Bearer pretend`` (not even a JWT) — peek returns None, so
-        the dispatcher falls through to the A365 path. Pins the
-        pre-#34 behaviour that other ``TestMessagesRoute`` cases
-        already rely on (they pass ``Bearer pretend`` + monkeypatched
-        A365 validator)."""
+        """Malformed compact tokens never reach issuer parsing or validators."""
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -1304,19 +1323,17 @@ class TestMessagesRoutePathBDispatch:
         r = client.post(
             "/api/messages",
             json=_make_inbound(),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer malformed"},
         )
-        assert r.status_code == 200, r.text
-        a365_validator.assert_awaited_once()
+        assert r.status_code == 401
+        assert r.json()["detail"] == "invalid bearer token"
+        a365_validator.assert_not_awaited()
         bf_validator.assert_not_awaited()
 
     def test_bf_validator_failure_returns_403(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """BF-issued token where the validator raises → 403 with the
-        validator's reason in the detail. Pins the actual route
-        behaviour against the Direct Line probe failure mode that
-        was documented in §11.10 finding 11."""
+        """BF validator diagnostics stay server-side on a fixed public 403."""
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -1336,7 +1353,8 @@ class TestMessagesRoutePathBDispatch:
             headers={"Authorization": f"Bearer {token}"},
         )
         assert r.status_code == 403
-        assert "BF signature/aud/iss" in r.json()["detail"]
+        assert r.json()["detail"] == "invalid bearer token"
+        assert "BF signature/aud/iss" not in r.text
         assert a._handled_events == []
 
 
@@ -1601,7 +1619,7 @@ class TestLifecycleCapture:
         caplog.set_level("INFO")
         body = self._lifecycle_body(type="installationUpdate", action="add")
         client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert "inbound activity type=installationUpdate action=add" in caplog.text
         assert "channelId=msteams" in caplog.text
@@ -1613,7 +1631,7 @@ class TestLifecycleCapture:
         client = self._client(a, monkeypatch)
         body = self._lifecycle_body(type="installationUpdate", action="add")
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.status_code == 200, r.text
         assert r.json() == {"status": "acked", "lifecycle": "upsert"}
@@ -1644,7 +1662,7 @@ class TestLifecycleCapture:
             conv_id="conv-vp", type="installationUpdate", action="add"
         )
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.json() == {"status": "acked", "lifecycle": "upsert"}
         ref = a._conversations.get("conv-vp")
@@ -1667,7 +1685,7 @@ class TestLifecycleCapture:
             membersAdded=[{"id": "user-x"}, {"id": "agent-1"}],
         )
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.json() == {"status": "acked", "lifecycle": "upsert"}
         assert a._handled_events == []
@@ -1687,7 +1705,7 @@ class TestLifecycleCapture:
             path="B", conv_id="conv-live", activity_id="user-act-1", text="hi"
         )
         r1 = client.post(
-            "/api/messages", json=msg, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=msg, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r1.json()["status"] == "dispatched"
         assert "conv-live" in a._seen_inbounds_this_lifetime
@@ -1700,7 +1718,7 @@ class TestLifecycleCapture:
             membersAdded=[{"id": "agent-1"}],
         )
         r2 = client.post(
-            "/api/messages", json=lc, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=lc, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r2.json() == {"status": "acked", "lifecycle": "upsert"}
         ref = a._conversations.get("conv-live")
@@ -1721,7 +1739,7 @@ class TestLifecycleCapture:
             conv_id="conv-rm", type="installationUpdate", action="remove"
         )
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.json() == {"status": "acked", "lifecycle": "evict"}
         assert a._handled_events == []
@@ -1746,7 +1764,7 @@ class TestLifecycleCapture:
         )
 
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
 
         assert r.json() == {"status": "acked", "lifecycle": "evict"}
@@ -1822,7 +1840,7 @@ class TestLifecycleCapture:
             conv_id="conv-rm", type="installationUpdate", action="remove"
         )
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.json() == {"status": "acked", "lifecycle": "evict"}
 
@@ -1857,7 +1875,7 @@ class TestLifecycleCapture:
             r = client.post(
                 "/api/messages",
                 json=body,
-                headers={"Authorization": "Bearer pretend"},
+                headers={"Authorization": "Bearer a.b.c"},
             )
             assert r.status_code == 200, r.text
         assert len(a._seen_inbounds_this_lifetime) <= 3
@@ -1880,7 +1898,7 @@ class TestLifecycleCapture:
             path="B", conv_id="fresh-chat", activity_id="act-fresh"
         )
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.status_code == 200, r.text
         # The just-received chat is retained (so send() takes the reply path,
@@ -1904,7 +1922,7 @@ class TestLifecycleCapture:
             r = client.post(
                 "/api/messages",
                 json=body,
-                headers={"Authorization": "Bearer pretend"},
+                headers={"Authorization": "Bearer a.b.c"},
             )
             assert r.status_code == 200, r.text
         assert len(a._conversations) <= 3
@@ -1941,7 +1959,7 @@ class TestLifecycleCapture:
         # A fresh inbound pushes the registry over cap (2) → enforce_cap runs.
         body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.status_code == 200, r.text
         # The in-flight stale entry survived; the idle stale one was evicted.
@@ -1971,7 +1989,7 @@ class TestLifecycleCapture:
         client = self._client(a, monkeypatch)
         body = _make_inbound(path="B", conv_id="current-turn", activity_id="act-c")
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.status_code == 200, r.text
         # Current-turn entry survives (its reply target); pinned entries too.
@@ -1999,7 +2017,7 @@ class TestLifecycleCapture:
             r = client.post(
                 "/api/messages",
                 json=body,
-                headers={"Authorization": "Bearer pretend"},
+                headers={"Authorization": "Bearer a.b.c"},
             )
             assert r.json() == {"status": "acked", "lifecycle": "upsert"}
         assert len(a._conversations) <= 3
@@ -2043,7 +2061,7 @@ class TestServeAppAgentsChannelFilter:
         r = client.post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
         assert r.json()["status"] == "acked"
@@ -2066,7 +2084,7 @@ class TestServeAppAgentsChannelFilter:
         r = client.post(
             "/api/messages",
             json=body,
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
         assert r.json()["status"] == "acked"
@@ -2081,7 +2099,7 @@ class TestServeAppAgentsChannelFilter:
         r = client.post(
             "/api/messages",
             json=_make_inbound(),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
         assert r.json()["status"] == "dispatched"
@@ -2589,7 +2607,7 @@ class TestSendGate:
         client.post(
             "/api/messages",
             json=_make_inbound(conv_id="conv-Z", activity_id="act-Z"),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert "conv-Z" in a._seen_inbounds_this_lifetime
 
@@ -2616,7 +2634,7 @@ class TestSendGate:
         client.post(
             "/api/messages",
             json=_make_inbound(conv_id="conv-Y", activity_id="act-Y"),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert "conv-Y" in a._seen_inbounds_this_lifetime
 
@@ -3771,7 +3789,7 @@ class TestAdapterPersistsRegistry:
         client.post(
             "/api/messages",
             json=_make_inbound(conv_id="conv-D", activity_id="act-Z"),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert conv_path.exists()
         # Reload independently to confirm durability.
@@ -6326,7 +6344,7 @@ class TestInvokeRoute:
         r = client.post(
             "/api/messages",
             json=self._invoke_body(),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200, r.text
         # BF wire: the taskInfo is the top-level HTTP body (NOT a {status,body}
@@ -6344,7 +6362,7 @@ class TestInvokeRoute:
         r = client.post(
             "/api/messages",
             json=self._invoke_body(name="composeExtension/query"),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         # Unknown name -> HTTP 501 (BF "not implemented") with the error body.
         assert r.status_code == 501
@@ -6359,7 +6377,7 @@ class TestInvokeRoute:
         r = client.post(
             "/api/messages",
             json=self._invoke_body(value="not-a-dict"),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
         assert r.json()["task"]["type"] == "continue"
@@ -6372,7 +6390,7 @@ class TestInvokeRoute:
         r = client.post(
             "/api/messages",
             json=_make_inbound(text="hi", conv_id="conv-M"),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
         assert r.json()["status"] == "dispatched"
@@ -6387,7 +6405,7 @@ class TestInvokeRoute:
         # BEFORE the idempotency dedupe; today's names (task/fetch) are local +
         # idempotent, so re-running on a retry is safe.
         a, client = self._client(monkeypatch)
-        headers = {"Authorization": "Bearer pretend"}
+        headers = {"Authorization": "Bearer a.b.c"}
         body = self._invoke_body()  # fixed activity id -> a repeat is a retry
         r1 = client.post("/api/messages", json=body, headers=headers)
         r2 = client.post("/api/messages", json=body, headers=headers)
@@ -6412,7 +6430,7 @@ class TestInvokeRoute:
         r = client.post(
             "/api/messages",
             json=self._invoke_body(),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         # Graceful degradation: a handler crash -> HTTP 500 with the error body,
         # never an unhandled exception.
@@ -6453,13 +6471,50 @@ class TestInvokeRoute:
         r = client.post(
             "/api/messages",
             json=self._invoke_body(),
-            headers={"Authorization": "Bearer pretend"},
+            headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
         ctx = captured["ctx"]
         assert ctx.user_oid == "claim-oid"
         assert ctx.tenant_id == "claim-tid"
         assert ctx.user_upn == "u@x"
+
+    @pytest.mark.parametrize(
+        ("conversation_type", "expected_chat_type"),
+        [("   ", "group"), ("PERSONAL", "dm"), ("CHANNEL", "channel")],
+    )
+    def test_conversation_type_normalization_matches_auth_and_invoke(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        conversation_type: str,
+        expected_chat_type: str,
+    ) -> None:
+        a, client = self._client(monkeypatch)
+        authorized_chat_types: list[str] = []
+        captured: dict[str, Any] = {}
+
+        def authorize(_user_id: str, chat_type: str, _chat_id: str) -> bool:
+            authorized_chat_types.append(chat_type)
+            return chat_type == expected_chat_type
+
+        async def capture(ctx: Any, *, registry: Any = None) -> Any:
+            captured["ctx"] = ctx
+            return adapter_mod.invoke.InvokeResponse(200, {"ok": True})
+
+        a._is_sender_authorized = authorize
+        monkeypatch.setattr(adapter_mod.invoke, "dispatch_invoke", capture)
+        body = self._invoke_body()
+        body["conversation"]["conversationType"] = conversation_type
+
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 200
+        assert authorized_chat_types == [expected_chat_type]
+        assert captured["ctx"].chat_type == expected_chat_type
 
 
 class _StreamCM:
@@ -7136,7 +7191,7 @@ class TestOutboundFiles:
         }
         client = TestClient(a.build_app())
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.status_code == 200, r.text
         # Handled inline — never dispatched to the fire-and-forget agent loop.
@@ -7512,11 +7567,15 @@ class TestInteractiveCards:
         att = reply["attachments"][0]
         assert att["contentType"] == "application/vnd.microsoft.card.adaptive"
         actions = att["content"]["actions"]
-        assert [act["data"]["choice"] for act in actions] == [
-            "once", "session", "always", "deny",
-        ]
+        assert all(
+            set(act["data"]) == {"hermes_kind", "capability", "choice_id"}
+            for act in actions
+        )
+        capability = a._card_capabilities[actions[0]["data"]["capability"]]
+        assert list(capability["choices"].values()) == ["once", "session", "always", "deny"]
+        assert capability["resolver"] == {"session_key": "sess-1"}
         assert all(act["data"]["hermes_kind"] == "exec_approval" for act in actions)
-        assert all(act["data"]["session_key"] == "sess-1" for act in actions)
+        assert all("session_key" not in act["data"] for act in actions)
         # A system approval card is NOT AI-generated content — no #73(a) entity.
         assert "entities" not in reply
 
@@ -7537,8 +7596,13 @@ class TestInteractiveCards:
         actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
             "actions"
         ]
-        assert [act["data"]["choice"] for act in actions] == ["once", "always", "cancel"]
-        assert all(act["data"]["confirm_id"] == "cfm-9" for act in actions)
+        capability = a._card_capabilities[actions[0]["data"]["capability"]]
+        assert list(capability["choices"].values()) == ["once", "always", "cancel"]
+        assert capability["resolver"] == {
+            "session_key": "sess-1",
+            "confirm_id": "cfm-9",
+        }
+        assert all("confirm_id" not in act["data"] for act in actions)
 
     @pytest.mark.asyncio
     async def test_send_clarify_with_choices(
@@ -7558,8 +7622,8 @@ class TestInteractiveCards:
             "actions"
         ]
         assert [act["title"] for act in actions] == ["Alpha", "Beta", "Something else"]
-        assert actions[0]["data"]["choice_text"] == "Alpha"
-        assert actions[-1]["data"]["choice"] == "other"
+        capability = a._card_capabilities[actions[0]["data"]["capability"]]
+        assert list(capability["choices"].values()) == ["Alpha", "Beta", "__other__"]
 
     @pytest.mark.asyncio
     async def test_send_clarify_open_ended_arms_text_intercept(
@@ -7613,12 +7677,48 @@ class TestInteractiveCards:
         a = _make_adapter(monkeypatch)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
-        activity = {"type": "message", "conversation": {"id": "conv-1"}}
-        value = {"hermes_kind": "exec_approval", "session_key": "sess-1", "choice": "always"}
+        activity = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="exec_approval",
+            choice="always",
+            resolver={"session_key": "sess-1"},
+        )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         assert json.loads(resp.body)["kind"] == "exec_approval"
         resolver.assert_called_once_with("sess-1", "always")
+
+    @pytest.mark.asyncio
+    async def test_card_capability_is_user_bound_single_use_and_resists_dos(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        owner = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            owner,
+            kind="exec_approval",
+            choice="once",
+            resolver={"session_key": "sess-1"},
+        )
+        attacker = _make_inbound(conv_id="conv-1")
+        attacker["from"] = {"id": "user-2", "name": "Other User"}
+
+        rejected = await a._handle_card_action(attacker, value)
+        assert rejected.status_code == 403
+        assert "test-capability" in a._card_capabilities
+        resolver.assert_not_called()
+
+        accepted = await a._handle_card_action(owner, value)
+        assert accepted.status_code == 200
+        resolver.assert_called_once_with("sess-1", "once")
+        replayed = await a._handle_card_action(owner, value)
+        assert replayed.status_code == 403
+        resolver.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_handle_card_action_slash_confirm_posts_followup(
@@ -7633,12 +7733,13 @@ class TestInteractiveCards:
             a, "_gw_resolve_slash_confirm", AsyncMock(return_value="Command ran.")
         )
         activity = _make_inbound(conv_id="conv-1")
-        value = {
-            "hermes_kind": "slash_confirm",
-            "session_key": "sess-1",
-            "confirm_id": "cfm-1",
-            "choice": "once",
-        }
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="slash_confirm",
+            choice="once",
+            resolver={"session_key": "sess-1", "confirm_id": "cfm-1"},
+        )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         # The resolver's follow-up text is posted as a reply.
@@ -7651,8 +7752,15 @@ class TestInteractiveCards:
         a = _make_adapter(monkeypatch)
         resolver = MagicMock(return_value=True)
         monkeypatch.setattr(a, "_gw_resolve_clarify", resolver)
-        value = {"hermes_kind": "clarify", "clarify_id": "clr-1", "choice_text": "Beta"}
-        resp = await a._handle_card_action({"type": "message"}, value)
+        activity = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="clarify",
+            choice="Beta",
+            resolver={"clarify_id": "clr-1"},
+        )
+        resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         resolver.assert_called_once_with("clr-1", "Beta")
 
@@ -7663,8 +7771,15 @@ class TestInteractiveCards:
         a = _make_adapter(monkeypatch)
         mark = MagicMock()
         monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
-        value = {"hermes_kind": "clarify", "clarify_id": "clr-1", "choice": "other"}
-        resp = await a._handle_card_action({"type": "message"}, value)
+        activity = _make_inbound(conv_id="conv-1")
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="clarify",
+            choice="__other__",
+            resolver={"clarify_id": "clr-1"},
+        )
+        resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         mark.assert_called_once_with("clr-1")
 
@@ -7683,14 +7798,16 @@ class TestInteractiveCards:
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
 
         body = _make_inbound(conv_id="conv-card", activity_id="ca-1", text="")
-        body["value"] = {
-            "hermes_kind": "exec_approval",
-            "session_key": "sess-1",
-            "choice": "deny",
-        }
+        body["value"] = _seed_card_capability(
+            a,
+            body,
+            kind="exec_approval",
+            choice="deny",
+            resolver={"session_key": "sess-1"},
+        )
         client = TestClient(a.build_app())
         r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer pretend"}
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
         )
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "card_action"
@@ -8465,6 +8582,7 @@ class TestGatewaySecretsProviderWiring:
         assert "likely nothing to bootstrap" in source  # found
         assert "could not be consulted" in source  # unreachable
         assert "has nothing stored for this tenant/app" in source  # empty
+        assert "--output-fd 3 3>/dev/null" in source
 
     def test_wizard_does_not_blame_408_when_the_provider_is_unreachable(
         self,
@@ -8486,3 +8604,145 @@ class TestGatewaySecretsProviderWiring:
 
         # Not found, but NOT evidence of an empty store.
         assert (found, reachable, label) == (False, False, "exploding")
+
+
+class TestSecurityAuthorizationOrder:
+    def test_unauthorized_user_is_rejected_before_media_or_state_side_effects(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        a._allow_all_users = False
+        a._allowed_users = ("user-allowed",)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        extract_media = AsyncMock()
+        monkeypatch.setattr(a, "_extract_inbound_media", extract_media)
+
+        response = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=_make_inbound(conv_id="conv-unauthorized"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 403
+        extract_media.assert_not_awaited()
+        assert a._handled_events == []
+        assert not (tmp_path / "conversations.json").exists()
+
+    @pytest.mark.parametrize(
+        ("activity_type", "channel_id", "sender_id"),
+        [
+            ("installationUpdate", "msteams", "system"),
+            ("conversationUpdate", "msteams", "system"),
+            ("typing", "msteams", "system"),
+            ("message", "agents", "no-reply@teams.mail.microsoft"),
+        ],
+    )
+    def test_platform_control_traffic_bypasses_only_end_user_authorization(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        activity_type: str,
+        channel_id: str,
+        sender_id: str,
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        a._allow_all_users = False
+        a._allowed_users = ("user-allowed",)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        activity = _make_inbound()
+        activity["type"] = activity_type
+        activity["channelId"] = channel_id
+        activity["from"] = {"id": sender_id}
+        if activity_type == "installationUpdate":
+            activity["action"] = "add"
+
+        response = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=activity,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["status"] == "acked"
+        assert a._handled_events == []
+
+    @pytest.mark.parametrize(
+        ("authorized_id", "expected_seen"),
+        [
+            (
+                "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+                [
+                    ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "group", "group-conv"),
+                    ("opaque-channel-id", "group", "group-conv"),
+                ],
+            ),
+            (
+                "opaque-channel-id",
+                [
+                    ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "group", "group-conv"),
+                    ("opaque-channel-id", "group", "group-conv"),
+                ],
+            ),
+        ],
+    )
+    def test_gateway_auth_and_event_share_normalized_identity_and_chat_type(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        authorized_id: str,
+        expected_seen: list[tuple[str, str, str]],
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        seen: list[tuple[str, str, str]] = []
+
+        def authorize(user_id: str, chat_type: str, chat_id: str) -> bool:
+            seen.append((user_id, chat_type, chat_id))
+            return user_id == authorized_id
+
+        a._is_sender_authorized = authorize
+        activity = _make_inbound(conv_id="group-conv")
+        activity["conversation"]["conversationType"] = "groupChat"
+        activity["from"] = {
+            "aadObjectId": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+            "id": "opaque-channel-id",
+            "name": "Sadiq",
+        }
+
+        response = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=activity,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 200
+        assert seen == expected_seen
+        event = a._handled_events[0]
+        assert event.source.user_id == authorized_id
+        assert event.source.chat_type == "group"

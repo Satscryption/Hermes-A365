@@ -37,11 +37,22 @@ CLI use::
 from __future__ import annotations
 
 import argparse
+import re
+import shlex
 import sys
 import uuid
 from dataclasses import dataclass
 
 from ._common import jinja_env
+
+_ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+
+
+def _shell_env_value(value: object) -> str:
+    text = str(value)
+    if any(ch in text for ch in ("\x00", "\r", "\n")):
+        raise ValueError("environment values must not contain NUL/CR/LF")
+    return shlex.quote(text)
 
 
 @dataclass
@@ -69,22 +80,41 @@ class InstanceEnvInputs:
 
 def render_instance_env(inputs: InstanceEnvInputs) -> str:
     """Render the per-agent .env content as a string (with trailing newline)."""
+    preserved: dict[str, str] = {}
+    for key, value in (inputs.preserved_env or {}).items():
+        if not _ENV_KEY_RE.fullmatch(key):
+            raise ValueError(f"invalid preserved environment key: {key!r}")
+        preserved[key] = _shell_env_value(value)
     env = jinja_env()
     template = env.get_template("instance.env.j2")
     return template.render(
-        agent_identity=inputs.agent_identity,
-        owner=inputs.owner,
-        owner_aad_id=inputs.owner_aad_id,
-        a365_app_id=inputs.a365_app_id,
-        a365_tenant_id=inputs.a365_tenant_id,
-        aa_instance_id=inputs.aa_instance_id,
-        hermes_otlp_endpoint=inputs.hermes_otlp_endpoint,
-        business_hours_tz=inputs.business_hours_tz,
-        business_hours_start=inputs.business_hours_start,
-        business_hours_end=inputs.business_hours_end,
-        a365_bf_app_id=inputs.a365_bf_app_id,
-        a365_bf_client_secret=inputs.a365_bf_client_secret,
-        preserved_env=inputs.preserved_env or {},
+        agent_identity=_shell_env_value(inputs.agent_identity),
+        owner=_shell_env_value(inputs.owner),
+        owner_aad_id=_shell_env_value(inputs.owner_aad_id),
+        a365_app_id=_shell_env_value(inputs.a365_app_id),
+        a365_tenant_id=_shell_env_value(inputs.a365_tenant_id),
+        aa_instance_id=_shell_env_value(inputs.aa_instance_id),
+        hermes_otlp_endpoint=_shell_env_value(inputs.hermes_otlp_endpoint),
+        business_hours_tz=(
+            _shell_env_value(inputs.business_hours_tz) if inputs.business_hours_tz else None
+        ),
+        business_hours_start=(
+            _shell_env_value(inputs.business_hours_start)
+            if inputs.business_hours_start
+            else None
+        ),
+        business_hours_end=(
+            _shell_env_value(inputs.business_hours_end) if inputs.business_hours_end else None
+        ),
+        a365_bf_app_id=(
+            _shell_env_value(inputs.a365_bf_app_id) if inputs.a365_bf_app_id else None
+        ),
+        a365_bf_client_secret=(
+            _shell_env_value(inputs.a365_bf_client_secret)
+            if inputs.a365_bf_client_secret
+            else None
+        ),
+        preserved_env=preserved,
     )
 
 
@@ -103,7 +133,6 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--business-hours-start")
     parser.add_argument("--business-hours-end")
     parser.add_argument("--a365-bf-app-id")
-    parser.add_argument("--a365-bf-client-secret")
     args = parser.parse_args(argv)
 
     inputs = InstanceEnvInputs(
@@ -118,7 +147,6 @@ def main(argv: list[str] | None = None) -> int:
         business_hours_start=args.business_hours_start,
         business_hours_end=args.business_hours_end,
         a365_bf_app_id=args.a365_bf_app_id,
-        a365_bf_client_secret=args.a365_bf_client_secret,
     )
     sys.stdout.write(render_instance_env(inputs))
     return 0

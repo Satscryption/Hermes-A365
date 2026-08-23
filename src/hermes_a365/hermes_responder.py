@@ -44,7 +44,8 @@ import json
 import os
 import secrets
 import sys
-from collections import deque
+import time
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -71,6 +72,9 @@ from .emit_card import GreetingInputs, emit_greeting
 DEFAULT_PORT = 9090
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_HISTORY_MAX = 50
+DEFAULT_CONVERSATION_MAX = 1000
+DEFAULT_HISTORY_TOTAL_MAX = 10_000
+DEFAULT_HISTORY_TTL_SECONDS = 24 * 3600.0
 
 ResponderMode = Literal["echo", "greeting", "canned"]
 _MODES: tuple[ResponderMode, ...] = ("echo", "greeting", "canned")
@@ -128,16 +132,34 @@ class ConversationStore:
     """
 
     history_max: int = DEFAULT_HISTORY_MAX
-    by_conv: dict[str, deque[dict[str, Any]]] = field(default_factory=dict)
+    conversation_max: int = DEFAULT_CONVERSATION_MAX
+    total_max: int = DEFAULT_HISTORY_TOTAL_MAX
+    ttl_seconds: float = DEFAULT_HISTORY_TTL_SECONDS
+    by_conv: OrderedDict[str, deque[dict[str, Any]]] = field(default_factory=OrderedDict)
+    last_seen: dict[str, float] = field(default_factory=dict)
 
     def append(self, conv_id: str, entry: dict[str, Any]) -> None:
         if not conv_id:
             return
+        now = time.monotonic()
+        for key in list(self.by_conv):
+            if now - self.last_seen.get(key, 0.0) <= self.ttl_seconds:
+                continue
+            self.by_conv.pop(key, None)
+            self.last_seen.pop(key, None)
         buf = self.by_conv.get(conv_id)
         if buf is None:
             buf = deque(maxlen=self.history_max)
             self.by_conv[conv_id] = buf
+        else:
+            self.by_conv.move_to_end(conv_id)
         buf.append(entry)
+        self.last_seen[conv_id] = now
+        while len(self.by_conv) > self.conversation_max or sum(
+            len(values) for values in self.by_conv.values()
+        ) > self.total_max:
+            evicted, _ = self.by_conv.popitem(last=False)
+            self.last_seen.pop(evicted, None)
 
     def for_conv(self, conv_id: str) -> list[dict[str, Any]]:
         return list(self.by_conv.get(conv_id, []))

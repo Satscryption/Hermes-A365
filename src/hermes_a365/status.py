@@ -194,6 +194,18 @@ _SECRET_KEY_MARKERS: tuple[str, ...] = (
     "CREDENTIAL",
 )
 _SECRET_REDACTION = "***redacted***"
+_PRESENCE_ONLY = "***present***"
+_SAFE_STATUS_ENV_VALUES = frozenset(
+    {
+        "A365_TENANT_ID",
+        "A365_APP_ID",
+        "AA_INSTANCE_ID",
+        "AGENT_IDENTITY",
+        "BUSINESS_HOURS_TZ",
+        "BUSINESS_HOURS_START",
+        "BUSINESS_HOURS_END",
+    }
+)
 
 
 def _redact_secret_env(env: dict[str, str]) -> dict[str, str]:
@@ -214,7 +226,12 @@ def _redact_secret_env(env: dict[str, str]) -> dict[str, str]:
             or norm.endswith("KEY")
             or norm.endswith("PAT")
         )
-        out[k] = _SECRET_REDACTION if is_secret else v
+        if is_secret:
+            out[k] = _SECRET_REDACTION
+        elif k in _SAFE_STATUS_ENV_VALUES:
+            out[k] = v
+        else:
+            out[k] = _PRESENCE_ONLY if v else ""
     return out
 
 

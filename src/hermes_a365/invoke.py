@@ -91,12 +91,17 @@ def classify_chat_type(activity: dict[str, Any], path_tag: str) -> str:
     """
     conv = activity.get("conversation")
     conv = conv if isinstance(conv, dict) else {}
-    conv_type = str(conv.get("conversationType") or "personal")
+    raw_conv_type = conv.get("conversationType")
+    conv_type = (
+        "personal" if raw_conv_type is None else str(raw_conv_type).strip().lower()
+    )
     if conv_type == "channel":
         return "channel"
-    if conv_type == "groupChat":
+    if conv_type == "groupchat":
         return "copilot_chat" if path_tag == "B" else "group"
-    return "dm"
+    if conv_type in {"personal", "dm"}:
+        return "dm"
+    return "group"
 
 
 def build_invoke_context(

@@ -86,6 +86,7 @@ CLI use::
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import logging
@@ -101,8 +102,12 @@ from typing import Any, Literal
 from urllib.parse import urlparse
 
 from ._common import (
+    TenantResolutionError,
+    active_az_tenant,
     parse_env,
+    resolve_expected_tenant,
     tcp_reachable,
+    tenant_ids_match,
     validate_slug,
 )
 from ._common import (
@@ -880,6 +885,11 @@ logger = logging.getLogger(__name__)
 
 # JWKS cache TTL per Microsoft's published guidance (refresh at least daily).
 JWKS_CACHE_TTL_SECONDS = 24 * 3600
+MAX_ACTIVITY_BODY_BYTES = 1024 * 1024
+MAX_JWT_BYTES = 16 * 1024
+MAX_ACTIVITY_JSON_DEPTH = 24
+MAX_ACTIVITY_JSON_NODES = 10_000
+JWKS_FAILURE_BACKOFF_MAX_SECONDS = 60.0
 
 # Slice 19i: how long the bridge remembers a delivered (conversationId,
 # activityId) pair to short-circuit BF / A365 retries. 1h matches the
@@ -933,6 +943,187 @@ WEBHOOK_ENVELOPE_VERSION = "1"
 # Default 10s budget on the operator webhook so a stuck responder
 # doesn't tie up BF (which itself times out around 15s).
 DEFAULT_WEBHOOK_TIMEOUT_SECONDS = 10.0
+
+
+def _validate_webhook_url(url: str, *, development_mode: bool) -> None:
+    """Require TLS, except explicit development mode on canonical loopback."""
+    try:
+        parsed = urlparse(url)
+        host = (parsed.hostname or "").lower().rstrip(".")
+        if parsed.username or parsed.password or not host:
+            raise ValueError
+    except ValueError as exc:
+        raise BridgeConfigError("operator webhook URL is malformed") from exc
+    if parsed.scheme == "https":
+        return
+    loopback = host in {"localhost", "127.0.0.1", "::1"}
+    if parsed.scheme == "http" and development_mode and loopback:
+        return
+    raise BridgeConfigError(
+        "operator webhook must use https; http is allowed only for canonical "
+        "loopback hosts together with --skip-jwt-validation development mode"
+    )
+
+
+def _activity_user_candidates(activity: dict[str, Any]) -> tuple[str, ...]:
+    """Return stable sender identifiers in authorization preference order."""
+    sender = activity.get("from")
+    if not isinstance(sender, dict):
+        return ()
+    candidates: list[str] = []
+    for key in ("aadObjectId", "id", "userPrincipalName", "email"):
+        value = sender.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip().lower()
+            if normalized not in candidates:
+                candidates.append(normalized)
+    return tuple(candidates)
+
+
+def _canonical_activity_user(activity: dict[str, Any]) -> str:
+    candidates = _activity_user_candidates(activity)
+    return candidates[0] if candidates else ""
+
+
+def _activity_chat_type(activity: dict[str, Any]) -> str:
+    """Map Bot Framework conversation types to Hermes' auth vocabulary."""
+    conversation = activity.get("conversation")
+    if not isinstance(conversation, dict):
+        return "dm"
+    value = conversation.get("conversationType")
+    if value is None:
+        return "dm"
+    raw = str(value).strip().lower()
+    return {
+        "personal": "dm",
+        "dm": "dm",
+        "groupchat": "group",
+        "group": "group",
+        "channel": "channel",
+        # Unknown explicit values are treated as multi-user rather than
+        # accidentally inheriting the less restrictive DM policy.
+    }.get(raw, "group")
+
+
+def _activity_requires_end_user_auth(activity: dict[str, Any]) -> bool:
+    """Return whether processing the activity represents an end-user action."""
+    activity_type = str(activity.get("type") or "message")
+    if activity_type in {
+        "conversationUpdate",
+        "typing",
+        "endOfConversation",
+        "installationUpdate",
+    }:
+        return False
+    if str(activity.get("channelId") or "") != "agents":
+        return True
+    sender = activity.get("from")
+    sender_id = str(sender.get("id") or "") if isinstance(sender, dict) else ""
+    return not (
+        activity_type == "event"
+        or sender_id == "system"
+        or sender_id.startswith("no-reply@")
+    )
+
+
+def _activity_user_authorized(
+    activity: dict[str, Any], *, allowed_users: tuple[str, ...], allow_all: bool
+) -> bool:
+    if allow_all:
+        return True
+    allowed = {value.strip().lower() for value in allowed_users if value.strip()}
+    return any(candidate in allowed for candidate in _activity_user_candidates(activity))
+
+
+def _safe_log_field(value: Any, *, limit: int = 160) -> str:
+    """Bound and escape body-derived fields before they reach text logs."""
+    text = str(value or "")[:limit]
+    return "".join(
+        ch if ch.isprintable() and ch not in "\r\n\x1b" else f"\\x{ord(ch):02x}"
+        for ch in text
+    )
+
+
+def _safe_url_host(value: Any) -> str:
+    try:
+        return _safe_log_field(urlparse(str(value or "")).hostname or "invalid")
+    except ValueError:
+        return "invalid"
+
+
+def _validate_activity_structure(value: Any) -> None:
+    """Bound JSON depth/node count after the byte-bounded decode."""
+    remaining = MAX_ACTIVITY_JSON_NODES
+    stack: list[tuple[Any, int]] = [(value, 1)]
+    while stack:
+        current, depth = stack.pop()
+        remaining -= 1
+        if remaining < 0 or depth > MAX_ACTIVITY_JSON_DEPTH:
+            raise ValueError("activity JSON exceeds structural limits")
+        if isinstance(current, dict):
+            stack.extend((item, depth + 1) for item in current.values())
+        elif isinstance(current, list):
+            stack.extend((item, depth + 1) for item in current)
+
+
+class BoundedRequestBodyMiddleware:
+    """Read an Activity body once, reject oversized streams, then replay it."""
+
+    def __init__(self, app: Any, *, max_bytes: int = MAX_ACTIVITY_BODY_BYTES) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        headers = {k.lower(): v for k, v in scope.get("headers", [])}
+        raw_length = headers.get(b"content-length")
+        if raw_length is not None:
+            try:
+                declared = int(raw_length)
+            except (TypeError, ValueError):
+                await self._reject(send, 400, b'{"detail":"invalid Content-Length"}')
+                return
+            if declared < 0 or declared > self.max_bytes:
+                await self._reject(send, 413, b'{"detail":"request body too large"}')
+                return
+        body = bytearray()
+        more = True
+        while more:
+            message = await receive()
+            if message.get("type") == "http.disconnect":
+                return
+            chunk = message.get("body", b"")
+            body.extend(chunk)
+            if len(body) > self.max_bytes:
+                await self._reject(send, 413, b'{"detail":"request body too large"}')
+                return
+            more = bool(message.get("more_body", False))
+        delivered = False
+
+        async def replay() -> dict[str, Any]:
+            nonlocal delivered
+            if delivered:
+                return {"type": "http.request", "body": b"", "more_body": False}
+            delivered = True
+            return {"type": "http.request", "body": bytes(body), "more_body": False}
+
+        await self.app(scope, replay, send)
+
+    @staticmethod
+    async def _reject(send: Any, status: int, body: bytes) -> None:
+        await send(
+            {
+                "type": "http.response.start",
+                "status": status,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                    (b"content-length", str(len(body)).encode("ascii")),
+                ],
+            }
+        )
+        await send({"type": "http.response.body", "body": body})
 
 
 # ---------------------------------------------------------------------------
@@ -993,6 +1184,11 @@ class BridgeConfig:
     # the `client_id` / `client_secret` for outbound BF S2S mint.
     bf_app_id: str = ""
     bf_client_secret: str = ""
+    # Standalone serve has no GatewayRunner authorization layer. It therefore
+    # owns a fail-closed end-user policy, using the same environment names as
+    # the plugin registration.
+    allowed_users: tuple[str, ...] = ()
+    allow_all_users: bool = False
 
 
 def load_bridge_config(
@@ -1066,6 +1262,7 @@ def load_bridge_config(
             "Point this at the operator's responder URL "
             "(see references/webhook-contract.md)."
         )
+    _validate_webhook_url(resolved_webhook, development_mode=skip_jwt_validation)
 
     agent_dir = hermes_home / "agents" / slug
     # #36: optional Path B identity. Empty defaults match Path A-only
@@ -1092,6 +1289,13 @@ def load_bridge_config(
         skip_jwt_validation=skip_jwt_validation,
         bf_app_id=bf_app_id,
         bf_client_secret=bf_client_secret,
+        allowed_users=tuple(
+            value.strip().lower()
+            for value in agent_env.get("A365_ALLOWED_USERS", "").split(",")
+            if value.strip()
+        ),
+        allow_all_users=agent_env.get("A365_ALLOW_ALL_USERS", "").strip().lower()
+        in {"1", "true", "yes", "on"},
     )
 
 
@@ -1107,6 +1311,74 @@ class _JwksCache:
     keys_by_kid: dict[str, Any] = field(default_factory=dict)
     fetched_at: float = 0.0
     ttl_seconds: float = JWKS_CACHE_TTL_SECONDS
+    refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
+    failure_count: int = 0
+    retry_after: float = 0.0
+
+
+def _validate_jwt_shape(token: str) -> None:
+    """Reject malformed/oversized JWTs before any discovery request."""
+    if not isinstance(token, str) or not token or len(token.encode("utf-8")) > MAX_JWT_BYTES:
+        raise JwtValidationError("JWT is missing or exceeds the size limit")
+    parts = token.split(".")
+    if len(parts) != 3 or any(not part or len(part) > MAX_JWT_BYTES for part in parts):
+        raise JwtValidationError("JWT has an invalid compact-serialization shape")
+
+
+def _extract_bearer_token(authorization: str | None) -> str:
+    """Extract and bound one compact JWT without parsing attacker-controlled data."""
+    if not isinstance(authorization, str) or not authorization:
+        raise JwtValidationError("missing bearer token")
+    if len(authorization.encode("utf-8")) > MAX_JWT_BYTES + len("Bearer "):
+        raise JwtValidationError("authorization header exceeds the size limit")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise JwtValidationError("authorization header is not a single bearer token")
+    token = parts[1]
+    _validate_jwt_shape(token)
+    return token
+
+
+async def _refresh_jwks(
+    cache: _JwksCache,
+    fetch: Any,
+    *,
+    now: float,
+) -> dict[str, Any]:
+    """Single-flight JWKS refresh with failure backoff and last-known-good use."""
+    if cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
+        return cache.keys_by_kid
+    if now < cache.retry_after:
+        if cache.keys_by_kid:
+            return cache.keys_by_kid
+        raise JwtValidationError("JWKS refresh temporarily unavailable")
+    async with cache.refresh_lock:
+        if cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
+            return cache.keys_by_kid
+        if now < cache.retry_after:
+            if cache.keys_by_kid:
+                return cache.keys_by_kid
+            raise JwtValidationError("JWKS refresh temporarily unavailable")
+        try:
+            keys = await fetch()
+            if not keys:
+                raise JwtValidationError("JWKS document contained no usable keys")
+        except Exception as exc:
+            cache.failure_count += 1
+            cache.retry_after = now + min(
+                JWKS_FAILURE_BACKOFF_MAX_SECONDS, float(2 ** min(cache.failure_count, 6))
+            )
+            if cache.keys_by_kid:
+                logger.warning("JWKS refresh failed; using last-known-good keys")
+                return cache.keys_by_kid
+            if isinstance(exc, JwtValidationError):
+                raise
+            raise JwtValidationError("JWKS refresh failed") from exc
+        cache.keys_by_kid = keys
+        cache.fetched_at = now
+        cache.failure_count = 0
+        cache.retry_after = 0.0
+        return keys
 
 
 # Slice 19i: in-memory dedupe of inbound BF / A365 activity deliveries.
@@ -1211,7 +1483,9 @@ class _IdempotencyCache:
         return False
 
 
-def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
+def _activity_delivery_id(
+    activity: dict[str, Any], *, validated_path: str = "", tenant_id: str = ""
+) -> str | None:
     """Compose the dedupe key from an inbound activity.
 
     Returns ``None`` when either id is missing or is not a string — some
@@ -1236,7 +1510,14 @@ def _activity_delivery_id(activity: dict[str, Any]) -> str | None:
         return None
     if not isinstance(activity_id, str) or not activity_id:
         return None
-    return f"{len(conv)}:{conv}:{activity_id}"
+    sender = _canonical_activity_user(activity)
+    recipient = activity.get("recipient")
+    recipient_id = ""
+    if isinstance(recipient, dict) and isinstance(recipient.get("id"), str):
+        recipient_id = recipient["id"]
+    activity_type = str(activity.get("type") or "")
+    parts = (tenant_id, validated_path, sender, recipient_id, conv, activity_id, activity_type)
+    return "|".join(f"{len(part)}:{part}" for part in parts)
 
 
 def _is_trusted_service_url(url: str, suffixes: tuple[str, ...]) -> bool:
@@ -1321,11 +1602,11 @@ async def _ensure_jwks_loaded(
     import time as _time
 
     cur = now if now is not None else _time.time()
-    if cache.keys_by_kid and (cur - cache.fetched_at) < cache.ttl_seconds:
-        return cache.keys_by_kid
-    cache.keys_by_kid = await _fetch_aad_v2_keys(client, tenant_id=tenant_id)
-    cache.fetched_at = cur
-    return cache.keys_by_kid
+    return await _refresh_jwks(
+        cache,
+        lambda: _fetch_aad_v2_keys(client, tenant_id=tenant_id),
+        now=cur,
+    )
 
 
 class JwtValidationError(RuntimeError):
@@ -1364,6 +1645,7 @@ async def validate_inbound_jwt(
     """
     if _jwt is None:
         raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
+    _validate_jwt_shape(token)
     keys = await _ensure_jwks_loaded(client, cache, tenant_id=tenant_id, now=now)
     try:
         unverified_header = _jwt.get_unverified_header(token)
@@ -1471,11 +1753,7 @@ async def _ensure_bf_jwks_loaded(
     import time as _time
 
     cur = now if now is not None else _time.time()
-    if cache.keys_by_kid and (cur - cache.fetched_at) < cache.ttl_seconds:
-        return cache.keys_by_kid
-    cache.keys_by_kid = await _fetch_bf_jwks_keys(client)
-    cache.fetched_at = cur
-    return cache.keys_by_kid
+    return await _refresh_jwks(cache, lambda: _fetch_bf_jwks_keys(client), now=cur)
 
 
 def peek_unverified_iss(token: str) -> str | None:
@@ -1530,6 +1808,7 @@ async def validate_inbound_jwt_bf(
     """
     if _jwt is None:
         raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
+    _validate_jwt_shape(token)
     keys = await _ensure_bf_jwks_loaded(client, cache, now=now)
     try:
         unverified_header = _jwt.get_unverified_header(token)
@@ -2475,8 +2754,12 @@ async def send_reply(
 
 
 def _reply_failed_response(error: Exception) -> Any:
+    if isinstance(error, ReplyPostError):
+        logger.warning("reply POST failed: HTTP %s", error.status_code)
+    else:
+        logger.warning("reply POST failed: %s", type(error).__name__)
     return _JSONResponse(
-        {"status": "reply_failed", "error": str(error)},
+        {"status": "reply_failed"},
         status_code=502,
     )
 
@@ -2525,7 +2808,9 @@ def make_app(
             max_entries=cfg.idempotency_max_entries,
         )
 
+    _validate_webhook_url(cfg.webhook_url, development_mode=cfg.skip_jwt_validation)
     app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}")
+    app.add_middleware(BoundedRequestBodyMiddleware, max_bytes=MAX_ACTIVITY_BODY_BYTES)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
@@ -2540,6 +2825,11 @@ def make_app(
         activity: dict[str, Any] = _Body(...),  # noqa: B008 — FastAPI idiom
         authorization: str | None = _Header(default=None),
     ) -> Any:
+        try:
+            _validate_activity_structure(activity)
+        except ValueError as exc:
+            raise _HTTPException(status_code=400, detail=str(exc)) from exc
+
         # Slice 19j: refuse to act on an activity whose `serviceUrl`
         # isn't on the trusted-host suffix allowlist. Without this a
         # forged activity could redirect our outbound user-FIC bearer
@@ -2557,7 +2847,7 @@ def make_app(
         if not _is_trusted_service_url(service_url, cfg.trusted_service_url_suffixes):
             raise _HTTPException(
                 status_code=403,
-                detail=f"untrusted serviceUrl: {service_url!r}",
+                detail="untrusted serviceUrl",
             )
 
         # JWT validation — the inbound `Authorization: Bearer <token>` header.
@@ -2569,9 +2859,11 @@ def make_app(
         # is skipped (dev only) → falls back to the body-derived tag.
         validated_path: str | None = None
         if not cfg.skip_jwt_validation:
-            if not authorization or not authorization.lower().startswith("bearer "):
-                raise _HTTPException(status_code=401, detail="missing bearer token")
-            token = authorization.split(None, 1)[1]
+            try:
+                token = _extract_bearer_token(authorization)
+            except JwtValidationError as exc:
+                detail = "missing bearer token" if not authorization else "invalid bearer token"
+                raise _HTTPException(status_code=401, detail=detail) from exc
             # Slice 19w-a (#18, review finding 3): dual inbound-JWT dispatch,
             # matching the plugin adapter. Previously serve validated ONLY the
             # AAD-v2 shape and would reject legitimate Path B BF Connector
@@ -2602,13 +2894,34 @@ def make_app(
                         cache=jwks_cache,
                     )
             except JwtValidationError as e:
-                raise _HTTPException(status_code=403, detail=str(e)) from e
+                logger.warning(
+                    "inbound 403 path=%s reason=%s",
+                    validated_path,
+                    _safe_log_field(e),
+                )
+                raise _HTTPException(status_code=403, detail="invalid bearer token") from e
+
+        # Standalone serve has no GatewayRunner layer. Authorize the represented
+        # end user before dedupe, persistence, forwarding, or any reply-token
+        # side effect. JWT-authenticated platform lifecycle/control activities do
+        # not carry an end-user principal and are acknowledged separately.
+        if _activity_requires_end_user_auth(activity):
+            if not _activity_user_authorized(
+                activity,
+                allowed_users=cfg.allowed_users,
+                allow_all=cfg.allow_all_users,
+            ):
+                raise _HTTPException(status_code=403, detail="end user is not authorized")
+        else:
+            return _JSONResponse({"status": "acked"})
 
         # Slice 19i: dedupe by (conversationId, activityId) so connector
         # retries don't double-fire the operator webhook. Channel-control
         # activities that lack `id` skip dedupe — better to always-deliver
         # them than to drop legitimate traffic on a missing id.
-        delivery_id = _activity_delivery_id(activity)
+        delivery_id = _activity_delivery_id(
+            activity, validated_path=validated_path or "dev", tenant_id=cfg.tenant_id
+        )
         if delivery_id is not None and idempotency_cache.is_duplicate(delivery_id):
             # A deduped *invoke* must not return the {status:duplicate} marker as
             # its body (#96): Teams reads an invoke's HTTP body as the
@@ -2682,11 +2995,15 @@ def make_app(
             # (Pre-dates this branch; surfaced by the #105 review because the
             # invoke exemption above makes this path load-bearing.)
             if activity_type == "invoke":
-                logger.warning("invoke webhook error: %s", e)
+                logger.warning("invoke webhook error: %s", type(e).__name__)
                 return _JSONResponse(None, status_code=200)
+            logger.warning("operator webhook error: %s", type(e).__name__)
             error_reply = render_reply_activity(
                 activity,
-                {"text": "", "card": render_error_card(f"Webhook error: {e}")},
+                {
+                    "text": "",
+                    "card": render_error_card("The agent backend could not be reached."),
+                },
             )
             try:
                 await send_reply(
@@ -2844,6 +3161,36 @@ def cmd_update_endpoint(args: argparse.Namespace) -> int:
         print("ERROR: a365 CLI not on PATH", file=sys.stderr)
         return 2
     try:
+        expected_tenant, _source = resolve_expected_tenant(
+            _resolve_hermes_home(), args.tenant_id
+        )
+    except TenantResolutionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if expected_tenant is None:
+        print(
+            "ERROR: no canonical tenant pin was resolved; pass --tenant-id or "
+            "set A365_TENANT_ID before updating the endpoint",
+            file=sys.stderr,
+        )
+        return 2
+    if not args.tenant_id:
+        argv.extend(["--tenant-id", expected_tenant])
+    active_tenant = active_az_tenant(lambda command: mutator.run(command))
+    try:
+        tenant_ok = bool(active_tenant) and tenant_ids_match(
+            str(active_tenant), expected_tenant, source="update-endpoint tenant pin"
+        )
+    except TenantResolutionError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if not tenant_ok:
+        print(
+            "ERROR: active Azure tenant does not match the update-endpoint tenant pin",
+            file=sys.stderr,
+        )
+        return 2
+    try:
         mutator.run(argv)
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
@@ -2865,6 +3212,8 @@ def cmd_update_endpoint(args: argparse.Namespace) -> int:
                         "--agent-name",
                         args.agent_name,
                         "--endpoint-only",
+                        "--tenant-id",
+                        expected_tenant,
                     ],
                     stdin_input="y\n",
                 )

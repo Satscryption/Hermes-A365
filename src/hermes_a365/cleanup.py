@@ -27,16 +27,18 @@ skip the CLI's own confirmation prompt — our gate is ``--confirm``.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import re
 import shlex
+import stat
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
 
-from . import bot_service
+from . import a365_config, bot_service
 from ._common import (
     TenantResolutionError,
     active_az_tenant,
@@ -490,10 +492,9 @@ def apply_cleanup_plan(
     except TenantResolutionError as e:
         raise CleanupError(str(e)) from e
     if expected_tenant is None:
-        result.messages.append(
-            "[apply] WARNING: no tenant pin (--tenant-id absent and no "
-            f"A365_TENANT_ID in {hermes_home / '.env'}) — proceeding against "
-            "the ambient az/a365 session tenant"
+        raise CleanupError(
+            "no canonical tenant pin was resolved; pass --tenant-id or set "
+            f"A365_TENANT_ID in {hermes_home / '.env'} before cleanup"
         )
     else:
         active = active_az_tenant(lambda argv: mutator.run(argv))
@@ -522,7 +523,56 @@ def apply_cleanup_plan(
             f"[apply] tenant pin OK: active az tenant matches {tenant_source}"
         )
 
+    cwd = Path.cwd()
+    cwd_config = cwd / "a365.config.json"
+    config_binding: tuple[int, int, str] | None = None
+    if cwd_config.exists():
+        try:
+            st = cwd_config.lstat()
+            if not stat.S_ISREG(st.st_mode) or cwd_config.is_symlink():
+                raise CleanupError("cwd a365.config.json is not a regular non-symlink file")
+            raw = cwd_config.read_bytes()
+            parsed = a365_config.A365Config.from_json_text(raw.decode("utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+            raise CleanupError(f"could not bind cwd a365.config.json: {exc}") from exc
+        if parsed.tenantId and parsed.tenantId.lower() != expected_tenant.lower():
+            raise CleanupError("cwd a365.config.json tenant does not match the cleanup pin")
+        expected_identity = f"{plan.inputs.agent_name} Identity"
+        expected_blueprint = f"{plan.inputs.agent_name} Blueprint"
+        if parsed.agentIdentityDisplayName not in ("", expected_identity) or (
+            parsed.agentBlueprintDisplayName not in ("", expected_blueprint)
+        ):
+            raise CleanupError("cwd a365.config.json names do not match the confirmed agent")
+        config_binding = (st.st_dev, st.st_ino, hashlib.sha256(raw).hexdigest())
+
+    def verify_cwd_config_binding() -> None:
+        if config_binding is None:
+            return
+        try:
+            st = cwd_config.lstat()
+            digest = hashlib.sha256(cwd_config.read_bytes()).hexdigest()
+        except OSError as exc:
+            raise CleanupError(f"cwd a365.config.json changed before mutation: {exc}") from exc
+        if (st.st_dev, st.st_ino, digest) != config_binding:
+            raise CleanupError("cwd a365.config.json changed after plan confirmation")
+
+    def harden_cleanup_backups() -> None:
+        for backup in sorted(cwd.glob("a365.*config.backup-*.json")):
+            try:
+                st = backup.lstat()
+                if not stat.S_ISREG(st.st_mode) or backup.is_symlink():
+                    raise OSError("not a regular non-symlink file")
+                os.chmod(backup, 0o600)
+                if stat.S_IMODE(backup.lstat().st_mode) != 0o600:
+                    raise OSError("mode verification failed")
+            except OSError as exc:
+                raise CleanupError(
+                    f"could not secure secret-bearing cleanup backup {backup}: {exc}"
+                ) from exc
+            result.messages.append(f"[apply] chmod 600 {backup}")
+
     for step in plan.steps:
+        verify_cwd_config_binding()
         if step.kind == "bot-service":
             bs_plan = plan.bot_service_plan
             if bs_plan is None:
@@ -550,6 +600,7 @@ def apply_cleanup_plan(
         # prompt that `-y` on the parent verb doesn't actually suppress
         # for subcommands. Slice 18w (corrects the gap left by 18l).
         run = mutator.run(step.argv, stdin_input="y\n")
+        harden_cleanup_backups()
         result.completed.append(step.kind)
         result.messages.append(f"[apply] {step.kind}: {step.description} — done")
         for oid in _parse_orphan_user_ids(run.stdout):
@@ -595,14 +646,7 @@ def apply_cleanup_plan(
     # world-readable). Tighten to 0600 so a stray operator-machine
     # incident doesn't leak the secret. Operators can still delete them
     # manually; we don't auto-delete because they have audit value.
-    cwd = Path.cwd()
-    for backup in sorted(cwd.glob("a365.*config.backup-*.json")):
-        try:
-            os.chmod(backup, 0o600)
-            result.messages.append(f"[apply] chmod 600 {backup}")
-        except OSError:
-            # Don't fail cleanup over a chmod that didn't take.
-            continue
+    harden_cleanup_backups()
 
     # Slice 19g: optionally purge orphan agentic users via az ad user
     # delete. The CLI's own delete path (`/beta/agentUsers/<id>`) 404s

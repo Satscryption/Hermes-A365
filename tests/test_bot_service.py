@@ -293,11 +293,14 @@ def _write_sidecar(
 ) -> Path:
     path = tmp_path / "a365.bot-service.config.json"
     cfg = BotServiceConfig(
-        schemaVersion=1,
+        schemaVersion=SIDECAR_SCHEMA_VERSION,
         subscriptionId=SUBSCRIPTION_ID,
         resourceGroup="hermes-a365-bots",
         botName="hermes-inbox-helper-bot",
-        armResourceId="/subscriptions/sub/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot",
+        armResourceId=(
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/hermes-a365-bots/"
+            "providers/Microsoft.BotService/botServices/hermes-inbox-helper-bot"
+        ),
         msaAppId=BF_APP_ID,
         tenantId=TENANT_ID,
         messagingEndpoint="https://example.test/api/messages",
@@ -380,7 +383,6 @@ def test_update_endpoint_apply_updates_bot_and_sidecar_without_disabling_channel
             sidecar_path=sidecar,
         )
     )
-
     result = apply_update_endpoint_plan(plan, runner=runner)
 
     assert result.endpoint_updated is True
@@ -846,14 +848,12 @@ def test_cleanup_refuses_sidecar_bound_to_other_agent(tmp_path: Path) -> None:
     assert sidecar.exists()
 
 
-def test_cleanup_legacy_sidecar_without_agent_name_warns_and_proceeds(
+def test_cleanup_legacy_sidecar_without_agent_name_uses_live_binding_and_confirm(
     tmp_path: Path,
 ) -> None:
-    # M6 (#102) backward-compat: a pre-M6 sidecar (no agentName KEY at all)
-    # still cleans up on --confirm alone, with a warning — refusing would
-    # break every deployed sidecar.
     sidecar = _write_sidecar(tmp_path)
     raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = 1
     del raw["agentName"]
     sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
     runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
@@ -861,10 +861,83 @@ def test_cleanup_legacy_sidecar_without_agent_name_warns_and_proceeds(
         BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
     )
 
-    result = apply_cleanup_plan(plan, runner=runner)
+    result = apply_cleanup_plan(plan, runner=runner, now=_now)
 
     assert result.bot_deleted is True
-    assert any("no agentName binding" in m for m in result.messages)
+    assert result.sidecar_removed is True
+    assert result.sidecar_backup_path is not None
+    assert result.sidecar_backup_path.exists()
+    assert not sidecar.exists()
+
+
+def test_update_migrates_verified_legacy_sidecar_to_bound_v2(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = 1
+    raw.pop("agentName")
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+            legacy_binding_confirmation="Hermes Inbox Helper",
+        )
+    )
+    assert "--confirm-legacy-binding='Hermes Inbox Helper'" in plan.render_human()
+
+    result = apply_update_endpoint_plan(plan, runner=runner)
+
+    updated = BotServiceConfig.from_file(sidecar)
+    assert updated.schemaVersion == SIDECAR_SCHEMA_VERSION
+    assert updated.agentName == "Hermes Inbox Helper"
+    assert any("migrated legacy sidecar" in message for message in result.messages)
+    backups = list(tmp_path.glob("a365.bot-service.config.backup-*.json"))
+    assert len(backups) == 1
+    assert json.loads(backups[0].read_text())["schemaVersion"] == 1
+
+
+@pytest.mark.parametrize("confirmation", [None, "Other Agent"])
+def test_update_refuses_legacy_binding_without_exact_confirmation_before_mutation(
+    tmp_path: Path, confirmation: str | None
+) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = 1
+    raw.pop("agentName")
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+            legacy_binding_confirmation=confirmation,
+        )
+    )
+
+    with pytest.raises(BotServiceError, match="--confirm-legacy-binding"):
+        apply_update_endpoint_plan(plan, runner=runner)
+
+    assert not any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
+    assert json.loads(sidecar.read_text())["schemaVersion"] == 1
+
+
+def test_parser_accepts_explicit_legacy_binding_confirmation() -> None:
+    args = build_parser().parse_args(
+        [
+            "update-endpoint",
+            "--agent-name",
+            "Hermes Inbox Helper",
+            "--url",
+            "https://example.test/api/messages",
+            "--confirm-legacy-binding",
+            "Hermes Inbox Helper",
+        ]
+    )
+
+    assert args.confirm_legacy_binding == "Hermes Inbox Helper"
 
 
 def test_create_apply_writes_agent_name_into_sidecar(tmp_path: Path) -> None:
@@ -892,6 +965,7 @@ def test_sidecar_from_file_accepts_legacy_without_agent_name(tmp_path: Path) -> 
     # sidecar written before the binding existed (agentName=None).
     sidecar = _write_sidecar(tmp_path)
     raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = 1
     del raw["agentName"]
     sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
 
@@ -1314,3 +1388,66 @@ def test_allow_local_cli_flag_wiring(sub: str) -> None:
         common += ["--resource-group", "rg"]
     assert build_parser().parse_args(common).allow_local is False
     assert build_parser().parse_args([*common, "--allow-local"]).allow_local is True
+
+
+@pytest.mark.parametrize("drift", ["arm", "app"])
+def test_mutation_refuses_live_bot_identity_drift(tmp_path: Path, drift: str) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    bot = FakeRunner._bot()
+    if drift == "arm":
+        bot["id"] = (
+            f"/subscriptions/{SUBSCRIPTION_ID}/resourceGroups/hermes-a365-bots/"
+            "providers/Microsoft.BotService/botServices/different-bot"
+        )
+    else:
+        bot["properties"]["msaAppId"] = "99999999-9999-9999-9999-999999999999"
+    runner = FakeRunner(bot=bot, teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+        )
+    )
+
+    with pytest.raises(BotServiceError, match="does not match"):
+        apply_update_endpoint_plan(plan, runner=runner)
+
+    assert not any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
+
+
+def test_mutation_refuses_live_bot_without_arm_resource_id(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    bot = FakeRunner._bot()
+    bot.pop("id")
+    runner = FakeRunner(bot=bot, teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+        )
+    )
+
+    with pytest.raises(BotServiceError, match="omitted its ARM resource id"):
+        apply_update_endpoint_plan(plan, runner=runner)
+
+    assert not any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
+
+
+def test_cleanup_never_purges_group_when_bound_bot_is_missing(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
+    runner = FakeRunner(bot=None, teams=None, group_resources=[])
+    plan = build_cleanup_plan(
+        BotServiceCleanupInputs(
+            agent_name="Hermes Inbox Helper",
+            sidecar_path=sidecar,
+            purge_resource_group=True,
+        )
+    )
+
+    result = apply_cleanup_plan(plan, runner=runner)
+
+    assert result.resource_group_deleted is False
+    assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
+    assert any("bound bot is missing" in message for message in result.messages)

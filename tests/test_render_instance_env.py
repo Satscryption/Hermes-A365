@@ -93,6 +93,24 @@ def test_render_instance_env_preserves_user_managed_env() -> None:
     assert text.endswith("CUSTOM_OPERATOR_FLAG=1\nZ_SIDE_SETTING=kept\n")
 
 
+def test_render_instance_env_quotes_shell_expansion() -> None:
+    text = render_instance_env(
+        _base_inputs(preserved_env={"CUSTOM_VALUE": "$(touch /tmp/pwned) value"})
+    )
+    assert "CUSTOM_VALUE='$(touch /tmp/pwned) value'\n" in text
+
+
+@pytest.mark.parametrize("value", ["first\nINJECTED=1", "first\rINJECTED=1", "nul\x00value"])
+def test_render_instance_env_rejects_line_injection(value: str) -> None:
+    with pytest.raises(ValueError, match="NUL/CR/LF"):
+        render_instance_env(_base_inputs(owner=value))
+
+
+def test_render_instance_env_rejects_invalid_preserved_key() -> None:
+    with pytest.raises(ValueError, match="invalid preserved environment key"):
+        render_instance_env(_base_inputs(preserved_env={"VALID\nINJECTED": "1"}))
+
+
 def test_render_instance_env_generates_uuid_when_missing() -> None:
     inputs = _base_inputs(aa_instance_id=None)
     assert inputs.aa_instance_id is not None
