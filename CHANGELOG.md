@@ -105,6 +105,23 @@ this heading is dated at release.
   triage also removed exception text and upstream response excerpts from the
   externally visible `reply_failed` response; sanitized diagnostics remain in
   server logs.
+- **v0.9.0 hardening migration notes.** Inbound bearer headers are bounded and
+  structurally validated before issuer routing; callers receive fixed auth
+  failures while bounded diagnostics remain server-side. End-user allowlists
+  apply to user messages, invokes, reactions, and card submissions, while
+  JWT-authenticated lifecycle/control traffic is acknowledged as platform
+  traffic. Bot Framework conversation types and sender aliases are normalized
+  into the same Hermes authorization identity used for dispatch. Operator
+  webhooks now require HTTPS except for explicit loopback development mode, and
+  Azure mutations require the canonical tenant/subscription pins described
+  below. Existing schema-v1 Bot Service sidecars remain usable: live tenant,
+  ARM id, and app id are verified first; successful mutating rewrites back up
+  and bind them as schema v2 only after
+  `--confirm-legacy-binding=<agent-name>`, while cleanup backs them up before
+  removal under its existing `--confirm=<agent-name>` gate. On
+  macOS, keychain reads/deletes and runtime miss-fill work by default; only the
+  secret-bearing `security add-generic-password` write path requires
+  `HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1`.
 - **#100 regression locks / #107 client-side characterization.** The
   #100 hardening (H1/H1-tenant/M1/M2/L4) shipped in v0.8.2; a scoping deep-read
   confirmed it live at the v0.8.5 tip. **#107** — no currently validated inbound

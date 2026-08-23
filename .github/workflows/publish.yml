@@ -51,7 +51,9 @@ jobs:
       - name: Build sdist + wheel
         # --no-isolation: use the hash-pinned hatchling above instead of
         # letting `build` resolve an unpinned backend at build time.
-        run: python -m build --no-isolation
+        run: |
+          rm -rf dist
+          python -m build --no-isolation
 
       - name: Sanity-check artefacts
         run: |
@@ -99,7 +101,43 @@ jobs:
 
       - name: Verify artefact digests
         run: |
-          sha256sum -c dist/SHA256SUMS
+          python - <<'PY'
+          from pathlib import Path
+
+          dist = Path("dist")
+          manifest = dist / "SHA256SUMS"
+          if manifest.is_symlink() or not manifest.is_file():
+              raise SystemExit("SHA256SUMS must be a regular file")
+          expected = set()
+          for line in manifest.read_text().splitlines():
+              parts = line.split(maxsplit=1)
+              if len(parts) != 2:
+                  raise SystemExit("malformed SHA256SUMS entry")
+              name = parts[1].lstrip("*")
+              path = Path(name)
+              if path.parent != dist or path.name == manifest.name:
+                  raise SystemExit(f"unsafe SHA256SUMS path: {name}")
+              if path in expected:
+                  raise SystemExit(f"duplicate SHA256SUMS path: {name}")
+              expected.add(path)
+
+          entries = [path for path in dist.iterdir() if path != manifest]
+          invalid = [path for path in entries if path.is_symlink() or not path.is_file()]
+          if invalid:
+              raise SystemExit(f"non-regular dist entries: {invalid}")
+          actual = set(entries)
+          if actual != expected:
+              raise SystemExit(
+                  f"dist set differs from SHA256SUMS: "
+                  f"extra={sorted(map(str, actual - expected))}, "
+                  f"missing={sorted(map(str, expected - actual))}"
+              )
+          wheels = [path for path in actual if path.suffix == ".whl"]
+          sdists = [path for path in actual if path.name.endswith(".tar.gz")]
+          if len(wheels) != 1 or len(sdists) != 1 or len(actual) != 2:
+              raise SystemExit("dist must contain exactly one wheel and one sdist")
+          PY
+          sha256sum --check --strict dist/SHA256SUMS
           rm dist/SHA256SUMS
 
       - name: Publish to PyPI

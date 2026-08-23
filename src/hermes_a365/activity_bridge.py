@@ -965,15 +965,65 @@ def _validate_webhook_url(url: str, *, development_mode: bool) -> None:
     )
 
 
-def _canonical_activity_user(activity: dict[str, Any]) -> str:
+def _activity_user_candidates(activity: dict[str, Any]) -> tuple[str, ...]:
+    """Return stable sender identifiers in authorization preference order."""
     sender = activity.get("from")
     if not isinstance(sender, dict):
-        return ""
-    for key in ("aadObjectId", "id"):
+        return ()
+    candidates: list[str] = []
+    for key in ("aadObjectId", "id", "userPrincipalName", "email"):
         value = sender.get(key)
         if isinstance(value, str) and value.strip():
-            return value.strip().lower()
-    return ""
+            normalized = value.strip().lower()
+            if normalized not in candidates:
+                candidates.append(normalized)
+    return tuple(candidates)
+
+
+def _canonical_activity_user(activity: dict[str, Any]) -> str:
+    candidates = _activity_user_candidates(activity)
+    return candidates[0] if candidates else ""
+
+
+def _activity_chat_type(activity: dict[str, Any]) -> str:
+    """Map Bot Framework conversation types to Hermes' auth vocabulary."""
+    conversation = activity.get("conversation")
+    if not isinstance(conversation, dict):
+        return "dm"
+    value = conversation.get("conversationType")
+    if value is None:
+        return "dm"
+    raw = str(value).strip().lower()
+    return {
+        "personal": "dm",
+        "dm": "dm",
+        "groupchat": "group",
+        "group": "group",
+        "channel": "channel",
+        # Unknown explicit values are treated as multi-user rather than
+        # accidentally inheriting the less restrictive DM policy.
+    }.get(raw, "group")
+
+
+def _activity_requires_end_user_auth(activity: dict[str, Any]) -> bool:
+    """Return whether processing the activity represents an end-user action."""
+    activity_type = str(activity.get("type") or "message")
+    if activity_type in {
+        "conversationUpdate",
+        "typing",
+        "endOfConversation",
+        "installationUpdate",
+    }:
+        return False
+    if str(activity.get("channelId") or "") != "agents":
+        return True
+    sender = activity.get("from")
+    sender_id = str(sender.get("id") or "") if isinstance(sender, dict) else ""
+    return not (
+        activity_type == "event"
+        or sender_id == "system"
+        or sender_id.startswith("no-reply@")
+    )
 
 
 def _activity_user_authorized(
@@ -981,8 +1031,8 @@ def _activity_user_authorized(
 ) -> bool:
     if allow_all:
         return True
-    user = _canonical_activity_user(activity)
-    return bool(user) and user in {value.lower() for value in allowed_users}
+    allowed = {value.strip().lower() for value in allowed_users if value.strip()}
+    return any(candidate in allowed for candidate in _activity_user_candidates(activity))
 
 
 def _safe_log_field(value: Any, *, limit: int = 160) -> str:
@@ -1273,6 +1323,20 @@ def _validate_jwt_shape(token: str) -> None:
     parts = token.split(".")
     if len(parts) != 3 or any(not part or len(part) > MAX_JWT_BYTES for part in parts):
         raise JwtValidationError("JWT has an invalid compact-serialization shape")
+
+
+def _extract_bearer_token(authorization: str | None) -> str:
+    """Extract and bound one compact JWT without parsing attacker-controlled data."""
+    if not isinstance(authorization, str) or not authorization:
+        raise JwtValidationError("missing bearer token")
+    if len(authorization.encode("utf-8")) > MAX_JWT_BYTES + len("Bearer "):
+        raise JwtValidationError("authorization header exceeds the size limit")
+    parts = authorization.split()
+    if len(parts) != 2 or parts[0].lower() != "bearer":
+        raise JwtValidationError("authorization header is not a single bearer token")
+    token = parts[1]
+    _validate_jwt_shape(token)
+    return token
 
 
 async def _refresh_jwks(
@@ -2795,9 +2859,11 @@ def make_app(
         # is skipped (dev only) → falls back to the body-derived tag.
         validated_path: str | None = None
         if not cfg.skip_jwt_validation:
-            if not authorization or not authorization.lower().startswith("bearer "):
-                raise _HTTPException(status_code=401, detail="missing bearer token")
-            token = authorization.split(None, 1)[1]
+            try:
+                token = _extract_bearer_token(authorization)
+            except JwtValidationError as exc:
+                detail = "missing bearer token" if not authorization else "invalid bearer token"
+                raise _HTTPException(status_code=401, detail=detail) from exc
             # Slice 19w-a (#18, review finding 3): dual inbound-JWT dispatch,
             # matching the plugin adapter. Previously serve validated ONLY the
             # AAD-v2 shape and would reject legitimate Path B BF Connector
@@ -2828,17 +2894,26 @@ def make_app(
                         cache=jwks_cache,
                     )
             except JwtValidationError as e:
-                raise _HTTPException(status_code=403, detail=str(e)) from e
+                logger.warning(
+                    "inbound 403 path=%s reason=%s",
+                    validated_path,
+                    _safe_log_field(e),
+                )
+                raise _HTTPException(status_code=403, detail="invalid bearer token") from e
 
         # Standalone serve has no GatewayRunner layer. Authorize the represented
-        # end user before dedupe, control activities, persistence, forwarding, or
-        # any reply-token side effect.
-        if not _activity_user_authorized(
-            activity,
-            allowed_users=cfg.allowed_users,
-            allow_all=cfg.allow_all_users,
-        ):
-            raise _HTTPException(status_code=403, detail="end user is not authorized")
+        # end user before dedupe, persistence, forwarding, or any reply-token
+        # side effect. JWT-authenticated platform lifecycle/control activities do
+        # not carry an end-user principal and are acknowledged separately.
+        if _activity_requires_end_user_auth(activity):
+            if not _activity_user_authorized(
+                activity,
+                allowed_users=cfg.allowed_users,
+                allow_all=cfg.allow_all_users,
+            ):
+                raise _HTTPException(status_code=403, detail="end user is not authorized")
+        else:
+            return _JSONResponse({"status": "acked"})
 
         # Slice 19i: dedupe by (conversationId, activityId) so connector
         # retries don't double-fire the operator webhook. Channel-control

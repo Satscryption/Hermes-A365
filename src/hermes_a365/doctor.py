@@ -313,7 +313,12 @@ def probe_keychain() -> ProbeResult:
                 _ERROR,
                 "macOS `security` not on PATH (Security framework wrapper)",
             )
-        return ProbeResult("keychain", _OK, f"macOS Security framework available ({binary})")
+        return ProbeResult(
+            "keychain",
+            _OK,
+            f"macOS Security framework available for reads ({binary}); writes require "
+            "HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1",
+        )
     if sys.platform.startswith("linux"):
         binary = shutil.which("secret-tool")
         if not binary:
@@ -350,6 +355,13 @@ def probe_local_config() -> ProbeResult:
                 {"home": str(home)},
             )
         parts.append(f".env: {len(parsed)} keys")
+        tenant_id = parsed.get("A365_TENANT_ID", "").strip()
+        if not tenant_id:
+            state = _ERROR
+            parts.append(
+                "no canonical tenant pin was resolved; set A365_TENANT_ID "
+                "before Azure mutations"
+            )
     else:
         parts.append(".env: absent or empty")
         state = _WARN
@@ -364,6 +376,9 @@ def probe_local_config() -> ProbeResult:
             "home": str(home),
             "env_present": env_file.exists(),
             "config_yaml_present": config_file.exists(),
+            "tenant_pinned": bool(
+                env_file.exists() and parsed.get("A365_TENANT_ID", "").strip()
+            ),
         },
     )
 

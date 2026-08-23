@@ -34,6 +34,7 @@ from hermes_a365.activity_bridge import (
     DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES,
     FMI_TOKEN_SCOPE,
     GRAPH_RESOURCE,
+    MAX_JWT_BYTES,
     OBSERVABILITY_RESOURCE_APPID,
     TENANT_TOKEN_URL_TEMPLATE,
     BridgeConfig,
@@ -41,6 +42,7 @@ from hermes_a365.activity_bridge import (
     JwtValidationError,
     TokenAcquisitionError,
     VerifyReport,
+    _activity_chat_type,
     _activity_delivery_id,
     _agentic_ids_from_activity,
     _BfTokenCache,
@@ -2447,7 +2449,7 @@ class TestServeApp:
             r = client.post("/api/messages", json=_inbound_message_activity())
         assert r.status_code == 401
 
-    def test_jwt_invalid_returns_403(self) -> None:
+    def test_structurally_invalid_jwt_returns_401_before_validation(self) -> None:
         cfg = _cfg()  # JWT validation enabled
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         with _client_for(cfg, capture=capture) as client:
@@ -2456,7 +2458,8 @@ class TestServeApp:
                 json=_inbound_message_activity(),
                 headers={"Authorization": "Bearer not-a-valid-jwt"},
             )
-        assert r.status_code == 403
+        assert r.status_code == 401
+        assert r.json()["detail"] == "invalid bearer token"
 
 
 # ---------------------------------------------------------------------------
@@ -3474,6 +3477,125 @@ class TestSecurityRequestBoundary:
 
         assert response.status_code == 403
         assert capture["webhook"] == []
+
+    @pytest.mark.parametrize(
+        "activity_type",
+        ["installationUpdate", "conversationUpdate", "typing", "endOfConversation"],
+    )
+    def test_platform_control_activity_acks_under_restrictive_user_allowlist(
+        self, activity_type: str
+    ) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        cfg.allow_all_users = False
+        cfg.allowed_users = ("user-allowed",)
+        activity = _inbound_message_activity()
+        activity["type"] = activity_type
+        activity["from"] = {"id": "system"}
+        client = _client_for(cfg, capture=capture)
+
+        response = client.post("/api/messages", json=activity)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "acked"}
+        assert capture["webhook"] == []
+
+    def test_authorization_accepts_any_normalized_activity_user_alias(self) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        cfg.allow_all_users = False
+        cfg.allowed_users = ("opaque-channel-user",)
+        activity = _inbound_message_activity()
+        activity["from"] = {
+            "aadObjectId": "AAAAAAAA-AAAA-AAAA-AAAA-AAAAAAAAAAAA",
+            "id": "OPAQUE-CHANNEL-USER",
+        }
+        client = _client_for(cfg, capture=capture)
+
+        response = client.post("/api/messages", json=activity)
+
+        assert response.status_code == 200
+        assert len(capture["webhook"]) == 1
+
+    @pytest.mark.parametrize(
+        ("conversation_type", "expected"),
+        [
+            (None, "dm"),
+            ("personal", "dm"),
+            ("groupChat", "group"),
+            ("channel", "channel"),
+            ("   ", "group"),
+            ("futureSurface", "group"),
+        ],
+    )
+    def test_chat_type_normalization_is_stable_and_fail_closed(
+        self, conversation_type: str | None, expected: str
+    ) -> None:
+        activity = _inbound_message_activity()
+        if conversation_type is None:
+            activity["conversation"].pop("conversationType", None)
+        else:
+            activity["conversation"]["conversationType"] = conversation_type
+
+        assert _activity_chat_type(activity) == expected
+
+    @pytest.mark.parametrize("header", ["Bearer", "Bearer malformed", "Basic abc"])
+    def test_malformed_authorization_never_reaches_unverified_jwt_peek(
+        self, header: str
+    ) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        client = _client_for(_cfg(), capture=capture)
+
+        with patch("hermes_a365.activity_bridge.peek_unverified_iss") as peek:
+            response = client.post(
+                "/api/messages",
+                json=_inbound_message_activity(),
+                headers={"Authorization": header},
+            )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "invalid bearer token"
+        peek.assert_not_called()
+
+    def test_oversized_authorization_never_reaches_unverified_jwt_peek(self) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        client = _client_for(_cfg(), capture=capture)
+        token = f"a.{('x' * MAX_JWT_BYTES)}.c"
+
+        with patch("hermes_a365.activity_bridge.peek_unverified_iss") as peek:
+            response = client.post(
+                "/api/messages",
+                json=_inbound_message_activity(),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+
+        assert response.status_code == 401
+        assert response.json()["detail"] == "invalid bearer token"
+        peek.assert_not_called()
+
+    def test_jwt_validation_detail_is_not_returned_to_caller(self) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        client = _client_for(_cfg(), capture=capture)
+        failure = "attacker-kid and configured-policy-detail"
+
+        with (
+            patch("hermes_a365.activity_bridge.peek_unverified_iss", return_value=None),
+            patch(
+                "hermes_a365.activity_bridge.validate_inbound_jwt",
+                new=AsyncMock(side_effect=JwtValidationError(failure)),
+            ),
+        ):
+            response = client.post(
+                "/api/messages",
+                json=_inbound_message_activity(),
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+
+        assert response.status_code == 403
+        assert response.json()["detail"] == "invalid bearer token"
+        assert failure not in response.text
 
     def test_plain_http_webhook_requires_loopback_development_mode(self) -> None:
         with pytest.raises(BridgeConfigError, match="must use https"):

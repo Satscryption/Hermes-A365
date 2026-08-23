@@ -14,17 +14,18 @@ always wins so a stale keychain entry cannot shadow a rotation.
 
 Backends
 --------
-- macOS: opt-in ``security`` command fallback (disabled by default because
-  the command exposes stored values in process metadata)
+- macOS: ``security`` command fallback; reads/deletes work by default, while
+  writes require opt-in because ``add-generic-password`` carries the secret in argv
 - Linux: ``secret-tool`` (libsecret)
 - Windows: not supported in v0.1 (per SPEC §10 Q3)
 
 Trade-off note
 --------------
 ``security add-generic-password`` only accepts the secret via ``-w`` (argv).
-That backend therefore requires the explicit
-``HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1`` opt-in. The Linux backend
-pipes the secret via stdin.
+That write path therefore requires the explicit
+``HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1`` opt-in. macOS reads and
+deletes do not put the secret in argv and remain available by default. The
+Linux backend pipes the secret via stdin.
 
 Programmatic use::
 
@@ -150,6 +151,20 @@ class MacOSBackend:
     name = "macos-security"
 
     def store(self, account: str, secret: str) -> None:
+        if os.environ.get("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "").lower() not in {
+            "1", "true", "yes", "on"
+        }:
+            raise KeychainError(
+                "the macOS `security add-generic-password` command exposes the new "
+                "secret in process metadata; set "
+                "HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1 to opt in"
+            )
+        warnings.warn(
+            "using the opt-in macOS security CLI write path; the new secret may be "
+            "visible in child process metadata",
+            RuntimeWarning,
+            stacklevel=2,
+        )
         # -U: update if exists. The secret is passed via -w (argv) — the only
         # interface `security` exposes for generic passwords.
         proc = _run_keychain_command(
@@ -299,19 +314,6 @@ def get_backend() -> KeychainBackend:
     if sys.platform == "darwin":
         if not shutil.which("security"):
             raise KeychainError("`security` command not found on PATH (macOS)")
-        if os.environ.get("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "").lower() not in {
-            "1", "true", "yes", "on"
-        }:
-            raise KeychainError(
-                "the macOS `security` CLI exposes stored values in process metadata; "
-                "set HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1 to opt in"
-            )
-        warnings.warn(
-            "using the opt-in macOS security CLI backend; secret values may be visible "
-            "in child process metadata",
-            RuntimeWarning,
-            stacklevel=2,
-        )
         return MacOSBackend()
     if sys.platform.startswith("linux"):
         if not shutil.which("secret-tool"):

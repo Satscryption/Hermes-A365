@@ -53,6 +53,7 @@ class PublishError(RuntimeError):
 
 
 _ZIP_MAX_MEMBERS = 128
+_ZIP_MAX_DEPTH = 16
 _ZIP_MAX_MANIFEST_BYTES = 1024 * 1024
 _ZIP_MAX_TOTAL_UNCOMPRESSED = 64 * 1024 * 1024
 _ZIP_MAX_COMPRESSION_RATIO = 100
@@ -402,8 +403,8 @@ def _zip_manifest_dir(manifest_dir: str) -> str | None:
     """Package an extracted manifest directory into a sibling ``.zip`` so the
     CEA transform pipeline (which operates on a zip) can run against the
     newer CLI's extract-and-stop output. Returns the zip path, or ``None``
-    when the directory is missing or carries no ``manifest.json``. Files are
-    written flat (the CLI extracts manifest.json + icons at the dir root)."""
+    when the directory is missing or carries no root ``manifest.json``. Bounded
+    nested regular files are preserved; links and special files fail closed."""
     d = Path(manifest_dir)
     zip_path = d.with_name(d.name + ".zip")
     if zip_path.exists() and not _regular_nonsymlink(zip_path):
@@ -417,32 +418,69 @@ def _zip_manifest_dir(manifest_dir: str) -> str | None:
         if hasattr(os, "O_NOFOLLOW"):
             dir_flags |= os.O_NOFOLLOW
         directory_fd = os.open(d, dir_flags)
-        names = sorted(os.listdir(directory_fd))
-        if "manifest.json" not in names or len(names) > _ZIP_MAX_MEMBERS:
+        root_names = sorted(os.listdir(directory_fd))
+        if "manifest.json" not in root_names:
             return None
         with ExitStack() as stack:
             sources: list[tuple[str, Any, os.stat_result]] = []
             total = 0
-            for name in names:
-                before = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
-                if not stat.S_ISREG(before.st_mode) or stat.S_ISLNK(before.st_mode):
-                    return None
-                fd = os.open(
-                    name,
-                    os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
-                    dir_fd=directory_fd,
-                )
-                source = stack.enter_context(os.fdopen(fd, "rb"))
-                st = os.fstat(source.fileno())
-                if (
-                    not stat.S_ISREG(st.st_mode)
-                    or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
-                ):
-                    return None
-                total += st.st_size
-                if total > _ZIP_MAX_TOTAL_UNCOMPRESSED:
-                    return None
-                sources.append((name, source, st))
+
+            def collect(dir_fd: int, prefix: str, depth: int) -> bool:
+                nonlocal total
+                if depth > _ZIP_MAX_DEPTH:
+                    return False
+                for name in sorted(os.listdir(dir_fd)):
+                    archive_name = f"{prefix}/{name}" if prefix else name
+                    if "\\" in archive_name:
+                        return False
+                    before = os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
+                    if stat.S_ISLNK(before.st_mode):
+                        return False
+                    if stat.S_ISDIR(before.st_mode):
+                        flags = os.O_RDONLY
+                        if hasattr(os, "O_DIRECTORY"):
+                            flags |= os.O_DIRECTORY
+                        if hasattr(os, "O_NOFOLLOW"):
+                            flags |= os.O_NOFOLLOW
+                        child_fd = os.open(name, flags, dir_fd=dir_fd)
+                        child_st = os.fstat(child_fd)
+                        if (
+                            not stat.S_ISDIR(child_st.st_mode)
+                            or (child_st.st_dev, child_st.st_ino)
+                            != (before.st_dev, before.st_ino)
+                        ):
+                            os.close(child_fd)
+                            return False
+                        stack.callback(os.close, child_fd)
+                        if not collect(child_fd, archive_name, depth + 1):
+                            return False
+                        continue
+                    if not stat.S_ISREG(before.st_mode):
+                        return False
+                    fd = os.open(
+                        name,
+                        os.O_RDONLY
+                        | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
+                        dir_fd=dir_fd,
+                    )
+                    source = stack.enter_context(os.fdopen(fd, "rb"))
+                    st = os.fstat(source.fileno())
+                    if (
+                        not stat.S_ISREG(st.st_mode)
+                        or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
+                    ):
+                        return False
+                    total += st.st_size
+                    if (
+                        total > _ZIP_MAX_TOTAL_UNCOMPRESSED
+                        or len(sources) >= _ZIP_MAX_MEMBERS
+                    ):
+                        return False
+                    sources.append((archive_name, source, st))
+                return True
+
+            if not collect(directory_fd, "", 1):
+                return None
             with tempfile.NamedTemporaryFile(dir=str(d.parent), delete=False) as tmp:
                 os.fchmod(tmp.fileno(), 0o600)
                 tmp_path = Path(tmp.name)
@@ -837,11 +875,16 @@ def apply_publish_plan(
             manifest_dir = _extract_manifest_dir(run.combined)
             if manifest_dir:
                 emitted_zip = _zip_manifest_dir(manifest_dir)
-                if emitted_zip:
-                    messages.append(
-                        "[apply] packaged extracted manifest template → "
-                        f"{emitted_zip} (CLI no longer emits a zip directly)"
+                if not emitted_zip:
+                    raise PublishError(
+                        "the CLI extracted a manifest directory, but it could not be "
+                        "packaged safely; inspect it for a missing root manifest.json, "
+                        "links, special files, excessive nesting, or size limits"
                     )
+                messages.append(
+                    "[apply] packaged extracted manifest template → "
+                    f"{emitted_zip} (CLI no longer emits a zip directly)"
+                )
         if emitted_zip:
             if plan.inputs.manifest_id == "auto" or (
                 plan.inputs.manifest_id is None

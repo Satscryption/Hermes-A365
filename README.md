@@ -176,7 +176,10 @@ this skill handles.** Where it lives + how to keep it that way:
   writes the secret in plaintext (`agentBlueprintClientSecretProtected:
   false`). The wrapper tightens the file mode to `0600` after
   `register --apply`. To move a secret out of plaintext, store it in the
-  OS keychain yourself —
+  OS keychain yourself. On macOS, the `security` CLI can only accept a new
+  password through argv, so writes require the explicit
+  `HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1` opt-in; reads and runtime
+  miss-fill remain available without it. Run
   `python -m hermes_a365.keychain store --tenant <id> --app-id <id>` —
   and remove it from the plaintext file; the runtime then resolves it
   through the secrets provider (#19). Nothing mirrors secrets into the
@@ -239,6 +242,9 @@ stale keychain entry.
 To keep a secret out of plaintext:
 
 ```bash
+# macOS only: acknowledge that `security add-generic-password` carries the
+# new value in child-process argv. Linux uses stdin and needs no opt-in.
+export HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1
 python -m hermes_a365.keychain store --tenant <tenant-id> --app-id <app-id>
 ```
 
@@ -569,8 +575,14 @@ as `ok`.
 > ```
 >
 > …paired with `A365_TENANT_ID`, `A365_APP_ID`, `A365_BLUEPRINT_CLIENT_SECRET`,
-> and either `A365_ALLOW_ALL_USERS=true` (testing) or `A365_ALLOWED_USERS=<csv>`
-> (production) in `~/.hermes/.env`.
+> and either `A365_ALLOW_ALL_USERS=true` (testing) or
+> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Entries may be
+> AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
+> includes those aliases in the signed activity. Bot Framework `personal` /
+> `groupChat` / `channel` values
+> are normalized to Hermes `dm` / `group` / `channel`; JWT-authenticated
+> lifecycle/control activities are acknowledged without pretending their
+> Microsoft system identity is an end user.
 
 ## Subcommand reference
 

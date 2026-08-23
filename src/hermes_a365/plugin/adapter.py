@@ -1062,10 +1062,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
 
             # Bearer presence check (shared by Path A and Path B).
-            if not authorization or not authorization.lower().startswith("bearer "):
-                logger.warning("inbound 401 reason=missing-bearer-token")
-                raise HTTPException(status_code=401, detail="missing bearer token")
-            token = authorization.split(None, 1)[1]
+            try:
+                token = bridge._extract_bearer_token(authorization)
+            except bridge.JwtValidationError as exc:
+                logger.warning("inbound 401 reason=invalid-bearer-token")
+                detail = "missing bearer token" if not authorization else "invalid bearer token"
+                raise HTTPException(status_code=401, detail=detail) from exc
 
             # #34 — peek unverified `iss` to pick the right validator.
             # BF tokens (Direct Line / Teams via Bot Service / Test in
@@ -1093,7 +1095,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 bf_expected_aud = self.bf_app_id or self.blueprint_app_id
                 logger.info(
                     "inbound path=B (iss=%s aud=%s…)",
-                    iss,
+                    bridge._safe_log_field(iss),
                     bf_expected_aud[:8] if bf_expected_aud else "",
                 )
                 try:
@@ -1106,12 +1108,12 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                 except bridge.JwtValidationError as e:
                     logger.warning(
-                        "inbound 403 path=B reason=%s", e
+                        "inbound 403 path=B reason=%s", bridge._safe_log_field(e)
                     )
-                    raise HTTPException(status_code=403, detail=str(e)) from e
+                    raise HTTPException(status_code=403, detail="invalid bearer token") from e
 
             else:
-                logger.info("inbound path=A (iss=%r)", iss)
+                logger.info("inbound path=A (iss=%s)", bridge._safe_log_field(iss))
                 try:
                     claims = await bridge.validate_inbound_jwt(
                         token=token,
@@ -1123,32 +1125,60 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                 except bridge.JwtValidationError as e:
                     logger.warning(
-                        "inbound 403 path=A reason=%s", e
+                        "inbound 403 path=A reason=%s", bridge._safe_log_field(e)
                     )
-                    raise HTTPException(status_code=403, detail=str(e)) from e
+                    raise HTTPException(status_code=403, detail="invalid bearer token") from e
 
             _in_conv = activity.get("conversation")
             _in_conv = _in_conv if isinstance(_in_conv, dict) else {}
             _in_from = activity.get("from")
             _in_from = _in_from if isinstance(_in_from, dict) else {}
-            sender_id = bridge._canonical_activity_user(activity)
-            chat_type = str(_in_conv.get("conversationType") or "")
+            sender_ids = bridge._activity_user_candidates(activity)
+            authorized_sender_id = bridge._canonical_activity_user(activity)
+            chat_type = bridge._activity_chat_type(activity)
             chat_id = str(_in_conv.get("id") or "")
-            auth_check = getattr(self, "_is_sender_authorized", None)
-            decision = (
-                auth_check(sender_id, chat_type, chat_id)
-                if callable(auth_check)
-                else None
-            )
-            if decision is None:
-                decision = bridge._activity_user_authorized(
-                    activity,
-                    allowed_users=self._allowed_users,
-                    allow_all=self._allow_all_users,
-                )
-            if not decision:
-                logger.warning("inbound 403 reason=unauthorized-end-user")
-                raise HTTPException(status_code=403, detail="end user is not authorized")
+            if bridge._activity_requires_end_user_auth(activity):
+                auth_check = getattr(self, "_is_sender_authorized", None)
+                if callable(auth_check):
+                    alias_decisions = [
+                        auth_check(sender_id, chat_type, chat_id)
+                        for sender_id in sender_ids
+                    ]
+                    decision = (
+                        True
+                        if True in alias_decisions
+                        else False
+                        if False in alias_decisions
+                        else None
+                    )
+                    if decision:
+                        authorized_sender_id = next(
+                            sender_id
+                            for sender_id, alias_decision in zip(
+                                sender_ids, alias_decisions, strict=True
+                            )
+                            if alias_decision is True
+                        )
+                else:
+                    decision = None
+                if decision is None:
+                    decision = bridge._activity_user_authorized(
+                        activity,
+                        allowed_users=self._allowed_users,
+                        allow_all=self._allow_all_users,
+                    )
+                    if decision and not self._allow_all_users:
+                        allowed = {
+                            value.strip().lower()
+                            for value in self._allowed_users
+                            if value.strip()
+                        }
+                        authorized_sender_id = next(
+                            candidate for candidate in sender_ids if candidate in allowed
+                        )
+                if not decision:
+                    logger.warning("inbound 403 reason=unauthorized-end-user")
+                    raise HTTPException(status_code=403, detail="end user is not authorized")
 
             logger.info(
                 "inbound activity type=%s action=%s channelId=%s from=%s "
@@ -1377,7 +1407,11 @@ class Agent365Adapter(BasePlatformAdapter):
             media = await self._extract_inbound_media(
                 activity, validated_path=validated_path
             )
-            event = self._activity_to_event(activity, media=media)
+            event = self._activity_to_event(
+                activity,
+                media=media,
+                authorized_user_id=authorized_sender_id,
+            )
             await self.handle_message(event)
             # M11 (#105): `handle_message` spawns the real turn as a base
             # background task and returns — the turn (incl. any approval/clarify
@@ -1645,6 +1679,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self,
         activity: dict[str, Any],
         media: tuple[list[str], list[str], MessageType] | None = None,
+        authorized_user_id: str | None = None,
     ) -> MessageEvent:
         conv = activity.get("conversation") or {}
         sender = activity.get("from") or {}
@@ -1658,17 +1693,17 @@ class Agent365Adapter(BasePlatformAdapter):
             recipient_id,
         )
         chat_id = str(conv.get("id") or "")
-        # BF conversation.conversationType: "personal" / "groupChat" / "channel"
-        conv_type = str(conv.get("conversationType") or "personal")
-        chat_type = "dm" if conv_type == "personal" else (
-            "group" if conv_type == "groupChat" else "channel"
-        )
+        chat_type = _import_bridge()._activity_chat_type(activity)
         source = SessionSource(
             platform=self.platform,
             chat_id=chat_id,
             chat_name=chat_id,  # 19o replaces with the resolved display name
             chat_type=chat_type,
-            user_id=str(sender.get("id") or ""),
+            user_id=(
+                authorized_user_id
+                if authorized_user_id is not None
+                else _import_bridge()._canonical_activity_user(activity)
+            ),
             user_name=str(sender.get("name") or ""),
             message_id=str(activity.get("id") or ""),
         )
@@ -5187,7 +5222,8 @@ def interactive_setup() -> None:
                 f"({label}) could not be consulted — an unavailable or locked "
                 "keychain, not necessarily an empty one. Fix that first "
                 "(`python -m hermes_a365.keychain get --tenant "
-                f"{tenant} --app-id {app}` should succeed) before assuming "
+                f"{tenant} --app-id {app} --output-fd 3 3>/dev/null` should "
+                "succeed) before assuming "
                 "the secret needs re-minting."
             )
         else:
@@ -5223,7 +5259,8 @@ def interactive_setup() -> None:
         "Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user."
     )
     print_info(
-        "Production: set A365_ALLOWED_USERS=<csv-of-emails-or-oids> instead."
+        "Production: set A365_ALLOWED_USERS to AAD object IDs, activity user IDs, "
+        "or UPN/email aliases present in the signed activity."
     )
     allow_all = prompt_yes_no(
         "Allow all users (testing only)?",
@@ -5238,7 +5275,8 @@ def interactive_setup() -> None:
     else:
         save_env_value("A365_ALLOW_ALL_USERS", "false")
         allowed = prompt(
-            "Allowed users (comma-separated emails/oids; blank = deny everyone)",
+            "Allowed users (comma-separated OIDs, activity IDs, or activity UPNs/emails; "
+            "blank = deny everyone)",
             default=get_env_value("A365_ALLOWED_USERS") or "",
         )
         save_env_value(

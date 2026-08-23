@@ -1159,6 +1159,35 @@ class TestApplyPublishPlanCopilotChat:
             # name.short truncated 32 -> <= 30 at a word boundary.
             assert m["name"]["short"] == "Hermes Inbox Helper R8"
 
+    def test_packages_bounded_nested_regular_manifest_assets(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import _zip_manifest_dir
+
+        d = tmp_path / "manifest"
+        nested = d / "assets" / "icons"
+        nested.mkdir(parents=True)
+        (d / "manifest.json").write_text(json.dumps({"manifestVersion": "1.27"}))
+        (nested / "color.png").write_bytes(b"png")
+
+        package = _zip_manifest_dir(str(d))
+
+        assert package is not None
+        with zipfile.ZipFile(package) as zf:
+            assert set(zf.namelist()) == {"manifest.json", "assets/icons/color.png"}
+
+    def test_extracted_manifest_packaging_failure_is_explicit(self, tmp_path):
+        d = tmp_path / "manifest"
+        d.mkdir()
+        (d / "not-a-manifest.txt").write_text("no manifest")
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, bot_id="bot-id")
+        )
+
+        with pytest.raises(PublishError, match="could not be packaged safely"):
+            apply_publish_plan(plan, mutator=self._scripted_template_extract(str(d)))
+
     def test_extract_manifest_dir_parses_both_phrasings(self):
         from hermes_a365.publish import _extract_manifest_dir
 

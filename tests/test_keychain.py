@@ -134,6 +134,10 @@ def _mock_completed(
 
 
 class TestMacOSBackend:
+    @pytest.fixture(autouse=True)
+    def _opt_in_store(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "1")
+
     def test_store_invokes_security_add(self, monkeypatch: pytest.MonkeyPatch) -> None:
         recorded: list[list[str]] = []
 
@@ -283,23 +287,25 @@ class TestLinuxBackend:
 class TestGetBackend:
     def test_macos_picks_macos_backend(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(secrets_mod.sys, "platform", "darwin")
-        monkeypatch.setenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "1")
+        monkeypatch.delenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", raising=False)
         monkeypatch.setattr(
             secrets_mod.shutil,
             "which",
             lambda binary: "/usr/bin/security" if binary == "security" else None,
         )
-        with pytest.warns(RuntimeWarning, match="process metadata"):
-            assert get_backend().name == "macos-security"
+        assert get_backend().name == "macos-security"
 
-    def test_macos_backend_requires_explicit_unsafe_opt_in(
+    def test_macos_backend_requires_explicit_unsafe_opt_in_only_for_writes(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(secrets_mod.sys, "platform", "darwin")
         monkeypatch.delenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", raising=False)
         monkeypatch.setattr(secrets_mod.shutil, "which", lambda _binary: "/usr/bin/security")
-        with pytest.raises(KeychainError, match="exposes stored values"):
-            get_backend()
+        backend = get_backend()
+        monkeypatch.setattr(subprocess, "run", lambda *a, **kw: _mock_completed(0, stdout="shh"))
+        assert backend.get("acct") == "shh"
+        with pytest.raises(KeychainError, match="add-generic-password"):
+            backend.store("acct", "new-secret")
 
     def test_macos_missing_security_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(secrets_mod.sys, "platform", "darwin")
@@ -387,6 +393,7 @@ class TestCLI:
         capsys: pytest.CaptureFixture[str],
     ) -> None:
         secret = "must-not-leak"
+        monkeypatch.setenv("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "1")
         monkeypatch.setattr(secrets_mod, "get_backend", MacOSBackend)
 
         def timeout(

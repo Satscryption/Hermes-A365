@@ -383,7 +383,6 @@ def test_update_endpoint_apply_updates_bot_and_sidecar_without_disabling_channel
             sidecar_path=sidecar,
         )
     )
-
     result = apply_update_endpoint_plan(plan, runner=runner)
 
     assert result.endpoint_updated is True
@@ -849,7 +848,7 @@ def test_cleanup_refuses_sidecar_bound_to_other_agent(tmp_path: Path) -> None:
     assert sidecar.exists()
 
 
-def test_cleanup_legacy_sidecar_without_agent_name_is_refused(
+def test_cleanup_legacy_sidecar_without_agent_name_uses_live_binding_and_confirm(
     tmp_path: Path,
 ) -> None:
     sidecar = _write_sidecar(tmp_path)
@@ -862,10 +861,83 @@ def test_cleanup_legacy_sidecar_without_agent_name_is_refused(
         BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar)
     )
 
-    with pytest.raises(BotServiceError, match="unbound legacy sidecar"):
-        apply_cleanup_plan(plan, runner=runner)
-    assert runner.calls == []
-    assert sidecar.exists()
+    result = apply_cleanup_plan(plan, runner=runner, now=_now)
+
+    assert result.bot_deleted is True
+    assert result.sidecar_removed is True
+    assert result.sidecar_backup_path is not None
+    assert result.sidecar_backup_path.exists()
+    assert not sidecar.exists()
+
+
+def test_update_migrates_verified_legacy_sidecar_to_bound_v2(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = 1
+    raw.pop("agentName")
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+            legacy_binding_confirmation="Hermes Inbox Helper",
+        )
+    )
+    assert "--confirm-legacy-binding='Hermes Inbox Helper'" in plan.render_human()
+
+    result = apply_update_endpoint_plan(plan, runner=runner)
+
+    updated = BotServiceConfig.from_file(sidecar)
+    assert updated.schemaVersion == SIDECAR_SCHEMA_VERSION
+    assert updated.agentName == "Hermes Inbox Helper"
+    assert any("migrated legacy sidecar" in message for message in result.messages)
+    backups = list(tmp_path.glob("a365.bot-service.config.backup-*.json"))
+    assert len(backups) == 1
+    assert json.loads(backups[0].read_text())["schemaVersion"] == 1
+
+
+@pytest.mark.parametrize("confirmation", [None, "Other Agent"])
+def test_update_refuses_legacy_binding_without_exact_confirmation_before_mutation(
+    tmp_path: Path, confirmation: str | None
+) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = 1
+    raw.pop("agentName")
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+            legacy_binding_confirmation=confirmation,
+        )
+    )
+
+    with pytest.raises(BotServiceError, match="--confirm-legacy-binding"):
+        apply_update_endpoint_plan(plan, runner=runner)
+
+    assert not any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
+    assert json.loads(sidecar.read_text())["schemaVersion"] == 1
+
+
+def test_parser_accepts_explicit_legacy_binding_confirmation() -> None:
+    args = build_parser().parse_args(
+        [
+            "update-endpoint",
+            "--agent-name",
+            "Hermes Inbox Helper",
+            "--url",
+            "https://example.test/api/messages",
+            "--confirm-legacy-binding",
+            "Hermes Inbox Helper",
+        ]
+    )
+
+    assert args.confirm_legacy_binding == "Hermes Inbox Helper"
 
 
 def test_create_apply_writes_agent_name_into_sidecar(tmp_path: Path) -> None:
@@ -1339,6 +1411,25 @@ def test_mutation_refuses_live_bot_identity_drift(tmp_path: Path, drift: str) ->
     )
 
     with pytest.raises(BotServiceError, match="does not match"):
+        apply_update_endpoint_plan(plan, runner=runner)
+
+    assert not any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
+
+
+def test_mutation_refuses_live_bot_without_arm_resource_id(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    bot = FakeRunner._bot()
+    bot.pop("id")
+    runner = FakeRunner(bot=bot, teams=FakeRunner._teams())
+    plan = build_update_endpoint_plan(
+        BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example",
+            sidecar_path=sidecar,
+        )
+    )
+
+    with pytest.raises(BotServiceError, match="omitted its ARM resource id"):
         apply_update_endpoint_plan(plan, runner=runner)
 
     assert not any(call[:3] == ["az", "bot", "update"] for call in runner.calls)
