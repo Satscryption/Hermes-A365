@@ -2512,6 +2512,15 @@ class TestActivityDeliveryId:
 
 
 class TestIdempotencyCache:
+    def test_forget_allows_retry(self) -> None:
+        cache = _IdempotencyCache()
+        assert cache.is_duplicate("retryable", now=100.0) is False
+        assert cache.is_duplicate("retryable", now=101.0) is True
+
+        cache.forget("retryable")
+
+        assert cache.is_duplicate("retryable", now=102.0) is False
+
     def test_first_call_records_and_returns_false(self) -> None:
         cache = _IdempotencyCache()
         assert cache.is_duplicate("conv-1:abc", now=100.0) is False

@@ -73,8 +73,10 @@ import os
 import re
 import secrets
 import stat
+import threading
 import time
 import uuid
+from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -111,6 +113,221 @@ from hermes_a365.secrets_provider import (  # noqa: E402
 # Plugin-local imports — these don't depend on the Hermes harness.
 from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 
+_AGENT_TURN_LIFECYCLE: ContextVar[tuple[int, str, int, int, asyncio.Event] | None] = ContextVar(
+    "agent365_agent_turn_lifecycle", default=None
+)
+_PERSIST_STATE_GUARD = threading.Lock()
+_PERSIST_STATES: dict[str, dict[str, Any]] = {}
+_MEDIA_STATE_GUARD = threading.Lock()
+_MEDIA_STATES: dict[str, dict[str, Any]] = {}
+
+
+class _PreAuthBodyTimeout(Exception):
+    pass
+
+
+def _persist_state(path: Path) -> dict[str, Any]:
+    key = str(path.expanduser().resolve(strict=False))
+    return _PERSIST_STATES.setdefault(
+        key,
+        {
+            "lock": threading.Lock(),
+            "next": 0,
+            "written": 0,
+            "owner_next": 0,
+            "current_owner": 0,
+            "handoff_owner": 0,
+            "handoff_cutoff": 0,
+            "pending": set(),
+            "mutation_next": 0,
+            "mutations": set(),
+            "retired_owners": {},
+        },
+    )
+
+
+def _claim_persist_owner(
+    path: Path,
+) -> tuple[dict[str, Any], int, int, int] | None:
+    with _PERSIST_STATE_GUARD:
+        state = _persist_state(path)
+        if int(state["handoff_owner"]):
+            return None
+        previous_owner = int(state["current_owner"])
+        state["owner_next"] += 1
+        owner = int(state["owner_next"])
+        state["handoff_owner"] = owner
+        state["handoff_cutoff"] = state["next"]
+        return (
+            state,
+            owner,
+            int(state["handoff_cutoff"]),
+            previous_owner,
+        )
+
+
+def _reserve_persist_sequence(
+    path: Path, owner: int
+) -> tuple[dict[str, Any], int | None]:
+    with _PERSIST_STATE_GUARD:
+        state = _persist_state(path)
+        current_owner = int(state["current_owner"])
+        handoff_owner = int(state["handoff_owner"])
+        if owner != current_owner:
+            return state, None
+        state["next"] += 1
+        sequence = int(state["next"])
+        state["pending"].add(sequence)
+        if handoff_owner:
+            state["handoff_cutoff"] = sequence
+        return state, sequence
+
+
+def _reserve_persist_mutation(
+    path: Path, owner: int
+) -> tuple[dict[str, Any], int | None]:
+    with _PERSIST_STATE_GUARD:
+        state = _persist_state(path)
+        if owner != int(state["current_owner"]):
+            return state, None
+        state["mutation_next"] += 1
+        mutation = int(state["mutation_next"])
+        state["mutations"].add(mutation)
+        return state, mutation
+
+
+def _promote_persist_mutation(
+    state: dict[str, Any], mutation: int, owner: int
+) -> int | None:
+    """Atomically turn a mutation lease into its post-mutation write order."""
+    with _PERSIST_STATE_GUARD:
+        state["mutations"].discard(mutation)
+        if owner != int(state["current_owner"]):
+            return None
+        state["next"] += 1
+        sequence = int(state["next"])
+        state["pending"].add(sequence)
+        if int(state["handoff_owner"]):
+            state["handoff_cutoff"] = sequence
+        return sequence
+
+
+def _complete_persist_mutation(state: dict[str, Any], mutation: int) -> None:
+    with _PERSIST_STATE_GUARD:
+        state["mutations"].discard(mutation)
+
+
+def _persist_write_is_admitted(
+    state: dict[str, Any], owner: int, sequence: int
+) -> bool:
+    with _PERSIST_STATE_GUARD:
+        return owner == int(state["current_owner"]) or sequence <= int(
+            state["handoff_cutoff"]
+        )
+
+
+def _complete_persist_sequence(state: dict[str, Any], sequence: int) -> None:
+    with _PERSIST_STATE_GUARD:
+        state["pending"].discard(sequence)
+
+
+def _registry_fingerprint(registry: ConversationRegistry) -> bytes:
+    payload = json.dumps(
+        registry.to_payload(),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+    return hashlib.sha256(payload).digest()
+
+
+def _media_cache_state(path: Path) -> dict[str, Any]:
+    key = str(path.expanduser().resolve(strict=False))
+    with _MEDIA_STATE_GUARD:
+        return _MEDIA_STATES.setdefault(
+            key,
+            {
+                "lock": threading.Lock(),
+                "reserved": 0,
+                "inflight": set(),
+                "leased": set(),
+            },
+        )
+
+
+class _PreAuthAdmissionMiddleware:
+    def __init__(
+        self,
+        app: Any,
+        *,
+        semaphore: asyncio.Semaphore,
+        owner: Any,
+    ) -> None:
+        self.app = app
+        self.semaphore = semaphore
+        self.owner = owner
+
+    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        if self.semaphore.locked():
+            body = b'{"status":"unavailable","reason":"pre_auth_backlog_full"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.semaphore.acquire()
+        task = asyncio.current_task()
+        if task is not None:
+            self.owner._pre_auth_tasks.add(task)
+            task.add_done_callback(self.owner._pre_auth_tasks.discard)
+        body_complete = False
+        deadline = asyncio.get_running_loop().time() + _PRE_AUTH_BODY_TIMEOUT_SEC
+
+        async def receive_with_deadline() -> Any:
+            nonlocal body_complete
+            if body_complete:
+                return await receive()
+            remaining = deadline - asyncio.get_running_loop().time()
+            try:
+                message = await asyncio.wait_for(receive(), timeout=max(0, remaining))
+            except TimeoutError as exc:
+                raise _PreAuthBodyTimeout from exc
+            if message.get("type") == "http.disconnect" or not message.get(
+                "more_body", False
+            ):
+                body_complete = True
+            return message
+
+        try:
+            await self.app(scope, receive_with_deadline, send)
+        except _PreAuthBodyTimeout:
+            body = b'{"status":"unavailable","reason":"request_body_timeout"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 408,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+        finally:
+            if task is not None:
+                self.owner._pre_auth_tasks.discard(task)
+            self.semaphore.release()
+
 # Bridge helpers are imported lazily inside methods so missing optional
 # extras (e.g. fastapi for `activity-bridge serve`) produce a clear runtime
 # error rather than blowing up at gateway-load time.
@@ -129,6 +346,7 @@ _MAX_INBOUND_ATTACHMENTS = 8
 _MAX_INBOUND_ACTIVITY_MEDIA_BYTES = 50 * 1024 * 1024
 _MEDIA_CACHE_QUOTA_BYTES = 256 * 1024 * 1024
 _MEDIA_CACHE_TTL_SEC = 24 * 3600.0
+_MAX_MEDIA_CACHE_FILES = 4096
 _MEDIA_ACTIVITY_DEADLINE_SEC = 60.0
 
 # #76c — outbound Teams file transfer. A local file is offered via a
@@ -379,6 +597,13 @@ _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
 _MAX_COALESCED_REPLY_SURVIVORS = _MAX_COALESCED_REPLY_GENERATIONS * 3
+_MAX_INBOUND_TASKS = _MAX_COALESCED_REPLY_GENERATIONS
+_MAX_PRE_AUTH_REQUESTS = 32
+_PRE_AUTH_BODY_TIMEOUT_SEC = 15.0
+_UVICORN_STARTUP_TIMEOUT_SEC = 10.0
+_PERSIST_HANDOFF_TIMEOUT_SEC = 10.0
+_MAX_ACTIVE_AGENT_TURNS = _MAX_INBOUND_TASKS
+_MAX_LIFECYCLE_OWNER_SURVIVORS = _MAX_INBOUND_TASKS * 2
 _MAX_CHAT_LIFECYCLE_GENERATIONS = 4096
 _MAX_COALESCED_TURN_TARGETS_PER_CHAT = 64
 _MAX_COALESCED_TURN_TARGETS = 2048
@@ -692,9 +917,16 @@ class Agent365Adapter(BasePlatformAdapter):
                 / "conversations.json"
             )
         )
-        self._conversations: ConversationRegistry = ConversationRegistry.load(
-            self._conversations_path
-        )
+        with _PERSIST_STATE_GUARD:
+            initial_persist_state = _persist_state(self._conversations_path)
+        with initial_persist_state["lock"]:
+            self._conversations: ConversationRegistry = ConversationRegistry.load(
+                self._conversations_path
+            )
+            self._persist_loaded_sequence = int(initial_persist_state["written"])
+            self._persist_loaded_fingerprint = _registry_fingerprint(
+                self._conversations
+            )
 
         # Slice 19x-d (#4): conversations registry prune threshold.
         # Default 30 days matches Hermes' SessionStore reset policy.
@@ -739,11 +971,21 @@ class Agent365Adapter(BasePlatformAdapter):
         self._lifecycle_lock = asyncio.Lock()
         self._disconnecting = False
         self._disconnect_cleanup_active = False
+        self._connect_starting = False
+        self._connect_failed = False
+        self._connect_ready = asyncio.Event()
+        self._connect_ready.set()
         self._lifecycle_generation = 0
         self._chat_lifecycle_sequence = 0
         self._chat_lifecycle_generation: dict[str, int] = {}
         self._retiring_chats: set[str] = set()
+        self._registry_evicting_chats: set[str] = set()
+        self._registry_eviction_tasks: dict[str, asyncio.Task[bool]] = {}
         self._chat_teardown_tasks: dict[str, asyncio.Task[None]] = {}
+        self._inbound_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
+        self._pre_auth_tasks: set[asyncio.Task[Any]] = set()
+        self._pre_auth_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
+        self._pre_auth_semaphore = asyncio.Semaphore(_MAX_PRE_AUTH_REQUESTS)
 
         # Slice 19s — per-stream state for BF streaming-response protocol.
         # Keyed on the Hermes-side ``message_id`` (the activity id returned
@@ -775,6 +1017,8 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_reply_tasks: dict[str, asyncio.Task] = {}
         self._coalesced_reply_survivors: dict[asyncio.Task[Any], str] = {}
         self._coalesced_reply_survivor_count_by_chat: dict[str, int] = {}
+        self._lifecycle_owner_survivors: dict[asyncio.Task[Any], str] = {}
+        self._lifecycle_owner_survivor_count_by_chat: dict[str, int] = {}
         self._coalesced_delivery_tail_by_turn: dict[
             tuple[str, str], asyncio.Event
         ] = {}
@@ -814,13 +1058,20 @@ class Agent365Adapter(BasePlatformAdapter):
         # handle_message, includes turns suspended awaiting a human
         # approval/clarify. Self-cleans mappings whose session has ended.
         self._session_key_to_conv: dict[str, str] = {}
+        self._agent_turn_guards: dict[str, asyncio.Event] = {}
+        self._agent_turn_admissions: dict[str, asyncio.Task[Any]] = {}
+        self._media_leases_by_session: dict[str, set[Path]] = {}
 
-        # M11 (#105): serialize registry saves. _persist_conversations builds
-        # its snapshot AND runs the off-loop write while holding this lock, so
-        # two concurrent inbounds can't let an older snapshot's os.replace land
-        # after a newer one's (which would silently stale/drop entries on disk).
-        # The lock is async — the event loop keeps serving during a write.
-        self._persist_lock = asyncio.Lock()
+        # M11 (#105): registry snapshots receive a process-wide, per-path
+        # sequence before their off-loop write is admitted. The shared writer
+        # skips an older snapshot if a replacement adapter already landed a
+        # newer one for the same path.
+        self._persist_tasks: set[asyncio.Task[None]] = set()
+        self._persist_semaphore = asyncio.Semaphore(_MAX_INBOUND_TASKS)
+        self._persist_owner_sequence: int | None = None
+        self._persist_previous_owner_sequence: int | None = None
+        self._persist_activation_lock = asyncio.Lock()
+        self._persist_activation_task: asyncio.Task[int] | None = None
 
         # Slice 19s-bis follow-up — Hermes' stream consumer can call
         # ``edit_message`` more than once with the same ``message_id``
@@ -1043,6 +1294,14 @@ class Agent365Adapter(BasePlatformAdapter):
             bridge.BoundedRequestBodyMiddleware,
             max_bytes=bridge.MAX_ACTIVITY_BODY_BYTES,
         )
+        # Starlette wraps middleware in reverse registration order. Admission
+        # is outermost so slow/chunked bodies are counted before buffering; the
+        # inner limiter still bounds every admitted body before JWT work.
+        app.add_middleware(
+            _PreAuthAdmissionMiddleware,
+            semaphore=self._pre_auth_semaphore,
+            owner=self,
+        )
 
         # Caches are bound here so build_app() is callable from tests
         # without having to also call connect(). Production connect()
@@ -1076,6 +1335,19 @@ class Agent365Adapter(BasePlatformAdapter):
             activity: dict[str, Any] = Body(...),  # noqa: B008
             authorization: str | None = Header(default=None),
         ) -> Any:
+            if self._connect_failed:
+                return JSONResponse(
+                    {"status": "unavailable", "reason": "connect_failed"},
+                    status_code=503,
+                )
+            if self._connect_starting:
+                await self._connect_ready.wait()
+                if self._connect_failed:
+                    return JSONResponse(
+                        {"status": "unavailable", "reason": "connect_failed"},
+                        status_code=503,
+                    )
+            await self._activate_persist_owner()
             try:
                 bridge._validate_activity_structure(activity)
             except ValueError as exc:
@@ -1102,6 +1374,17 @@ class Agent365Adapter(BasePlatformAdapter):
                     status_code=403,
                     detail="untrusted serviceUrl",
                 )
+
+            _in_conv = activity.get("conversation")
+            _in_conv = _in_conv if isinstance(_in_conv, dict) else {}
+            _in_from = activity.get("from")
+            _in_from = _in_from if isinstance(_in_from, dict) else {}
+            chat_id = str(_in_conv.get("id") or "")
+            lifecycle_action = _lifecycle_registry_action(activity)
+            request_generation = self._lifecycle_generation
+            request_chat_generation = self._chat_generation(chat_id)
+            request_client = self._http_client
+            self._register_pre_auth_chat_task(chat_id)
 
             # Bearer presence check (shared by Path A and Path B).
             try:
@@ -1171,14 +1454,24 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     raise HTTPException(status_code=403, detail="invalid bearer token") from e
 
-            _in_conv = activity.get("conversation")
-            _in_conv = _in_conv if isinstance(_in_conv, dict) else {}
-            _in_from = activity.get("from")
-            _in_from = _in_from if isinstance(_in_from, dict) else {}
+            if self._disconnecting:
+                return JSONResponse(
+                    {"status": "unavailable", "reason": "disconnecting"},
+                    status_code=503,
+                )
+            if not self._lifecycle_is_current(
+                request_generation, request_client
+            ) or not self._chat_lifecycle_is_current(
+                chat_id, request_chat_generation
+            ):
+                return JSONResponse(
+                    {"status": "unavailable", "reason": "lifecycle_changed"},
+                    status_code=503,
+                )
+
             sender_ids = bridge._activity_user_candidates(activity)
             authorized_sender_id = bridge._canonical_activity_user(activity)
             chat_type = bridge._activity_chat_type(activity)
-            chat_id = str(_in_conv.get("id") or "")
             if bridge._activity_requires_end_user_auth(activity):
                 auth_check = getattr(self, "_is_sender_authorized", None)
                 if callable(auth_check):
@@ -1221,6 +1514,24 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not decision:
                     logger.warning("inbound 403 reason=unauthorized-end-user")
                     raise HTTPException(status_code=403, detail="end user is not authorized")
+
+            if self._disconnecting:
+                return JSONResponse(
+                    {"status": "unavailable", "reason": "disconnecting"},
+                    status_code=503,
+                )
+            if (
+                chat_id in self._retiring_chats or chat_id in self._registry_evicting_chats
+            ) and lifecycle_action != "evict":
+                return JSONResponse({"status": "acked", "reason": "conversation_retiring"})
+            # The eviction request owns teardown and must not register itself
+            # as message work: its child teardown task cancels every other
+            # inbound owner for the chat.
+            if lifecycle_action != "evict" and not self._register_inbound_task(chat_id):
+                return JSONResponse(
+                    {"status": "unavailable", "reason": "inbound_backlog_full"},
+                    status_code=503,
+                )
 
             logger.info(
                 "inbound activity type=%s action=%s channelId=%s from=%s "
@@ -1300,7 +1611,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 # must be the top-level body.
                 return JSONResponse(resp.body, status_code=resp.status)
 
-            # Slice 19i — dedupe (conversationId, activityId).
+            # Slice 19i — dedupe (conversationId, activityId). A retryable
+            # teardown-backlog response forgets its key below so the connector
+            # can retry; successful lifecycle controls remain deduped so a
+            # stale remove/add retry cannot cross a later reinstall/uninstall.
             delivery_id = bridge._activity_delivery_id(
                 activity,
                 validated_path=validated_path or "",
@@ -1333,7 +1647,6 @@ class Agent365Adapter(BasePlatformAdapter):
             # user-message activity id, so ``send()`` must route via the
             # proactive ``sendToConversation`` path, never replyToActivity.
             # Out of the agent loop either way — ack-and-bail.
-            lifecycle_action = _lifecycle_registry_action(activity)
             if lifecycle_action is not None:
                 conv = activity.get("conversation")
                 lifecycle_conv_id = (
@@ -1347,14 +1660,27 @@ class Agent365Adapter(BasePlatformAdapter):
                     # not make cleanup depend on projecting unrelated fields:
                     # an oversized activity id/name must not leave stale
                     # registry, stream, or watchdog state behind.
-                    if lifecycle_conv_id:
-                        await self._teardown_chat_state(lifecycle_conv_id)
-                        self._seen_inbounds_this_lifetime.discard(
-                            lifecycle_conv_id
+                    if lifecycle_conv_id and not await self._evict_conversation(
+                        lifecycle_conv_id
+                    ):
+                        if delivery_id is not None:
+                            self._idempotency_cache.forget(delivery_id)
+                        return JSONResponse(
+                            {
+                                "status": "unavailable",
+                                "reason": "eviction_backlog_full",
+                            },
+                            status_code=503,
                         )
-                        if self._conversations.evict(lifecycle_conv_id):
-                            await self._persist_conversations()
                 else:
+                    if not self._inbound_lifecycle_is_current(
+                        chat_id,
+                        request_generation,
+                        request_chat_generation,
+                    ):
+                        return JSONResponse(
+                            {"status": "acked", "reason": "lifecycle_changed"}
+                        )
                     ref = ConversationRef.from_activity(activity)
                 if ref is not None:
                     # L4 (#100, #106 review follow-up): stamp the JWT-validated
@@ -1369,10 +1695,27 @@ class Agent365Adapter(BasePlatformAdapter):
                     # must NEVER overwrite a richer captured user-message ref.
                     existing = self._conversations.get(ref.conversation_id)
                     if existing is None or not existing.raw:
-                        self._conversations.upsert(ref)
-                        # M11 (#105): lifecycle capture is a growth path too.
-                        self._enforce_registry_cap(ref.conversation_id)
-                        await self._persist_conversations()
+                        reservation = await self._reserve_registry_mutation()
+                        if reservation is None:
+                            if delivery_id is not None:
+                                self._idempotency_cache.forget(delivery_id)
+                            return JSONResponse(
+                                {
+                                    "status": "unavailable",
+                                    "reason": "persistence_handoff",
+                                },
+                                status_code=503,
+                            )
+                        try:
+                            self._conversations.upsert(ref)
+                            # M11 (#105): lifecycle capture is a growth path too.
+                            self._enforce_registry_cap(ref.conversation_id)
+                        except BaseException:
+                            _complete_persist_mutation(
+                                reservation[0], reservation[1]
+                            )
+                            raise
+                        await self._persist_conversations(reservation)
                 logger.info(
                     "inbound lifecycle type=%s action=%s conv=%s",
                     str(activity.get("type") or ""),
@@ -1388,6 +1731,13 @@ class Agent365Adapter(BasePlatformAdapter):
             if not _should_dispatch(activity):
                 return JSONResponse({"status": "acked"})
 
+            if not self._inbound_lifecycle_is_current(
+                chat_id,
+                request_generation,
+                request_chat_generation,
+            ):
+                return JSONResponse({"status": "acked", "reason": "lifecycle_changed"})
+
             # Dispatchable messages need a real activity id: the steady-state
             # outbound path replies to that activity. Lifecycle/control events
             # may legitimately omit it, but they have already acked above.
@@ -1397,6 +1747,19 @@ class Agent365Adapter(BasePlatformAdapter):
                     "inbound acked without dispatch: missing or invalid activity id"
                 )
                 return JSONResponse({"status": "acked", "reason": "unroutable"})
+
+            admission_event = self._activity_to_event(
+                activity,
+                media=([], [], MessageType.TEXT),
+                authorized_user_id=authorized_sender_id,
+            )
+            sk = self._session_key_for(admission_event)
+            admission_key = sk or f"agent365:{chat_id}"
+            if not self._reserve_agent_turn_admission(admission_key):
+                return JSONResponse(
+                    {"status": "unavailable", "reason": "active_turns_full"},
+                    status_code=503,
+                )
 
             # Slice 19o — upsert into the durable registry. ``send()``,
             # ``send_typing()``, and ``send_image()`` all look up by
@@ -1420,52 +1783,132 @@ class Agent365Adapter(BasePlatformAdapter):
             # L4 (#100): stamp the validated path so later decoupled mints
             # off this ref bind to it, not the body.
             ref.validated_path = validated_path
-            self._capture_coalesced_turn_target(ref)
-            self._conversations.upsert(ref)
-            # Slice 19x-e (#27): record that this gateway lifetime
-            # has captured an inbound for this chat. Drives the
-            # send() gate that picks replyToActivity vs
-            # sendToConversation. Per-lifetime, not persisted.
-            seen = self._seen_inbounds_this_lifetime
-            seen.add(ref.conversation_id)
-            # L2 (#105): bound the set, but NEVER evict the chat we just
-            # received — the send() gate above routes reply-vs-proactive
-            # off its membership, so evicting it would misroute THIS turn's
-            # response to sendToConversation. Trim arbitrary OTHER entries
-            # down to the cap (set.pop() can't hit a discarded key).
-            if len(seen) > _MAX_SEEN_INBOUNDS:
-                seen.discard(ref.conversation_id)
-                # ``and seen`` guards the degenerate cap<=0 case (would
-                # otherwise pop() an empty set → KeyError).
-                while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
-                    seen.pop()
+            reservation = await self._reserve_registry_mutation()
+            if reservation is None:
+                if delivery_id is not None:
+                    self._idempotency_cache.forget(delivery_id)
+                return JSONResponse(
+                    {"status": "unavailable", "reason": "persistence_handoff"},
+                    status_code=503,
+                )
+            try:
+                self._capture_coalesced_turn_target(ref)
+                self._conversations.upsert(ref)
+                # Slice 19x-e (#27): record that this gateway lifetime
+                # has captured an inbound for this chat. Drives the
+                # send() gate that picks replyToActivity vs
+                # sendToConversation. Per-lifetime, not persisted.
+                seen = self._seen_inbounds_this_lifetime
                 seen.add(ref.conversation_id)
-            # M11 (#105): bound the registry on the hot growth path.
-            self._enforce_registry_cap(ref.conversation_id)
-            await self._persist_conversations()
+                # L2 (#105): bound the set, but NEVER evict the chat we just
+                # received — the send() gate above routes reply-vs-proactive
+                # off its membership, so evicting it would misroute THIS turn's
+                # response to sendToConversation. Trim arbitrary OTHER entries
+                # down to the cap (set.pop() can't hit a discarded key).
+                if len(seen) > _MAX_SEEN_INBOUNDS:
+                    seen.discard(ref.conversation_id)
+                    # ``and seen`` guards the degenerate cap<=0 case (would
+                    # otherwise pop() an empty set → KeyError).
+                    while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
+                        seen.pop()
+                    seen.add(ref.conversation_id)
+                # M11 (#105): bound the registry on the hot growth path.
+                self._enforce_registry_cap(ref.conversation_id)
+            except BaseException:
+                _complete_persist_mutation(reservation[0], reservation[1])
+                raise
+            await self._persist_conversations(reservation)
+
+            if not self._inbound_lifecycle_is_current(
+                chat_id,
+                request_generation,
+                request_chat_generation,
+            ):
+                return JSONResponse(
+                    {"status": "acked", "reason": "lifecycle_changed"}
+                )
 
             # Build event + dispatch through Hermes' loop.
             # #76 — download any inbound attachments (images/files) into the
             # media cache so the agent's auto-vision / document path sees them.
-            media = await self._extract_inbound_media(
-                activity, validated_path=validated_path
-            )
-            event = self._activity_to_event(
-                activity,
-                media=media,
-                authorized_user_id=authorized_sender_id,
-            )
-            await self.handle_message(event)
+            request_media_leases: set[Path] = set()
+            try:
+                media = await self._extract_inbound_media(
+                    activity,
+                    validated_path=validated_path,
+                    lease_paths=request_media_leases,
+                )
+            except BaseException:
+                self._release_media_paths(request_media_leases)
+                raise
+            if not self._inbound_lifecycle_is_current(
+                chat_id,
+                request_generation,
+                request_chat_generation,
+            ):
+                self._release_media_paths(request_media_leases)
+                return JSONResponse(
+                    {"status": "acked", "reason": "lifecycle_changed"}
+                )
+            try:
+                event = self._activity_to_event(
+                    activity,
+                    media=media,
+                    authorized_user_id=authorized_sender_id,
+                )
+            except BaseException:
+                self._release_media_paths(request_media_leases)
+                raise
             # M11 (#105): `handle_message` spawns the real turn as a base
             # background task and returns — the turn (incl. any approval/clarify
             # suspend) outlives this call. Record session_key → conversation_id
+            # before dispatch so concurrent teardown can find the task from the
+            # instant it is spawned. The ContextVar is inherited by that task
+            # and every child it creates; teardown sets the guard before asking
+            # Hermes to cancel the session, so a cancellation-resistant old turn
+            # remains unable to emit into a later reinstall of the same chat.
+            #
             # so `_active_conversation_ids()` can see this conversation as
             # in-flight (via the base's live `_active_sessions`) for the WHOLE
             # turn and keep the registry cap/prune from evicting its reply
             # target underneath it.
-            sk = self._session_key_for(event)
+            turn_guard = asyncio.Event()
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
+                turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
+                self._media_leases_by_session.setdefault(sk, set()).update(
+                    request_media_leases
+                )
+            turn_token = _AGENT_TURN_LIFECYCLE.set(
+                (
+                    id(self),
+                    ref.conversation_id,
+                    request_generation,
+                    request_chat_generation,
+                    turn_guard,
+                )
+            )
+            try:
+                await self.handle_message(event)
+            except BaseException:
+                if sk is not None:
+                    self._release_request_media_leases(sk, request_media_leases)
+                else:
+                    self._release_media_paths(request_media_leases)
+                raise
+            finally:
+                _AGENT_TURN_LIFECYCLE.reset(turn_token)
+            if sk is not None:
+                owner = getattr(self, "_session_tasks", {}).get(sk)
+                if isinstance(owner, asyncio.Task):
+                    self._watch_agent_turn_owner(sk, turn_guard, owner)
+                elif sk not in getattr(self, "_active_sessions", {}):
+                    self._agent_turn_guards.pop(sk, None)
+                    self._release_request_media_leases(sk, request_media_leases)
+                else:
+                    self._release_request_media_leases(sk, request_media_leases)
+            else:
+                self._release_media_paths(request_media_leases)
             return JSONResponse({"status": "dispatched"})
 
         return app
@@ -1480,7 +1923,33 @@ class Agent365Adapter(BasePlatformAdapter):
         home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
         return Path(home) / "platforms" / "agent365" / "media"
 
-    def _prepare_media_cache(self) -> Path:
+    @staticmethod
+    def _release_media_paths(paths: set[Path]) -> None:
+        by_cache: dict[Path, set[Path]] = {}
+        for path in paths:
+            by_cache.setdefault(path.parent, set()).add(path)
+        for cache_dir, cache_paths in by_cache.items():
+            media_state = _media_cache_state(cache_dir)
+            with media_state["lock"]:
+                media_state["leased"].difference_update(cache_paths)
+
+    def _release_session_media_leases(self, session_key: str) -> None:
+        paths = self._media_leases_by_session.pop(session_key, set())
+        self._release_media_paths(paths)
+
+    def _release_request_media_leases(
+        self, session_key: str, request_paths: set[Path]
+    ) -> None:
+        session_paths = self._media_leases_by_session.get(session_key)
+        if session_paths is not None:
+            session_paths.difference_update(request_paths)
+            if not session_paths:
+                self._media_leases_by_session.pop(session_key, None)
+        self._release_media_paths(request_paths)
+
+    def _prepare_media_cache(
+        self, *, protected_paths: set[Path] | None = None
+    ) -> Path:
         cache_dir = self._media_cache_dir()
         cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(cache_dir, 0o700)
@@ -1491,6 +1960,8 @@ class Agent365Adapter(BasePlatformAdapter):
             try:
                 st = item.lstat()
             except OSError:
+                continue
+            if protected_paths is not None and item in protected_paths:
                 continue
             if not stat.S_ISREG(st.st_mode) or item.is_symlink():
                 continue
@@ -1558,6 +2029,7 @@ class Agent365Adapter(BasePlatformAdapter):
         extension: str,
         max_bytes: int,
         chat_id: str = "",
+        lease_paths: set[Path] | None = None,
     ) -> tuple[str, int] | None:
         """Download one inbound attachment into the media cache; return its local
         path or None. Best-effort (a failed download is logged + skipped so the
@@ -1576,8 +2048,51 @@ class Agent365Adapter(BasePlatformAdapter):
         cap = min(_MAX_INBOUND_MEDIA_BYTES, max(0, max_bytes))
         if cap <= 0:
             return None
-        cache_dir = self._prepare_media_cache()
-        out = cache_dir / f"{secrets.token_hex(20)}{extension}"
+        cache_dir = self._media_cache_dir()
+        cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+        media_state = _media_cache_state(cache_dir)
+        with media_state["lock"]:
+            cache_dir = self._prepare_media_cache(
+                protected_paths=media_state["inflight"] | media_state["leased"]
+            )
+            used = 0
+            completed_files: list[tuple[float, int, Path]] = []
+            eviction_candidates: list[tuple[float, int, Path]] = []
+            for item in cache_dir.iterdir():
+                if item in media_state["inflight"]:
+                    continue
+                try:
+                    st = item.lstat()
+                except OSError:
+                    continue
+                if stat.S_ISREG(st.st_mode) and not item.is_symlink():
+                    used += st.st_size
+                    completed_files.append((st.st_mtime, st.st_size, item))
+                    if item not in media_state["leased"]:
+                        eviction_candidates.append((st.st_mtime, st.st_size, item))
+            # A byte quota alone still permits millions of zero-byte files.
+            # Reserve one inode under the same process-wide cache lock used for
+            # bytes, evicting the oldest completed files while never touching a
+            # download another adapter instance has in flight.
+            inflight_count = len(media_state["inflight"])
+            for _mtime, size, item in sorted(eviction_candidates):
+                if len(completed_files) + inflight_count < _MAX_MEDIA_CACHE_FILES:
+                    break
+                try:
+                    item.unlink()
+                except OSError:
+                    continue
+                used -= size
+                completed_files.remove((_mtime, size, item))
+            if len(completed_files) + inflight_count >= _MAX_MEDIA_CACHE_FILES:
+                logger.warning("agent365 inbound media cache file cap reserved; dropped")
+                return None
+            if used + int(media_state["reserved"]) + cap > _MEDIA_CACHE_QUOTA_BYTES:
+                logger.warning("agent365 inbound media cache quota reserved; dropped")
+                return None
+            media_state["reserved"] += cap
+            out = cache_dir / f"{secrets.token_hex(20)}{extension}"
+            media_state["inflight"].add(out)
         flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -1588,6 +2103,11 @@ class Agent365Adapter(BasePlatformAdapter):
             outbound_task, outbound_added = self._register_outbound_task(chat_id)
         except RuntimeError as e:
             logger.warning("agent365 inbound media download rejected: %s", e)
+            with media_state["lock"]:
+                media_state["reserved"] = max(
+                    0, int(media_state["reserved"]) - cap
+                )
+                media_state["inflight"].discard(out)
             return None
         try:
             # R2-P1: stream + bound. Never buffer resp.content (an allowed endpoint
@@ -1659,10 +2179,22 @@ class Agent365Adapter(BasePlatformAdapter):
             self._unregister_outbound_task(
                 chat_id, outbound_task, outbound_added
             )
+            with media_state["lock"]:
+                media_state["reserved"] = max(
+                    0, int(media_state["reserved"]) - cap
+                )
+                media_state["inflight"].discard(out)
+                if completed and lease_paths is not None:
+                    media_state["leased"].add(out)
+                    lease_paths.add(out)
         return (str(out), written) if completed and out.exists() else None
 
     async def _extract_inbound_media(
-        self, activity: dict[str, Any], *, validated_path: str | None
+        self,
+        activity: dict[str, Any],
+        *,
+        validated_path: str | None,
+        lease_paths: set[Path] | None = None,
     ) -> tuple[list[str], list[str], MessageType]:
         """#76(a/b): download Teams inbound attachments into the media cache so
         the agent's auto-vision (images) / document path sees them. Returns
@@ -1721,6 +2253,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     extension=ext,
                     max_bytes=remaining,
                     chat_id=chat_id,
+                    lease_paths=lease_paths,
                 )
                 if downloaded is not None:
                     path, size = downloaded
@@ -1753,6 +2286,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     extension=ext,
                     max_bytes=remaining,
                     chat_id=chat_id,
+                    lease_paths=lease_paths,
                 )
                 if downloaded is not None:
                     path, size = downloaded
@@ -1837,6 +2371,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._disconnecting:
             logger.warning("agent365 connect deferred while outbound tasks retire")
             return False
+        self._lifecycle_generation += 1
         bridge = _import_bridge()
         try:
             import httpx
@@ -1878,35 +2413,62 @@ class Agent365Adapter(BasePlatformAdapter):
             lifespan="on",
         )
         self._uvicorn_server = uvicorn.Server(config)
+        self._connect_starting = True
+        self._connect_failed = False
+        self._connect_ready.clear()
         self._uvicorn_task = asyncio.create_task(self._uvicorn_server.serve())
 
         # Wait for uvicorn to flip its ``started`` flag before we
         # report ready — otherwise the gateway's status check could
         # race the bind.
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            if getattr(self._uvicorn_server, "started", False):
-                break
-            if self._uvicorn_task.done():
-                exc = self._uvicorn_task.exception()
-                logger.error("agent365 uvicorn died during startup: %s", exc)
+        deadline = time.monotonic() + _UVICORN_STARTUP_TIMEOUT_SEC
+        try:
+            while time.monotonic() < deadline:
+                if getattr(self._uvicorn_server, "started", False):
+                    break
+                if self._uvicorn_task.done():
+                    exc = self._uvicorn_task.exception()
+                    logger.error("agent365 uvicorn died during startup: %s", exc)
+                    self._set_fatal_error(
+                        "uvicorn_startup_failed",
+                        str(exc) if exc else "unknown",
+                        retryable=True,
+                    )
+                    if await self._run_failed_connect_cleanup():
+                        raise asyncio.CancelledError()
+                    return False
+                await asyncio.sleep(0.05)
+            else:
+                logger.error("agent365 uvicorn did not start within 10s")
                 self._set_fatal_error(
-                    "uvicorn_startup_failed",
-                    str(exc) if exc else "unknown",
+                    "uvicorn_startup_timeout",
+                    "uvicorn did not flip started=True within 10s",
                     retryable=True,
                 )
+                if await self._run_failed_connect_cleanup():
+                    raise asyncio.CancelledError()
                 return False
-            await asyncio.sleep(0.05)
-        else:
-            logger.error("agent365 uvicorn did not start within 10s")
+        except asyncio.CancelledError:
+            await self._run_failed_connect_cleanup()
+            raise
+
+        try:
+            await self._activate_persist_owner(tentative=True)
+        except asyncio.CancelledError:
+            await self._run_failed_connect_cleanup()
+            raise
+        except Exception as e:
+            logger.error("agent365 persistence activation failed: %s", e)
+            if await self._run_failed_connect_cleanup():
+                raise asyncio.CancelledError() from e
             self._set_fatal_error(
-                "uvicorn_startup_timeout",
-                "uvicorn did not flip started=True within 10s",
-                retryable=True,
+                "persistence_activation_failed", str(e), retryable=True
             )
             return False
-
+        self._commit_persist_owner()
         self._mark_connected()
+        self._connect_starting = False
+        self._connect_ready.set()
         logger.info(
             "agent365 adapter listening on http://%s:%s/api/messages",
             self.host,
@@ -1914,11 +2476,44 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         return True
 
+    async def _cleanup_failed_connect_runtime(self) -> None:
+        http_client = self._http_client
+        self._http_client = None
+        self._connect_failed = True
+        self._connect_starting = False
+        self._connect_ready.set()
+        self._disconnecting = True
+        self._disconnect_cleanup_active = True
+        self._lifecycle_generation += 1
+        self._retire_all_agent_turns()
+        self._chat_lifecycle_generation.clear()
+        self._mark_disconnected()
+        await self._disconnect(http_client)
+        self._release_failed_persist_owner()
+
+    async def _run_failed_connect_cleanup(self) -> bool:
+        cleanup = asyncio.create_task(self._cleanup_failed_connect_runtime())
+        current = asyncio.current_task()
+        cancelled = bool(current is not None and current.cancelling())
+        if current is not None:
+            while current.cancelling():
+                current.uncancel()
+        while not cleanup.done():
+            try:
+                await asyncio.shield(cleanup)
+            except asyncio.CancelledError:
+                cancelled = True
+                if current is not None:
+                    current.uncancel()
+        cleanup.result()
+        return cancelled
+
     async def disconnect(self) -> None:
         async with self._lifecycle_lock:
             self._disconnecting = True
             self._disconnect_cleanup_active = True
             self._lifecycle_generation += 1
+            self._retire_all_agent_turns()
             self._chat_lifecycle_generation.clear()
             http_client = self._http_client
             self._http_client = None
@@ -1937,25 +2532,68 @@ class Agent365Adapter(BasePlatformAdapter):
     async def _disconnect(self, http_client: Any) -> None:
         current = asyncio.current_task()
         try:
-            await self._drain_chat_teardowns()
             await self._stop_uvicorn()
+            await self._drain_pre_auth_tasks(current)
+            await self.cancel_background_tasks()
+            await self._drain_chat_teardowns()
+            await self._drain_persist_tasks()
             await self._drain_coalesced_reply_tasks(current)
         finally:
             await self._finish_disconnect(http_client, current)
 
     async def _drain_chat_teardowns(self) -> None:
-        tasks = [task for task in self._chat_teardown_tasks.values() if not task.done()]
+        # One eviction owns its nested teardown and then durable persistence.
+        # Track the outer owner when present; counting both would double the
+        # admission bound and could drop the task that actually spans persist.
+        task_chats = {
+            task: chat_id
+            for chat_id, task in self._registry_eviction_tasks.items()
+            if not task.done()
+        }
+        owned_chats = set(task_chats.values())
+        task_chats.update(
+            {
+                task: chat_id
+                for chat_id, task in self._chat_teardown_tasks.items()
+                if chat_id not in owned_chats and not task.done()
+            }
+        )
+        if not task_chats:
+            return
+        done, pending = await asyncio.wait(
+            task_chats,
+            timeout=_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC,
+        )
+        for task in done:
+            self._consume_coalesced_reply_task_result(task)
+        if pending:
+            logger.warning(
+                "agent365 disconnect left %d lifecycle owner(s) draining",
+                len(pending),
+            )
+            for task in pending:
+                self._track_lifecycle_owner_survivor(task, task_chats[task])
+
+    async def _drain_pre_auth_tasks(
+        self, current: asyncio.Task[Any] | None
+    ) -> None:
+        tasks = {
+            task
+            for task in self._pre_auth_tasks
+            if task is not current and not task.done()
+        }
+        for task in tasks:
+            task.cancel()
         if not tasks:
             return
-        _done, pending = await asyncio.wait(
+        done, pending = await asyncio.wait(
             tasks,
             timeout=_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC,
         )
-        if pending:
-            logger.warning(
-                "agent365 disconnect left %d chat teardown(s) draining",
-                len(pending),
-            )
+        for task in done:
+            self._consume_coalesced_reply_task_result(task)
+        for task in pending:
+            self._track_lifecycle_owner_survivor(task, "")
 
     async def _stop_uvicorn(self) -> None:
         if self._uvicorn_server is not None:
@@ -1970,9 +2608,33 @@ class Agent365Adapter(BasePlatformAdapter):
             self._uvicorn_task = None
             self._uvicorn_server = None
 
+    async def _drain_persist_tasks(self) -> None:
+        tasks = {task for task in self._persist_tasks if not task.done()}
+        if (
+            self._persist_activation_task is not None
+            and not self._persist_activation_task.done()
+        ):
+            tasks.add(self._persist_activation_task)
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC,
+        )
+        for task in done:
+            self._consume_coalesced_reply_task_result(task)
+        if pending:
+            logger.warning(
+                "agent365 disconnect left %d registry write(s) draining",
+                len(pending),
+            )
+            for task in pending:
+                self._track_lifecycle_owner_survivor(task, "")
+
     async def _drain_coalesced_reply_tasks(
         self, current: asyncio.Task[Any] | None
     ) -> None:
+        existing_survivors = set(self._coalesced_reply_survivors)
         task_chats = dict(self._coalesced_reply_survivors)
         for message_id, task in self._coalesced_reply_tasks.items():
             state = self._coalesced_replies.get(message_id) or {}
@@ -1994,9 +2656,13 @@ class Agent365Adapter(BasePlatformAdapter):
         for chat_id, tasks in self._outbound_tasks_by_chat.items():
             for task in tasks:
                 task_chats[task] = chat_id
+        for chat_id, tasks in self._inbound_tasks_by_chat.items():
+            for task in tasks:
+                task_chats[task] = chat_id
         shutdown_tasks = [task for task in task_chats if task is not current]
         for task in shutdown_tasks:
-            task.cancel()
+            if task not in existing_survivors:
+                task.cancel()
         for message_id in list(self._coalesced_replies):
             self._drop_coalesced_reply_state(
                 message_id,
@@ -2016,7 +2682,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     len(pending),
                 )
                 for task in pending:
-                    task.cancel()
+                    if task not in existing_survivors:
+                        task.cancel()
                     self._track_coalesced_reply_survivor(
                         task, task_chats.get(task, "")
                     )
@@ -2059,9 +2726,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_targets.clear()
         self._coalesced_turn_target_order_by_chat.clear()
         self._coalesced_turn_target_count_by_chat.clear()
-        for stream_key, state in list(self._streams.items()):
+        for stream_key in list(self._streams):
             message_id = stream_key[1]
-            chat_id = str(state.get("chat_id") or "")
+            chat_id = stream_key[0]
             if chat_id:
                 self._record_recently_finalized(message_id, chat_id)
         self._streams.clear()
@@ -2076,13 +2743,27 @@ class Agent365Adapter(BasePlatformAdapter):
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
         self._card_capabilities.clear()
+        self._agent_turn_guards.clear()
+        self._session_key_to_conv.clear()
+        self._chat_teardown_tasks.clear()
+        self._registry_eviction_tasks.clear()
+        self._registry_evicting_chats.clear()
+        self._inbound_tasks_by_chat.clear()
+        self._pre_auth_tasks_by_chat.clear()
+        self._outbound_tasks_by_chat.clear()
+        self._card_action_tasks_by_chat.clear()
+        if not self._coalesced_reply_survivors and not self._lifecycle_owner_survivors:
+            self._retiring_chats.clear()
         try:
             if http_client is not None:
                 with contextlib.suppress(asyncio.CancelledError, Exception):
                     await http_client.aclose()
         finally:
             self._disconnect_cleanup_active = False
-            self._disconnecting = bool(self._coalesced_reply_survivors)
+            self._disconnecting = bool(
+                self._coalesced_reply_survivors
+                or self._lifecycle_owner_survivors
+            )
 
     @staticmethod
     def _consume_coalesced_reply_task_result(task: asyncio.Task[Any]) -> None:
@@ -2120,6 +2801,48 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._retiring_chats.discard(chat_id)
         if (
             not self._coalesced_reply_survivors
+            and not self._lifecycle_owner_survivors
+            and not self._disconnect_cleanup_active
+        ):
+            self._disconnecting = False
+        self._consume_coalesced_reply_task_result(task)
+
+    def _track_lifecycle_owner_survivor(
+        self, task: asyncio.Task[Any], chat_id: str
+    ) -> None:
+        if task in self._lifecycle_owner_survivors:
+            return
+        if (
+            len(self._lifecycle_owner_survivors)
+            >= _MAX_LIFECYCLE_OWNER_SURVIVORS
+        ):
+            logger.error("agent365 lifecycle owner survivor registry full")
+            task.add_done_callback(self._consume_coalesced_reply_task_result)
+            return
+        owner = str(chat_id)
+        self._lifecycle_owner_survivors[task] = owner
+        self._lifecycle_owner_survivor_count_by_chat[owner] = (
+            self._lifecycle_owner_survivor_count_by_chat.get(owner, 0) + 1
+        )
+        task.add_done_callback(self._lifecycle_owner_survivor_done)
+
+    def _lifecycle_owner_survivor_done(self, task: asyncio.Task[Any]) -> None:
+        chat_id = self._lifecycle_owner_survivors.pop(task, None)
+        if chat_id is not None:
+            count = self._lifecycle_owner_survivor_count_by_chat.get(chat_id, 0)
+            if count <= 1:
+                self._lifecycle_owner_survivor_count_by_chat.pop(chat_id, None)
+            else:
+                self._lifecycle_owner_survivor_count_by_chat[chat_id] = count - 1
+            if (
+                chat_id not in self._lifecycle_owner_survivor_count_by_chat
+                and chat_id not in self._coalesced_reply_survivor_count_by_chat
+                and chat_id not in self._chat_teardown_tasks
+            ):
+                self._retiring_chats.discard(chat_id)
+        if (
+            not self._lifecycle_owner_survivors
+            and not self._coalesced_reply_survivors
             and not self._disconnect_cleanup_active
         ):
             self._disconnecting = False
@@ -2128,6 +2851,8 @@ class Agent365Adapter(BasePlatformAdapter):
     def _register_outbound_task(
         self, chat_id: str
     ) -> tuple[asyncio.Task[Any] | None, bool]:
+        if not self._agent_turn_lifecycle_is_current():
+            raise RuntimeError("agent365 agent turn lifecycle changed")
         owner = str(chat_id)
         task = asyncio.current_task()
         if task is None:
@@ -2195,6 +2920,70 @@ class Agent365Adapter(BasePlatformAdapter):
             and (client is None or client is self._http_client)
         )
 
+    def _register_inbound_task(self, chat_id: str) -> bool:
+        task = asyncio.current_task()
+        if task is None:
+            return True
+        owner = str(chat_id)
+        tasks = self._inbound_tasks_by_chat.setdefault(owner, set())
+        if task in tasks:
+            return True
+        live_count = sum(len(items) for items in self._inbound_tasks_by_chat.values())
+        if live_count >= _MAX_INBOUND_TASKS:
+            if not tasks:
+                self._inbound_tasks_by_chat.pop(owner, None)
+            return False
+        tasks.add(task)
+        task.add_done_callback(
+            lambda completed, owner=owner: self._inbound_task_done(owner, completed)
+        )
+        return True
+
+    def _register_pre_auth_chat_task(self, chat_id: str) -> None:
+        task = asyncio.current_task()
+        if task is None:
+            return
+        owner = str(chat_id)
+        tasks = self._pre_auth_tasks_by_chat.setdefault(owner, set())
+        if task in tasks:
+            return
+        tasks.add(task)
+        task.add_done_callback(
+            lambda completed, owner=owner: self._pre_auth_chat_task_done(
+                owner, completed
+            )
+        )
+
+    def _pre_auth_chat_task_done(
+        self, chat_id: str, task: asyncio.Task[Any]
+    ) -> None:
+        tasks = self._pre_auth_tasks_by_chat.get(chat_id)
+        if tasks is None:
+            return
+        tasks.discard(task)
+        if not tasks:
+            self._pre_auth_tasks_by_chat.pop(chat_id, None)
+
+    def _inbound_task_done(self, chat_id: str, task: asyncio.Task[Any]) -> None:
+        tasks = self._inbound_tasks_by_chat.get(chat_id)
+        if tasks is None:
+            return
+        tasks.discard(task)
+        if not tasks:
+            self._inbound_tasks_by_chat.pop(chat_id, None)
+
+    def _inbound_lifecycle_is_current(
+        self,
+        chat_id: str,
+        generation: int,
+        chat_generation: int,
+    ) -> bool:
+        return (
+            self._lifecycle_is_current(generation)
+            and self._chat_lifecycle_is_current(chat_id, chat_generation)
+            and str(chat_id) not in self._registry_evicting_chats
+        )
+
     def _chat_generation(self, chat_id: str) -> int:
         return self._chat_lifecycle_generation.get(str(chat_id), 0)
 
@@ -2204,93 +2993,87 @@ class Agent365Adapter(BasePlatformAdapter):
             and generation == self._chat_generation(chat_id)
         )
 
-    def _advance_chat_generation(self, chat_id: str) -> int:
+    def _chat_has_live_lifecycle_state(
+        self,
+        chat_id: str,
+        active_conversation_ids: set[str] | None = None,
+    ) -> bool:
+        chat_id = str(chat_id)
+        if active_conversation_ids is None:
+            active_conversation_ids = self._active_conversation_ids()
+        return (
+            chat_id in active_conversation_ids
+            or chat_id in self._retiring_chats
+            or chat_id in self._registry_evicting_chats
+            or chat_id in self._chat_teardown_tasks
+            or bool(self._pre_auth_tasks_by_chat.get(chat_id))
+            or bool(self._inbound_tasks_by_chat.get(chat_id))
+            or bool(self._outbound_tasks_by_chat.get(chat_id))
+            or bool(self._card_action_tasks_by_chat.get(chat_id))
+            or self._coalesced_reply_survivor_count_by_chat.get(chat_id, 0) > 0
+            or self._lifecycle_owner_survivor_count_by_chat.get(chat_id, 0) > 0
+            or chat_id in self._active_stream_by_chat
+            or self._coalesced_generation_count_by_chat.get(chat_id, 0) > 0
+            or any(key[0] == chat_id for key in self._streams)
+            or any(
+                str(state.get("chat_id") or "") == chat_id
+                for state in self._coalesced_status.values()
+            )
+            or any(
+                str(pending.get("conversation_id") or "") == chat_id
+                for pending in self._pending_file_uploads.values()
+            )
+            or any(
+                str(capability.get("conversation_id") or "") == chat_id
+                for capability in self._card_capabilities.values()
+            )
+        )
+
+    def _advance_chat_generation(self, chat_id: str) -> int | None:
         chat_id = str(chat_id)
         if (
             chat_id not in self._chat_lifecycle_generation
             and len(self._chat_lifecycle_generation)
             >= _MAX_CHAT_LIFECYCLE_GENERATIONS
         ):
-            self._lifecycle_generation += 1
-            self._retire_lifecycle_bound_state()
-            self._chat_lifecycle_generation.clear()
-            logger.warning(
-                "agent365 chat lifecycle generation cap reached; "
-                "invalidated in-flight outbound operations"
-            )
+            active_conversation_ids = self._active_conversation_ids()
+            for candidate in list(self._chat_lifecycle_generation):
+                if not self._chat_has_live_lifecycle_state(
+                    candidate, active_conversation_ids
+                ):
+                    self._chat_lifecycle_generation.pop(candidate, None)
+                    break
+            if len(self._chat_lifecycle_generation) >= _MAX_CHAT_LIFECYCLE_GENERATIONS:
+                logger.warning(
+                    "agent365 chat lifecycle generation cap occupied by "
+                    "live chats; teardown admission deferred"
+                )
+                return None
         self._chat_lifecycle_sequence += 1
+        self._chat_lifecycle_generation.pop(chat_id, None)
         self._chat_lifecycle_generation[chat_id] = self._chat_lifecycle_sequence
         return self._chat_lifecycle_sequence
 
-    def _retire_lifecycle_bound_state(self) -> None:
-        task_chats: dict[asyncio.Task[Any], str] = {}
-        for message_id, task in self._coalesced_reply_tasks.items():
-            state = self._coalesced_replies.get(message_id) or {}
-            task_chats[task] = str(state.get("chat_id") or "")
-        for state in self._coalesced_replies.values():
-            chat_id = str(state.get("chat_id") or "")
-            for task in (
-                state.get("finalize_task"),
-                state.get("finalize_owner_task"),
-            ):
-                if isinstance(task, asyncio.Task):
-                    task_chats[task] = chat_id
-        for key, task in self._coalesced_status_tasks.items():
-            state = self._coalesced_status.get(key) or {}
-            task_chats[task] = str(state.get("chat_id") or "")
-        for chat_id, tasks in self._card_action_tasks_by_chat.items():
-            for task in tasks:
-                task_chats[task] = chat_id
-        for chat_id, tasks in self._outbound_tasks_by_chat.items():
-            for task in tasks:
-                task_chats[task] = chat_id
-        current = asyncio.current_task()
-        for task, chat_id in task_chats.items():
-            if task is current:
-                continue
-            task.cancel()
-            if not task.done():
-                self._track_coalesced_reply_survivor(task, chat_id)
-        if self._coalesced_reply_survivors:
-            self._disconnecting = True
-        for stream_key, state in list(self._streams.items()):
-            message_id = stream_key[1]
-            chat_id = str(state.get("chat_id") or "")
-            if chat_id:
-                self._record_recently_finalized(message_id, chat_id)
-        self._streams.clear()
-        self._active_stream_by_chat.clear()
-        for state in list(self._coalesced_replies.values()):
-            for task in (
-                state.get("finalize_task"),
-                state.get("finalize_owner_task"),
-            ):
-                if isinstance(task, asyncio.Task):
-                    task.cancel()
-        for task in list(self._coalesced_reply_tasks.values()):
-            task.cancel()
-        for message_id in list(self._coalesced_replies):
-            self._drop_coalesced_reply_state(
-                message_id,
-                restore_turn_target=False,
-            )
-        self._coalesced_reply_tasks.clear()
-        self._active_coalesced_reply_by_chat.clear()
-        self._active_coalesced_reply_by_turn.clear()
-        self._active_coalesced_reply_ids_by_chat.clear()
-        self._coalesced_delivery_tail_by_turn.clear()
-        self._coalesced_generation_count_by_chat.clear()
-        self._coalesced_generation_count_by_turn.clear()
-        self._coalesced_turn_owners.clear()
-        self._coalesced_turn_targets.clear()
-        self._coalesced_turn_target_order_by_chat.clear()
-        self._coalesced_turn_target_count_by_chat.clear()
-        for task in list(self._coalesced_status_tasks.values()):
-            task.cancel()
-        self._coalesced_status_tasks.clear()
-        self._coalesced_status.clear()
-        self._pending_file_uploads.clear()
-        self._card_capabilities.clear()
+    def _reserve_agent_turn_admission(self, session_key: str) -> bool:
+        active = set(getattr(self, "_active_sessions", {}) or {})
+        for key, task in list(self._agent_turn_admissions.items()):
+            if task.done():
+                self._agent_turn_admissions.pop(key, None)
+        if session_key in active or session_key in self._agent_turn_admissions:
+            return True
+        if len(active | set(self._agent_turn_admissions)) >= _MAX_ACTIVE_AGENT_TURNS:
+            return False
+        task = asyncio.current_task()
+        if task is None:
+            return False
+        self._agent_turn_admissions[session_key] = task
+
+        def release(completed: asyncio.Task[Any], *, key: str = session_key) -> None:
+            if self._agent_turn_admissions.get(key) is completed:
+                self._agent_turn_admissions.pop(key, None)
+
+        task.add_done_callback(release)
+        return True
 
     # ── Outbound ──────────────────────────────────────────────────────────
 
@@ -2311,6 +3094,69 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         except Exception:
             return None
+
+    def _watch_agent_turn_owner(
+        self,
+        session_key: str,
+        guard: asyncio.Event,
+        task: asyncio.Task[Any],
+    ) -> None:
+        task.add_done_callback(
+            lambda completed, key=session_key, owner_guard=guard: self._agent_turn_owner_done(
+                key, owner_guard, completed
+            )
+        )
+
+    def _agent_turn_owner_done(
+        self,
+        session_key: str,
+        guard: asyncio.Event,
+        task: asyncio.Task[Any],
+    ) -> None:
+        owner = getattr(self, "_session_tasks", {}).get(session_key)
+        if isinstance(owner, asyncio.Task) and owner is not task:
+            self._watch_agent_turn_owner(session_key, guard, owner)
+            return
+        if self._agent_turn_guards.get(session_key) is guard:
+            self._agent_turn_guards.pop(session_key, None)
+        self._release_session_media_leases(session_key)
+
+    def _agent_turn_lifecycle_is_current(self) -> bool:
+        token = _AGENT_TURN_LIFECYCLE.get()
+        if token is None:
+            return True
+        if token[0] != id(self):
+            return False
+        _adapter_id, source_chat_id, generation, chat_generation, guard = token
+        return (
+            not guard.is_set()
+            and self._lifecycle_is_current(generation)
+            and self._chat_lifecycle_is_current(source_chat_id, chat_generation)
+        )
+
+    def _retire_all_agent_turns(self) -> None:
+        for guard in self._agent_turn_guards.values():
+            guard.set()
+
+    async def _retire_chat_agent_turns(self, chat_id: str) -> None:
+        session_keys = [
+            session_key
+            for session_key, owner_chat_id in self._session_key_to_conv.items()
+            if owner_chat_id == str(chat_id)
+        ]
+        for session_key in session_keys:
+            guard = self._agent_turn_guards.pop(session_key, None)
+            if guard is not None:
+                guard.set()
+            try:
+                await self.cancel_session_processing(session_key)
+            except Exception:
+                logger.warning(
+                    "agent365 failed to cancel retired session %s",
+                    session_key,
+                    exc_info=True,
+                )
+            self._session_key_to_conv.pop(session_key, None)
 
     def _active_conversation_ids(self) -> set[str]:
         """Conversation ids whose Hermes turn is currently in flight — the set
@@ -2340,7 +3186,22 @@ class Agent365Adapter(BasePlatformAdapter):
             ),
         )
 
-    async def _persist_conversations(self) -> None:
+    async def _reserve_registry_mutation(
+        self,
+    ) -> tuple[dict[str, Any], int, int] | None:
+        """Reserve a handoff-visible lease before mutating the registry."""
+        owner = await self._activate_persist_owner()
+        state, mutation = _reserve_persist_mutation(
+            self._conversations_path, owner
+        )
+        if mutation is None:
+            return None
+        return state, mutation, owner
+
+    async def _persist_conversations(
+        self,
+        reservation: tuple[dict[str, Any], int, int] | None = None,
+    ) -> None:
         """Best-effort save of the registry, OFF the event loop (#105/M11).
 
         The registry snapshot (``to_payload``) is built on the loop thread —
@@ -2349,32 +3210,240 @@ class Agent365Adapter(BasePlatformAdapter):
         keeps a large save (~0.6s at 20k entries in the pre-M11 shape) from
         stalling inbound processing. Failures are logged, never raised.
 
-        The locked write is ``asyncio.shield``-ed: cancelling the caller (e.g.
-        on shutdown) must NOT release ``_persist_lock`` while the executor
-        thread is still writing — otherwise a newer save could acquire the
-        lock and ``os.replace`` first, then this older worker overwrites it
-        (#105/M11). Shield lets the inner locked write run to completion,
-        holding the lock, even when this coroutine is cancelled."""
-        await asyncio.shield(self._locked_persist())
-
-    async def _locked_persist(self) -> None:
-        """The serialized snapshot+write half of :meth:`_persist_conversations`
-        — held under ``_persist_lock`` for its whole duration so saves land in
-        order. Run only via the shielded wrapper above."""
-        async with self._persist_lock:
-            payload = self._conversations.to_payload()
-            path = self._conversations_path
-            registry_cls = type(self._conversations)
-            try:
-                await asyncio.get_event_loop().run_in_executor(
-                    None, registry_cls.write_payload, path, payload
-                )
-            except OSError as e:
-                logger.warning(
-                    "agent365 conversations: save failed for %s: %s",
+        The ordered write is ``asyncio.shield``-ed and retained: cancelling
+        the caller does not lose ownership of its executor work. A shared
+        per-path sequence makes stale writes no-op even across replacement
+        adapter instances."""
+        path = self._conversations_path
+        if reservation is None:
+            owner = await self._activate_persist_owner()
+            state, sequence = _reserve_persist_sequence(path, owner)
+            if sequence is None:
+                logger.info(
+                    "agent365 conversations: stale adapter save skipped for %s",
                     path,
-                    e,
                 )
+                return
+        else:
+            state, mutation, owner = reservation
+            sequence = _promote_persist_mutation(state, mutation, owner)
+            if sequence is None:
+                logger.info(
+                    "agent365 conversations: stale adapter mutation skipped for %s",
+                    path,
+                )
+                return
+        try:
+            await self._persist_semaphore.acquire()
+        except BaseException:
+            _complete_persist_sequence(state, sequence)
+            raise
+        try:
+            if sequence < int(state["written"]):
+                _complete_persist_sequence(state, sequence)
+                self._persist_semaphore.release()
+                return
+            payload = self._conversations.to_payload()
+            registry_cls = type(self._conversations)
+            task = asyncio.create_task(
+                self._write_persist(
+                    registry_cls,
+                    path,
+                    payload,
+                    state,
+                    sequence,
+                    owner,
+                )
+            )
+        except BaseException:
+            _complete_persist_sequence(state, sequence)
+            self._persist_semaphore.release()
+            raise
+        self._persist_tasks.add(task)
+        task.add_done_callback(self._persist_done)
+        await asyncio.shield(task)
+
+    async def _activate_persist_owner(self, *, tentative: bool = False) -> int:
+        async with self._persist_activation_lock:
+            task = self._persist_activation_task
+            if task is None:
+                task = asyncio.create_task(self._activate_persist_owner_impl())
+                self._persist_activation_task = task
+
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+                if tentative:
+                    task.cancel()
+            except BaseException:
+                # Read and normalize the retained task's terminal exception
+                # below so a failed claim always releases its handoff state.
+                break
+        try:
+            owner = task.result()
+        except BaseException:
+            self._release_failed_persist_owner()
+            raise
+        if not tentative:
+            self._commit_persist_owner()
+        if cancelled:
+            raise asyncio.CancelledError()
+        return owner
+
+    async def _activate_persist_owner_impl(self) -> int:
+        if self._persist_owner_sequence is not None:
+            return self._persist_owner_sequence
+        claim = _claim_persist_owner(self._conversations_path)
+        while claim is None:
+            await asyncio.sleep(0.01)
+            claim = _claim_persist_owner(self._conversations_path)
+        state, owner, _cutoff, previous_owner = claim
+        self._persist_owner_sequence = owner
+        self._persist_previous_owner_sequence = previous_owner
+        deadline = time.monotonic() + _PERSIST_HANDOFF_TIMEOUT_SEC
+
+        # Keep the previous owner live while this adapter is tentative. Every
+        # reservation it makes extends the handoff cutoff, so no accepted
+        # mutation is lost merely because a replacement is still starting.
+        while True:
+            with _PERSIST_STATE_GUARD:
+                cutoff = int(state["handoff_cutoff"])
+                pending = any(
+                    sequence <= cutoff for sequence in state["pending"]
+                ) or bool(state["mutations"])
+                if not pending:
+                    # Flip ownership under the same guard used to reserve a
+                    # sequence. The previous owner can no longer admit work,
+                    # while the handoff marker serializes later replacements
+                    # until this adapter has reloaded the completed snapshot.
+                    state["current_owner"] = owner
+                    break
+            if time.monotonic() >= deadline:
+                raise TimeoutError("conversation persistence handoff timed out")
+            await asyncio.sleep(0.01)
+
+        acquired = False
+        try:
+            while not state["lock"].acquire(blocking=False):
+                await asyncio.sleep(0.01)
+            acquired = True
+            if int(state["written"]) > self._persist_loaded_sequence:
+                if (
+                    _registry_fingerprint(self._conversations)
+                    != self._persist_loaded_fingerprint
+                ):
+                    raise RuntimeError(
+                        "conversation registry mutated before persistence "
+                        "ownership activation"
+                    )
+                self._conversations = type(self._conversations).load(
+                    self._conversations_path
+                )
+                self._persist_loaded_sequence = int(state["written"])
+                self._persist_loaded_fingerprint = _registry_fingerprint(
+                    self._conversations
+                )
+        finally:
+            if acquired:
+                state["lock"].release()
+        with _PERSIST_STATE_GUARD:
+            if int(state["handoff_owner"]) == owner:
+                state["handoff_owner"] = 0
+        return owner
+
+    def _commit_persist_owner(self) -> None:
+        """Make the current ownership handoff ineligible for rollback."""
+        self._persist_previous_owner_sequence = None
+
+    def _release_failed_persist_owner(self) -> None:
+        owner = self._persist_owner_sequence
+        previous_owner = self._persist_previous_owner_sequence
+        if owner is None:
+            self._persist_activation_task = None
+            return
+        if previous_owner is None:
+            return
+        with _PERSIST_STATE_GUARD:
+            state = _persist_state(self._conversations_path)
+            retired = state["retired_owners"]
+            fallback = int(previous_owner)
+            traversed: list[int] = []
+            while fallback in retired:
+                traversed.append(fallback)
+                fallback = int(retired[fallback])
+            for retired_owner in traversed:
+                retired.pop(retired_owner, None)
+            was_handoff = int(state["handoff_owner"]) == owner
+            if was_handoff:
+                state["handoff_owner"] = 0
+            is_current = int(state["current_owner"]) == owner
+            if is_current:
+                state["current_owner"] = fallback
+                if int(state["handoff_owner"]):
+                    # A successor may already have captured this owner as its
+                    # rollback target. Preserve the compressed fallback until
+                    # that handoff either commits or fails, so it cannot
+                    # resurrect this failed adapter.
+                    retired[owner] = fallback
+                else:
+                    retired.pop(owner, None)
+            elif not was_handoff:
+                retired[owner] = fallback
+        self._persist_owner_sequence = None
+        self._persist_previous_owner_sequence = None
+        self._persist_activation_task = None
+
+    def _persist_done(self, task: asyncio.Task[None]) -> None:
+        self._persist_tasks.discard(task)
+        self._persist_semaphore.release()
+
+    async def _write_persist(
+        self,
+        registry_cls: Any,
+        path: Path,
+        payload: dict[str, Any],
+        state: dict[str, Any],
+        sequence: int,
+        owner: int,
+    ) -> None:
+        acquired = False
+        try:
+            # Never occupy one executor worker per replacement adapter while a
+            # previous write owns this path. Wait cooperatively, then submit at
+            # most one blocking filesystem write for the path.
+            while not state["lock"].acquire(blocking=False):
+                await asyncio.sleep(0.01)
+            acquired = True
+            if not _persist_write_is_admitted(state, owner, sequence) or sequence < int(
+                state["written"]
+            ):
+                return
+            write = asyncio.get_running_loop().run_in_executor(
+                None, registry_cls.write_payload, path, payload
+            )
+            cancelled = False
+            while not write.done():
+                try:
+                    await asyncio.shield(write)
+                except asyncio.CancelledError:
+                    cancelled = True
+            write.result()
+            state["written"] = sequence
+            if cancelled:
+                raise asyncio.CancelledError()
+        except OSError as e:
+            logger.warning(
+                "agent365 conversations: save failed for %s: %s",
+                path,
+                e,
+            )
+        finally:
+            if acquired:
+                state["lock"].release()
+            _complete_persist_sequence(state, sequence)
 
     async def prune_conversations(self) -> int:
         """Slice 19x-d (#4): drop stale ConversationRegistry entries.
@@ -2391,23 +3460,32 @@ class Agent365Adapter(BasePlatformAdapter):
 
         Returns the number of entries removed.
         """
+        reservation = await self._reserve_registry_mutation()
+        if reservation is None:
+            return 0
         # #105: pass the in-flight set in the registry's conversation-id space
         # (base `_active_sessions` is keyed by prefixed session keys, which the
         # registry's bare-conversation_id comparison never matches — a
         # long-standing no-op the M11 work corrected).
         active_keys = self._active_conversation_ids()
-        dropped = self._conversations.prune_old_entries(
-            max_age_days=self._conversations_prune_max_age_days,
-            active_session_keys=active_keys,
-        )
+        try:
+            dropped = self._conversations.prune_old_entries(
+                max_age_days=self._conversations_prune_max_age_days,
+                active_session_keys=active_keys,
+            )
+        except BaseException:
+            _complete_persist_mutation(reservation[0], reservation[1])
+            raise
         if dropped > 0:
-            await self._persist_conversations()
+            await self._persist_conversations(reservation)
             logger.info(
                 "agent365 prune_conversations: dropped %d stale entry(ies); "
                 "%d remain.",
                 dropped,
                 len(self._conversations),
             )
+        else:
+            _complete_persist_mutation(reservation[0], reservation[1])
         return dropped
 
     def _cached_inbound_for(self, chat_id: str) -> dict[str, Any] | None:
@@ -2571,6 +3649,11 @@ class Agent365Adapter(BasePlatformAdapter):
         Fallback to a non-streaming ``message`` activity when the
         streaming-start POST itself fails.
         """
+        if not self._agent_turn_lifecycle_is_current():
+            return SendResult(
+                success=False,
+                error="agent365 send: agent turn lifecycle changed",
+            )
         if self._disconnecting or str(chat_id) in self._retiring_chats:
             return SendResult(
                 success=False,
@@ -3957,6 +5040,11 @@ class Agent365Adapter(BasePlatformAdapter):
               ``(chat_id, status_key)`` and flush one consolidated bubble
               once the burst settles (``_watch_coalesced_status``).
         """
+        if not self._agent_turn_lifecycle_is_current():
+            return SendResult(
+                success=False,
+                error="agent365 status: agent turn lifecycle changed",
+            )
         if self._disconnecting or str(chat_id) in self._retiring_chats:
             return SendResult(
                 success=False,
@@ -4036,6 +5124,8 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> None:
         """Send a BF ``typing`` activity to the conversation. Renders
         as the trailing-dots indicator on Teams 1:1 chats."""
+        if not self._agent_turn_lifecycle_is_current():
+            return None
         inbound = self._cached_inbound_for(chat_id)
         if not inbound:
             # No-op: the gateway pulses typing periodically; without
@@ -4066,6 +5156,11 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """Render an Adaptive Card with an Image element + optional
         caption, route through send()'s outbound POST path."""
+        if not self._agent_turn_lifecycle_is_current():
+            return SendResult(
+                success=False,
+                error="agent365 send_image: agent turn lifecycle changed",
+            )
         bridge = _import_bridge()
         inbound = self._cached_inbound_for(chat_id)
         if not inbound:
@@ -4188,6 +5283,11 @@ class Agent365Adapter(BasePlatformAdapter):
         to. Personal scope only: a non-personal chat (Copilot Chat / group /
         channel) has no file-consent affordance, so it degrades to the base text
         fallback so the agent still communicates the file."""
+        if not self._agent_turn_lifecycle_is_current():
+            return SendResult(
+                success=False,
+                error="agent365 send_file: agent turn lifecycle changed",
+            )
         inbound = self._cached_inbound_for(chat_id)
         if not inbound:
             msg = f"agent365 send_file: no cached inbound for {chat_id!r}"
@@ -4720,6 +5820,13 @@ class Agent365Adapter(BasePlatformAdapter):
             if isinstance(action, dict) and isinstance(action.get("data"), dict)
         }
         capability_nonces.discard("")
+        if not self._agent_turn_lifecycle_is_current():
+            for nonce in capability_nonces:
+                self._card_capabilities.pop(nonce, None)
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: agent turn lifecycle changed",
+            )
         if not self._chat_lifecycle_is_current(chat_id, chat_generation):
             for nonce in capability_nonces:
                 self._card_capabilities.pop(nonce, None)
@@ -5072,6 +6179,11 @@ class Agent365Adapter(BasePlatformAdapter):
         - https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
         - https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/overview-custom-engine-agent
         """
+        if not self._agent_turn_lifecycle_is_current():
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: agent turn lifecycle changed",
+            )
         if self._disconnecting or str(chat_id) in self._retiring_chats:
             return SendResult(
                 success=False,
@@ -5148,6 +6260,17 @@ class Agent365Adapter(BasePlatformAdapter):
         generation = self._lifecycle_generation
         chat_generation = self._chat_generation(chat_id)
         client = self._http_client
+
+        requested_stream_key = (str(chat_id), str(message_id))
+        if requested_stream_key not in self._streams and any(
+            other_message_id == str(message_id)
+            for other_chat_id, other_message_id in self._streams
+            if other_chat_id != str(chat_id)
+        ):
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: stream belongs to another chat",
+            )
 
         active_msg_id = self._active_stream_by_chat.get(chat_id)
         if active_msg_id and (str(chat_id), active_msg_id) not in self._streams:
@@ -5595,12 +6718,78 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._active_stream_by_chat.get(chat_id) == message_id:
             self._active_stream_by_chat.pop(chat_id, None)
 
-    async def _teardown_chat_state(self, chat_id: str) -> None:
+    async def _evict_conversation(self, chat_id: str) -> bool:
+        chat_id = str(chat_id)
+        owner = await self._activate_persist_owner()
+        current = asyncio.current_task()
+        if current is not None:
+            # The eviction request becomes the teardown owner. Its child must
+            # cancel older pre-auth work for this chat without cancelling the
+            # parent request that is awaiting the child.
+            self._pre_auth_chat_task_done(chat_id, current)
+        task = self._registry_eviction_tasks.get(chat_id)
+        if task is None or task.done():
+            if len(self._registry_eviction_tasks) >= _MAX_INBOUND_TASKS:
+                return False
+            state, mutation = _reserve_persist_mutation(
+                self._conversations_path, owner
+            )
+            if mutation is None:
+                return False
+            reservation = (state, mutation, owner)
+            self._registry_evicting_chats.add(chat_id)
+            task = asyncio.create_task(
+                self._evict_conversation_impl(chat_id, reservation)
+            )
+            self._registry_eviction_tasks[chat_id] = task
+            task.add_done_callback(
+                lambda completed, owner=chat_id: self._registry_eviction_done(owner, completed)
+            )
+
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        completed = task.result()
+        if cancelled:
+            raise asyncio.CancelledError()
+        return completed is not False
+
+    async def _evict_conversation_impl(
+        self,
+        chat_id: str,
+        reservation: tuple[dict[str, Any], int, int],
+    ) -> bool:
+        try:
+            if not await self._teardown_chat_state(chat_id):
+                _complete_persist_mutation(reservation[0], reservation[1])
+                return False
+            self._seen_inbounds_this_lifetime.discard(chat_id)
+            evicted = self._conversations.evict(chat_id)
+        except BaseException:
+            _complete_persist_mutation(reservation[0], reservation[1])
+            raise
+        if evicted:
+            await self._persist_conversations(reservation)
+        else:
+            _complete_persist_mutation(reservation[0], reservation[1])
+        return True
+
+    def _registry_eviction_done(self, chat_id: str, task: asyncio.Task[bool]) -> None:
+        if self._registry_eviction_tasks.get(chat_id) is task:
+            self._registry_eviction_tasks.pop(chat_id, None)
+            self._registry_evicting_chats.discard(chat_id)
+        self._consume_coalesced_reply_task_result(task)
+
+    async def _teardown_chat_state(self, chat_id: str) -> bool:
         chat_id = str(chat_id)
         cleanup_task = self._chat_teardown_tasks.get(chat_id)
         if cleanup_task is None or cleanup_task.done():
+            if self._advance_chat_generation(chat_id) is None:
+                return False
             self._retiring_chats.add(chat_id)
-            self._advance_chat_generation(chat_id)
             cleanup_task = asyncio.create_task(
                 self._teardown_chat_state_impl(chat_id)
             )
@@ -5618,6 +6807,7 @@ class Agent365Adapter(BasePlatformAdapter):
         cleanup_task.result()
         if cancelled:
             raise asyncio.CancelledError()
+        return True
 
     def _chat_teardown_done(
         self, chat_id: str, task: asyncio.Task[None]
@@ -5639,6 +6829,8 @@ class Agent365Adapter(BasePlatformAdapter):
         safe to call unconditionally."""
         current = asyncio.current_task()
 
+        await self._retire_chat_agent_turns(chat_id)
+
         task_chats: dict[asyncio.Task[Any], str] = {
             task: owner_chat_id
             for task, owner_chat_id in self._coalesced_reply_survivors.items()
@@ -5652,6 +6844,12 @@ class Agent365Adapter(BasePlatformAdapter):
             if str(state.get("chat_id") or "") == chat_id and task is not current:
                 task_chats[task] = chat_id
         for task in self._outbound_tasks_by_chat.get(chat_id, set()):
+            if task is not current:
+                task_chats[task] = chat_id
+        for task in self._inbound_tasks_by_chat.get(chat_id, set()):
+            if task is not current:
+                task_chats[task] = chat_id
+        for task in self._pre_auth_tasks_by_chat.get(chat_id, set()):
             if task is not current:
                 task_chats[task] = chat_id
         reply_ids = {

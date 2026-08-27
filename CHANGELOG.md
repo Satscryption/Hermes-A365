@@ -261,19 +261,71 @@ this heading is dated at release.
   watchdog-only traffic cannot grow it indefinitely, and a finalized ID from
   one chat is never accepted as a retry in another.
 - **Lifecycle retirement now covers every asynchronous transport surface.**
-  Disconnect, uninstall, and lifecycle-table rollover establish their barrier
-  before canceling reply, stream, status, card, file, token-mint, upload, and
+  Disconnect and uninstall establish their barrier before canceling reply,
+  stream, status, card, file, token-mint, upload, inbound-request, and
   inbound-media work. Cancellation-resistant tasks remain counted as survivors;
-  replacement traffic stays blocked until they terminate. Stream state and
-  finalization tombstones are chat-scoped, so equal Bot Framework ids in two
+  replacement traffic stays blocked until they terminate. The lifecycle epoch
+  table is hard-bounded, reclaims only quiescent epochs, and returns a retryable
+  teardown-backlog response when every epoch is still live. An ASGI admission
+  gate caps every POST at 32 concurrent owners before body buffering or JWT
+  validation, and expires incomplete bodies after 15 seconds. Authenticated
+  chat identity is associated with that owner before any JWT network wait so
+  a stalled request keeps its lifecycle epoch live; and a
+  bounded, shielded uninstall owner carries teardown through durable registry
+  eviction even if its HTTP request is cancelled. Distinct agent turns also
+  reserve a bounded admission slot before registry or media growth. Hermes
+  background turns inherit a retirement guard, so cancellation-resistant work
+  cannot emit after the conversation is reinstalled. Stream state and
+  finalization tombstones use
+  their authoritative chat-scoped key, so equal Bot Framework ids in two
   conversations cannot collide, while teardown removes every detached stream
-  owned by only the retiring chat.
+  owned by only the retiring chat. Foreign stream identifiers are rejected
+  before active-stream substitution, preventing cross-chat content replay.
+  Successful lifecycle controls remain delivery-deduped so stale retries cannot
+  cross a later reinstall/uninstall; only a retryable teardown-backlog 503
+  forgets its key so Bot Framework can retry the deferred operation.
 - **Status and inbound-media buffering have hard resource and lifetime bounds.**
   Status lines are capped by line length, count, aggregate message size, and a
   hard buffer age that sustained updates cannot postpone. Inbound attachment
   token/download work captures its client and lifecycle generation, aborts the
   whole inbound turn on retirement, and removes partial files even when
-  cancellation lands during asynchronous HTTP stream cleanup.
+  cancellation lands during asynchronous HTTP stream cleanup. Cache-path-wide
+  byte and file-count reservations keep concurrent and replacement adapters
+  inside the media quota without evicting files still being written. Completed
+  files stay leased to the real Hermes turn owner until it finishes, so another
+  chat cannot evict an attachment before the active turn consumes it.
+- **Registry persistence is ordered across adapter replacement.** Save owners
+  are admitted and retained under a hard bound, drained during disconnect, and
+  receive a process-wide per-path sequence with their snapshot. Contention for
+  one path waits asynchronously rather than occupying executor threads. An
+  older shielded write can no longer overwrite a newer replacement-adapter
+  snapshot, even when the old caller was cancelled. A replacement claim is
+  two-phase: the previous owner remains writable while startup is tentative,
+  and every newly admitted save extends the handoff barrier. Ownership flips
+  atomically only after those saves reach a terminal state, then the replacement
+  reloads under the path lock; even an uninstall queued behind an older write
+  cannot be suppressed or resurrected during handoff. Registry upserts, prune,
+  and uninstall reserve a handoff-visible mutation lease before changing
+  memory; uninstall carries that lease across asynchronous teardown through its
+  durable eviction, so a replacement cannot overtake an accepted revocation.
+  The lease converts atomically to a fresh write sequence only after mutation,
+  preventing an unrelated later snapshot from making a delayed revocation look
+  stale.
+  A successful connect commits the new owner and clears its rollback token,
+  while startup
+  cancellation, timeout, early server death, or activation failure stops
+  uvicorn, closes the client, and restores the prior live owner before connect
+  returns. Mutation paths activate committed ownership before changing the
+  registry. The handoff task is retained and shielded, so caller cancellation
+  cannot publish ownership before its drain/reload barrier completes. Ingress
+  admitted after bind waits for the connect attempt to commit; a failed attempt
+  establishes the lifecycle barrier and drains that work before reconnect. The
+  gate runs before persistence activation. Overlapping failed replacements
+  compress and preserve their rollback chain through an in-progress successor
+  handoff, so out-of-order cleanup cannot restore a dead owner. Tentative
+  cancellation releases its claim immediately, and a 10-second handoff
+  deadline restores the live owner under sustained writes instead of blocking
+  every later replacement indefinitely.
 - **M10 — a corrupt conversation registry no longer permanently breaks a chat.**
   `ConversationRef.from_dict` now coerces a non-dict `raw` (from a
   hand-edited/corrupted `conversations.json`) to `{}`, so the next
@@ -380,10 +432,10 @@ this heading is dated at release.
   (3)
   `_persist_conversations` snapshots the
   payload on the loop then runs the blocking serialize+fsync+replace in an
-  executor, so a large save no longer stalls inbound processing. The locked write
-  is `asyncio.shield`-ed and serialized under a lock, so cancelling an in-flight
-  older save (e.g. on shutdown) can't let its executor thread `os.replace` a stale
-  snapshot over a newer one — saves land strictly in order.
+  executor, so a large save no longer stalls inbound processing. The shielded
+  write is sequenced under a process-wide per-path lock, so cancelling an
+  in-flight older save (e.g. on shutdown) cannot let it `os.replace` a stale
+  snapshot over a newer replacement-adapter save.
 ### Tests
 
 - **#118 — test suite is hermetic under randomized order.** An autouse

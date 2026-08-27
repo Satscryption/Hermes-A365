@@ -1482,6 +1482,13 @@ class _IdempotencyCache:
         self.seen[cache_key] = cur
         return False
 
+    def forget(self, delivery_id: str) -> None:
+        """Forget one delivery so a retryable transport failure can retry it."""
+        cache_key = hashlib.sha256(
+            delivery_id.encode("utf-8", errors="surrogatepass")
+        ).hexdigest()
+        self.seen.pop(cache_key, None)
+
 
 def _activity_delivery_id(
     activity: dict[str, Any], *, validated_path: str = "", tenant_id: str = ""
