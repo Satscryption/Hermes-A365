@@ -260,6 +260,20 @@ this heading is dated at release.
   late-finalization cache is also chat-bound, TTL-pruned, and capped at 4,096:
   watchdog-only traffic cannot grow it indefinitely, and a finalized ID from
   one chat is never accepted as a retry in another.
+- **Lifecycle retirement now covers every asynchronous transport surface.**
+  Disconnect, uninstall, and lifecycle-table rollover establish their barrier
+  before canceling reply, stream, status, card, file, token-mint, upload, and
+  inbound-media work. Cancellation-resistant tasks remain counted as survivors;
+  replacement traffic stays blocked until they terminate. Stream state and
+  finalization tombstones are chat-scoped, so equal Bot Framework ids in two
+  conversations cannot collide, while teardown removes every detached stream
+  owned by only the retiring chat.
+- **Status and inbound-media buffering have hard resource and lifetime bounds.**
+  Status lines are capped by line length, count, aggregate message size, and a
+  hard buffer age that sustained updates cannot postpone. Inbound attachment
+  token/download work captures its client and lifecycle generation, aborts the
+  whole inbound turn on retirement, and removes partial files even when
+  cancellation lands during asynchronous HTTP stream cleanup.
 - **M10 — a corrupt conversation registry no longer permanently breaks a chat.**
   `ConversationRef.from_dict` now coerces a non-dict `raw` (from a
   hand-edited/corrupted `conversations.json`) to `{}`, so the next

@@ -378,10 +378,13 @@ _STREAMING_FINALIZE_MAX_FAILURES = 2
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
+_MAX_COALESCED_REPLY_SURVIVORS = _MAX_COALESCED_REPLY_GENERATIONS * 3
+_MAX_CHAT_LIFECYCLE_GENERATIONS = 4096
 _MAX_COALESCED_TURN_TARGETS_PER_CHAT = 64
 _MAX_COALESCED_TURN_TARGETS = 2048
 _COALESCED_TURN_TARGET_TTL_SEC = 300.0
 _MAX_RECENTLY_FINALIZED = 4096
+_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC = 10.0
 
 # #53 — Hermes' status/lifecycle callbacks (retry/fallback traces, a
 # terminal-failure summary) arrive as a rapid burst of same-``status_key``
@@ -392,6 +395,9 @@ _MAX_RECENTLY_FINALIZED = 4096
 # failure produces no reply, so a couple of seconds of latency on the
 # consolidated notice is invisible.
 _STATUS_COALESCE_FLUSH_AFTER_SEC = 2.0
+_MAX_STATUS_LINE_CHARS = 1000
+_MAX_STATUS_LINES = 16
+_MAX_STATUS_BUFFER_AGE_SEC = 30.0
 
 # Status keys that carry a single substantive, user-must-see notice rather
 # than a burst of transient retry/fallback traces. The agent emits these via
@@ -730,6 +736,14 @@ class Agent365Adapter(BasePlatformAdapter):
         self._app: Any = None
         self._uvicorn_server: Any = None
         self._uvicorn_task: asyncio.Task | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._disconnecting = False
+        self._disconnect_cleanup_active = False
+        self._lifecycle_generation = 0
+        self._chat_lifecycle_sequence = 0
+        self._chat_lifecycle_generation: dict[str, int] = {}
+        self._retiring_chats: set[str] = set()
+        self._chat_teardown_tasks: dict[str, asyncio.Task[None]] = {}
 
         # Slice 19s — per-stream state for BF streaming-response protocol.
         # Keyed on the Hermes-side ``message_id`` (the activity id returned
@@ -737,7 +751,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # Each ``edit_message`` call increments ``sequence``; the first call
         # captures the BF-side ``streamId`` from the 201 response. Entries
         # are dropped on ``finalize=True`` or terminal 403.
-        self._streams: dict[str, dict[str, Any]] = {}
+        self._streams: dict[tuple[str, str], dict[str, Any]] = {}
 
         # Slice 19s-bis — at most one active BF stream per conversation
         # (Microsoft's "one streaming sequence per user turn" rule from the
@@ -759,6 +773,8 @@ class Agent365Adapter(BasePlatformAdapter):
         self._active_coalesced_reply_by_turn: dict[tuple[str, str], str] = {}
         self._active_coalesced_reply_ids_by_chat: dict[str, set[str]] = {}
         self._coalesced_reply_tasks: dict[str, asyncio.Task] = {}
+        self._coalesced_reply_survivors: dict[asyncio.Task[Any], str] = {}
+        self._coalesced_reply_survivor_count_by_chat: dict[str, int] = {}
         self._coalesced_delivery_tail_by_turn: dict[
             tuple[str, str], asyncio.Event
         ] = {}
@@ -820,7 +836,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # We track recently-finalized message_ids so duplicate calls
         # no-op (return success). 5-minute TTL is plenty (a BF stream
         # can't outlive 2 minutes; 5 covers slow-clock skew).
-        self._recently_finalized: dict[str, tuple[str, float]] = {}
+        self._recently_finalized: dict[tuple[str, str], float] = {}
         self._recently_finalized_ttl_sec = 300.0
 
         # #53 — gateway status/lifecycle callbacks (retry/fallback traces,
@@ -845,6 +861,8 @@ class Agent365Adapter(BasePlatformAdapter):
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
         self._card_capabilities: dict[str, dict[str, Any]] = {}
+        self._card_action_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
+        self._outbound_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
 
         # #73(c) — feedback-loop opt-in. Default on; operators disable via
         # A365_FEEDBACK_LOOP=0. Gates the channelData.feedbackLoop stamp so the
@@ -1330,7 +1348,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     # an oversized activity id/name must not leave stale
                     # registry, stream, or watchdog state behind.
                     if lifecycle_conv_id:
-                        self._teardown_chat_state(lifecycle_conv_id)
+                        await self._teardown_chat_state(lifecycle_conv_id)
                         self._seen_inbounds_this_lifetime.discard(
                             lifecycle_conv_id
                         )
@@ -1500,32 +1518,60 @@ class Agent365Adapter(BasePlatformAdapter):
         ``contentUrl`` (Teams serves inline-image content with the bot's
         Connector token). Returns None on any failure. The token audience for
         attachment download is walk-validated at #89."""
-        if self._http_client is None or self._bridge_cfg is None:
+        chat_id = str((activity.get("conversation") or {}).get("id") or "")
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if client is None or self._bridge_cfg is None:
             return None
         try:
             bridge = _import_bridge()
-            token, _p = await bridge.acquire_reply_token(
-                client=self._http_client,
-                cfg=self._bridge_cfg,
-                activity=activity,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=validated_path,
+            token, _p = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=activity,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=validated_path,
+                ),
+                propagate_cancel=True,
             )
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return None
             return token
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("agent365 inbound-media token mint failed: %s", e)
             return None
 
     async def _download_inbound_media(
-        self, url: str, *, headers: dict[str, str] | None, extension: str, max_bytes: int
+        self,
+        url: str,
+        *,
+        headers: dict[str, str] | None,
+        extension: str,
+        max_bytes: int,
+        chat_id: str = "",
     ) -> tuple[str, int] | None:
         """Download one inbound attachment into the media cache; return its local
         path or None. Best-effort (a failed download is logged + skipped so the
         text still dispatches) and size-capped. ``cache_name`` must be
         caller-sanitised — it is joined onto the cache dir."""
-        if self._http_client is None:
+        chat_id = str(chat_id)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if (
+            client is None
+            or not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+        ):
             return None
         cap = min(_MAX_INBOUND_MEDIA_BYTES, max(0, max_bytes))
         if cap <= 0:
@@ -1539,13 +1585,18 @@ class Agent365Adapter(BasePlatformAdapter):
         written = 0
         completed = False
         try:
+            outbound_task, outbound_added = self._register_outbound_task(chat_id)
+        except RuntimeError as e:
+            logger.warning("agent365 inbound media download rejected: %s", e)
+            return None
+        try:
             # R2-P1: stream + bound. Never buffer resp.content (an allowed endpoint
             # could return an arbitrarily large body → memory exhaustion). Reject an
             # oversized Content-Length up front, then read incrementally and abort
             # once we exceed the cap — without consuming the rest of the body.
             # Review-F1: follow_redirects=False + explicit 2xx so a 3xx can't
             # re-target the (bearer-bearing) request past the validated URL.
-            async with self._http_client.stream(
+            async with client.stream(
                 "GET", url, headers=headers or {}, timeout=30.0, follow_redirects=False
             ) as resp:
                 status_code = int(getattr(resp, "status_code", 0) or 0)
@@ -1582,7 +1633,16 @@ class Agent365Adapter(BasePlatformAdapter):
                         view = view[consumed:]
                 os.fchmod(fd, 0o600)
                 os.fsync(fd)
-                completed = True
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(
+                chat_id, chat_generation
+            ):
+                return None
+            completed = True
+        except asyncio.CancelledError:
+            logger.warning("agent365 inbound media download cancelled by lifecycle")
+            raise
         except Exception as e:
             logger.warning(
                 "agent365 inbound media download failed host=%s error=%s",
@@ -1596,6 +1656,9 @@ class Agent365Adapter(BasePlatformAdapter):
             if not completed:
                 with contextlib.suppress(OSError):
                     out.unlink()
+            self._unregister_outbound_task(
+                chat_id, outbound_task, outbound_added
+            )
         return (str(out), written) if completed and out.exists() else None
 
     async def _extract_inbound_media(
@@ -1615,6 +1678,7 @@ class Agent365Adapter(BasePlatformAdapter):
         media_urls: list[str] = []
         media_types: list[str] = []
         saw_image = saw_file = False
+        chat_id = str((activity.get("conversation") or {}).get("id") or "")
         remaining = _MAX_INBOUND_ACTIVITY_MEDIA_BYTES
         deadline = time.monotonic() + _MEDIA_ACTIVITY_DEADLINE_SEC
         # Review-F1: the connector allowlist gates where the reply bearer may be
@@ -1656,6 +1720,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     headers={"Authorization": f"Bearer {image_bearer}"},
                     extension=ext,
                     max_bytes=remaining,
+                    chat_id=chat_id,
                 )
                 if downloaded is not None:
                     path, size = downloaded
@@ -1683,7 +1748,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 file_type = str(content.get("fileType") or "").lower()
                 ext = f".{file_type}" if file_type and file_type.isalnum() else ".bin"
                 downloaded = await self._download_inbound_media(
-                    url, headers=None, extension=ext, max_bytes=remaining
+                    url,
+                    headers=None,
+                    extension=ext,
+                    max_bytes=remaining,
+                    chat_id=chat_id,
                 )
                 if downloaded is not None:
                     path, size = downloaded
@@ -1749,6 +1818,10 @@ class Agent365Adapter(BasePlatformAdapter):
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
+        async with self._lifecycle_lock:
+            return await self._connect(is_reconnect=is_reconnect)
+
+    async def _connect(self, *, is_reconnect: bool = False) -> bool:
         """Build the bridge runtime + start uvicorn on `self.port`.
 
         ``is_reconnect`` is part of the ``BasePlatformAdapter.connect``
@@ -1761,6 +1834,9 @@ class Agent365Adapter(BasePlatformAdapter):
         gateway raises ``unexpected keyword argument 'is_reconnect'`` and
         the platform never connects.
         """
+        if self._disconnecting:
+            logger.warning("agent365 connect deferred while outbound tasks retire")
+            return False
         bridge = _import_bridge()
         try:
             import httpx
@@ -1839,8 +1915,49 @@ class Agent365Adapter(BasePlatformAdapter):
         return True
 
     async def disconnect(self) -> None:
-        import contextlib
+        async with self._lifecycle_lock:
+            self._disconnecting = True
+            self._disconnect_cleanup_active = True
+            self._lifecycle_generation += 1
+            self._chat_lifecycle_generation.clear()
+            http_client = self._http_client
+            self._http_client = None
+            self._mark_disconnected()
+            cleanup_task = asyncio.create_task(self._disconnect(http_client))
+            cancelled = False
+            while not cleanup_task.done():
+                try:
+                    await asyncio.shield(cleanup_task)
+                except asyncio.CancelledError:
+                    cancelled = True
+            cleanup_task.result()
+            if cancelled:
+                raise asyncio.CancelledError()
 
+    async def _disconnect(self, http_client: Any) -> None:
+        current = asyncio.current_task()
+        try:
+            await self._drain_chat_teardowns()
+            await self._stop_uvicorn()
+            await self._drain_coalesced_reply_tasks(current)
+        finally:
+            await self._finish_disconnect(http_client, current)
+
+    async def _drain_chat_teardowns(self) -> None:
+        tasks = [task for task in self._chat_teardown_tasks.values() if not task.done()]
+        if not tasks:
+            return
+        _done, pending = await asyncio.wait(
+            tasks,
+            timeout=_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC,
+        )
+        if pending:
+            logger.warning(
+                "agent365 disconnect left %d chat teardown(s) draining",
+                len(pending),
+            )
+
+    async def _stop_uvicorn(self) -> None:
         if self._uvicorn_server is not None:
             self._uvicorn_server.should_exit = True
         if self._uvicorn_task is not None:
@@ -1852,16 +1969,78 @@ class Agent365Adapter(BasePlatformAdapter):
                 logger.warning("agent365 uvicorn shutdown noise: %s", e)
             self._uvicorn_task = None
             self._uvicorn_server = None
-        reply_tasks = list(self._coalesced_reply_tasks.values())
-        reply_tasks.extend(
-            task
-            for state in self._coalesced_replies.values()
-            if isinstance((task := state.get("finalize_task")), asyncio.Task)
-        )
-        for task in reply_tasks:
+
+    async def _drain_coalesced_reply_tasks(
+        self, current: asyncio.Task[Any] | None
+    ) -> None:
+        task_chats = dict(self._coalesced_reply_survivors)
+        for message_id, task in self._coalesced_reply_tasks.items():
+            state = self._coalesced_replies.get(message_id) or {}
+            task_chats[task] = str(state.get("chat_id") or "")
+        for state in self._coalesced_replies.values():
+            chat_id = str(state.get("chat_id") or "")
+            for task in (
+                state.get("finalize_task"),
+                state.get("finalize_owner_task"),
+            ):
+                if isinstance(task, asyncio.Task):
+                    task_chats[task] = chat_id
+        for chat_id, tasks in self._card_action_tasks_by_chat.items():
+            for task in tasks:
+                task_chats[task] = chat_id
+        for key, task in self._coalesced_status_tasks.items():
+            state = self._coalesced_status.get(key) or {}
+            task_chats[task] = str(state.get("chat_id") or "")
+        for chat_id, tasks in self._outbound_tasks_by_chat.items():
+            for task in tasks:
+                task_chats[task] = chat_id
+        shutdown_tasks = [task for task in task_chats if task is not current]
+        for task in shutdown_tasks:
             task.cancel()
-        if reply_tasks:
-            await asyncio.gather(*reply_tasks, return_exceptions=True)
+        for message_id in list(self._coalesced_replies):
+            self._drop_coalesced_reply_state(
+                message_id,
+                cancel_task=False,
+                restore_turn_target=False,
+            )
+        if shutdown_tasks:
+            done, pending = await asyncio.wait(
+                shutdown_tasks,
+                timeout=_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC,
+            )
+            for task in done:
+                self._consume_coalesced_reply_task_result(task)
+            if pending:
+                logger.warning(
+                    "agent365 coalesced reply shutdown timed out with %d task(s)",
+                    len(pending),
+                )
+                for task in pending:
+                    task.cancel()
+                    self._track_coalesced_reply_survivor(
+                        task, task_chats.get(task, "")
+                    )
+
+    async def _finish_disconnect(
+        self,
+        http_client: Any,
+        current: asyncio.Task[Any] | None,
+    ) -> None:
+        late_tasks: dict[asyncio.Task[Any], str] = {}
+        for message_id, task in self._coalesced_reply_tasks.items():
+            state = self._coalesced_replies.get(message_id) or {}
+            late_tasks[task] = str(state.get("chat_id") or "")
+        for state in self._coalesced_replies.values():
+            chat_id = str(state.get("chat_id") or "")
+            for task in (
+                state.get("finalize_task"),
+                state.get("finalize_owner_task"),
+            ):
+                if isinstance(task, asyncio.Task) and task is not current:
+                    late_tasks[task] = chat_id
+        for task, chat_id in late_tasks.items():
+            task.cancel()
+            self._track_coalesced_reply_survivor(task, chat_id)
         for message_id in list(self._coalesced_replies):
             self._drop_coalesced_reply_state(
                 message_id,
@@ -1880,11 +2059,13 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_targets.clear()
         self._coalesced_turn_target_order_by_chat.clear()
         self._coalesced_turn_target_count_by_chat.clear()
-        self._recently_finalized.clear()
-        if self._http_client is not None:
-            with contextlib.suppress(Exception):
-                await self._http_client.aclose()
-            self._http_client = None
+        for stream_key, state in list(self._streams.items()):
+            message_id = stream_key[1]
+            chat_id = str(state.get("chat_id") or "")
+            if chat_id:
+                self._record_recently_finalized(message_id, chat_id)
+        self._streams.clear()
+        self._active_stream_by_chat.clear()
         for task in list(self._coalesced_status_tasks.values()):
             task.cancel()
         self._coalesced_status_tasks.clear()
@@ -1895,7 +2076,221 @@ class Agent365Adapter(BasePlatformAdapter):
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
         self._card_capabilities.clear()
-        self._mark_disconnected()
+        try:
+            if http_client is not None:
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await http_client.aclose()
+        finally:
+            self._disconnect_cleanup_active = False
+            self._disconnecting = bool(self._coalesced_reply_survivors)
+
+    @staticmethod
+    def _consume_coalesced_reply_task_result(task: asyncio.Task[Any]) -> None:
+        with contextlib.suppress(asyncio.CancelledError, Exception):
+            task.result()
+
+    def _track_coalesced_reply_survivor(
+        self, task: asyncio.Task[Any], chat_id: str
+    ) -> None:
+        if task in self._coalesced_reply_survivors:
+            return
+        if len(self._coalesced_reply_survivors) >= _MAX_COALESCED_REPLY_SURVIVORS:
+            logger.error("agent365 coalesced reply survivor registry full")
+            task.add_done_callback(self._consume_coalesced_reply_task_result)
+            return
+        owner_chat_id = str(chat_id)
+        self._coalesced_reply_survivors[task] = owner_chat_id
+        self._coalesced_reply_survivor_count_by_chat[owner_chat_id] = (
+            self._coalesced_reply_survivor_count_by_chat.get(owner_chat_id, 0) + 1
+        )
+        task.add_done_callback(self._coalesced_reply_survivor_done)
+
+    def _coalesced_reply_survivor_done(self, task: asyncio.Task[Any]) -> None:
+        chat_id = self._coalesced_reply_survivors.pop(task, None)
+        if chat_id is not None:
+            count = self._coalesced_reply_survivor_count_by_chat.get(chat_id, 0)
+            if count <= 1:
+                self._coalesced_reply_survivor_count_by_chat.pop(chat_id, None)
+            else:
+                self._coalesced_reply_survivor_count_by_chat[chat_id] = count - 1
+            if (
+                chat_id not in self._coalesced_reply_survivor_count_by_chat
+                and chat_id not in self._chat_teardown_tasks
+            ):
+                self._retiring_chats.discard(chat_id)
+        if (
+            not self._coalesced_reply_survivors
+            and not self._disconnect_cleanup_active
+        ):
+            self._disconnecting = False
+        self._consume_coalesced_reply_task_result(task)
+
+    def _register_outbound_task(
+        self, chat_id: str
+    ) -> tuple[asyncio.Task[Any] | None, bool]:
+        owner = str(chat_id)
+        task = asyncio.current_task()
+        if task is None:
+            return None, False
+        tasks = self._outbound_tasks_by_chat.setdefault(owner, set())
+        added = task not in tasks
+        if added:
+            live_tasks = {
+                live_task
+                for owners in self._outbound_tasks_by_chat.values()
+                for live_task in owners
+            }
+            if (
+                len(tasks)
+                + self._coalesced_reply_survivor_count_by_chat.get(owner, 0)
+                >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT
+                or len(live_tasks) + len(self._coalesced_reply_survivors)
+                >= _MAX_COALESCED_REPLY_GENERATIONS
+            ):
+                if not tasks:
+                    self._outbound_tasks_by_chat.pop(owner, None)
+                raise RuntimeError("agent365 outbound backlog full")
+            tasks.add(task)
+        return task, added
+
+    def _unregister_outbound_task(
+        self, chat_id: str, task: asyncio.Task[Any] | None, added: bool
+    ) -> None:
+        if task is None or not added:
+            return
+        owner = str(chat_id)
+        tasks = self._outbound_tasks_by_chat.get(owner)
+        if tasks is None:
+            return
+        tasks.discard(task)
+        if not tasks:
+            self._outbound_tasks_by_chat.pop(owner, None)
+
+    async def _await_outbound(
+        self, chat_id: str, awaitable: Any, *, propagate_cancel: bool = False
+    ) -> Any:
+        """Run one external network await under teardown accounting."""
+        try:
+            task, added = self._register_outbound_task(chat_id)
+        except Exception:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise
+        try:
+            return await awaitable
+        except asyncio.CancelledError as exc:
+            if propagate_cancel:
+                raise
+            raise RuntimeError("agent365 outbound operation cancelled") from exc
+        finally:
+            self._unregister_outbound_task(chat_id, task, added)
+
+    def _lifecycle_is_current(
+        self, generation: int, client: Any | None = None
+    ) -> bool:
+        return (
+            not self._disconnecting
+            and generation == self._lifecycle_generation
+            and (client is None or client is self._http_client)
+        )
+
+    def _chat_generation(self, chat_id: str) -> int:
+        return self._chat_lifecycle_generation.get(str(chat_id), 0)
+
+    def _chat_lifecycle_is_current(self, chat_id: str, generation: int) -> bool:
+        return (
+            str(chat_id) not in self._retiring_chats
+            and generation == self._chat_generation(chat_id)
+        )
+
+    def _advance_chat_generation(self, chat_id: str) -> int:
+        chat_id = str(chat_id)
+        if (
+            chat_id not in self._chat_lifecycle_generation
+            and len(self._chat_lifecycle_generation)
+            >= _MAX_CHAT_LIFECYCLE_GENERATIONS
+        ):
+            self._lifecycle_generation += 1
+            self._retire_lifecycle_bound_state()
+            self._chat_lifecycle_generation.clear()
+            logger.warning(
+                "agent365 chat lifecycle generation cap reached; "
+                "invalidated in-flight outbound operations"
+            )
+        self._chat_lifecycle_sequence += 1
+        self._chat_lifecycle_generation[chat_id] = self._chat_lifecycle_sequence
+        return self._chat_lifecycle_sequence
+
+    def _retire_lifecycle_bound_state(self) -> None:
+        task_chats: dict[asyncio.Task[Any], str] = {}
+        for message_id, task in self._coalesced_reply_tasks.items():
+            state = self._coalesced_replies.get(message_id) or {}
+            task_chats[task] = str(state.get("chat_id") or "")
+        for state in self._coalesced_replies.values():
+            chat_id = str(state.get("chat_id") or "")
+            for task in (
+                state.get("finalize_task"),
+                state.get("finalize_owner_task"),
+            ):
+                if isinstance(task, asyncio.Task):
+                    task_chats[task] = chat_id
+        for key, task in self._coalesced_status_tasks.items():
+            state = self._coalesced_status.get(key) or {}
+            task_chats[task] = str(state.get("chat_id") or "")
+        for chat_id, tasks in self._card_action_tasks_by_chat.items():
+            for task in tasks:
+                task_chats[task] = chat_id
+        for chat_id, tasks in self._outbound_tasks_by_chat.items():
+            for task in tasks:
+                task_chats[task] = chat_id
+        current = asyncio.current_task()
+        for task, chat_id in task_chats.items():
+            if task is current:
+                continue
+            task.cancel()
+            if not task.done():
+                self._track_coalesced_reply_survivor(task, chat_id)
+        if self._coalesced_reply_survivors:
+            self._disconnecting = True
+        for stream_key, state in list(self._streams.items()):
+            message_id = stream_key[1]
+            chat_id = str(state.get("chat_id") or "")
+            if chat_id:
+                self._record_recently_finalized(message_id, chat_id)
+        self._streams.clear()
+        self._active_stream_by_chat.clear()
+        for state in list(self._coalesced_replies.values()):
+            for task in (
+                state.get("finalize_task"),
+                state.get("finalize_owner_task"),
+            ):
+                if isinstance(task, asyncio.Task):
+                    task.cancel()
+        for task in list(self._coalesced_reply_tasks.values()):
+            task.cancel()
+        for message_id in list(self._coalesced_replies):
+            self._drop_coalesced_reply_state(
+                message_id,
+                restore_turn_target=False,
+            )
+        self._coalesced_reply_tasks.clear()
+        self._active_coalesced_reply_by_chat.clear()
+        self._active_coalesced_reply_by_turn.clear()
+        self._active_coalesced_reply_ids_by_chat.clear()
+        self._coalesced_delivery_tail_by_turn.clear()
+        self._coalesced_generation_count_by_chat.clear()
+        self._coalesced_generation_count_by_turn.clear()
+        self._coalesced_turn_owners.clear()
+        self._coalesced_turn_targets.clear()
+        self._coalesced_turn_target_order_by_chat.clear()
+        self._coalesced_turn_target_count_by_chat.clear()
+        for task in list(self._coalesced_status_tasks.values()):
+            task.cancel()
+        self._coalesced_status_tasks.clear()
+        self._coalesced_status.clear()
+        self._pending_file_uploads.clear()
+        self._card_capabilities.clear()
 
     # ── Outbound ──────────────────────────────────────────────────────────
 
@@ -2176,6 +2571,11 @@ class Agent365Adapter(BasePlatformAdapter):
         Fallback to a non-streaming ``message`` activity when the
         streaming-start POST itself fails.
         """
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return SendResult(
+                success=False,
+                error="agent365 send: adapter or chat is disconnecting",
+            )
         turn_key: tuple[str, str] | None = None
         turn_validated_path: str | None = None
         if reply_to is not None:
@@ -2217,6 +2617,14 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = "agent365 send: adapter not connected"
             logger.error(msg)
             return SendResult(success=False, error=msg)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 send: chat is disconnecting",
+            )
 
         # Slice 19s-bis: try streaming-start only when in a streaming
         # context. ``reply_to`` is the signal — Hermes' stream consumer's
@@ -2258,6 +2666,13 @@ class Agent365Adapter(BasePlatformAdapter):
             finalized = await self._auto_finalize_stale_stream(
                 chat_id=chat_id, message_id=stale_msg_id, inbound=inbound,
             )
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return SendResult(
+                    success=False,
+                    error="agent365 send: adapter lifecycle changed",
+                )
             if not finalized and chat_id in self._active_stream_by_chat:
                 return SendResult(
                     success=False,
@@ -2294,6 +2709,11 @@ class Agent365Adapter(BasePlatformAdapter):
             # fall through to non-streaming reply.
 
         if chat_type != "personal" and reply_to is not None:
+            if self._disconnecting or str(chat_id) in self._retiring_chats:
+                return SendResult(
+                    success=False,
+                    error="agent365 send: adapter or chat is disconnecting",
+                )
             assert turn_key is not None
             message_id = self._active_coalesced_reply_by_turn.get(turn_key)
             if message_id is None:
@@ -2327,6 +2747,19 @@ class Agent365Adapter(BasePlatformAdapter):
         validated_path: str | None = None,
     ) -> SendResult:
         bridge = _import_bridge()
+        generation = self._lifecycle_generation
+        chat_id = str((inbound.get("conversation") or {}).get("id") or "")
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if (
+            client is None
+            or not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+        ):
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: adapter not connected",
+            )
         webhook_response: dict[str, Any] = {"text": content}
         # #73(b) citations (metadata-driven) + #73(c) feedback loop (env-gated).
         if citations:
@@ -2335,22 +2768,32 @@ class Agent365Adapter(BasePlatformAdapter):
             webhook_response["feedback"] = True
         reply = bridge.render_reply_activity(inbound, webhook_response)
         try:
-            await bridge.send_reply(
-                inbound=inbound,
-                reply=reply,
-                cfg=self._bridge_cfg,
-                client=self._http_client,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                validated_path=(
-                    validated_path
-                    if validated_path is not None
-                    else self._validated_path_for_inbound(inbound)
-                ),  # L4 (#100)
+            await self._await_outbound(
+                chat_id,
+                bridge.send_reply(
+                    inbound=inbound,
+                    reply=reply,
+                    cfg=self._bridge_cfg,
+                    client=client,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    validated_path=(
+                        validated_path
+                        if validated_path is not None
+                        else self._validated_path_for_inbound(inbound)
+                    ),  # L4 (#100)
+                ),
             )
         except Exception as e:
             logger.error("agent365 %s send_reply failed: %s", log_context, e)
             return SendResult(success=False, error=str(e))
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: adapter lifecycle changed",
+            )
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     @staticmethod
@@ -2473,7 +2916,18 @@ class Agent365Adapter(BasePlatformAdapter):
             generation_count = self._coalesced_generation_count_by_chat.get(
                 chat_id, 0
             )
-            if generation_count >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT:
+            live_status_count = sum(
+                1
+                for item in self._coalesced_status.values()
+                if str(item.get("chat_id") or "") == str(chat_id)
+            )
+            survivor_count = self._coalesced_reply_survivor_count_by_chat.get(
+                chat_id, 0
+            )
+            if (
+                generation_count + live_status_count + survivor_count
+                >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT
+            ):
                 return SendResult(
                     success=False,
                     error=(
@@ -2481,7 +2935,12 @@ class Agent365Adapter(BasePlatformAdapter):
                         f"chat_id={chat_id!r}"
                     ),
                 )
-            if len(self._coalesced_replies) >= _MAX_COALESCED_REPLY_GENERATIONS:
+            if (
+                len(self._coalesced_replies)
+                + len(self._coalesced_status)
+                + len(self._coalesced_reply_survivors)
+                >= _MAX_COALESCED_REPLY_GENERATIONS
+            ):
                 return SendResult(
                     success=False,
                     error="agent365 send: global coalesced reply backlog full",
@@ -2495,6 +2954,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 "validated_path": validated_path,
                 "opened_ts": now,
                 "last_update_ts": now,
+                "lifecycle_generation": self._lifecycle_generation,
+                "chat_generation": self._chat_generation(chat_id),
                 "predecessor_delivery": self._coalesced_delivery_tail_by_turn.get(
                     turn_key
                 ),
@@ -2641,6 +3102,18 @@ class Agent365Adapter(BasePlatformAdapter):
             await predecessor.wait()
         if self._coalesced_replies.get(message_id) is not state:
             return SendResult(success=True, message_id="")
+        if state.get("lifecycle_generation") != self._lifecycle_generation or state.get(
+            "chat_generation"
+        ) != self._chat_generation(chat_id):
+            self._drop_coalesced_reply_state(
+                message_id,
+                cancel_task=False,
+                restore_turn_target=False,
+            )
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: coalesced reply lifecycle expired",
+            )
         if self._http_client is None or self._bridge_cfg is None:
             result = SendResult(
                 success=False,
@@ -2663,6 +3136,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 content=final_content,
                 log_context="coalesced edit_message",
                 validated_path=str(state.get("validated_path") or ""),
+            )
+        if self._coalesced_replies.get(message_id) is not state:
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: coalesced reply was cancelled",
             )
         if result.success:
             self._drop_coalesced_reply_state(message_id)
@@ -2865,24 +3343,73 @@ class Agent365Adapter(BasePlatformAdapter):
         last line is dropped (retry bookkeeping can fire the same callback
         twice)."""
         key = self._coalesced_status_key(chat_id, status_key)
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return SendResult(
+                success=False,
+                error="agent365 status: adapter or chat is disconnecting",
+            )
         now = asyncio.get_event_loop().time()
-        line = _strip_streaming_cursor(content).strip()
+        line = _strip_streaming_cursor(content).strip()[:_MAX_STATUS_LINE_CHARS]
         state = self._coalesced_status.get(key)
         if state is None:
+            live_status_count = sum(
+                1
+                for item in self._coalesced_status.values()
+                if str(item.get("chat_id") or "") == str(chat_id)
+            )
+            generation_count = self._coalesced_generation_count_by_chat.get(
+                chat_id, 0
+            )
+            survivor_count = self._coalesced_reply_survivor_count_by_chat.get(
+                chat_id, 0
+            )
+            if (
+                generation_count + live_status_count + survivor_count
+                >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT
+            ):
+                return SendResult(
+                    success=False,
+                    error=(
+                        "agent365 status: outbound backlog full for "
+                        f"chat_id={chat_id!r}"
+                    ),
+                )
+            if (
+                len(self._coalesced_replies)
+                + len(self._coalesced_status)
+                + len(self._coalesced_reply_survivors)
+                >= _MAX_COALESCED_REPLY_GENERATIONS
+            ):
+                return SendResult(
+                    success=False,
+                    error="agent365 status: global outbound backlog full",
+                )
             state = {
                 "chat_id": chat_id,
                 "lines": [],
                 "inbound": inbound,
                 "opened_ts": now,
                 "last_update_ts": now,
+                "lifecycle_generation": self._lifecycle_generation,
+                "chat_generation": self._chat_generation(chat_id),
             }
             self._coalesced_status[key] = state
-        else:
-            state["inbound"] = inbound
-            state["last_update_ts"] = now
         lines = state["lines"]
-        if line and (not lines or lines[-1] != line):
-            lines.append(line)
+        if not line or (lines and lines[-1] == line):
+            self._ensure_coalesced_status_task(key)
+            return SendResult(success=True, message_id=key)
+        aggregate_chars = sum(len(str(item)) for item in lines) + len(lines)
+        if (
+            len(lines) >= _MAX_STATUS_LINES
+            or aggregate_chars + len(line) > self.MAX_MESSAGE_LENGTH
+        ):
+            return SendResult(
+                success=False,
+                error="agent365 status: coalesced status buffer full",
+            )
+        lines.append(line)
+        state["inbound"] = inbound
+        state["last_update_ts"] = now
         self._ensure_coalesced_status_task(key)
         return SendResult(success=True, message_id=key)
 
@@ -2908,7 +3435,17 @@ class Agent365Adapter(BasePlatformAdapter):
                         last_update_ts = loop_now
                     state["last_update_ts"] = last_update_ts
                 age = loop_now - float(last_update_ts)
-                remaining = _STATUS_COALESCE_FLUSH_AFTER_SEC - age
+                opened_ts = state.get("opened_ts", loop_now)
+                if not isinstance(opened_ts, (int, float)):
+                    opened_ts = loop_now
+                    state["opened_ts"] = opened_ts
+                lifetime_remaining = _MAX_STATUS_BUFFER_AGE_SEC - (
+                    loop_now - float(opened_ts)
+                )
+                remaining = min(
+                    _STATUS_COALESCE_FLUSH_AFTER_SEC - age,
+                    lifetime_remaining,
+                )
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                     continue
@@ -2945,6 +3482,13 @@ class Agent365Adapter(BasePlatformAdapter):
         if state is None:
             return True
         chat_id = str(state.get("chat_id") or "")
+        if (
+            state.get("lifecycle_generation") != self._lifecycle_generation
+            or state.get("chat_generation") != self._chat_generation(chat_id)
+            or self._disconnecting
+        ):
+            self._drop_coalesced_status_state(key)
+            return False
         inbound = state.get("inbound")
         lines = state.get("lines") or []
         content = "\n".join(str(line) for line in lines).strip()
@@ -2981,6 +3525,13 @@ class Agent365Adapter(BasePlatformAdapter):
             content=content,
             log_context="coalesced status",
         )
+        if (
+            self._coalesced_status.get(key) is not state
+            or state.get("lifecycle_generation") != self._lifecycle_generation
+            or state.get("chat_generation") != self._chat_generation(chat_id)
+        ):
+            self._drop_coalesced_status_state(key)
+            return False
         if not result.success:
             logger.warning(
                 "agent365 coalesced status flush failed: "
@@ -3076,6 +3627,14 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = "agent365 proactive send: adapter not connected"
             logger.error(msg)
             return SendResult(success=False, error=msg)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 proactive send: chat is disconnecting",
+            )
 
         # Synthetic activity-shape for the dispatcher. For Path A the
         # dispatcher reads recipient.agenticAppId/agenticUserId/tenantId;
@@ -3092,18 +3651,28 @@ class Agent365Adapter(BasePlatformAdapter):
 
         bridge = _import_bridge()
         try:
-            token, _path = await bridge.acquire_reply_token(
-                client=self._http_client,
-                cfg=self._bridge_cfg,
-                activity=token_input,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=target.get("validated_path"),  # L4 (#100)
+            token, _path = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=token_input,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=target.get("validated_path"),  # L4 (#100)
+                ),
             )
         except Exception as e:
             logger.error("agent365 proactive token mint failed: %s", e)
             return SendResult(success=False, error=f"token: {e}")
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 proactive send: adapter lifecycle changed",
+            )
 
         activity = {
             "type": "message",
@@ -3118,15 +3687,25 @@ class Agent365Adapter(BasePlatformAdapter):
         url = _conversations_activities_url(service_url, target["conversation_id"])
 
         try:
-            resp = await self._http_client.post(
-                url,
-                json=activity,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15.0,
+            resp = await self._await_outbound(
+                chat_id,
+                client.post(
+                    url,
+                    json=activity,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                ),
             )
         except Exception as e:
             logger.error("agent365 proactive POST failed: %s", e)
             return SendResult(success=False, error=f"post: {e}")
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 proactive send: adapter lifecycle changed",
+            )
 
         # httpx raises on .raise_for_status; do the same shape but avoid
         # hard-coupling to httpx specifics (the tests use MagicMock).
@@ -3160,7 +3739,7 @@ class Agent365Adapter(BasePlatformAdapter):
         Returns the captured ``bf_stream_id`` as ``SendResult.message_id``
         so subsequent ``edit_message`` calls — which Hermes drives with
         whatever ``message_id`` we return — find the stream state by the
-        same key in ``self._streams``.
+        same chat-scoped key in ``self._streams``.
 
         Returns ``None`` on stream-start failure so ``send()`` can fall
         back to a non-streaming activity rather than dropping the reply.
@@ -3171,6 +3750,14 @@ class Agent365Adapter(BasePlatformAdapter):
         conv_id = conv.get("id")
         if not service_url or not conv_id:
             return None
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if client is None or not self._lifecycle_is_current(generation, client):
+            return SendResult(
+                success=False,
+                error="agent365 stream-start: adapter not connected",
+            )
 
         activity = {
             "type": "typing",
@@ -3190,24 +3777,37 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         url = _conversations_activities_url(service_url, conv_id)
         try:
-            token, _path = await bridge.acquire_reply_token(
-                client=self._http_client,
-                cfg=self._bridge_cfg,
-                activity=inbound,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=(
-                    validated_path
-                    if validated_path is not None
-                    else self._validated_path_for_inbound(inbound)
-                ),  # L4 (#100)
+            token, _path = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=inbound,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=(
+                        validated_path
+                        if validated_path is not None
+                        else self._validated_path_for_inbound(inbound)
+                    ),  # L4 (#100)
+                ),
             )
-            resp = await self._http_client.post(
-                url,
-                json=activity,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15.0,
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return SendResult(
+                    success=False,
+                    error="agent365 stream-start: adapter lifecycle changed",
+                )
+            resp = await self._await_outbound(
+                chat_id,
+                client.post(
+                    url,
+                    json=activity,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -3216,6 +3816,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 e,
             )
             return None
+
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 stream-start: adapter lifecycle changed",
+            )
 
         if resp.status_code != 201:
             logger.warning(
@@ -3239,12 +3847,15 @@ class Agent365Adapter(BasePlatformAdapter):
         loop = asyncio.get_event_loop()
         now = loop.time()
         clean_content = _strip_streaming_cursor(content)
-        self._streams[bf_stream_id] = {
+        self._streams[(str(chat_id), bf_stream_id)] = {
             "bf_stream_id": bf_stream_id,
+            "chat_id": str(chat_id),
             "sequence": 1,
             "last_emit_ts": now,
             "opened_ts": now,
             "finalize_failures": 0,
+            "lifecycle_generation": generation,
+            "chat_generation": chat_generation,
             # Track last-sent content so auto-finalize-stale-stream has
             # something non-empty to POST as the close (BF rejects
             # empty-text final activities with 400 BadSyntax).
@@ -3268,22 +3879,42 @@ class Agent365Adapter(BasePlatformAdapter):
             raise RuntimeError(
                 "agent365 _post_activity: serviceUrl / conversation.id missing"
             )
+        chat_id = str(conv_id)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            raise RuntimeError("agent365: chat is disconnecting")
         url = _conversations_activities_url(service_url, conv_id)
-        token, _path = await bridge.acquire_reply_token(
-            client=self._http_client,
-            cfg=self._bridge_cfg,
-            activity=inbound,
-            fmi_cache=self._fmi_cache,
-            user_cache=self._user_cache,
-            bf_cache=self._bf_token_cache,
-            validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+        token, _path = await self._await_outbound(
+            chat_id,
+            bridge.acquire_reply_token(
+                client=client,
+                cfg=self._bridge_cfg,
+                activity=inbound,
+                fmi_cache=self._fmi_cache,
+                user_cache=self._user_cache,
+                bf_cache=self._bf_token_cache,
+                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+            ),
         )
-        resp = await self._http_client.post(
-            url,
-            json=activity,
-            headers={"Authorization": f"Bearer {token}"},
-            timeout=15.0,
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            raise RuntimeError("agent365: adapter lifecycle changed")
+        resp = await self._await_outbound(
+            chat_id,
+            client.post(
+                url,
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=15.0,
+            ),
         )
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            raise RuntimeError("agent365: adapter lifecycle changed")
         if resp.status_code >= 300:
             raise RuntimeError(
                 f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}"
@@ -3326,6 +3957,11 @@ class Agent365Adapter(BasePlatformAdapter):
               ``(chat_id, status_key)`` and flush one consolidated bubble
               once the burst settles (``_watch_coalesced_status``).
         """
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return SendResult(
+                success=False,
+                error="agent365 status: adapter or chat is disconnecting",
+            )
         inbound = self._cached_inbound_for(chat_id)
         conv = (inbound or {}).get("conversation") or {}
         chat_type = str(conv.get("conversationType") or "")
@@ -3383,6 +4019,11 @@ class Agent365Adapter(BasePlatformAdapter):
         if not (content or "").strip():
             return SendResult(success=True, message_id="")
 
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return SendResult(
+                success=False,
+                error="agent365 status: adapter or chat is disconnecting",
+            )
         return self._buffer_coalesced_status(
             chat_id=chat_id,
             status_key=status_key,
@@ -3437,6 +4078,14 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = "agent365 send_image: adapter not connected"
             logger.error(msg)
             return SendResult(success=False, error=msg)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 send_image: chat is disconnecting",
+            )
         if chat_id in self._active_stream_by_chat:
             msg = "agent365 send_image: active stream still open"
             logger.warning("%s for %s", msg, chat_id)
@@ -3453,18 +4102,28 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         reply = bridge.render_reply_activity(inbound, {"text": "", "card": card})
         try:
-            await bridge.send_reply(
-                inbound=inbound,
-                reply=reply,
-                cfg=self._bridge_cfg,
-                client=self._http_client,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+            await self._await_outbound(
+                chat_id,
+                bridge.send_reply(
+                    inbound=inbound,
+                    reply=reply,
+                    cfg=self._bridge_cfg,
+                    client=client,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                ),
             )
         except Exception as e:
             logger.error("agent365 send_image failed: %s", e)
             return SendResult(success=False, error=str(e))
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 send_image: adapter lifecycle changed",
+            )
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     # ── #76c outbound file transfer (FileConsentCard → OneDrive) ───────────
@@ -3559,6 +4218,14 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = "agent365 send_file: adapter not connected"
             logger.error(msg)
             return SendResult(success=False, error=msg)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 send_file: chat is disconnecting",
+            )
 
         # Path-safety + existence + size via the gateway's shared validator
         # (resolves symlinks, blocks credential/system paths).
@@ -3598,19 +4265,29 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         reply = self._reply_with_attachment(inbound, card)
         try:
-            await _import_bridge().send_reply(
-                inbound=inbound,
-                reply=reply,
-                cfg=self._bridge_cfg,
-                client=self._http_client,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+            await self._await_outbound(
+                chat_id,
+                _import_bridge().send_reply(
+                    inbound=inbound,
+                    reply=reply,
+                    cfg=self._bridge_cfg,
+                    client=client,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                ),
             )
         except Exception as e:
             logger.error("agent365 send_file consent card failed: %s", e)
             return SendResult(success=False, error=str(e))
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 send_file: adapter lifecycle changed",
+            )
         # Record the pending upload only AFTER the card is accepted by BF — a
         # failed send leaves no consent the user can act on.
         #
@@ -3631,6 +4308,8 @@ class Agent365Adapter(BasePlatformAdapter):
             "user_id": str((inbound.get("from") or {}).get("id") or ""),
             "service_url": str(inbound.get("serviceUrl") or ""),
             "validated_path": self._validated_path_for_inbound(inbound),
+            "lifecycle_generation": generation,
+            "chat_generation": chat_generation,
             "created_at": time.time(),
         }
         _bound_map(self._pending_file_uploads)
@@ -3707,6 +4386,19 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return invoke.InvokeResponse(status=200, body={})
 
+        pending_chat_id = str(pending.get("conversation_id") or "")
+        if (
+            self._disconnecting
+            or pending.get("lifecycle_generation") != self._lifecycle_generation
+            or pending.get("chat_generation")
+            != self._chat_generation(pending_chat_id)
+        ):
+            logger.warning(
+                "agent365 fileConsent accept for expired lifecycle consent=%s",
+                consent_id[:8],
+            )
+            return invoke.InvokeResponse(status=200, body={})
+
         # Review-F2 / R2-P1 — capability model, not authenticated-user check.
         # The real boundary is: (1) this handler is only reached AFTER inbound-JWT
         # validation (a legitimate platform caller), and (2) ``consent_id`` is an
@@ -3738,7 +4430,17 @@ class Agent365Adapter(BasePlatformAdapter):
         upload_info = value.get("uploadInfo")
         upload_info = upload_info if isinstance(upload_info, dict) else {}
         upload_url = str(upload_info.get("uploadUrl") or "")
-        if not upload_url or self._http_client is None:
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(pending_chat_id)
+        client = self._http_client
+        if (
+            not upload_url
+            or client is None
+            or not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(
+                pending_chat_id, chat_generation
+            )
+        ):
             logger.warning("agent365 fileConsent accept missing uploadUrl/client")
             return invoke.InvokeResponse(status=200, body={})
         # R2-P1: only POST bytes to an EXACT configured tenant SharePoint/OneDrive
@@ -3773,15 +4475,18 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
             return invoke.InvokeResponse(status=200, body={})
         try:
-            put_resp = await self._http_client.put(
-                upload_url,
-                content=data,
-                headers={
-                    "Content-Length": str(size),
-                    "Content-Range": f"bytes 0-{size - 1}/{size}",
-                },
-                timeout=60.0,
-                follow_redirects=False,  # Review-F2: no redirect off the validated host
+            put_resp = await self._await_outbound(
+                pending_chat_id,
+                client.put(
+                    upload_url,
+                    content=data,
+                    headers={
+                        "Content-Length": str(size),
+                        "Content-Range": f"bytes 0-{size - 1}/{size}",
+                    },
+                    timeout=60.0,
+                    follow_redirects=False,
+                ),
             )
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
             if status_code < 200 or status_code >= 300:
@@ -3789,6 +4494,18 @@ class Agent365Adapter(BasePlatformAdapter):
                 return invoke.InvokeResponse(status=200, body={})
         except Exception as e:
             logger.error("agent365 fileConsent upload failed: %s", e)
+            return invoke.InvokeResponse(status=200, body={})
+
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(
+            pending_chat_id, chat_generation
+        ):
+            logger.warning(
+                "agent365 fileConsent upload completed after lifecycle change "
+                "consent=%s",
+                consent_id[:8],
+            )
             return invoke.InvokeResponse(status=200, body={})
 
         # Confirm with a FileInfoCard so the file renders inline in the chat.
@@ -3805,15 +4522,18 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         try:
             reply = self._reply_with_attachment(activity, info_card)
-            await _import_bridge().send_reply(
-                inbound=activity,
-                reply=reply,
-                cfg=self._bridge_cfg,
-                client=self._http_client,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=validated_path,
+            await self._await_outbound(
+                pending_chat_id,
+                _import_bridge().send_reply(
+                    inbound=activity,
+                    reply=reply,
+                    cfg=self._bridge_cfg,
+                    client=client,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=validated_path,
+                ),
             )
         except Exception as e:
             logger.warning("agent365 fileConsent info card failed: %s", e)
@@ -3991,6 +4711,22 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = f"agent365 {log_context}: adapter not connected"
             logger.warning(msg)
             return SendResult(success=False, error=msg)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        capability_nonces = {
+            str((action.get("data") or {}).get("capability") or "")
+            for action in card.get("actions", [])
+            if isinstance(action, dict) and isinstance(action.get("data"), dict)
+        }
+        capability_nonces.discard("")
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            for nonce in capability_nonces:
+                self._card_capabilities.pop(nonce, None)
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: chat is disconnecting",
+            )
         self._conversations.mark_used(chat_id)
         attachment = {
             "contentType": "application/vnd.microsoft.card.adaptive",
@@ -3998,19 +4734,33 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         reply = self._reply_with_attachment(inbound, attachment)
         try:
-            await _import_bridge().send_reply(
-                inbound=inbound,
-                reply=reply,
-                cfg=self._bridge_cfg,
-                client=self._http_client,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=self._validated_path_for_inbound(inbound),
+            await self._await_outbound(
+                chat_id,
+                _import_bridge().send_reply(
+                    inbound=inbound,
+                    reply=reply,
+                    cfg=self._bridge_cfg,
+                    client=client,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=self._validated_path_for_inbound(inbound),
+                ),
             )
         except Exception as e:
+            for nonce in capability_nonces:
+                self._card_capabilities.pop(nonce, None)
             logger.error("agent365 %s card send failed: %s", log_context, e)
             return SendResult(success=False, error=str(e))
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            for nonce in capability_nonces:
+                self._card_capabilities.pop(nonce, None)
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: adapter lifecycle changed",
+            )
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     async def send_exec_approval(
@@ -4135,6 +4885,8 @@ class Agent365Adapter(BasePlatformAdapter):
             "conversation_id": chat_id,
             "user_id": bridge._canonical_activity_user(inbound),
             "tenant_id": self.tenant_id.lower(),
+            "lifecycle_generation": self._lifecycle_generation,
+            "chat_generation": self._chat_generation(chat_id),
             "created_at": time.monotonic(),
             "resolver": dict(resolver),
             "choices": opaque_choices,
@@ -4218,6 +4970,11 @@ class Agent365Adapter(BasePlatformAdapter):
             or capability.get("conversation_id") != conv_id
             or capability.get("user_id") != user_id
             or capability.get("tenant_id") != self.tenant_id.lower()
+            or capability.get("lifecycle_generation")
+            != self._lifecycle_generation
+            or capability.get("chat_generation") != self._chat_generation(conv_id)
+            or self._disconnecting
+            or conv_id in self._retiring_chats
         ):
             logger.warning("agent365 card action rejected: invalid or mismatched capability")
             return JSONResponse({"status": "card_action_rejected"}, status_code=403)
@@ -4229,6 +4986,13 @@ class Agent365Adapter(BasePlatformAdapter):
         # mismatched user must not be able to invalidate the owner's card.
         self._card_capabilities.pop(nonce, None)
         resolver = capability["resolver"]
+        action_generation = int(capability["lifecycle_generation"])
+        action_chat_generation = int(capability["chat_generation"])
+        action_task = asyncio.current_task()
+        if action_task is not None:
+            self._card_action_tasks_by_chat.setdefault(conv_id, set()).add(
+                action_task
+            )
         try:
             if kind == _CARD_KIND_EXEC_APPROVAL:
                 self._gw_resolve_approval(
@@ -4240,7 +5004,11 @@ class Agent365Adapter(BasePlatformAdapter):
                     str(resolver.get("confirm_id") or ""),
                     choice,
                 )
-                if follow:
+                if follow and self._lifecycle_is_current(
+                    action_generation
+                ) and self._chat_lifecycle_is_current(
+                    conv_id, action_chat_generation
+                ):
                     # The resolver returns a follow-up (command result / cancelled
                     # notice) the adapter must post as a new message.
                     await self._send_reply_activity(
@@ -4254,6 +5022,13 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._gw_resolve_clarify(clarify_id, choice)
         except Exception as e:
             logger.error("agent365 card action (%s) resolve failed: %s", kind, e)
+        finally:
+            if action_task is not None:
+                tasks = self._card_action_tasks_by_chat.get(conv_id)
+                if tasks is not None:
+                    tasks.discard(action_task)
+                    if not tasks:
+                        self._card_action_tasks_by_chat.pop(conv_id, None)
         return JSONResponse({"status": "card_action", "kind": kind})
 
     # ── Slice 19s — BF streaming response protocol ────────────────────────
@@ -4297,6 +5072,11 @@ class Agent365Adapter(BasePlatformAdapter):
         - https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
         - https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/overview-custom-engine-agent
         """
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: adapter or chat is disconnecting",
+            )
         # Slice 19x-d (#4): streaming edits are clear outbound traffic;
         # mark the conversation as recently used so prune respects it.
         self._conversations.mark_used(chat_id)
@@ -4306,14 +5086,8 @@ class Agent365Adapter(BasePlatformAdapter):
         # docstring for the Hermes stream-consumer quirk this guards.
         loop_now = asyncio.get_event_loop().time()
         self._prune_recently_finalized(loop_now)
-        recent = self._recently_finalized.get(message_id)
+        recent = self._recently_finalized.get((str(chat_id), str(message_id)))
         if recent is not None:
-            owner_chat_id, _finalized_at = recent
-            if owner_chat_id != str(chat_id):
-                return SendResult(
-                    success=False,
-                    error="agent365 edit_message: finalized message belongs to another chat",
-                )
             return SendResult(success=True, message_id="")
 
         if message_id.startswith("coalesced:"):
@@ -4371,9 +5145,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 edit_message: adapter not connected",
             )
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
 
         active_msg_id = self._active_stream_by_chat.get(chat_id)
-        if active_msg_id and active_msg_id not in self._streams:
+        if active_msg_id and (str(chat_id), active_msg_id) not in self._streams:
             self._active_stream_by_chat.pop(chat_id, None)
             active_msg_id = None
         if active_msg_id and active_msg_id != message_id:
@@ -4388,7 +5165,31 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             message_id = active_msg_id
 
-        state = self._streams.get(message_id)
+        stream_key = (str(chat_id), str(message_id))
+        state = self._streams.get(stream_key)
+        if state is None and any(
+            other_message_id == str(message_id)
+            for other_chat_id, other_message_id in self._streams
+            if other_chat_id != str(chat_id)
+        ):
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: stream belongs to another chat",
+            )
+        if state is not None and str(state.get("chat_id") or chat_id) != str(chat_id):
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: stream belongs to another chat",
+            )
+        if state is not None and (
+            state.get("lifecycle_generation", generation) != generation
+            or state.get("chat_generation", chat_generation) != chat_generation
+        ):
+            self._drop_stream_state(chat_id, message_id)
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: stream lifecycle expired",
+            )
         is_first = state is None
         if state is None:
             state = {
@@ -4397,8 +5198,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 "last_emit_ts": 0.0,
                 "opened_ts": loop_now,
                 "finalize_failures": 0,
+                "chat_id": str(chat_id),
+                "lifecycle_generation": generation,
+                "chat_generation": chat_generation,
             }
-            self._streams[message_id] = state
+            self._streams[stream_key] = state
 
         # Throttle — Microsoft recommends 1.5-2 s pacing even though the
         # hard limit is 1 req/s. Adapter-side rather than relying on the
@@ -4408,6 +5212,13 @@ class Agent365Adapter(BasePlatformAdapter):
         elapsed = now - state["last_emit_ts"]
         if elapsed < _STREAMING_MIN_GAP_SEC and state["last_emit_ts"] > 0.0:
             await asyncio.sleep(_STREAMING_MIN_GAP_SEC - elapsed)
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: adapter lifecycle changed",
+            )
 
         state["sequence"] += 1
         entity: dict[str, Any] = {"type": "streaminfo"}
@@ -4460,24 +5271,47 @@ class Agent365Adapter(BasePlatformAdapter):
         url = _conversations_activities_url(service_url, conv_id)
 
         try:
-            token, _path = await bridge.acquire_reply_token(
-                client=self._http_client,
-                cfg=self._bridge_cfg,
-                activity=inbound,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+            token, _path = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=inbound,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                ),
             )
-            resp = await self._http_client.post(
-                url,
-                json=activity,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15.0,
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return SendResult(
+                    success=False,
+                    error="agent365 edit_message: adapter lifecycle changed",
+                )
+            resp = await self._await_outbound(
+                chat_id,
+                client.post(
+                    url,
+                    json=activity,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                ),
             )
         except Exception as e:
             logger.warning("agent365 edit_message POST failed: %s", e)
             return SendResult(success=False, error=str(e))
+
+        if (
+            not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+            or self._streams.get(stream_key) is not state
+        ):
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: adapter lifecycle changed",
+            )
 
         state["last_emit_ts"] = loop.time()
 
@@ -4572,12 +5406,21 @@ class Agent365Adapter(BasePlatformAdapter):
         one, leaving stream A as a stuck typing indicator while stream B
         opens beside it.
         """
-        state = self._streams.get(message_id)
+        state = self._streams.get((str(chat_id), str(message_id)))
         if state is None or not state.get("bf_stream_id"):
             # Nothing to close, or never received a stream id from
             # Microsoft (stream-start failed). Just drop the slot.
             self._drop_stream_state(chat_id, message_id)
             return True
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if (
+            client is None
+            or not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+        ):
+            return False
 
         bf_stream_id = state["bf_stream_id"]
         conv = inbound.get("conversation") or {}
@@ -4610,20 +5453,30 @@ class Agent365Adapter(BasePlatformAdapter):
         url = _conversations_activities_url(service_url, conv_id)
         try:
             bridge = _import_bridge()
-            token, _path = await bridge.acquire_reply_token(
-                client=self._http_client,
-                cfg=self._bridge_cfg,
-                activity=inbound,
-                fmi_cache=self._fmi_cache,
-                user_cache=self._user_cache,
-                bf_cache=self._bf_token_cache,
-                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+            token, _path = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=inbound,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                ),
             )
-            resp = await self._http_client.post(
-                url,
-                json=activity,
-                headers={"Authorization": f"Bearer {token}"},
-                timeout=15.0,
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return False
+            resp = await self._await_outbound(
+                chat_id,
+                client.post(
+                    url,
+                    json=activity,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                ),
             )
         except Exception as e:
             logger.warning(
@@ -4636,6 +5489,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 state=state,
                 reason=str(e),
             )
+
+        if not self._lifecycle_is_current(
+            generation, client
+        ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return False
 
         if 200 <= resp.status_code < 300:
             logger.info(
@@ -4709,7 +5567,7 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> None:
         finalized_at = asyncio.get_event_loop().time() if now is None else now
         self._prune_recently_finalized(finalized_at)
-        self._recently_finalized[message_id] = (str(chat_id), finalized_at)
+        self._recently_finalized[(str(chat_id), str(message_id))] = finalized_at
         while len(self._recently_finalized) > _MAX_RECENTLY_FINALIZED:
             self._recently_finalized.pop(next(iter(self._recently_finalized)))
 
@@ -4718,25 +5576,59 @@ class Agent365Adapter(BasePlatformAdapter):
         cutoff = now - self._recently_finalized_ttl_sec
         stale = [
             key
-            for key, (_chat_id, finalized_at) in self._recently_finalized.items()
+            for key, finalized_at in self._recently_finalized.items()
             if finalized_at < cutoff
         ]
         for k in stale:
             self._recently_finalized.pop(k, None)
 
     def _drop_stream_state(self, chat_id: str, message_id: str) -> None:
-        """Slice 19s-bis: clear both ``self._streams[message_id]`` and the
-        chat's active-stream slot. Called on finalize success and terminal
-        errors so the next ``send()`` for the same conversation starts a
-        fresh stream cleanly."""
-        self._streams.pop(message_id, None)
+        """Clear ``self._streams[(chat_id, message_id)]`` and its chat slot.
+
+        Called on finalize success and terminal errors so the next ``send()``
+        for the same conversation starts a fresh stream cleanly.
+        """
+        self._streams.pop((str(chat_id), str(message_id)), None)
         # Only clear the chat-level slot if it points at the same id we're
         # cleaning up — protects against tool-progress streams clobbering
         # a content stream's slot (or vice versa).
         if self._active_stream_by_chat.get(chat_id) == message_id:
             self._active_stream_by_chat.pop(chat_id, None)
 
-    def _teardown_chat_state(self, chat_id: str) -> None:
+    async def _teardown_chat_state(self, chat_id: str) -> None:
+        chat_id = str(chat_id)
+        cleanup_task = self._chat_teardown_tasks.get(chat_id)
+        if cleanup_task is None or cleanup_task.done():
+            self._retiring_chats.add(chat_id)
+            self._advance_chat_generation(chat_id)
+            cleanup_task = asyncio.create_task(
+                self._teardown_chat_state_impl(chat_id)
+            )
+            self._chat_teardown_tasks[chat_id] = cleanup_task
+            cleanup_task.add_done_callback(
+                lambda task, owner=chat_id: self._chat_teardown_done(owner, task)
+            )
+
+        cancelled = False
+        while not cleanup_task.done():
+            try:
+                await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                cancelled = True
+        cleanup_task.result()
+        if cancelled:
+            raise asyncio.CancelledError()
+
+    def _chat_teardown_done(
+        self, chat_id: str, task: asyncio.Task[None]
+    ) -> None:
+        if self._chat_teardown_tasks.get(chat_id) is task:
+            self._chat_teardown_tasks.pop(chat_id, None)
+            if not self._coalesced_reply_survivor_count_by_chat.get(chat_id, 0):
+                self._retiring_chats.discard(chat_id)
+        self._consume_coalesced_reply_task_result(task)
+
+    async def _teardown_chat_state_impl(self, chat_id: str) -> None:
         """L3 (#105): drop every live stream / coalesced-reply / coalesced-status
         slot for ``chat_id`` and cancel their debounce watchdog tasks.
 
@@ -4745,22 +5637,73 @@ class Agent365Adapter(BasePlatformAdapter):
         and later fire a doomed POST into a conversation the tenant already
         removed the agent from. Pops are no-ops when a slot is absent, so it's
         safe to call unconditionally."""
-        # Streaming slot.
-        sid = self._active_stream_by_chat.pop(chat_id, None)
-        if sid is not None:
-            self._streams.pop(sid, None)
-        # Every coalesced-reply generation for this chat, including a detached
-        # generation whose finalize POST is currently in flight.
+        current = asyncio.current_task()
+
+        task_chats: dict[asyncio.Task[Any], str] = {
+            task: owner_chat_id
+            for task, owner_chat_id in self._coalesced_reply_survivors.items()
+            if owner_chat_id == chat_id
+        }
+        for task in self._card_action_tasks_by_chat.get(chat_id, set()):
+            if task is not current:
+                task_chats[task] = chat_id
+        for key, task in self._coalesced_status_tasks.items():
+            state = self._coalesced_status.get(key) or {}
+            if str(state.get("chat_id") or "") == chat_id and task is not current:
+                task_chats[task] = chat_id
+        for task in self._outbound_tasks_by_chat.get(chat_id, set()):
+            if task is not current:
+                task_chats[task] = chat_id
         reply_ids = {
             mid
             for mid, state in self._coalesced_replies.items()
             if isinstance(state, dict) and state.get("chat_id") == chat_id
         }
+        active_mid = self._active_coalesced_reply_by_chat.get(chat_id)
+        if active_mid is not None:
+            reply_ids.add(active_mid)
+        for message_id in reply_ids:
+            state = self._coalesced_replies.get(message_id) or {}
+            watchdog = self._coalesced_reply_tasks.get(message_id)
+            if isinstance(watchdog, asyncio.Task):
+                task_chats[watchdog] = chat_id
+            elif watchdog is not None:
+                watchdog.cancel()
+            for task in (
+                state.get("finalize_task"),
+                state.get("finalize_owner_task"),
+            ):
+                if isinstance(task, asyncio.Task) and task is not current:
+                    task_chats[task] = chat_id
+        for task in task_chats:
+            task.cancel()
+
+        # Streaming slot.
+        self._active_stream_by_chat.pop(chat_id, None)
+        for stream_key in list(self._streams):
+            if stream_key[0] == chat_id:
+                self._streams.pop(stream_key, None)
+        # Every coalesced-reply generation for this chat, including a detached
+        # generation whose finalize POST is currently in flight.
         active_mid = self._active_coalesced_reply_by_chat.pop(chat_id, None)
         if active_mid is not None:
             reply_ids.add(active_mid)
         for mid in reply_ids:
-            self._drop_coalesced_reply_state(mid, restore_turn_target=False)
+            self._drop_coalesced_reply_state(
+                mid,
+                cancel_task=False,
+                restore_turn_target=False,
+            )
+        if task_chats:
+            done, pending = await asyncio.wait(
+                task_chats,
+                timeout=_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC,
+            )
+            for task in done:
+                self._consume_coalesced_reply_task_result(task)
+            for task in pending:
+                task.cancel()
+                self._track_coalesced_reply_survivor(task, chat_id)
         turn_keys = {
             key
             for mapping in (
@@ -4785,11 +5728,15 @@ class Agent365Adapter(BasePlatformAdapter):
         for turn_key in target_order:
             self._drop_coalesced_turn_target(turn_key)
         self._coalesced_turn_target_count_by_chat.pop(chat_id, None)
-        for message_id, (owner_chat_id, _finalized_at) in list(
-            self._recently_finalized.items()
-        ):
-            if owner_chat_id == chat_id:
-                self._recently_finalized.pop(message_id, None)
+        for key in list(self._recently_finalized):
+            if key[0] == chat_id:
+                self._recently_finalized.pop(key, None)
+        for consent_id, pending in list(self._pending_file_uploads.items()):
+            if str(pending.get("conversation_id") or "") == chat_id:
+                self._pending_file_uploads.pop(consent_id, None)
+        for nonce, capability in list(self._card_capabilities.items()):
+            if str(capability.get("conversation_id") or "") == chat_id:
+                self._card_capabilities.pop(nonce, None)
         # Coalesced-status slots (keyed ``status:{chat}:{status_key}``) + their
         # watchdogs. Match on the stored chat_id, not a key prefix, since a
         # Teams chat id itself contains ':'.
@@ -4801,7 +5748,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for k in status_keys:
             self._coalesced_status.pop(k, None)
             task = self._coalesced_status_tasks.pop(k, None)
-            if task is not None:
+            if task is not None and task not in task_chats:
                 task.cancel()
 
     @staticmethod
