@@ -235,6 +235,31 @@ this heading is dated at release.
 
 ### Reliability (#105)
 
+- **H4 — sequential coalesced reply segments are no longer swallowed.**
+  Non-personal chats now assign a fresh synthetic message id to every newly
+  opened coalesced segment. Multiple segments for the same inbound activity
+  therefore remain distinct, while a duplicate or late finalization for an
+  already-delivered segment still no-ops through the existing five-minute
+  recently-finalized guard. Each inbound's bounded reply target and JWT-validated
+  Path A/B tag are captured under its exact `(chat_id, activity_id)` before the
+  durable registry can advance to another user. Generations keep that ownership
+  immutable: concurrent users in one group cannot overwrite each other's
+  `replyToId`, identity, or token path; unrelated turns deliver independently;
+  and sequential generations for one turn retain ordered delivery across retry.
+  A target absent after expiry/eviction, or present only in a pre-restart durable
+  registry, fails closed instead of falling through to the latest chat activity.
+  Finalization is claimed exactly once across explicit and watchdog paths, and
+  in-flight work is cancelled on uninstall/disconnect.
+- **H4 state is bounded under authenticated concurrency.** Coalesced content is
+  capped at the adapter's 4,000-character wire limit (including the optional
+  handoff affordance); pending targets are TTL- and count-bounded (64 per chat,
+  2,048 globally); and live generations are capped at 32 per chat / 1,024
+  globally. Admission and active-generation cleanup use constant-time counters
+  and per-chat sets, cap rejection is non-mutating on every send/edit path, and
+  duplicate teardown cannot undercount or release another chat's state. The
+  late-finalization cache is also chat-bound, TTL-pruned, and capped at 4,096:
+  watchdog-only traffic cannot grow it indefinitely, and a finalized ID from
+  one chat is never accepted as a retry in another.
 - **M10 — a corrupt conversation registry no longer permanently breaks a chat.**
   `ConversationRef.from_dict` now coerces a non-dict `raw` (from a
   hand-edited/corrupted `conversations.json`) to `{}`, so the next
@@ -345,9 +370,6 @@ this heading is dated at release.
   is `asyncio.shield`-ed and serialized under a lock, so cancelling an in-flight
   older save (e.g. on shutdown) can't let its executor thread `os.replace` a stale
   snapshot over a newer one — saves land strictly in order.
-
-  (H4 coalesced-reply drop lands in a later, walk-gated #105 PR.)
-
 ### Tests
 
 - **#118 — test suite is hermetic under randomized order.** An autouse

@@ -3970,7 +3970,12 @@ class TestSendImage:
     ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-1")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        assert ref is not None
+        recipient = inbound.get("recipient") or {}
+        ref.validated_path = "A" if recipient.get("agenticAppId") else "B"
+        a._capture_coalesced_turn_target(ref)
+        a._conversations.upsert(ref)
         a._active_stream_by_chat["conv-1"] = "m1"
         a._streams["m1"] = {
             "bf_stream_id": "bf-1",
@@ -4056,7 +4061,12 @@ class TestEditMessage:
         ``post_responses`` may be a single response, a list (one per
         successive POST), or ``None`` (defaults to a 202 OK).
         """
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        assert ref is not None
+        recipient = inbound.get("recipient") or {}
+        ref.validated_path = "A" if recipient.get("agenticAppId") else "B"
+        a._capture_coalesced_turn_target(ref)
+        a._conversations.upsert(ref)
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -4131,6 +4141,30 @@ class TestEditMessage:
         assert ai["additionalType"] == ["AIGeneratedContent"]
 
     @pytest.mark.asyncio
+    async def test_personal_stream_duplicate_finalize_remains_a_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-S-double-final")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-1"})
+        final = MagicMock(status_code=202, text="", json=lambda: {})
+        post_mock = self._wire_adapter(
+            a, inbound=inbound, post_responses=[first, final]
+        )
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-S-double-final", "m1", "Hi", finalize=False)
+        await a.edit_message("conv-S-double-final", "m1", "Done", finalize=True)
+        duplicate = await a.edit_message(
+            "conv-S-double-final", "m1", "Done", finalize=True
+        )
+
+        assert duplicate.success is True
+        assert duplicate.message_id == ""
+        assert post_mock.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_intermediate_chunk_has_no_ai_label(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -4170,7 +4204,7 @@ class TestEditMessage:
             reply_to="act-1",
         )
         assert first.success is True
-        assert str(first.message_id).startswith("coalesced:conv-G:")
+        assert str(first.message_id).startswith("coalesced:")
         assert send_reply_mock.await_count == 0
         assert post_mock.await_count == 0
         assert a._coalesced_replies[first.message_id]["content"] == "Hello"
@@ -4217,6 +4251,97 @@ class TestEditMessage:
         assert duplicate.success is True
         assert send_reply_mock.await_count == 1
 
+        cross_chat = await a.edit_message(
+            "conv-other",
+            str(first.message_id),
+            "Hello world!",
+            finalize=True,
+        )
+        assert cross_chat.success is False
+        assert "finalized message belongs to another chat" in str(cross_chat.error)
+
+    def test_recently_finalized_cache_is_ttl_and_count_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_RECENTLY_FINALIZED", 3)
+        a = _make_adapter(monkeypatch)
+        for index in range(4):
+            a._record_recently_finalized(
+                f"coalesced:{index}", "conv-G", now=float(index)
+            )
+        assert list(a._recently_finalized) == [
+            "coalesced:1",
+            "coalesced:2",
+            "coalesced:3",
+        ]
+
+        a._record_recently_finalized(
+            "coalesced:fresh",
+            "conv-G",
+            now=a._recently_finalized_ttl_sec + 10.0,
+        )
+        assert a._recently_finalized == {
+            "coalesced:fresh": (
+                "conv-G",
+                a._recently_finalized_ttl_sec + 10.0,
+            )
+        }
+
+    @pytest.mark.asyncio
+    async def test_non_personal_same_turn_delivers_each_coalesced_segment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-segments")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        first = await a.send(
+            chat_id="conv-G-segments",
+            content="First segment ▉",
+            reply_to="act-1",
+        )
+        await a.edit_message(
+            "conv-G-segments",
+            str(first.message_id),
+            "First segment",
+            finalize=True,
+        )
+
+        second = await a.send(
+            chat_id="conv-G-segments",
+            content="Second segment ▉",
+            reply_to="act-1",
+        )
+        assert second.message_id != first.message_id
+        assert second.message_id in a._coalesced_replies
+
+        await a.edit_message(
+            "conv-G-segments",
+            str(second.message_id),
+            "Second segment updated ▉",
+            finalize=False,
+        )
+        await a.edit_message(
+            "conv-G-segments",
+            str(second.message_id),
+            "Second segment updated",
+            finalize=True,
+        )
+
+        assert [
+            call.kwargs["reply"]["text"]
+            for call in send_reply_mock.await_args_list
+        ] == ["First segment", "Second segment updated"]
+        assert first.message_id in a._recently_finalized
+        assert second.message_id in a._recently_finalized
+        assert a._coalesced_replies == {}
+        assert a._active_coalesced_reply_by_chat == {}
+
     @pytest.mark.asyncio
     async def test_stale_coalesced_reply_flushes_buffer_and_late_final_noops(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4261,6 +4386,797 @@ class TestEditMessage:
         )
         assert late_final.success is True
         assert send_reply_mock.await_count == 1
+
+        next_segment = await a.send(
+            chat_id="conv-G-stale",
+            content="After recovery ▉",
+            reply_to="act-1",
+        )
+        assert next_segment.message_id != message_id
+        await a.edit_message(
+            "conv-G-stale",
+            str(next_segment.message_id),
+            "After recovery",
+            finalize=True,
+        )
+        assert send_reply_mock.await_count == 2
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "After recovery"
+
+    @pytest.mark.asyncio
+    async def test_coalesced_finalize_detaches_before_network_await(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-overlap")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+        sent: list[str] = []
+
+        async def blocking_send_reply(**kwargs: Any) -> None:
+            sent.append(kwargs["reply"]["text"])
+            if len(sent) == 1:
+                started.set()
+                await release.wait()
+
+        monkeypatch.setattr(
+            bridge, "send_reply", AsyncMock(side_effect=blocking_send_reply)
+        )
+
+        first = await a.send(
+            chat_id="conv-G-overlap", content="First", reply_to="act-1"
+        )
+        first_finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-G-overlap", str(first.message_id), "First", finalize=True
+            )
+        )
+        await started.wait()
+
+        second = await a.send(
+            chat_id="conv-G-overlap", content="Second", reply_to="act-1"
+        )
+        assert second.message_id != first.message_id
+        assert a._active_coalesced_reply_by_chat["conv-G-overlap"] == second.message_id
+
+        release.set()
+        assert (await first_finalize).success is True
+        assert second.message_id in a._coalesced_replies
+        await a.edit_message(
+            "conv-G-overlap", str(second.message_id), "Second", finalize=True
+        )
+        assert sent == ["First", "Second"]
+
+    @pytest.mark.asyncio
+    async def test_coalesced_watchdog_and_explicit_finalize_share_one_delivery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-finalize-race")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_send_reply(**_kwargs: Any) -> None:
+            started.set()
+            await release.wait()
+
+        send_reply_mock = AsyncMock(side_effect=blocking_send_reply)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        first = await a.send(
+            chat_id="conv-G-finalize-race", content="Only once", reply_to="act-1"
+        )
+
+        explicit = asyncio.create_task(
+            a.edit_message(
+                "conv-G-finalize-race",
+                str(first.message_id),
+                "Only once",
+                finalize=True,
+            )
+        )
+        await started.wait()
+        watchdog = asyncio.create_task(
+            a._flush_stale_coalesced_reply(str(first.message_id))
+        )
+        await asyncio.sleep(0)
+        release.set()
+
+        explicit_result, watchdog_result = await asyncio.gather(explicit, watchdog)
+        assert explicit_result.success is True
+        assert watchdog_result is True
+        assert send_reply_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_concurrent_coalesced_finalizes_share_one_delivery(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-double-final")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_send_reply(**_kwargs: Any) -> None:
+            started.set()
+            await release.wait()
+
+        send_reply_mock = AsyncMock(side_effect=blocking_send_reply)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        first = await a.send(
+            chat_id="conv-G-double-final", content="Only once", reply_to="act-1"
+        )
+        args = ("conv-G-double-final", str(first.message_id), "Only once")
+        finalize_one = asyncio.create_task(a.edit_message(*args, finalize=True))
+        await started.wait()
+        finalize_two = asyncio.create_task(a.edit_message(*args, finalize=True))
+        await asyncio.sleep(0)
+        release.set()
+
+        results = await asyncio.gather(finalize_one, finalize_two)
+        assert all(result.success for result in results)
+        assert send_reply_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_finalize_does_not_erase_overlapping_segment(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-failed-overlap")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def failing_send_reply(**_kwargs: Any) -> None:
+            started.set()
+            await release.wait()
+            raise RuntimeError("connector down")
+
+        monkeypatch.setattr(
+            bridge, "send_reply", AsyncMock(side_effect=failing_send_reply)
+        )
+        first = await a.send(
+            chat_id="conv-G-failed-overlap", content="First", reply_to="act-1"
+        )
+        first_finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-G-failed-overlap",
+                str(first.message_id),
+                "First",
+                finalize=True,
+            )
+        )
+        await started.wait()
+        second = await a.send(
+            chat_id="conv-G-failed-overlap", content="Second", reply_to="act-1"
+        )
+        release.set()
+
+        assert (await first_finalize).success is False
+        assert second.message_id in a._coalesced_replies
+        assert (
+            a._active_coalesced_reply_by_chat["conv-G-failed-overlap"]
+            == second.message_id
+        )
+
+        successful_send = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", successful_send)
+        second_finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-G-failed-overlap",
+                str(second.message_id),
+                "Second",
+                finalize=True,
+            )
+        )
+        await asyncio.sleep(0)
+        assert second_finalize.done() is False
+
+        retry = await a.edit_message(
+            "conv-G-failed-overlap",
+            str(first.message_id),
+            "First",
+            finalize=True,
+        )
+        result = await second_finalize
+        assert retry.success is True
+        assert result.success is True
+        assert [
+            call.kwargs["reply"]["text"]
+            for call in successful_send.await_args_list
+        ] == ["First", "Second"]
+
+    @pytest.mark.asyncio
+    async def test_coalesced_generation_backlog_is_bounded_per_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT", 2
+        )
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-backlog")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+
+        started = asyncio.Event()
+        release = asyncio.Event()
+
+        async def blocking_send_reply(**_kwargs: Any) -> None:
+            if not started.is_set():
+                started.set()
+                await release.wait()
+
+        monkeypatch.setattr(
+            bridge, "send_reply", AsyncMock(side_effect=blocking_send_reply)
+        )
+        first = await a.send(
+            chat_id="conv-G-backlog", content="First", reply_to="act-1"
+        )
+        first_finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-G-backlog", str(first.message_id), "First", finalize=True
+            )
+        )
+        await started.wait()
+        second = await a.send(
+            chat_id="conv-G-backlog", content="Second", reply_to="act-1"
+        )
+        second_finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-G-backlog",
+                str(second.message_id),
+                "Second",
+                finalize=True,
+            )
+        )
+        await asyncio.sleep(0)
+        assert second_finalize.done() is False
+
+        states_before = set(a._coalesced_replies)
+        tasks_before = set(a._coalesced_reply_tasks)
+        rejected = await a.send(
+            chat_id="conv-G-backlog", content="Third", reply_to="act-1"
+        )
+        assert rejected.success is False
+        assert "backlog full" in str(rejected.error)
+        assert set(a._coalesced_replies) == states_before
+        assert set(a._coalesced_reply_tasks) == tasks_before
+
+        rejected_edit = await a.edit_message(
+            "conv-G-backlog", "unknown-edit", "Third", finalize=False
+        )
+        rejected_final = await a.edit_message(
+            "conv-G-backlog", "unknown-final", "Third", finalize=True
+        )
+        assert rejected_edit.success is False
+        assert rejected_final.success is False
+        assert "unknown coalesced message id" in str(rejected_edit.error)
+        assert "unknown coalesced message id" in str(rejected_final.error)
+        assert set(a._coalesced_replies) == states_before
+        assert set(a._coalesced_reply_tasks) == tasks_before
+        assert "unknown-edit" not in a._coalesced_replies
+        assert "unknown-final" not in a._coalesced_replies
+
+        release.set()
+        assert (await first_finalize).success is True
+        assert (await second_finalize).success is True
+
+    @pytest.mark.asyncio
+    async def test_coalesced_message_id_is_bound_to_its_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound_a = _make_inbound(conv_id="conv-A", activity_id="act-A")
+        inbound_a["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound_a)
+        inbound_b = _make_inbound(conv_id="conv-B", activity_id="act-B")
+        inbound_b["conversation"]["conversationType"] = "groupChat"
+        ref_b = adapter_mod.ConversationRef.from_activity(inbound_b)
+        assert ref_b is not None
+        ref_b.validated_path = "A"
+        a._capture_coalesced_turn_target(ref_b)
+        a._conversations.upsert(ref_b)
+        a._seen_inbounds_this_lifetime.add("conv-B")
+
+        first_a = await a.send(chat_id="conv-A", content="A", reply_to="act-A")
+        first_b = await a.send(chat_id="conv-B", content="B", reply_to="act-B")
+        result = await a.edit_message(
+            "conv-A", str(first_b.message_id), "poison", finalize=True
+        )
+
+        assert result.success is False
+        assert "another chat" in str(result.error)
+        assert a._coalesced_replies[first_a.message_id]["content"] == "A"
+        assert a._coalesced_replies[first_b.message_id]["content"] == "B"
+        assert a._active_coalesced_reply_by_chat == {
+            "conv-A": first_a.message_id,
+            "conv-B": first_b.message_id,
+        }
+        a._drop_coalesced_reply_state(str(first_a.message_id))
+        a._drop_coalesced_reply_state(str(first_b.message_id))
+
+    @pytest.mark.asyncio
+    async def test_teardown_cancels_detached_finalize_and_preserves_other_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-evict-finalizing")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        other = _make_inbound(conv_id="conv-evict-other", activity_id="act-2")
+        other["conversation"]["conversationType"] = "groupChat"
+        other_ref = adapter_mod.ConversationRef.from_activity(other)
+        assert other_ref is not None
+        other_ref.validated_path = "A"
+        a._capture_coalesced_turn_target(other_ref)
+        a._conversations.upsert(other_ref)
+        a._seen_inbounds_this_lifetime.add("conv-evict-other")
+        bridge = adapter_mod._import_bridge()
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_send_reply(**_kwargs: Any) -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(
+            bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply)
+        )
+        first = await a.send(
+            chat_id="conv-evict-finalizing", content="First", reply_to="act-1"
+        )
+        other_reply = await a.send(
+            chat_id="conv-evict-other", content="Other", reply_to="act-2"
+        )
+        finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-evict-finalizing",
+                str(first.message_id),
+                "First",
+                finalize=True,
+            )
+        )
+        await started.wait()
+
+        a._teardown_chat_state("conv-evict-finalizing")
+        await cancelled.wait()
+        with pytest.raises(asyncio.CancelledError):
+            await finalize
+
+        assert first.message_id not in a._coalesced_replies
+        assert "conv-evict-finalizing" not in a._active_coalesced_reply_by_chat
+        assert other_reply.message_id in a._coalesced_replies
+        assert (
+            a._active_coalesced_reply_by_chat["conv-evict-other"]
+            == other_reply.message_id
+        )
+        a._drop_coalesced_reply_state(str(other_reply.message_id))
+
+    @pytest.mark.asyncio
+    async def test_disconnect_cancels_detached_finalize_before_client_close(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-disconnect-finalizing")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+
+        started = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_send_reply(**_kwargs: Any) -> None:
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.set()
+                raise
+
+        monkeypatch.setattr(
+            bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply)
+        )
+        first = await a.send(
+            chat_id="conv-disconnect-finalizing", content="First", reply_to="act-1"
+        )
+        finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-disconnect-finalizing",
+                str(first.message_id),
+                "First",
+                finalize=True,
+            )
+        )
+        await started.wait()
+
+        await a.disconnect()
+        await cancelled.wait()
+        with pytest.raises(asyncio.CancelledError):
+            await finalize
+        assert a._coalesced_replies == {}
+        assert a._coalesced_reply_tasks == {}
+        assert a._coalesced_delivery_tail_by_turn == {}
+
+    def test_coalesced_reply_ids_are_opaque_and_fixed_size(self) -> None:
+        message_id = adapter_mod.Agent365Adapter._coalesced_reply_message_id()
+        prefix, opaque_id = message_id.split(":", 1)
+        assert prefix == "coalesced"
+        assert len(opaque_id) == 32
+        assert int(opaque_id, 16) >= 0
+
+    @pytest.mark.asyncio
+    async def test_concurrent_group_turns_retain_immutable_reply_ownership(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound_a = _make_inbound(
+            conv_id="conv-G-users", activity_id="act-user-A"
+        )
+        inbound_a["conversation"]["conversationType"] = "groupChat"
+        inbound_a["from"] = {"id": "user-A", "name": "A"}
+        self._wire_adapter(a, inbound=inbound_a)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        ref_a = adapter_mod.ConversationRef.from_activity(inbound_a)
+        assert ref_a is not None
+        ref_a.validated_path = "A"
+        a._capture_coalesced_turn_target(ref_a)
+
+        inbound_b = _make_inbound(
+            conv_id="conv-G-users", activity_id="act-user-B", path="B"
+        )
+        inbound_b["conversation"]["conversationType"] = "groupChat"
+        inbound_b["from"] = {"id": "user-B", "name": "B"}
+        ref_b = adapter_mod.ConversationRef.from_activity(inbound_b)
+        assert ref_b is not None
+        ref_b.validated_path = "B"
+        a._capture_coalesced_turn_target(ref_b)
+        a._conversations.upsert(ref_b)
+
+        # Turn B is now the latest durable registry entry before delayed turn A
+        # asks to send. Exact turn-target capture must still route A to A.
+        first = await a.send(
+            chat_id="conv-G-users", content="Reply A", reply_to="act-user-A"
+        )
+        second = await a.send(
+            chat_id="conv-G-users", content="Reply B", reply_to="act-user-B"
+        )
+
+        assert first.message_id != second.message_id
+        assert a._coalesced_replies[first.message_id]["inbound"]["id"] == "act-user-A"
+        assert a._coalesced_replies[second.message_id]["inbound"]["id"] == "act-user-B"
+
+        await a.send(
+            chat_id="conv-G-users", content="Reply A updated", reply_to="act-user-A"
+        )
+        assert a._coalesced_replies[first.message_id]["content"] == "Reply A updated"
+        assert a._coalesced_replies[first.message_id]["inbound"]["from"]["id"] == "user-A"
+
+        second_finalize = asyncio.create_task(
+            a.edit_message(
+                "conv-G-users",
+                str(second.message_id),
+                "Reply B",
+                finalize=True,
+            )
+        )
+        assert (await asyncio.wait_for(second_finalize, timeout=0.1)).success is True
+        assert (
+            await a.edit_message(
+                "conv-G-users",
+                str(first.message_id),
+                "Reply A updated",
+                finalize=True,
+            )
+        ).success is True
+
+        assert [
+            call.kwargs["inbound"]["id"]
+            for call in send_reply_mock.await_args_list
+        ] == ["act-user-B", "act-user-A"]
+        assert [
+            call.kwargs["reply"]["replyToId"]
+            for call in send_reply_mock.await_args_list
+        ] == ["act-user-B", "act-user-A"]
+        assert [
+            call.kwargs["validated_path"]
+            for call in send_reply_mock.await_args_list
+        ] == ["B", "A"]
+
+    @pytest.mark.asyncio
+    async def test_global_coalesced_generation_budget_bounds_many_chats(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS", 2)
+        a = _make_adapter(monkeypatch)
+        first_inbound = _make_inbound(conv_id="conv-global-1")
+        first_inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=first_inbound)
+
+        accepted: list[tuple[str, Any]] = []
+        for index in (1, 2):
+            chat_id = f"conv-global-{index}"
+            inbound = _make_inbound(conv_id=chat_id, activity_id=f"act-{index}")
+            inbound["conversation"]["conversationType"] = "groupChat"
+            ref = adapter_mod.ConversationRef.from_activity(inbound)
+            assert ref is not None
+            ref.validated_path = "A"
+            a._capture_coalesced_turn_target(ref)
+            a._conversations.upsert(ref)
+            a._seen_inbounds_this_lifetime.add(chat_id)
+            result = await a.send(
+                chat_id=chat_id, content=f"Reply {index}", reply_to=f"act-{index}"
+            )
+            assert result.success is True
+            accepted.append((chat_id, result.message_id))
+
+        third_inbound = _make_inbound(
+            conv_id="conv-global-3", activity_id="act-3"
+        )
+        third_inbound["conversation"]["conversationType"] = "groupChat"
+        third_ref = adapter_mod.ConversationRef.from_activity(third_inbound)
+        assert third_ref is not None
+        third_ref.validated_path = "A"
+        a._capture_coalesced_turn_target(third_ref)
+        a._conversations.upsert(third_ref)
+        a._seen_inbounds_this_lifetime.add("conv-global-3")
+        rejected = await a.send(
+            chat_id="conv-global-3", content="Reply 3", reply_to="act-3"
+        )
+
+        assert rejected.success is False
+        assert "global" in str(rejected.error)
+        assert len(a._coalesced_replies) == 2
+        assert len(a._coalesced_reply_tasks) == 2
+        assert a._coalesced_generation_count_by_chat == {
+            "conv-global-1": 1,
+            "conv-global-2": 1,
+        }
+        for _chat_id, message_id in accepted:
+            a._drop_coalesced_reply_state(str(message_id))
+        assert a._coalesced_generation_count_by_chat == {}
+
+    @pytest.mark.asyncio
+    async def test_coalesced_content_bound_rejects_without_mutation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-content-bound")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        oversized = "x" * (a.MAX_MESSAGE_LENGTH + 1)
+
+        rejected = await a.send(
+            chat_id="conv-G-content-bound",
+            content=oversized,
+            reply_to="act-1",
+        )
+        assert rejected.success is False
+        assert a._coalesced_replies == {}
+        assert a._coalesced_reply_tasks == {}
+
+        accepted = await a.send(
+            chat_id="conv-G-content-bound", content="keep", reply_to="act-1"
+        )
+        state = a._coalesced_replies[accepted.message_id]
+        captured_inbound = state["inbound"]
+        rejected_update = await a.edit_message(
+            "conv-G-content-bound",
+            str(accepted.message_id),
+            oversized,
+            finalize=False,
+        )
+        assert rejected_update.success is False
+        assert state["content"] == "keep"
+        assert state["inbound"] is captured_inbound
+        a._drop_coalesced_reply_state(str(accepted.message_id))
+
+    @pytest.mark.asyncio
+    async def test_duplicate_drop_cannot_undercount_generation_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-idempotent-drop")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        first = await a.send(
+            chat_id="conv-G-idempotent-drop", content="First", reply_to="act-1"
+        )
+
+        assert a._coalesced_generation_count_by_chat == {
+            "conv-G-idempotent-drop": 1
+        }
+        a._drop_coalesced_reply_state(str(first.message_id))
+        a._drop_coalesced_reply_state(str(first.message_id))
+        assert a._coalesced_generation_count_by_chat == {}
+        assert a._coalesced_generation_count_by_turn == {}
+
+    @pytest.mark.asyncio
+    async def test_evicted_turn_target_fails_closed_without_retargeting(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_TURN_TARGETS_PER_CHAT", 2)
+        a = _make_adapter(monkeypatch)
+        first_inbound = _make_inbound(
+            conv_id="conv-G-target-cap", activity_id="act-1"
+        )
+        first_inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=first_inbound)
+
+        for activity_id in ("act-2", "act-3"):
+            inbound = _make_inbound(
+                conv_id="conv-G-target-cap", activity_id=activity_id
+            )
+            inbound["conversation"]["conversationType"] = "groupChat"
+            ref = adapter_mod.ConversationRef.from_activity(inbound)
+            assert ref is not None
+            ref.validated_path = "A"
+            a._capture_coalesced_turn_target(ref)
+            a._conversations.upsert(ref)
+
+        assert (
+            "conv-G-target-cap",
+            "act-1",
+        ) not in a._coalesced_turn_targets
+        rejected = await a.send(
+            chat_id="conv-G-target-cap", content="Late reply", reply_to="act-1"
+        )
+        assert rejected.success is False
+        assert "no cached inbound for exact turn" in str(rejected.error)
+        assert a._coalesced_replies == {}
+        assert a._coalesced_turn_target_count_by_chat == {
+            "conv-G-target-cap": 2
+        }
+
+        a._teardown_chat_state("conv-G-target-cap")
+        assert a._coalesced_turn_targets == {}
+        assert a._coalesced_turn_target_count_by_chat == {}
+
+    @pytest.mark.asyncio
+    async def test_exact_turn_precedes_lifetime_proactive_gate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(
+            conv_id="conv-G-lifetime-evicted", activity_id="act-exact"
+        )
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        proactive = AsyncMock()
+        monkeypatch.setattr(a, "_send_proactive", proactive)
+        a._seen_inbounds_this_lifetime.discard("conv-G-lifetime-evicted")
+
+        result = await a.send(
+            chat_id="conv-G-lifetime-evicted",
+            content="Exact reply",
+            reply_to="act-exact",
+        )
+        assert result.success is True
+        assert result.message_id in a._coalesced_replies
+        assert proactive.await_count == 0
+        a._drop_coalesced_reply_state(str(result.message_id))
+
+    @pytest.mark.asyncio
+    async def test_persisted_exact_id_without_lifetime_capture_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(
+            conv_id="conv-G-restarted", activity_id="act-before-restart"
+        )
+        inbound["conversation"]["conversationType"] = "groupChat"
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        assert ref is not None
+        ref.validated_path = "A"
+        a._conversations.upsert(ref)
+
+        result = await a.send(
+            chat_id="conv-G-restarted",
+            content="Must not use stale replyToActivity",
+            reply_to="act-before-restart",
+        )
+        assert result.success is False
+        assert "no cached inbound for exact turn" in str(result.error)
+        assert a._coalesced_replies == {}
+
+    @pytest.mark.asyncio
+    async def test_exact_group_turn_precedes_latest_personal_type(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        group = _make_inbound(
+            conv_id="conv-mixed-latest", activity_id="act-group"
+        )
+        group["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=group)
+
+        personal = _make_inbound(
+            conv_id="conv-mixed-latest", activity_id="act-personal"
+        )
+        personal_ref = adapter_mod.ConversationRef.from_activity(personal)
+        assert personal_ref is not None
+        personal_ref.validated_path = "A"
+        a._capture_coalesced_turn_target(personal_ref)
+        a._conversations.upsert(personal_ref)
+        stream_start = AsyncMock()
+        monkeypatch.setattr(a, "_send_stream_start", stream_start)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        result = await a.send(
+            chat_id="conv-mixed-latest",
+            content="Group reply",
+            reply_to="act-group",
+        )
+        assert result.success is True
+        assert result.message_id in a._coalesced_replies
+        assert stream_start.await_count == 0
+        assert (
+            a._coalesced_replies[result.message_id]["inbound"]["id"]
+            == "act-group"
+        )
+        finalized = await a.edit_message(
+            "conv-mixed-latest",
+            str(result.message_id),
+            "Group reply",
+            finalize=True,
+        )
+        assert finalized.success is True
+        assert send_reply.await_args.kwargs["inbound"]["id"] == "act-group"
+        assert send_reply.await_args.kwargs["validated_path"] == "A"
+
+    @pytest.mark.asyncio
+    async def test_teardown_does_not_evict_another_chats_delayed_target(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_TURN_TARGETS", 1)
+        a = _make_adapter(monkeypatch)
+        inbound_a = _make_inbound(conv_id="conv-target-A", activity_id="act-A")
+        inbound_a["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound_a)
+        generation_a = await a.send(
+            chat_id="conv-target-A", content="A", reply_to="act-A"
+        )
+
+        inbound_b = _make_inbound(conv_id="conv-target-B", activity_id="act-B")
+        inbound_b["conversation"]["conversationType"] = "groupChat"
+        ref_b = adapter_mod.ConversationRef.from_activity(inbound_b)
+        assert ref_b is not None
+        ref_b.validated_path = "A"
+        a._capture_coalesced_turn_target(ref_b)
+        a._conversations.upsert(ref_b)
+        a._seen_inbounds_this_lifetime.add("conv-target-B")
+
+        a._teardown_chat_state("conv-target-A")
+        assert generation_a.message_id not in a._coalesced_replies
+        assert ("conv-target-B", "act-B") in a._coalesced_turn_targets
+
+        result_b = await a.send(
+            chat_id="conv-target-B", content="B", reply_to="act-B"
+        )
+        assert result_b.success is True
+        assert result_b.message_id in a._coalesced_replies
+        a._drop_coalesced_reply_state(str(result_b.message_id))
 
     @pytest.mark.asyncio
     async def test_coalesced_reply_watchdog_flushes_when_finalize_never_arrives(
@@ -4658,7 +5574,12 @@ class TestSendOrUpdateStatus:
     def _wire(a: Any, inbound: dict[str, Any]) -> None:
         """Register the inbound + stub the http/bridge plumbing the flush
         path needs (``_send_reply_activity`` POSTs through ``send_reply``)."""
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        assert ref is not None
+        recipient = inbound.get("recipient") or {}
+        ref.validated_path = "A" if recipient.get("agenticAppId") else "B"
+        a._capture_coalesced_turn_target(ref)
+        a._conversations.upsert(ref)
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -4826,7 +5747,9 @@ class TestSendOrUpdateStatus:
         assert key in a._coalesced_status
 
         # 2) The turn's first reply chunk opens a coalesced reply for the chat.
-        await a.send(chat_id="conv-G-buf", content="partial ▉", reply_to="act-1")
+        reply = await a.send(
+            chat_id="conv-G-buf", content="partial ▉", reply_to="act-1"
+        )
         assert "conv-G-buf" in a._active_coalesced_reply_by_chat
         send_reply_mock.reset_mock()
 
@@ -4840,7 +5763,7 @@ class TestSendOrUpdateStatus:
         # Finalize the reply so no watchdog lingers past the test.
         await a.edit_message(
             "conv-G-buf",
-            a._coalesced_reply_message_id("conv-G-buf", "act-1"),
+            str(reply.message_id),
             "partial done",
             finalize=True,
         )
@@ -5003,7 +5926,9 @@ class TestSendStreamStart:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-S1")  # personal by default
+        inbound = _make_inbound(
+            conv_id="conv-S1", activity_id="inbound-id-1"
+        )  # personal by default
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
@@ -5058,7 +5983,7 @@ class TestSendStreamStart:
         # The full streaming flow: send() opens the stream, edit_message
         # continues it without starting a new stream. Single growing bubble.
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-S2")
+        inbound = _make_inbound(conv_id="conv-S2", activity_id="inbound-id-1")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
@@ -5192,7 +6117,7 @@ class TestSendStreamStart:
         # A new streaming first chunk may replace a stale stream, but only
         # after the adapter sends streamType=final for the previous one.
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-X2")
+        inbound = _make_inbound(conv_id="conv-X2", activity_id="inbound-id-1")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
@@ -5247,7 +6172,7 @@ class TestSendStreamStart:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-X3")
+        inbound = _make_inbound(conv_id="conv-X3", activity_id="inbound-id-1")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
@@ -5292,7 +6217,7 @@ class TestSendStreamStart:
         # Liveness guard for #54 review feedback: a permanently dead BF
         # stream id must not wedge the chat forever.
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-X4")
+        inbound = _make_inbound(conv_id="conv-X4", activity_id="inbound-id-1")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
@@ -5345,7 +6270,7 @@ class TestSendStreamStart:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-X5")
+        inbound = _make_inbound(conv_id="conv-X5", activity_id="inbound-id-1")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
         a._http_client = MagicMock()
@@ -7926,6 +8851,17 @@ class TestHandoff:
             adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-dm"))
         )
         assert a._maybe_append_handoff_link("conv-dm", "body") == "body"
+
+    def test_append_handoff_link_never_exceeds_message_bound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_HANDOFF_LINK", "1")
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cc-full")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        content = "x" * a.MAX_MESSAGE_LENGTH
+        assert a._maybe_append_handoff_link("conv-cc-full", content) == content
 
 
 # ---------------------------------------------------------------------------

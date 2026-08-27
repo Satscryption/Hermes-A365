@@ -63,6 +63,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import ipaddress
 import json
@@ -375,6 +376,12 @@ _STREAMING_MIN_GAP_SEC = 1.5
 _STREAMING_FORCE_DROP_AFTER_SEC = 130.0
 _STREAMING_FINALIZE_MAX_FAILURES = 2
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
+_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
+_MAX_COALESCED_REPLY_GENERATIONS = 1024
+_MAX_COALESCED_TURN_TARGETS_PER_CHAT = 64
+_MAX_COALESCED_TURN_TARGETS = 2048
+_COALESCED_TURN_TARGET_TTL_SEC = 300.0
+_MAX_RECENTLY_FINALIZED = 4096
 
 # #53 — Hermes' status/lifecycle callbacks (retry/fallback traces, a
 # terminal-failure summary) arrive as a rapid burst of same-``status_key``
@@ -749,7 +756,24 @@ class Agent365Adapter(BasePlatformAdapter):
         # arrives. Maps synthetic message_id -> buffer state.
         self._coalesced_replies: dict[str, dict[str, Any]] = {}
         self._active_coalesced_reply_by_chat: dict[str, str] = {}
+        self._active_coalesced_reply_by_turn: dict[tuple[str, str], str] = {}
+        self._active_coalesced_reply_ids_by_chat: dict[str, set[str]] = {}
         self._coalesced_reply_tasks: dict[str, asyncio.Task] = {}
+        self._coalesced_delivery_tail_by_turn: dict[
+            tuple[str, str], asyncio.Event
+        ] = {}
+        self._coalesced_generation_count_by_chat: dict[str, int] = {}
+        self._coalesced_generation_count_by_turn: dict[tuple[str, str], int] = {}
+        self._coalesced_turn_owners: dict[
+            tuple[str, str], tuple[dict[str, Any], str]
+        ] = {}
+        self._coalesced_turn_targets: dict[
+            tuple[str, str], tuple[dict[str, Any], str, float]
+        ] = {}
+        self._coalesced_turn_target_order_by_chat: dict[
+            str, dict[tuple[str, str], None]
+        ] = {}
+        self._coalesced_turn_target_count_by_chat: dict[str, int] = {}
 
         # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
         # captured an inbound for since boot. Used as ``send()``'s gate
@@ -796,7 +820,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # We track recently-finalized message_ids so duplicate calls
         # no-op (return success). 5-minute TTL is plenty (a BF stream
         # can't outlive 2 minutes; 5 covers slow-clock skew).
-        self._recently_finalized: dict[str, float] = {}
+        self._recently_finalized: dict[str, tuple[str, float]] = {}
         self._recently_finalized_ttl_sec = 300.0
 
         # #53 — gateway status/lifecycle callbacks (retry/fallback traces,
@@ -1378,6 +1402,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # L4 (#100): stamp the validated path so later decoupled mints
             # off this ref bind to it, not the body.
             ref.validated_path = validated_path
+            self._capture_coalesced_turn_target(ref)
             self._conversations.upsert(ref)
             # Slice 19x-e (#27): record that this gateway lifetime
             # has captured an inbound for this chat. Drives the
@@ -1827,15 +1852,39 @@ class Agent365Adapter(BasePlatformAdapter):
                 logger.warning("agent365 uvicorn shutdown noise: %s", e)
             self._uvicorn_task = None
             self._uvicorn_server = None
+        reply_tasks = list(self._coalesced_reply_tasks.values())
+        reply_tasks.extend(
+            task
+            for state in self._coalesced_replies.values()
+            if isinstance((task := state.get("finalize_task")), asyncio.Task)
+        )
+        for task in reply_tasks:
+            task.cancel()
+        if reply_tasks:
+            await asyncio.gather(*reply_tasks, return_exceptions=True)
+        for message_id in list(self._coalesced_replies):
+            self._drop_coalesced_reply_state(
+                message_id,
+                cancel_task=False,
+                restore_turn_target=False,
+            )
+        self._coalesced_reply_tasks.clear()
+        self._coalesced_replies.clear()
+        self._active_coalesced_reply_by_chat.clear()
+        self._active_coalesced_reply_by_turn.clear()
+        self._active_coalesced_reply_ids_by_chat.clear()
+        self._coalesced_delivery_tail_by_turn.clear()
+        self._coalesced_generation_count_by_chat.clear()
+        self._coalesced_generation_count_by_turn.clear()
+        self._coalesced_turn_owners.clear()
+        self._coalesced_turn_targets.clear()
+        self._coalesced_turn_target_order_by_chat.clear()
+        self._coalesced_turn_target_count_by_chat.clear()
+        self._recently_finalized.clear()
         if self._http_client is not None:
             with contextlib.suppress(Exception):
                 await self._http_client.aclose()
             self._http_client = None
-        for task in list(self._coalesced_reply_tasks.values()):
-            task.cancel()
-        self._coalesced_reply_tasks.clear()
-        self._coalesced_replies.clear()
-        self._active_coalesced_reply_by_chat.clear()
         for task in list(self._coalesced_status_tasks.values()):
             task.cancel()
         self._coalesced_status_tasks.clear()
@@ -2127,22 +2176,37 @@ class Agent365Adapter(BasePlatformAdapter):
         Fallback to a non-streaming ``message`` activity when the
         streaming-start POST itself fails.
         """
-        # Slice 19x-e (#27): the gate is "did this lifetime capture an
-        # inbound for chat_id", not "is the registry populated". The
-        # registry's raw persists across restarts (slice 19o), so the
-        # earlier ``_cached_inbound_for is None`` check never fired in
-        # production — every send took the cached-inbound path with a
-        # potentially stale activity_id.
-        if chat_id not in self._seen_inbounds_this_lifetime:
-            return await self._send_proactive(chat_id, content)
+        turn_key: tuple[str, str] | None = None
+        turn_validated_path: str | None = None
+        if reply_to is not None:
+            turn_key = self._coalesced_reply_turn_key(chat_id, reply_to)
+            target = self._coalesced_turn_target(turn_key)
+            if target is None:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "agent365 send: no cached inbound for exact "
+                        f"turn chat_id={chat_id!r}"
+                    ),
+                )
+            inbound, turn_validated_path = target
+        else:
+            # Slice 19x-e (#27): the gate is "did this lifetime capture an
+            # inbound for chat_id", not "is the registry populated". The
+            # registry's raw persists across restarts (slice 19o), so the
+            # earlier ``_cached_inbound_for is None`` check never fired in
+            # production — every send took the cached-inbound path with a
+            # potentially stale activity_id.
+            if chat_id not in self._seen_inbounds_this_lifetime:
+                return await self._send_proactive(chat_id, content)
 
-        inbound = self._cached_inbound_for(chat_id)
-        if not inbound:
-            # Defensive fallback: lifetime set says we saw an inbound,
-            # but the registry doesn't have raw. Should be unreachable
-            # under normal flow (capture writes both atomically); treat
-            # like a fresh-lifetime call and route via proactive.
-            return await self._send_proactive(chat_id, content)
+            inbound = self._cached_inbound_for(chat_id)
+            if not inbound:
+                # Defensive fallback: lifetime set says we saw an inbound,
+                # but the registry doesn't have raw. Should be unreachable
+                # under normal flow (capture writes both atomically); treat
+                # like a fresh-lifetime call and route via proactive.
+                return await self._send_proactive(chat_id, content)
 
         # Slice 19x-d (#4): bump the registry's last_used_at so prune
         # honours actively-driven chats even when no fresh inbound has
@@ -2200,22 +2264,18 @@ class Agent365Adapter(BasePlatformAdapter):
                     error="active stream still open; suppressed next send",
                 )
 
-        if chat_id in self._active_coalesced_reply_by_chat:
-            active_msg_id = self._active_coalesced_reply_by_chat[chat_id]
-            if reply_to is None:
-                logger.info(
-                    "agent365 send suppressed while coalesced reply active: "
-                    "chat_id=%s active_message_id=%s",
-                    chat_id,
-                    active_msg_id,
-                )
-                return SendResult(success=True, message_id=active_msg_id)
-            return self._buffer_coalesced_reply(
-                chat_id=chat_id,
-                content=content,
-                message_id=active_msg_id,
-                inbound=inbound,
+        if (
+            reply_to is None
+            and self._coalesced_generation_count_by_chat.get(chat_id, 0) > 0
+        ):
+            active_msg_id = self._active_coalesced_reply_by_chat.get(chat_id, "")
+            logger.info(
+                "agent365 send suppressed while coalesced reply active: "
+                "chat_id=%s active_message_id=%s",
+                chat_id,
+                active_msg_id,
             )
+            return SendResult(success=True, message_id=active_msg_id)
 
         if (
             chat_type == "personal"
@@ -2223,7 +2283,10 @@ class Agent365Adapter(BasePlatformAdapter):
             and chat_id not in self._active_stream_by_chat
         ):
             stream_result = await self._send_stream_start(
-                chat_id=chat_id, content=content, inbound=inbound
+                chat_id=chat_id,
+                content=content,
+                inbound=inbound,
+                validated_path=turn_validated_path,
             )
             if stream_result is not None:
                 return stream_result
@@ -2231,12 +2294,17 @@ class Agent365Adapter(BasePlatformAdapter):
             # fall through to non-streaming reply.
 
         if chat_type != "personal" and reply_to is not None:
-            message_id = self._coalesced_reply_message_id(chat_id, reply_to)
+            assert turn_key is not None
+            message_id = self._active_coalesced_reply_by_turn.get(turn_key)
+            if message_id is None:
+                message_id = self._coalesced_reply_message_id()
             return self._buffer_coalesced_reply(
                 chat_id=chat_id,
                 content=content,
                 message_id=message_id,
                 inbound=inbound,
+                turn_key=turn_key,
+                validated_path=str(turn_validated_path or ""),
             )
 
         return await self._send_reply_activity(
@@ -2246,6 +2314,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # #73(b): the agent surfaces sources under metadata["citations"];
             # render_reply_activity converts them to Teams citation entities.
             citations=(metadata or {}).get("citations"),
+            validated_path=turn_validated_path,
         )
 
     async def _send_reply_activity(
@@ -2255,6 +2324,7 @@ class Agent365Adapter(BasePlatformAdapter):
         content: str,
         log_context: str,
         citations: Any = None,
+        validated_path: str | None = None,
     ) -> SendResult:
         bridge = _import_bridge()
         webhook_response: dict[str, Any] = {"text": content}
@@ -2272,7 +2342,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 client=self._http_client,
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
-                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                validated_path=(
+                    validated_path
+                    if validated_path is not None
+                    else self._validated_path_for_inbound(inbound)
+                ),  # L4 (#100)
             )
         except Exception as e:
             logger.error("agent365 %s send_reply failed: %s", log_context, e)
@@ -2280,8 +2354,98 @@ class Agent365Adapter(BasePlatformAdapter):
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     @staticmethod
-    def _coalesced_reply_message_id(chat_id: str, reply_to: Any) -> str:
-        return f"coalesced:{chat_id}:{reply_to}"
+    def _coalesced_reply_turn_key(chat_id: str, reply_to: Any) -> tuple[str, str]:
+        return str(chat_id), str(reply_to)
+
+    @staticmethod
+    def _coalesced_reply_message_id() -> str:
+        # Opaque per-generation identity: no caller-controlled chat/activity
+        # values enter logs, task names, or recently-finalized cache keys.
+        return f"coalesced:{uuid.uuid4().hex}"
+
+    def _drop_coalesced_turn_target(self, turn_key: tuple[str, str]) -> bool:
+        target = self._coalesced_turn_targets.pop(turn_key, None)
+        if target is None:
+            return False
+        chat_id = turn_key[0]
+        count = self._coalesced_turn_target_count_by_chat.get(chat_id, 0)
+        if count <= 1:
+            self._coalesced_turn_target_count_by_chat.pop(chat_id, None)
+        else:
+            self._coalesced_turn_target_count_by_chat[chat_id] = count - 1
+        order = self._coalesced_turn_target_order_by_chat.get(chat_id)
+        if order is not None:
+            order.pop(turn_key, None)
+            if not order:
+                self._coalesced_turn_target_order_by_chat.pop(chat_id, None)
+        return True
+
+    def _capture_coalesced_turn_target(self, ref: ConversationRef) -> None:
+        if not ref.last_inbound_activity_id:
+            return
+        turn_key = self._coalesced_reply_turn_key(
+            ref.conversation_id, ref.last_inbound_activity_id
+        )
+        self._store_coalesced_turn_target(
+            turn_key, ref.raw, str(ref.validated_path or "")
+        )
+
+    def _store_coalesced_turn_target(
+        self,
+        turn_key: tuple[str, str],
+        inbound: dict[str, Any],
+        validated_path: str,
+    ) -> None:
+        if turn_key in self._coalesced_turn_targets:
+            return
+
+        chat_id = turn_key[0]
+        order = self._coalesced_turn_target_order_by_chat.setdefault(
+            chat_id, {}
+        )
+        while (
+            self._coalesced_turn_target_count_by_chat.get(chat_id, 0)
+            >= _MAX_COALESCED_TURN_TARGETS_PER_CHAT
+        ):
+            oldest_for_chat = next(iter(order))
+            self._drop_coalesced_turn_target(oldest_for_chat)
+        while len(self._coalesced_turn_targets) >= _MAX_COALESCED_TURN_TARGETS:
+            oldest = next(iter(self._coalesced_turn_targets))
+            self._drop_coalesced_turn_target(oldest)
+
+        order = self._coalesced_turn_target_order_by_chat.setdefault(chat_id, {})
+        self._coalesced_turn_targets[turn_key] = (
+            copy.deepcopy(inbound),
+            validated_path,
+            time.monotonic(),
+        )
+        order[turn_key] = None
+        self._coalesced_turn_target_count_by_chat[chat_id] = (
+            self._coalesced_turn_target_count_by_chat.get(chat_id, 0) + 1
+        )
+
+    def _coalesced_turn_target(
+        self,
+        turn_key: tuple[str, str],
+    ) -> tuple[dict[str, Any], str] | None:
+        owner = self._coalesced_turn_owners.get(turn_key)
+        if owner is not None:
+            return copy.deepcopy(owner[0]), owner[1]
+        target = self._coalesced_turn_targets.get(turn_key)
+        if target is not None:
+            if time.monotonic() - target[2] > _COALESCED_TURN_TARGET_TTL_SEC:
+                self._drop_coalesced_turn_target(turn_key)
+                return None
+            return copy.deepcopy(target[0]), target[1]
+        ref = self._conversations.get(turn_key[0])
+        if (
+            ref is not None
+            and turn_key[0] in self._seen_inbounds_this_lifetime
+            and ref.last_inbound_activity_id == turn_key[1]
+            and ref.raw
+        ):
+            return copy.deepcopy(ref.raw), str(ref.validated_path or "")
+        return None
 
     def _buffer_coalesced_reply(
         self,
@@ -2290,24 +2454,75 @@ class Agent365Adapter(BasePlatformAdapter):
         content: str,
         message_id: str,
         inbound: dict[str, Any],
+        turn_key: tuple[str, str],
+        validated_path: str,
     ) -> SendResult:
         loop = asyncio.get_event_loop()
         now = loop.time()
+        buffered_content = _strip_streaming_cursor(content)
+        if len(buffered_content) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error=(
+                    "agent365 send: coalesced reply content exceeds "
+                    f"{self.MAX_MESSAGE_LENGTH} characters"
+                ),
+            )
         state = self._coalesced_replies.get(message_id)
         if state is None:
+            generation_count = self._coalesced_generation_count_by_chat.get(
+                chat_id, 0
+            )
+            if generation_count >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "agent365 send: coalesced reply backlog full for "
+                        f"chat_id={chat_id!r}"
+                    ),
+                )
+            if len(self._coalesced_replies) >= _MAX_COALESCED_REPLY_GENERATIONS:
+                return SendResult(
+                    success=False,
+                    error="agent365 send: global coalesced reply backlog full",
+                )
+            delivered = asyncio.Event()
             state = {
                 "chat_id": chat_id,
+                "turn_key": turn_key,
                 "content": "",
-                "inbound": inbound,
+                "inbound": copy.deepcopy(inbound),
+                "validated_path": validated_path,
                 "opened_ts": now,
                 "last_update_ts": now,
+                "predecessor_delivery": self._coalesced_delivery_tail_by_turn.get(
+                    turn_key
+                ),
+                "delivery_complete": delivered,
             }
             self._coalesced_replies[message_id] = state
+            self._coalesced_generation_count_by_chat[chat_id] = generation_count + 1
+            self._coalesced_generation_count_by_turn[turn_key] = (
+                self._coalesced_generation_count_by_turn.get(turn_key, 0) + 1
+            )
+            self._coalesced_delivery_tail_by_turn[turn_key] = delivered
+            self._coalesced_turn_owners.setdefault(
+                turn_key, (copy.deepcopy(inbound), validated_path)
+            )
+            self._drop_coalesced_turn_target(turn_key)
+        elif state.get("turn_key") != turn_key or state.get("chat_id") != chat_id:
+            return SendResult(
+                success=False,
+                error="agent365 send: coalesced message belongs to another turn",
+            )
         else:
-            state["inbound"] = inbound
             state["last_update_ts"] = now
-        state["content"] = _strip_streaming_cursor(content)
+        state["content"] = buffered_content
         self._active_coalesced_reply_by_chat[chat_id] = message_id
+        self._active_coalesced_reply_by_turn[turn_key] = message_id
+        self._active_coalesced_reply_ids_by_chat.setdefault(chat_id, set()).add(
+            message_id
+        )
         self._ensure_coalesced_reply_task(message_id)
         return SendResult(success=True, message_id=message_id)
 
@@ -2321,59 +2536,144 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound: dict[str, Any],
         loop_now: float,
     ) -> SendResult:
-        active_msg_id = self._active_coalesced_reply_by_chat.get(chat_id)
-        if active_msg_id and active_msg_id != message_id:
-            logger.info(
-                "agent365 edit_message continuing coalesced reply: "
-                "chat_id=%s requested_message_id=%s active_message_id=%s "
-                "finalize=%s",
-                chat_id,
-                message_id,
-                active_msg_id,
-                finalize,
+        requested_state = self._coalesced_replies.get(message_id)
+        if requested_state is not None and str(
+            requested_state.get("chat_id") or ""
+        ) != str(chat_id):
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: coalesced message belongs to another chat",
             )
-            message_id = active_msg_id
 
-        if message_id not in self._coalesced_replies:
-            self._buffer_coalesced_reply(
+        state = self._coalesced_replies.get(message_id)
+        if state is not None and state.get("finalizing"):
+            if finalize:
+                return await self._finalize_coalesced_reply(message_id)
+            return SendResult(success=True, message_id=message_id)
+
+        if state is None:
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: unknown coalesced message id",
+            )
+        else:
+            turn_key = state.get("turn_key")
+            if not (
+                isinstance(turn_key, tuple)
+                and len(turn_key) == 2
+                and all(isinstance(part, str) for part in turn_key)
+            ):
+                return SendResult(
+                    success=False,
+                    error="agent365 edit_message: invalid coalesced reply ownership",
+                )
+            buffered = self._buffer_coalesced_reply(
                 chat_id=chat_id,
                 content=content,
                 message_id=message_id,
-                inbound=inbound,
+                inbound=state["inbound"],
+                turn_key=turn_key,
+                validated_path=str(state.get("validated_path") or ""),
             )
-        else:
-            self._coalesced_replies[message_id]["content"] = (
-                _strip_streaming_cursor(content)
-            )
-            self._coalesced_replies[message_id]["inbound"] = inbound
-            self._coalesced_replies[message_id]["last_update_ts"] = loop_now
-            self._ensure_coalesced_reply_task(message_id)
+            if not buffered.success:
+                return buffered
 
         if not finalize:
             return SendResult(success=True, message_id=message_id)
 
+        return await self._finalize_coalesced_reply(message_id)
+
+    def _deactivate_coalesced_reply(
+        self, message_id: str, state: dict[str, Any]
+    ) -> None:
+        chat_id = str(state.get("chat_id") or "")
+        turn_key = state.get("turn_key")
+        if (
+            isinstance(turn_key, tuple)
+            and self._active_coalesced_reply_by_turn.get(turn_key) == message_id
+        ):
+            self._active_coalesced_reply_by_turn.pop(turn_key, None)
+        active_ids = self._active_coalesced_reply_ids_by_chat.get(chat_id)
+        if active_ids is not None:
+            active_ids.discard(message_id)
+            if not active_ids:
+                self._active_coalesced_reply_ids_by_chat.pop(chat_id, None)
+        if self._active_coalesced_reply_by_chat.get(chat_id) != message_id:
+            return
+        replacement = next(iter(active_ids), None) if active_ids else None
+        if replacement is None:
+            self._active_coalesced_reply_by_chat.pop(chat_id, None)
+        else:
+            self._active_coalesced_reply_by_chat[chat_id] = replacement
+
+    def _claim_coalesced_reply_finalize(
+        self,
+        message_id: str,
+    ) -> tuple[asyncio.Task[SendResult] | None, bool]:
+        state = self._coalesced_replies.get(message_id)
+        if state is None:
+            return None, False
+        task = state.get("finalize_task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            return task, False
+
+        state["finalizing"] = True
+        self._deactivate_coalesced_reply(message_id, state)
+        state["finalize_owner_task"] = asyncio.current_task()
+        task = asyncio.create_task(self._deliver_coalesced_reply(message_id))
+        state["finalize_task"] = task
+        return task, True
+
+    async def _finalize_coalesced_reply(self, message_id: str) -> SendResult:
+        task, _claimed = self._claim_coalesced_reply_finalize(message_id)
+        if task is None:
+            return SendResult(success=True, message_id="")
+        return await asyncio.shield(task)
+
+    async def _deliver_coalesced_reply(self, message_id: str) -> SendResult:
+        state = self._coalesced_replies.get(message_id)
+        if state is None:
+            return SendResult(success=True, message_id="")
+        chat_id = str(state.get("chat_id") or "")
+        inbound = state.get("inbound")
+        predecessor = state.get("predecessor_delivery")
+        if isinstance(predecessor, asyncio.Event):
+            await predecessor.wait()
+        if self._coalesced_replies.get(message_id) is not state:
+            return SendResult(success=True, message_id="")
         if self._http_client is None or self._bridge_cfg is None:
-            return SendResult(
+            result = SendResult(
                 success=False,
                 error="agent365 edit_message: adapter not connected",
             )
-
-        state = self._coalesced_replies.get(message_id) or {}
-        final_content = str(state.get("content") or "")
-        # #82 — the coalesced path is the "degraded-from-stream" surface for
-        # every non-personal chat (Copilot Chat AND genuine Teams groups are
-        # wire-indistinguishable here). Offer a "continue in Teams" link
-        # (policy-gated, off by default).
-        final_content = self._maybe_append_handoff_link(chat_id, final_content)
-        result = await self._send_reply_activity(
-            inbound=inbound,
-            content=final_content,
-            log_context="coalesced edit_message",
-        )
+        elif not chat_id or not isinstance(inbound, dict):
+            result = SendResult(
+                success=False,
+                error="agent365 edit_message: incomplete coalesced reply state",
+            )
+        else:
+            final_content = str(state.get("content") or "")
+            # #82 — the coalesced path is the "degraded-from-stream" surface
+            # for every non-personal chat (Copilot Chat AND genuine Teams
+            # groups are wire-indistinguishable here). Offer a policy-gated
+            # "continue in Teams" link.
+            final_content = self._maybe_append_handoff_link(chat_id, final_content)
+            result = await self._send_reply_activity(
+                inbound=inbound,
+                content=final_content,
+                log_context="coalesced edit_message",
+                validated_path=str(state.get("validated_path") or ""),
+            )
         if result.success:
-            self._drop_coalesced_reply_state(chat_id, message_id)
-            self._recently_finalized[message_id] = loop_now
+            self._drop_coalesced_reply_state(message_id)
+            self._record_recently_finalized(message_id, chat_id)
             return SendResult(success=True, message_id=result.message_id)
+
+        current_state = self._coalesced_replies.get(message_id)
+        if current_state is state:
+            current_state["finalizing"] = False
+            current_state.pop("finalize_task", None)
+            current_state.pop("finalize_owner_task", None)
         return result
 
     def _ensure_coalesced_reply_task(self, message_id: str) -> None:
@@ -2402,10 +2702,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                     continue
-                await self._flush_stale_coalesced_reply(
+                flushed = await self._flush_stale_coalesced_reply(
                     message_id, cancel_task=False
                 )
-                return
+                if flushed or message_id not in self._coalesced_replies:
+                    return
+                state = self._coalesced_replies[message_id]
+                state["last_update_ts"] = asyncio.get_event_loop().time()
         except asyncio.CancelledError:
             raise
         except Exception as e:
@@ -2421,13 +2724,13 @@ class Agent365Adapter(BasePlatformAdapter):
         message_id: str,
         *,
         cancel_task: bool = True,
+        restore_turn_target: bool = True,
     ) -> bool:
         state = self._coalesced_replies.get(message_id)
         if state is None:
             return True
         chat_id = str(state.get("chat_id") or "")
         inbound = state.get("inbound")
-        content = str(state.get("content") or "")
         if not chat_id or not isinstance(inbound, dict):
             logger.warning(
                 "agent365 dropping stale coalesced reply with incomplete state: "
@@ -2436,7 +2739,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             self._drop_coalesced_reply_state(
-                chat_id, message_id, cancel_task=cancel_task
+                message_id, cancel_task=cancel_task
             )
             return False
 
@@ -2448,26 +2751,22 @@ class Agent365Adapter(BasePlatformAdapter):
                 message_id,
             )
             self._drop_coalesced_reply_state(
-                chat_id, message_id, cancel_task=cancel_task
+                message_id, cancel_task=cancel_task
             )
             return False
 
-        result = await self._send_reply_activity(
-            inbound=inbound,
-            content=content,
-            log_context="stale coalesced reply",
-        )
+        task, claimed = self._claim_coalesced_reply_finalize(message_id)
+        if task is None:
+            return True
+        result = await asyncio.shield(task)
         if result.success:
-            logger.warning(
-                "agent365 auto-flushed stale coalesced reply: "
-                "chat_id=%s message_id=%s",
-                chat_id,
-                message_id,
-            )
-            self._drop_coalesced_reply_state(
-                chat_id, message_id, cancel_task=cancel_task
-            )
-            self._recently_finalized[message_id] = asyncio.get_event_loop().time()
+            if claimed:
+                logger.warning(
+                    "agent365 auto-flushed stale coalesced reply: "
+                    "chat_id=%s message_id=%s",
+                    chat_id,
+                    message_id,
+                )
             return True
 
         logger.warning(
@@ -2477,25 +2776,75 @@ class Agent365Adapter(BasePlatformAdapter):
             message_id,
             result.error,
         )
-        self._drop_coalesced_reply_state(
-            chat_id, message_id, cancel_task=cancel_task
-        )
+        failed_state = self._coalesced_replies.get(message_id)
+        if (
+            claimed
+            and failed_state is not None
+            and not failed_state.get("finalize_task")
+        ):
+            self._drop_coalesced_reply_state(
+                message_id, cancel_task=cancel_task
+            )
         return False
 
     def _drop_coalesced_reply_state(
         self,
-        chat_id: str,
         message_id: str,
         *,
         cancel_task: bool = True,
+        restore_turn_target: bool = True,
     ) -> None:
-        self._coalesced_replies.pop(message_id, None)
-        if self._active_coalesced_reply_by_chat.get(chat_id) == message_id:
-            self._active_coalesced_reply_by_chat.pop(chat_id, None)
-        task = self._coalesced_reply_tasks.pop(message_id, None)
+        state = self._coalesced_replies.pop(message_id, None)
+        if state is None:
+            task = self._coalesced_reply_tasks.pop(message_id, None)
+            if cancel_task and task is not None and task is not asyncio.current_task():
+                task.cancel()
+            return
+        chat_id = str(state.get("chat_id") or "")
+        turn_key = state.get("turn_key")
+        self._deactivate_coalesced_reply(message_id, state)
+        count = self._coalesced_generation_count_by_chat.get(chat_id, 0)
+        if count <= 1:
+            self._coalesced_generation_count_by_chat.pop(chat_id, None)
+        else:
+            self._coalesced_generation_count_by_chat[chat_id] = count - 1
+        if isinstance(turn_key, tuple):
+            turn_count = self._coalesced_generation_count_by_turn.get(turn_key, 0)
+            if turn_count <= 1:
+                self._coalesced_generation_count_by_turn.pop(turn_key, None)
+            else:
+                self._coalesced_generation_count_by_turn[turn_key] = turn_count - 1
+        delivered = state.get("delivery_complete")
+        if isinstance(delivered, asyncio.Event):
+            delivered.set()
+            if (
+                isinstance(turn_key, tuple)
+                and self._coalesced_delivery_tail_by_turn.get(turn_key) is delivered
+            ):
+                self._coalesced_delivery_tail_by_turn.pop(turn_key, None)
+        if (
+            isinstance(turn_key, tuple)
+            and turn_key not in self._coalesced_generation_count_by_turn
+        ):
+            turn_owner = self._coalesced_turn_owners.pop(turn_key, None)
+            if restore_turn_target and turn_owner is not None:
+                self._store_coalesced_turn_target(
+                    turn_key, turn_owner[0], turn_owner[1]
+                )
         current = asyncio.current_task()
-        if cancel_task and task is not None and task is not current:
-            task.cancel()
+        owner = state.get("finalize_owner_task")
+        tasks = [
+            self._coalesced_reply_tasks.pop(message_id, None),
+            state.get("finalize_task"),
+        ]
+        if cancel_task:
+            for task in tasks:
+                if (
+                    task is not None
+                    and task is not current
+                    and not (task is owner and task is tasks[0])
+                ):
+                    task.cancel()
 
     # ── Status coalescing (Copilot Chat, #53) ────────────────────────────
     @staticmethod
@@ -2616,7 +2965,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # (mirrors the entry guard in send_or_update_status).
         if (
             chat_id in self._active_stream_by_chat
-            or chat_id in self._active_coalesced_reply_by_chat
+            or self._coalesced_generation_count_by_chat.get(chat_id, 0) > 0
         ):
             logger.info(
                 "agent365 coalesced status suppressed (turn opened during "
@@ -2804,6 +3153,7 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id: str,
         content: str,
         inbound: dict[str, Any],
+        validated_path: str | None = None,
     ) -> SendResult | None:
         """Slice 19s-bis: open a new BF stream from ``send()``.
 
@@ -2847,7 +3197,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 fmi_cache=self._fmi_cache,
                 user_cache=self._user_cache,
                 bf_cache=self._bf_token_cache,
-                validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                validated_path=(
+                    validated_path
+                    if validated_path is not None
+                    else self._validated_path_for_inbound(inbound)
+                ),  # L4 (#100)
             )
             resp = await self._http_client.post(
                 url,
@@ -3010,7 +3364,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # an active turn — mirror send()'s reply_to=None suppression.
         if (
             chat_id in self._active_stream_by_chat
-            or chat_id in self._active_coalesced_reply_by_chat
+            or self._coalesced_generation_count_by_chat.get(chat_id, 0) > 0
         ):
             active = (
                 self._active_coalesced_reply_by_chat.get(chat_id)
@@ -3555,7 +3909,8 @@ class Agent365Adapter(BasePlatformAdapter):
         link = self._mint_handoff_link(chat_id, reason="cc_degraded")
         if not link:
             return content
-        return f"{content}\n\n[Continue in Teams]({link})"
+        with_link = f"{content}\n\n[Continue in Teams]({link})"
+        return with_link if len(with_link) <= self.MAX_MESSAGE_LENGTH else content
 
     def _mint_handoff_link(self, chat_id: str, *, reason: str) -> str | None:
         """#82: mint a continuation token bound to ``chat_id`` and return the
@@ -3942,13 +4297,6 @@ class Agent365Adapter(BasePlatformAdapter):
         - https://learn.microsoft.com/en-us/microsoftteams/platform/bots/streaming-ux
         - https://learn.microsoft.com/en-us/microsoft-365/copilot/extensibility/overview-custom-engine-agent
         """
-        inbound = self._cached_inbound_for(chat_id)
-        if not inbound:
-            return SendResult(
-                success=False,
-                error=f"agent365 edit_message: no cached inbound for chat_id={chat_id!r}",
-            )
-
         # Slice 19x-d (#4): streaming edits are clear outbound traffic;
         # mark the conversation as recently used so prune respects it.
         self._conversations.mark_used(chat_id)
@@ -3958,8 +4306,52 @@ class Agent365Adapter(BasePlatformAdapter):
         # docstring for the Hermes stream-consumer quirk this guards.
         loop_now = asyncio.get_event_loop().time()
         self._prune_recently_finalized(loop_now)
-        if message_id in self._recently_finalized:
+        recent = self._recently_finalized.get(message_id)
+        if recent is not None:
+            owner_chat_id, _finalized_at = recent
+            if owner_chat_id != str(chat_id):
+                return SendResult(
+                    success=False,
+                    error="agent365 edit_message: finalized message belongs to another chat",
+                )
             return SendResult(success=True, message_id="")
+
+        if message_id.startswith("coalesced:"):
+            state = self._coalesced_replies.get(message_id)
+            if state is None:
+                return SendResult(
+                    success=False,
+                    error="agent365 edit_message: unknown coalesced message id",
+                )
+            if str(state.get("chat_id") or "") != str(chat_id):
+                return SendResult(
+                    success=False,
+                    error=(
+                        "agent365 edit_message: coalesced message belongs "
+                        "to another chat"
+                    ),
+                )
+            owner_inbound = state.get("inbound")
+            if not isinstance(owner_inbound, dict):
+                return SendResult(
+                    success=False,
+                    error="agent365 edit_message: invalid coalesced reply target",
+                )
+            return await self._edit_coalesced_reply(
+                chat_id=chat_id,
+                message_id=message_id,
+                content=content,
+                finalize=finalize,
+                inbound=owner_inbound,
+                loop_now=loop_now,
+            )
+
+        inbound = self._cached_inbound_for(chat_id)
+        if not inbound:
+            return SendResult(
+                success=False,
+                error=f"agent365 edit_message: no cached inbound for chat_id={chat_id!r}",
+            )
 
         # DM-only: BF streaming-ux doc:
         # "Streaming bot message is available only for one-on-one chats."
@@ -4111,7 +4503,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if finalize:
                 # First + finalize is degenerate but legal — drop state.
                 self._drop_stream_state(chat_id, message_id)
-                self._recently_finalized[message_id] = loop_now
+                self._record_recently_finalized(message_id, chat_id, loop_now)
             else:
                 self._active_stream_by_chat[chat_id] = message_id
             return SendResult(success=True, message_id=state["bf_stream_id"])
@@ -4130,7 +4522,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             if finalize:
                 self._drop_stream_state(chat_id, message_id)
-                self._recently_finalized[message_id] = loop_now
+                self._record_recently_finalized(message_id, chat_id, loop_now)
             return SendResult(success=True, message_id=state.get("bf_stream_id") or "")
 
         if resp.status_code == 403:
@@ -4252,7 +4644,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             self._drop_stream_state(chat_id, message_id)
             loop_now = asyncio.get_event_loop().time()
-            self._recently_finalized[message_id] = loop_now
+            self._record_recently_finalized(message_id, chat_id, loop_now)
             return True
 
         logger.warning(
@@ -4305,14 +4697,30 @@ class Agent365Adapter(BasePlatformAdapter):
                 reason,
             )
             self._drop_stream_state(chat_id, message_id)
-            self._recently_finalized[message_id] = loop_now
+            self._record_recently_finalized(message_id, chat_id, loop_now)
             return True
         return False
+
+    def _record_recently_finalized(
+        self,
+        message_id: str,
+        chat_id: str,
+        now: float | None = None,
+    ) -> None:
+        finalized_at = asyncio.get_event_loop().time() if now is None else now
+        self._prune_recently_finalized(finalized_at)
+        self._recently_finalized[message_id] = (str(chat_id), finalized_at)
+        while len(self._recently_finalized) > _MAX_RECENTLY_FINALIZED:
+            self._recently_finalized.pop(next(iter(self._recently_finalized)))
 
     def _prune_recently_finalized(self, now: float) -> None:
         """Drop ``_recently_finalized`` entries older than the TTL."""
         cutoff = now - self._recently_finalized_ttl_sec
-        stale = [k for k, ts in self._recently_finalized.items() if ts < cutoff]
+        stale = [
+            key
+            for key, (_chat_id, finalized_at) in self._recently_finalized.items()
+            if finalized_at < cutoff
+        ]
         for k in stale:
             self._recently_finalized.pop(k, None)
 
@@ -4341,13 +4749,47 @@ class Agent365Adapter(BasePlatformAdapter):
         sid = self._active_stream_by_chat.pop(chat_id, None)
         if sid is not None:
             self._streams.pop(sid, None)
-        # Coalesced-reply slot + its watchdog.
-        mid = self._active_coalesced_reply_by_chat.pop(chat_id, None)
-        if mid is not None:
-            self._coalesced_replies.pop(mid, None)
-            task = self._coalesced_reply_tasks.pop(mid, None)
-            if task is not None:
-                task.cancel()
+        # Every coalesced-reply generation for this chat, including a detached
+        # generation whose finalize POST is currently in flight.
+        reply_ids = {
+            mid
+            for mid, state in self._coalesced_replies.items()
+            if isinstance(state, dict) and state.get("chat_id") == chat_id
+        }
+        active_mid = self._active_coalesced_reply_by_chat.pop(chat_id, None)
+        if active_mid is not None:
+            reply_ids.add(active_mid)
+        for mid in reply_ids:
+            self._drop_coalesced_reply_state(mid, restore_turn_target=False)
+        turn_keys = {
+            key
+            for mapping in (
+                self._active_coalesced_reply_by_turn,
+                self._coalesced_delivery_tail_by_turn,
+                self._coalesced_generation_count_by_turn,
+                self._coalesced_turn_owners,
+            )
+            for key in mapping
+            if key[0] == chat_id
+        }
+        for turn_key in turn_keys:
+            self._active_coalesced_reply_by_turn.pop(turn_key, None)
+            self._coalesced_delivery_tail_by_turn.pop(turn_key, None)
+            self._coalesced_generation_count_by_turn.pop(turn_key, None)
+            self._coalesced_turn_owners.pop(turn_key, None)
+        self._active_coalesced_reply_ids_by_chat.pop(chat_id, None)
+        self._coalesced_generation_count_by_chat.pop(chat_id, None)
+        target_order = self._coalesced_turn_target_order_by_chat.pop(
+            chat_id, {}
+        )
+        for turn_key in target_order:
+            self._drop_coalesced_turn_target(turn_key)
+        self._coalesced_turn_target_count_by_chat.pop(chat_id, None)
+        for message_id, (owner_chat_id, _finalized_at) in list(
+            self._recently_finalized.items()
+        ):
+            if owner_chat_id == chat_id:
+                self._recently_finalized.pop(message_id, None)
         # Coalesced-status slots (keyed ``status:{chat}:{status_key}``) + their
         # watchdogs. Match on the stored chat_id, not a key prefix, since a
         # Teams chat id itself contains ':'.
