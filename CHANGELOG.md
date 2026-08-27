@@ -91,6 +91,13 @@ this heading is dated at release.
 
 ### Security / docs
 
+- **#121 adds reviewer-gated PyPI publishing.** The `publish` job now targets
+  the protected `pypi` GitHub environment, whose required-reviewer rule gates
+  the job before its OIDC permission or PyPI action is available. A typed,
+  manual `approval_test` path enters that same job and environment from a
+  branch build, verifies the built artefact, and independently skips the PyPI
+  action so approval and rejection can be exercised without creating a
+  package or GitHub Release.
 - **#125 establishes the pre-v1 repository security baseline.** The public
   security policy now defines supported versions, a private disclosure route,
   response expectations, and coordinated disclosure guidance. Test and

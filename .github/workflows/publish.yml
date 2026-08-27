@@ -13,11 +13,18 @@ on:
   # (e.g. account-wide Actions scheduler bug 2026-05-26). Allows
   # `gh workflow run publish.yml --ref v0.x.y` to publish a tag
   # that didn't auto-fire publish.yml on tag push. Dispatching on a
-  # BRANCH ref builds but does not publish (see the publish job's
-  # tag-ref guard). NOTE: PyPI Trusted Publisher (OIDC) may need a
+  # branch ref builds but does not publish unless `approval_test` is
+  # selected; that mode enters the real protected environment and then
+  # skips the PyPI action. NOTE: PyPI Trusted Publisher (OIDC) may need a
   # separate trust entry for `workflow_dispatch` events; verify with
-  # a test publish to TestPyPI first if relying on this path.
+  # TestPyPI first if relying on the tag-dispatch publication path.
   workflow_dispatch:
+    inputs:
+      approval_test:
+        description: Exercise the pypi approval gate without publishing
+        required: false
+        default: false
+        type: boolean
 
 jobs:
   build:
@@ -32,6 +39,7 @@ jobs:
           fetch-depth: 0
 
       - name: Verify release provenance
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_REF: ${{ github.ref }}
           RELEASE_SHA: ${{ github.sha }}
@@ -76,16 +84,12 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
-    # M12: publish only from a v* tag ref. A `workflow_dispatch` against a
-    # branch ref (or any non-tag ref) stops here, so repo writers cannot
-    # publish arbitrary branch contents to PyPI via OIDC. NOTE: this is a
-    # ref-NAME guard only — it does not attest commit provenance, so a
-    # repo-writer who pushes a malicious `v*` tag could still publish. That
-    # higher-privilege threat (compromised/insider maintainer) is out of
-    # scope for this guard; close it with a protected GitHub `environment:`
-    # carrying required-reviewer rules on this job (configure the rules in
-    # repo settings first — an unconfigured `environment:` is a no-op gate).
-    if: startsWith(github.ref, 'refs/tags/v')
+    # M12: real publication still requires a v* tag ref. The only branch-ref
+    # exception is the explicit approval test, which enters the same protected
+    # environment but independently skips the PyPI action below.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') ||
+      (github.event_name == 'workflow_dispatch' && inputs.approval_test == true)
     environment: pypi
     # Uses PyPI Trusted Publisher (OIDC) — no PYPI_API_TOKEN secret.
     # One-time setup: register the project on pypi.org and add this
@@ -141,4 +145,9 @@ jobs:
           rm dist/SHA256SUMS
 
       - name: Publish to PyPI
+        if: ${{ github.event_name != 'workflow_dispatch' || inputs.approval_test != true }}
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+
+      - name: Confirm approval test completed without publishing
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.approval_test == true }}
+        run: echo "pypi approval gate passed; package publication intentionally skipped"
