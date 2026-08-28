@@ -37,6 +37,7 @@ import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Literal
+from uuid import UUID
 
 from . import a365_config, bot_service
 from ._common import (
@@ -122,6 +123,8 @@ class CleanupInputs:
     bot_service_sidecar_path: Path = field(
         default_factory=lambda: Path.cwd() / bot_service.SIDECAR_FILENAME
     )
+    bot_service_target_confirmation: str | None = None
+    bot_service_legacy_binding_confirmation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_name:
@@ -169,6 +172,7 @@ class CleanupPlan:
     steps: list[CleanupStep]
     local_paths: list[Path] = field(default_factory=list)
     bot_service_plan: bot_service.BotServiceCleanupPlan | None = None
+    orphan_user_ids: tuple[str, ...] = ()
     orphan_instance_ids: tuple[str, ...] = ()
 
     def bot_service_target_summary(self) -> str | None:
@@ -215,6 +219,15 @@ class CleanupPlan:
                     "      apply with: "
                     f"--purge-orphans --confirm-orphan {instance_id}"
                 )
+        if self.orphan_user_ids:
+            lines.append("  orphan agentic users requiring double entry:")
+            for user_id in self.orphan_user_ids:
+                lines.append(f"    - {user_id}")
+                lines.append(
+                    "      apply with: "
+                    f"--purge-orphans --orphan-user-id {user_id} "
+                    f"--confirm-orphan-user {user_id}"
+                )
         return "\n".join(lines)
 
 
@@ -257,6 +270,7 @@ def build_cleanup_plan(
     hermes_home: Path | None = None,
     generated_config_path: Path | None = None,
     additional_orphan_instance_ids: tuple[str, ...] = (),
+    additional_orphan_user_ids: tuple[str, ...] = (),
 ) -> CleanupPlan:
     """Compose the ordered list of CLI cleanup steps + local artefact list.
 
@@ -291,6 +305,10 @@ def build_cleanup_plan(
             bot_service.BotServiceCleanupInputs(
                 agent_name=inputs.agent_name,
                 sidecar_path=inputs.bot_service_sidecar_path,
+                target_confirmation=inputs.bot_service_target_confirmation,
+                legacy_binding_confirmation=(
+                    inputs.bot_service_legacy_binding_confirmation
+                ),
             )
         )
 
@@ -301,6 +319,7 @@ def build_cleanup_plan(
         # artefacts this run's kinds may actually remove.
         local_paths=_local_artefacts(hermes_home, inputs.resolved_slug, normalized_kinds),
         bot_service_plan=bot_service_plan,
+        orphan_user_ids=_collect_orphan_user_ids(additional_orphan_user_ids),
         # Capture candidates while the generated config still exists so the
         # dry-run tells the operator exactly what to double-enter on apply.
         orphan_instance_ids=_collect_orphan_instance_ids(
@@ -382,11 +401,34 @@ def _collect_orphan_instance_ids(
     """Return the canonical, ordered union of discovered orphan candidates."""
     candidates: list[str] = []
     for oid in (*existing, _snapshot_agent_instance_id(generated_config_path) or ""):
-        normalized = oid.strip().lower()
+        normalized = _canonical_guid(oid, source="orphan instance candidate")
         if normalized and normalized not in candidates:
             candidates.append(normalized)
     for oid in additional_orphan_instance_ids:
-        normalized = oid.strip().lower()
+        normalized = _canonical_guid(oid, source="--orphan-instance-id")
+        if normalized and normalized not in candidates:
+            candidates.append(normalized)
+    return tuple(candidates)
+
+
+def _canonical_guid(value: str, *, source: str) -> str:
+    """Return one safe Graph path segment, rejecting malformed identifiers."""
+    stripped = value.strip()
+    if not stripped:
+        return ""
+    try:
+        return str(UUID(stripped))
+    except (ValueError, AttributeError) as exc:
+        raise CleanupError(f"{source} must be a GUID, got {value!r}") from exc
+
+
+def _collect_orphan_user_ids(
+    additional_orphan_user_ids: tuple[str, ...] = (),
+    existing: tuple[str, ...] = (),
+) -> tuple[str, ...]:
+    candidates: list[str] = []
+    for oid in (*existing, *additional_orphan_user_ids):
+        normalized = _canonical_guid(oid, source="--orphan-user-id")
         if normalized and normalized not in candidates:
             candidates.append(normalized)
     return tuple(candidates)
@@ -420,6 +462,8 @@ def apply_cleanup_plan(
     generated_config_path: Path | None = None,
     additional_orphan_instance_ids: tuple[str, ...] = (),
     confirmed_orphan_instance_ids: tuple[str, ...] = (),
+    additional_orphan_user_ids: tuple[str, ...] = (),
+    confirmed_orphan_user_ids: tuple[str, ...] = (),
     bot_service_runner: bot_service.CommandRunner | None = None,
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
@@ -463,8 +507,27 @@ def apply_cleanup_plan(
         )
     )
     confirmed_instance_ids = {
-        oid.strip().lower() for oid in confirmed_orphan_instance_ids if oid.strip()
+        normalized
+        for oid in confirmed_orphan_instance_ids
+        if (normalized := _canonical_guid(oid, source="--confirm-orphan"))
     }
+    confirmed_user_ids = {
+        normalized
+        for oid in confirmed_orphan_user_ids
+        if (normalized := _canonical_guid(oid, source="--confirm-orphan-user"))
+    }
+    candidate_user_ids = _collect_orphan_user_ids(
+        additional_orphan_user_ids, plan.orphan_user_ids
+    )
+    unmatched_user_confirmations = sorted(
+        confirmed_user_ids - set(candidate_user_ids)
+    )
+    if unmatched_user_confirmations:
+        unmatched = ", ".join(unmatched_user_confirmations)
+        raise CleanupError(
+            f"--confirm-orphan-user value(s) did not match an explicit orphan-user "
+            f"candidate: {unmatched}. Pass each id with --orphan-user-id as well."
+        )
     unmatched_confirmations = sorted(confirmed_instance_ids - set(candidate_instance_ids))
     if unmatched_confirmations:
         unmatched = ", ".join(unmatched_confirmations)
@@ -578,8 +641,11 @@ def apply_cleanup_plan(
             if bs_plan is None:
                 raise CleanupError("bot-service cleanup step is missing its parsed target plan")
             bs_result = bot_service.apply_cleanup_plan(bs_plan, runner=bot_service_runner)
-            result.completed.append(step.kind)
-            blueprint_teardown_requested = "blueprint" in plan.inputs.kinds
+            if not bs_result.target_missing and not bs_result.resource_group_purge_pending:
+                result.completed.append(step.kind)
+            blueprint_teardown_requested = any(
+                planned.kind == "blueprint" for planned in plan.steps
+            )
             preserved_message = (
                 bs_result.blueprint_preserved_message
                 if blueprint_teardown_requested and bs_result.blueprint_preserved
@@ -589,7 +655,17 @@ def apply_cleanup_plan(
                 if message == preserved_message:
                     continue
                 result.messages.append(message)
-            if blueprint_teardown_requested:
+            if bs_result.target_missing:
+                result.messages.append(
+                    "[apply] bot-service cleanup incomplete: sidecar missing; "
+                    "shared local recovery state preserved"
+                )
+            elif bs_result.resource_group_purge_pending:
+                result.messages.append(
+                    "[apply] bot-service cleanup incomplete: requested managed "
+                    "resource-group purge remains pending"
+                )
+            elif blueprint_teardown_requested:
                 result.messages.append(
                     "[apply] bot-service cleanup complete before blueprint teardown"
                 )
@@ -607,13 +683,24 @@ def apply_cleanup_plan(
             if oid not in result.orphan_user_ids:
                 result.orphan_user_ids.append(oid)
 
+    for oid in candidate_user_ids:
+        if oid not in result.orphan_user_ids:
+            result.orphan_user_ids.append(oid)
+
     # #103/M9: every unlink/rmdir target must resolve inside the agents root.
     # ``resolved_slug`` already rejects traversal slugs, so this is
     # belt-and-braces (also catches a symlinked agent dir pointing outside):
     # fail closed with a clear operator error rather than deleting an
     # arbitrary path the CLI cleanup should never touch.
     agents_root = hermes_home / "agents"
+    all_kinds_torn_down = set(result.completed) >= set(CLEANUP_KINDS)
     for path in plan.local_paths:
+        if path.name in {".env", "bridge.pid", "bridge.log"} and not all_kinds_torn_down:
+            result.messages.append(
+                f"[apply] preserved shared local state {path}: not every cloud kind "
+                "completed"
+            )
+            continue
         try:
             ensure_contained(path, agents_root)
         except ValueError as e:
@@ -634,7 +721,6 @@ def apply_cleanup_plan(
         ensure_contained(agent_dir, agents_root)
     except ValueError as e:
         raise CleanupError(f"refusing to rmdir a path outside the agents root: {e}") from e
-    all_kinds_torn_down = set(result.completed) >= set(CLEANUP_KINDS)
     if all_kinds_torn_down and agent_dir.exists() and not any(agent_dir.iterdir()):
         agent_dir.rmdir()
         result.messages.append(f"[apply] removed empty dir {agent_dir}")
@@ -659,6 +745,14 @@ def apply_cleanup_plan(
             result.messages.append(
                 f"[apply] orphaned agentic user: {oid}; "
                 f"recover with: az ad user delete --id {oid}"
+            )
+            continue
+        if oid not in confirmed_user_ids:
+            result.orphans_remaining.append(oid)
+            result.messages.append(
+                f"[apply] refused to purge orphaned agentic user {oid} without "
+                f"--confirm-orphan-user {oid}; re-run with --orphan-user-id {oid} "
+                f"--confirm-orphan-user {oid} --purge-orphans"
             )
             continue
         try:
@@ -791,6 +885,16 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         "--confirm",
         help="must equal --agent-name for the apply path to proceed",
     )
+    parser.add_argument(
+        "--confirm-bot-target",
+        metavar="ARM_RESOURCE_ID",
+        help="required for Bot Service cleanup; must match the sidecar ARM id exactly",
+    )
+    parser.add_argument(
+        "--confirm-legacy-binding",
+        metavar="AGENT_NAME",
+        help="required when the Bot Service sidecar uses legacy schema v1",
+    )
     parser.add_argument("--apply", action="store_true", help="execute the plan; default is dry-run")
     # Slice 19g
     parser.add_argument(
@@ -836,6 +940,26 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
             "working directory, not bound to --agent-name. May be repeated."
         ),
     )
+    parser.add_argument(
+        "--orphan-user-id",
+        action="append",
+        default=[],
+        metavar="GUID",
+        help=(
+            "agentic-user id surfaced by a prior cleanup. May be repeated and "
+            "requires matching --confirm-orphan-user for deletion."
+        ),
+    )
+    parser.add_argument(
+        "--confirm-orphan-user",
+        action="append",
+        default=[],
+        metavar="GUID",
+        help=(
+            "re-type an orphaned agentic-user id previously surfaced by cleanup "
+            "to authorise `az ad user delete`. May be repeated."
+        ),
+    )
     return parser
 
 
@@ -855,6 +979,8 @@ def run(args: argparse.Namespace) -> int:
             tenant_id=pinned_tenant,
             kinds=kinds,
             slug=args.slug,
+            bot_service_target_confirmation=args.confirm_bot_target,
+            bot_service_legacy_binding_confirmation=args.confirm_legacy_binding,
         )
     except (ValueError, CleanupError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -866,8 +992,9 @@ def run(args: argparse.Namespace) -> int:
         plan = build_cleanup_plan(
             inputs,
             additional_orphan_instance_ids=tuple(args.orphan_instance_id),
+            additional_orphan_user_ids=tuple(args.orphan_user_id),
         )
-    except (ValueError, bot_service.BotServiceError) as e:
+    except (ValueError, CleanupError, bot_service.BotServiceError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
     sys.stdout.write(plan.render_human() + "\n")
@@ -875,9 +1002,16 @@ def run(args: argparse.Namespace) -> int:
     if not args.apply:
         target = plan.bot_service_target_summary()
         target_text = f" Bot Service target: {target}." if target is not None else ""
+        apply_args = ["--apply", f"--confirm={args.agent_name}"]
+        if plan.bot_service_plan is not None and plan.bot_service_plan.config is not None:
+            apply_args.append(
+                f"--confirm-bot-target={plan.bot_service_plan.config.armResourceId}"
+            )
+            if plan.bot_service_plan.config.agentName is None:
+                apply_args.append(f"--confirm-legacy-binding={args.agent_name}")
         sys.stdout.write(
-            f"\nNo mutations.{target_text} Re-run with --apply "
-            f"--confirm={args.agent_name} to tear down.\n"
+            f"\nNo mutations.{target_text} Re-run with {shlex.join(apply_args)} "
+            "to tear down.\n"
         )
         return 0
 
@@ -895,6 +1029,8 @@ def run(args: argparse.Namespace) -> int:
             purge_orphans=args.purge_orphans,
             additional_orphan_instance_ids=tuple(args.orphan_instance_id),
             confirmed_orphan_instance_ids=tuple(args.confirm_orphan),
+            additional_orphan_user_ids=tuple(args.orphan_user_id),
+            confirmed_orphan_user_ids=tuple(args.confirm_orphan_user),
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
@@ -914,7 +1050,12 @@ def run(args: argparse.Namespace) -> int:
     # Exit 1 (partial) if any orphan was left behind — CI / scripted
     # teardown should notice. Slice 19g (agentic users) and 19h
     # (agentRegistry instances) both feed this.
-    if result.orphans_remaining or result.orphan_instances_remaining:
+    requested = {step.kind for step in plan.steps}
+    if (
+        not requested.issubset(set(result.completed))
+        or result.orphans_remaining
+        or result.orphan_instances_remaining
+    ):
         return 1
     return 0
 

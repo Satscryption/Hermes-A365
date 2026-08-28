@@ -157,6 +157,12 @@ class FakeBotServiceRunner:
 # ---------------------------------------------------------------------------
 
 
+_BOT_ARM_ID = (
+    "/subscriptions/sub-id/resourceGroups/hermes-a365-bots/providers/"
+    "Microsoft.BotService/botServices/hermes-inbox-helper-bot"
+)
+
+
 def _seed_agent_dir(
     tmp_path: Path,
     *,
@@ -185,10 +191,7 @@ def _seed_bot_service_sidecar(
         "subscriptionId": "sub-id",
         "resourceGroup": "hermes-a365-bots",
         "botName": "hermes-inbox-helper-bot",
-        "armResourceId": (
-            "/subscriptions/sub-id/resourceGroups/hermes-a365-bots/providers/"
-            "Microsoft.BotService/botServices/hermes-inbox-helper-bot"
-        ),
+        "armResourceId": _BOT_ARM_ID,
         "msaAppId": "bot-app-id",
         "tenantId": "tenant-id",
         "messagingEndpoint": "https://example.test/api/messages",
@@ -451,6 +454,7 @@ class TestPlanRender:
         assert "Bot Service target:" in confirmation
         assert "hermes-inbox-helper-bot" in confirmation
         assert "--confirm=inbox-helper" in confirmation
+        assert f"--confirm-bot-target={_BOT_ARM_ID}" in confirmation
 
     def test_dry_run_surfaces_snapshot_orphan_confirmation(
         self,
@@ -481,14 +485,14 @@ class TestPlanRender:
 
 
 class TestApplyCleanup:
-    def test_runs_three_cloud_steps_then_removes_local(self, tmp_path: Path) -> None:
+    def test_missing_bot_sidecar_preserves_shared_local_state(self, tmp_path: Path) -> None:
         _seed_agent_dir(tmp_path)
         plan = build_cleanup_plan(CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path)
         mutator = FakeMutator()
         result = apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
 
         assert isinstance(result, CleanupResult)
-        assert result.completed == ["bot-service", "azure", "instance", "blueprint"]
+        assert result.completed == ["azure", "instance", "blueprint"]
         # Mutator received argv lists matching plan order.
         # Index 3 = subcommand (after `a365 cleanup -y`).
         cleanup_calls = [argv for argv in mutator.calls if argv[0] == "a365"]
@@ -507,9 +511,34 @@ class TestApplyCleanup:
             for argv, stdin in zip(mutator.calls, mutator.stdin_inputs, strict=True)
             if argv[0] == "a365"
         ] == ["y\n", "y\n", "y\n"]
-        # Local .env was removed; agent dir reaped.
-        assert not (tmp_path / "agents" / "inbox-helper" / ".env").exists()
-        assert not (tmp_path / "agents" / "inbox-helper").exists()
+        # Missing cloud provenance must not authorise removal of shared ids.
+        assert (tmp_path / "agents" / "inbox-helper" / ".env").exists()
+        assert (tmp_path / "agents" / "inbox-helper").exists()
+
+    def test_cli_reports_missing_bot_sidecar_as_partial(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setattr("hermes_a365.cleanup.get_mutator", lambda: FakeMutator())
+        args = build_parser().parse_args(
+            [
+                "--agent-name",
+                "inbox-helper",
+                "--tenant-id",
+                _TEST_TENANT,
+                "--apply",
+                "--confirm",
+                "inbox-helper",
+            ]
+        )
+
+        assert run(args) == 1
+        assert "bot-service cleanup incomplete" in capsys.readouterr().out
 
     def test_apply_refuses_to_delete_outside_agents_root(self, tmp_path: Path) -> None:
         # #103/M9: belt-and-braces — even if an escaping path reaches the
@@ -549,6 +578,7 @@ class TestApplyCleanup:
             CleanupInputs(
                 agent_name="inbox-helper",
                 bot_service_sidecar_path=sidecar,
+                bot_service_target_confirmation=_BOT_ARM_ID,
             ),
             hermes_home=tmp_path,
         )
@@ -571,7 +601,7 @@ class TestApplyCleanup:
             "instance",
             "blueprint",
         ]
-        assert not sidecar.exists()
+        assert sidecar.exists()
         assert not any("Blueprint Entra app" in message for message in result.messages)
         assert any(
             "bot-service cleanup complete before blueprint teardown" in message
@@ -586,6 +616,7 @@ class TestApplyCleanup:
                 agent_name="inbox-helper",
                 kinds=("bot-service", "instance"),
                 bot_service_sidecar_path=sidecar,
+                bot_service_target_confirmation=_BOT_ARM_ID,
             ),
             hermes_home=tmp_path,
         )
@@ -647,15 +678,15 @@ class TestApplyCleanup:
         with pytest.raises(CliInvocationError):
             apply_cleanup_plan(plan, mutator=mutator, hermes_home=tmp_path)
 
-    def test_idempotent_re_run_after_full_cleanup(self, tmp_path: Path) -> None:
+    def test_missing_sidecar_re_run_keeps_recovery_state_visible(self, tmp_path: Path) -> None:
         _seed_agent_dir(tmp_path)
         plan = build_cleanup_plan(CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path)
         apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
 
-        # Second run: agent dir is gone, plan still has all three cloud steps
-        # (we don't probe to check), but local_paths is empty.
+        # A second run continues to show the preserved shared state until the
+        # operator restores enough Bot Service provenance to clean it safely.
         plan2 = build_cleanup_plan(CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path)
-        assert plan2.local_paths == []
+        assert plan2.local_paths == [tmp_path / "agents" / "inbox-helper" / ".env"]
 
     def test_no_local_files_means_no_local_removal(self, tmp_path: Path) -> None:
         plan = build_cleanup_plan(CleanupInputs(agent_name="ghost"), hermes_home=tmp_path)
@@ -757,7 +788,12 @@ class TestApplyCleanupOrphans:
             ]
         )
         result = apply_cleanup_plan(
-            plan, mutator=mutator, hermes_home=tmp_path, purge_orphans=True
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            additional_orphan_user_ids=("b8dab9ca-afa7-48aa-bb22-520eeabcd4f7",),
+            confirmed_orphan_user_ids=("b8dab9ca-afa7-48aa-bb22-520eeabcd4f7",),
         )
 
         assert result.orphans_purged == ["b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"]
@@ -771,6 +807,78 @@ class TestApplyCleanupOrphans:
             "--id",
             "b8dab9ca-afa7-48aa-bb22-520eeabcd4f7",
         ]
+
+    def test_purge_orphans_refuses_unconfirmed_agentic_user(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path
+        )
+        mutator = FakeMutator(
+            scripted=[
+                _scripted_run(""),
+                _scripted_run(""),
+                _scripted_run(_REAL_ORPHAN_OUTPUT),
+            ]
+        )
+
+        result = apply_cleanup_plan(
+            plan, mutator=mutator, hermes_home=tmp_path, purge_orphans=True
+        )
+
+        oid = "b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"
+        assert result.orphans_purged == []
+        assert result.orphans_remaining == [oid]
+        assert any(f"--confirm-orphan-user {oid}" in m for m in result.messages)
+        assert not any(call[:3] == ["az", "ad", "user"] for call in mutator.calls)
+
+    def test_orphan_user_two_pass_recovery_uses_candidate_and_confirmation(
+        self, tmp_path: Path
+    ) -> None:
+        oid = "b8dab9ca-afa7-48aa-bb22-520eeabcd4f7"
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+            hermes_home=tmp_path,
+            additional_orphan_user_ids=(oid,),
+        )
+        mutator = FakeMutator(scripted=[_scripted_run(""), _scripted_run("")])
+
+        result = apply_cleanup_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            additional_orphan_user_ids=(oid,),
+            confirmed_orphan_user_ids=(oid,),
+        )
+
+        assert result.orphans_purged == [oid]
+        assert mutator.calls[-1] == ["az", "ad", "user", "delete", "--id", oid]
+
+    def test_unmatched_orphan_user_confirmation_refuses_before_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+            hermes_home=tmp_path,
+        )
+        mutator = FakeMutator()
+
+        with pytest.raises(CleanupError, match="--orphan-user-id"):
+            apply_cleanup_plan(
+                plan,
+                mutator=mutator,
+                hermes_home=tmp_path,
+                purge_orphans=True,
+                confirmed_orphan_user_ids=(
+                    "b8dab9ca-afa7-48aa-bb22-520eeabcd4f7",
+                ),
+            )
+
+        assert mutator.calls == []
 
     def test_purge_orphans_failure_keeps_orphan_in_remaining(
         self, tmp_path: Path
@@ -788,7 +896,12 @@ class TestApplyCleanupOrphans:
             ]
         )
         result = apply_cleanup_plan(
-            plan, mutator=mutator, hermes_home=tmp_path, purge_orphans=True
+            plan,
+            mutator=mutator,
+            hermes_home=tmp_path,
+            purge_orphans=True,
+            additional_orphan_user_ids=("b8dab9ca-afa7-48aa-bb22-520eeabcd4f7",),
+            confirmed_orphan_user_ids=("b8dab9ca-afa7-48aa-bb22-520eeabcd4f7",),
         )
 
         assert result.orphans_purged == []
@@ -1309,19 +1422,24 @@ class TestScopedArtefactGating:
         assert not any(agent_dir.iterdir())
 
     def test_full_run_still_reaps_env_and_dir(self, tmp_path: Path) -> None:
-        # Full teardown (all four kinds) keeps the pre-M8 behaviour: .env and
-        # the emptied agent dir are removed. Bot-service kind included via a
-        # missing sidecar (config=None -> no-op step that still completes).
+        # A genuinely complete teardown still removes shared local state.
         agent_dir = _seed_agent_dir(tmp_path, with_env=True, with_blueprint_cache=True)
+        sidecar = _seed_bot_service_sidecar(tmp_path)
         plan = build_cleanup_plan(
             CleanupInputs(
                 agent_name="inbox-helper",
-                bot_service_sidecar_path=tmp_path / "absent-sidecar.json",
+                bot_service_sidecar_path=sidecar,
+                bot_service_target_confirmation=_BOT_ARM_ID,
             ),
             hermes_home=tmp_path,
         )
 
-        result = apply_cleanup_plan(plan, mutator=FakeMutator(), hermes_home=tmp_path)
+        result = apply_cleanup_plan(
+            plan,
+            mutator=FakeMutator(),
+            hermes_home=tmp_path,
+            bot_service_runner=FakeBotServiceRunner(),
+        )
 
         assert not (agent_dir / ".env").exists()
         assert not agent_dir.exists()
@@ -1335,6 +1453,17 @@ class TestScopedArtefactGating:
 
 class TestOrphanConfirmGate:
     _MANUAL = "11111111-2222-3333-4444-555555555555"
+
+    def test_path_shaped_instance_id_is_rejected_before_mutation(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        with pytest.raises(CleanupError, match="must be a GUID"):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper"),
+                hermes_home=tmp_path,
+                additional_orphan_instance_ids=("../users/victim",),
+            )
 
     def test_operator_id_refused_without_confirm(self, tmp_path: Path) -> None:
         # L6 (#102): a typo'd --orphan-instance-id would DELETE an unrelated
@@ -1490,6 +1619,20 @@ class TestOrphanConfirmGate:
             self._MANUAL,
             "99999999-8888-7777-6666-555555555555",
         ]
+
+    def test_cli_parser_accepts_agentic_user_confirmation(self) -> None:
+        args = build_parser().parse_args(
+            [
+                "--agent-name",
+                "inbox-helper",
+                "--orphan-user-id",
+                self._MANUAL,
+                "--confirm-orphan-user",
+                self._MANUAL,
+            ]
+        )
+        assert args.orphan_user_id == [self._MANUAL]
+        assert args.confirm_orphan_user == [self._MANUAL]
 
 
 class TestTenantPinRound1Fixes:
