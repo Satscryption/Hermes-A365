@@ -153,13 +153,15 @@ class TestMacOSBackend:
         assert "-w" in recorded[0] and "shh" in recorded[0]
 
     def test_store_failure_raises(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        secret = "must-not-leak"
         monkeypatch.setattr(
             subprocess,
             "run",
-            lambda *a, **kw: _mock_completed(1, stderr="boom"),
+            lambda *a, **kw: _mock_completed(1, stderr=f"echoed {secret}"),
         )
-        with pytest.raises(KeychainError, match="add-generic-password failed"):
-            MacOSBackend().store("acct", "shh")
+        with pytest.raises(KeychainError, match="add-generic-password failed") as exc_info:
+            MacOSBackend().store("acct", secret)
+        assert secret not in str(exc_info.value)
 
     def test_store_timeout_exception_never_contains_secret(
         self, monkeypatch: pytest.MonkeyPatch
@@ -239,6 +241,19 @@ class TestLinuxBackend:
         assert recorded["input"] == "shh"
         assert argv[:2] == ["secret-tool", "store"]
 
+    def test_store_failure_never_echoes_secret(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "must-not-leak"
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *a, **kw: _mock_completed(2, stderr=f"received {secret}"),
+        )
+        with pytest.raises(KeychainError, match="secret-tool store failed") as exc_info:
+            LinuxBackend().store("acct", secret)
+        assert secret not in str(exc_info.value)
+
     def test_get_returns_value(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(
             subprocess,
@@ -294,6 +309,24 @@ class TestGetBackend:
             lambda binary: "/usr/bin/security" if binary == "security" else None,
         )
         assert get_backend().name == "macos-security"
+
+    def test_discovered_binary_is_the_one_executed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        recorded: list[list[str]] = []
+        monkeypatch.setattr(secrets_mod.sys, "platform", "darwin")
+        monkeypatch.setattr(
+            secrets_mod.shutil,
+            "which",
+            lambda binary: "/trusted/security" if binary == "security" else None,
+        )
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda argv, **kw: recorded.append(argv) or _mock_completed(44),
+        )
+        assert get_backend().get("acct") is None
+        assert recorded[0][0] == "/trusted/security"
 
     def test_macos_backend_requires_explicit_unsafe_opt_in_only_for_writes(
         self, monkeypatch: pytest.MonkeyPatch

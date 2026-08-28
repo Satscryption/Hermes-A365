@@ -150,6 +150,9 @@ def account_name(tenant: str, app_id: str) -> str:
 class MacOSBackend:
     name = "macos-security"
 
+    def __init__(self, binary: str = "security") -> None:
+        self._binary = binary
+
     def store(self, account: str, secret: str) -> None:
         if os.environ.get("HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI", "").lower() not in {
             "1", "true", "yes", "on"
@@ -169,7 +172,7 @@ class MacOSBackend:
         # interface `security` exposes for generic passwords.
         proc = _run_keychain_command(
             [
-                "security",
+                self._binary,
                 "add-generic-password",
                 "-U",
                 "-s",
@@ -182,16 +185,18 @@ class MacOSBackend:
             sensitive_argv_indices=(-1,),
         )
         if proc.returncode != 0:
+            # Store subprocesses receive the secret. A backend wrapper is free
+            # to echo argv/stdin on failure, so none of its output may cross
+            # this boundary into a CLI transcript.
             raise KeychainError(
-                f"security add-generic-password failed (rc={proc.returncode}): "
-                f"{proc.stderr.strip()}"
+                f"security add-generic-password failed (rc={proc.returncode})"
             )
 
     def get(self, account: str) -> str | None:
         # -w: print password to stdout
         proc = _run_keychain_command(
             [
-                "security",
+                self._binary,
                 "find-generic-password",
                 "-s",
                 SERVICE,
@@ -212,7 +217,7 @@ class MacOSBackend:
     def delete(self, account: str) -> bool:
         proc = _run_keychain_command(
             [
-                "security",
+                self._binary,
                 "delete-generic-password",
                 "-s",
                 SERVICE,
@@ -237,11 +242,14 @@ class MacOSBackend:
 class LinuxBackend:
     name = "libsecret"
 
+    def __init__(self, binary: str = "secret-tool") -> None:
+        self._binary = binary
+
     def store(self, account: str, secret: str) -> None:
         # secret-tool reads the secret from stdin — preferred over argv.
         proc = _run_keychain_command(
             [
-                "secret-tool",
+                self._binary,
                 "store",
                 "--label",
                 f"{SERVICE} {account}",
@@ -253,14 +261,14 @@ class LinuxBackend:
             input_text=secret,
         )
         if proc.returncode != 0:
-            raise KeychainError(
-                f"secret-tool store failed (rc={proc.returncode}): {proc.stderr.strip()}"
-            )
+            # The secret arrived on stdin; do not trust a failing backend not
+            # to reflect it into stderr.
+            raise KeychainError(f"secret-tool store failed (rc={proc.returncode})")
 
     def get(self, account: str) -> str | None:
         proc = _run_keychain_command(
             [
-                "secret-tool",
+                self._binary,
                 "lookup",
                 "service",
                 SERVICE,
@@ -285,7 +293,7 @@ class LinuxBackend:
         existed = self.get(account) is not None
         proc = _run_keychain_command(
             [
-                "secret-tool",
+                self._binary,
                 "clear",
                 "service",
                 SERVICE,
@@ -312,13 +320,15 @@ def get_backend() -> KeychainBackend:
     binary is missing.
     """
     if sys.platform == "darwin":
-        if not shutil.which("security"):
+        binary = shutil.which("security")
+        if not binary:
             raise KeychainError("`security` command not found on PATH (macOS)")
-        return MacOSBackend()
+        return MacOSBackend(binary)
     if sys.platform.startswith("linux"):
-        if not shutil.which("secret-tool"):
+        binary = shutil.which("secret-tool")
+        if not binary:
             raise KeychainError("`secret-tool` not found (install libsecret-tools / libsecret-1-0)")
-        return LinuxBackend()
+        return LinuxBackend(binary)
     raise KeychainError(f"unsupported platform: {sys.platform} (v0.1 supports macOS + Linux)")
 
 

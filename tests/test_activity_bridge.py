@@ -67,6 +67,7 @@ from hermes_a365.activity_bridge import (
     main,
     make_app,
     peek_unverified_iss,
+    probe_bf_secret,
     probe_generated_config,
     probe_local_config,
     probe_otlp_endpoint,
@@ -100,6 +101,7 @@ def _seed_agent_env(home: Path, slug: str = "inbox-helper", **overrides: str) ->
     agent_dir.mkdir(parents=True, exist_ok=True)
     env_path = agent_dir / ".env"
     env_path.write_text("".join(f"{k}={v}\n" for k, v in base.items()))
+    os.chmod(env_path, 0o600)
     return env_path
 
 
@@ -300,7 +302,9 @@ class TestProbeLocalConfig:
         # AGENT_IDENTITY is fine but A365_APP_ID is required.
         agent_dir = tmp_path / "agents" / "ghost"
         agent_dir.mkdir(parents=True)
-        (agent_dir / ".env").write_text("AGENT_IDENTITY=ghost\n")
+        env_path = agent_dir / ".env"
+        env_path.write_text("AGENT_IDENTITY=ghost\n")
+        env_path.chmod(0o600)
         probe, _env = probe_local_config(tmp_path, "ghost")
         assert probe.state == "error"
         assert "missing keys" in probe.detail
@@ -318,16 +322,44 @@ class TestProbeGeneratedConfig:
         assert probe.state == "error"
         assert data == {}
 
-    def test_warns_on_world_readable_perms(self, tmp_path: Path) -> None:
+    def test_rejects_world_readable_perms(self, tmp_path: Path) -> None:
         # Slice 18x policy: secret-bearing files must be 0600. Verify
-        # the bridge surfaces a warning if the operator's filesystem
+        # the bridge fails closed if the operator's filesystem
         # left them looser.
         path = _seed_generated_config(tmp_path, mode=0o644)
         probe, data = probe_generated_config(path)
-        assert probe.state == "warn"
+        assert probe.state == "error"
         assert "chmod 600" in probe.detail
-        # Secret was still extracted — the probe is a warning, not a hard error.
-        assert data["client_secret"]
+        assert data == {}
+
+
+class TestProbeBfSecret:
+    def test_path_a_only_is_ok(self) -> None:
+        probe = probe_bf_secret({"A365_TENANT_ID": "tenant"})
+        assert probe.state == "ok"
+        assert "not configured" in probe.detail
+
+    def test_half_configured_path_b_fails(self) -> None:
+        probe = probe_bf_secret(
+            {"A365_TENANT_ID": "tenant", "A365_BF_APP_ID": "bf-app"}
+        )
+        assert probe.state == "error"
+        assert "no A365_BF_CLIENT_SECRET" in probe.detail
+
+    def test_provider_source_is_reported_without_value(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        secret = "must-not-be-rendered"
+        monkeypatch.setattr(
+            "hermes_a365.activity_bridge.probe_provider",
+            lambda *_args, **_kwargs: (True, True, "fake-store"),
+        )
+        probe = probe_bf_secret(
+            {"A365_TENANT_ID": "tenant", "A365_BF_APP_ID": "bf-app"}
+        )
+        assert probe.state == "ok"
+        assert "fake-store" in probe.detail
+        assert secret not in repr(probe)
 
     def test_happy_path_at_0600(self, tmp_path: Path) -> None:
         path = _seed_generated_config(tmp_path, mode=0o600)
@@ -453,6 +485,7 @@ class TestRunVerify:
         names = [p.name for p in report.probes]
         assert names == [
             "local_config",
+            "bf_secret",
             "generated_config",
             "token_acquisition",
             "fmi_exchange",
@@ -2000,6 +2033,7 @@ class TestLoadBridgeConfig:
                 }
             )
         )
+        path.chmod(0o600)
         with pytest.raises(BridgeConfigError, match="supplied none either"):
             load_bridge_config(
                 slug="inbox-helper",
@@ -2022,6 +2056,7 @@ class TestLoadBridgeConfig:
                 {"agentBlueprintId": "bp-id", "agentBlueprintClientSecret": None}
             )
         )
+        path.chmod(0o600)
         with pytest.raises(BridgeConfigError, match="no A365_TENANT_ID was set"):
             load_bridge_config(
                 slug="inbox-helper",
@@ -2055,6 +2090,7 @@ class TestLoadBridgeConfig:
                 }
             )
         )
+        os.chmod(path, 0o600)
         cfg = load_bridge_config(
             slug="inbox-helper",
             webhook_url="https://hook",
@@ -2088,6 +2124,7 @@ class TestLoadBridgeConfig:
                 }
             )
         )
+        os.chmod(path, 0o600)
         cfg = load_bridge_config(
             slug="inbox-helper",
             webhook_url="https://hook",
@@ -2113,6 +2150,7 @@ class TestLoadBridgeConfig:
                 }
             )
         )
+        os.chmod(path, 0o600)
         monkeypatch.setenv("HERMES_BRIDGE_WEBHOOK", "https://from-env")
         cfg = load_bridge_config(
             slug="inbox-helper",
@@ -2121,6 +2159,83 @@ class TestLoadBridgeConfig:
             generated_config_path=path,
         )
         assert cfg.webhook_url == "https://from-env"
+
+    def test_secret_bearing_generated_config_must_be_private(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path)
+        path = _seed_generated_config(tmp_path, secret="sek", mode=0o644)
+        with pytest.raises(BridgeConfigError, match="chmod 600"):
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="https://hook",
+                hermes_home=tmp_path,
+                generated_config_path=path,
+            )
+
+    def test_secret_bearing_agent_env_must_be_private(self, tmp_path: Path) -> None:
+        env_path = _seed_agent_env(
+            tmp_path,
+            A365_BF_APP_ID="bf-app",
+            A365_BF_CLIENT_SECRET="bf-secret",
+        )
+        os.chmod(env_path, 0o644)
+        path = _seed_generated_config(tmp_path)
+        with pytest.raises(BridgeConfigError, match=r"agent \.env"):
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="https://hook",
+                hermes_home=tmp_path,
+                generated_config_path=path,
+            )
+
+    def test_half_configured_path_b_is_rejected(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path, A365_BF_APP_ID="bf-app")
+        path = _seed_generated_config(tmp_path)
+        with pytest.raises(BridgeConfigError, match="A365_BF_CLIENT_SECRET"):
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="https://hook",
+                hermes_home=tmp_path,
+                generated_config_path=path,
+            )
+
+    def test_bridge_config_repr_redacts_both_secrets(self, tmp_path: Path) -> None:
+        _seed_agent_env(
+            tmp_path,
+            A365_BF_APP_ID="bf-app",
+            A365_BF_CLIENT_SECRET="bf-secret",
+        )
+        path = _seed_generated_config(tmp_path, secret="blueprint-secret")
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        rendered = repr(cfg)
+        assert "blueprint-secret" not in rendered
+        assert "bf-secret" not in rendered
+
+    def test_duplicate_env_key_cannot_hide_secret_in_loose_file(self, tmp_path: Path) -> None:
+        env_path = _seed_agent_env(tmp_path)
+        with env_path.open("a") as stream:
+            stream.write("A365_BF_CLIENT_SECRET=left-on-disk\n")
+            stream.write("A365_BF_CLIENT_SECRET=\n")
+        os.chmod(env_path, 0o644)
+
+        with pytest.raises(BridgeConfigError, match=r"agent \.env"):
+            load_agent_env(tmp_path, "inbox-helper")
+
+    def test_duplicate_json_key_cannot_hide_secret_in_loose_file(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path)
+        path = tmp_path / "a365.generated.config.json"
+        path.write_text(
+            '{"agentBlueprintId":"app","agentBlueprintClientSecret":"left-on-disk",'
+            '"agentBlueprintClientSecret":null}'
+        )
+        os.chmod(path, 0o644)
+
+        with pytest.raises(BridgeConfigError, match="generated config"):
+            load_generated_config(path)
 
 
 # ---------------------------------------------------------------------------
@@ -3294,6 +3409,7 @@ class TestServeSecretsProviderWiring:
                 }
             )
         )
+        os.chmod(path, 0o600)
         return path
 
     def test_blueprint_secret_filled_from_provider_when_config_empty(
@@ -3397,6 +3513,86 @@ class TestServeSecretsProviderWiring:
         assert probe.state != "error"
         assert data["client_secret"] == "from-keychain"
         assert "provider" in probe.detail
+
+    def test_verify_probe_distinguishes_unreachable_provider(
+        self, tmp_path: Path
+    ) -> None:
+        from hermes_a365.secrets_provider import set_default_provider
+
+        class Unreachable:
+            name = "locked-store"
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                raise RuntimeError("locked")
+
+        _seed_agent_env(tmp_path)
+        set_default_provider(Unreachable())
+
+        probe, _data = probe_generated_config(
+            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
+        )
+
+        assert probe.state == "error"
+        assert "unreachable" in probe.detail
+        assert "had none" not in probe.detail
+        assert "register --apply" not in probe.detail
+        assert "keychain store" not in probe.detail
+
+    def test_serve_startup_distinguishes_unreachable_provider(
+        self, tmp_path: Path
+    ) -> None:
+        from hermes_a365.secrets_provider import set_default_provider
+
+        class Unreachable:
+            name = "locked-store"
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                raise RuntimeError("locked")
+
+        _seed_agent_env(tmp_path)
+        set_default_provider(Unreachable())
+
+        with pytest.raises(BridgeConfigError, match="was unreachable") as exc_info:
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="https://hook",
+                hermes_home=tmp_path,
+                generated_config_path=self._gen(tmp_path, secret=""),
+            )
+        detail = str(exc_info.value)
+        assert "register --apply" not in detail
+        assert "credential reset" not in detail
+        assert "keychain store" not in detail
+
+    def test_verify_uses_one_atomic_provider_result(
+        self, tmp_path: Path
+    ) -> None:
+        from hermes_a365.secrets_provider import set_default_provider
+
+        class Recovering:
+            name = "recovering-store"
+
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def resolve(self, tenant: str, app_id: str) -> str | None:
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("temporarily locked")
+                return "recovered-secret"
+
+        provider = Recovering()
+        _seed_agent_env(tmp_path)
+        set_default_provider(provider)
+
+        probe, data = probe_generated_config(
+            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
+        )
+
+        assert probe.state == "error"
+        assert data == {}
+        assert "unreachable" in probe.detail
+        assert provider.calls == 1
 
     def test_verify_probe_still_errors_when_neither_tier_has_it(
         self, tmp_path: Path

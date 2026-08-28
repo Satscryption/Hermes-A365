@@ -19,8 +19,8 @@ this heading is dated at release.
   exposes `set_default_provider(...)` so an embedding application can plug in
   Vault / AWS Secrets Manager / Azure Key Vault / 1Password without this
   package depending on any of them. It is wired into **every** secret read
-  that resolves a credential: the gateway adapter (Path A via
-  `_ensure_secret`, Path B at construction), the standalone `serve` bridge
+  that resolves a credential: the gateway adapter (both identities at
+  connect), the standalone `serve` bridge
   (both identities in `load_bridge_config`), and `activity-bridge verify` —
   the docs-designated bridge preflight / CI gate, which must agree with what
   the runtime will actually use or it fails a healthy deployment. Its probe
@@ -48,8 +48,34 @@ this heading is dated at release.
   failed lookup is indistinguishable from a genuine miss (both `""`), so
   caching one would pin a transient outage for the life of the adapter.
   Both Path A and Path B cache provider hits only; a miss is re-consulted on
-  the next connect. Re-consulting costs one keychain lookup per identity per
-  connect attempt, not per turn.
+  the next connect, and reconnect clears successful provider hits so a
+  provider-only rotation is observed without replacing the adapter object.
+  Generated-config secrets are re-read rather than copied into the
+  environment-owned field, so file rotations are observed on the next
+  connection too.
+  Re-consulting costs one keychain lookup per identity per connect attempt,
+  not per turn.
+- **Profile isolation now covers every A365 gateway credential.** On Hermes
+  releases with `gateway.multiplex_profiles`, tenant/app ids, both client
+  secrets, authorization settings, and profile-local tuning resolve through
+  Hermes' context-local secret scope. A scoped miss never borrows the default
+  profile's process environment. Conversation state, bridge logs/PIDs, and
+  media caches are rooted under the active profile's `HERMES_HOME`; setup
+  drift and slug discovery use that same profile home. Single-profile and
+  unscoped default-profile behavior remains compatible. The active profile's
+  `.env` must be mode `0600` before any scoped value is consumed.
+- **Credential failures are early and value-free.** `activity-bridge verify`
+  now reports the Path B secret's source/reachability without returning the
+  value, and both runtimes reject a half-configured BF identity before the
+  first Microsoft request. `BridgeConfig.__repr__` omits both secrets,
+  generated config and per-agent `.env` files must be mode `0600` regardless
+  of their final parsed values (so duplicate keys cannot hide earlier secret
+  material), and keychain store failures discard untrusted backend output that
+  could reflect the supplied secret. Production keychain backends execute the
+  absolute binary discovered during probing, closing the discovery/execution
+  PATH race. Path A verify/startup errors distinguish an unreachable provider
+  from an empty one, avoiding advice to rotate a credential that may still
+  exist in a locked store.
 - **This closes the gap where the keychain was write-only.** `keychain.py` has
   shipped a store since v0.1 but **nothing ever read from it** — an operator
   who stored a secret there got no benefit. The README claimed the wrapper
@@ -72,8 +98,9 @@ this heading is dated at release.
   store answered and is genuinely empty, which is when #408 is the right call.
   Keychain reachability comes from the target lookup itself, never an unrelated
   sentinel key that could succeed after a target-specific access denial.
-  The paste prompt is offered on all three, exactly as before #19: the provider
-  can only tell us a secret *exists*, never that it is the right one.
+  The paste prompt remains available when the store answers (found or empty),
+  but is suppressed while the provider is unreachable so a replacement cannot
+  silently shadow a credential in a temporarily locked store.
 - **A provider written to the documented interface can't break the preflight.**
   `activity-bridge verify` interpolated `default_provider().name` unguarded, so
   a third-party provider implementing only the `resolve(tenant, app_id)`
@@ -84,7 +111,7 @@ this heading is dated at release.
   that falls back to the class name; `name` is documented as part of the
   interface. `hermes a365 doctor`'s `--auto-recover-secret` advice is unaffected
   — it keys off the detected `a365` CLI *version*, not off a null secret.
-- Remaining #19 stretch scope, explicitly **not** in this slice: making the
+- Post-1.0 stretch scope, explicitly **not** in this slice: making the
   provider the *primary* store (routing `register --apply` rotation and the
   setup wizard's plaintext writes through it) and shipping non-keychain
   backends.
