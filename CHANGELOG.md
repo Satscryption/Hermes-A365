@@ -153,26 +153,32 @@ this heading is dated at release.
   resources). Cleanup and verify pin the sidecar's **persisted**
   `subscriptionId` the same way, so deletes and probes target the subscription
   the resources actually live in. The paste-ready app-id-drift recovery
-  commands carry the pin too. `az account show` (which resolution reads) and
-  the `az rest` Teams-terms PATCH (pinned via its absolute management URL) are
-  the deliberate exceptions.
-- **M5 — `--purge-resource-group` re-checks the group's contents before
-  deleting it.** Provisioning puts exactly one top-level resource in a managed
-  group (the bot), so at apply time the purge now runs `az resource list` and
-  **skips** the group delete — never the whole cleanup — when the group holds
-  anything else (each foreign resource is named in the message) or when the
-  listing fails (unknown contents fail closed). The dry-run plan enumerates
-  the group's current contents when a managed-group purge is requested, so the
-  operator sees the blast radius before `--apply`.
+  commands carry the pin too. A subscription-specific account readback now
+  proves its tenant matches the resolved tenant before the first mutation.
+  The initial ambient `az account show` (which supplies defaults) and the
+  `az rest` Teams-terms PATCH (pinned via its absolute management URL) are the
+  deliberate exceptions.
+- **M5 — managed resource-group deletion is inventory-gated and manual.**
+  Azure offers no conditional group delete, so a safe inventory read cannot be
+  made atomic with `az group delete`. `--purge-resource-group` therefore
+  enumerates and classifies the group, but never auto-deletes it. A clean
+  inventory prints a subscription-pinned manual command; foreign, malformed,
+  or unreadable contents remain explicit blockers. The run returns partial and
+  preserves the sidecar until a later cleanup reads the group back as absent.
 - **M6 — the cleanup sidecar is bound to its agent.** `bot-service create`
   now stamps `agentName` into a v2 sidecar. The reader still accepts pre-M6 v1
   sidecars with a warning, while older binaries reject v2 rather than silently
   ignoring the binding. Cleanup **refuses before any deletion** when the
   sidecar names a different agent than
   `--agent-name`/`--confirm` — the run-cleanup-in-the-wrong-directory footgun.
-  A legacy sidecar without the binding proceeds on `--confirm` alone with a
-  warning. The plan and the pre-`--apply` summary now surface the full
-  deletion target (bot, resource group, subscription, and which agent the
+  Every sidecar-driven Azure mutation (`cleanup`, `enable-channel`, and
+  `update-endpoint`) also requires exact `--confirm-bot-target <ARM-ID>`
+  double entry and a stable plan/apply sidecar fingerprint. A legacy sidecar
+  requires the additional exact
+  `--confirm-legacy-binding <agent-name>` acknowledgement. The sidecar is
+  restricted to strict field types, a regular non-symlink file, and one
+  fingerprinted revision across plan/apply. The plan and pre-`--apply` summary
+  surface the full deletion target (bot, resource group, subscription, and which agent the
   sidecar was provisioned for) at the moment the operator is told what to
   type. This binding also applies when the top-level `cleanup` orchestrator
   drives the bot-service step; its plan and confirmation summary show the same
@@ -182,6 +188,13 @@ this heading is dated at release.
   sidecar fails the dry-run with its specific load error instead of rendering
   a plan the apply could never execute. Preview the other kinds around a
   broken sidecar with `--kinds azure,instance,blueprint`.
+  Cleanup backs up the exact bound snapshot but preserves the live sidecar as
+  post-cleanup provenance; this avoids unlinking a newer revision published
+  between the final binding check and pathname removal.
+  Create, update, enable, and cleanup now hold one exclusive per-sidecar lock
+  from apply validation through Azure mutation and local write; a competing
+  operation fails before making an Azure call instead of leaving cloud and
+  sidecar state divergent.
 
 - **M7 — teardown and provisioning are tenant-pinned.** `cleanup --apply` and
   `register --apply` no longer trust whatever tenant the ambient az/a365
@@ -200,9 +213,8 @@ this heading is dated at release.
   resolve. Tenant pins are compared as canonical GUIDs; legacy domain aliases
   receive a migration instruction because `az account show` cannot prove their
   equivalence from its GUID-only output.
-  (The bot-service step was already tenant-safe transitively: its az calls
-  pin the sidecar's subscription, and a subscription belongs to exactly one
-  tenant.)
+  Bot Service now verifies the tenant through a subscription-specific account
+  readback rather than relying on that relationship transitively.
 - **M8 — scoped cleanups only remove the artefacts they own.** The agent
   `.env` is a cross-kind identity file (instance id, blueprint app id, and
   the Path B bot ids), so a `--kinds=blueprint` run no longer wipes it — or
@@ -211,7 +223,9 @@ this heading is dated at release.
   `blueprint.json` (single-owner) leaves with the blueprint kind. The
   agent-dir reaper now requires **every** kind to have actually completed in
   the run (keyed on succeeded steps, not requested ones). Dry-run listings
-  name only the artefacts the scoped run may touch. Note for scripted
+  name only the artefacts the scoped run may touch. A missing Bot Service
+  sidecar is no longer counted as completed teardown, and shared recovery
+  state is preserved when any requested cloud kind remains unproven. Note for scripted
   workflows: a scoped run that previously removed the whole agent dir now
   leaves `.env` behind by design — run a full (default-kinds) cleanup to
   reap it.
@@ -230,6 +244,11 @@ this heading is dated at release.
   run after the file has gone must provide both `--orphan-instance-id <GUID>`
   and `--confirm-orphan <GUID>`; unmatched confirmations now fail before any
   cleanup step instead of silently succeeding without deleting the orphan.
+  All instance ids are parsed and canonicalized as UUIDs before they can enter
+  a Graph URL. Orphaned agentic-user deletion now has the same explicit gate:
+  repeatable `--orphan-user-id <GUID>` and `--confirm-orphan-user <GUID>` must
+  match the id surfaced by the prior cleanup output before `az ad user delete`
+  can run. Unmatched confirmations fail before mutation.
 
   (M15 is split out to #127.)
 

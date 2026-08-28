@@ -17,12 +17,15 @@ local file mutations.
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import shlex
+import stat
 import subprocess
 import sys
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import MISSING, dataclass, field, fields
 from datetime import UTC, datetime
 from pathlib import Path
@@ -229,11 +232,20 @@ class BotServiceConfig:
         if not path.exists():
             raise BotServiceError(f"{path} does not exist; run `bot-service create --apply` first")
         try:
-            raw = json.loads(path.read_text())
+            text = path.read_text()
+        except OSError as e:
+            raise BotServiceError(f"could not read {path}: {e}") from e
+        return cls.from_json_text(text, source=str(path))
+
+    @classmethod
+    def from_json_text(cls, text: str, *, source: str) -> BotServiceConfig:
+        """Parse one already-bound sidecar snapshot."""
+        try:
+            raw = json.loads(text)
         except json.JSONDecodeError as e:
-            raise BotServiceError(f"{path} is not valid JSON: {e}") from e
+            raise BotServiceError(f"{source} is not valid JSON: {e}") from e
         if not isinstance(raw, dict):
-            raise BotServiceError(f"{path} is JSON {type(raw).__name__}, expected object")
+            raise BotServiceError(f"{source} is JSON {type(raw).__name__}, expected object")
         raw.setdefault("resourceGroupManaged", False)
         missing = [
             f.name
@@ -241,7 +253,7 @@ class BotServiceConfig:
             if f.name not in raw and f.default is MISSING and f.default_factory is MISSING
         ]
         if missing:
-            raise BotServiceError(f"{path} missing required keys: {missing}")
+            raise BotServiceError(f"{source} missing required keys: {missing}")
         schema_version = raw.get("schemaVersion")
         if (
             not isinstance(schema_version, int)
@@ -249,28 +261,43 @@ class BotServiceConfig:
             or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
         ):
             raise BotServiceError(
-                f"{path} schemaVersion={schema_version!r}; expected one of "
+                f"{source} schemaVersion={schema_version!r}; expected one of "
                 f"{sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
             )
         if schema_version == SIDECAR_SCHEMA_VERSION:
             agent_name = raw.get("agentName")
             if not isinstance(agent_name, str) or not agent_name.strip():
                 raise BotServiceError(
-                    f"{path} schemaVersion={SIDECAR_SCHEMA_VERSION} requires a non-empty "
+                    f"{source} schemaVersion={SIDECAR_SCHEMA_VERSION} requires a non-empty "
                     "agentName binding; refusing to load"
                 )
-        # #102 H3/L5 review: a blank subscriptionId would silently UN-pin every
-        # az call built from this config (_sub_args('') emits no flag), letting
-        # cleanup/verify fall back to the ambient az subscription — the exact
-        # wrong-target failure the pinning exists to prevent. Provisioning can
-        # never write a blank id, so this only bites hand-edited/corrupted
-        # sidecars: fail closed at load rather than un-pin destructive calls.
-        if not str(raw.get("subscriptionId") or "").strip():
+        if not isinstance(raw.get("resourceGroupManaged"), bool):
             raise BotServiceError(
-                f"{path} has a blank subscriptionId; refusing to load — az calls "
-                "would silently target the CLI's ambient subscription. Restore "
-                "the provisioned subscription id (see the sidecar backup or "
-                "az bot show) and re-run."
+                f"{source} resourceGroupManaged must be true or false, got "
+                f"{raw.get('resourceGroupManaged')!r}; refusing to infer purge authority"
+            )
+        for key in (
+            "subscriptionId",
+            "resourceGroup",
+            "botName",
+            "armResourceId",
+            "msaAppId",
+            "tenantId",
+            "messagingEndpoint",
+            "createdAt",
+        ):
+            if not isinstance(raw.get(key), str) or not raw[key].strip():
+                if key == "subscriptionId":
+                    raise BotServiceError(
+                        f"{source} has a blank subscriptionId; refusing to load"
+                    )
+                raise BotServiceError(f"{source} requires a non-empty string {key}")
+        channels = raw.get("channelsEnabled")
+        if not isinstance(channels, list) or any(
+            not isinstance(channel, str) or not channel.strip() for channel in channels
+        ):
+            raise BotServiceError(
+                f"{source} channelsEnabled must be a list of non-empty strings"
             )
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in raw.items() if k in known})
@@ -325,6 +352,7 @@ class BotServiceEnableChannelInputs:
     channel: str = "msteams"
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
     legacy_binding_confirmation: str | None = None
+    target_confirmation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
@@ -338,6 +366,8 @@ class BotServiceEnableChannelInputs:
 class BotServiceEnableChannelPlan:
     inputs: BotServiceEnableChannelInputs
     config: BotServiceConfig
+    sidecar_binding: tuple[int, int, int, str]
+    sidecar_snapshot: bytes = field(repr=False)
 
     def render_human(self) -> str:
         legacy_note = (
@@ -355,6 +385,7 @@ class BotServiceEnableChannelPlan:
                 f"  channel:        {self.inputs.channel}",
                 f"  resource group: {self.config.resourceGroup}",
                 f"  bot resource:   {self.config.botName}",
+                f"  confirm target: {self.config.armResourceId}",
                 f"  sidecar:        {self.inputs.sidecar_path}",
                 *legacy_note,
                 "  azure steps:",
@@ -381,6 +412,7 @@ class BotServiceUpdateEndpointInputs:
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
     allow_local: bool = False
     legacy_binding_confirmation: str | None = None
+    target_confirmation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
@@ -392,6 +424,8 @@ class BotServiceUpdateEndpointInputs:
 class BotServiceUpdateEndpointPlan:
     inputs: BotServiceUpdateEndpointInputs
     config: BotServiceConfig
+    sidecar_binding: tuple[int, int, int, str]
+    sidecar_snapshot: bytes = field(repr=False)
 
     def render_human(self) -> str:
         legacy_note = (
@@ -408,6 +442,7 @@ class BotServiceUpdateEndpointPlan:
                 f"[plan] hermes a365 bot-service update-endpoint {self.inputs.agent_name}",
                 f"  resource group: {self.config.resourceGroup}",
                 f"  bot resource:   {self.config.botName}",
+                f"  confirm target: {self.config.armResourceId}",
                 f"  current URL:     {self.config.messagingEndpoint}",
                 f"  new URL:         {self.inputs.url}",
                 f"  sidecar:        {self.inputs.sidecar_path}",
@@ -434,6 +469,8 @@ class BotServiceCleanupInputs:
     agent_name: str
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
     purge_resource_group: bool = False
+    target_confirmation: str | None = None
+    legacy_binding_confirmation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
@@ -450,6 +487,8 @@ class BotServiceCleanupPlan:
     # enumerated (no runner given / purge not requested / listing failed);
     # the authoritative content re-check happens again at apply time.
     resource_group_contents: list[str] | None = None
+    sidecar_binding: tuple[int, int, int, str] | None = None
+    sidecar_snapshot: bytes | None = field(default=None, repr=False)
 
     def render_human(self) -> str:
         lines = [f"[plan] hermes a365 bot-service cleanup {self.inputs.agent_name}"]
@@ -464,18 +503,22 @@ class BotServiceCleanupPlan:
             lines.append(f"  resource group: {self.config.resourceGroup}")
             lines.append(f"  bot resource:   {self.config.botName}")
             lines.append(f"  subscription:   {self.config.subscriptionId}")
+            lines.append(f"  confirm target: {self.config.armResourceId}")
             if self.config.agentName is not None:
                 lines.append(f"  provisioned for: {self.config.agentName}")
             else:
                 lines.append("  provisioned for: (unbound pre-M6 sidecar; no agentName)")
+                lines.append(
+                    f"  legacy confirm: --confirm-legacy-binding={self.inputs.agent_name!r}"
+                )
             lines.append("  azure steps:")
             lines.append("    - az bot msteams delete (best effort)")
             lines.append("    - az bot delete (skip if already gone)")
             if self.inputs.purge_resource_group:
                 if self.config.resourceGroupManaged:
                     lines.append(
-                        "    - az group delete (resourceGroupManaged=true; refused at "
-                        "apply if the group holds non-Hermes resources)"
+                        "    - enumerate the managed resource group and print a manual "
+                        "delete command (never auto-delete the group)"
                     )
                     if self.resource_group_contents is not None:
                         if self.resource_group_contents:
@@ -490,7 +533,10 @@ class BotServiceCleanupPlan:
             else:
                 lines.append("    - skip az group delete (--purge-resource-group not set)")
         lines.append("  local steps:")
-        lines.append("    - back up and remove a365.bot-service.config.json when present")
+        lines.append(
+            "    - back up the bound sidecar snapshot and preserve the live sidecar "
+            "for cloud-state readback"
+        )
         lines.append("  preserved:")
         lines.append("    - Blueprint Entra app + service principal (Path A still depends on it)")
         return "\n".join(lines)
@@ -499,8 +545,10 @@ class BotServiceCleanupPlan:
 @dataclass
 class BotServiceCleanupResult:
     sidecar_path: Path
+    target_missing: bool = False
     bot_deleted: bool = False
     resource_group_deleted: bool = False
+    resource_group_purge_pending: bool = False
     sidecar_backup_path: Path | None = None
     sidecar_removed: bool = False
     blueprint_preserved: bool = False
@@ -558,18 +606,28 @@ def build_create_plan(
 def build_enable_channel_plan(
     inputs: BotServiceEnableChannelInputs,
 ) -> BotServiceEnableChannelPlan:
+    config, binding, snapshot = _read_bound_sidecar(inputs.sidecar_path)
+    if _sidecar_file_binding(inputs.sidecar_path) != binding:
+        raise BotServiceError(f"{inputs.sidecar_path} changed while the plan was read")
     return BotServiceEnableChannelPlan(
         inputs=inputs,
-        config=BotServiceConfig.from_file(inputs.sidecar_path),
+        config=config,
+        sidecar_binding=binding,
+        sidecar_snapshot=snapshot,
     )
 
 
 def build_update_endpoint_plan(
     inputs: BotServiceUpdateEndpointInputs,
 ) -> BotServiceUpdateEndpointPlan:
+    config, binding, snapshot = _read_bound_sidecar(inputs.sidecar_path)
+    if _sidecar_file_binding(inputs.sidecar_path) != binding:
+        raise BotServiceError(f"{inputs.sidecar_path} changed while the plan was read")
     return BotServiceUpdateEndpointPlan(
         inputs=inputs,
-        config=BotServiceConfig.from_file(inputs.sidecar_path),
+        config=config,
+        sidecar_binding=binding,
+        sidecar_snapshot=snapshot,
     )
 
 
@@ -588,7 +646,9 @@ def build_cleanup_plan(
     top-level cleanup orchestrator) are unchanged."""
     if not inputs.sidecar_path.exists():
         return BotServiceCleanupPlan(inputs=inputs, config=None, sidecar_exists=False)
-    config = BotServiceConfig.from_file(inputs.sidecar_path)
+    config, binding, snapshot = _read_bound_sidecar(inputs.sidecar_path)
+    if _sidecar_file_binding(inputs.sidecar_path) != binding:
+        raise BotServiceError(f"{inputs.sidecar_path} changed while the cleanup plan was read")
     contents: list[str] | None = None
     if runner is not None and inputs.purge_resource_group and config.resourceGroupManaged:
         listed = _resource_list(
@@ -604,7 +664,43 @@ def build_cleanup_plan(
         config=config,
         sidecar_exists=True,
         resource_group_contents=contents,
+        sidecar_binding=binding,
+        sidecar_snapshot=snapshot,
     )
+
+
+def _read_sidecar_bytes(path: Path) -> tuple[bytes, tuple[int, int, int, str]]:
+    """Read one regular sidecar revision and derive its binding from those bytes."""
+    try:
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+            raise BotServiceError(f"{path} must be a regular non-symlink file")
+        raw = path.read_bytes()
+        after = path.lstat()
+    except OSError as exc:
+        raise BotServiceError(f"could not bind cleanup sidecar {path}: {exc}") from exc
+    identity_before = (before.st_dev, before.st_ino, before.st_size)
+    identity_after = (after.st_dev, after.st_ino, after.st_size)
+    if identity_after != identity_before:
+        raise BotServiceError(f"{path} changed while it was being read")
+    return raw, (*identity_after, hashlib.sha256(raw).hexdigest())
+
+
+def _read_bound_sidecar(
+    path: Path,
+) -> tuple[BotServiceConfig, tuple[int, int, int, str], bytes]:
+    raw, binding = _read_sidecar_bytes(path)
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BotServiceError(f"{path} is not valid UTF-8: {exc}") from exc
+    return BotServiceConfig.from_json_text(text, source=str(path)), binding, raw
+
+
+def _sidecar_file_binding(path: Path) -> tuple[int, int, int, str]:
+    """Return the binding for the exact bytes read from a sidecar."""
+    _, binding = _read_sidecar_bytes(path)
+    return binding
 
 
 def _require_success(result: CommandResult, action: str) -> CommandResult:
@@ -739,19 +835,17 @@ def _foreign_resources(
     bot (``Microsoft.BotService/botServices/<botName>``; the Teams channel is a
     child of it, not a group member). Everything else appeared after we created
     the group and must not be destroyed by ``--purge-resource-group``. Matched
-    case-insensitively by ARM id against the sidecar's ``armResourceId``, with
-    a type+name fallback for the id-shape drifting. Returns human-readable
-    ``type/name`` labels for the refusal message."""
+    case-insensitively by the full ARM id against the sidecar's
+    ``armResourceId``. Type/name is display-only: it cannot override a missing
+    or mismatching id and accidentally bless an unrelated resource. Returns
+    human-readable ``type/name`` labels for the refusal message."""
     managed_id = (config.armResourceId or "").lower()
     foreign: list[str] = []
     for item in resources:
         arm_id = str(item.get("id") or "").lower()
         rtype = str(item.get("type") or "")
         name = str(item.get("name") or "")
-        is_managed_bot = (managed_id and arm_id == managed_id) or (
-            rtype.lower() == "microsoft.botservice/botservices"
-            and name.lower() == config.botName.lower()
-        )
+        is_managed_bot = bool(managed_id and arm_id == managed_id)
         if not is_managed_bot:
             foreign.append(f"{rtype or '(unknown type)'}/{name or '(unnamed)'}")
     return foreign
@@ -842,7 +936,13 @@ def _verify_sidecar_target(
             f"sidecar belongs to agent {config.agentName!r}, not {agent_name!r}; "
             f"refusing target {config.resourceGroup}/{config.botName}"
         )
-    account = _account_show(runner)
+    account = _account_show(runner, subscription_id=config.subscriptionId)
+    selected_subscription = str(account.get("id") or "").strip().lower()
+    if selected_subscription != config.subscriptionId.strip().lower():
+        raise BotServiceError(
+            "Azure returned a different subscription than the sidecar binding; "
+            "refusing mutation"
+        )
     active_tenant = str(account.get("tenantId") or "").strip().lower()
     if not active_tenant or active_tenant != config.tenantId.strip().lower():
         raise BotServiceError(
@@ -896,9 +996,13 @@ def _teams_terms_accepted(channel: dict[str, Any] | None) -> bool:
     return bool(props.get("acceptedTerms") and props.get("isEnabled", True))
 
 
-def _account_show(runner: CommandRunner) -> dict[str, Any]:
+def _account_show(
+    runner: CommandRunner, *, subscription_id: str | None = None
+) -> dict[str, Any]:
     return _json_from_result(
-        runner.run(["az", "account", "show", "-o", "json"]),
+        runner.run(
+            ["az", "account", "show", "-o", "json", *_sub_args(subscription_id)]
+        ),
         "az account show",
     )
 
@@ -1043,6 +1147,39 @@ def _write_bot_service_config(path: Path, config: BotServiceConfig) -> None:
     _write_text_atomic(path, config.to_json(), mode=0o600)
 
 
+@contextmanager
+def _exclusive_sidecar_lock(path: Path) -> Iterator[None]:
+    """Serialize every Hermes writer for one Bot Service sidecar."""
+    lock_path = path.with_name(f"{path.name}.lock")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise BotServiceError(
+            f"another Bot Service operation holds {lock_path}; refusing before "
+            "Azure mutation. If no operation is active, inspect and remove the "
+            "stale lock deliberately."
+        ) from exc
+    except OSError as exc:
+        raise BotServiceError(f"could not acquire sidecar lock {lock_path}: {exc}") from exc
+    locked_stat = os.fstat(fd)
+    try:
+        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+        yield
+    finally:
+        os.close(fd)
+        try:
+            current = lock_path.lstat()
+            if (current.st_dev, current.st_ino) == (
+                locked_stat.st_dev,
+                locked_stat.st_ino,
+            ):
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def _backup_sidecar_path(path: Path, *, now: datetime) -> Path:
     stamp = now.astimezone(UTC).strftime("%Y%m%d-%H%M%S")
     if path.name.endswith(".json"):
@@ -1057,6 +1194,7 @@ def _bind_legacy_sidecar(
     path: Path,
     messages: list[str],
     confirmation: str | None,
+    snapshot: bytes,
 ) -> BotServiceConfig:
     """Upgrade verified v1 state immediately before its first successful rewrite."""
     if config.schemaVersion == SIDECAR_SCHEMA_VERSION:
@@ -1065,7 +1203,7 @@ def _bind_legacy_sidecar(
         config, agent_name=agent_name, confirmation=confirmation
     )
     backup = _backup_sidecar_path(path, now=datetime.now(UTC))
-    _write_text_atomic(backup, path.read_text(), mode=0o600)
+    _write_text_atomic(backup, snapshot.decode("utf-8"), mode=0o600)
     messages.append(f"[apply] backed up legacy sidecar to {backup}")
     messages.append(f"[apply] migrated legacy sidecar binding to agent {agent_name}")
     return BotServiceConfig(
@@ -1098,7 +1236,56 @@ def _validate_legacy_binding_confirmation(
         )
 
 
+def _validate_cleanup_target_confirmation(
+    config: BotServiceConfig, confirmation: str | None
+) -> None:
+    """Require exact double entry of the immutable ARM target before cleanup."""
+    if confirmation != config.armResourceId:
+        raise BotServiceError(
+            "cleanup requires exact target acknowledgement before any Azure read or "
+            f"mutation. Re-run with --confirm-bot-target={config.armResourceId!r}"
+        )
+
+
+def _validate_sidecar_mutation_plan(
+    *,
+    config: BotServiceConfig,
+    agent_name: str,
+    target_confirmation: str | None,
+    legacy_binding_confirmation: str | None,
+    sidecar_path: Path,
+    sidecar_binding: tuple[int, int, int, str],
+) -> None:
+    """Validate every local binding before the first Azure read or mutation."""
+    if config.agentName is not None and config.agentName != agent_name:
+        raise BotServiceError(
+            f"sidecar belongs to agent {config.agentName!r}, not {agent_name!r}; "
+            f"refusing target {config.resourceGroup}/{config.botName}"
+        )
+    _validate_cleanup_target_confirmation(config, target_confirmation)
+    _validate_legacy_binding_confirmation(
+        config,
+        agent_name=agent_name,
+        confirmation=legacy_binding_confirmation,
+    )
+    if _sidecar_file_binding(sidecar_path) != sidecar_binding:
+        raise BotServiceError(f"{sidecar_path} changed after planning; refusing mutation")
+
+
 def apply_create_plan(
+    plan: BotServiceCreatePlan,
+    *,
+    runner: CommandRunner | None = None,
+    operator_env: dict[str, str] | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> BotServiceCreateResult:
+    with _exclusive_sidecar_lock(plan.inputs.sidecar_path):
+        return _apply_create_plan_locked(
+            plan, runner=runner, operator_env=operator_env, now=now
+        )
+
+
+def _apply_create_plan_locked(
     plan: BotServiceCreatePlan,
     *,
     runner: CommandRunner | None = None,
@@ -1119,6 +1306,24 @@ def apply_create_plan(
     account = _account_show(runner)
     tenant_id = _resolve_tenant_id(inputs, operator_env, account)
     subscription_id = _resolve_subscription_id(inputs, account)
+
+    # Resolve the selected subscription itself before the first provider/RG
+    # mutation. An explicit subscription can belong to a different tenant than
+    # the tenant pin; merely adding --subscription to later commands would
+    # otherwise discover that mismatch after provisioning had started.
+    selected_account = _account_show(runner, subscription_id=subscription_id)
+    selected_subscription = str(selected_account.get("id") or "").strip()
+    selected_tenant = str(selected_account.get("tenantId") or "").strip()
+    if selected_subscription.lower() != subscription_id.lower():
+        raise BotServiceError(
+            "az account show returned a different subscription than the resolved "
+            "--subscription-id; refusing to provision"
+        )
+    if selected_tenant.lower() != tenant_id.lower():
+        raise BotServiceError(
+            f"subscription {subscription_id} belongs to tenant {selected_tenant or '(unknown)'}, "
+            f"not the resolved tenant {tenant_id}; refusing before mutation"
+        )
 
     messages: list[str] = []
     # #102 H3: every ARM read/mutate below carries the RESOLVED subscription —
@@ -1274,6 +1479,15 @@ def apply_enable_channel_plan(
     *,
     runner: CommandRunner | None = None,
 ) -> BotServiceEnableChannelResult:
+    with _exclusive_sidecar_lock(plan.inputs.sidecar_path):
+        return _apply_enable_channel_plan_locked(plan, runner=runner)
+
+
+def _apply_enable_channel_plan_locked(
+    plan: BotServiceEnableChannelPlan,
+    *,
+    runner: CommandRunner | None = None,
+) -> BotServiceEnableChannelResult:
     if runner is None:
         runner = SubprocessRunner()
 
@@ -1282,13 +1496,16 @@ def apply_enable_channel_plan(
     messages: list[str] = []
     channel_created = False
 
+    _validate_sidecar_mutation_plan(
+        config=config,
+        agent_name=inputs.agent_name,
+        target_confirmation=inputs.target_confirmation,
+        legacy_binding_confirmation=inputs.legacy_binding_confirmation,
+        sidecar_path=inputs.sidecar_path,
+        sidecar_binding=plan.sidecar_binding,
+    )
     _verify_sidecar_target(
         runner, config, agent_name=inputs.agent_name, require_live=True
-    )
-    _validate_legacy_binding_confirmation(
-        config,
-        agent_name=inputs.agent_name,
-        confirmation=inputs.legacy_binding_confirmation,
     )
 
     teams = _msteams_show(
@@ -1324,12 +1541,17 @@ def apply_enable_channel_plan(
         patched_teams_terms = True
         messages.append("[apply] accepted Microsoft Teams channel terms")
 
+    if _sidecar_file_binding(inputs.sidecar_path) != plan.sidecar_binding:
+        raise BotServiceError(
+            f"{inputs.sidecar_path} changed during channel update; refusing local rewrite"
+        )
     bound = _bind_legacy_sidecar(
         config,
         agent_name=inputs.agent_name,
         path=inputs.sidecar_path,
         messages=messages,
         confirmation=inputs.legacy_binding_confirmation,
+        snapshot=plan.sidecar_snapshot,
     )
     updated = BotServiceConfig(
         **{
@@ -1353,6 +1575,15 @@ def apply_update_endpoint_plan(
     *,
     runner: CommandRunner | None = None,
 ) -> BotServiceUpdateEndpointResult:
+    with _exclusive_sidecar_lock(plan.inputs.sidecar_path):
+        return _apply_update_endpoint_plan_locked(plan, runner=runner)
+
+
+def _apply_update_endpoint_plan_locked(
+    plan: BotServiceUpdateEndpointPlan,
+    *,
+    runner: CommandRunner | None = None,
+) -> BotServiceUpdateEndpointResult:
     if runner is None:
         runner = SubprocessRunner()
 
@@ -1360,15 +1591,18 @@ def apply_update_endpoint_plan(
     inputs = plan.inputs
     messages: list[str] = []
 
+    _validate_sidecar_mutation_plan(
+        config=config,
+        agent_name=inputs.agent_name,
+        target_confirmation=inputs.target_confirmation,
+        legacy_binding_confirmation=inputs.legacy_binding_confirmation,
+        sidecar_path=inputs.sidecar_path,
+        sidecar_binding=plan.sidecar_binding,
+    )
     bot = _verify_sidecar_target(
         runner, config, agent_name=inputs.agent_name, require_live=True
     )
     assert bot is not None
-    _validate_legacy_binding_confirmation(
-        config,
-        agent_name=inputs.agent_name,
-        confirmation=inputs.legacy_binding_confirmation,
-    )
 
     current = _bot_endpoint(bot)
     endpoint_updated = False
@@ -1389,12 +1623,17 @@ def apply_update_endpoint_plan(
         messages.append("[apply] Bot Service endpoint already current")
 
     channels = sorted({*_enabled_channels(bot), *config.channelsEnabled})
+    if _sidecar_file_binding(inputs.sidecar_path) != plan.sidecar_binding:
+        raise BotServiceError(
+            f"{inputs.sidecar_path} changed during endpoint update; refusing local rewrite"
+        )
     bound = _bind_legacy_sidecar(
         config,
         agent_name=inputs.agent_name,
         path=inputs.sidecar_path,
         messages=messages,
         confirmation=inputs.legacy_binding_confirmation,
+        snapshot=plan.sidecar_snapshot,
     )
     updated = BotServiceConfig(
         **{
@@ -1414,6 +1653,16 @@ def apply_update_endpoint_plan(
 
 
 def apply_cleanup_plan(
+    plan: BotServiceCleanupPlan,
+    *,
+    runner: CommandRunner | None = None,
+    now: Callable[[], datetime] | None = None,
+) -> BotServiceCleanupResult:
+    with _exclusive_sidecar_lock(plan.inputs.sidecar_path):
+        return _apply_cleanup_plan_locked(plan, runner=runner, now=now)
+
+
+def _apply_cleanup_plan_locked(
     plan: BotServiceCleanupPlan,
     *,
     runner: CommandRunner | None = None,
@@ -1439,11 +1688,30 @@ def apply_cleanup_plan(
 
     config = plan.config
     if config is None:
+        result.target_missing = True
         result.messages.append(
             f"[apply] no bot-service sidecar at {inputs.sidecar_path}; nothing to clean up"
         )
         record_blueprint_preserved()
         return result
+
+    if config.agentName is not None and config.agentName != inputs.agent_name:
+        raise BotServiceError(
+            f"sidecar belongs to agent {config.agentName!r}, not {inputs.agent_name!r}; "
+            f"refusing target {config.resourceGroup}/{config.botName}"
+        )
+    _validate_cleanup_target_confirmation(config, inputs.target_confirmation)
+    _validate_legacy_binding_confirmation(
+        config,
+        agent_name=inputs.agent_name,
+        confirmation=inputs.legacy_binding_confirmation,
+    )
+    if plan.sidecar_binding is None:
+        raise BotServiceError("cleanup plan is missing its sidecar file binding")
+    if _sidecar_file_binding(inputs.sidecar_path) != plan.sidecar_binding:
+        raise BotServiceError(
+            f"{inputs.sidecar_path} changed after planning; refusing cleanup"
+        )
 
     # Refuse BEFORE any deletion when the sidecar is legacy or belongs to
     # another agent. The classic footgun is running cleanup for agent X from a
@@ -1484,65 +1752,86 @@ def apply_cleanup_plan(
         result.messages.append(f"[apply] deleted bot resource {config.botName}")
 
     if inputs.purge_resource_group:
-        if bot is None:
-            result.messages.append(
-                f"[apply] skipped resource group purge for {config.resourceGroup}: "
-                "the bound bot is missing, so the sidecar target cannot be "
-                "verified against a live ARM identity"
-            )
-        elif config.resourceGroupManaged:
-            # #102 M5: re-check the group's contents at apply time. We created
-            # this group holding exactly one top-level resource (the bot, now
-            # deleted above); anything else appeared later and is NOT ours to
-            # destroy. Skip the purge — never the whole cleanup — when foreign
-            # resources are present or the listing fails (contents unknown ==
-            # fail closed). The operator can delete the group manually once
-            # they have judged the leftovers.
-            leftovers = _resource_list(
+        if config.resourceGroupManaged:
+            group = _group_show(
                 runner, config.resourceGroup, subscription_id=subscription_id
             )
-            foreign = None if leftovers is None else _foreign_resources(leftovers, config)
-            if leftovers is None:
+            if group is None:
                 result.messages.append(
-                    f"[apply] skipped resource group purge for {config.resourceGroup}: "
-                    "could not enumerate its contents (az resource list failed); "
-                    "refusing to delete a group with unknown contents"
-                )
-            elif foreign:
-                listing = ", ".join(foreign)
-                result.messages.append(
-                    f"[apply] skipped resource group purge for {config.resourceGroup}: "
-                    f"it holds {len(foreign)} non-Hermes-managed resource(s) "
-                    f"[{listing}]; delete them (or the group) manually if intended"
+                    f"[apply] managed resource group {config.resourceGroup} is already absent"
                 )
             else:
-                _require_success(
-                    runner.run(
+                # #102 M5: re-check the group's contents at apply time. We created
+                # this group holding exactly one top-level resource. Azure has
+                # no conditional group delete, so even a clean inventory
+                # cannot be coupled atomically to deletion. Always leave the
+                # final group delete to the operator and retain the sidecar
+                # until a subsequent run reads the group back as absent.
+                leftovers = _resource_list(
+                    runner, config.resourceGroup, subscription_id=subscription_id
+                )
+                foreign = (
+                    None if leftovers is None else _foreign_resources(leftovers, config)
+                )
+                result.resource_group_purge_pending = True
+                if leftovers is None:
+                    result.messages.append(
+                        f"[apply] resource group purge remains pending for "
+                        f"{config.resourceGroup}: could not enumerate its contents; "
+                        "refusing to delete a group with unknown contents"
+                    )
+                elif foreign:
+                    listing = ", ".join(foreign)
+                    result.messages.append(
+                        f"[apply] resource group purge remains pending for "
+                        f"{config.resourceGroup}: it holds {len(foreign)} "
+                        f"non-Hermes-managed or unverified resource(s) [{listing}]"
+                    )
+                else:
+                    manual = shlex.join(
                         [
-                            "az", "group", "delete", "--name", config.resourceGroup, "--yes",
+                            "az",
+                            "group",
+                            "delete",
+                            "--name",
+                            config.resourceGroup,
+                            "--yes",
                             *_sub_args(subscription_id),
                         ]
-                    ),
-                    "az group delete",
-                )
-                result.resource_group_deleted = True
-                result.messages.append(
-                    f"[apply] deleted managed resource group {config.resourceGroup}"
-                )
+                    )
+                    result.messages.append(
+                        f"[apply] resource group purge remains pending for "
+                        f"{config.resourceGroup}: no non-Hermes top-level resources "
+                        "were found, but Azure cannot make the inventory check and "
+                        "group deletion atomic; review and run manually, then re-run "
+                        f"cleanup for readback: {manual}"
+                    )
         else:
             result.messages.append(
                 f"[apply] skipped resource group purge for {config.resourceGroup}: "
                 "sidecar resourceGroupManaged=false"
             )
 
-    if inputs.sidecar_path.exists():
+    if inputs.sidecar_path.exists() and not result.resource_group_purge_pending:
+        if _sidecar_file_binding(inputs.sidecar_path) != plan.sidecar_binding:
+            raise BotServiceError(
+                f"{inputs.sidecar_path} changed during cleanup; refusing to back up or remove it"
+            )
+        if plan.sidecar_snapshot is None:
+            raise BotServiceError("cleanup plan is missing its bound sidecar snapshot")
         backup = _backup_sidecar_path(inputs.sidecar_path, now=now())
-        _write_text_atomic(backup, inputs.sidecar_path.read_text(), mode=0o600)
-        inputs.sidecar_path.unlink()
+        _write_text_atomic(backup, plan.sidecar_snapshot.decode("utf-8"), mode=0o600)
         result.sidecar_backup_path = backup
-        result.sidecar_removed = True
         result.messages.append(f"[apply] backed up sidecar to {backup}")
-        result.messages.append(f"[apply] removed {inputs.sidecar_path}")
+        result.messages.append(
+            f"[apply] preserved {inputs.sidecar_path} as post-cleanup provenance; "
+            "remove it manually only after cloud-state readback"
+        )
+    elif result.resource_group_purge_pending:
+        result.messages.append(
+            f"[apply] preserved {inputs.sidecar_path} until the requested managed "
+            "resource-group purge is read back as complete"
+        )
 
     record_blueprint_preserved()
     return result
@@ -1912,6 +2201,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         metavar="AGENT_NAME",
         help="required to bind a verified schema-v1 sidecar; must equal --agent-name",
     )
+    enable.add_argument(
+        "--confirm-bot-target",
+        metavar="ARM_RESOURCE_ID",
+        help="must exactly match the sidecar ARM resource id for apply",
+    )
 
     endpoint = subs.add_parser(
         "update-endpoint",
@@ -1934,6 +2228,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         help="required to bind a verified schema-v1 sidecar; must equal --agent-name",
     )
     endpoint.add_argument(
+        "--confirm-bot-target",
+        metavar="ARM_RESOURCE_ID",
+        help="must exactly match the sidecar ARM resource id for apply",
+    )
+    endpoint.add_argument(
         "--allow-local",
         action="store_true",
         help="permit a localhost/loopback endpoint over http (local dev tunnels)",
@@ -1953,6 +2252,16 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     cleanup.add_argument(
         "--confirm",
         help="must equal --agent-name for the apply path to proceed",
+    )
+    cleanup.add_argument(
+        "--confirm-bot-target",
+        metavar="ARM_RESOURCE_ID",
+        help="must exactly match the sidecar ARM resource id for cleanup apply",
+    )
+    cleanup.add_argument(
+        "--confirm-legacy-binding",
+        metavar="AGENT_NAME",
+        help="required with a schema-v1 sidecar; must equal --agent-name",
     )
     cleanup.add_argument("--apply", action="store_true", help="execute Azure + sidecar mutations")
 
@@ -2025,6 +2334,7 @@ def _run_enable_channel(args: argparse.Namespace) -> int:
             channel=args.channel,
             sidecar_path=args.sidecar,
             legacy_binding_confirmation=args.confirm_legacy_binding,
+            target_confirmation=args.confirm_bot_target,
         )
         plan = build_enable_channel_plan(inputs)
     except (ValueError, BotServiceError) as e:
@@ -2033,7 +2343,13 @@ def _run_enable_channel(args: argparse.Namespace) -> int:
 
     sys.stdout.write(plan.render_human() + "\n")
     if not args.apply:
-        sys.stdout.write("\nNo mutations. Re-run with --apply to enable the channel.\n")
+        apply_args = ["--apply", f"--confirm-bot-target={plan.config.armResourceId}"]
+        if plan.config.agentName is None:
+            apply_args.append(f"--confirm-legacy-binding={args.agent_name}")
+        sys.stdout.write(
+            f"\nNo mutations. Re-run with {shlex.join(apply_args)} "
+            "to enable the channel.\n"
+        )
         return 0
 
     try:
@@ -2053,6 +2369,7 @@ def _run_update_endpoint(args: argparse.Namespace) -> int:
             sidecar_path=args.sidecar,
             allow_local=args.allow_local,
             legacy_binding_confirmation=args.confirm_legacy_binding,
+            target_confirmation=args.confirm_bot_target,
         )
         plan = build_update_endpoint_plan(inputs)
     except (ValueError, BotServiceError) as e:
@@ -2061,7 +2378,13 @@ def _run_update_endpoint(args: argparse.Namespace) -> int:
 
     sys.stdout.write(plan.render_human() + "\n")
     if not args.apply:
-        sys.stdout.write("\nNo mutations. Re-run with --apply to update Azure Bot Service.\n")
+        apply_args = ["--apply", f"--confirm-bot-target={plan.config.armResourceId}"]
+        if plan.config.agentName is None:
+            apply_args.append(f"--confirm-legacy-binding={args.agent_name}")
+        sys.stdout.write(
+            f"\nNo mutations. Re-run with {shlex.join(apply_args)} "
+            "to update Azure Bot Service.\n"
+        )
         return 0
 
     try:
@@ -2092,6 +2415,8 @@ def _run_cleanup(args: argparse.Namespace) -> int:
             agent_name=args.agent_name,
             sidecar_path=args.sidecar,
             purge_resource_group=args.purge_resource_group,
+            target_confirmation=args.confirm_bot_target,
+            legacy_binding_confirmation=args.confirm_legacy_binding,
         )
         # #102 M5: give the plan a real runner so a purge dry-run can
         # enumerate the group's contents (build_cleanup_plan only issues the
@@ -2113,8 +2438,19 @@ def _run_cleanup(args: argparse.Namespace) -> int:
                 f"{plan.config.resourceGroup!r} (subscription "
                 f"{plan.config.subscriptionId})."
             )
+        apply_args = [
+            "--apply",
+            f"--confirm={args.agent_name}",
+            (
+                f"--confirm-bot-target={plan.config.armResourceId}"
+                if plan.config is not None
+                else "--confirm-bot-target=<ARM-ID>"
+            ),
+        ]
+        if plan.config is not None and plan.config.agentName is None:
+            apply_args.append(f"--confirm-legacy-binding={args.agent_name}")
         sys.stdout.write(
-            f"\nNo mutations.{target} Re-run with --apply --confirm={args.agent_name} "
+            f"\nNo mutations.{target} Re-run with {shlex.join(apply_args)} "
             "to clean up Bot Service.\n"
         )
         return 0
@@ -2131,7 +2467,7 @@ def _run_cleanup(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 1
     sys.stdout.write("\n" + "\n".join(result.messages) + "\ndone.\n")
-    return 0
+    return 1 if result.target_missing or result.resource_group_purge_pending else 0
 
 
 def _run_verify(args: argparse.Namespace) -> int:

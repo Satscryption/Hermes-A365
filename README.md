@@ -508,8 +508,12 @@ hermes gateway run --profile inbox-helper
 hermes a365 status inbox-helper --human
 
 # 11. Tear down
+# First run without --apply and copy the exact Bot Service ARM id shown as
+# "confirm target". Legacy schema-v1 sidecars also require
+# --confirm-legacy-binding "Inbox Helper".
 hermes a365 cleanup --agent-name "Inbox Helper" \
-    --slug inbox-helper --apply --confirm "Inbox Helper"
+    --slug inbox-helper --apply --confirm "Inbox Helper" \
+    --confirm-bot-target "/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.BotService/botServices/<bot>"
 ```
 
 > **Running the CLI standalone.** Every `hermes a365 <verb>` mirrors
@@ -604,7 +608,9 @@ hermes a365 instance create <slug> --owner <email> --owner-aad-id <oid> [--apply
 hermes a365 publish --agent-name "<display>" [--aiteammate] [--copilot-chat] \
     [--bot-id <guid>] [--apply]
 hermes a365 cleanup --agent-name "<display>" [--slug <slug>] [--kinds=...] \
-    [--purge-orphans] [--orphan-instance-id <guid>] --apply --confirm "<display>"
+    [--purge-orphans] [--orphan-instance-id <guid>] [--orphan-user-id <guid>] \
+    [--confirm-orphan <guid>] [--confirm-orphan-user <guid>] \
+    [--confirm-bot-target <arm-id>] --apply --confirm "<display>"
 
 # === Activity bridge ===
 hermes a365 activity-bridge verify --slug <slug>
