@@ -923,7 +923,12 @@ class Agent365Adapter(BasePlatformAdapter):
         # bridge.pid. A genuinely absent slug still resolves to "default".
         _slug_raw = str(extra.get("slug") or _profile_env("AGENT_IDENTITY") or "")
         if _slug_raw:
-            self.slug: str = validate_slug(_slug_raw)
+            try:
+                self.slug: str = validate_slug(_slug_raw)
+            except ValueError:
+                raise ValueError(
+                    "agent365 configured slug is not path-safe"
+                ) from None
         else:
             self.slug = ""
         self.host: str = str(extra.get("host") or "127.0.0.1")
@@ -7156,10 +7161,7 @@ def validate_config(config: Any) -> bool:
         try:
             validate_slug(slug_raw)
         except ValueError:
-            logger.warning(
-                "agent365 configured slug %r is not path-safe; refusing to load",
-                slug_raw,
-            )
+            logger.warning("agent365 configured slug is not path-safe; refusing to load")
             return False
     return True
 

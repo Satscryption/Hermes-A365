@@ -12523,8 +12523,9 @@ class TestSlugIngestion:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("AGENT_IDENTITY", "../../tmp/evil")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as exc_info:
             _make_adapter(monkeypatch, slug=None)
+        assert "../../tmp/evil" not in str(exc_info.value)
 
     def test_absent_slug_resolves_to_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -12537,7 +12538,9 @@ class TestSlugIngestion:
         assert a._conversations_path.parent.name == "default"
 
     def test_validate_config_rejects_explicit_invalid_slug(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
         monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
@@ -12548,6 +12551,7 @@ class TestSlugIngestion:
         assert adapter_mod.validate_config(good) is True
         assert adapter_mod.validate_config(absent) is True
         assert adapter_mod.validate_config(bad) is False
+        assert "../evil" not in caplog.text
 
     def test_two_invalid_profiles_cannot_share_default(
         self, monkeypatch: pytest.MonkeyPatch
