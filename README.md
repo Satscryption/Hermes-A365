@@ -216,20 +216,24 @@ list:
 
 | Runtime | Identity | Plaintext tier (checked first) |
 |---|---|---|
-| Gateway plugin | Path A blueprint | `A365_BLUEPRINT_CLIENT_SECRET` env → platform `extra` → `a365.generated.config.json` |
-| Gateway plugin | Path B BF | `A365_BF_CLIENT_SECRET` env → platform `extra` |
+| Gateway plugin | Path A blueprint | profile-scoped `A365_BLUEPRINT_CLIENT_SECRET` → platform `extra` → `a365.generated.config.json` |
+| Gateway plugin | Path B BF | profile-scoped `A365_BF_CLIENT_SECRET` → platform `extra` |
 | `activity-bridge serve` | Path A blueprint | `a365.generated.config.json` only (never env) |
 | `activity-bridge serve` | Path B BF | per-agent `~/.hermes/agents/<slug>/.env` only |
 
 `activity-bridge verify` uses the same two-tier resolution as `serve`, so
-the preflight agrees with what the runtime will actually use.
+the preflight agrees with what the runtime will actually use. It reports a
+value-free source/reachability result for both the Path A blueprint secret
+and the optional Path B BF secret.
 
-Note what "env" means in rows 1–2: it is the gateway process's
-*environment*, not one particular file. `hermes gateway run` sources your
-operator `~/.hermes/.env`, and the documented Path B start sequence also
-sources `~/.hermes/agents/<slug>/.env` — so on the **gateway** both files
-are runtime sources, as is any `export` in your shell. On **`serve`** the
-operator `~/.hermes/.env` is not a runtime source; there it only feeds
+In single-profile mode, "profile-scoped" in rows 1–2 means the gateway
+process environment. `hermes gateway run` sources your operator
+`~/.hermes/.env`, and the documented Path B start sequence may also source
+`~/.hermes/agents/<slug>/.env`; an `export` in the launching shell therefore
+participates too. With Hermes multiplexing enabled, the adapter instead uses
+the active profile's secret scope and active `HERMES_HOME`; process-global
+values from another/default profile are deliberately ignored. On **`serve`**
+the operator `~/.hermes/.env` is not a runtime source; there it only feeds
 provisioning (`instance create` copies the BF secret from it into the
 per-agent `.env`, which `serve` then reads directly).
 
@@ -250,25 +254,24 @@ python -m hermes_a365.keychain store --tenant <tenant-id> --app-id <app-id>
 
 then clear the plaintext tier for your runtime and identity, per the table
 above. **The rule is what matters, not the list: the provider is consulted
-only when the plaintext tier is empty, so any surviving copy — in any file,
-or in the process environment by any route — keeps winning silently.** The
-usual places, which is not a guarantee of completeness:
+only when the plaintext tier is empty, so any surviving copy in a source
+active for the selected runtime and multiplex mode keeps winning silently.**
+The usual places, which is not a guarantee of completeness:
 
 | Where | Applies to |
 |---|---|
 | `agentBlueprintClientSecret` in `a365.generated.config.json` | Both runtimes, Path A |
-| `A365_BF_CLIENT_SECRET` in `~/.hermes/agents/<slug>/.env` | `serve`; also the **gateway**, because the documented start sequence sources this file into the shell |
-| `A365_BLUEPRINT_CLIENT_SECRET` / `A365_BF_CLIENT_SECRET` in `~/.hermes/.env` | Gateway (`hermes gateway run` sources it) |
+| `A365_BF_CLIENT_SECRET` in `~/.hermes/agents/<slug>/.env` | `serve`; also a single-profile **gateway** when the documented start sequence sources this file |
+| `A365_BLUEPRINT_CLIENT_SECRET` / `A365_BF_CLIENT_SECRET` in the active profile's `.env` | Gateway; multiplex mode isolates this to the active `HERMES_HOME` |
 | `extra.blueprint_client_secret` / `extra.bf_client_secret` under `gateway.platforms.agent365` in `~/.hermes/config.yaml` | Gateway — easy to miss |
-| Any `export` in your shell rc, launch script, or service unit | Gateway |
+| Any `export` in your shell rc, launch script, or service unit | Single-profile gateway only; multiplex mode ignores process-global credentials |
 
-For the **Path A blueprint secret on `serve`**, you can check rather than
-trust this list: `hermes a365 activity-bridge verify` reports which tier
-answered (`secret loaded from provider: os-keychain` vs `from generated
-config`). If it does not say the provider, a plaintext copy is still winning
-somewhere. That is the only automated check — `verify` does not report on the
-Path B BF secret, and the gateway has no equivalent report for either. For
-those, work the table.
+For **`serve`**, you can check rather than trust this list:
+`hermes a365 activity-bridge verify` reports which tier answered for Path A
+(`secret loaded from provider: os-keychain` vs `from generated config`) and
+Path B (`agent .env` vs provider). If it does not say the provider, a plaintext
+copy is still winning somewhere. The gateway has no equivalent source report,
+so use the table for that runtime.
 
 Two caveats. `hermes a365 instance create --apply` **re-writes**
 `A365_BF_CLIENT_SECRET` into the per-agent `.env` from your operator
@@ -286,6 +289,20 @@ The runtime then resolves it from the keychain on the next start. Put the
 line back to return to the plaintext tier. An unavailable keychain (no
 `security`/`secret-tool`, unsupported platform) is treated as a miss, not
 an error — Path-A-only operators with no Path B identity are unaffected.
+When a Path B app id is configured, its client secret is now required at
+startup; a half-configured identity fails before the first Microsoft request.
+Generated config, active-profile `.env`, and per-agent `.env` files must be mode `0600`. This is
+enforced even when their final parsed value is empty, so duplicate keys cannot
+hide an earlier plaintext secret in a group/world-readable file.
+
+With Hermes `gateway.multiplex_profiles` either `true` or `false`, gateway
+credential reads follow Hermes' active profile secret scope. A secondary
+profile cannot borrow the default profile's `A365_*` values, and its
+conversation, bridge-log, PID, and media paths resolve under that profile's
+`HERMES_HOME`. When multiplexing is on, an otherwise unspecified generated
+config also defaults under that active profile home rather than the process
+working directory; an explicit profile-scoped `A365_GENERATED_CONFIG_PATH` or
+`extra.generated_config_path` still wins.
 
 Note this section is the one place that asks you to leave
 `agentBlueprintClientSecret` null. Elsewhere this README treats a null there
@@ -300,7 +317,7 @@ Embedding applications can register a different backend
 `resolve(tenant, app_id) -> str | None` plus a `name: str` used in log and
 diagnostic lines (omit it and the class name is used instead). Making the provider the
 *primary* store — routing rotation and the setup wizard's writes through
-it — remains open on #19.
+it — is deferred to post-1.0 enhancement scope.
 
 ## What is A365?
 
@@ -694,11 +711,11 @@ until a concrete operator pain point surfaces — designing them in a
 vacuum risks getting the API surface wrong. Each issue body lists the
 explicit triggers that would re-prioritise it.
 
-- **[#19](../../issues/19)** — Pluggable secrets provider. **Partly
-  shipped in v0.9.0**: `hermes_a365.secrets_provider` defines the
+- **Pluggable secrets provider follow-ons.** The v0.9.0 minimum from #19 is
+  shipped: `hermes_a365.secrets_provider` defines the
   `SecretsProvider` interface, ships a keychain-backed default, and is
   wired into both runtimes' secret reads (see "Secrets at rest").
-  Remaining stretch scope: making the provider the *primary* store —
+  Post-1.0 stretch scope is making the provider the *primary* store —
   routing `register --apply` rotation and the setup wizard's writes
   through it — and shipping non-keychain backends (Vault / AWS Secrets
   Manager / Azure Key Vault / 1Password), or consuming a Hermes-side

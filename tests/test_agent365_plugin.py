@@ -1033,6 +1033,7 @@ class TestAdapterConstruction:
     ) -> None:
         cfg_path = tmp_path / "a365.generated.config.json"
         cfg_path.write_text('{"agentBlueprintClientSecret": "from-disk"}')
+        cfg_path.chmod(0o600)
         monkeypatch.setenv("A365_TENANT_ID", "t")
         monkeypatch.setenv("A365_APP_ID", "a")
         monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
@@ -1043,7 +1044,192 @@ class TestAdapterConstruction:
         # Lazy-loaded only when the bridge config is built.
         assert a.blueprint_client_secret == ""
         assert a._ensure_secret() == "from-disk"
-        assert a.blueprint_client_secret == "from-disk"
+        assert a.blueprint_client_secret == ""
+
+    def test_profile_env_must_be_owner_only(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        env_path = tmp_path / ".env"
+        env_path.write_text("A365_TENANT_ID=exposed-tenant\n")
+        env_path.chmod(0o644)
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: tmp_path
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+
+        with pytest.raises(
+            RuntimeError, match=r"profile \.env is group/world-readable"
+        ):
+            adapter_mod.Agent365Adapter(_StubPlatformConfig())
+
+    def test_preflight_rejects_loose_profile_env_before_scoped_reads(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        env_path = tmp_path / ".env"
+        env_path.write_text(
+            "A365_TENANT_ID=exposed-tenant\nA365_APP_ID=exposed-app\n"
+        )
+        env_path.chmod(0o644)
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: tmp_path
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+
+        assert adapter_mod.validate_config(_StubPlatformConfig()) is False
+
+    def test_profile_secret_scope_beats_default_process_credentials(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        class UnscopedSecretError(RuntimeError):
+            pass
+
+        scoped = {
+            "AGENT_IDENTITY": "profile-b",
+            "HERMES_BRIDGE_PORT": "4100",
+            "A365_TENANT_ID": "profile-b-tenant",
+            "A365_APP_ID": "profile-b-app",
+            "A365_BLUEPRINT_CLIENT_SECRET": "profile-b-secret",
+            "A365_ALLOWED_USERS": "profile-b-user",
+            "A365_CONVERSATIONS_PATH": str(tmp_path / "profile-b.json"),
+        }
+        secret_scope = types.ModuleType("agent.secret_scope")
+        secret_scope.UnscopedSecretError = UnscopedSecretError
+        secret_scope.get_secret = lambda name, default=None: scoped.get(name, default)
+        agent_pkg = types.ModuleType("agent")
+        agent_pkg.__path__ = []  # type: ignore[attr-defined]
+        agent_pkg.secret_scope = secret_scope
+        monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+        monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+
+        monkeypatch.setenv("A365_TENANT_ID", "default-tenant")
+        monkeypatch.setenv("A365_APP_ID", "default-app")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "default-secret")
+        monkeypatch.setenv("A365_BF_APP_ID", "default-bf-app")
+        monkeypatch.setenv("A365_BF_CLIENT_SECRET", "default-bf-secret")
+
+        adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig())
+
+        assert adapter.slug == "profile-b"
+        assert adapter.port == 4100
+        assert adapter.tenant_id == "profile-b-tenant"
+        assert adapter.blueprint_app_id == "profile-b-app"
+        assert adapter.blueprint_client_secret == "profile-b-secret"
+        assert adapter.bf_app_id == ""
+        assert adapter.bf_client_secret == ""
+        assert adapter._allowed_users == ("profile-b-user",)
+        assert adapter_mod.validate_config(_StubPlatformConfig()) is True
+
+        scoped.clear()
+        # A scoped miss is authoritative: validation must not borrow the
+        # default profile's process-global tenant/app values.
+        assert adapter_mod.validate_config(_StubPlatformConfig()) is False
+
+    def test_profile_hermes_home_owns_runtime_state(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: tmp_path
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+        monkeypatch.delenv("A365_CONVERSATIONS_PATH", raising=False)
+
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(
+                extra={
+                    "slug": "profile-b",
+                    "tenant_id": "tenant",
+                    "app_id": "app",
+                    "blueprint_client_secret": "secret",
+                }
+            )
+        )
+        bridge_cfg = adapter._make_bridge_config()
+
+        assert adapter._conversations_path == (
+            tmp_path / "agents" / "profile-b" / "conversations.json"
+        )
+        assert bridge_cfg.log_path == tmp_path / "agents" / "profile-b" / "bridge.log"
+
+    def test_unscoped_multiplex_default_rebuilds_profile_scope(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        class UnscopedSecretError(RuntimeError):
+            pass
+
+        scoped = {
+            "AGENT_IDENTITY": "active-default",
+            "A365_TENANT_ID": "scoped-tenant",
+            "A365_APP_ID": "scoped-app",
+            "A365_BLUEPRINT_CLIENT_SECRET": "scoped-secret",
+            "A365_CONVERSATIONS_PATH": str(tmp_path / "scoped.json"),
+        }
+        secret_scope = types.ModuleType("agent.secret_scope")
+        secret_scope.UnscopedSecretError = UnscopedSecretError
+        secret_scope.get_secret = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            UnscopedSecretError()
+        )
+        secret_scope.is_multiplex_active = lambda: True
+        secret_scope.build_profile_secret_scope = lambda home: (
+            scoped if Path(home) == tmp_path else {}
+        )
+        agent_pkg = types.ModuleType("agent")
+        agent_pkg.__path__ = []  # type: ignore[attr-defined]
+        agent_pkg.secret_scope = secret_scope
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: tmp_path
+        monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+        monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+
+        monkeypatch.setenv("A365_TENANT_ID", "process-tenant")
+        monkeypatch.setenv("A365_APP_ID", "process-app")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "process-secret")
+
+        adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig())
+
+        assert adapter.tenant_id == "scoped-tenant"
+        assert adapter.blueprint_app_id == "scoped-app"
+        assert adapter.blueprint_client_secret == "scoped-secret"
+        assert adapter._generated_config_path == tmp_path / "a365.generated.config.json"
+
+    def test_unscoped_secret_api_skew_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        class UnscopedSecretError(RuntimeError):
+            pass
+
+        secret_scope = types.ModuleType("agent.secret_scope")
+        secret_scope.UnscopedSecretError = UnscopedSecretError
+        secret_scope.get_secret = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            UnscopedSecretError()
+        )
+        agent_pkg = types.ModuleType("agent")
+        agent_pkg.__path__ = []  # type: ignore[attr-defined]
+        agent_pkg.secret_scope = secret_scope
+        monkeypatch.setitem(sys.modules, "agent", agent_pkg)
+        monkeypatch.setitem(sys.modules, "agent.secret_scope", secret_scope)
+        monkeypatch.setenv("A365_TENANT_ID", "another-profile-tenant")
+
+        with pytest.raises(UnscopedSecretError):
+            adapter_mod._profile_env("A365_TENANT_ID")
+
+    def test_env_secret_does_not_bypass_generated_config_mode(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        cfg_path = tmp_path / "a365.generated.config.json"
+        cfg_path.write_text(
+            '{"agentBlueprintClientSecret": "stale-exposed-secret"}'
+        )
+        cfg_path.chmod(0o644)
+        monkeypatch.setenv("A365_TENANT_ID", "tenant")
+        monkeypatch.setenv("A365_APP_ID", "app")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "environment-secret")
+
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(
+                extra={"generated_config_path": str(cfg_path)}
+            )
+        )
+
+        with pytest.raises(RuntimeError, match="group/world-readable"):
+            adapter._make_bridge_config()
 
     def test_make_bridge_config_raises_without_secret(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1054,6 +1240,7 @@ class TestAdapterConstruction:
         # Generated config exists but has no secret.
         cfg_path = tmp_path / "a365.generated.config.json"
         cfg_path.write_text("{}")
+        cfg_path.chmod(0o600)
         cfg = _StubPlatformConfig(
             extra={"generated_config_path": str(cfg_path)}
         )
@@ -12336,8 +12523,9 @@ class TestSlugIngestion:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("AGENT_IDENTITY", "../../tmp/evil")
-        with pytest.raises(ValueError):
+        with pytest.raises(ValueError) as exc_info:
             _make_adapter(monkeypatch, slug=None)
+        assert "../../tmp/evil" not in str(exc_info.value)
 
     def test_absent_slug_resolves_to_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -12350,7 +12538,9 @@ class TestSlugIngestion:
         assert a._conversations_path.parent.name == "default"
 
     def test_validate_config_rejects_explicit_invalid_slug(
-        self, monkeypatch: pytest.MonkeyPatch
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
     ) -> None:
         monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
         monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
@@ -12361,6 +12551,7 @@ class TestSlugIngestion:
         assert adapter_mod.validate_config(good) is True
         assert adapter_mod.validate_config(absent) is True
         assert adapter_mod.validate_config(bad) is False
+        assert "../evil" not in caplog.text
 
     def test_two_invalid_profiles_cannot_share_default(
         self, monkeypatch: pytest.MonkeyPatch
@@ -12690,12 +12881,49 @@ class TestGatewaySecretsProviderWiring:
         assert a._ensure_bf_secret() == ""
         assert a.blueprint_client_secret == "fake-secret"
 
+    def test_half_configured_path_b_fails_before_runtime_start(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
+        monkeypatch.delenv("A365_BF_CLIENT_SECRET", raising=False)
+        self._provider({})
+        adapter = _make_adapter(monkeypatch)
+
+        with pytest.raises(RuntimeError, match="A365_BF_CLIENT_SECRET"):
+            adapter._make_bridge_config()
+
+    def test_reconnect_clears_provider_hits_for_rotation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
+        monkeypatch.delenv("A365_BF_CLIENT_SECRET", raising=False)
+        values = {
+            (self._TENANT, self._BLUEPRINT_APP): "blueprint-v1",
+            (self._TENANT, self._BF_APP): "bf-v1",
+        }
+        self._provider(values)
+        adapter = _make_adapter(monkeypatch)
+        adapter.blueprint_client_secret = ""
+        monkeypatch.setattr(adapter, "_load_secret_from_generated_config", lambda: "")
+
+        assert adapter._ensure_secret() == "blueprint-v1"
+        assert adapter._ensure_bf_secret() == "bf-v1"
+        values[(self._TENANT, self._BLUEPRINT_APP)] = "blueprint-v2"
+        values[(self._TENANT, self._BF_APP)] = "bf-v2"
+
+        adapter._clear_provider_secret_cache()
+
+        assert adapter._ensure_secret() == "blueprint-v2"
+        assert adapter._ensure_bf_secret() == "bf-v2"
+
     def test_connect_offloads_secret_resolution_from_the_gateway_loop(self) -> None:
         import inspect
 
         source = inspect.getsource(adapter_mod.Agent365Adapter.connect)
         source += inspect.getsource(adapter_mod.Agent365Adapter._connect)
         assert "await asyncio.to_thread(self._make_bridge_config)" in source
+        assert "self._clear_provider_secret_cache()" in source
 
     def test_provider_secret_never_shadows_a_later_rotation(
         self, monkeypatch: pytest.MonkeyPatch
@@ -12722,6 +12950,25 @@ class TestGatewaySecretsProviderWiring:
 
         # It must win on the next call, not lose to the cached provider value.
         assert a._ensure_secret() == "FRESH-ROTATED"
+
+    def test_generated_config_rotation_is_seen_after_first_file_hit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        self._provider({})
+        adapter = _make_adapter(monkeypatch)
+        adapter.blueprint_client_secret = ""
+        generated = {"value": "file-v1"}
+        monkeypatch.setattr(
+            adapter,
+            "_load_secret_from_generated_config",
+            lambda: generated["value"],
+        )
+
+        assert adapter._ensure_secret() == "file-v1"
+        generated["value"] = "file-v2"
+
+        assert adapter._ensure_secret() == "file-v2"
 
     def test_transient_provider_failure_is_not_pinned_for_the_adapter(
         self, monkeypatch: pytest.MonkeyPatch
@@ -12873,6 +13120,7 @@ class TestGatewaySecretsProviderWiring:
         # which also appears in a comment, so that branch was not pinned.)
         assert "likely nothing to bootstrap" in source  # found
         assert "could not be consulted" in source  # unreachable
+        assert "Manual secret replacement is disabled" in source
         assert "has nothing stored for this tenant/app" in source  # empty
         assert "--output-fd 3 3>/dev/null" in source
 

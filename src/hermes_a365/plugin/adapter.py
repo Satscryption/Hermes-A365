@@ -113,6 +113,79 @@ from hermes_a365.secrets_provider import (  # noqa: E402
 # Plugin-local imports — these don't depend on the Hermes harness.
 from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
 
+
+def _profile_env(name: str, default: str | None = None) -> str | None:
+    """Read a credential without crossing a multiplex profile boundary.
+
+    Secondary adapters are created inside Hermes' context-local secret scope.
+    A scoped miss is authoritative and must not borrow the default profile's
+    process environment. The default profile itself is intentionally
+    constructed unscoped; when multiplexing is active, rebuild its isolated
+    map from the active Hermes home rather than weakening that boundary.
+    Standalone imports keep the legacy environment behavior when the Hermes
+    API is unavailable.
+    """
+    try:
+        from agent.secret_scope import UnscopedSecretError, get_secret
+    except (ImportError, AttributeError):
+        value = os.getenv(name)
+        return value if value is not None else default
+
+    try:
+        value = get_secret(name, default)
+    except UnscopedSecretError as scope_error:
+        # Hermes normally installs a scope around every secondary profile.
+        # Its default profile is constructed unscoped, but falling back to the
+        # process environment while multiplexing is active weakens the very
+        # isolation contract signalled by this exception. Rebuild that one
+        # profile's authoritative map instead.
+        try:
+            from agent.secret_scope import (
+                build_profile_secret_scope,
+                is_multiplex_active,
+            )
+        except (ImportError, AttributeError):
+            raise scope_error from None
+        if not is_multiplex_active():
+            raise scope_error
+        value = build_profile_secret_scope(_active_hermes_home()).get(name, default)
+    return value if value is not None else default
+
+
+def _active_hermes_home() -> Path:
+    """Return the context-local Hermes home, with a standalone fallback."""
+    try:
+        from hermes_constants import get_hermes_home
+
+        return Path(get_hermes_home()).expanduser()
+    except (ImportError, AttributeError):
+        return Path(os.path.expanduser(os.getenv("HERMES_HOME") or "~/.hermes"))
+
+
+def _multiplex_active() -> bool:
+    """Return Hermes' multiplex state when that API is available."""
+    try:
+        from agent.secret_scope import is_multiplex_active
+
+        return bool(is_multiplex_active())
+    except (ImportError, AttributeError):
+        return False
+
+
+def _validate_profile_env_permissions(hermes_home: Path) -> None:
+    """Reject a profile environment file readable by other local users."""
+    path = hermes_home / ".env"
+    try:
+        mode = path.stat().st_mode & 0o777
+    except FileNotFoundError:
+        return
+    except OSError as e:
+        raise RuntimeError(f"cannot verify profile .env permissions: {e}") from e
+    if mode & 0o077:
+        raise RuntimeError(
+            f"profile .env is group/world-readable (mode 0{mode:o}); chmod 600 {path}"
+        )
+
 _AGENT_TURN_LIFECYCLE: ContextVar[tuple[int, str, int, int, asyncio.Event] | None] = ContextVar(
     "agent365_agent_turn_lifecycle", default=None
 )
@@ -837,6 +910,8 @@ class Agent365Adapter(BasePlatformAdapter):
         super().__init__(config=config, platform=Platform("agent365"))
 
         extra = getattr(config, "extra", {}) or {}
+        self._hermes_home = _active_hermes_home()
+        _validate_profile_env_permissions(self._hermes_home)
 
         # Connection / runtime config
         # #103/M9 + review P2: an EXPLICITLY configured slug must be
@@ -846,26 +921,31 @@ class Agent365Adapter(BasePlatformAdapter):
         # two invalid profiles (or an invalid one + a real "default")
         # would share and clobber conversations.json / bridge.log /
         # bridge.pid. A genuinely absent slug still resolves to "default".
-        _slug_raw = str(extra.get("slug") or os.getenv("AGENT_IDENTITY") or "")
+        _slug_raw = str(extra.get("slug") or _profile_env("AGENT_IDENTITY") or "")
         if _slug_raw:
-            self.slug: str = validate_slug(_slug_raw)
+            try:
+                self.slug: str = validate_slug(_slug_raw)
+            except ValueError:
+                raise ValueError(
+                    "agent365 configured slug is not path-safe"
+                ) from None
         else:
             self.slug = ""
         self.host: str = str(extra.get("host") or "127.0.0.1")
         self.port: int = int(
-            os.getenv("HERMES_BRIDGE_PORT") or extra.get("port") or _DEFAULT_PORT
+            _profile_env("HERMES_BRIDGE_PORT") or extra.get("port") or _DEFAULT_PORT
         )
 
         # Tenant + blueprint identity (also pulled by load_bridge_config when
         # available, but env-first lookup keeps the plugin loadable when
         # generated config isn't on disk in the gateway's cwd).
-        self.tenant_id: str = os.getenv("A365_TENANT_ID") or str(
+        self.tenant_id: str = _profile_env("A365_TENANT_ID") or str(
             extra.get("tenant_id") or ""
         )
-        self.blueprint_app_id: str = os.getenv("A365_APP_ID") or str(
+        self.blueprint_app_id: str = _profile_env("A365_APP_ID") or str(
             extra.get("app_id") or ""
         )
-        self.blueprint_client_secret: str = os.getenv(
+        self.blueprint_client_secret: str = _profile_env(
             "A365_BLUEPRINT_CLIENT_SECRET"
         ) or str(extra.get("blueprint_client_secret") or "")
 
@@ -873,10 +953,10 @@ class Agent365Adapter(BasePlatformAdapter):
         # defaults to the blueprint app (which fails AADSTS82001 on
         # outbound for #36's reasons). Operators following the #36
         # walk register a second Entra app + set these env vars.
-        self.bf_app_id: str = os.getenv("A365_BF_APP_ID") or str(
+        self.bf_app_id: str = _profile_env("A365_BF_APP_ID") or str(
             extra.get("bf_app_id") or ""
         )
-        self.bf_client_secret: str = os.getenv("A365_BF_CLIENT_SECRET") or str(
+        self.bf_client_secret: str = _profile_env("A365_BF_CLIENT_SECRET") or str(
             extra.get("bf_client_secret") or ""
         )
         # #19: provider-resolved secrets are lazy and cached separately from
@@ -887,20 +967,25 @@ class Agent365Adapter(BasePlatformAdapter):
         self._provider_secret: str = ""
         self._provider_bf_secret: str = ""
 
+        generated_config_default = (
+            self._hermes_home / "a365.generated.config.json"
+            if _multiplex_active()
+            else Path.cwd() / "a365.generated.config.json"
+        )
         self._generated_config_path: Path = Path(
             extra.get("generated_config_path")
-            or os.getenv("A365_GENERATED_CONFIG_PATH")
-            or (Path.cwd() / "a365.generated.config.json")
+            or _profile_env("A365_GENERATED_CONFIG_PATH")
+            or generated_config_default
         )
 
         self._allowed_users: tuple[str, ...] = tuple(
             value.strip().lower()
-            for value in os.environ.get("A365_ALLOWED_USERS", "").split(",")
+            for value in (_profile_env("A365_ALLOWED_USERS", "") or "").split(",")
             if value.strip()
         )
-        self._allow_all_users = os.environ.get(
+        self._allow_all_users = (_profile_env(
             "A365_ALLOW_ALL_USERS", ""
-        ).strip().lower() in {"1", "true", "yes", "on"}
+        ) or "").strip().lower() in {"1", "true", "yes", "on"}
 
         # Slice 19o — durable conversation registry keyed on
         # `conversation.id`. Persists to
@@ -908,10 +993,9 @@ class Agent365Adapter(BasePlatformAdapter):
         # sends and longer conversations work across uvicorn restarts.
         self._conversations_path: Path = Path(
             extra.get("conversations_path")
-            or os.getenv("A365_CONVERSATIONS_PATH")
+            or _profile_env("A365_CONVERSATIONS_PATH")
             or (
-                Path.home()
-                / ".hermes"
+                self._hermes_home
                 / "agents"
                 / (self.slug or "default")
                 / "conversations.json"
@@ -1118,15 +1202,15 @@ class Agent365Adapter(BasePlatformAdapter):
         # #73(c) — feedback-loop opt-in. Default on; operators disable via
         # A365_FEEDBACK_LOOP=0. Gates the channelData.feedbackLoop stamp so the
         # thumbs up/down affordance can be turned off without a code change.
-        self._feedback_enabled = os.environ.get(
-            "A365_FEEDBACK_LOOP", "1"
+        self._feedback_enabled = (
+            _profile_env("A365_FEEDBACK_LOOP", "1") or "1"
         ).strip().lower() not in ("0", "false", "no", "off", "")
 
         # #82 — "continue in Teams" deep-link affordance on degraded Copilot Chat
         # replies. Default OFF (a UX-changing surface that needs walk validation
         # and could read as noise); operators opt in with A365_HANDOFF_LINK=1.
-        self._handoff_link_enabled = os.environ.get(
-            "A365_HANDOFF_LINK", "0"
+        self._handoff_link_enabled = (
+            _profile_env("A365_HANDOFF_LINK", "0") or "0"
         ).strip().lower() in ("1", "true", "yes", "on")
 
         # R2/R3-P1 — EXACT tenant SharePoint/OneDrive hosts allowed as inbound file
@@ -1142,7 +1226,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # single-profile compatibility fallback.
         _fha = extra.get("file_host_allowlist")
         if _fha is None:
-            _fha = os.environ.get("A365_FILE_HOST_ALLOWLIST", "")
+            _fha = _profile_env("A365_FILE_HOST_ALLOWLIST", "") or ""
         if isinstance(_fha, str):
             _fha_items: list[Any] = _fha.split(",")
         elif isinstance(_fha, (list, tuple)):
@@ -1185,22 +1269,40 @@ class Agent365Adapter(BasePlatformAdapter):
 
     # ── Configuration helpers ─────────────────────────────────────────────
 
+    def _validate_generated_config_permissions(self) -> None:
+        """Reject a configured plaintext file unless only its owner can read it."""
+        try:
+            mode = self._generated_config_path.stat().st_mode & 0o777
+        except FileNotFoundError:
+            return
+        except OSError as e:
+            raise RuntimeError(
+                f"cannot verify generated-config permissions: {e}"
+            ) from e
+        if mode & 0o077:
+            raise RuntimeError(
+                "generated config is group/world-readable "
+                f"(mode 0{mode:o}); chmod 600 {self._generated_config_path}"
+            )
+
     def _load_secret_from_generated_config(self) -> str:
         """Best-effort read of `agentBlueprintClientSecret` from the
         local generated config. Returns empty string on miss."""
+        self._validate_generated_config_permissions()
         try:
             data = json.loads(self._generated_config_path.read_text())
         except (OSError, json.JSONDecodeError):
             return ""
         secret = data.get("agentBlueprintClientSecret") if isinstance(data, dict) else None
-        return secret if isinstance(secret, str) else ""
+        if not isinstance(secret, str) or not secret:
+            return ""
+        return secret
 
     def _ensure_secret(self) -> str:
         if self.blueprint_client_secret:
             return self.blueprint_client_secret
         secret = self._load_secret_from_generated_config()
         if secret:
-            self.blueprint_client_secret = secret
             return secret
         # #19: the provider tier, consulted only after env AND the generated
         # config have both missed.
@@ -1249,10 +1351,18 @@ class Agent365Adapter(BasePlatformAdapter):
         self._provider_bf_secret = found
         return found
 
+    def _clear_provider_secret_cache(self) -> None:
+        """Force a reconnect to observe provider-only credential rotation."""
+        self._provider_secret = ""
+        self._provider_bf_secret = ""
+
     def _make_bridge_config(self) -> Any:
         """Construct a `BridgeConfig` for the bridge helpers (token
         acquisition, JWT validation, send_reply)."""
         bridge = _import_bridge()
+        # A plaintext secret file remains an exposure even when a higher
+        # precedence environment value wins, so validate it unconditionally.
+        self._validate_generated_config_permissions()
         secret = self._ensure_secret()
         bf_secret = self._ensure_bf_secret()
         if not (self.tenant_id and self.blueprint_app_id and secret):
@@ -1261,7 +1371,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 "blueprint_client_secret — check A365_TENANT_ID, A365_APP_ID, "
                 "and A365_BLUEPRINT_CLIENT_SECRET (or generated config path)"
             )
-        log_path = Path.home() / ".hermes" / "agents" / (self.slug or "default") / "bridge.log"
+        if bool(self.bf_app_id) != bool(bf_secret):
+            missing = "A365_BF_CLIENT_SECRET" if self.bf_app_id else "A365_BF_APP_ID"
+            raise RuntimeError(
+                "agent365 Path B identity is only partially configured; "
+                f"{missing} is required when its matching value is set"
+            )
+        log_path = self._hermes_home / "agents" / (self.slug or "default") / "bridge.log"
         pid_path = log_path.with_name("bridge.pid")
         return bridge.BridgeConfig(
             slug=self.slug or "default",
@@ -1920,8 +2036,7 @@ class Agent365Adapter(BasePlatformAdapter):
         Absolute paths under here go into ``MessageEvent.media_urls``; the gateway
         reads them for auto-vision / documents (matches the whatsapp_cloud
         adapter's per-platform cache convention)."""
-        home = os.environ.get("HERMES_HOME") or str(Path.home() / ".hermes")
-        return Path(home) / "platforms" / "agent365" / "media"
+        return self._hermes_home / "platforms" / "agent365" / "media"
 
     @staticmethod
     def _release_media_paths(paths: set[Path]) -> None:
@@ -2371,6 +2486,11 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._disconnecting:
             logger.warning("agent365 connect deferred while outbound tasks retire")
             return False
+        if is_reconnect:
+            # Provider hits are intentionally cached during one connection,
+            # but a reconnect is the operator-visible boundary for picking up
+            # a keychain/Vault rotation without replacing the adapter object.
+            self._clear_provider_secret_cache()
         self._lifecycle_generation += 1
         bridge = _import_bridge()
         try:
@@ -7023,23 +7143,25 @@ def validate_config(config: Any) -> bool:
     `A365_TENANT_ID` + `A365_APP_ID` available either via env or
     ``extra`` — and, if a slug is explicitly configured, that it is
     path-safe."""
+    try:
+        _validate_profile_env_permissions(_active_hermes_home())
+    except RuntimeError as e:
+        logger.error("agent365 configuration rejected: %s", e)
+        return False
     extra = getattr(config, "extra", {}) or {}
-    tenant = os.getenv("A365_TENANT_ID") or extra.get("tenant_id")
-    app = os.getenv("A365_APP_ID") or extra.get("app_id")
+    tenant = _profile_env("A365_TENANT_ID") or extra.get("tenant_id")
+    app = _profile_env("A365_APP_ID") or extra.get("app_id")
     if not (tenant and app):
         return False
     # Review P2: reject an explicitly configured non-path-safe slug at
     # pre-flight (mirrors __init__'s fail-closed guard) rather than let the
     # adapter route to the shared "default" profile state.
-    slug_raw = str(extra.get("slug") or os.getenv("AGENT_IDENTITY") or "")
+    slug_raw = str(extra.get("slug") or _profile_env("AGENT_IDENTITY") or "")
     if slug_raw:
         try:
             validate_slug(slug_raw)
         except ValueError:
-            logger.warning(
-                "agent365 configured slug %r is not path-safe; refusing to load",
-                slug_raw,
-            )
+            logger.warning("agent365 configured slug is not path-safe; refusing to load")
             return False
     return True
 
@@ -7175,6 +7297,7 @@ def _ensure_xdg_generated_config_symlink(
 def _detect_drift(
     *,
     home: Path | None = None,
+    hermes_home: Path | None = None,
     config: dict[str, Any] | None = None,
 ) -> list[dict[str, Any]]:
     """Scan operator config files for drift that accumulates across
@@ -7191,6 +7314,8 @@ def _detect_drift(
     Args:
         home: Override for ``Path.home()``. Defaults to the real home
             dir. Tests pass a tmp_path to isolate the filesystem reads.
+        hermes_home: Override for the active Hermes profile home. When absent,
+            ``<home>/.hermes`` preserves the historical/default-profile path.
         config: Override for the parsed ``~/.hermes/config.yaml``.
             Defaults to ``hermes_cli.config.load_config()``. Tests
             pass a synthetic dict to exercise stanza-shape branches.
@@ -7200,8 +7325,9 @@ def _detect_drift(
 
     drift: list[dict[str, Any]] = []
     home_dir = home if home is not None else _Path.home()
-    operator_env = home_dir / ".hermes" / ".env"
-    agents_dir = home_dir / ".hermes" / "agents"
+    profile_home = hermes_home if hermes_home is not None else home_dir / ".hermes"
+    operator_env = profile_home / ".env"
+    agents_dir = profile_home / "agents"
     a365_config = home_dir / "a365.config.json"
 
     # Helpers — kept inline so this function has no module-level deps
@@ -7548,7 +7674,8 @@ def interactive_setup() -> None:
     print_header("Microsoft Agent 365")
 
     # Slice 19r-b: drift detection pass.
-    drift = _detect_drift()
+    active_hermes_home = _active_hermes_home()
+    drift = _detect_drift(hermes_home=active_hermes_home)
     drift_force_reconfigure = False
     if drift:
         print_warning(f"Found {len(drift)} configuration drift item(s):")
@@ -7684,7 +7811,7 @@ def interactive_setup() -> None:
     #      operator hits Enter on a freeform prompt.
     #    - 0 dirs: prompt freeform but re-prompt on blank (up to 3
     #      tries) to avoid silently writing an empty stanza.
-    agents_dir = Path.home() / ".hermes" / "agents"
+    agents_dir = active_hermes_home / "agents"
     slug_options = (
         sorted(d.name for d in agents_dir.iterdir() if d.is_dir())
         if agents_dir.is_dir()
@@ -7761,7 +7888,8 @@ def interactive_setup() -> None:
     if detected_secret:
         if prompt_yes_no(
             f"Use secret from {generated_path}? "
-            "(writes plaintext to ~/.hermes/.env — keychain-only is slice #19)",
+            "(writes plaintext to the active Hermes profile .env; choose No "
+            "to keep provider-only storage)",
             True,
         ):
             # #110 / CS-002: never add the secret to a permissive .env.
@@ -7789,21 +7917,14 @@ def interactive_setup() -> None:
         # secret to rest, where `--auto-recover-secret` would mint a fresh one
         # that outranks theirs. Consult the provider and report accordingly.
         #
-        # The paste prompt is offered on every branch, as it was before #19:
-        # the provider tells us a secret EXISTS, never that it is the right
-        # one, and plaintext is what outranks a stale entry.
+        # The paste prompt remains available when the provider answers: it can
+        # tell us a secret EXISTS, never that it is the right one. Suppress the
+        # prompt when unreachable so plaintext cannot shadow an unknown item.
         found, reachable, label = _probe_secret_at_rest(tenant, app)
-        if found:
-            print_success(
-                "agentBlueprintClientSecret is null in the generated config, "
-                f"but a secret for this tenant/app resolves from the secrets "
-                f"provider ({label}) — likely nothing to bootstrap. Its "
-                "validity was not checked; paste a replacement below only if "
-                "you know the stored one is stale."
-            )
-        elif not reachable:
+        if not reachable:
             # Do NOT print the #408 remedy here: the store may well hold the
-            # secret and we simply could not read it.
+            # secret and we simply could not read it. For the same reason, do
+            # not offer a plaintext replacement that would shadow it.
             print_warning(
                 f"agentBlueprintClientSecret is null, and the secrets provider "
                 f"({label}) could not be consulted — an unavailable or locked "
@@ -7813,17 +7934,31 @@ def interactive_setup() -> None:
                 "succeed) before assuming "
                 "the secret needs re-minting."
             )
-        else:
-            print_warning(
-                f"agentBlueprintClientSecret is null and the secrets provider "
-                f"({label}) has nothing stored for this tenant/app — most "
-                "likely Microsoft#408 on this CLI release. Re-run "
-                "`hermes a365 register --apply --auto-recover-secret`."
+            print_info(
+                "Manual secret replacement is disabled while the provider "
+                "is unreachable. Restore access and re-run the wizard."
             )
-        manual_secret = prompt(
-            "Or paste the 40-char client secret now (skipped if blank)",
-            password=True,
-        )
+            manual_secret = ""
+        else:
+            if found:
+                print_success(
+                    "agentBlueprintClientSecret is null in the generated config, "
+                    f"but a secret for this tenant/app resolves from the secrets "
+                    f"provider ({label}) — likely nothing to bootstrap. Its "
+                    "validity was not checked; paste a replacement below only if "
+                    "you know the stored one is stale."
+                )
+            else:
+                print_warning(
+                    f"agentBlueprintClientSecret is null and the secrets provider "
+                    f"({label}) has nothing stored for this tenant/app — most "
+                    "likely Microsoft#408 on this CLI release. Re-run "
+                    "`hermes a365 register --apply --auto-recover-secret`."
+                )
+            manual_secret = prompt(
+                "Or paste the 40-char client secret now (skipped if blank)",
+                password=True,
+            )
         if manual_secret:
             # #110 / CS-002: same gate on the manual-paste branch.
             if _gate_env_secret_write(

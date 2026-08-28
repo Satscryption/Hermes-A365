@@ -116,7 +116,12 @@ from ._common import (
 
 # #19: secrets-at-rest provider. Fills a MISS only — the plaintext
 # generated-config / per-agent .env values still win.
-from .secrets_provider import provider_label, resolve_secret
+from .secrets_provider import (
+    probe_provider,
+    provider_label,
+    resolve_secret,
+    resolve_secret_state,
+)
 
 # Slice 19b — `serve` mode dependencies. Optional extras: operators
 # who only need `verify` can install without them. We bind the names
@@ -251,9 +256,18 @@ def load_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:
             f"agent .env missing: {path}; run `hermes a365 instance create {slug} --apply`"
         )
     try:
-        return parse_env(path.read_text())
+        parsed = parse_env(path.read_text())
     except OSError as e:
         raise BridgeConfigError(f"agent .env unreadable: {e}") from e
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError as e:
+        raise BridgeConfigError(f"cannot verify permissions on {path}: {e}") from e
+    if mode & 0o077:
+        raise BridgeConfigError(
+            f"agent .env is group/world-readable (mode 0{mode:o}): chmod 600 {path}"
+        )
+    return parsed
 
 
 def load_generated_config(path: Path) -> dict[str, Any]:
@@ -266,9 +280,18 @@ def load_generated_config(path: Path) -> dict[str, Any]:
             f"{path} missing; run `hermes a365 register --apply` to create the blueprint"
         )
     try:
-        return json.loads(path.read_text())
+        parsed = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError) as e:
         raise BridgeConfigError(f"{path} unreadable / not JSON: {e}") from e
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError as e:
+        raise BridgeConfigError(f"cannot verify permissions on {path}: {e}") from e
+    if mode & 0o077:
+        raise BridgeConfigError(
+            f"generated config is group/world-readable (mode 0{mode:o}): chmod 600 {path}"
+        )
+    return parsed
 
 
 # ---------------------------------------------------------------------------
@@ -400,32 +423,48 @@ def probe_generated_config(
     # remediation text sent them to `register --apply`, which writes the
     # plaintext secret back and shadows the keychain entry.
     secret_source = "generated config"
+    provider_state = None
     if not secret:
-        secret = resolve_secret(tenant_id, str(blueprint_id), existing="")
+        provider_state = resolve_secret_state(
+            tenant_id, str(blueprint_id), existing=""
+        )
+        secret = provider_state.value
         if secret:
-            secret_source = f"provider: {provider_label()}"
+            secret_source = f"provider: {provider_state.provider}"
     if not secret:
         # `resolve_secret` short-circuits on an empty tenant, so without one
         # the provider was never actually consulted — say which happened
         # rather than blaming a store that was never asked.
         if tenant_id:
-            provider_note = (
-                f"and the secrets provider ({provider_label()}) had none for "
-                f"(tenant, {str(blueprint_id)[:8]}…)"
-            )
+            assert provider_state is not None
+            if provider_state.reachable:
+                provider_note = (
+                    f"and the secrets provider ({provider_state.provider}) had none for "
+                    f"(tenant, {str(blueprint_id)[:8]}…)"
+                )
+                remediation = (
+                    "re-run `hermes a365 register --apply`, or store it with "
+                    "`python -m hermes_a365.keychain store`"
+                )
+            else:
+                provider_note = (
+                    f"and the secrets provider ({provider_state.provider}) was unreachable for "
+                    f"(tenant, {str(blueprint_id)[:8]}…)"
+                )
+                remediation = "restore provider access and retry verification"
         else:
             provider_note = (
                 "and no tenant id was available, so the secrets provider "
                 f"({provider_label()}) could not be consulted — set "
                 "A365_TENANT_ID in the agent env"
             )
+            remediation = "set the tenant id and retry verification"
         return (
             ProbeResult(
                 "generated_config",
                 _ERROR,
                 f"{path} has no agentBlueprintClientSecret {provider_note}; "
-                "re-run `hermes a365 register --apply`, or store it with "
-                "`python -m hermes_a365.keychain store`",
+                f"{remediation}",
             ),
             {},
         )
@@ -439,19 +478,53 @@ def probe_generated_config(
         f"appId={blueprint_id[:8]}… secret loaded from {secret_source} "
         f"(mode=0{mode:o})"
     )
-    if mode >= 0 and (mode & 0o077):
-        return (
-            ProbeResult(
-                "generated_config",
-                _WARN,
-                f"{detail}; world-/group-readable — chmod 600 {path}",
-                extra,
-            ),
-            {"blueprint_id": blueprint_id, "client_secret": secret},
-        )
     return (
         ProbeResult("generated_config", _OK, detail, extra),
         {"blueprint_id": blueprint_id, "client_secret": secret},
+    )
+
+
+def probe_bf_secret(agent_env: dict[str, str]) -> ProbeResult:
+    """Report Path B credential source/reachability without returning it."""
+    tenant_id = agent_env.get("A365_TENANT_ID", "")
+    app_id = agent_env.get("A365_BF_APP_ID", "")
+    plaintext = agent_env.get("A365_BF_CLIENT_SECRET", "")
+    if not app_id and not plaintext:
+        return ProbeResult("bf_secret", _OK, "Path B identity not configured")
+    if not app_id:
+        return ProbeResult(
+            "bf_secret",
+            _ERROR,
+            "A365_BF_CLIENT_SECRET is set but A365_BF_APP_ID is missing",
+        )
+    if plaintext:
+        return ProbeResult(
+            "bf_secret",
+            _OK,
+            f"appId={app_id[:8]}… secret loaded from agent .env",
+            {"app_id": app_id, "source": "agent_env"},
+        )
+
+    found, reachable, label = probe_provider(tenant_id, app_id)
+    if found:
+        return ProbeResult(
+            "bf_secret",
+            _OK,
+            f"appId={app_id[:8]}… secret loaded from provider: {label}",
+            {"app_id": app_id, "source": "provider", "provider": label},
+        )
+    if not reachable:
+        detail = (
+            f"Path B secrets provider ({label}) is unreachable for appId={app_id[:8]}…"
+            if tenant_id
+            else "A365_TENANT_ID is missing, so the Path B provider cannot be consulted"
+        )
+        return ProbeResult("bf_secret", _ERROR, detail)
+    return ProbeResult(
+        "bf_secret",
+        _ERROR,
+        f"A365_BF_APP_ID is set but no A365_BF_CLIENT_SECRET resolves from "
+        f"the agent .env or provider ({label})",
     )
 
 
@@ -637,13 +710,27 @@ def run_verify(
     local_probe, agent_env = probe_local_config(hermes_home, slug)
     report.probes.append(local_probe)
 
+    if local_probe.state == _ERROR:
+        bf_probe = ProbeResult(
+            "bf_secret",
+            _WARN,
+            "skipped — local_config probe failed",
+        )
+    else:
+        bf_probe = probe_bf_secret(agent_env)
+    report.probes.append(bf_probe)
+
     gen_probe, gen_data = probe_generated_config(
         generated_config_path,
         tenant_id=agent_env.get("A365_TENANT_ID", "") if agent_env else "",
     )
     report.probes.append(gen_probe)
 
-    if local_probe.state == _ERROR or gen_probe.state == _ERROR:
+    if (
+        local_probe.state == _ERROR
+        or bf_probe.state == _ERROR
+        or gen_probe.state == _ERROR
+    ):
         # Skip auth probes — we don't have what we need.
         for name in ("token_acquisition", "fmi_exchange"):
             report.probes.append(
@@ -1159,7 +1246,7 @@ class BridgeConfig:
     slug: str
     tenant_id: str
     blueprint_client_id: str
-    blueprint_client_secret: str
+    blueprint_client_secret: str = field(repr=False)
     webhook_url: str
     log_path: Path
     pid_path: Path
@@ -1183,7 +1270,7 @@ class BridgeConfig:
     # used as `expected_app_id` for inbound BF JWT validation AND as
     # the `client_id` / `client_secret` for outbound BF S2S mint.
     bf_app_id: str = ""
-    bf_client_secret: str = ""
+    bf_client_secret: str = field(default="", repr=False)
     # Standalone serve has no GatewayRunner authorization layer. It therefore
     # owns a fail-closed end-user policy, using the same environment names as
     # the plugin registration.
@@ -1219,11 +1306,12 @@ def load_bridge_config(
     # #19: fill a MISS from the secrets-at-rest provider (OS keychain by
     # default). The generated-config value still wins, so a secret rotated
     # by `register --apply` can never be beaten by a stale keychain entry.
-    blueprint_secret = resolve_secret(
+    blueprint_state = resolve_secret_state(
         agent_env.get("A365_TENANT_ID", ""),
         blueprint_client_id,
         existing=blueprint_secret,
     )
+    blueprint_secret = blueprint_state.value
     if not blueprint_client_id:
         raise BridgeConfigError(
             f"{generated_config_path} has no agentBlueprintId; "
@@ -1233,26 +1321,38 @@ def load_bridge_config(
         # `resolve_secret` short-circuits on an empty tenant, so with no
         # A365_TENANT_ID the provider was never actually consulted — do not
         # blame a store that was never asked (mirrors probe_generated_config).
-        if agent_env.get("A365_TENANT_ID", ""):
-            provider_clause = (
-                f"and the secrets provider ({provider_label()}) supplied none "
-                "either. "
-            )
+        tenant_id = agent_env.get("A365_TENANT_ID", "")
+        if tenant_id:
+            if blueprint_state.reachable:
+                provider_clause = (
+                    f"and the secrets provider ({blueprint_state.provider}) "
+                    "supplied none either. "
+                )
+                remediation = (
+                    "Common cause: `a365 publish` was run after `register` and "
+                    "clobbered the local secret. Recover by either re-running "
+                    "register --apply (with cleanup first) or `az ad app "
+                    "credential reset --id <blueprint-app-id>` and patching the "
+                    "new secret into the generated config — or store it at rest "
+                    "with `python -m hermes_a365.keychain store`."
+                )
+            else:
+                provider_clause = (
+                    f"and the secrets provider ({blueprint_state.provider}) "
+                    "was unreachable. "
+                )
+                remediation = "Restore provider access and retry startup."
         else:
             provider_clause = (
                 "and no A365_TENANT_ID was set, so the secrets provider could "
                 "not be consulted (set it in the agent .env to enable the "
                 "at-rest tier). "
             )
+            remediation = "Set A365_TENANT_ID and retry startup."
         raise BridgeConfigError(
             f"{generated_config_path} has no agentBlueprintClientSecret, "
             f"{provider_clause}"
-            "Common cause: `a365 publish` was run after `register` and "
-            "clobbered the local secret. Recover by either re-running "
-            "register --apply (with cleanup first) or `az ad app "
-            "credential reset --id <blueprint-app-id>` and patching the "
-            "new secret into the generated config — or store it at rest with "
-            "`python -m hermes_a365.keychain store`."
+            f"{remediation}"
         )
 
     resolved_webhook = webhook_url or os.environ.get("HERMES_BRIDGE_WEBHOOK") or ""
@@ -1278,6 +1378,12 @@ def load_bridge_config(
         bf_app_id,
         existing=bf_client_secret,
     )
+    if bool(bf_app_id) != bool(bf_client_secret):
+        missing = "A365_BF_CLIENT_SECRET" if bf_app_id else "A365_BF_APP_ID"
+        raise BridgeConfigError(
+            "Path B identity is only partially configured; "
+            f"{missing} is required when its matching value is set"
+        )
     return BridgeConfig(
         slug=slug,
         tenant_id=agent_env["A365_TENANT_ID"],

@@ -12,6 +12,7 @@ from hermes_a365.secrets_provider import (
     KeychainSecretsProvider,
     SecretsProvider,
     resolve_secret,
+    resolve_secret_state,
     set_default_provider,
 )
 
@@ -59,6 +60,24 @@ def test_existing_value_wins_over_provider() -> None:
     assert got == "plaintext-secret"
 
 
+def test_existing_value_never_touches_provider_or_its_label() -> None:
+    class MustNotTouch:
+        @property
+        def name(self) -> str:
+            raise AssertionError("provider label was touched")
+
+        def resolve(self, tenant: str, app_id: str) -> str | None:
+            raise AssertionError("provider was consulted")
+
+    state = resolve_secret_state(
+        TENANT, BLUEPRINT_APP, existing="plaintext-secret", provider=MustNotTouch()
+    )
+
+    assert state.value == "plaintext-secret"
+    assert state.provider == "unconsulted"
+    assert "plaintext-secret" not in repr(state)
+
+
 def test_provider_fills_a_miss() -> None:
     backend = FakeBackend(items={account_name(TENANT, BLUEPRINT_APP): "keychain-secret"})
     provider = KeychainSecretsProvider(backend=backend)
@@ -69,6 +88,50 @@ def test_provider_fills_a_miss() -> None:
     assert resolve_secret(TENANT, BLUEPRINT_APP, existing=None, provider=provider) == (
         "keychain-secret"
     )
+
+
+def test_keychain_subclass_resolve_override_is_honoured() -> None:
+    class CustomKeychain(KeychainSecretsProvider):
+        def resolve(self, tenant: str, app_id: str) -> str | None:
+            return "custom-secret"
+
+    state = resolve_secret_state(
+        TENANT, BLUEPRINT_APP, existing="", provider=CustomKeychain(FakeBackend())
+    )
+
+    assert state.value == "custom-secret"
+    assert state.reachable is True
+
+
+def test_keychain_subclass_inheriting_resolve_preserves_unreachable_state() -> None:
+    class InheritedKeychain(KeychainSecretsProvider):
+        pass
+
+    provider = InheritedKeychain(
+        FakeBackend(raise_on_get=KeychainError("locked"))
+    )
+    state = resolve_secret_state(
+        TENANT, BLUEPRINT_APP, existing="", provider=provider
+    )
+
+    assert state.value == ""
+    assert state.reachable is False
+
+
+def test_delegating_keychain_override_treats_none_as_unreachable() -> None:
+    class InstrumentedKeychain(KeychainSecretsProvider):
+        def resolve(self, tenant: str, app_id: str) -> str | None:
+            return super().resolve(tenant, app_id)
+
+    provider = InstrumentedKeychain(
+        FakeBackend(raise_on_get=KeychainError("locked"))
+    )
+    state = resolve_secret_state(
+        TENANT, BLUEPRINT_APP, existing="", provider=provider
+    )
+
+    assert state.value == ""
+    assert state.reachable is False
 
 
 def test_rotation_safety_stale_keychain_never_beats_fresh_plaintext() -> None:

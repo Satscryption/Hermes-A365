@@ -27,8 +27,8 @@ reasons, both load-bearing:
 To *use* the keychain, an operator stores the secret and removes it from
 the plaintext file — the keychain then fills the resulting miss. Putting it
 back in ``.env`` restores the documented fallback. Full keychain-primary
-storage (rotation routed *through* the provider, arbitrary backends) is the
-remaining stretch scope on #19; this slice ships the interface and a
+storage (rotation routed *through* the provider, arbitrary backends) is
+deferred to post-1.0 enhancement scope; this slice ships the interface and a
 keychain-backed default so the #123 walk can validate secrets-at-rest.
 
 Naming note: this module is deliberately **not** ``secrets.py`` — that name
@@ -40,6 +40,7 @@ original module to :mod:`hermes_a365.keychain`.
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass, field
 from subprocess import TimeoutExpired
 from typing import Protocol, runtime_checkable
 
@@ -70,6 +71,15 @@ class SecretsProvider(Protocol):
     def resolve(self, tenant: str, app_id: str) -> str | None: ...
 
 
+@dataclass(frozen=True)
+class SecretResolution:
+    """A value and its diagnostic state from one provider lookup."""
+
+    value: str = field(repr=False)
+    reachable: bool
+    provider: str
+
+
 class KeychainSecretsProvider:
     """Default provider: the OS keychain via :mod:`hermes_a365.keychain`.
 
@@ -85,8 +95,10 @@ class KeychainSecretsProvider:
     def __init__(self, backend: KeychainBackend | None = None) -> None:
         self._backend = backend
 
-    def probe(self, tenant: str, app_id: str) -> tuple[bool, bool]:
-        """Probe one exact key, returning ``(found, reachable)``.
+    def resolve_with_status(
+        self, tenant: str, app_id: str
+    ) -> tuple[str, bool]:
+        """Resolve one exact key, returning ``(value, reachable)``.
 
         Reachability must come from the target lookup itself. Probing an
         unrelated sentinel after a target-specific denial can succeed and
@@ -95,35 +107,32 @@ class KeychainSecretsProvider:
         """
         try:
             found = get_secret(tenant, app_id, backend=self._backend)
-        except (KeychainError, ValueError):
-            return False, False
+        except (KeychainTimeoutError, TimeoutExpired):
+            logger.warning("secrets provider: keychain lookup timed out")
+            return "", False
+        except KeychainError as e:
+            logger.debug("secrets provider: keychain unavailable (%s)", e)
+            return "", False
+        except ValueError as e:
+            logger.debug("secrets provider: unusable key (%s)", e)
+            return "", False
         except Exception:
-            return False, False
+            logger.warning("secrets provider: unexpected keychain lookup failure")
+            return "", False
         if found is None:
-            return False, True
+            return "", True
         if not isinstance(found, str):
-            return False, False
-        return bool(found), True
+            return "", False
+        return found, True
+
+    def probe(self, tenant: str, app_id: str) -> tuple[bool, bool]:
+        """Probe one exact key, returning ``(found, reachable)``."""
+        value, reachable = self.resolve_with_status(tenant, app_id)
+        return bool(value), reachable
 
     def resolve(self, tenant: str, app_id: str) -> str | None:
-        try:
-            return get_secret(tenant, app_id, backend=self._backend)
-        except (KeychainTimeoutError, TimeoutExpired):
-            # The backend boundary has already replaced TimeoutExpired with a
-            # sanitized exception, so no secret-bearing argv can escape.
-            logger.warning("secrets provider: keychain lookup timed out")
-            return None
-        except KeychainError as e:
-            # No backend binary / unsupported platform. Expected on plenty
-            # of hosts — debug, not warn, and never the secret value.
-            logger.debug("secrets provider: keychain unavailable (%s)", e)
-            return None
-        except ValueError as e:
-            # account_name() rejects an empty/`/`-bearing tenant or app id.
-            # Path-A-only operators legitimately have bf_app_id="", so this
-            # must degrade to a miss rather than crash a runtime read.
-            logger.debug("secrets provider: unusable key (%s)", e)
-            return None
+        value, _reachable = self.resolve_with_status(tenant, app_id)
+        return value or None
 
 
 _default_provider: SecretsProvider = KeychainSecretsProvider()
@@ -162,30 +171,10 @@ def probe_provider(
 
     Never raises, and never returns the secret — only whether one is there.
     """
-    active = provider if provider is not None else default_provider()
-    label = provider_label(active)
-    if not (tenant and app_id):
-        # resolve_secret short-circuits on an empty key, so the provider was
-        # not consulted; that is not evidence about the store either way.
-        return False, False, label
-    if isinstance(active, KeychainSecretsProvider):
-        found, reachable = active.probe(tenant, app_id)
-        return found, reachable, label
-    try:
-        found = active.resolve(tenant, app_id)
-    except Exception:
-        logger.warning("secrets provider %r raised while probing", label)
-        return False, False, label
-    if found is None:
-        return False, True, label
-    if not isinstance(found, str):
-        logger.warning(
-            "secrets provider %r returned a %s while probing, not a str",
-            label,
-            type(found).__name__,
-        )
-        return False, False, label
-    return bool(found), True, label
+    state = resolve_secret_state(
+        tenant, app_id, existing="", provider=provider
+    )
+    return bool(state.value), state.reachable, state.provider
 
 
 def provider_label(provider: object | None = None) -> str:
@@ -218,32 +207,36 @@ def provider_label(provider: object | None = None) -> str:
         return "unknown-provider"
 
 
-def resolve_secret(
+def resolve_secret_state(
     tenant: str,
     app_id: str,
     *,
     existing: str | None,
     provider: SecretsProvider | None = None,
-) -> str:
-    """Return ``existing`` if it holds a value, else ask the provider.
+) -> SecretResolution:
+    """Resolve a value and reachability state with one provider lookup.
 
-    ``existing`` is whatever the call site already resolved from its
-    plaintext sources — it always wins (see the module docstring). Returns
-    ``""`` when neither tier has the secret, matching the empty-string
-    convention the call sites already use for "not configured".
-
-    Never raises: a provider that misbehaves must not take down a runtime
-    credential read, so a failing third-party implementation degrades to
-    the plaintext tier. That is a deliberate boundary around *pluggable*
-    code, not blanket exception-swallowing — the failure is logged at
-    warning level (without the secret) so it stays visible.
+    The existing plaintext source still wins. A provider miss is reachable;
+    an exception, unusable key, or invalid return type is not. The returned
+    object keeps diagnostics tied to the exact lookup that produced the
+    value, avoiding contradictory follow-up probes against a changing store.
     """
     if existing:
-        return existing
-    if not (tenant and app_id):
-        return ""
+        return SecretResolution(existing, True, "unconsulted")
     active = provider if provider is not None else default_provider()
     label = provider_label(active)
+    if not (tenant and app_id):
+        return SecretResolution("", False, label)
+    # The shipped resolve() delegates to resolve_with_status(), including for
+    # subclasses that inherit it. A subclass may legitimately override the
+    # documented resolve() seam; routing around an actual override would
+    # silently lose its secret and misclassify the store.
+    if (
+        isinstance(active, KeychainSecretsProvider)
+        and type(active).resolve is KeychainSecretsProvider.resolve
+    ):
+        value, reachable = active.resolve_with_status(tenant, app_id)
+        return SecretResolution(value, reachable, label)
     try:
         found = active.resolve(tenant, app_id)
     except Exception:
@@ -252,17 +245,32 @@ def resolve_secret(
             "falling back to the plaintext source",
             label,
         )
-        return ""
+        return SecretResolution("", False, label)
     if found is None:
-        return ""
+        # A KeychainSecretsProvider override has only the legacy Optional[str]
+        # result, whose None collapses empty and unreachable. Treat that
+        # ambiguity conservatively so a delegating/instrumentation override
+        # cannot re-enable credential-rotation advice for a locked store.
+        reachable = not isinstance(active, KeychainSecretsProvider)
+        return SecretResolution("", reachable, label)
     if not isinstance(found, str):
-        # Belt-and-braces at the pluggable boundary: a third-party provider
-        # returning bytes/int would otherwise be carried into an OAuth POST
-        # body as-is. Refuse rather than guess an encoding.
         logger.warning(
             "secrets provider %r returned a %s, not a str; ignoring it",
             label,
             type(found).__name__,
         )
-        return ""
-    return found
+        return SecretResolution("", False, label)
+    return SecretResolution(found, True, label)
+
+
+def resolve_secret(
+    tenant: str,
+    app_id: str,
+    *,
+    existing: str | None,
+    provider: SecretsProvider | None = None,
+) -> str:
+    """Return the value from :func:`resolve_secret_state`."""
+    return resolve_secret_state(
+        tenant, app_id, existing=existing, provider=provider
+    ).value
