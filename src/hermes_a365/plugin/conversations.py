@@ -476,16 +476,20 @@ class ConversationRegistry:
             raw = path.read_text()
         except FileNotFoundError:
             return cls()
-        except OSError as e:
-            logger.warning("agent365 conversations: read failed for %s: %s", path, e)
+        except OSError:
+            logger.warning(
+                "agent365 conversations: registry read failed; starting empty"
+            )
             return cls()
         try:
             payload = json.loads(raw)
-        except (json.JSONDecodeError, RecursionError) as e:
+        except (json.JSONDecodeError, RecursionError):
             # RecursionError: a corrupted / hand-edited file nested past the
             # interpreter limit (#105/M11 review). Treat as unparseable — an
             # empty registry beats crashing adapter construction.
-            logger.warning("agent365 conversations: json parse failed for %s: %s", path, e)
+            logger.warning(
+                "agent365 conversations: registry JSON is invalid; starting empty"
+            )
             return cls()
         if not isinstance(payload, dict):
             return cls()
