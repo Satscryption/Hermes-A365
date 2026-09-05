@@ -4481,13 +4481,46 @@ class TestConversationRegistry:
         reg = ConversationRegistry.load(tmp_path / "nope.json")
         assert len(reg) == 0
 
-    def test_load_unparseable_returns_empty(self, tmp_path: Path) -> None:
+    def test_load_read_failure_does_not_log_path_or_exception(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
         from hermes_a365.plugin.conversations import ConversationRegistry
 
-        path = tmp_path / "convs.json"
-        path.write_text("not json {{{")
+        path = tmp_path / "sensitive-profile-name.json"
+
+        def _fail_read(_path: Path) -> str:
+            raise OSError("sensitive-read-error")
+
+        monkeypatch.setattr(Path, "read_text", _fail_read)
+        caplog.set_level("WARNING")
+
         reg = ConversationRegistry.load(path)
+
         assert len(reg) == 0
+        assert "registry read failed; starting empty" in caplog.text
+        assert "sensitive-profile-name" not in caplog.text
+        assert "sensitive-read-error" not in caplog.text
+
+    def test_load_unparseable_returns_empty_without_logging_file_data(
+        self,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        from hermes_a365.plugin.conversations import ConversationRegistry
+
+        path = tmp_path / "sensitive-profile-name.json"
+        path.write_text("sensitive-file-content {{{")
+        caplog.set_level("WARNING")
+
+        reg = ConversationRegistry.load(path)
+
+        assert len(reg) == 0
+        assert "registry JSON is invalid; starting empty" in caplog.text
+        assert "sensitive-profile-name" not in caplog.text
+        assert "sensitive-file-content" not in caplog.text
 
     def test_save_and_load_round_trip(self, tmp_path: Path) -> None:
         from hermes_a365.plugin.conversations import (
