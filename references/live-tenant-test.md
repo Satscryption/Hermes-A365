@@ -596,26 +596,48 @@ Prerequisites:
   for non-walkthrough deployments. The skill is tunnel-agnostic;
   `update-endpoint --apply` takes whatever URL you produce.
 
-Stand up three processes (substitute your tunnel/proxy of choice
-for the `cloudflared` line if you're not following the walkthrough
-literally):
+Start the responder and bridge first, in separate terminals. Confirm both
+ports are free before starting; if either belongs to another process, stop
+and choose an isolated configuration. Do not stop an unrelated listener.
+Substitute your tunnel/proxy of choice for the `cloudflared` line.
 
 ```bash
-# 1. Tunnel — exposes the bridge port to A365's BF infra.
-#    Quick tunnel (no account / no setup) shown here. For a
-#    stable URL or production use, see references/exposing-the-bot-endpoint.md.
-cloudflared tunnel --url http://localhost:3978 &
-# Take the trycloudflare.com URL it prints.
+# Preflight: neither command should list an existing listener.
+lsof -nP -iTCP:9090 -sTCP:LISTEN
+lsof -nP -iTCP:3978 -sTCP:LISTEN
+```
 
-# 2. Reference responder.
+```bash
+# Terminal 1: reference responder, running in the foreground.
 python -m hermes_a365.hermes_responder serve \
-    --port 9090 --mode greeting --slug inbox-helper &
+    --port 9090 --mode greeting --slug inbox-helper
+```
 
-# 3. Bridge.
+```bash
+# Terminal 2: bridge, running in the foreground.
 HERMES_BRIDGE_WEBHOOK=http://127.0.0.1:9090/respond \
     hermes-a365 activity-bridge serve \
-        --slug inbox-helper --port 3978 &
+        --slug inbox-helper --port 3978
 ```
+
+In a third terminal, inspect the listener PID and confirm it belongs to the
+bridge just started. A healthy response alone does not establish ownership.
+If startup failed or ownership differs, do not start the tunnel.
+
+```bash
+lsof -nP -iTCP:3978 -sTCP:LISTEN
+curl --fail --silent --show-error http://127.0.0.1:3978/healthz
+```
+
+Only after those checks succeed, start the tunnel in the third terminal:
+
+```bash
+cloudflared tunnel --url http://127.0.0.1:3978
+# Take the trycloudflare.com URL it prints.
+```
+
+Do not launch the bridge and tunnel concurrently. For stable URLs or
+production deployment, see [endpoint exposure](exposing-the-bot-endpoint.md).
 
 Send a test message in the Teams 1:1 chat with the agent.
 
