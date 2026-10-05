@@ -225,6 +225,7 @@ dependencies = [
 
 [package.optional-dependencies]
 bridge = [
+    { name = "anyio" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -234,6 +235,7 @@ bridge = [
     { name = "uvicorn", extra = ["standard"] },
 ]
 dev = [
+    { name = "anyio" },
     { name = "cryptography" },
     { name = "fastapi" },
     { name = "httpx" },
@@ -249,6 +251,8 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "anyio", marker = "extra == 'bridge'", specifier = ">=4.14.2" },
+    { name = "anyio", marker = "extra == 'dev'", specifier = ">=4.14.2" },
     { name = "cryptography", marker = "extra == 'bridge'", specifier = ">=50.0.0" },
     { name = "cryptography", marker = "extra == 'dev'", specifier = ">=50.0.0" },
     { name = "fastapi", marker = "extra == 'bridge'", specifier = ">=0.141.1" },
@@ -258,8 +262,8 @@ requires-dist = [
     { name = "idna", marker = "extra == 'bridge'", specifier = ">=3.15" },
     { name = "idna", marker = "extra == 'dev'", specifier = ">=3.15" },
     { name = "jinja2", specifier = ">=3.1" },
-    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'bridge'", specifier = ">=2.13.0" },
-    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'dev'", specifier = ">=2.13.0" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'bridge'", specifier = ">=2.15.0" },
+    { name = "pyjwt", extras = ["crypto"], marker = "extra == 'dev'", specifier = ">=2.15.0" },
     { name = "pytest", marker = "extra == 'dev'", specifier = ">=8.0" },
     { name = "pytest-asyncio", marker = "extra == 'dev'", specifier = ">=0.24" },
     { name = "pytest-randomly", marker = "extra == 'dev'", specifier = ">=3.15" },

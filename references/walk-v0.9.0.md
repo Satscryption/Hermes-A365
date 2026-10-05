@@ -9,15 +9,20 @@ its dated commands against the current CLI before execution.
 
 ## Current checkpoint
 
-- Inspected source: `0f566cb7ef3134ece5dec2faee387e19c302f24f` on `main`.
+- Initial preflight source: `0f566cb7ef3134ece5dec2faee387e19c302f24f`.
+  Dependency PRs #145 and #146 are now merged on `main` at
+  `d6a5294f33dfc92c087344d9b7986219d3c5f27c` and integrated into this branch.
 - PR #144 is merged. CodeQL and secret scanning report zero open alerts.
 - Prerequisites #19, #100, #118, #121 and #125 are closed. #102 and #105
   remain open; their remaining live acceptance must be reconciled here.
   #107 explicitly requires the positive and negative Entra exchange below.
-- State: preflight complete; live candidate admission blocked by dependency
-  security findings. No live acceptance row is marked passed.
+- State: dependency alerts resolved on main; published dependency floors and
+  startup-order remediation verified on this branch, pending PR integration.
+  Freeze a new merged candidate before live execution. No live acceptance
+  row is marked passed.
 - User requested starting #123. Preparation, readback and local checks have
-  begun. Dependency-PR merge approval is pending. No release publication,
+  begun. The user approved dependency remediation and merging #145/#146;
+  both merges are complete. No release publication,
   issue closure, cloud provisioning or destructive operation has occurred.
 - Local gateway port 3978 had no listener at preflight. This is a snapshot,
   not permission to start a tunnel later without checking again.
@@ -72,25 +77,43 @@ uv run --frozen pytest tests/test_cleanup.py tests/test_bot_service.py \
 The secret-store tests use mocks and do not establish real credential-store
 or process-restart evidence. Total for these two disjoint selections: 322 tests.
 
-## Open findings
+## Findings and remediation
 
-1. Fifteen open Dependabot alerts affect the current lockfile: AnyIO
-   alerts 16-17 and PyJWT alerts 18-30. Existing PRs
+1. Initial preflight found fifteen Dependabot alerts: AnyIO
+   alerts 16-17 and PyJWT alerts 18-30. PRs
    [#145](https://github.com/Satscryption/Hermes-A365/pull/145) and
    [#146](https://github.com/Satscryption/Hermes-A365/pull/146) update to
-   AnyIO 4.14.2 and PyJWT 2.15.0. Both modify only `uv.lock`, have passing
-   test and dependency-review jobs, and are mergeable at preflight.
-   Their CodeQL check is neutral, not a successful new source scan.
-   The proposed versions are outside every returned vulnerable range.
-   Alert 30 has no first-patched version in its metadata, so confirm the
-   alert's actual post-merge state rather than claiming automatic closure.
-2. Published dependency requirements still allow PyJWT 2.13.0, and do not
-   impose an AnyIO security floor. Consumers do not use this project's
-   lockfile when installing its wheel. Raise the bridge/dev requirements
-   to the patched floors and verify package metadata as part of remediation.
-3. The older tenant runbook starts a tunnel before the bridge in its example
-   near section 6. For this walk, require the port-ownership and healthy
-   gateway checks below before any tunnel starts.
+   AnyIO 4.14.2 and PyJWT 2.15.0. Both merged with passing test and
+   dependency-review jobs. Their PR CodeQL check was neutral, not a
+   successful new source scan. A subsequent GitHub API readback returned
+   zero open Dependabot alerts, including resolution of alert 30 whose
+   advisory metadata omitted a first-patched version.
+2. Published requirements previously allowed PyJWT 2.13.0 and lacked an
+   AnyIO floor. This branch requires `anyio>=4.14.2` and
+   `pyjwt[crypto]>=2.15.0` independently in both `bridge` and `dev` extras,
+   with regenerated lock metadata. Wheel and sdist metadata enforce both
+   floors; base requirements, the crypto extra and Python >=3.11 are
+   preserved. The change needs merge and a future release to protect new
+   public installations; it cannot update already-installed environments.
+3. The tenant runbook previously started its tunnel before the bridge in
+   section 9c. This branch requires free-port checks, foreground responder
+   and bridge startup, listener-ownership verification and `/healthz`
+   success before starting the tunnel. No tunnel was launched for validation.
+
+Remediation verification on the branch integrating the merged dependencies:
+
+- `uv lock`: no resolved package-version changes beyond the already merged
+  dependency PRs; only project dependency metadata changed.
+- `uv build`: wheel successfully built from the source distribution.
+- Structured inspection of wheel `METADATA` and sdist `PKG-INFO`: both
+  extras exclude AnyIO 4.13.0/4.14.1 and PyJWT 2.13.0/2.14.0, and admit
+  AnyIO 4.14.2/PyJWT 2.15.0.
+- Offline wheel-only `uv pip compile --python-version 3.11`, independent of
+  this repository's lock: both extras resolve with the patched pair;
+  pinning either AnyIO 4.14.1 or PyJWT 2.14.0 fails with a dependency
+  conflict for each extra (four negative controls).
+- `uv run --locked --all-extras pytest`: 1,645 passed, five existing warnings.
+- Ruff: all checks passed.
 
 These are release-preflight findings, not a claim that all upstream
 advisories are exploitable in Hermes. JWT verification pins RS256, the
@@ -108,7 +131,7 @@ Record expected/observed results and sanitized evidence for each row.
 
 | Row | Required observation | State |
 |---|---|---|
-| 1a | Security controls match #125 and every active alert has a supported disposition | Blocked: dependency findings above |
+| 1a | Security controls match #125 and every active alert has a supported disposition | Controls verified; zero open dependency alerts; package-floor PR integration pending |
 | 1b | Publish approval/rejection evidence remains applicable; rejection creates no package or release | Prior evidence carried forward after workflow/configuration comparison |
 | 2a | Copilot Chat receives two coalesced segments promptly, once, in order | Not run |
 | 2b | Uninstall/eviction clears active stream and coalescing state; no delayed doomed POST | Not run |
