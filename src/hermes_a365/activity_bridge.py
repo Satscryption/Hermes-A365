@@ -2945,12 +2945,20 @@ async def send_reply(
         bf_cache=bf_cache,
         validated_path=validated_path,
     )
-    response = await client.post(
-        url,
-        json=reply,
-        headers={"Authorization": f"Bearer {token}"},
-        timeout=15.0,
-    )
+    try:
+        response = await client.post(
+            url,
+            json=reply,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=15.0,
+        )
+    except Exception as exc:
+        # Only this POST can have stored the activity. A ReadTimeout or
+        # WriteTimeout from acquire_reply_token (above) is still a miss
+        # and must propagate unchanged so the caller can retry.
+        if type(exc).__name__ in {"ReadTimeout", "WriteTimeout"}:
+            raise RuntimeError("timeout after the request was sent") from exc
+        raise
     status_code = int(getattr(response, "status_code", 0) or 0)
     if status_code < 200 or status_code >= 300:
         raise ReplyPostError(
