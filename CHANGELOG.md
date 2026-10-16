@@ -344,68 +344,16 @@ this heading is dated at release.
 
 ### Reliability (#105)
 
-- **Copilot Chat one-turn replies flush when the turn ends (#123 live walk).**
-  Non-personal chats (Copilot Chat arrives as `groupChat`) buffer a
-  coalesced reply until `edit_message(finalize=True)`. A plain final
-  `send(reply_to=...)` never sends that signal, so the reply waited on the
-  130s stale-buffer watchdog. `on_processing_complete` now finalizes the
-  chat's pending coalesced replies at turn end. While a buffer is still
-  open, `send` suppresses an unscoped send only when it belongs to that
-  same turn — a later or earlier turn is delivered — and a suppressed send
-  is a failure, so dropped text is not reported as success. Hermes
-  operational notices (the "No home channel… `/sethome`" prompt) default
-  to `config.extra["notice_delivery"] = "private"`. `send_private_notice`
-  withholds them on non-personal chats (INFO; success so the gateway does
-  not fall back to a public post) and sends them normally in personal chats.
-- **Copilot Chat replies no longer die inside a cancelled stream send (#123).**
-  On non-personal chats Hermes cancels the stream-consumer task at turn
-  end while its post-tool `send` is still awaiting the Bot Framework POST.
-  `_await_outbound` raises `outbound operation cancelled`, and Hermes
-  treats that text as already streamed, so the rest of the answer is lost.
-  A live non-personal turn (cached `conversationType` other than
-  `personal`, and an inbound seen this gateway lifetime) now opens
-  `_turn_buffers[chat_id]` in `on_processing_start`, holding a copy of the
-  inbound and its validated path. `send` appends a segment and returns
-  without a network await (streaming cursor stripped, a repeat of the last
-  segment deduped, `MAX_MESSAGE_LENGTH` enforced). `edit_message` on
-  `turnbuf:<n>` replaces that segment. `on_processing_complete` posts one
-  merged reply — segments joined by a blank line, plus the opt-in handoff
-  link — via `_send_reply_activity`, then runs the existing coalesced
-  flush. The buffer is cleared on disconnect and on chat eviction.
-  Personal chats are not buffered. A segment that is only an exact
-  Hermes tool-progress line (``💻 Running date``, registered emoji plus
-  verb) is left out of that merged reply. A one-line answer that merely
-  shares the verb is kept. A nested ``on_processing_start`` appends a
-  follow-up turn with its own inbound snapshot. The nested complete
-  posts only that follow-up; the outer turn's segments and ``turnbuf:``
-  ids stay until the outer stream has finished, and a send is attributed
-  by its ``reply_to`` activity. Each chunk is posted once. On failure
-  the unsent text stays for the next turn-end flush. Oversize joins are
-  split. There is no immediate retry and no idle watchdog, so a timeout
-  cannot fan out into a second bubble while the turn is still live.
-  Walk row 2a passed with typing suppressed: the reply rendered in
-  about 16s.
-- **Copilot turn-end cleanup no longer hangs on a swallowed typing cancel (F8).**
-  `Agent365Adapter._await_outbound` turned every `CancelledError` into
-  `RuntimeError("agent365 outbound operation cancelled")`. Hermes cancels
-  its progress task at turn end (`_run_agent_cleanup_turn_tasks` →
-  `send_progress_messages` → `send_typing`). `send_typing` caught that
-  `RuntimeError`, the progress loop retried forever, cleanup waited, and
-  `on_processing_complete` never ran. A caller cancellation now propagates.
-  The `RuntimeError` conversion remains only while the adapter is tearing
-  down (`_disconnecting`, or the chat is in `_retiring_chats` /
-  `_registry_evicting_chats`). That teardown case is a debug log. Every
-  other `send_typing` failure stays a warning. PR #153 F6 only downgrades
-  the cancellation log; that log was this hang's symptom, and a log-level
-  change must not hide a real typing failure.
-- **Copilot Chat typing is limited to personal chats.** After caller
-  cancellation let typing activities reach Copilot, the merged reply
-  posted (about 10s) but the client never rendered it and timed out at
-  45s. `send_typing` is now a no-op unless the cached `conversationType`
-  is `personal`. Teams 1:1 chats still get the indicator. With typing
-  suppressed, walk row 2a rendered in about 16s (3 segments, 166
-  characters, one activity). Turns longer than about 45s still need the
-  keep-alive in #155.
+- **Copilot Chat typing is limited to personal chats.** Copilot Chat
+  arrives as `groupChat`. A typing activity is accepted, but the reply
+  that follows is never rendered and the client times out at 45s.
+  `send_typing` is a no-op unless the cached `conversationType` is
+  exactly `personal`. Teams 1:1 chats still get the indicator. With
+  typing suppressed, live walk row 2a rendered the reply in about 16s
+  (3 segments, 166 characters, one activity). The per-turn buffer,
+  flush, segment rework, and progress-line filter are not in this
+  change. That buffering and retry work moves to a follow-up after
+  0.9.0.
 - **H4 — sequential coalesced reply segments are no longer swallowed.**
   Non-personal chats now assign a fresh synthetic message id to every newly
   opened coalesced segment. Multiple segments for the same inbound activity

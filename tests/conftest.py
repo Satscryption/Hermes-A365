@@ -22,7 +22,7 @@ def pytest_addoption(parser):  # type: ignore[no-untyped-def]
 
 @pytest.fixture(autouse=True)
 def _isolate_hermes_home(tmp_path_factory, monkeypatch):  # type: ignore[no-untyped-def]
-    """Give every test a fresh ``$HOME`` / ``$HERMES_HOME`` and cwd (#118).
+    """Give every test a fresh, empty ``$HOME`` / ``$HERMES_HOME`` (#118).
 
     Many adapter tests build ``Agent365Adapter`` with the *default*
     conversations path, which resolves to
@@ -32,22 +32,12 @@ def _isolate_hermes_home(tmp_path_factory, monkeypatch):  # type: ignore[no-unty
     run (``pytest-randomly``) makes registry-count assertions like
     ``TestPruneConversations`` order-dependent and flaky. A per-test tmp
     home makes every test hermetic and stops the suite touching the real
-    home dir, including the operator's ``~/.hermes/.env``.
-
-    The working directory is isolated for the same reason. Status, doctor,
-    verify, and the adapter's generated-config default read
-    ``./a365.bot-service.config.json`` and ``./a365.generated.config.json``.
-    A checkout that contains those files (a live-walk machine) would
-    otherwise change ``tests/test_status.py::test_agent_scope_adds_activity_bridge``
-    from skipped Path B to a real sidecar probe. Tests that set
-    ``HOME``/``HERMES_HOME`` or ``chdir`` themselves still win (autouse
-    runs first).
+    home dir. Tests that set ``HOME``/``HERMES_HOME`` themselves, or pass
+    an explicit path, still win (autouse runs first).
     """
     home = tmp_path_factory.mktemp("home")
-    work = tmp_path_factory.mktemp("cwd")
     monkeypatch.setenv("HOME", str(home))
     monkeypatch.setenv("HERMES_HOME", str(home / ".hermes"))
-    monkeypatch.chdir(work)
 
 
 @pytest.fixture(autouse=True)
