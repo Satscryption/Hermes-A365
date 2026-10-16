@@ -66,6 +66,7 @@ from hermes_a365.activity_bridge import (
     load_generated_config,
     main,
     make_app,
+    parse_agent_identity_ids,
     peek_unverified_iss,
     probe_bf_secret,
     probe_generated_config,
@@ -1111,6 +1112,7 @@ def _agentic_token_handler(
             {
                 "url": str(req.url),
                 "grant_type": params.get("grant_type"),
+                "client_id": params.get("client_id"),
                 "scope": params.get("scope"),
                 "fmi_path": params.get("fmi_path"),
                 "user_id": params.get("user_id"),
@@ -1275,16 +1277,17 @@ class TestAcquireOutboundToken:
         assert len(capture) == 3
 
     async def test_h1_rejects_foreign_agent_app_id(self) -> None:
-        # H1 (#100) — recipient.agenticAppId is an unauthenticated body field; a
-        # value differing from the configured blueprint must be refused BEFORE any
-        # FMI mint, never trusted to name the identity we mint under.
+        # H1 (#100) — recipient.agenticAppId is an unauthenticated body field.
+        # With an empty A365_AGENT_IDENTITY_IDS allowlist, a value other than
+        # the configured blueprint is refused BEFORE any FMI mint. The body
+        # must not name the identity we mint under.
         a = _inbound_message_activity()
         a["recipient"]["agenticAppId"] = "some-other-tenant-app"
         capture: list[dict[str, Any]] = []
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
         ) as client:
-            with pytest.raises(RuntimeError, match="does not match the configured"):
+            with pytest.raises(RuntimeError, match="not an allowlisted agent identity"):
                 await acquire_outbound_token(
                     client=client,
                     cfg=_cfg(),
@@ -1293,6 +1296,80 @@ class TestAcquireOutboundToken:
                     user_cache=_UserTokenCache(),
                 )
         # Refused before any token POST — no partial mint.
+        assert capture == []
+
+    async def test_allowlisted_instance_mints_under_that_identity(self) -> None:
+        # Teams Create-instance agents: agenticAppId is the instance
+        # agentIdentity, agenticAppBlueprintId is the configured blueprint.
+        # T1 still authenticates as the blueprint and sets fmi_path to the
+        # allowlisted instance. T2 and user_fic use that instance as client_id.
+        a = _inbound_message_activity()
+        a["recipient"]["agenticAppId"] = "INSTANCE-APP-ID"
+        a["recipient"]["agenticAppBlueprintId"] = "Blueprint-App-Id"
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            token = await acquire_outbound_token(
+                client=client,
+                cfg=_cfg(agent_identity_ids=("instance-app-id",)),
+                activity=a,
+                fmi_cache=_FmiCache(),
+                user_cache=_UserTokenCache(),
+            )
+        assert token == "FINAL"
+        assert [c["grant_type"] for c in capture] == [
+            "client_credentials",
+            "client_credentials",
+            "user_fic",
+        ]
+        assert capture[0]["client_id"] == "blueprint-app-id"
+        assert capture[0]["fmi_path"] == "INSTANCE-APP-ID"
+        assert capture[1]["client_id"] == "INSTANCE-APP-ID"
+        assert capture[2]["client_id"] == "INSTANCE-APP-ID"
+        assert capture[2]["user_id"] == "agentic-user-1"
+
+    async def test_matching_body_blueprint_does_not_authorize_unlisted_instance(
+        self,
+    ) -> None:
+        # The body blueprint id is a check, not a credential. A matching
+        # agenticAppBlueprintId must not admit an instance that is absent
+        # from the operator allowlist.
+        a = _inbound_message_activity()
+        a["recipient"]["agenticAppId"] = "unlisted-instance"
+        a["recipient"]["agenticAppBlueprintId"] = "blueprint-app-id"
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            with pytest.raises(RuntimeError, match="not an allowlisted agent identity"):
+                await acquire_outbound_token(
+                    client=client,
+                    cfg=_cfg(agent_identity_ids=("some-other-instance",)),
+                    activity=a,
+                    fmi_cache=_FmiCache(),
+                    user_cache=_UserTokenCache(),
+                )
+        assert capture == []
+
+    async def test_allowlisted_instance_with_foreign_blueprint_refused(self) -> None:
+        a = _inbound_message_activity()
+        a["recipient"]["agenticAppId"] = "instance-app-id"
+        a["recipient"]["agenticAppBlueprintId"] = "other-blueprint"
+        capture: list[dict[str, Any]] = []
+        async with httpx.AsyncClient(
+            transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
+        ) as client:
+            with pytest.raises(
+                RuntimeError, match="agenticAppBlueprintId does not match"
+            ):
+                await acquire_outbound_token(
+                    client=client,
+                    cfg=_cfg(agent_identity_ids=("instance-app-id",)),
+                    activity=a,
+                    fmi_cache=_FmiCache(),
+                    user_cache=_UserTokenCache(),
+                )
         assert capture == []
 
     async def test_h1_rejects_foreign_tenant(self) -> None:
@@ -1858,7 +1935,11 @@ class TestAcquireReplyTokenDispatcher:
 # ---------------------------------------------------------------------------
 
 
-def _cfg(webhook_url: str = "https://hook.test/responder") -> BridgeConfig:
+def _cfg(
+    webhook_url: str = "https://hook.test/responder",
+    *,
+    agent_identity_ids: tuple[str, ...] = (),
+) -> BridgeConfig:
     return BridgeConfig(
         slug="inbox-helper",
         tenant_id="tenant-1",
@@ -1868,6 +1949,7 @@ def _cfg(webhook_url: str = "https://hook.test/responder") -> BridgeConfig:
         log_path=Path("/tmp/x.log"),
         pid_path=Path("/tmp/x.pid"),
         allow_all_users=True,
+        agent_identity_ids=agent_identity_ids,
     )
 
 
@@ -2103,6 +2185,7 @@ class TestLoadBridgeConfig:
         # #36 defaults — empty when not set in agent .env.
         assert cfg.bf_app_id == ""
         assert cfg.bf_client_secret == ""
+        assert cfg.agent_identity_ids == ()
 
     def test_path_b_identity_loaded_from_agent_env(
         self, tmp_path: Path
@@ -2136,6 +2219,22 @@ class TestLoadBridgeConfig:
         # Blueprint creds untouched — both identities coexist.
         assert cfg.blueprint_client_id == "blueprint-app-id"
         assert cfg.blueprint_client_secret == "sek"
+
+    def test_agent_identity_allowlist_loaded_from_agent_env(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_env(
+            tmp_path,
+            A365_AGENT_IDENTITY_IDS="Inst-1, inst-1, inst-2",
+        )
+        path = _seed_generated_config(tmp_path)
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.agent_identity_ids == ("inst-1", "inst-2")
 
     def test_falls_back_to_env_var_when_no_webhook_arg(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
@@ -2236,6 +2335,24 @@ class TestLoadBridgeConfig:
 
         with pytest.raises(BridgeConfigError, match="generated config"):
             load_generated_config(path)
+
+
+class TestParseAgentIdentityIds:
+    def test_blank_is_empty(self) -> None:
+        assert parse_agent_identity_ids(None) == ()
+        assert parse_agent_identity_ids("") == ()
+        assert parse_agent_identity_ids("  ,  , ") == ()
+
+    def test_splits_strips_dedupes_and_casefolds(self) -> None:
+        assert parse_agent_identity_ids(" AbC , def,abc ") == ("abc", "def")
+
+    def test_list_form_splits_embedded_commas(self) -> None:
+        assert parse_agent_identity_ids(["One", "two, one"]) == ("one", "two")
+
+    def test_scalar_misconfig_is_empty(self) -> None:
+        assert parse_agent_identity_ids(True) == ()
+        assert parse_agent_identity_ids(5) == ()
+        assert parse_agent_identity_ids({"app": "x"}) == ()
 
 
 # ---------------------------------------------------------------------------

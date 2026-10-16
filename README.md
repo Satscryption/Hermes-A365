@@ -600,13 +600,17 @@ as `ok`.
 >
 > …paired with `A365_TENANT_ID`, `A365_APP_ID`, `A365_BLUEPRINT_CLIENT_SECRET`,
 > and either `A365_ALLOW_ALL_USERS=true` (testing) or
-> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Entries may be
+> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Allowlist
+> entries may be
 > AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
 > includes those aliases in the signed activity. Bot Framework `personal` /
 > `groupChat` / `channel` values
 > are normalized to Hermes `dm` / `group` / `channel`; JWT-authenticated
 > lifecycle/control activities are acknowledged without pretending their
-> Microsoft system identity is an end user.
+> Microsoft system identity is an end user. Teams Create-instance agents
+> also need `A365_AGENT_IDENTITY_IDS` (comma-separated Entra agentIdentity
+> app ids) or `extra.agent_identity_ids`; without it, outbound replies
+> under those instance ids are refused.
 
 ## Subcommand reference
 
