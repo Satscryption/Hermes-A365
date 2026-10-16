@@ -5810,10 +5810,10 @@ class TestEditMessage:
         a._seen_inbounds_this_lifetime.add("conv-G-buf")
         await a.on_processing_start(event)
         assert "conv-G-buf" in a._turn_buffers
-        stored = a._turn_buffers["conv-G-buf"]["inbound"]
+        stored = a._turn_buffers["conv-G-buf"]["turns"][0]["inbound"]
         assert stored is not inbound
         assert stored["id"] == "act-1"
-        assert a._turn_buffers["conv-G-buf"]["validated_path"] == "A"
+        assert a._turn_buffers["conv-G-buf"]["turns"][0]["validated_path"] == "A"
         # A later registry write must not retarget the buffered reply.
         inbound["id"] = "act-mutated"
 
@@ -6022,11 +6022,13 @@ class TestEditMessage:
         assert "conv-G-answer" not in a._turn_buffers
 
     @pytest.mark.asyncio
-    async def test_nested_processing_start_flushes_turns_in_order(
+    async def test_nested_complete_flushes_only_the_finished_turn(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A queued follow-up calls start+complete before the outer complete.
-        # The outer segments must survive that nested start and post first.
+        # A queued follow-up calls start+complete before the outer stream
+        # has finished. That complete posts only the follow-up, replyTo the
+        # follow-up activity. The outer turnbuf id stays editable, and a
+        # send that still names the outer activity stays on the outer turn.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-nest", activity_id="act-outer")
         inbound["conversation"]["conversationType"] = "groupChat"
@@ -6034,35 +6036,82 @@ class TestEditMessage:
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
-        event = _StubMessageEvent(
+        outer_event = _StubMessageEvent(
             text="first",
             source=_StubSessionSource(platform=None, chat_id="conv-G-nest"),
             message_id="act-outer",
         )
-        await a.on_processing_start(event)
+        await a.on_processing_start(outer_event)
         outer = await a.send(
-            chat_id="conv-G-nest", content="Outer reply", reply_to=None
+            chat_id="conv-G-nest", content="Outer draft", reply_to="act-outer"
         )
         assert outer.success is True
+        outer_id = str(outer.message_id)
         inbound["id"] = "act-followup"
-        await a.on_processing_start(event)
-        assert a._turn_buffers["conv-G-nest"]["inbound"]["id"] == "act-outer"
-        assert a._turn_buffers["conv-G-nest"]["depth"] == 2
-        assert [segment["text"] for segment in a._turn_buffers["conv-G-nest"]["segments"]] == [
-            "Outer reply"
-        ]
-        follow = await a.send(
-            chat_id="conv-G-nest", content="Follow-up reply", reply_to=None
+        follow_event = _StubMessageEvent(
+            text="second",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-nest"),
+            message_id="act-followup",
         )
+        await a.on_processing_start(follow_event)
+        turns = a._turn_buffers["conv-G-nest"]["turns"]
+        assert [turn["inbound"]["id"] for turn in turns] == [
+            "act-outer",
+            "act-followup",
+        ]
+        assert a._turn_buffers["conv-G-nest"]["depth"] == 2
+        outer_again = await a.send(
+            chat_id="conv-G-nest",
+            content="Outer still streaming",
+            reply_to="act-outer",
+        )
+        follow = await a.send(
+            chat_id="conv-G-nest",
+            content="Follow-up reply",
+            reply_to="act-followup",
+        )
+        follow_note = await a.send(
+            chat_id="conv-G-nest", content="Follow-up note", reply_to=None
+        )
+        assert outer_again.success is True
         assert follow.success is True
-        await a.on_processing_complete(event, outcome="success")
+        assert follow_note.success is True
+        by_turn = {"1": [], "2": []}
+        for segment in a._turn_buffers["conv-G-nest"]["segments"]:
+            by_turn[segment["turn"]].append(segment["text"])
+        assert by_turn == {
+            "1": ["Outer draft", "Outer still streaming"],
+            "2": ["Follow-up reply", "Follow-up note"],
+        }
+        await a.on_processing_complete(follow_event, outcome="success")
         texts = [
             call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list
         ]
-        assert texts == ["Outer reply", "Follow-up reply"]
-        assert send_reply_mock.await_args_list[0].kwargs["inbound"]["id"] == "act-outer"
-        assert "conv-G-nest" in a._turn_buffers
-        await a.on_processing_complete(event, outcome="success")
+        assert texts == ["Follow-up reply\n\nFollow-up note"]
+        assert send_reply_mock.await_args.kwargs["inbound"]["id"] == "act-followup"
+        assert a._turn_buffers["conv-G-nest"]["depth"] == 1
+        outer_segments = [
+            segment
+            for segment in a._turn_buffers["conv-G-nest"]["segments"]
+            if segment["turn"] == "1"
+        ]
+        assert [segment["id"] for segment in outer_segments] == [
+            outer_id,
+            str(outer_again.message_id),
+        ]
+        edited = await a.edit_message(
+            "conv-G-nest", outer_id, "Outer final", finalize=True
+        )
+        assert edited.success is True
+        await a.on_processing_complete(outer_event, outcome="success")
+        texts = [
+            call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list
+        ]
+        assert texts == [
+            "Follow-up reply\n\nFollow-up note",
+            "Outer final\n\nOuter still streaming",
+        ]
+        assert send_reply_mock.await_args_list[1].kwargs["inbound"]["id"] == "act-outer"
         assert send_reply_mock.await_count == 2
         assert "conv-G-nest" not in a._turn_buffers
 
@@ -6085,15 +6134,20 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await a.send(chat_id="conv-G-retry", content="Keep me", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == adapter_mod._TURN_BUFFER_POST_ATTEMPTS
+        # One attempt. A timeout can mean the activity was stored, so the
+        # flush does not post it again inside the same complete.
+        assert send_reply_mock.await_count == 1
         assert [segment["text"] for segment in a._turn_buffers["conv-G-retry"]["segments"]] == [
             "Keep me"
         ]
+        await asyncio.sleep(0)
+        assert send_reply_mock.await_count == 1
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
         await a.on_processing_complete(event, outcome="success")
         assert a._turn_buffers == {}
         posted = bridge.send_reply.await_args.kwargs["reply"]["text"]
         assert posted == "Keep me"
+        assert bridge.send_reply.await_count == 1
 
     @pytest.mark.asyncio
     async def test_turn_buffer_flush_cancel_keeps_text(
@@ -6164,12 +6218,13 @@ class TestEditMessage:
         assert "conv-G-split" not in a._turn_buffers
 
     @pytest.mark.asyncio
-    async def test_turn_buffer_watchdog_posts_stale_text(
+    async def test_open_turn_is_not_posted_before_complete(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_FLUSH_AFTER_SEC", 0.0)
+        # Nothing posts a live turn. The idle watchdog used to flush at
+        # depth > 0 and delete a turnbuf id the stream was still editing.
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-G-stale", activity_id="act-1")
+        inbound = _make_inbound(conv_id="conv-G-live", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         bridge = adapter_mod._import_bridge()
@@ -6177,21 +6232,73 @@ class TestEditMessage:
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
         event = _StubMessageEvent(
             text="hi",
-            source=_StubSessionSource(platform=None, chat_id="conv-G-stale"),
+            source=_StubSessionSource(platform=None, chat_id="conv-G-live"),
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        await a.send(chat_id="conv-G-stale", content="Posted by the watchdog", reply_to=None)
-
-        async def _posted() -> None:
-            while send_reply_mock.await_count == 0:
-                await asyncio.sleep(0)
-
-        await asyncio.wait_for(_posted(), timeout=1)
-        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Posted by the watchdog"
+        sent = await a.send(
+            chat_id="conv-G-live", content="Still streaming", reply_to="act-1"
+        )
+        assert sent.success is True
+        await asyncio.sleep(0)
+        assert send_reply_mock.await_count == 0
+        assert a._turn_buffers["conv-G-live"]["depth"] == 1
+        segment_id = str(sent.message_id)
+        assert [segment["id"] for segment in a._turn_buffers["conv-G-live"]["segments"]] == [
+            segment_id
+        ]
+        edited = await a.edit_message(
+            "conv-G-live", segment_id, "Still streaming, edited", finalize=False
+        )
+        assert edited.success is True
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 1
-        assert "conv-G-stale" not in a._turn_buffers
+        assert (
+            send_reply_mock.await_args.kwargs["reply"]["text"]
+            == "Still streaming, edited"
+        )
+        assert "conv-G-live" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_delivered_chunk_is_not_posted_again(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The first chunk of a split reply is removed only after its post
+        # returns success. A later flush retries the chunk that failed and
+        # does not send the delivered one again.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-once", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        parts = [char * 1500 for char in ("A", "B", "C")]
+        first = f"{parts[0]}\n\n{parts[1]}"
+        posted: list[str] = []
+
+        async def send_reply(**kwargs: Any) -> None:
+            text = kwargs["reply"]["text"]
+            posted.append(text)
+            if text == parts[2] and posted.count(parts[2]) == 1:
+                raise RuntimeError("timeout after the request was sent")
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-once"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        for part in parts:
+            result = await a.send(chat_id="conv-G-once", content=part, reply_to=None)
+            assert result.success is True
+        await a.on_processing_complete(event, outcome="success")
+        assert posted == [first, parts[2]]
+        assert [segment["text"] for segment in a._turn_buffers["conv-G-once"]["segments"]] == [
+            parts[2]
+        ]
+        await a.on_processing_complete(event, outcome="success")
+        assert posted == [first, parts[2], parts[2]]
+        assert "conv-G-once" not in a._turn_buffers
 
     @pytest.mark.asyncio
     async def test_personal_chat_is_not_turn_buffered(

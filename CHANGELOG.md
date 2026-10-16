@@ -375,11 +375,16 @@ this heading is dated at release.
   Personal chats are not buffered. A segment that is only an exact
   Hermes tool-progress line (``💻 Running date``, registered emoji plus
   verb) is left out of that merged reply. A one-line answer that merely
-  shares the verb is kept. A nested ``on_processing_start`` keeps the
-  open buffer and later flushes turns in order. The buffer stays until
-  each post succeeds; oversize joins are split; a failed post is retried
-  and a stale buffer is flushed again. Walk row 2a passed with typing
-  suppressed: the reply rendered in about 16s.
+  shares the verb is kept. A nested ``on_processing_start`` appends a
+  follow-up turn with its own inbound snapshot. The nested complete
+  posts only that follow-up; the outer turn's segments and ``turnbuf:``
+  ids stay until the outer stream has finished, and a send is attributed
+  by its ``reply_to`` activity. Each chunk is posted once. On failure
+  the unsent text stays for the next turn-end flush. Oversize joins are
+  split. There is no immediate retry and no idle watchdog, so a timeout
+  cannot fan out into a second bubble while the turn is still live.
+  Walk row 2a passed with typing suppressed: the reply rendered in
+  about 16s.
 - **Copilot turn-end cleanup no longer hangs on a swallowed typing cancel (F8).**
   `Agent365Adapter._await_outbound` turned every `CancelledError` into
   `RuntimeError("agent365 outbound operation cancelled")`. Hermes cancels

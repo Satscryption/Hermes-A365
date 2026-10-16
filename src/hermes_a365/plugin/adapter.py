@@ -748,11 +748,6 @@ _STREAMING_MIN_GAP_SEC = 1.5
 _STREAMING_FORCE_DROP_AFTER_SEC = 130.0
 _STREAMING_FINALIZE_MAX_FAILURES = 2
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
-# Same idle window as a coalesced reply. A turn buffer that still holds
-# text after a failed post, or that never received complete, is flushed
-# again instead of being dropped.
-_TURN_BUFFER_FLUSH_AFTER_SEC = _COALESCED_REPLY_FLUSH_AFTER_SEC
-_TURN_BUFFER_POST_ATTEMPTS = 3
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
 _MAX_COALESCED_REPLY_SURVIVORS = _MAX_COALESCED_REPLY_GENERATIONS * 3
@@ -1223,11 +1218,15 @@ class Agent365Adapter(BasePlatformAdapter):
         # ``on_processing_complete`` posts one merged reply on the session
         # task, which is not the cancelled consumer. Opened only for a
         # non-personal chat that has seen an inbound this lifetime.
-        # A nested ``on_processing_start`` (Hermes queued follow-up) bumps
-        # ``depth`` and ``turn_seq`` and appends; it does not replace the
-        # buffer. Segments stay until a post succeeds.
-        # ``{"inbound", "validated_path", "segments": [{"id", "text", "turn"}],
-        #   "depth", "turn_seq", "last_update_ts", "lock", "watchdog"}``.
+        # A nested ``on_processing_start`` (Hermes queued follow-up) appends
+        # another turn with its own inbound snapshot. ``on_processing_complete``
+        # closes and posts only that innermost turn. Outer segments and their
+        # ``turnbuf:`` ids stay while the outer turn is open. Each chunk is
+        # posted once; unsent text waits for the next complete. No idle
+        # watchdog and no immediate retry: a timeout may already have stored
+        # the activity.
+        # ``{"turns": [{"seq", "inbound", "validated_path", "activity_id",
+        #   "open"}], "segments": [{"id", "text", "turn"}], "depth", "lock"}``.
         self._turn_buffers: dict[str, dict[str, Any]] = {}
         self._turn_buffer_seq = 0
 
@@ -2915,10 +2914,6 @@ class Agent365Adapter(BasePlatformAdapter):
         for chat_id, tasks in self._inbound_tasks_by_chat.items():
             for task in tasks:
                 task_chats[task] = chat_id
-        for chat_id, buf in self._turn_buffers.items():
-            task = buf.get("watchdog")
-            if isinstance(task, asyncio.Task) and task is not current:
-                task_chats[task] = chat_id
         shutdown_tasks = [task for task in task_chats if task is not current]
         for task in shutdown_tasks:
             if task not in existing_survivors:
@@ -2986,7 +2981,6 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_targets.clear()
         self._coalesced_turn_target_order_by_chat.clear()
         self._coalesced_turn_target_count_by_chat.clear()
-        await self._cancel_turn_buffer_watchdogs()
         self._turn_buffers.clear()
         for stream_key in list(self._streams):
             message_id = stream_key[1]
@@ -3990,7 +3984,9 @@ class Agent365Adapter(BasePlatformAdapter):
         # is what Hermes cancels when it stops the stream consumer.
         if str(chat_id) in self._turn_buffers:
             self._conversations.mark_used(chat_id)
-            return self._append_turn_buffer_segment(str(chat_id), content)
+            return self._append_turn_buffer_segment(
+                str(chat_id), content, reply_to=reply_to
+            )
 
         turn_key: tuple[str, str] | None = None
         turn_validated_path: str | None = None
@@ -4245,8 +4241,8 @@ class Agent365Adapter(BasePlatformAdapter):
         sends stay on ``sendToConversation``).
 
         A queued follow-up calls start again before the outer complete.
-        That nested start keeps the open segments and starts a new turn
-        id; it does not replace the buffer.
+        That nested start keeps the outer turn's segments and snapshots
+        the follow-up's own inbound. It does not replace the buffer.
         """
         chat_id = self._chat_id_from_processing_event(event)
         if chat_id and chat_id in self._seen_inbounds_this_lifetime:
@@ -4254,91 +4250,88 @@ class Agent365Adapter(BasePlatformAdapter):
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
             if inbound and chat_type and chat_type != "personal":
-                self._open_or_nest_turn_buffer(chat_id, inbound)
+                activity_id = str(getattr(event, "message_id", "") or "")
+                self._open_or_nest_turn_buffer(
+                    chat_id, inbound, activity_id=activity_id
+                )
         parent = getattr(super(), "on_processing_start", None)
         if callable(parent):
             await parent(event)
 
-    def _open_or_nest_turn_buffer(self, chat_id: str, inbound: dict[str, Any]) -> None:
-        """Open a buffer, or nest another turn inside the one already open."""
-        now = asyncio.get_event_loop().time()
+    def _open_or_nest_turn_buffer(
+        self, chat_id: str, inbound: dict[str, Any], *, activity_id: str
+    ) -> None:
+        """Open a buffer, or append a turn inside the one already open."""
+        snapshot = copy.deepcopy(inbound)
+        if activity_id:
+            snapshot["id"] = activity_id
         buf = self._turn_buffers.get(chat_id)
-        if buf is not None:
-            buf["depth"] = int(buf.get("depth") or 1) + 1
-            buf["turn_seq"] = int(buf.get("turn_seq") or 1) + 1
-            buf["last_update_ts"] = now
-            self._ensure_turn_buffer_watchdog(chat_id)
-            return
-        self._turn_buffers[chat_id] = {
-            "inbound": copy.deepcopy(inbound),
+        seq = "1" if buf is None else str(len(buf.get("turns") or []) + 1)
+        turn = {
+            "seq": seq,
+            "inbound": snapshot,
             "validated_path": self._validated_path_for(chat_id),
-            "segments": [],
-            "depth": 1,
-            "turn_seq": 1,
-            "flush_failures": 0,
-            "last_update_ts": now,
-            "lock": asyncio.Lock(),
+            "activity_id": str(snapshot.get("id") or ""),
+            "open": True,
         }
-        self._ensure_turn_buffer_watchdog(chat_id)
+        if buf is None:
+            self._turn_buffers[chat_id] = {
+                "turns": [turn],
+                "segments": [],
+                "depth": 1,
+                "lock": asyncio.Lock(),
+            }
+            return
+        buf.setdefault("turns", []).append(turn)
+        buf["depth"] = sum(1 for item in buf["turns"] if item.get("open"))
 
-    def _ensure_turn_buffer_watchdog(self, chat_id: str) -> None:
+    def _close_innermost_turn(self, chat_id: str) -> None:
+        """Mark the newest open turn finished. Leave every outer turn open."""
         buf = self._turn_buffers.get(chat_id)
         if buf is None:
             return
-        task = buf.get("watchdog")
-        if isinstance(task, asyncio.Task) and not task.done():
-            return
-        buf["watchdog"] = asyncio.create_task(self._watch_turn_buffer(chat_id))
-
-    async def _cancel_turn_buffer_watchdogs(self) -> None:
-        current = asyncio.current_task()
-        tasks: list[asyncio.Task[Any]] = []
-        for buf in self._turn_buffers.values():
-            task = buf.get("watchdog")
-            if isinstance(task, asyncio.Task) and task is not current and not task.done():
-                task.cancel()
-                tasks.append(task)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
+        for turn in reversed(buf.get("turns") or []):
+            if turn.get("open"):
+                turn["open"] = False
+                break
+        buf["depth"] = sum(1 for turn in buf.get("turns") or [] if turn.get("open"))
 
     async def _drop_turn_buffer(self, chat_id: str) -> None:
-        buf = self._turn_buffers.get(str(chat_id))
-        if buf is None:
-            return
-        task = buf.get("watchdog")
-        current = asyncio.current_task()
         self._turn_buffers.pop(str(chat_id), None)
-        if isinstance(task, asyncio.Task) and task is not current and not task.done():
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await task
 
     async def on_processing_complete(self, event: Any, outcome: Any = None) -> None:
-        """Post this turn's merged non-personal reply, then flush leftovers.
+        """Post the turn that just finished, then flush any earlier failure.
 
         The merged post runs on the session task, after Hermes has
-        cancelled the stream consumer, so it is not the in-flight
+        cancelled that turn's stream consumer, so it is not the in-flight
         ``send()`` that used to die as ``outbound operation cancelled``.
-        A nested complete (queued follow-up) posts the turns finished so
-        far, oldest first, and leaves the outer buffer open. The outer
-        complete posts whatever is still buffered. Any coalesced buffer
-        still open is flushed afterwards.
+        A nested complete closes only the follow-up. The outer turn's
+        segments and ``turnbuf:`` ids stay until the outer complete, so
+        the outer stream can still edit them. Each post uses the inbound
+        snapshotted when that turn started. Any coalesced buffer still
+        open is flushed afterwards.
         """
         chat_id = self._chat_id_from_processing_event(event)
         if chat_id:
-            buf = self._turn_buffers.get(chat_id)
-            if buf is not None:
-                buf["depth"] = max(0, int(buf.get("depth") or 1) - 1)
+            self._close_innermost_turn(chat_id)
             await self._flush_turn_buffer(chat_id)
             await self._flush_pending_coalesced_replies(chat_id)
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
             await parent(event, outcome)
 
-    def _append_turn_buffer_segment(self, chat_id: str, content: str) -> SendResult:
-        """Append one local segment. No network, no await."""
+    def _append_turn_buffer_segment(
+        self, chat_id: str, content: str, *, reply_to: Any | None = None
+    ) -> SendResult:
+        """Append one local segment onto the turn it belongs to. No network."""
         buf = self._turn_buffers.get(chat_id)
         if buf is None:
+            return SendResult(
+                success=False,
+                error=f"agent365 send: no turn buffer for chat_id={chat_id!r}",
+            )
+        turn = self._turn_for_send(buf, reply_to)
+        if turn is None:
             return SendResult(
                 success=False,
                 error=f"agent365 send: no turn buffer for chat_id={chat_id!r}",
@@ -4353,19 +4346,48 @@ class Agent365Adapter(BasePlatformAdapter):
                 ),
             )
         segments: list[dict[str, str]] = buf["segments"]
-        if segments and segments[-1]["text"] == text:
-            return SendResult(success=True, message_id=segments[-1]["id"])
+        turn_seq = str(turn.get("seq") or "")
+        own = [segment for segment in segments if str(segment.get("turn") or "") == turn_seq]
+        if own and own[-1]["text"] == text:
+            return SendResult(success=True, message_id=own[-1]["id"])
         self._turn_buffer_seq += 1
         segment_id = f"turnbuf:{self._turn_buffer_seq}"
-        segments.append(
-            {
-                "id": segment_id,
-                "text": text,
-                "turn": str(buf.get("turn_seq") or 1),
-            }
-        )
-        buf["last_update_ts"] = asyncio.get_event_loop().time()
+        segments.append({"id": segment_id, "text": text, "turn": turn_seq})
         return SendResult(success=True, message_id=segment_id)
+
+    @staticmethod
+    def _turn_matches_reply(turn: dict[str, Any], token: str) -> bool:
+        if str(turn.get("activity_id") or "") == token:
+            return True
+        inbound = turn.get("inbound")
+        inbound = inbound if isinstance(inbound, dict) else {}
+        return str(inbound.get("id") or "") == token
+
+    def _turn_for_send(
+        self, buf: dict[str, Any], reply_to: Any | None
+    ) -> dict[str, Any] | None:
+        """Pick the turn a send belongs to.
+
+        A stream chunk carries ``reply_to`` equal to that turn's activity
+        id, including an outer stream that is still sending after a nested
+        start. An unscoped send (tool progress, commentary) belongs to the
+        innermost open turn.
+        """
+        turns: list[dict[str, Any]] = list(buf.get("turns") or [])
+        if not turns:
+            return None
+        token = "" if reply_to is None else str(reply_to)
+        if token:
+            for turn in turns:
+                if turn.get("open") and self._turn_matches_reply(turn, token):
+                    return turn
+            for turn in turns:
+                if self._turn_matches_reply(turn, token):
+                    return turn
+        for turn in reversed(turns):
+            if turn.get("open"):
+                return turn
+        return turns[-1]
 
     def _replace_turn_buffer_segment(
         self, chat_id: str, message_id: str, content: str
@@ -4387,7 +4409,6 @@ class Agent365Adapter(BasePlatformAdapter):
             for segment in own["segments"]:
                 if segment["id"] == message_id:
                     segment["text"] = text
-                    own["last_update_ts"] = asyncio.get_event_loop().time()
                     return SendResult(success=True, message_id=message_id)
         for other_id, buf in self._turn_buffers.items():
             if other_id == chat_id:
@@ -4443,80 +4464,21 @@ class Agent365Adapter(BasePlatformAdapter):
             return ""
         return f"\n\n[Continue in Teams]({link})"
 
-    async def _post_turn_buffer_text(
-        self,
-        *,
-        chat_id: str,
-        inbound: dict[str, Any],
-        content: str,
-        validated_path: str | None,
-    ) -> SendResult:
-        """POST one chunk. Retry a few times; leave the text buffered on failure."""
-        last = SendResult(success=False, error="agent365 turn buffer: no post attempted")
-        for attempt in range(1, _TURN_BUFFER_POST_ATTEMPTS + 1):
-            try:
-                last = await self._send_reply_activity(
-                    inbound=inbound,
-                    content=content,
-                    log_context="turn buffer",
-                    validated_path=validated_path,
-                )
-            except asyncio.CancelledError:
-                raise
-            if last.success:
-                return last
-            logger.warning(
-                "agent365 turn buffer flush failed: chat_id=%s attempt=%s/%s error=%s",
-                chat_id,
-                attempt,
-                _TURN_BUFFER_POST_ATTEMPTS,
-                last.error,
-            )
-        return last
-
-    async def _watch_turn_buffer(self, chat_id: str) -> None:
-        """Repost a buffer that still holds text after the idle window."""
-        try:
-            while True:
-                buf = self._turn_buffers.get(chat_id)
-                if buf is None or self._disconnecting:
-                    return
-                now = asyncio.get_event_loop().time()
-                last = buf.get("last_update_ts")
-                if not isinstance(last, (int, float)):
-                    last = now
-                    buf["last_update_ts"] = last
-                remaining = _TURN_BUFFER_FLUSH_AFTER_SEC - (now - float(last))
-                if remaining > 0:
-                    await asyncio.sleep(remaining)
-                    continue
-                await self._flush_turn_buffer(chat_id)
-                buf = self._turn_buffers.get(chat_id)
-                if buf is None or self._disconnecting:
-                    return
-                buf["last_update_ts"] = asyncio.get_event_loop().time()
-                if not buf.get("segments") and int(buf.get("depth") or 0) == 0:
-                    await self._drop_turn_buffer(chat_id)
-                    return
-                await asyncio.sleep(_TURN_BUFFER_FLUSH_AFTER_SEC)
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            logger.warning(
-                "agent365 turn buffer watchdog failed: chat_id=%s error=%s",
-                chat_id,
-                e,
-            )
-
     async def _flush_turn_buffer(self, chat_id: str) -> None:
-        """Post buffered turns in order. Keep the text until each post succeeds.
+        """Post finished turns once. Leave every open turn's segments in place.
 
-        Turns are separate ordered posts (outer reply, then a nested
-        follow-up). A turn whose joined text exceeds ``MAX_MESSAGE_LENGTH``
-        is split on segment boundaries. Progress-only segments are omitted.
-        A failed or cancelled post leaves the unsent segments in place for
-        a later complete or the stale-buffer watchdog. The buffer is
-        dropped only when depth is 0 and nothing remains.
+        A nested complete has already closed only the innermost turn.
+        Segments of a turn that is still open are not posted and their
+        ``turnbuf:`` ids are not removed, so the outer stream can keep
+        editing them. Each finished turn uses the inbound snapshotted at
+        its own start. A joined body over ``MAX_MESSAGE_LENGTH`` is split
+        on segment boundaries. One attempt per chunk: the text stays until
+        that post returns success. A failure is logged and left for the
+        next ``on_processing_complete``. There is no immediate retry and
+        no idle watchdog. A timeout or an unclear response can mean the
+        activity was already stored, and posting it again would duplicate
+        the bubble. The buffer is dropped only when every turn is finished
+        and nothing remains.
         """
         chat_id = str(chat_id)
         buf = self._turn_buffers.get(chat_id)
@@ -4527,82 +4489,102 @@ class Agent365Adapter(BasePlatformAdapter):
             lock = asyncio.Lock()
             buf["lock"] = lock
         async with lock:
-            buf = self._turn_buffers.get(chat_id)
-            if not buf or self._disconnecting:
+            await self._flush_closed_turns(chat_id)
+
+    async def _flush_closed_turns(self, chat_id: str) -> None:
+        buf = self._turn_buffers.get(chat_id)
+        if not buf or self._disconnecting:
+            return
+        turns: list[dict[str, Any]] = list(buf.get("turns") or [])
+        include_handoff = not any(turn.get("open") for turn in turns)
+        plan: list[tuple[dict[str, Any], list[dict[str, str]], list[str]]] = []
+        for turn in turns:
+            if turn.get("open"):
+                continue
+            kept: list[dict[str, str]] = []
+            drop_ids: list[str] = []
+            seq = str(turn.get("seq") or "")
+            for segment in buf.get("segments") or []:
+                if str(segment.get("turn") or "") != seq:
+                    continue
+                text = str(segment.get("text") or "")
+                if not text or _is_hermes_tool_progress_segment(text):
+                    if text and _is_hermes_tool_progress_segment(text):
+                        logger.debug(
+                            "agent365 turn buffer omitting tool-progress segment: "
+                            "chat_id=%s",
+                            chat_id,
+                        )
+                    drop_ids.append(str(segment.get("id") or ""))
+                    continue
+                kept.append(segment)
+            plan.append((turn, kept, drop_ids))
+        last_postable = -1
+        for index, (_turn, kept, _drop_ids) in enumerate(plan):
+            if kept:
+                last_postable = index
+        for index, (turn, kept, drop_ids) in enumerate(plan):
+            if not self._turn_buffers.get(chat_id) or self._disconnecting:
                 return
-            inbound = buf.get("inbound")
+            if not kept:
+                self._remove_turn_segments(buf, drop_ids)
+                continue
+            inbound = turn.get("inbound")
             if not isinstance(inbound, dict):
                 logger.warning(
                     "agent365 turn buffer flush skipped: invalid inbound chat_id=%s",
                     chat_id,
                 )
                 return
-            segments: list[dict[str, str]] = list(buf.get("segments") or [])
-            groups = self._turn_groups(segments)
-            postable_groups: list[list[dict[str, str]]] = []
-            drop_ids: list[str] = []
-            for group in groups:
-                kept: list[dict[str, str]] = []
-                for segment in group:
-                    text = str(segment.get("text") or "")
-                    if not text:
-                        drop_ids.append(str(segment.get("id") or ""))
-                        continue
-                    if _is_hermes_tool_progress_segment(text):
-                        logger.debug(
-                            "agent365 turn buffer omitting tool-progress segment: "
-                            "chat_id=%s",
-                            chat_id,
-                        )
-                        drop_ids.append(str(segment.get("id") or ""))
-                        continue
-                    kept.append(segment)
-                if kept:
-                    postable_groups.append(kept)
-            if not postable_groups:
-                self._remove_turn_segments(buf, drop_ids)
-                if int(buf.get("depth") or 0) == 0:
-                    await self._drop_turn_buffer(chat_id)
-                return
-
             chunks: list[tuple[list[dict[str, str]], str]] = []
-            for group in postable_groups:
-                for chunk in self._chunk_turn_segments(group):
-                    chunks.append(
-                        (chunk, "\n\n".join(str(segment.get("text") or "") for segment in chunk))
+            for chunk in self._chunk_turn_segments(kept):
+                chunks.append(
+                    (
+                        chunk,
+                        "\n\n".join(str(segment.get("text") or "") for segment in chunk),
                     )
-            suffix = self._turn_buffer_handoff_suffix(chat_id)
+                )
+            suffix = ""
+            if include_handoff and index == last_postable:
+                suffix = self._turn_buffer_handoff_suffix(chat_id)
             link_alone = False
             if chunks and suffix:
-                _last_segments, last_text = chunks[-1]
+                last_segments, last_text = chunks[-1]
                 if len(last_text) + len(suffix) <= self.MAX_MESSAGE_LENGTH:
-                    chunks[-1] = (_last_segments, last_text + suffix)
+                    chunks[-1] = (last_segments, last_text + suffix)
                 elif len(suffix.strip()) <= self.MAX_MESSAGE_LENGTH:
                     link_alone = True
-            validated_path = buf.get("validated_path")
+            validated_path = turn.get("validated_path")
             path = validated_path if isinstance(validated_path, str) else None
             for chunk_segments, content in chunks:
-                if not self._turn_buffers.get(chat_id):
+                if not self._turn_buffers.get(chat_id) or self._disconnecting:
                     return
-                result = await self._post_turn_buffer_text(
-                    chat_id=chat_id,
+                result = await self._send_reply_activity(
                     inbound=inbound,
                     content=content,
+                    log_context="turn buffer",
                     validated_path=path,
                 )
                 if not result.success:
-                    buf = self._turn_buffers.get(chat_id)
-                    if buf is not None:
-                        buf["flush_failures"] = int(buf.get("flush_failures") or 0) + 1
+                    logger.warning(
+                        "agent365 turn buffer flush failed: chat_id=%s error=%s",
+                        chat_id,
+                        result.error,
+                    )
                     return
+                live = self._turn_buffers.get(chat_id)
+                if live is None:
+                    return
+                buf = live
                 self._remove_turn_segments(
-                    buf, [str(segment.get("id") or "") for segment in chunk_segments]
+                    buf,
+                    [str(segment.get("id") or "") for segment in chunk_segments],
                 )
             if link_alone and suffix.strip():
-                link_result = await self._post_turn_buffer_text(
-                    chat_id=chat_id,
+                link_result = await self._send_reply_activity(
                     inbound=inbound,
                     content=suffix.strip(),
+                    log_context="turn buffer",
                     validated_path=path,
                 )
                 if not link_result.success:
@@ -4611,26 +4593,14 @@ class Agent365Adapter(BasePlatformAdapter):
                         chat_id,
                         link_result.error,
                     )
+            live = self._turn_buffers.get(chat_id)
+            if live is None:
+                return
+            buf = live
             self._remove_turn_segments(buf, drop_ids)
-            buf = self._turn_buffers.get(chat_id)
-            if buf is not None and int(buf.get("depth") or 0) == 0 and not buf.get("segments"):
-                await self._drop_turn_buffer(chat_id)
-
-    @staticmethod
-    def _turn_groups(segments: list[dict[str, str]]) -> list[list[dict[str, str]]]:
-        groups: list[list[dict[str, str]]] = []
-        current: list[dict[str, str]] = []
-        current_turn: str | None = None
-        for segment in segments:
-            turn = str(segment.get("turn") or "")
-            if current and turn != current_turn:
-                groups.append(current)
-                current = []
-            current_turn = turn
-            current.append(segment)
-        if current:
-            groups.append(current)
-        return groups
+        buf = self._turn_buffers.get(chat_id)
+        if buf is not None and int(buf.get("depth") or 0) == 0 and not buf.get("segments"):
+            await self._drop_turn_buffer(chat_id)
 
     @staticmethod
     def _remove_turn_segments(buf: dict[str, Any], ids: list[str]) -> None:
