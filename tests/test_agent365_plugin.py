@@ -3003,6 +3003,87 @@ class TestLifecycleCapture:
         assert "stale-idle" not in a._conversations
         assert len(a._conversations) <= 2
 
+    def test_registry_cap_keeps_unanswered_approval_without_active_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #130: a conversation with an outstanding approval card must survive
+        # churn even when the Hermes turn has already left `_active_sessions`.
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        for cid in ("awaiting-approval", "idle"):
+            a._conversations.upsert(
+                adapter_mod.ConversationRef(
+                    conversation_id=cid, service_url="https://x/"
+                ),
+                now=1000.0,
+            )
+        a._card_capabilities["nonce"] = {
+            "kind": "exec_approval",
+            "conversation_id": "awaiting-approval",
+            "created_at": time.monotonic(),
+        }
+        assert "awaiting-approval" not in a._active_conversation_ids()
+
+        client = self._client(a, monkeypatch)
+        body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert r.status_code == 200, r.text
+        assert "awaiting-approval" in a._conversations
+        assert "idle" not in a._conversations
+        assert len(a._conversations) <= 2
+
+    def test_registry_cap_drops_expired_approval_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        for cid in ("expired-card", "idle"):
+            a._conversations.upsert(
+                adapter_mod.ConversationRef(
+                    conversation_id=cid, service_url="https://x/"
+                ),
+                now=1000.0,
+            )
+        a._card_capabilities["nonce"] = {
+            "kind": "exec_approval",
+            "conversation_id": "expired-card",
+            "created_at": time.monotonic() - adapter_mod._CARD_CAPABILITY_TTL_SEC - 1,
+        }
+
+        client = self._client(a, monkeypatch)
+        body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert r.status_code == 200, r.text
+        assert "expired-card" not in a._conversations
+        assert "fresh" in a._conversations
+
+    def test_registry_cap_keeps_open_ended_clarify(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        for cid in ("awaiting-text", "idle"):
+            a._conversations.upsert(
+                adapter_mod.ConversationRef(
+                    conversation_id=cid, service_url="https://x/"
+                ),
+                now=1000.0,
+            )
+        a._awaiting_text_chats["awaiting-text"] = time.monotonic()
+
+        client = self._client(a, monkeypatch)
+        body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert r.status_code == 200, r.text
+        assert "awaiting-text" in a._conversations
+        assert "idle" not in a._conversations
+
     def test_registry_cap_never_evicts_current_turn_when_saturated(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -9157,6 +9238,31 @@ class TestPruneConversations:
         assert captured["active_session_keys"] == {"active-chat"}
 
     @pytest.mark.asyncio
+    async def test_prune_keeps_unanswered_approval_without_active_session(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #130: prune uses the same protected set as the cap. An outstanding
+        # card survives even when `_active_sessions` does not hold the chat.
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch, conversations_prune_max_age_days=10)
+        for cid in ("awaiting-approval", "stale-chat"):
+            a._conversations.upsert(
+                ConversationRef(conversation_id=cid, service_url="https://x/")
+            )
+            a._conversations._by_id[cid].last_used_at = 1000.0
+        a._card_capabilities["nonce"] = {
+            "kind": "clarify",
+            "conversation_id": "awaiting-approval",
+            "created_at": time.monotonic(),
+        }
+
+        dropped = await a.prune_conversations()
+        assert dropped == 1
+        assert "awaiting-approval" in a._conversations
+        assert "stale-chat" not in a._conversations
+
+    @pytest.mark.asyncio
     async def test_saves_to_disk_when_anything_dropped(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -12093,6 +12199,7 @@ class TestInteractiveCards:
         # Question sent as a plain text reply; intercept armed for the answer.
         assert send_reply.await_args.kwargs["reply"]["text"] == "Say more?"
         mark.assert_called_once_with("clr-2")
+        assert "conv-1" in a._awaiting_text_chats
 
     @pytest.mark.asyncio
     async def test_send_exec_approval_no_inbound_falls_back(
