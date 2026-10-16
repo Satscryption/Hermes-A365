@@ -139,6 +139,17 @@ this heading is dated at release.
   triage also removed exception text and upstream response excerpts from the
   externally visible `reply_failed` response; sanitized diagnostics remain in
   server logs.
+- **#148 documents the Hermes install conflict without lowering security
+  floors.** Hermes Agent 0.20.0 pins `PyJWT[crypto]==2.13.0`, and Hermes
+  `main` as of 2026-10-16 still pins that exact release on Python 3.14, the
+  runtime Hermes supports. `hermes-a365[bridge]` keeps `pyjwt[crypto]>=2.15.0`
+  (and the other #125 floors). The two do not resolve together. The
+  compatible path is an upstream exact-pin bump to 2.15.0, plus a FastAPI
+  bump when `hermes-agent[web]` is installed (`fastapi==0.133.1` is below
+  our `>=0.141.1`). A uv override or `--no-deps` install does not satisfy
+  #148 or the #123 gateway rows.
+  [`references/hermes-runtime-compatibility.md`](references/hermes-runtime-compatibility.md)
+  is the contract.
 - **v0.9.0 hardening migration notes.** Inbound bearer headers are bounded and
   structurally validated before issuer routing; callers receive fixed auth
   failures while bounded diagnostics remain server-side. End-user allowlists

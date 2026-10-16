@@ -438,6 +438,13 @@ directory required:
 hermes plugins list                # `agent365` should appear with source=entrypoint
 ```
 
+Hermes' supported runtime is Python 3.14, and current Hermes `main` pins
+`PyJWT[crypto]==2.13.0` on that version. This package's `bridge` extra
+requires `pyjwt[crypto]>=2.15.0` and will not lower that floor. Ordinary
+resolution of the two packages together fails until Hermes bumps the pin.
+A uv override or `--no-deps` install is not a supported setup. See
+[`references/hermes-runtime-compatibility.md`](references/hermes-runtime-compatibility.md).
+
 **Local development** (from a checkout):
 
 ```bash
