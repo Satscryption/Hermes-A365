@@ -1201,9 +1201,11 @@ class Agent365Adapter(BasePlatformAdapter):
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
         self._card_capabilities: dict[str, dict[str, Any]] = {}
-        # #130: open-ended clarify (no choice buttons) has no card capability.
-        # chat_id → monotonic time the prompt was sent. Cap/prune skip these
-        # until the user answers, the chat is torn down, or the card TTL elapses.
+        # #130: a typed-answer wait has no live card capability. Open-ended
+        # clarify never mints one. "Something else" consumes the choice card
+        # and then waits the same way. chat_id → monotonic time the wait
+        # started. Cap/prune skip these until the user answers, the chat is
+        # torn down, or the card TTL elapses.
         self._awaiting_text_chats: dict[str, float] = {}
         self._card_action_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
         self._outbound_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
@@ -3310,9 +3312,11 @@ class Agent365Adapter(BasePlatformAdapter):
         """Conversations cap and prune must not evict (#105/M11, #130).
 
         Unions in-flight Hermes turns with chats that still have an
-        unanswered approval/clarify/slash-confirm card, or an open-ended
-        clarify prompt, inside ``_CARD_CAPABILITY_TTL_SEC``. Protection does
-        not depend on ``_active_sessions`` still holding the turn."""
+        unanswered approval/clarify/slash-confirm card, or a free-text
+        clarify wait (an open-ended prompt, or "Something else" after the
+        choice card is consumed), inside ``_CARD_CAPABILITY_TTL_SEC``.
+        Protection does not depend on ``_active_sessions`` still holding
+        the turn."""
         now = time.monotonic()
         protected = self._active_conversation_ids()
         for capability in self._card_capabilities.values():
@@ -6107,7 +6111,8 @@ class Agent365Adapter(BasePlatformAdapter):
         question as text and arms the gateway's text-intercept. On a choice click
         the route resolves via
         ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, choice_text)``;
-        "Something else" arms ``mark_awaiting_text(clarify_id)``."""
+        "Something else" consumes the card, arms ``mark_awaiting_text``, and
+        keeps the chat in ``_awaiting_text_chats`` for the card TTL."""
         if not choices:
             inbound = self._cached_inbound_for(chat_id)
             if not inbound:
@@ -6290,6 +6295,12 @@ class Agent365Adapter(BasePlatformAdapter):
             elif kind == _CARD_KIND_CLARIFY:
                 clarify_id = str(resolver.get("clarify_id") or "")
                 if choice == "__other__":
+                    # The capability was consumed above. This free-text wait
+                    # is the same human window as an open-ended clarify, so
+                    # arm the TTL set before the gateway intercept. A mark
+                    # failure must not leave the chat evictable.
+                    if conv_id:
+                        self._awaiting_text_chats[conv_id] = time.monotonic()
                     self._gw_mark_awaiting_text(clarify_id)
                 else:
                     self._gw_resolve_clarify(clarify_id, choice)

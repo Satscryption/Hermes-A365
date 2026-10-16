@@ -298,6 +298,34 @@ def _seed_card_capability(
     return {"hermes_kind": kind, "capability": nonce, "choice_id": choice_id}
 
 
+async def _assert_cached_send_resolves(
+    adapter: Any,
+    monkeypatch: pytest.MonkeyPatch,
+    chat_id: str,
+    activity_id: str,
+) -> None:
+    """#130: after cap or prune, resume still has the cached inbound and send()."""
+    inbound = adapter._cached_inbound_for(chat_id)
+    assert inbound is not None
+    assert inbound["id"] == activity_id
+    adapter._seen_inbounds_this_lifetime.add(chat_id)
+    adapter._bridge_cfg = MagicMock()
+    adapter._fmi_cache = MagicMock()
+    adapter._user_cache = MagicMock()
+    if adapter._http_client is None:
+        adapter._http_client = MagicMock()
+    bridge = adapter_mod._import_bridge()
+    send_reply = AsyncMock(return_value=None)
+    monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+    result = await adapter.send(chat_id=chat_id, content="resumed")
+
+    assert result.success is True
+    assert send_reply.await_count == 1
+    assert send_reply.await_args.kwargs["inbound"]["id"] == activity_id
+    assert send_reply.await_args.kwargs["reply"]["text"] == "resumed"
+
+
 # ---------------------------------------------------------------------------
 # Manifest + register (carried over from 19m)
 # ---------------------------------------------------------------------------
@@ -3083,6 +3111,91 @@ class TestLifecycleCapture:
         assert r.status_code == 200, r.text
         assert "awaiting-text" in a._conversations
         assert "idle" not in a._conversations
+
+    @pytest.mark.asyncio
+    async def test_registry_cap_resume_send_resolves_for_live_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #130: surviving the cap is not enough. The cached inbound must still
+        # resolve, and send() must still post the resume.
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        awaiting = _make_inbound(
+            conv_id="awaiting-approval", activity_id="act-wait"
+        )
+        ref = adapter_mod.ConversationRef.from_activity(awaiting)
+        assert ref is not None
+        a._conversations.upsert(ref, now=1000.0)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef(
+                conversation_id="idle", service_url="https://x/"
+            ),
+            now=1000.0,
+        )
+        a._card_capabilities["nonce"] = {
+            "kind": "exec_approval",
+            "conversation_id": "awaiting-approval",
+            "created_at": time.monotonic(),
+        }
+
+        client = self._client(a, monkeypatch)
+        body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert r.status_code == 200, r.text
+        assert "awaiting-approval" in a._conversations
+        assert "idle" not in a._conversations
+        await _assert_cached_send_resolves(
+            a, monkeypatch, "awaiting-approval", "act-wait"
+        )
+
+    @pytest.mark.asyncio
+    async def test_something_else_stays_protected_and_send_resolves_after_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Clicking "Something else" pops the card. The free-text wait must
+        # keep the chat through a later cap, and send() must still resolve.
+        monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        activity = _make_inbound(conv_id="awaiting-other", activity_id="act-other")
+        ref = adapter_mod.ConversationRef.from_activity(activity)
+        assert ref is not None
+        a._conversations.upsert(ref, now=1000.0)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef(
+                conversation_id="idle", service_url="https://x/"
+            ),
+            now=1000.0,
+        )
+        mark = MagicMock()
+        monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="clarify",
+            choice="__other__",
+            resolver={"clarify_id": "clr-other"},
+        )
+
+        resp = await a._handle_card_action(activity, value)
+        assert resp.status_code == 200
+        mark.assert_called_once_with("clr-other")
+        assert "test-capability" not in a._card_capabilities
+        assert "awaiting-other" in a._awaiting_text_chats
+        assert "awaiting-other" in a._registry_protected_conversation_ids()
+
+        client = self._client(a, monkeypatch)
+        body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
+        r = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert r.status_code == 200, r.text
+        assert "awaiting-other" in a._conversations
+        assert "idle" not in a._conversations
+        await _assert_cached_send_resolves(
+            a, monkeypatch, "awaiting-other", "act-other"
+        )
 
     def test_registry_cap_never_evicts_current_turn_when_saturated(
         self, monkeypatch: pytest.MonkeyPatch
@@ -9263,6 +9376,73 @@ class TestPruneConversations:
         assert "stale-chat" not in a._conversations
 
     @pytest.mark.asyncio
+    async def test_prune_resume_send_resolves_for_live_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch, conversations_prune_max_age_days=10)
+        awaiting = _make_inbound(
+            conv_id="awaiting-approval", activity_id="act-wait"
+        )
+        ref = ConversationRef.from_activity(awaiting)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._conversations.upsert(
+            ConversationRef(conversation_id="stale-chat", service_url="https://x/")
+        )
+        a._conversations._by_id["awaiting-approval"].last_used_at = 1000.0
+        a._conversations._by_id["stale-chat"].last_used_at = 1000.0
+        a._card_capabilities["nonce"] = {
+            "kind": "exec_approval",
+            "conversation_id": "awaiting-approval",
+            "created_at": time.monotonic(),
+        }
+
+        dropped = await a.prune_conversations()
+        assert dropped == 1
+        assert "stale-chat" not in a._conversations
+        await _assert_cached_send_resolves(
+            a, monkeypatch, "awaiting-approval", "act-wait"
+        )
+
+    @pytest.mark.asyncio
+    async def test_prune_resume_send_resolves_after_something_else(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = _make_adapter(monkeypatch, conversations_prune_max_age_days=10)
+        activity = _make_inbound(conv_id="awaiting-other", activity_id="act-other")
+        ref = ConversationRef.from_activity(activity)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._conversations.upsert(
+            ConversationRef(conversation_id="stale-chat", service_url="https://x/")
+        )
+        a._conversations._by_id["awaiting-other"].last_used_at = 1000.0
+        a._conversations._by_id["stale-chat"].last_used_at = 1000.0
+        monkeypatch.setattr(a, "_gw_mark_awaiting_text", MagicMock())
+        value = _seed_card_capability(
+            a,
+            activity,
+            kind="clarify",
+            choice="__other__",
+            resolver={"clarify_id": "clr-other"},
+        )
+        resp = await a._handle_card_action(activity, value)
+        assert resp.status_code == 200
+        assert "test-capability" not in a._card_capabilities
+
+        dropped = await a.prune_conversations()
+        assert dropped == 1
+        assert "awaiting-other" in a._conversations
+        assert "stale-chat" not in a._conversations
+        await _assert_cached_send_resolves(
+            a, monkeypatch, "awaiting-other", "act-other"
+        )
+
+    @pytest.mark.asyncio
     async def test_saves_to_disk_when_anything_dropped(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -12370,6 +12550,7 @@ class TestInteractiveCards:
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         resolver.assert_called_once_with("clr-1", "Beta")
+        assert a._awaiting_text_chats == {}
 
     @pytest.mark.asyncio
     async def test_handle_card_action_clarify_other_arms_intercept(
@@ -12389,6 +12570,8 @@ class TestInteractiveCards:
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         mark.assert_called_once_with("clr-1")
+        assert a._awaiting_text_chats["conv-1"] > 0
+        assert "conv-1" in a._registry_protected_conversation_ids()
 
     def test_route_card_submit_not_dispatched(
         self, monkeypatch: pytest.MonkeyPatch
