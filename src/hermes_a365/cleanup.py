@@ -34,16 +34,20 @@ import re
 import shlex
 import stat
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from . import a365_config, bot_service
 from ._common import (
+    TENANT_ID_HELP,
+    UNPINNED_TENANT_PLAN_LINE,
     TenantResolutionError,
     active_az_tenant,
     ensure_contained,
+    parse_env,
     resolve_expected_tenant,
     slugify,
     tenant_ids_match,
@@ -190,7 +194,7 @@ class CleanupPlan:
         if self.inputs.tenant_id:
             lines.append(f"  tenant: {self.inputs.tenant_id}")
         else:
-            lines.append("  tenant: (auto-detect from `az account show`)")
+            lines.append(UNPINNED_TENANT_PLAN_LINE)
         lines.append(f"  local slug: {self.inputs.resolved_slug}")
         lines.append("  cloud steps (in order):")
         if not self.steps:
@@ -212,7 +216,10 @@ class CleanupPlan:
             for p in self.local_paths:
                 lines.append(f"    - {p}")
         if self.orphan_instance_ids:
-            lines.append("  orphan agentRegistry instances requiring double entry:")
+            lines.append(
+                "  orphan agentRegistry instances (Graph ownership verified; "
+                "deletion still requires double entry):"
+            )
             for instance_id in self.orphan_instance_ids:
                 lines.append(f"    - {instance_id}")
                 lines.append(
@@ -220,7 +227,10 @@ class CleanupPlan:
                     f"--purge-orphans --confirm-orphan {instance_id}"
                 )
         if self.orphan_user_ids:
-            lines.append("  orphan agentic users requiring double entry:")
+            lines.append(
+                "  orphan agentic users (Graph ownership verified; "
+                "deletion still requires double entry):"
+            )
             for user_id in self.orphan_user_ids:
                 lines.append(f"    - {user_id}")
                 lines.append(
@@ -271,6 +281,7 @@ def build_cleanup_plan(
     generated_config_path: Path | None = None,
     additional_orphan_instance_ids: tuple[str, ...] = (),
     additional_orphan_user_ids: tuple[str, ...] = (),
+    graph_get: GraphGet | None = None,
 ) -> CleanupPlan:
     """Compose the ordered list of CLI cleanup steps + local artefact list.
 
@@ -312,6 +323,27 @@ def build_cleanup_plan(
             )
         )
 
+    # Capture candidates while the generated config still exists so a verified
+    # id can be double-entered on apply after the CLI removes that file.
+    orphan_user_ids = _collect_orphan_user_ids(additional_orphan_user_ids)
+    orphan_instance_ids = _collect_orphan_instance_ids(
+        generated_config_path, additional_orphan_instance_ids
+    )
+    # #123 4f / #102 L6: do not plan a deletion until Graph proves the object
+    # belongs to this agent's A365_APP_ID. Double entry alone offered to
+    # delete another agent's live agentic user.
+    _require_verified_orphan_ownership(
+        agent_name=inputs.agent_name,
+        hermes_home=hermes_home,
+        slug=inputs.resolved_slug,
+        generated_config_path=generated_config_path,
+        sidecar_config=(
+            bot_service_plan.config if bot_service_plan is not None else None
+        ),
+        user_ids=orphan_user_ids,
+        instance_ids=orphan_instance_ids,
+        graph_get=graph_get,
+    )
     return CleanupPlan(
         inputs=inputs,
         steps=steps,
@@ -319,12 +351,8 @@ def build_cleanup_plan(
         # artefacts this run's kinds may actually remove.
         local_paths=_local_artefacts(hermes_home, inputs.resolved_slug, normalized_kinds),
         bot_service_plan=bot_service_plan,
-        orphan_user_ids=_collect_orphan_user_ids(additional_orphan_user_ids),
-        # Capture candidates while the generated config still exists so the
-        # dry-run tells the operator exactly what to double-enter on apply.
-        orphan_instance_ids=_collect_orphan_instance_ids(
-            generated_config_path, additional_orphan_instance_ids
-        ),
+        orphan_user_ids=orphan_user_ids,
+        orphan_instance_ids=orphan_instance_ids,
     )
 
 
@@ -434,6 +462,276 @@ def _collect_orphan_user_ids(
     return tuple(candidates)
 
 
+# Graph ownership (#123 walk 4f / #102 L6). Typing an object id twice is not
+# proof it belongs to this agent. Anchors are the per-agent A365_APP_ID and,
+# when Graph returns it, that application's object id. The cwd sidecar and
+# a365.generated.config.json are not anchor sources: a matching agentName or
+# a copied object/identity GUID would let one agent delete another's user.
+# agentInstance.agentIdentityBlueprintId is the blueprint object id,
+# agentIdentity.agentIdentityBlueprintId is the blueprint app id, and
+# managedBy is compared to those same blueprint anchors. agentIdentityId is
+# not an ownership signal. The shared AI Teammate managing app
+# (9b975845-388f-4429-889e-eab1ef63949c) is not an anchor.
+GraphGet = Callable[[str], dict[str, Any] | None]
+_AGENT_USER_FILTER_URL = (
+    "https://graph.microsoft.com/beta/agentRegistry/agentInstances"
+    "?$filter=agentUserId eq '{user_id}'"
+)
+_AGENT_IDENTITY_URL = (
+    "https://graph.microsoft.com/beta/servicePrincipals/{object_id}"
+    "?$select=id,appId,servicePrincipalType,agentIdentityBlueprintId"
+)
+_APPLICATION_BY_APP_ID_URL = (
+    "https://graph.microsoft.com/beta/applications(appId='{app_id}')?$select=id,appId"
+)
+
+
+def _uuid_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    try:
+        return str(UUID(value.strip()))
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _per_agent_blueprint_app_id(*, hermes_home: Path, slug: str) -> str:
+    """Return this agent's A365_APP_ID.
+
+    The cwd sidecar and ``a365.generated.config.json`` are not read. A
+    sidecar ``msaAppId`` is the same anchor only when it equals this id,
+    so it never contributes a second GUID.
+    """
+    env_path = _agent_dir(hermes_home, slug) / ".env"
+    env: dict[str, str] = {}
+    if env_path.is_file():
+        try:
+            env = parse_env(env_path.read_text())
+        except OSError:
+            env = {}
+    return _uuid_text(env.get("A365_APP_ID", ""))
+
+
+def _blueprint_association(record: dict[str, Any]) -> set[str]:
+    """Blueprint app/object ids on a Graph record. Not agentIdentityId."""
+    found: set[str] = set()
+    for key in ("agentIdentityBlueprintId", "managedBy"):
+        parsed = _uuid_text(record.get(key))
+        if parsed:
+            found.add(parsed)
+    return found
+
+
+def _record_belongs(record: dict[str, Any], anchors: frozenset[str]) -> bool:
+    return bool(_blueprint_association(record) & anchors)
+
+
+def _application_object_id(payload: dict[str, Any] | None, app_id: str) -> str:
+    """Object id from a Graph application read, only if it is this app."""
+    if not isinstance(payload, dict) or payload.get("error"):
+        return ""
+    value = payload.get("value")
+    if isinstance(value, list):
+        candidates = [item for item in value if isinstance(item, dict)]
+    elif payload.get("id") or payload.get("appId"):
+        candidates = [payload]
+    else:
+        candidates = []
+    matched = [item for item in candidates if _uuid_text(item.get("appId")) == app_id]
+    if len(matched) != 1:
+        return ""
+    return _uuid_text(matched[0].get("id"))
+
+
+def _blueprint_anchors(app_id: str, graph_get: GraphGet) -> frozenset[str]:
+    """App id plus the object id Graph reports for that same application."""
+    anchors = {app_id}
+    try:
+        payload = graph_get(_APPLICATION_BY_APP_ID_URL.format(app_id=app_id))
+    except (CliInvocationError, AADSTSError, OSError):
+        payload = None
+    object_id = _application_object_id(payload, app_id)
+    if object_id:
+        anchors.add(object_id)
+    return frozenset(anchors)
+
+
+def _instances_from_graph(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    value = payload.get("value")
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if payload.get("id"):
+        return [payload]
+    return []
+
+
+def _graph_get_from_mutator(mutator: Mutator) -> GraphGet:
+    def graph_get(url: str) -> dict[str, Any] | None:
+        try:
+            result = mutator.run(["az", "rest", "--method", "GET", "--uri", url])
+        except (CliInvocationError, AADSTSError, OSError):
+            return None
+        stdout = result.stdout or ""
+        start = stdout.find("{")
+        if start < 0:
+            return None
+        try:
+            data, _end = json.JSONDecoder().raw_decode(stdout[start:])
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    return graph_get
+
+
+def _graph_dict(graph_get: GraphGet, url: str) -> dict[str, Any] | None:
+    """Return a Graph JSON object, or None when the lookup cannot be trusted."""
+    try:
+        payload = graph_get(url)
+    except (CliInvocationError, AADSTSError, OSError):
+        return None
+    if not isinstance(payload, dict) or payload.get("error"):
+        return None
+    return payload
+
+
+def _require_matching_blueprint(
+    record: dict[str, Any],
+    anchors: frozenset[str],
+    *,
+    refusal: str,
+    unproven: str,
+) -> None:
+    if _record_belongs(record, anchors):
+        return
+    if _blueprint_association(record):
+        raise CleanupError(refusal)
+    raise CleanupError(unproven)
+
+
+def _require_verified_orphan_ownership(
+    *,
+    agent_name: str,
+    hermes_home: Path,
+    slug: str,
+    generated_config_path: Path,
+    sidecar_config: bot_service.BotServiceConfig | None,
+    user_ids: tuple[str, ...],
+    instance_ids: tuple[str, ...],
+    graph_get: GraphGet | None,
+) -> None:
+    """Raise unless every candidate is Graph-proven to belong to this agent.
+
+    ``generated_config_path`` is unused on purpose: object and identity
+    GUIDs in the cwd generated file are not anchors. ``sidecar_config``
+    contributes ``msaAppId`` only when that id equals per-agent
+    ``A365_APP_ID``; a different sidecar app id is ignored.
+    """
+    if not user_ids and not instance_ids:
+        return
+    if graph_get is None:
+        raise CleanupError(
+            "refusing to plan orphan deletion without a Graph ownership lookup. "
+            "Typing the object id twice does not prove the agentic user or agent "
+            "identity belongs to this agent."
+        )
+    app_id = _per_agent_blueprint_app_id(hermes_home=hermes_home, slug=slug)
+    if not app_id:
+        raise CleanupError(
+            "refusing to plan orphan deletion: no per-agent A365_APP_ID is bound "
+            f"to {agent_name!r}. Set A365_APP_ID in that agent's env. A cwd "
+            "sidecar msaAppId or a365.generated.config.json GUID is not proof."
+        )
+    if sidecar_config is not None and sidecar_config.agentName == agent_name:
+        msa_app_id = _uuid_text(sidecar_config.msaAppId)
+        if msa_app_id == app_id:
+            app_id = msa_app_id
+    anchors = _blueprint_anchors(app_id, graph_get)
+    del generated_config_path
+    for instance_id in instance_ids:
+        payload = _graph_dict(
+            graph_get, _AGENT_INSTANCES_GRAPH_URL.format(instance_id=instance_id)
+        )
+        if payload is None:
+            raise CleanupError(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                "Graph lookup did not prove it belongs to this agent's blueprint."
+            )
+        if _uuid_text(payload.get("id")) != instance_id:
+            raise CleanupError(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                f"Graph payload id {payload.get('id')!r} does not match the typed id."
+            )
+        _require_matching_blueprint(
+            payload,
+            anchors,
+            refusal=(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                "Graph shows it belongs to a different blueprint than this "
+                "agent's A365_APP_ID."
+            ),
+            unproven=(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                "Graph lookup did not prove it belongs to this agent's blueprint."
+            ),
+        )
+    for user_id in user_ids:
+        listed = _graph_dict(graph_get, _AGENT_USER_FILTER_URL.format(user_id=user_id))
+        instances = _instances_from_graph(listed)
+        if instances:
+            for item in instances:
+                if _uuid_text(item.get("agentUserId")) != user_id:
+                    raise CleanupError(
+                        f"refusing to plan deletion of agentic user {user_id}: "
+                        f"Graph agentUserId {item.get('agentUserId')!r} does not "
+                        "match the typed id."
+                    )
+                _require_matching_blueprint(
+                    item,
+                    anchors,
+                    refusal=(
+                        f"refusing to plan deletion of agentic user {user_id}: "
+                        "Graph shows this is the live agent user of a different "
+                        "agent's blueprint, not this agent's A365_APP_ID."
+                    ),
+                    unproven=(
+                        f"refusing to plan deletion of agentic user {user_id}: "
+                        "Graph lookup did not prove the agentic user belongs to "
+                        "this agent's blueprint."
+                    ),
+                )
+            continue
+        identity = _graph_dict(graph_get, _AGENT_IDENTITY_URL.format(object_id=user_id))
+        if identity is None:
+            raise CleanupError(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                "lookup did not prove the agentic user or agent identity "
+                "belongs to this agent's blueprint."
+            )
+        if _uuid_text(identity.get("id")) != user_id:
+            raise CleanupError(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                f"service principal id {identity.get('id')!r} does not match "
+                "the typed id."
+            )
+        _require_matching_blueprint(
+            identity,
+            anchors,
+            refusal=(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                "shows this agent identity belongs to a different blueprint "
+                "than this agent's A365_APP_ID."
+            ),
+            unproven=(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                "lookup did not prove the agentic user or agent identity "
+                "belongs to this agent's blueprint."
+            ),
+        )
+
+
 @dataclass
 class CleanupResult:
     plan: CleanupPlan
@@ -465,6 +763,7 @@ def apply_cleanup_plan(
     additional_orphan_user_ids: tuple[str, ...] = (),
     confirmed_orphan_user_ids: tuple[str, ...] = (),
     bot_service_runner: bot_service.CommandRunner | None = None,
+    graph_get: GraphGet | None = None,
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
 
@@ -537,15 +836,31 @@ def apply_cleanup_plan(
             "again with --orphan-instance-id as well as --confirm-orphan."
         )
 
+    # Re-check before any mutation. A plan can be built in one process and
+    # applied in another, and ids can appear between the two calls.
+    sidecar_config = (
+        plan.bot_service_plan.config if plan.bot_service_plan is not None else None
+    )
+    _require_verified_orphan_ownership(
+        agent_name=plan.inputs.agent_name,
+        hermes_home=hermes_home,
+        slug=plan.inputs.resolved_slug,
+        generated_config_path=generated_config_path,
+        sidecar_config=sidecar_config,
+        user_ids=candidate_user_ids,
+        instance_ids=tuple(candidate_instance_ids),
+        graph_get=graph_get,
+    )
+
     # #102 M7: bind the WHOLE teardown to the persisted tenant BEFORE any
     # destructive step. The a365 subcommands auto-detect their tenant from the
     # ambient az session, and the two az orphan paths (`az ad user delete`,
     # `az rest` Graph DELETE) have no per-call tenant flag at all — so the only
     # sound enforcement is up-front: assert the active az tenant matches the
     # expected one (explicit --tenant-id, else the operator env's
-    # A365_TENANT_ID), and refuse on mismatch or when the session can't be
-    # verified. With no pin available anywhere we proceed — a fresh setup has
-    # nothing to compare against — but say so loudly. (The bot-service step is
+    # A365_TENANT_ID), and refuse on mismatch, when the session can't be
+    # verified, or when no pin was resolved. Ambient `az account show` is
+    # not a pin. (The bot-service step is
     # independently safe: its az calls pin the sidecar's subscriptionId, and a
     # subscription belongs to exactly one tenant.)
     try:
@@ -680,8 +995,25 @@ def apply_cleanup_plan(
         result.completed.append(step.kind)
         result.messages.append(f"[apply] {step.kind}: {step.description} — done")
         for oid in _parse_orphan_user_ids(run.stdout):
-            if oid not in result.orphan_user_ids:
+            if oid in result.orphan_user_ids or oid in result.orphans_remaining:
+                continue
+            try:
+                _require_verified_orphan_ownership(
+                    agent_name=plan.inputs.agent_name,
+                    hermes_home=hermes_home,
+                    slug=plan.inputs.resolved_slug,
+                    generated_config_path=generated_config_path,
+                    sidecar_config=sidecar_config,
+                    user_ids=(oid,),
+                    instance_ids=(),
+                    graph_get=graph_get,
+                )
+            except CleanupError as exc:
                 result.orphan_user_ids.append(oid)
+                result.orphans_remaining.append(oid)
+                result.messages.append(f"[apply] {exc}")
+                continue
+            result.orphan_user_ids.append(oid)
 
     for oid in candidate_user_ids:
         if oid not in result.orphan_user_ids:
@@ -740,6 +1072,8 @@ def apply_cleanup_plan(
     # cleanup itself when asked. Off by default; opt-in with
     # ``--purge-orphans`` so the CLI invocation set stays auditable.
     for oid in result.orphan_user_ids:
+        if oid in result.orphans_remaining:
+            continue
         if not purge_orphans:
             result.orphans_remaining.append(oid)
             result.messages.append(
@@ -863,7 +1197,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     parser.add_argument("--agent-name", required=True, help="agent base name")
     parser.add_argument(
         "--tenant-id",
-        help="tenant id; default auto-detects via `az account show`",
+        help=TENANT_ID_HELP,
     )
     parser.add_argument(
         "--kinds",
@@ -931,13 +1265,9 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         default=[],
         metavar="GUID",
         help=(
-            "re-type an orphan instance id to authorise its Graph DELETE "
-            "under --purge-orphans. Double-entry guard: a typo'd "
-            "instance id would delete an UNRELATED agentRegistry instance, "
-            "and the wrapper has no Graph read with which to verify "
-            "ownership. Snapshot-derived ids from a365.generated.config.json "
-            "also require confirmation because that file is selected by the "
-            "working directory, not bound to --agent-name. May be repeated."
+            "re-type an orphan instance id whose Graph ownership was already "
+            "verified against this agent's per-agent blueprint (A365_APP_ID). "
+            "Double entry alone does not authorise deletion. May be repeated."
         ),
     )
     parser.add_argument(
@@ -956,8 +1286,9 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         default=[],
         metavar="GUID",
         help=(
-            "re-type an orphaned agentic-user id previously surfaced by cleanup "
-            "to authorise `az ad user delete`. May be repeated."
+            "re-type an orphaned agentic-user id whose Graph ownership was "
+            "already verified against this agent's per-agent blueprint "
+            "(A365_APP_ID). May be repeated."
         ),
     )
     return parser
@@ -986,6 +1317,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    mutator = get_mutator()
+    graph_get = _graph_get_from_mutator(mutator)
     try:
         # #103/M9: building the plan resolves ``resolved_slug`` (which rejects
         # traversal-shaped ``--slug`` values); surface that as a clean rc=2.
@@ -993,6 +1326,7 @@ def run(args: argparse.Namespace) -> int:
             inputs,
             additional_orphan_instance_ids=tuple(args.orphan_instance_id),
             additional_orphan_user_ids=tuple(args.orphan_user_id),
+            graph_get=graph_get,
         )
     except (ValueError, CleanupError, bot_service.BotServiceError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -1024,13 +1358,14 @@ def run(args: argparse.Namespace) -> int:
     try:
         result = apply_cleanup_plan(
             plan,
-            mutator=get_mutator(),
+            mutator=mutator,
             hermes_home=_resolve_hermes_home(),
             purge_orphans=args.purge_orphans,
             additional_orphan_instance_ids=tuple(args.orphan_instance_id),
             confirmed_orphan_instance_ids=tuple(args.confirm_orphan),
             additional_orphan_user_ids=tuple(args.orphan_user_id),
             confirmed_orphan_user_ids=tuple(args.confirm_orphan_user),
+            graph_get=graph_get,
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)

@@ -498,10 +498,13 @@ hermes a365 doctor --human                                # exit 0/1/2
 hermes a365 license --users 12 --agents 3 --plan E5
 
 # 3. Register the blueprint + MCP/Bot permissions.
-#    --m365 routes Teams via MCP Platform. --auto-recover-secret patches
-#    the GA CLI's macOS / Linux secret-null regression (Microsoft#408)
-#    in place.
+#    --tenant-id (or A365_TENANT_ID) is required; az account show is only
+#    checked against that pin. --m365 is forwarded to setup blueprint and
+#    does not register the messaging endpoint — step 8 does that.
+#    --auto-recover-secret patches the GA CLI's macOS / Linux secret-null
+#    regression (Microsoft#408) in place.
 hermes a365 register --agent-name "Inbox Helper" \
+    --tenant-id "<tenant-guid>" \
     --m365 --apply --auto-recover-secret
 
 # 4. (Verify admin consent — usually granted automatically by setup blueprint;
