@@ -848,6 +848,17 @@ def apply_publish_plan(
             "no canonical tenant pin was resolved; pass --tenant-id or set "
             "A365_TENANT_ID before publishing"
         )
+    # The a365 mutator refuses every argv, including `az account show`, when
+    # the a365 binary is missing. That used to surface as a tenant-verification
+    # failure (#123 F5).
+    if getattr(mutator, "available", True) is False:
+        raise PublishError(
+            "a365 CLI not found on PATH. Install the Agent 365 CLI "
+            "(dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease) "
+            "and put its directory on PATH. publish --apply did not verify the "
+            "Azure tenant because the a365 command runner rejects every "
+            "invocation, including `az account show`, when that binary is missing."
+        )
     active = active_az_tenant(lambda argv: mutator.run(argv))
     if active is None:
         raise PublishError("could not verify the active Azure tenant")

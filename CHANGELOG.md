@@ -10,6 +10,32 @@ Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
 Gated by the #123 focused hardening walk. Entries accumulate here per PR and
 this heading is dated at release.
 
+### Walk findings (#102, #123)
+
+- **Orphan deletion requires a Graph ownership proof.** `cleanup` (including
+  its bot-service step) no longer plans deletion of an agent instance, agent
+  identity, or agentic user just because the object id was typed twice.
+  The only local anchor is per-agent `A365_APP_ID`. A sidecar `msaAppId`
+  counts only when it is that same id. Object and identity GUIDs in the
+  cwd `a365.generated.config.json` are not anchors. Graph is asked for the
+  application object id of `A365_APP_ID`, and a record matches only when
+  its `agentIdentityBlueprintId` or `managedBy` is that app id or object
+  id. `agentIdentityId` is not proof. The returned instance `id`, each
+  filtered instance's `agentUserId`, and a service principal `id` must
+  equal the typed id. A live user of a different agent is refused, and a
+  lookup that cannot prove ownership is refused. Double entry remains a
+  second gate after that proof.
+- **Direct Line verify distinguishes an allowlist 403.** After the bot token
+  check succeeds, HTTP 403 is reported as "auth OK, probe user
+  `hermes-a365-verify` is not allowlisted", with guidance to set
+  `A365_ALLOWED_USERS` or `A365_ALLOW_ALL_USERS`. It is not reported as a
+  Bot Framework credential rejection. The gateway logs that case as
+  `403 reason=unauthorized-end-user`.
+- **`publish --apply` names a missing `a365` CLI.** When the a365 binary is
+  not on PATH, the command says so instead of "could not verify the active
+  Azure tenant". The runner rejects every invocation, including
+  `az account show`, until the CLI is installed.
+
 ### Secrets at rest (#19)
 
 - **A `SecretsProvider` seam now backs both client secrets.** New
