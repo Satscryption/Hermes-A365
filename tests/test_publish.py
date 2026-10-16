@@ -236,6 +236,16 @@ class TestApplyPublish:
             _apply_publish_plan(plan, mutator=mutator)
         assert mutator.calls == []
 
+    def test_missing_a365_cli_is_not_a_tenant_verification_failure(self) -> None:
+        plan = build_publish_plan(
+            PublishInputs(agent_name="x", tenant_id=_TEST_TENANT)
+        )
+        mutator = FakeMutator(available=False)
+        with pytest.raises(PublishError, match="a365 CLI not found on PATH") as exc:
+            _apply_publish_plan(plan, mutator=mutator)
+        assert "could not verify the active Azure tenant" not in str(exc.value)
+        assert mutator.calls == []
+
     def test_surfaces_package_path_when_visible_aiteammate(self) -> None:
         # Slice 18t (bug #14): zip extraction only runs in AI Teammate flow.
         plan = build_publish_plan(PublishInputs(agent_name="x", aiteammate=True))

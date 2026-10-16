@@ -10,6 +10,32 @@ Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
 Gated by the #123 focused hardening walk. Entries accumulate here per PR and
 this heading is dated at release.
 
+### Walk findings (#102, #123)
+
+- **Orphan deletion requires a Graph ownership proof.** `cleanup` (including
+  its bot-service step) no longer plans deletion of an agent instance, agent
+  identity, or agentic user just because the object id was typed twice.
+  Before the id is listed, Graph must show that the instance's blueprint /
+  managing app, or the user's agent instance / agent identity, matches this
+  agent's bound blueprint record (`A365_APP_ID` and a generated config with
+  the same `agentBlueprintId`) or Bot Service sidecar (`agentName` plus
+  `msaAppId`). A live user of a different agent is refused, and a lookup
+  that cannot prove ownership is refused. Double entry remains a second
+  gate after that proof.
+- **Direct Line verify distinguishes an allowlist 403.** After the bot token
+  check succeeds, HTTP 403 is reported as "auth OK, probe user
+  `hermes-a365-verify` is not allowlisted", with guidance to set
+  `A365_ALLOWED_USERS` or `A365_ALLOW_ALL_USERS`. It is not reported as a
+  Bot Framework credential rejection. The gateway logs that case as
+  `403 reason=unauthorized-end-user`.
+- **`publish --apply` names a missing `a365` CLI.** When the a365 binary is
+  not on PATH, the command says so instead of "could not verify the active
+  Azure tenant". The runner rejects every invocation, including
+  `az account show`, until the CLI is installed.
+- **Benign typing cancellation is a debug log.** A Teams turn cancels the
+  in-flight typing POST when the reply supersedes it. That expected
+  cancellation is logged at debug, not as a warning.
+
 ### Secrets at rest (#19)
 
 - **A `SecretsProvider` seam now backs both client secrets.** New

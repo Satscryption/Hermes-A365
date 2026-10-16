@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import logging
 import sys
 import time
 import types
@@ -4969,6 +4970,59 @@ class TestSendTyping:
         )
         # Must not raise — gateway typing pulse runs in a hot path.
         await a.send_typing("conv-1")
+
+    @pytest.mark.asyncio
+    async def test_expected_cancellation_is_debug_not_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-T"))
+        )
+
+        async def _cancelled(**_kwargs: Any) -> None:
+            raise RuntimeError("agent365 outbound operation cancelled")
+
+        a._post_activity = _cancelled
+        caplog.set_level(logging.DEBUG, logger="hermes_a365.plugin.adapter")
+        await a.send_typing("conv-T")
+
+        warnings = [
+            record
+            for record in caplog.records
+            if record.levelno >= logging.WARNING and "send_typing" in record.message
+        ]
+        assert warnings == []
+        assert any(
+            record.levelno == logging.DEBUG and "send_typing cancelled" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_typing_failure_stays_a_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-T"))
+        )
+
+        async def _failed(**_kwargs: Any) -> None:
+            raise RuntimeError("token mint failed")
+
+        a._post_activity = _failed
+        caplog.set_level(logging.DEBUG, logger="hermes_a365.plugin.adapter")
+        await a.send_typing("conv-T")
+
+        assert any(
+            record.levelno == logging.WARNING and "send_typing failed" in record.message
+            for record in caplog.records
+        )
+        assert not any("send_typing cancelled" in record.message for record in caplog.records)
 
 
 class TestSendImage:

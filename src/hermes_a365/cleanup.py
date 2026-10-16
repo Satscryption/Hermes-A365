@@ -34,9 +34,10 @@ import re
 import shlex
 import stat
 import sys
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 from uuid import UUID
 
 from . import a365_config, bot_service
@@ -44,6 +45,7 @@ from ._common import (
     TenantResolutionError,
     active_az_tenant,
     ensure_contained,
+    parse_env,
     resolve_expected_tenant,
     slugify,
     tenant_ids_match,
@@ -212,7 +214,10 @@ class CleanupPlan:
             for p in self.local_paths:
                 lines.append(f"    - {p}")
         if self.orphan_instance_ids:
-            lines.append("  orphan agentRegistry instances requiring double entry:")
+            lines.append(
+                "  orphan agentRegistry instances (Graph ownership verified; "
+                "deletion still requires double entry):"
+            )
             for instance_id in self.orphan_instance_ids:
                 lines.append(f"    - {instance_id}")
                 lines.append(
@@ -220,7 +225,10 @@ class CleanupPlan:
                     f"--purge-orphans --confirm-orphan {instance_id}"
                 )
         if self.orphan_user_ids:
-            lines.append("  orphan agentic users requiring double entry:")
+            lines.append(
+                "  orphan agentic users (Graph ownership verified; "
+                "deletion still requires double entry):"
+            )
             for user_id in self.orphan_user_ids:
                 lines.append(f"    - {user_id}")
                 lines.append(
@@ -271,6 +279,7 @@ def build_cleanup_plan(
     generated_config_path: Path | None = None,
     additional_orphan_instance_ids: tuple[str, ...] = (),
     additional_orphan_user_ids: tuple[str, ...] = (),
+    graph_get: GraphGet | None = None,
 ) -> CleanupPlan:
     """Compose the ordered list of CLI cleanup steps + local artefact list.
 
@@ -312,6 +321,27 @@ def build_cleanup_plan(
             )
         )
 
+    # Capture candidates while the generated config still exists so a verified
+    # id can be double-entered on apply after the CLI removes that file.
+    orphan_user_ids = _collect_orphan_user_ids(additional_orphan_user_ids)
+    orphan_instance_ids = _collect_orphan_instance_ids(
+        generated_config_path, additional_orphan_instance_ids
+    )
+    # #123 4f / #102 L6: do not plan a deletion until Graph proves the object
+    # belongs to this agent's blueprint or sidecar records. Double entry alone
+    # offered to delete another agent's live agentic user.
+    _require_verified_orphan_ownership(
+        agent_name=inputs.agent_name,
+        hermes_home=hermes_home,
+        slug=inputs.resolved_slug,
+        generated_config_path=generated_config_path,
+        sidecar_config=(
+            bot_service_plan.config if bot_service_plan is not None else None
+        ),
+        user_ids=orphan_user_ids,
+        instance_ids=orphan_instance_ids,
+        graph_get=graph_get,
+    )
     return CleanupPlan(
         inputs=inputs,
         steps=steps,
@@ -319,12 +349,8 @@ def build_cleanup_plan(
         # artefacts this run's kinds may actually remove.
         local_paths=_local_artefacts(hermes_home, inputs.resolved_slug, normalized_kinds),
         bot_service_plan=bot_service_plan,
-        orphan_user_ids=_collect_orphan_user_ids(additional_orphan_user_ids),
-        # Capture candidates while the generated config still exists so the
-        # dry-run tells the operator exactly what to double-enter on apply.
-        orphan_instance_ids=_collect_orphan_instance_ids(
-            generated_config_path, additional_orphan_instance_ids
-        ),
+        orphan_user_ids=orphan_user_ids,
+        orphan_instance_ids=orphan_instance_ids,
     )
 
 
@@ -434,6 +460,223 @@ def _collect_orphan_user_ids(
     return tuple(candidates)
 
 
+# Graph ownership (#123 walk 4f / #102 L6). Typing an object id twice is not
+# proof it belongs to this agent: a throwaway cleanup planned deletion of a
+# different agent's live agentic user. agentInstance.agentIdentityBlueprintId
+# is the blueprint object id, agentIdentity.agentIdentityBlueprintId is the
+# blueprint app id, and managedBy is the managing app's appId.
+GraphGet = Callable[[str], dict[str, Any] | None]
+_AGENT_USER_FILTER_URL = (
+    "https://graph.microsoft.com/beta/agentRegistry/agentInstances"
+    "?$filter=agentUserId eq '{user_id}'"
+)
+_AGENT_IDENTITY_URL = (
+    "https://graph.microsoft.com/beta/servicePrincipals/{object_id}"
+    "?$select=id,appId,servicePrincipalType,agentIdentityBlueprintId"
+)
+
+
+@dataclass(frozen=True)
+class _OwnershipAnchors:
+    blueprint_ids: frozenset[str]
+    agent_identity_ids: frozenset[str]
+
+
+def _uuid_text(value: object) -> str:
+    if not isinstance(value, str):
+        return ""
+    try:
+        return str(UUID(value.strip()))
+    except (ValueError, AttributeError):
+        return ""
+
+
+def _read_json_dict(path: Path) -> dict[str, Any] | None:
+    try:
+        raw = path.read_text()
+    except OSError:
+        return None
+    try:
+        parsed = json.loads(raw)
+    except json.JSONDecodeError:
+        return None
+    return parsed if isinstance(parsed, dict) else None
+
+
+def _ownership_anchors(
+    *,
+    agent_name: str,
+    hermes_home: Path,
+    slug: str,
+    generated_config_path: Path,
+    sidecar_config: bot_service.BotServiceConfig | None,
+) -> _OwnershipAnchors:
+    """Ids from records bound to this agent, not from the orphan id itself."""
+    blueprint: set[str] = set()
+    identities: set[str] = set()
+    env_path = _agent_dir(hermes_home, slug) / ".env"
+    env: dict[str, str] = {}
+    if env_path.is_file():
+        try:
+            env = parse_env(env_path.read_text())
+        except OSError:
+            env = {}
+    app_id = _uuid_text(env.get("A365_APP_ID", ""))
+    if app_id:
+        blueprint.add(app_id)
+    if sidecar_config is not None and sidecar_config.agentName == agent_name:
+        msa_app_id = _uuid_text(sidecar_config.msaAppId)
+        if msa_app_id:
+            blueprint.add(msa_app_id)
+    generated = _read_json_dict(generated_config_path)
+    # The generated file is selected by cwd. Trust its blueprint object ids
+    # only when its app id matches the per-agent env, which is bound to --agent-name.
+    if generated and app_id and _uuid_text(generated.get("agentBlueprintId")) == app_id:
+        for key in (
+            "agentBlueprintId",
+            "agentBlueprintObjectId",
+            "agentBlueprintServicePrincipalObjectId",
+        ):
+            found = _uuid_text(generated.get(key))
+            if found:
+                blueprint.add(found)
+        for key in ("agentIdentityId", "agentIdentityObjectId"):
+            found = _uuid_text(generated.get(key))
+            if found:
+                identities.add(found)
+    return _OwnershipAnchors(frozenset(blueprint), frozenset(identities))
+
+
+def _linked_ids(record: dict[str, Any]) -> set[str]:
+    found: set[str] = set()
+    for key in ("agentIdentityBlueprintId", "managedBy", "agentIdentityId"):
+        parsed = _uuid_text(record.get(key))
+        if parsed:
+            found.add(parsed)
+    return found
+
+
+def _record_belongs(record: dict[str, Any], anchors: _OwnershipAnchors) -> bool:
+    return bool(_linked_ids(record) & (anchors.blueprint_ids | anchors.agent_identity_ids))
+
+
+def _instances_from_graph(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if not isinstance(payload, dict) or payload.get("error"):
+        return []
+    value = payload.get("value")
+    if isinstance(value, list):
+        return [item for item in value if isinstance(item, dict)]
+    if payload.get("id"):
+        return [payload]
+    return []
+
+
+def _graph_get_from_mutator(mutator: Mutator) -> GraphGet:
+    def graph_get(url: str) -> dict[str, Any] | None:
+        try:
+            result = mutator.run(["az", "rest", "--method", "GET", "--uri", url])
+        except (CliInvocationError, AADSTSError, OSError):
+            return None
+        stdout = result.stdout or ""
+        start = stdout.find("{")
+        if start < 0:
+            return None
+        try:
+            data, _end = json.JSONDecoder().raw_decode(stdout[start:])
+        except json.JSONDecodeError:
+            return None
+        return data if isinstance(data, dict) else None
+
+    return graph_get
+
+
+def _require_verified_orphan_ownership(
+    *,
+    agent_name: str,
+    hermes_home: Path,
+    slug: str,
+    generated_config_path: Path,
+    sidecar_config: bot_service.BotServiceConfig | None,
+    user_ids: tuple[str, ...],
+    instance_ids: tuple[str, ...],
+    graph_get: GraphGet | None,
+) -> None:
+    """Raise unless every candidate is Graph-proven to belong to this agent."""
+    if not user_ids and not instance_ids:
+        return
+    if graph_get is None:
+        raise CleanupError(
+            "refusing to plan orphan deletion without a Graph ownership lookup. "
+            "Typing the object id twice does not prove the agentic user or agent "
+            "identity belongs to this agent."
+        )
+    anchors = _ownership_anchors(
+        agent_name=agent_name,
+        hermes_home=hermes_home,
+        slug=slug,
+        generated_config_path=generated_config_path,
+        sidecar_config=sidecar_config,
+    )
+    if not anchors.blueprint_ids and not anchors.agent_identity_ids:
+        raise CleanupError(
+            "refusing to plan orphan deletion: no blueprint or sidecar record is "
+            f"bound to {agent_name!r}. Bind per-agent A365_APP_ID, a generated "
+            "config whose agentBlueprintId matches it, or a Bot Service sidecar "
+            "whose agentName matches, then re-run so Graph can prove ownership."
+        )
+    for instance_id in instance_ids:
+        payload = graph_get(_AGENT_INSTANCES_GRAPH_URL.format(instance_id=instance_id))
+        record = payload if isinstance(payload, dict) and not payload.get("error") else None
+        if record is not None and _record_belongs(record, anchors):
+            continue
+        if record is not None and _linked_ids(record):
+            raise CleanupError(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                "Graph shows it belongs to a different blueprint or agent "
+                "identity than this agent's sidecar and blueprint records."
+            )
+        raise CleanupError(
+            f"refusing to plan deletion of agent instance {instance_id}: "
+            "Graph lookup did not prove it belongs to this agent's blueprint "
+            "or sidecar records."
+        )
+    for user_id in user_ids:
+        listed = graph_get(_AGENT_USER_FILTER_URL.format(user_id=user_id))
+        instances = _instances_from_graph(listed if isinstance(listed, dict) else None)
+        if instances:
+            if all(_record_belongs(item, anchors) for item in instances):
+                continue
+            if any(_linked_ids(item) for item in instances):
+                raise CleanupError(
+                    f"refusing to plan deletion of agentic user {user_id}: Graph "
+                    "shows this is the live agent user of a different agent's "
+                    "identity, not this agent's blueprint or sidecar records."
+                )
+            raise CleanupError(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                "lookup did not prove the agentic user belongs to this agent's "
+                "blueprint or sidecar records."
+            )
+        identity = graph_get(_AGENT_IDENTITY_URL.format(object_id=user_id))
+        if (
+            isinstance(identity, dict)
+            and not identity.get("error")
+            and _record_belongs(identity, anchors)
+        ):
+            continue
+        if isinstance(identity, dict) and _linked_ids(identity):
+            raise CleanupError(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                "shows this agent identity belongs to a different blueprint "
+                "than this agent's sidecar and blueprint records."
+            )
+        raise CleanupError(
+            f"refusing to plan deletion of agentic user {user_id}: Graph lookup "
+            "did not prove the agentic user or agent identity belongs to this "
+            "agent's blueprint or sidecar records."
+        )
+
+
 @dataclass
 class CleanupResult:
     plan: CleanupPlan
@@ -465,6 +708,7 @@ def apply_cleanup_plan(
     additional_orphan_user_ids: tuple[str, ...] = (),
     confirmed_orphan_user_ids: tuple[str, ...] = (),
     bot_service_runner: bot_service.CommandRunner | None = None,
+    graph_get: GraphGet | None = None,
 ) -> CleanupResult:
     """Run each cloud step in order; on success, remove local artefacts.
 
@@ -536,6 +780,22 @@ def apply_cleanup_plan(
             "If a prior cleanup removed a365.generated.config.json, pass each id "
             "again with --orphan-instance-id as well as --confirm-orphan."
         )
+
+    # Re-check before any mutation. A plan can be built in one process and
+    # applied in another, and ids can appear between the two calls.
+    sidecar_config = (
+        plan.bot_service_plan.config if plan.bot_service_plan is not None else None
+    )
+    _require_verified_orphan_ownership(
+        agent_name=plan.inputs.agent_name,
+        hermes_home=hermes_home,
+        slug=plan.inputs.resolved_slug,
+        generated_config_path=generated_config_path,
+        sidecar_config=sidecar_config,
+        user_ids=candidate_user_ids,
+        instance_ids=tuple(candidate_instance_ids),
+        graph_get=graph_get,
+    )
 
     # #102 M7: bind the WHOLE teardown to the persisted tenant BEFORE any
     # destructive step. The a365 subcommands auto-detect their tenant from the
@@ -680,8 +940,25 @@ def apply_cleanup_plan(
         result.completed.append(step.kind)
         result.messages.append(f"[apply] {step.kind}: {step.description} — done")
         for oid in _parse_orphan_user_ids(run.stdout):
-            if oid not in result.orphan_user_ids:
+            if oid in result.orphan_user_ids or oid in result.orphans_remaining:
+                continue
+            try:
+                _require_verified_orphan_ownership(
+                    agent_name=plan.inputs.agent_name,
+                    hermes_home=hermes_home,
+                    slug=plan.inputs.resolved_slug,
+                    generated_config_path=generated_config_path,
+                    sidecar_config=sidecar_config,
+                    user_ids=(oid,),
+                    instance_ids=(),
+                    graph_get=graph_get,
+                )
+            except CleanupError as exc:
                 result.orphan_user_ids.append(oid)
+                result.orphans_remaining.append(oid)
+                result.messages.append(f"[apply] {exc}")
+                continue
+            result.orphan_user_ids.append(oid)
 
     for oid in candidate_user_ids:
         if oid not in result.orphan_user_ids:
@@ -740,6 +1017,8 @@ def apply_cleanup_plan(
     # cleanup itself when asked. Off by default; opt-in with
     # ``--purge-orphans`` so the CLI invocation set stays auditable.
     for oid in result.orphan_user_ids:
+        if oid in result.orphans_remaining:
+            continue
         if not purge_orphans:
             result.orphans_remaining.append(oid)
             result.messages.append(
@@ -931,13 +1210,9 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         default=[],
         metavar="GUID",
         help=(
-            "re-type an orphan instance id to authorise its Graph DELETE "
-            "under --purge-orphans. Double-entry guard: a typo'd "
-            "instance id would delete an UNRELATED agentRegistry instance, "
-            "and the wrapper has no Graph read with which to verify "
-            "ownership. Snapshot-derived ids from a365.generated.config.json "
-            "also require confirmation because that file is selected by the "
-            "working directory, not bound to --agent-name. May be repeated."
+            "re-type an orphan instance id whose Graph ownership was already "
+            "verified against this agent's blueprint or sidecar records. "
+            "Double entry alone does not authorise deletion. May be repeated."
         ),
     )
     parser.add_argument(
@@ -956,8 +1231,9 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         default=[],
         metavar="GUID",
         help=(
-            "re-type an orphaned agentic-user id previously surfaced by cleanup "
-            "to authorise `az ad user delete`. May be repeated."
+            "re-type an orphaned agentic-user id whose Graph ownership was "
+            "already verified against this agent's blueprint or sidecar "
+            "records. May be repeated."
         ),
     )
     return parser
@@ -986,6 +1262,8 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
+    mutator = get_mutator()
+    graph_get = _graph_get_from_mutator(mutator)
     try:
         # #103/M9: building the plan resolves ``resolved_slug`` (which rejects
         # traversal-shaped ``--slug`` values); surface that as a clean rc=2.
@@ -993,6 +1271,7 @@ def run(args: argparse.Namespace) -> int:
             inputs,
             additional_orphan_instance_ids=tuple(args.orphan_instance_id),
             additional_orphan_user_ids=tuple(args.orphan_user_id),
+            graph_get=graph_get,
         )
     except (ValueError, CleanupError, bot_service.BotServiceError) as e:
         print(f"ERROR: {e}", file=sys.stderr)
@@ -1024,13 +1303,14 @@ def run(args: argparse.Namespace) -> int:
     try:
         result = apply_cleanup_plan(
             plan,
-            mutator=get_mutator(),
+            mutator=mutator,
             hermes_home=_resolve_hermes_home(),
             purge_orphans=args.purge_orphans,
             additional_orphan_instance_ids=tuple(args.orphan_instance_id),
             confirmed_orphan_instance_ids=tuple(args.confirm_orphan),
             additional_orphan_user_ids=tuple(args.orphan_user_id),
             confirmed_orphan_user_ids=tuple(args.confirm_orphan_user),
+            graph_get=graph_get,
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)

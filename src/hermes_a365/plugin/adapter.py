@@ -885,6 +885,26 @@ def _import_bridge() -> Any:
     return activity_bridge
 
 
+def _expected_typing_cancellation(exc: BaseException) -> bool:
+    """True when a typing POST was cancelled because the turn moved on.
+
+    The gateway pulses typing and then cancels that outbound call once the
+    reply is ready. ``_await_outbound`` rewrites the cancellation as
+    ``RuntimeError("agent365 outbound operation cancelled")``. That happens
+    on every Teams turn and is not a delivery failure.
+    """
+    current: BaseException | None = exc
+    for _ in range(5):
+        if current is None:
+            return False
+        if isinstance(current, asyncio.CancelledError):
+            return True
+        if "outbound operation cancelled" in str(current):
+            return True
+        current = current.__cause__ or current.__context__
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Adapter
 # ---------------------------------------------------------------------------
@@ -5263,8 +5283,14 @@ class Agent365Adapter(BasePlatformAdapter):
             await self._post_activity(inbound=inbound, activity=typing_activity)
         except Exception as e:
             # Typing failures are best-effort — never raise into the
-            # gateway's pulse loop.
-            logger.warning("agent365 send_typing failed for %s: %s", chat_id, e)
+            # gateway's pulse loop. Cancellation is expected: the gateway
+            # drops the in-flight typing POST when the turn reply supersedes
+            # it, and _await_outbound rewrites that as
+            # "outbound operation cancelled".
+            if _expected_typing_cancellation(e):
+                logger.debug("agent365 send_typing cancelled for %s: %s", chat_id, e)
+            else:
+                logger.warning("agent365 send_typing failed for %s: %s", chat_id, e)
         return None
 
     async def send_image(
