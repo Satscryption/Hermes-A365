@@ -215,13 +215,22 @@ real time. Use the wrapper directly:
 ```bash
 hermes-a365 register \
     --agent-name "<display-name>" \
+    --tenant-id "<tenant-guid>" \
     --m365 \
     --apply
 ```
 
-(Drop `--m365` for blueprint-only flow without messaging endpoint
-registration. Add `--tenant-id <id>` to skip the `az account show`
-auto-detect.)
+`--tenant-id` is required before `--apply` unless `A365_TENANT_ID` is
+already set in the operator env (`~/.hermes/.env`). The wrapper checks
+`az account show` against that pin and refuses when they differ. It does
+not take the pin from the ambient az account. A dry-run with no pin still
+prints the plan and says `--apply` will refuse.
+
+`--m365` is forwarded to `a365 setup blueprint`. On current a365 CLI
+builds that flag does not register the messaging endpoint by itself
+(the CLI says so). Register the endpoint after the tunnel exists with
+`activity-bridge update-endpoint`, which passes `--m365 --update-endpoint`.
+Drop `--m365` only when you do not want that flag forwarded.
 
 Behind the flag: `register --apply` runs `a365 setup blueprint
 [--m365]`, then `setup permissions mcp`, then `setup permissions bot`,

@@ -1741,6 +1741,105 @@ def test_directline_probe_percent_encodes_conversation_id(
     assert "../" not in after
 
 
+def test_directline_403_after_token_check_names_the_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_a365 import bot_service
+
+    cfg = BotServiceConfig(
+        schemaVersion=1,
+        subscriptionId=SUBSCRIPTION_ID,
+        resourceGroup="hermes-a365-bots",
+        botName="hermes-inbox-helper-bot",
+        armResourceId=(
+            "/subscriptions/sub/resourceGroups/rg/providers/"
+            "Microsoft.BotService/botServices/bot"
+        ),
+        msaAppId=BF_APP_ID,
+        tenantId=TENANT_ID,
+        messagingEndpoint="https://example.test/api/messages",
+        channelsEnabled=["webchat", "directline"],
+        createdAt="2026-05-18T12:30:00Z",
+        resourceGroupManaged=False,
+    )
+
+    class _SecretRunner:
+        def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+            return CommandResult(
+                argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}})
+            )
+
+    def _allowlisted_403(
+        url: str,
+        *,
+        token: str,
+        body: dict[str, Any] | None = None,
+        timeout: float = 20.0,
+    ) -> tuple[int, dict[str, Any]]:
+        if url.endswith("/v3/directline/conversations"):
+            return 201, {"conversationId": "conv-probe", "token": "conv-token"}
+        assert body is not None
+        assert body["from"]["id"] == "hermes-a365-verify"
+        return 403, {"error": "end user is not authorized"}
+
+    monkeypatch.setattr(bot_service, "_http_json", _allowlisted_403)
+    result = directline_runtime_probe(cfg, _SecretRunner())
+
+    assert result.status == "ERROR"
+    assert "auth OK" in result.detail
+    assert "not allowlisted" in result.detail
+    assert "A365_ALLOWED_USERS" in result.detail
+    assert "hermes-a365-verify" in result.detail
+    assert "rejected a Path B BF Connector token" not in result.detail
+
+
+def test_directline_403_with_token_failure_stays_a_credential_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_a365 import bot_service
+
+    cfg = BotServiceConfig(
+        schemaVersion=1,
+        subscriptionId=SUBSCRIPTION_ID,
+        resourceGroup="hermes-a365-bots",
+        botName="hermes-inbox-helper-bot",
+        armResourceId=(
+            "/subscriptions/sub/resourceGroups/rg/providers/"
+            "Microsoft.BotService/botServices/bot"
+        ),
+        msaAppId=BF_APP_ID,
+        tenantId=TENANT_ID,
+        messagingEndpoint="https://example.test/api/messages",
+        channelsEnabled=["webchat", "directline"],
+        createdAt="2026-05-18T12:30:00Z",
+        resourceGroupManaged=False,
+    )
+
+    class _SecretRunner:
+        def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+            return CommandResult(
+                argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}})
+            )
+
+    def _token_403(
+        url: str,
+        *,
+        token: str,
+        body: dict[str, Any] | None = None,
+        timeout: float = 20.0,
+    ) -> tuple[int, dict[str, Any]]:
+        if url.endswith("/v3/directline/conversations"):
+            return 201, {"conversationId": "conv-probe", "token": "conv-token"}
+        return 403, {"code": "BotError", "error": "invalid_token"}
+
+    monkeypatch.setattr(bot_service, "_http_json", _token_403)
+    result = directline_runtime_probe(cfg, _SecretRunner())
+
+    assert result.status == "ERROR"
+    assert "rejected a Path B BF Connector token" in result.detail
+    assert "not allowlisted" not in result.detail
+
+
 def test_verify_errors_when_teams_terms_not_accepted(tmp_path: Path) -> None:
     sidecar = _write_sidecar(tmp_path)
     runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams(accepted=False))

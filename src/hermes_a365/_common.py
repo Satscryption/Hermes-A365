@@ -202,6 +202,19 @@ def parse_env(text: str) -> dict[str, str]:
     return out
 
 
+# #102 M7: `--apply` refuses unless the operator pinned a tenant. The active
+# `az account show` tenant is the value we compare against, not the pin.
+UNPINNED_TENANT_PLAN_LINE = (
+    "  tenant: (no canonical pin — pass --tenant-id or set A365_TENANT_ID; "
+    "--apply refuses rather than using the ambient az account)"
+)
+TENANT_ID_HELP = (
+    "canonical tenant GUID required before --apply. An explicit value wins; "
+    "otherwise A365_TENANT_ID in the operator env is used. `az account show` "
+    "is checked against that pin and is not used as the pin"
+)
+
+
 def resolve_expected_tenant(
     hermes_home: Path, explicit: str | None
 ) -> tuple[str | None, str]:
