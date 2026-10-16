@@ -6948,17 +6948,21 @@ class TestEditMessage:
     async def test_read_timeout_after_send_is_not_retried(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        # The activity POST itself timed out after the request was sent.
+        # Real send_reply marks that, and the flush does not retry it.
+        import httpx
+
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-read", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
         bridge = adapter_mod._import_bridge()
-
-        class ReadTimeout(Exception):
-            pass
-
-        send_reply_mock = AsyncMock(side_effect=ReadTimeout())
-        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "A")),
+        )
+        post_mock.side_effect = httpx.ReadTimeout("The read operation timed out")
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0)
         event = _StubMessageEvent(
             text="hi",
@@ -6970,8 +6974,54 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         await asyncio.sleep(0)
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == 1
+        assert post_mock.await_count == 1
         assert "conv-G-read" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_token_acquisition_timeout_is_retried(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # acquire_reply_token runs before the activity POST. A read
+        # timeout there has not stored the reply. Real send_reply must
+        # leave the segment buffered for the deferred retry.
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-token", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        calls = {"n": 0}
+
+        async def acquire_reply_token(**_kwargs: Any) -> tuple[str, str]:
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise httpx.ReadTimeout("The read operation timed out")
+            return "bearer-test", "A"
+
+        monkeypatch.setattr(bridge, "acquire_reply_token", acquire_reply_token)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-token"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-token", content="Still ours", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        buf = a._turn_buffers.get("conv-G-token")
+        if buf is not None:
+            assert [segment["text"] for segment in buf["segments"]] == ["Still ours"]
+            assert post_mock.await_count == 0
+            retry = buf.get("retry_task")
+            assert isinstance(retry, asyncio.Task)
+            await retry
+        assert calls["n"] == 2
+        assert post_mock.await_count == 1
+        assert post_mock.await_args.kwargs["headers"]["Authorization"] == (
+            "Bearer bearer-test"
+        )
+        assert "conv-G-token" not in a._turn_buffers
 
     @pytest.mark.asyncio
     async def test_interim_tool_and_final_are_one_activity(

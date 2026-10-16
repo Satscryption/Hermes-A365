@@ -662,6 +662,8 @@ def _hermes_progress_target_is_sentence(target: str) -> bool:
 # activity was already stored is retried later, not inside the same flush.
 _TURN_BUFFER_RETRY_DELAY_SEC = 0.2
 _TURN_BUFFER_DEFERRED_RETRY_LIMIT = 3
+# ``send_reply`` raises this only when the activity POST itself times out
+# after the request was sent. A token-mint timeout does not use it.
 _POST_SEND_TIMEOUT_MARKER = "timeout after the request was sent"
 
 
@@ -669,19 +671,6 @@ def _consume_turn_buffer_retry_result(task: asyncio.Task[Any]) -> None:
     with contextlib.suppress(asyncio.CancelledError, Exception):
         if not task.cancelled():
             task.result()
-
-
-def _request_may_already_be_stored(exc: BaseException) -> bool:
-    """True when retrying the POST could create a second bubble.
-
-    A read or write timeout means the request left the client. Bot
-    Framework may already have stored the activity, and there is no
-    idempotency key. Connect failures and explicit ``post failed``
-    errors have not been stored and stay retryable.
-    """
-    if _POST_SEND_TIMEOUT_MARKER in str(exc).casefold():
-        return True
-    return type(exc).__name__ in {"ReadTimeout", "WriteTimeout"}
 
 
 def _is_hermes_tool_progress_line(line: str) -> bool:
@@ -4385,13 +4374,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         except Exception as e:
             logger.error("agent365 %s send_reply failed: %s", log_context, e)
-            error = str(e)
-            if (
-                _request_may_already_be_stored(e)
-                and _POST_SEND_TIMEOUT_MARKER not in error.casefold()
-            ):
-                error = f"{_POST_SEND_TIMEOUT_MARKER}: {error}"
-            return SendResult(success=False, error=error)
+            return SendResult(success=False, error=str(e))
         if not self._lifecycle_is_current(
             generation, client
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):

@@ -412,8 +412,10 @@ this heading is dated at release.
   returns success. A failed flush does not retry inside that call.
   When no turn is open and segments remain, a deferred retry posts
   them, so one reply is not stranded until the next user turn. A chunk
-  that timed out after the request was sent is treated as possibly
-  delivered and is not posted again. Operational notices default to
+  whose activity POST timed out after the request was sent is treated
+  as possibly delivered and is not posted again. A timeout or failure
+  while acquiring the reply token happens before that POST, so the
+  segments stay and the deferred retry runs. Operational notices default to
   `config.extra["notice_delivery"] = "private"` and are withheld on
   non-personal chats. A caller cancellation of `_await_outbound`
   propagates unless the adapter is tearing the chat down, so turn-end
