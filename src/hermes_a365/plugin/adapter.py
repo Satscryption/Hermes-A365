@@ -42,6 +42,7 @@ Configuration in ``config.yaml``::
             host: 127.0.0.1                       # bind interface
             blueprint_client_secret: ""           # or via env
             generated_config_path: ""             # default cwd/a365.generated.config.json
+            notice_delivery: private              # withhold ops notices off 1:1
 
 Or via environment variables:
 
@@ -908,6 +909,15 @@ class Agent365Adapter(BasePlatformAdapter):
 
     def __init__(self, config: PlatformConfig, **_kwargs: Any) -> None:
         super().__init__(config=config, platform=Platform("agent365"))
+
+        # Hermes reads ``adapter.config.extra["notice_delivery"]`` when
+        # routing setup/operational notices (the ``/sethome`` home-channel
+        # prompt). The gateway default is public, which posts that notice
+        # into Copilot Chat and it becomes the turn's visible reply.
+        # Private tells the gateway to call ``send_private_notice`` instead.
+        config_extra = getattr(config, "extra", None)
+        if isinstance(config_extra, dict):
+            config_extra.setdefault("notice_delivery", "private")
 
         extra = getattr(config, "extra", {}) or {}
         self._hermes_home = _active_hermes_home()
@@ -3760,11 +3770,17 @@ class Agent365Adapter(BasePlatformAdapter):
         chunk (``reply_to`` present) starts a local coalescing buffer
         instead of POSTing immediately. ``edit_message(finalize=True)``
         later emits one normal ``send_reply`` with the final text.
+        A plain final reply never sends that finalize signal (#123
+        live walk). ``on_processing_complete`` flushes the buffer when
+        the turn ends so it does not wait on the stale-buffer watchdog.
 
         Suppress one-shot non-streaming sends while a stream is active;
         Copilot Chat renders interleaved progress/fallback activities
         as separate bubbles. A new streaming first chunk must first
         finalize the prior stream successfully before opening another.
+        An unscoped send is suppressed for an open coalesced reply only
+        when it belongs to that same turn, and the result is a failure
+        so dropped text is not reported as delivered.
 
         Fallback to a non-streaming ``message`` activity when the
         streaming-start POST itself fails.
@@ -3885,6 +3901,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if (
             reply_to is None
             and self._coalesced_generation_count_by_chat.get(chat_id, 0) > 0
+            and self._unscoped_send_shares_active_coalesced_turn(chat_id)
         ):
             active_msg_id = self._active_coalesced_reply_by_chat.get(chat_id, "")
             logger.info(
@@ -3893,7 +3910,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
                 active_msg_id,
             )
-            return SendResult(success=True, message_id=active_msg_id)
+            # Same-turn progress is not a separate bubble. Reporting success
+            # would tell Hermes the text was delivered.
+            return SendResult(
+                success=False,
+                error=(
+                    "agent365 send suppressed while coalesced reply active: "
+                    f"chat_id={chat_id} active_message_id={active_msg_id}"
+                ),
+            )
 
         if (
             chat_type == "personal"
@@ -3998,6 +4023,121 @@ class Agent365Adapter(BasePlatformAdapter):
                 error=f"agent365 {log_context}: adapter lifecycle changed",
             )
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
+
+    @staticmethod
+    def _chat_id_from_processing_event(event: Any) -> str:
+        source = getattr(event, "source", None)
+        chat_id = getattr(source, "chat_id", None)
+        if chat_id:
+            return str(chat_id)
+        raw = getattr(event, "raw_message", None)
+        if isinstance(raw, dict):
+            conv = raw.get("conversation")
+            if isinstance(conv, dict) and conv.get("id"):
+                return str(conv["id"])
+        return ""
+
+    async def on_processing_complete(self, event: Any, outcome: Any = None) -> None:
+        """Flush this chat's pending non-personal replies when the turn ends.
+
+        Hermes calls this after the agent turn, including the plain-final
+        path that buffers a coalesced reply and never calls
+        ``edit_message(finalize=True)``. Without the flush the reply sits
+        until the stale-buffer watchdog (~130s) and the next turn's sends
+        see a still-open coalesced reply.
+        """
+        chat_id = self._chat_id_from_processing_event(event)
+        if chat_id:
+            await self._flush_pending_coalesced_replies(chat_id)
+        parent = getattr(super(), "on_processing_complete", None)
+        if callable(parent):
+            await parent(event, outcome)
+
+    async def send_private_notice(
+        self,
+        chat_id: str,
+        user_id: str | None,
+        content: str,
+        reply_to: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> SendResult:
+        """Deliver a Hermes operational notice without stealing a shared reply.
+
+        ``notice_delivery: private`` routes the ``/sethome`` home-channel
+        prompt here. Copilot Chat arrives as ``groupChat`` and has no
+        private surface, so posting the notice makes it the turn's visible
+        bubble. Withhold it there (INFO) and send normally in personal
+        chats. Success is reported on a withhold: the gateway treats a
+        failure as "fall back to a public send", which would post the
+        notice into the shared chat.
+        """
+        del user_id  # Bot Framework has no per-user ephemeral channel.
+        inbound = self._cached_inbound_for(str(chat_id))
+        conv = (inbound or {}).get("conversation") or {}
+        chat_type = str(conv.get("conversationType") or "")
+        if chat_type and chat_type != "personal":
+            logger.info(
+                "agent365 withholding operational notice on non-personal chat: "
+                "chat_id=%s chat_type=%s",
+                chat_id,
+                chat_type,
+            )
+            return SendResult(success=True, message_id="")
+        return await self.send(
+            chat_id=str(chat_id),
+            content=content,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
+
+    def _unscoped_send_shares_active_coalesced_turn(self, chat_id: str) -> bool:
+        """Whether a ``reply_to is None`` send belongs to the open coalesced turn.
+
+        The chat-level generation count stays raised for the whole buffer
+        lifetime, including a previous turn that is still waiting to flush.
+        Suppressing every unscoped send in that window drops the next turn
+        and, if reported as success, loses it. Only progress that shares
+        the current inbound activity with every live buffer for this chat
+        is the same turn.
+        """
+        chat_id = str(chat_id)
+        turn_ids: list[str] = []
+        for state in self._coalesced_replies.values():
+            if str(state.get("chat_id") or "") != chat_id:
+                continue
+            turn_key = state.get("turn_key")
+            if (
+                isinstance(turn_key, tuple)
+                and len(turn_key) == 2
+                and isinstance(turn_key[1], str)
+                and turn_key[1]
+            ):
+                turn_ids.append(turn_key[1])
+        if not turn_ids:
+            return False
+        ref = self._conversations.get(chat_id)
+        current = str(getattr(ref, "last_inbound_activity_id", "") or "")
+        return bool(current) and all(turn_id == current for turn_id in turn_ids)
+
+    async def _flush_pending_coalesced_replies(self, chat_id: str) -> None:
+        """Finalize every still-buffered coalesced reply for ``chat_id``."""
+        pending = [
+            message_id
+            for message_id, state in list(self._coalesced_replies.items())
+            if str(state.get("chat_id") or "") == str(chat_id)
+        ]
+        for message_id in pending:
+            if message_id not in self._coalesced_replies:
+                continue
+            result = await self._finalize_coalesced_reply(message_id)
+            if not result.success:
+                logger.warning(
+                    "agent365 turn-end coalesced flush failed: "
+                    "chat_id=%s message_id=%s error=%s",
+                    chat_id,
+                    message_id,
+                    result.error,
+                )
 
     @staticmethod
     def _coalesced_reply_turn_key(chat_id: str, reply_to: Any) -> tuple[str, str]:

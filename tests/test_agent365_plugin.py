@@ -5283,8 +5283,10 @@ class TestEditMessage:
             content="interim progress",
             reply_to=None,
         )
-        assert progress.success is True
-        assert progress.message_id == first.message_id
+        # Same turn as the open buffer: suppressed, and not reported as
+        # delivered. The buffered reply itself is unchanged.
+        assert progress.success is False
+        assert "coalesced reply active" in str(progress.error)
         assert send_reply_mock.await_count == 0
         assert a._coalesced_replies[first.message_id]["content"] == "Hello"
 
@@ -5328,6 +5330,129 @@ class TestEditMessage:
         )
         assert cross_chat.success is False
         assert "unknown coalesced message" in str(cross_chat.error)
+
+    @pytest.mark.asyncio
+    async def test_turn_end_flushes_final_reply_to_once(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #123: a plain final send(reply_to=...) never calls
+        # edit_message(finalize=True). The turn-end hook must deliver it
+        # once and clear the generation count, without waiting 130s.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-turn-end", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        buffered = await a.send(
+            chat_id="conv-G-turn-end",
+            content="Final answer",
+            reply_to="act-1",
+        )
+        assert buffered.success is True
+        assert send_reply_mock.await_count == 0
+        assert a._coalesced_generation_count_by_chat["conv-G-turn-end"] == 1
+
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-turn-end"),
+            message_id="act-1",
+        )
+        await a.on_processing_complete(event, outcome="success")
+        await a.on_processing_complete(event, outcome="success")
+
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Final answer"
+        assert "conv-G-turn-end" not in a._coalesced_generation_count_by_chat
+        assert a._coalesced_generation_count_by_turn == {}
+        assert a._coalesced_replies == {}
+
+    @pytest.mark.asyncio
+    async def test_next_turn_send_not_suppressed_by_prior_coalesced_buffer(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # The prior turn's buffer is still open (generation count > 0).
+        # A later turn's unscoped send must be delivered, not dropped as a
+        # successful "coalesced reply active" suppression.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-next", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        caplog.set_level("INFO")
+
+        prior = await a.send(
+            chat_id="conv-G-next",
+            content="Prior turn",
+            reply_to="act-1",
+        )
+        assert prior.success is True
+        assert a._coalesced_generation_count_by_chat["conv-G-next"] == 1
+
+        later = _make_inbound(conv_id="conv-G-next", activity_id="act-2", text="next")
+        later["conversation"]["conversationType"] = "groupChat"
+        ref = adapter_mod.ConversationRef.from_activity(later)
+        assert ref is not None
+        ref.validated_path = "A"
+        a._conversations.upsert(ref)
+
+        result = await a.send(
+            chat_id="conv-G-next",
+            content="Next turn answer",
+            reply_to=None,
+        )
+
+        assert result.success is True
+        assert "suppressed while coalesced reply active" not in caplog.text
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Next turn answer"
+        # The prior turn's buffer is still pending; it did not swallow this send.
+        assert a._coalesced_replies[prior.message_id]["content"] == "Prior turn"
+        assert a._coalesced_generation_count_by_chat["conv-G-next"] == 1
+
+    @pytest.mark.asyncio
+    async def test_private_notice_withheld_on_group_sent_on_personal(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        assert a.config.extra["notice_delivery"] == "private"
+        explicit = _make_adapter(monkeypatch, notice_delivery="public")
+        assert explicit.config.extra["notice_delivery"] == "public"
+
+        group = _make_inbound(conv_id="conv-notice-group", activity_id="act-g")
+        group["conversation"]["conversationType"] = "groupChat"
+        personal = _make_inbound(conv_id="conv-notice-personal", activity_id="act-p")
+        self._wire_adapter(a, inbound=group)
+        personal_ref = adapter_mod.ConversationRef.from_activity(personal)
+        assert personal_ref is not None
+        personal_ref.validated_path = "A"
+        a._conversations.upsert(personal_ref)
+        a._seen_inbounds_this_lifetime.add("conv-notice-personal")
+
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        caplog.set_level("INFO")
+
+        notice = "No home channel is configured. Use /sethome to set one."
+        withheld = await a.send_private_notice(
+            "conv-notice-group", "user-1", notice
+        )
+        assert withheld.success is True
+        assert send_reply_mock.await_count == 0
+        assert "withholding operational notice" in caplog.text
+        assert "groupChat" in caplog.text
+
+        sent = await a.send_private_notice(
+            "conv-notice-personal", "user-1", notice
+        )
+        assert sent.success is True
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == notice
 
     def test_recently_finalized_cache_is_ttl_and_count_bounded(
         self, monkeypatch: pytest.MonkeyPatch

@@ -281,6 +281,19 @@ this heading is dated at release.
 
 ### Reliability (#105)
 
+- **Copilot Chat one-turn replies flush when the turn ends (#123 live walk).**
+  Non-personal chats (Copilot Chat arrives as `groupChat`) buffer a
+  coalesced reply until `edit_message(finalize=True)`. A plain final
+  `send(reply_to=...)` never sends that signal, so the reply waited on the
+  130s stale-buffer watchdog. `on_processing_complete` now finalizes the
+  chat's pending coalesced replies at turn end. While a buffer is still
+  open, `send` suppresses an unscoped send only when it belongs to that
+  same turn — a later or earlier turn is delivered — and a suppressed send
+  is a failure, so dropped text is not reported as success. Hermes
+  operational notices (the "No home channel… `/sethome`" prompt) default
+  to `config.extra["notice_delivery"] = "private"`. `send_private_notice`
+  withholds them on non-personal chats (INFO; success so the gateway does
+  not fall back to a public post) and sends them normally in personal chats.
 - **H4 — sequential coalesced reply segments are no longer swallowed.**
   Non-personal chats now assign a fresh synthetic message id to every newly
   opened coalesced segment. Multiple segments for the same inbound activity
