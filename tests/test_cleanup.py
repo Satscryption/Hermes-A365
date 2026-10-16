@@ -400,6 +400,8 @@ class TestPlanRender:
         plan = build_cleanup_plan(CleanupInputs(agent_name="inbox-helper"), hermes_home=tmp_path)
         text = plan.render_human()
         assert "[plan] hermes a365 cleanup inbox-helper" in text
+        assert "no canonical pin" in text
+        assert "auto-detect" not in text
         assert "azure" in text
         assert "instance" in text
         assert "blueprint" in text

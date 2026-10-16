@@ -41,6 +41,8 @@ from uuid import UUID
 
 from . import a365_config, bot_service
 from ._common import (
+    TENANT_ID_HELP,
+    UNPINNED_TENANT_PLAN_LINE,
     TenantResolutionError,
     active_az_tenant,
     ensure_contained,
@@ -190,7 +192,7 @@ class CleanupPlan:
         if self.inputs.tenant_id:
             lines.append(f"  tenant: {self.inputs.tenant_id}")
         else:
-            lines.append("  tenant: (auto-detect from `az account show`)")
+            lines.append(UNPINNED_TENANT_PLAN_LINE)
         lines.append(f"  local slug: {self.inputs.resolved_slug}")
         lines.append("  cloud steps (in order):")
         if not self.steps:
@@ -543,9 +545,9 @@ def apply_cleanup_plan(
     # `az rest` Graph DELETE) have no per-call tenant flag at all — so the only
     # sound enforcement is up-front: assert the active az tenant matches the
     # expected one (explicit --tenant-id, else the operator env's
-    # A365_TENANT_ID), and refuse on mismatch or when the session can't be
-    # verified. With no pin available anywhere we proceed — a fresh setup has
-    # nothing to compare against — but say so loudly. (The bot-service step is
+    # A365_TENANT_ID), and refuse on mismatch, when the session can't be
+    # verified, or when no pin was resolved. Ambient `az account show` is
+    # not a pin. (The bot-service step is
     # independently safe: its az calls pin the sidecar's subscriptionId, and a
     # subscription belongs to exactly one tenant.)
     try:
@@ -863,7 +865,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     parser.add_argument("--agent-name", required=True, help="agent base name")
     parser.add_argument(
         "--tenant-id",
-        help="tenant id; default auto-detects via `az account show`",
+        help=TENANT_ID_HELP,
     )
     parser.add_argument(
         "--kinds",

@@ -176,7 +176,12 @@ identities), and surface known auth errors:
   "deferred — run `hermes a365 consent`" rather than failing the run.
   The blueprint apps remain created.
 
-`--m365` registers the messaging endpoint via MCP Platform.
+`--tenant-id` (or `A365_TENANT_ID` in the operator env) is required before
+`--apply`. The active `az account show` tenant is checked against that pin
+and is not used as the pin.
+`--m365` is forwarded to `a365 setup blueprint`. Current a365 CLI builds do
+not register the messaging endpoint from that flag alone; after the tunnel
+exists, run `activity-bridge update-endpoint`.
 `--aiteammate` is intentionally unsupported on `register`: the wrapper
 only runs blueprint + permission setup. Use
 `hermes a365 publish --aiteammate --apply`, then upload and activate the

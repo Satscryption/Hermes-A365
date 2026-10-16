@@ -233,7 +233,8 @@ this heading is dated at release.
   delete`, the `az rest` Graph DELETE) have no per-call tenant flag at all;
   the a365 subcommands additionally carry an explicit `--tenant-id`
   (visible in the plan) instead of auto-detecting. With no pin available
-  anywhere (fresh setup), behaviour is unchanged but a warning says so.
+  anywhere, `--apply` refuses. Ambient `az account show` is not accepted
+  as the pin.
   An existing but unreadable operator env now fails closed instead of silently
   downgrading to that warning path; this applies to the dry-run as well as
   `--apply`, because the plan must not advertise a tenant it could not safely
@@ -278,6 +279,20 @@ this heading is dated at release.
   can run. Unmatched confirmations fail before mutation.
 
   (M15 is split out to #127.)
+- **Tenant pins are not `az account show`.** `register`, `cleanup`, and
+  `publish` `--apply` already refuse when no canonical tenant pin was
+  resolved (`--tenant-id`, else `A365_TENANT_ID`). Dry-run text and
+  `--help` still said the default was to auto-detect from the ambient az
+  account, which is the check target, not the pin. The plan now says
+  `--apply` will refuse, and the help text matches. An operator who sees
+  a tenant in `az account show` still has to pass it explicitly or set
+  `A365_TENANT_ID` before the first register.
+- **`register --m365` does not register the messaging endpoint.** The flag
+  is still forwarded to `a365 setup blueprint`. Current a365 CLI builds
+  report that `--m365` has no effect on that command by itself. The plan
+  and help text say to run `activity-bridge update-endpoint` after the
+  tunnel exists. Wiring `reconcile_app` / `reconcile_blueprint` remains
+  #127 and is not in this change.
 
 ### Reliability (#105)
 

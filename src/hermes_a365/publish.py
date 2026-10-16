@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
+    TENANT_ID_HELP,
+    UNPINNED_TENANT_PLAN_LINE,
     TenantResolutionError,
     active_az_tenant,
     resolve_expected_tenant,
@@ -281,7 +283,7 @@ class PublishPlan:
         if self.inputs.tenant_id:
             lines.append(f"  tenant: {self.inputs.tenant_id}")
         else:
-            lines.append("  tenant: (auto-detect from `az account show`)")
+            lines.append(UNPINNED_TENANT_PLAN_LINE)
         if self.inputs.aiteammate and self.inputs.copilot_chat:
             flavour = "AI Teammate + Custom Engine Agent (both surfaces)"
         elif self.inputs.copilot_chat:
@@ -1031,7 +1033,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     parser.add_argument("--agent-name", required=True, help="agent base name")
     parser.add_argument(
         "--tenant-id",
-        help="tenant id; default auto-detects via `az account show`",
+        help=TENANT_ID_HELP,
     )
     parser.add_argument(
         "--aiteammate",
