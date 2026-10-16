@@ -4970,6 +4970,145 @@ class TestSendTyping:
         # Must not raise — gateway typing pulse runs in a hot path.
         await a.send_typing("conv-1")
 
+    @staticmethod
+    async def _hang_until_cancelled(started: asyncio.Event) -> None:
+        started.set()
+        await asyncio.Event().wait()
+
+    @pytest.mark.asyncio
+    async def test_caller_cancel_propagates_from_outbound_and_typing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # F8: Hermes cancels the progress task at turn end. That cancel
+        # must leave send_typing, or the progress loop retries forever and
+        # on_processing_complete never runs.
+        a = _make_adapter(monkeypatch)
+        started = asyncio.Event()
+
+        async def caller() -> None:
+            await a._await_outbound(
+                "conv-cancel",
+                self._hang_until_cancelled(started),
+            )
+
+        task = asyncio.create_task(caller())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-typing-cancel")
+            )
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        typing_started = asyncio.Event()
+
+        async def hang_token(**_kwargs: Any) -> None:
+            await self._hang_until_cancelled(typing_started)
+
+        monkeypatch.setattr(bridge, "acquire_reply_token", hang_token)
+        typing = asyncio.create_task(a.send_typing("conv-typing-cancel"))
+        await typing_started.wait()
+        assert not a._disconnecting
+        assert "conv-typing-cancel" not in a._retiring_chats
+        typing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await typing
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "arm",
+        ["disconnecting", "retiring", "evicting"],
+    )
+    async def test_teardown_cancel_converts_to_runtime_error(
+        self, monkeypatch: pytest.MonkeyPatch, arm: str
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        started = asyncio.Event()
+
+        async def caller() -> None:
+            await a._await_outbound("conv-teardown", self._hang_until_cancelled(started))
+
+        if arm == "disconnecting":
+            a._disconnecting = True
+        elif arm == "retiring":
+            a._retiring_chats.add("conv-teardown")
+        else:
+            a._registry_evicting_chats.add("conv-teardown")
+
+        task = asyncio.create_task(caller())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(RuntimeError, match="agent365 outbound operation cancelled"):
+            await task
+
+        # Inbound media minting opts into propagation even during teardown.
+        started = asyncio.Event()
+
+        async def propagated() -> None:
+            await a._await_outbound(
+                "conv-teardown",
+                self._hang_until_cancelled(started),
+                propagate_cancel=True,
+            )
+
+        task = asyncio.create_task(propagated())
+        await started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    @pytest.mark.asyncio
+    async def test_typing_teardown_cancel_is_debug_and_real_failures_warn(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-typing-down")
+            )
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        started = asyncio.Event()
+
+        async def hang_token(**_kwargs: Any) -> None:
+            await self._hang_until_cancelled(started)
+
+        monkeypatch.setattr(bridge, "acquire_reply_token", hang_token)
+        caplog.set_level("DEBUG")
+        a._disconnecting = True
+        typing = asyncio.create_task(a.send_typing("conv-typing-down"))
+        await started.wait()
+        typing.cancel()
+        assert await typing is None
+        assert "send_typing cancelled during teardown" in caplog.text
+        assert "send_typing failed" not in caplog.text
+
+        caplog.clear()
+        a._disconnecting = False
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(side_effect=RuntimeError("token mint failed")),
+        )
+        await a.send_typing("conv-typing-down")
+        assert "send_typing failed" in caplog.text
+        assert "token mint failed" in caplog.text
+
 
 class TestSendImage:
     @pytest.mark.asyncio

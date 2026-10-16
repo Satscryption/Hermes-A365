@@ -3035,10 +3035,36 @@ class Agent365Adapter(BasePlatformAdapter):
         if not tasks:
             self._outbound_tasks_by_chat.pop(owner, None)
 
+    def _outbound_teardown_cancel(self, chat_id: str) -> bool:
+        """True when this chat's outbound work is being torn down.
+
+        Hermes also cancels the progress/typing task at ordinary turn end
+        (``_run_agent_cleanup_turn_tasks`` → ``send_progress_messages`` →
+        ``send_typing``). That is not teardown. Rewriting it as
+        ``RuntimeError`` lets ``send_typing`` swallow it, the progress loop
+        retries forever, cleanup waits, and ``on_processing_complete``
+        never runs (F8).
+        """
+        chat_id = str(chat_id)
+        return (
+            self._disconnecting
+            or chat_id in self._retiring_chats
+            or chat_id in self._registry_evicting_chats
+        )
+
     async def _await_outbound(
         self, chat_id: str, awaitable: Any, *, propagate_cancel: bool = False
     ) -> Any:
-        """Run one external network await under teardown accounting."""
+        """Run one external network await under teardown accounting.
+
+        A cancellation from the caller propagates as ``CancelledError``.
+        The ``RuntimeError("agent365 outbound operation cancelled")``
+        conversion is only for adapter teardown (disconnect, chat
+        retirement, or registry eviction), so best-effort callers such as
+        ``send_typing`` can finish shutdown instead of aborting it.
+        ``propagate_cancel=True`` still re-raises during teardown; inbound
+        media minting uses that so a cancelled download stays cancelled.
+        """
         try:
             task, added = self._register_outbound_task(chat_id)
         except Exception:
@@ -3049,7 +3075,7 @@ class Agent365Adapter(BasePlatformAdapter):
         try:
             return await awaitable
         except asyncio.CancelledError as exc:
-            if propagate_cancel:
+            if propagate_cancel or not self._outbound_teardown_cancel(chat_id):
                 raise
             raise RuntimeError("agent365 outbound operation cancelled") from exc
         finally:
@@ -5550,10 +5576,29 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         try:
             await self._post_activity(inbound=inbound, activity=typing_activity)
+        except asyncio.CancelledError:
+            # Caller cancellation (Hermes ending the progress task at turn
+            # end) must leave this task. Swallowing it makes the progress
+            # loop retry forever, so cleanup never reaches
+            # on_processing_complete. PR #153 F6 only lowered the log for
+            # the converted RuntimeError; that log was this bug's symptom,
+            # not the fix. Real send_typing failures stay warnings.
+            raise
         except Exception as e:
             # Typing failures are best-effort — never raise into the
-            # gateway's pulse loop.
-            logger.warning("agent365 send_typing failed for %s: %s", chat_id, e)
+            # gateway's pulse loop. The converted RuntimeError is only
+            # produced when the adapter itself is tearing the chat down.
+            if (
+                isinstance(e, RuntimeError)
+                and str(e) == "agent365 outbound operation cancelled"
+            ):
+                logger.debug(
+                    "agent365 send_typing cancelled during teardown for %s: %s",
+                    chat_id,
+                    e,
+                )
+            else:
+                logger.warning("agent365 send_typing failed for %s: %s", chat_id, e)
         return None
 
     async def send_image(

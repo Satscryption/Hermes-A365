@@ -311,6 +311,19 @@ this heading is dated at release.
   flush. The buffer is cleared on disconnect and on chat eviction.
   Personal chats are not buffered. The live section 2a retest is still
   pending.
+- **Copilot turn-end cleanup no longer hangs on a swallowed typing cancel (F8).**
+  `Agent365Adapter._await_outbound` turned every `CancelledError` into
+  `RuntimeError("agent365 outbound operation cancelled")`. Hermes cancels
+  its progress task at turn end (`_run_agent_cleanup_turn_tasks` →
+  `send_progress_messages` → `send_typing`). `send_typing` caught that
+  `RuntimeError`, the progress loop retried forever, cleanup waited, and
+  `on_processing_complete` never ran. A caller cancellation now propagates.
+  The `RuntimeError` conversion remains only while the adapter is tearing
+  down (`_disconnecting`, or the chat is in `_retiring_chats` /
+  `_registry_evicting_chats`). That teardown case is a debug log. Every
+  other `send_typing` failure stays a warning. PR #153 F6 only downgrades
+  the cancellation log; that log was this hang's symptom, and a log-level
+  change must not hide a real typing failure.
 - **H4 — sequential coalesced reply segments are no longer swallowed.**
   Non-personal chats now assign a fresh synthetic message id to every newly
   opened coalesced segment. Multiple segments for the same inbound activity
