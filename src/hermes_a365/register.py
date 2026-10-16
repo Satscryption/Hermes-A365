@@ -52,6 +52,8 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
+    TENANT_ID_HELP,
+    UNPINNED_TENANT_PLAN_LINE,
     TenantResolutionError,
     active_az_tenant,
     resolve_expected_tenant,
@@ -123,8 +125,8 @@ class RegisterInputs:
     """User-supplied arguments for the register orchestration."""
 
     agent_name: str
-    tenant_id: str | None = None  # None → CLI auto-detects from `az account show`
-    m365: bool = False  # register messaging endpoint via MCP Platform
+    tenant_id: str | None = None  # None → --apply refuses; not an az auto-detect
+    m365: bool = False  # forwarded to `a365 setup blueprint`; does not set the endpoint
     aiteammate: bool = False  # Parser back-compat; rejected in __post_init__.
     authmode: str = "obo"  # obo / s2s / both — only used by `setup all`, kept here for config
     no_endpoint: bool = False  # blueprint-only; skip endpoint registration
@@ -165,7 +167,13 @@ class RegisterPlan:
         if self.inputs.tenant_id:
             lines.append(f"  tenant: {self.inputs.tenant_id}")
         else:
-            lines.append("  tenant: (auto-detect from `az account show`)")
+            lines.append(UNPINNED_TENANT_PLAN_LINE)
+        if self.inputs.m365:
+            lines.append(
+                "  note: --m365 is forwarded to `a365 setup blueprint`, which does "
+                "not register the messaging endpoint by itself. After the tunnel "
+                "exists, run `activity-bridge update-endpoint`."
+            )
         lines.append("  steps (in order):")
         for s in self.steps:
             lines.append(f"    - {s.name:<18} {s.description}")
@@ -280,13 +288,11 @@ def apply_register_plan(
     """Run each step in order. Stop on a consent-required defer; propagate
     other AADSTS errors and any non-AADSTS CLI failures.
 
-    #102 M7: when ``plan.inputs.tenant_id`` carries a pin (the CLI layer
-    resolves it from ``--tenant-id`` or the operator env's ``A365_TENANT_ID``
-    before building inputs), the active az session tenant is asserted to
-    match BEFORE any provisioning step — the a365 CLI auto-detects its tenant
-    from that session, so a mismatched login would provision the agent into
-    the wrong tenant. Unpinned inputs (direct API callers, fresh setups with
-    nothing to compare against) keep the previous behaviour."""
+    #102 M7: ``plan.inputs.tenant_id`` is the operator pin (explicit
+    ``--tenant-id``, else ``A365_TENANT_ID``). The active az session is
+    asserted to match BEFORE any provisioning step, because the a365 CLI
+    otherwise takes its tenant from that session. A missing pin is refused
+    here too: ambient ``az account show`` is not a pin."""
     result = ApplyResult(plan=plan)
 
     expected_tenant = (plan.inputs.tenant_id or "").strip()
@@ -680,12 +686,16 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     )
     parser.add_argument(
         "--tenant-id",
-        help="tenant id; default auto-detects via `az account show`",
+        help=TENANT_ID_HELP,
     )
     parser.add_argument(
         "--m365",
         action="store_true",
-        help="register the messaging endpoint via MCP Platform (M365 agent)",
+        help=(
+            "forward --m365 to `a365 setup blueprint`. That flag does not "
+            "register the messaging endpoint; use activity-bridge update-endpoint "
+            "once the tunnel URL exists"
+        ),
     )
     parser.add_argument(
         "--aiteammate",

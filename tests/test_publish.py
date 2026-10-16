@@ -160,7 +160,8 @@ class TestPlanRender:
         text = plan.render_human()
         assert "[plan] hermes a365 publish inbox-helper" in text
         assert "blueprint-only" in text
-        assert "auto-detect" in text
+        assert "no canonical pin" in text
+        assert "auto-detect" not in text
         assert "$ a365 publish --agent-name inbox-helper" in text
 
     def test_human_aiteammate_flavour(self) -> None:
