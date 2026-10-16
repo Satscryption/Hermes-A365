@@ -112,8 +112,20 @@ class ConversationRef:
     # allowlisted raw overflows _RAW_MAX_BYTES.
     _RAW_MIN_PROJECTION: ClassVar[dict[str, tuple[str, ...]]] = {
         "conversation": ("id", "tenantId", "conversationType", "name"),
-        "recipient": ("id", "name", "agenticAppId", "agenticUserId", "tenantId"),
-        "from": ("id", "name"),
+        "recipient": (
+            "id",
+            "name",
+            "agenticAppId",
+            "agenticUserId",
+            "tenantId",
+            "appId",
+            "applicationId",
+        ),
+        # aadObjectId is the cross-conversation user key (personal ``a:…``
+        # vs Copilot ``19:…``). Keep it when the raw is shrunk so uninstall
+        # can still find sibling chats. appId / applicationId are the bot
+        # app id when recipient.id is only a channel account.
+        "from": ("id", "name", "aadObjectId"),
     }
 
     @staticmethod

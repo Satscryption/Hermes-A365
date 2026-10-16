@@ -10,6 +10,17 @@ Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
 Gated by the #123 focused hardening walk. Entries accumulate here per PR and
 this heading is dated at release.
 
+### Uninstall scope (walk row 2b)
+
+- **An ``installationUpdate`` remove retires every cached conversation for
+  that user and bot, not only the chat named on the activity.** Copilot
+  Chat uninstall arrives on the personal ``a:…`` conversation while the
+  in-flight turn lives on the sibling ``19:…`` groupChat. The adapter now
+  cancels those turns, clears their buffers, and blocks a late post through
+  the existing ``_retiring_chats`` teardown. A different user or a different
+  bot is left in place. Removing the bot from a single chat
+  (``conversationUpdate`` / ``membersRemoved``) still evicts only that chat.
+
 ### Secrets at rest (#19)
 
 - **A `SecretsProvider` seam now backs both client secrets.** New
