@@ -1141,10 +1141,15 @@ class Agent365Adapter(BasePlatformAdapter):
         # conversation-id space. Recorded at dispatch: session_key → the
         # conversation_id it belongs to. `_active_conversation_ids()`
         # intersects this with the live `_active_sessions` so the registry
-        # cap/prune never evict a conversation whose turn is running — which,
-        # since the base runs the turn in a background task that outlives
-        # handle_message, includes turns suspended awaiting a human
-        # approval/clarify. Self-cleans mappings whose session has ended.
+        # cap/prune never evict a conversation whose turn is running.
+        # Self-cleans mappings whose session has ended.
+        #
+        # #130: that in-flight set is not enough for a card the human has not
+        # answered yet. `handle_message` can return while the approval is
+        # still outstanding, and Hermes may not keep `_active_sessions` for
+        # the whole think-time. `_registry_protected_conversation_ids()`
+        # also keeps chats with a live card capability or an open-ended
+        # clarify, independent of the session guard.
         self._session_key_to_conv: dict[str, str] = {}
         self._agent_turn_guards: dict[str, asyncio.Event] = {}
         self._agent_turn_admissions: dict[str, asyncio.Task[Any]] = {}
@@ -1200,6 +1205,12 @@ class Agent365Adapter(BasePlatformAdapter):
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
         self._card_capabilities: dict[str, dict[str, Any]] = {}
+        # #130: a typed-answer wait has no live card capability. Open-ended
+        # clarify never mints one. "Something else" consumes the choice card
+        # and then waits the same way. chat_id → monotonic time the wait
+        # started. Cap/prune skip these until the user answers, the chat is
+        # torn down, or the card TTL elapses.
+        self._awaiting_text_chats: dict[str, float] = {}
         self._card_action_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
         self._outbound_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
 
@@ -1942,6 +1953,10 @@ class Agent365Adapter(BasePlatformAdapter):
                         seen.pop()
                     seen.add(ref.conversation_id)
                 # M11 (#105): bound the registry on the hot growth path.
+                # #130: this inbound is the answer to an open-ended clarify, so
+                # the prompt no longer needs its own protection. The current
+                # conversation id still cannot be evicted by this upsert.
+                self._awaiting_text_chats.pop(ref.conversation_id, None)
                 self._enforce_registry_cap(ref.conversation_id)
             except BaseException:
                 _complete_persist_mutation(reservation[0], reservation[1])
@@ -2876,6 +2891,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
         self._card_capabilities.clear()
+        self._awaiting_text_chats.clear()
         self._agent_turn_guards.clear()
         self._session_key_to_conv.clear()
         self._chat_teardown_tasks.clear()
@@ -3292,30 +3308,62 @@ class Agent365Adapter(BasePlatformAdapter):
             self._session_key_to_conv.pop(session_key, None)
 
     def _active_conversation_ids(self) -> set[str]:
-        """Conversation ids whose Hermes turn is currently in flight — the set
-        the registry cap/prune must not evict (#105/M11).
+        """Conversation ids whose Hermes turn is currently in flight.
 
-        The base's ``_active_sessions`` guard spans the whole background turn,
-        including a turn suspended awaiting a human approval/clarify, but is
-        keyed by session key. Bridge it to the registry's conversation-id space
-        via ``_session_key_to_conv`` (recorded at dispatch), self-cleaning any
-        mapping whose session has since ended."""
+        The base's ``_active_sessions`` guard is keyed by session key. Bridge
+        it to the registry's conversation-id space via ``_session_key_to_conv``
+        (recorded at dispatch), self-cleaning any mapping whose session has
+        since ended. This set does not cover a conversation whose turn has
+        already returned while an approval or clarify card is still
+        outstanding (#130); use ``_registry_protected_conversation_ids``."""
         active_sks = set(getattr(self, "_active_sessions", {}) or {})
         for sk in [k for k in self._session_key_to_conv if k not in active_sks]:
             self._session_key_to_conv.pop(sk, None)
         return set(self._session_key_to_conv.values())
 
+    def _registry_protected_conversation_ids(self) -> set[str]:
+        """Conversations cap and prune must not evict (#105/M11, #130).
+
+        Unions in-flight Hermes turns with chats that still have an
+        unanswered approval/clarify/slash-confirm card, or a free-text
+        clarify wait (an open-ended prompt, or "Something else" after the
+        choice card is consumed), inside ``_CARD_CAPABILITY_TTL_SEC``.
+        Protection does not depend on ``_active_sessions`` still holding
+        the turn."""
+        now = time.monotonic()
+        protected = self._active_conversation_ids()
+        for capability in self._card_capabilities.values():
+            if not isinstance(capability, dict):
+                continue
+            created = float(capability.get("created_at") or 0.0)
+            if now - created > _CARD_CAPABILITY_TTL_SEC:
+                continue
+            conversation_id = str(capability.get("conversation_id") or "")
+            if conversation_id:
+                protected.add(conversation_id)
+        expired = [
+            chat_id
+            for chat_id, created in self._awaiting_text_chats.items()
+            if now - created > _CARD_CAPABILITY_TTL_SEC
+        ]
+        for chat_id in expired:
+            self._awaiting_text_chats.pop(chat_id, None)
+        protected.update(self._awaiting_text_chats)
+        return protected
+
     def _enforce_registry_cap(self, current_conversation_id: str) -> None:
         """M11 (#105): bound the durable registry after a growth-capable
         upsert. LRU-evict down to ``_MAX_REGISTRY_ENTRIES``, never dropping a
-        pinned entry, a conversation whose Hermes turn is in flight, or the
+        pinned entry, a conversation whose Hermes turn is in flight, a
+        conversation with an outstanding approval/clarify (#130), or the
         conversation just upserted (``current_conversation_id`` — this turn's
         reply target). Shared by the dispatch AND lifecycle-capture upserts so
         every growth path is bounded."""
         self._conversations.enforce_cap(
             _MAX_REGISTRY_ENTRIES,
             active_conversation_ids=(
-                self._active_conversation_ids() | {current_conversation_id}
+                self._registry_protected_conversation_ids()
+                | {current_conversation_id}
             ),
         )
 
@@ -3582,8 +3630,8 @@ class Agent365Adapter(BasePlatformAdapter):
         """Slice 19x-d (#4): drop stale ConversationRegistry entries.
 
         Mirrors Hermes' ``SessionStore.prune_old_entries`` shape —
-        skips entries that are operator-pinned, have a Hermes turn in flight
-        (``_active_conversation_ids``), or have no ``last_used_at`` stamp.
+        skips entries that are operator-pinned, in flight, awaiting an
+        approval/clarify answer (#130), or have no ``last_used_at`` stamp.
         Threshold is ``extra.conversations_prune_max_age_days`` (default 30).
 
         Operators wire this from cron (no built-in periodic loop;
@@ -3596,11 +3644,9 @@ class Agent365Adapter(BasePlatformAdapter):
         reservation = await self._reserve_registry_mutation()
         if reservation is None:
             return 0
-        # #105: pass the in-flight set in the registry's conversation-id space
-        # (base `_active_sessions` is keyed by prefixed session keys, which the
-        # registry's bare-conversation_id comparison never matches — a
-        # long-standing no-op the M11 work corrected).
-        active_keys = self._active_conversation_ids()
+        # #105/#130: protect in-flight turns and chats with an outstanding
+        # approval/clarify, in the registry's conversation-id space.
+        active_keys = self._registry_protected_conversation_ids()
         try:
             dropped = self._conversations.prune_old_entries(
                 max_age_days=self._conversations_prune_max_age_days,
@@ -6078,7 +6124,8 @@ class Agent365Adapter(BasePlatformAdapter):
         question as text and arms the gateway's text-intercept. On a choice click
         the route resolves via
         ``tools.clarify_gateway.resolve_gateway_clarify(clarify_id, choice_text)``;
-        "Something else" arms ``mark_awaiting_text(clarify_id)``."""
+        "Something else" consumes the card, arms ``mark_awaiting_text``, and
+        keeps the chat in ``_awaiting_text_chats`` for the card TTL."""
         if not choices:
             inbound = self._cached_inbound_for(chat_id)
             if not inbound:
@@ -6089,6 +6136,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 inbound=inbound, content=question, log_context="clarify"
             )
             if result.success:
+                # #130: keep this chat in the registry until the typed answer
+                # arrives, even if the Hermes turn is no longer in
+                # ``_active_sessions``.
+                self._awaiting_text_chats[str(chat_id)] = time.monotonic()
                 # Arm the gateway text-intercept for the user's typed answer.
                 try:
                     self._gw_mark_awaiting_text(clarify_id)
@@ -6257,6 +6308,12 @@ class Agent365Adapter(BasePlatformAdapter):
             elif kind == _CARD_KIND_CLARIFY:
                 clarify_id = str(resolver.get("clarify_id") or "")
                 if choice == "__other__":
+                    # The capability was consumed above. This free-text wait
+                    # is the same human window as an open-ended clarify, so
+                    # arm the TTL set before the gateway intercept. A mark
+                    # failure must not leave the chat evictable.
+                    if conv_id:
+                        self._awaiting_text_chats[conv_id] = time.monotonic()
                     self._gw_mark_awaiting_text(clarify_id)
                 else:
                     self._gw_resolve_clarify(clarify_id, choice)
@@ -7068,6 +7125,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for nonce, capability in list(self._card_capabilities.items()):
             if str(capability.get("conversation_id") or "") == chat_id:
                 self._card_capabilities.pop(nonce, None)
+        self._awaiting_text_chats.pop(chat_id, None)
         # Coalesced-status slots (keyed ``status:{chat}:{status_key}``) + their
         # watchdogs. Match on the stored chat_id, not a key prefix, since a
         # Teams chat id itself contains ':'.

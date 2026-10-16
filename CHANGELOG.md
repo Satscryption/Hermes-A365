@@ -545,6 +545,16 @@ this heading is dated at release.
   write is sequenced under a process-wide per-path lock, so cancelling an
   in-flight older save (e.g. on shutdown) cannot let it `os.replace` a stale
   snapshot over a newer replacement-adapter save.
+- **#130 — an unanswered approval or clarify is not evicted while the human
+  is still deciding.** The registry cap and prune already skip pinned entries
+  and conversations whose Hermes turn is still in `_active_sessions`. That
+  in-flight set does not cover a card whose turn has returned. Cap and prune
+  now also skip a conversation with a live approval, slash-confirm, or clarify
+  card, and a free-text clarify wait, for the same 15-minute card TTL.
+  Choosing "Something else" consumes the choice card and arms that same
+  wait, so the typed-answer window stays protected until the answer arrives.
+  An expired card or wait is evictable again. The answering inbound clears the
+  free-text mark; uninstall and disconnect clear it with the card state.
 ### Tests
 
 - **#118 — test suite is hermetic under randomized order.** An autouse
