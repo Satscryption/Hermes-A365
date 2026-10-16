@@ -119,8 +119,14 @@ Common flags across `setup *`:
 - `--tenant-id <tenant>` — override auto-detection.
 - `--dry-run` — show what would happen without executing.
 - `-v / --verbose` — verbose logging.
-- `--m365` — treat the agent as an M365 agent (registers messaging
-  endpoint via MCP Platform). Default off.
+- `--m365` — treat the agent as an M365 agent. The 2026-05-05 snapshot
+  described this as registering the messaging endpoint via MCP Platform.
+  A later live run (issue #117, 2026-07-16) observed the CLI note that
+  `--m365` has no effect on `setup blueprint` by itself; the endpoint is
+  registered with `setup blueprint --endpoint-only --m365` or
+  `--update-endpoint`. `hermes-a365 register --m365` still forwards the
+  flag and tells the operator to run `activity-bridge update-endpoint`
+  once a tunnel URL exists. Default off.
 - `--skip-requirements` — skip prerequisites validation (use with care).
 
 `setup all` also accepts `--aiteammate`, but current CLI help says that
