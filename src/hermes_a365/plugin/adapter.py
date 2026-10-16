@@ -831,20 +831,22 @@ def _lifecycle_registry_action(activity: dict[str, Any]) -> str | None:
 
 # Teams / Copilot present the same person and the same bot under more than
 # one identifier. ``from.id`` is a channel account (often ``29:…``) and can
-# differ between the personal ``a:…`` chat and a Copilot ``19:…`` groupChat,
-# while ``from.aadObjectId`` is stable. The bot's ``recipient.id`` is likewise
-# a channel account (often ``28:…``) on one surface and the bare app id on
-# another. Uninstall matching treats those as aliases, with the stronger id
-# winning when both sides have one:
+# differ between the personal ``a:…`` chat and a Copilot ``19:…`` groupChat;
+# ``from.aadObjectId`` is the only user id that may cross conversations.
+# The bot's ``recipient.id`` is a channel account on one surface and the
+# app GUID on another. Uninstall fan-out fails closed:
 #
-# - Same user when the identifier sets intersect, unless BOTH sides carry an
-#   ``aadObjectId`` and those disagree — a shared ``from.id`` must not cross
-#   two Entra users.
-# - Same bot when the identifier sets intersect, unless BOTH sides carry an
-#   app id (explicit app-id field, or a GUID embedded in ``recipient.id``)
-#   and those disagree. A JWT ``aud`` is only an extra alias for the
-#   uninstalling app; it is not allowed to veto a channel-account match.
-# - Empty identifiers never match. A party we cannot name is not "everyone".
+# - Same user only when both sides have an ``aadObjectId`` and those sets
+#   are equal. A ref with no object id matches no sibling, even when
+#   ``from.id`` is shared. The activity's own conversation is still retired.
+# - Same bot only when both sides have the same nonempty set of app GUIDs.
+#   ``28:`` and ``28:orgid:`` prefixes normalize to that GUID. Any extra or
+#   different GUID vetoes. A non-GUID ``agenticAppId`` / ``appId`` /
+#   ``applicationId``, a channel account that is not a GUID, and the JWT
+#   ``aud`` never authorize a sibling by themselves.
+# - Absorbing the named conversation's cached ref copies a strong id only
+#   when this side has none. Disagreeing strong ids are not unioned; that
+#   conflict retires only the named conversation.
 _APP_GUID_RE = re.compile(
     r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 )
@@ -874,40 +876,30 @@ def _bot_app_guid(value: Any) -> str:
 
 
 class _PartyIdentity:
-    """One side of a conversation: a strong id plus every accepted alias."""
+    """Strong identifiers for one user (``aadObjectId``) or one bot (app GUID)."""
 
-    __slots__ = ("strong", "tokens")
+    __slots__ = ("strong",)
 
     def __init__(self) -> None:
         self.strong: set[str] = set()
-        self.tokens: set[str] = set()
 
-    def add_weak(self, value: Any) -> None:
+    def add_aad(self, value: Any) -> None:
         token = _normalized_token(value)
         if token:
-            self.tokens.add(token)
+            self.strong.add(token)
 
-    def add_strong(self, value: Any) -> None:
-        token = _normalized_token(value)
-        if not token:
-            return
-        self.strong.add(token)
-        self.tokens.add(token)
-
-    def add_bot_channel(self, value: Any) -> None:
-        token = _normalized_token(value)
-        if not token:
-            return
-        self.tokens.add(token)
-        guid = _bot_app_guid(token)
+    def add_bot_app_id(self, value: Any) -> None:
+        guid = _bot_app_guid(value)
         if guid:
-            # ``28:<app-guid>`` and the bare app id are the same bot.
             self.strong.add(guid)
-            self.tokens.add(guid)
+
+    def conflicts(self, other: _PartyIdentity) -> bool:
+        return bool(self.strong and other.strong and self.strong != other.strong)
 
     def absorb(self, other: _PartyIdentity) -> None:
-        self.strong.update(other.strong)
-        self.tokens.update(other.tokens)
+        """Copy ``other`` when this side has no strong id. Never unions."""
+        if not self.strong:
+            self.strong.update(other.strong)
 
 
 class _ConversationParties:
@@ -919,81 +911,55 @@ class _ConversationParties:
         self.user = _PartyIdentity()
         self.bot = _PartyIdentity()
 
-    def usable(self) -> bool:
-        return bool(self.user.tokens) and bool(self.bot.tokens)
+    def can_fan_out(self) -> bool:
+        return bool(self.user.strong) and bool(self.bot.strong)
 
-    def absorb(self, other: _ConversationParties) -> None:
+    def absorb(self, other: _ConversationParties) -> bool:
+        """Enrich from ``other``. Disagreeing strong ids leave this unchanged."""
+        if self.user.conflicts(other.user) or self.bot.conflicts(other.bot):
+            return False
         self.user.absorb(other.user)
         self.bot.absorb(other.bot)
-
-
-def _parties_conflict(anchor: _PartyIdentity, other: _PartyIdentity) -> bool:
-    return bool(
-        anchor.strong
-        and other.strong
-        and anchor.strong.isdisjoint(other.strong)
-    )
+        return True
 
 
 def _same_uninstall_parties(
     anchor: _ConversationParties, other: _ConversationParties
 ) -> bool:
-    """True when ``other`` is the same user and the same bot as ``anchor``."""
-    if not anchor.usable() or not other.usable():
-        return False
-    if _parties_conflict(anchor.user, other.user):
-        return False
-    if _parties_conflict(anchor.bot, other.bot):
-        return False
-    return not anchor.user.tokens.isdisjoint(other.user.tokens) and not (
-        anchor.bot.tokens.isdisjoint(other.bot.tokens)
+    """True when ``other`` is the same Entra user and the same bot app."""
+    return bool(
+        anchor.user.strong
+        and anchor.user.strong == other.user.strong
+        and anchor.bot.strong
+        and anchor.bot.strong == other.bot.strong
     )
 
 
 def _parties_from_mapping(
     sender: Any,
     recipient: Any,
-    *,
-    user_id: Any = None,
-    jwt_app_id: Any = None,
 ) -> _ConversationParties:
     parties = _ConversationParties()
     if isinstance(sender, dict):
-        parties.user.add_strong(sender.get("aadObjectId"))
-        parties.user.add_weak(sender.get("id"))
-    parties.user.add_weak(user_id)
+        parties.user.add_aad(sender.get("aadObjectId"))
     if isinstance(recipient, dict):
-        parties.bot.add_bot_channel(recipient.get("id"))
+        parties.bot.add_bot_app_id(recipient.get("id"))
         for key in _BOT_APP_ID_KEYS:
-            parties.bot.add_strong(recipient.get(key))
-    # Authenticated app id of THIS uninstall only. It can link a channel
-    # account to the app GUID, but it is not a strong id: a mismatched aud
-    # must not veto a recipient-id match (and a non-GUID audience is ignored).
-    aud_guid = _bot_app_guid(jwt_app_id)
-    if aud_guid:
-        parties.bot.add_weak(aud_guid)
+            # Only a GUID counts. A shared blueprint name or other non-GUID
+            # application id must not authorize retiring a sibling.
+            parties.bot.add_bot_app_id(recipient.get(key))
     return parties
 
 
-def _parties_from_activity(
-    activity: dict[str, Any] | None, *, jwt_app_id: Any = None
-) -> _ConversationParties:
+def _parties_from_activity(activity: dict[str, Any] | None) -> _ConversationParties:
     if not isinstance(activity, dict):
         return _ConversationParties()
-    return _parties_from_mapping(
-        activity.get("from"),
-        activity.get("recipient"),
-        jwt_app_id=jwt_app_id,
-    )
+    return _parties_from_mapping(activity.get("from"), activity.get("recipient"))
 
 
 def _parties_from_ref(ref: ConversationRef) -> _ConversationParties:
     raw = ref.raw if isinstance(ref.raw, dict) else {}
-    return _parties_from_mapping(
-        raw.get("from"),
-        raw.get("recipient"),
-        user_id=ref.user_id,
-    )
+    return _parties_from_mapping(raw.get("from"), raw.get("recipient"))
 
 
 def _should_dispatch(activity: dict[str, Any]) -> bool:
@@ -1954,11 +1920,9 @@ class Agent365Adapter(BasePlatformAdapter):
                         str(activity.get("type") or "") == "installationUpdate"
                         and str(activity.get("action") or "").lower() == "remove"
                     ):
-                        aud = claims.get("aud") if isinstance(claims, dict) else None
-                        target_ids = self._uninstall_conversation_ids(
-                            activity,
-                            jwt_app_id=aud if isinstance(aud, str) else "",
-                        )
+                        # JWT aud is not a bot id. A weak audience must not
+                        # widen uninstall to another app's conversations.
+                        target_ids = self._uninstall_conversation_ids(activity)
                     else:
                         target_ids = (
                             [lifecycle_conv_id] if lifecycle_conv_id else []
@@ -7031,15 +6995,17 @@ class Agent365Adapter(BasePlatformAdapter):
         """Conversation ids to retire for an ``installationUpdate`` remove.
 
         Always includes the conversation named on the activity. Also includes
-        every cached conversation for the same user and the same bot.
+        every cached conversation for the same Entra user and the same bot
+        app when both sides have equal strong ids.
 
-        The activity is unioned with the cached ref for its own conversation
-        id before siblings are selected. An uninstall payload sometimes omits
-        ``aadObjectId`` that an earlier message on that personal chat already
-        stored; one hop of enrichment links the Copilot sibling. Identifiers
-        are not chased through further conversations, so a shared weak id
-        cannot pull in a third user.
+        The named conversation's cached ref may supply an ``aadObjectId`` or
+        app GUID the uninstall payload omitted. That copy happens only when
+        this side has no strong id. Disagreeing object ids or app GUIDs are
+        not unioned, and a conflict retires only the named chat. ``from.id``
+        alone never selects a sibling. ``jwt_app_id`` (the inbound audience)
+        is ignored: a weak ``aud`` must not authorize retiring another chat.
         """
+        del jwt_app_id
         conv = activity.get("conversation")
         named = (
             str(conv.get("id")).strip()
@@ -7055,14 +7021,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 ordered.append(chat_id)
 
         add(named)
-        anchor = _parties_from_activity(activity, jwt_app_id=jwt_app_id)
+        anchor = _parties_from_activity(activity)
         if named:
             cached = self._conversations.get(named)
-            if cached is not None:
-                anchor.absorb(_parties_from_ref(cached))
-        if not anchor.usable():
-            # No user or no bot: retire only the named chat. Guessing would
-            # retire other users or other bots.
+            if cached is not None and not anchor.absorb(_parties_from_ref(cached)):
+                return ordered
+        if not anchor.can_fan_out():
+            # No aadObjectId or no app GUID: retire only the named chat.
             return ordered
         for ref in self._conversations.items():
             if _same_uninstall_parties(anchor, _parties_from_ref(ref)):
@@ -7084,15 +7049,120 @@ class Agent365Adapter(BasePlatformAdapter):
             and not self._lifecycle_owner_survivor_count_by_chat.get(chat_id, 0)
         )
 
+    def _release_unadopted_retirements(self, armed: list[str]) -> None:
+        for chat_id in armed:
+            if self._retirement_not_adopted(chat_id):
+                self._retiring_chats.discard(chat_id)
+
+    async def _cancel_matched_outbound(self, chat_ids: list[str]) -> None:
+        """Cancel in-flight outbound posts on every matched chat at once.
+
+        Per-chat teardown also cancels these tasks, but it runs one chat
+        after another and waits out the shutdown budget on each. Cancelling
+        the whole set first stops a Copilot post while the personal chat is
+        still tearing down. One wait covers every chat. Tasks that ignore
+        cancellation are parked as survivors and removed from the outbound
+        map so teardown does not spend a second shutdown budget on them.
+        """
+        current = asyncio.current_task()
+        pending: dict[asyncio.Task[Any], str] = {}
+        for chat_id in chat_ids:
+            tasks = self._outbound_tasks_by_chat.get(chat_id)
+            if not tasks:
+                continue
+            for task in list(tasks):
+                if task is current:
+                    continue
+                if task.done():
+                    self._consume_coalesced_reply_task_result(task)
+                    continue
+                pending[task] = chat_id
+        if not pending:
+            return
+        for task in pending:
+            task.cancel()
+        _done, still_pending = await asyncio.wait(
+            set(pending),
+            timeout=_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC,
+        )
+        for task in _done:
+            self._consume_coalesced_reply_task_result(task)
+        for task in still_pending:
+            task.cancel()
+            chat_id = pending[task]
+            self._track_coalesced_reply_survivor(task, chat_id)
+            tasks = self._outbound_tasks_by_chat.get(chat_id)
+            if tasks is not None:
+                tasks.discard(task)
+                if not tasks:
+                    self._outbound_tasks_by_chat.pop(chat_id, None)
+
+    async def _evict_armed_conversations(
+        self,
+        ordered: list[str],
+        armed: list[str],
+        finished: set[str],
+        failed_holder: list[bool],
+    ) -> bool:
+        """Evict ``ordered``, skipping chats already settled in this call."""
+        for chat_id in ordered:
+            if chat_id in finished:
+                continue
+            generation_before = self._chat_generation(chat_id)
+            try:
+                adopted = await self._evict_conversation(chat_id)
+            except asyncio.CancelledError:
+                # ``_evict_conversation`` re-raises only after a shielded
+                # eviction task has finished. A cancel during persist-owner
+                # activation raises before teardown, and that chat must be
+                # retried. Generation advances only once teardown starts.
+                if self._chat_generation(chat_id) != generation_before:
+                    finished.add(chat_id)
+                raise
+            finished.add(chat_id)
+            if not adopted:
+                failed_holder[0] = True
+        if failed_holder[0]:
+            self._release_unadopted_retirements(armed)
+        return not failed_holder[0]
+
+    async def _evict_armed_after_cancel(
+        self,
+        ordered: list[str],
+        armed: list[str],
+        finished: set[str],
+        failed_holder: list[bool],
+    ) -> bool:
+        """Finish armed teardowns after this uninstall task was cancelled.
+
+        ``uncancel`` clears the count so the remaining awaits can run.
+        The cancel is restored afterwards so the caller still sees
+        ``CancelledError``. A second cancel rolls back chats that never
+        entered teardown instead of leaving them in ``_retiring_chats``.
+        """
+        current = asyncio.current_task()
+        if current is not None:
+            while current.cancelling():
+                current.uncancel()
+        try:
+            await self._cancel_matched_outbound(ordered)
+            return await self._evict_armed_conversations(
+                ordered, armed, finished, failed_holder
+            )
+        finally:
+            if current is not None and current.cancelling() == 0:
+                current.cancel()
+
     async def _evict_conversations(self, chat_ids: list[str]) -> bool:
         """Retire each chat via the existing teardown + registry eviction.
 
         Every target is added to ``_retiring_chats`` before the first await
         so a sibling turn cannot post while this chat's teardown is still
-        starting. Each id then runs ``_evict_conversation``, which cancels
-        live turns, clears per-turn buffers, and blocks outbound posts.
-        ``_await_outbound`` still converts ``CancelledError`` to
-        ``RuntimeError`` only for a post already in flight during teardown.
+        starting. In-flight outbound posts on all of those chats are
+        cancelled together before any per-chat teardown waits. If this task
+        is cancelled after that arming, teardown is finished (or, if a
+        second cancel arrives, unadopted chats are dropped) so a sibling
+        cannot stay stuck in ``_retiring_chats``.
         """
         ordered: list[str] = []
         seen: set[str] = set()
@@ -7106,15 +7176,27 @@ class Agent365Adapter(BasePlatformAdapter):
             if chat_id not in self._retiring_chats:
                 self._retiring_chats.add(chat_id)
                 armed.append(chat_id)
-        failed = False
-        for chat_id in ordered:
-            if not await self._evict_conversation(chat_id):
-                failed = True
-        if failed:
-            for chat_id in armed:
-                if self._retirement_not_adopted(chat_id):
-                    self._retiring_chats.discard(chat_id)
-        return not failed
+        finished: set[str] = set()
+        failed_holder = [False]
+        outcome: bool | None = None
+        try:
+            await self._cancel_matched_outbound(ordered)
+            outcome = await self._evict_armed_conversations(
+                ordered, armed, finished, failed_holder
+            )
+            return outcome
+        except asyncio.CancelledError:
+            try:
+                outcome = await self._evict_armed_after_cancel(
+                    ordered, armed, finished, failed_holder
+                )
+            except asyncio.CancelledError:
+                self._release_unadopted_retirements(armed)
+                raise
+            raise
+        finally:
+            if outcome is None:
+                self._release_unadopted_retirements(armed)
 
     async def _evict_conversation(self, chat_id: str) -> bool:
         chat_id = str(chat_id)

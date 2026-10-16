@@ -123,8 +123,9 @@ class ConversationRef:
         ),
         # aadObjectId is the cross-conversation user key (personal ``a:…``
         # vs Copilot ``19:…``). Keep it when the raw is shrunk so uninstall
-        # can still find sibling chats. appId / applicationId are the bot
-        # app id when recipient.id is only a channel account.
+        # can still find sibling chats. appId / applicationId are kept so a
+        # GUID app id still matches when recipient.id is only a channel
+        # account; a non-GUID value is not a strong bot id.
         "from": ("id", "name", "aadObjectId"),
     }
 

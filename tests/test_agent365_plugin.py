@@ -2505,6 +2505,171 @@ class TestLifecycleCapture:
         )
         assert anonymous == ["a:unnamed"]
 
+    def test_uninstall_does_not_match_from_id_without_aad(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A third conversation that shares the personal channel account but
+        # has no aadObjectId is not the same user. from.id alone must not
+        # retire it, including when absorb copies the cached personal ref.
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        a = _make_adapter(monkeypatch)
+
+        def seed(
+            conv_id: str,
+            from_id: str,
+            aad: str,
+            recipient_id: str,
+            *,
+            conv_type: str = "groupChat",
+        ) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            sender: dict[str, Any] = {"id": from_id, "name": "User"}
+            if aad:
+                sender["aadObjectId"] = aad
+            activity["from"] = sender
+            activity["recipient"] = {"id": recipient_id, "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed("a:personal", "29:personal", user, f"28:{app_id}", conv_type="personal")
+        seed("19:copilot@thread.v2", "29:copilot-channel", user, app_id)
+        seed("19:no-aad@thread.v2", "29:personal", "", f"28:{app_id}")
+        seed("19:activity-from@thread.v2", "29:personal-channel", "", app_id)
+        activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:personal-channel"},
+            "recipient": {"id": f"28:{app_id}", "name": "Bot"},
+            "conversation": {"id": "a:personal", "conversationType": "personal"},
+        }
+
+        ids = a._uninstall_conversation_ids(activity)
+
+        assert "a:personal" in ids
+        assert "19:copilot@thread.v2" in ids
+        assert "19:no-aad@thread.v2" not in ids
+        assert "19:activity-from@thread.v2" not in ids
+
+    def test_uninstall_absorb_does_not_union_disagreeing_object_ids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        alice = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        bob = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        a = _make_adapter(monkeypatch)
+
+        def seed(conv_id: str, aad: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["from"] = {"id": "29:shared", "aadObjectId": aad, "name": "User"}
+            activity["recipient"] = {"id": f"28:{app_id}", "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed("a:personal", bob)
+        seed("19:alice@thread.v2", alice)
+        seed("19:bob@thread.v2", bob)
+        activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:personal-channel", "aadObjectId": alice},
+            "recipient": {"id": app_id, "name": "Bot"},
+            "conversation": {"id": "a:personal"},
+        }
+
+        assert a._uninstall_conversation_ids(activity) == ["a:personal"]
+
+    def test_uninstall_bot_match_requires_equal_guid_app_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A shared non-GUID applicationId must not hide a different 28: app
+        # GUID, and a JWT aud must not retire a sibling when the uninstall
+        # itself has no strong bot id. 28:orgid: still normalizes to the GUID.
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        other_app = "22222222-2222-2222-2222-222222222222"
+        a = _make_adapter(monkeypatch)
+
+        def seed(conv_id: str, recipient: dict[str, Any]) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = "groupChat"
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            activity["recipient"] = recipient
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed(
+            "a:personal",
+            {"id": f"28:{app_id}", "applicationId": "copilot", "name": "Bot"},
+        )
+        seed(
+            "19:orgid@thread.v2",
+            {"id": f"28:orgid:{app_id}", "applicationId": "copilot", "name": "Bot"},
+        )
+        seed(
+            "19:other-guid@thread.v2",
+            {"id": f"28:{other_app}", "applicationId": "copilot", "name": "Bot"},
+        )
+        activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:personal-channel", "aadObjectId": user},
+            "recipient": {
+                "id": f"28:{app_id}",
+                "applicationId": "copilot",
+                "name": "Bot",
+            },
+            "conversation": {"id": "a:personal"},
+        }
+
+        ids = a._uninstall_conversation_ids(activity)
+
+        assert "a:personal" in ids
+        assert "19:orgid@thread.v2" in ids
+        assert "19:other-guid@thread.v2" not in ids
+
+        veto = _make_adapter(monkeypatch)
+        anchor = _make_inbound(path="B", conv_id="a:personal", activity_id="anchor")
+        anchor["from"] = {"id": "29:personal", "aadObjectId": user, "name": "User"}
+        anchor["recipient"] = {
+            "id": f"28:{app_id}",
+            "applicationId": other_app,
+            "name": "Bot",
+        }
+        sibling = _make_inbound(path="B", conv_id="19:one-guid@thread.v2", activity_id="sib")
+        sibling["conversation"]["conversationType"] = "groupChat"
+        sibling["from"] = {"id": "29:copilot", "aadObjectId": user, "name": "User"}
+        sibling["recipient"] = {"id": app_id, "name": "Bot"}
+        veto._conversations.upsert(adapter_mod.ConversationRef.from_activity(anchor))
+        veto._conversations.upsert(adapter_mod.ConversationRef.from_activity(sibling))
+        veto_activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:personal", "aadObjectId": user},
+            "recipient": {"id": f"28:{app_id}", "applicationId": other_app},
+            "conversation": {"id": "a:personal"},
+        }
+        assert veto._uninstall_conversation_ids(veto_activity) == ["a:personal"]
+
+        weak = _make_adapter(monkeypatch)
+        named = _make_inbound(path="B", conv_id="a:personal", activity_id="named")
+        named["from"] = {"id": "29:personal", "aadObjectId": user, "name": "User"}
+        named["recipient"] = {"id": "28:channel-acct", "name": "Bot"}
+        sibling = _make_inbound(path="B", conv_id="19:aud-sibling@thread.v2", activity_id="aud")
+        sibling["conversation"]["conversationType"] = "groupChat"
+        sibling["from"] = {"id": "29:copilot", "aadObjectId": user, "name": "User"}
+        sibling["recipient"] = {"id": app_id, "agenticAppId": "copilot", "name": "Bot"}
+        weak._conversations.upsert(adapter_mod.ConversationRef.from_activity(named))
+        weak._conversations.upsert(adapter_mod.ConversationRef.from_activity(sibling))
+        weak_activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:personal", "aadObjectId": user},
+            "recipient": {"id": "28:channel-acct", "applicationId": "copilot"},
+            "conversation": {"id": "a:personal"},
+        }
+        assert weak._uninstall_conversation_ids(
+            weak_activity, jwt_app_id=app_id
+        ) == ["a:personal"]
+
     def test_bot_removed_from_one_chat_does_not_retire_sibling(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -2678,6 +2843,9 @@ class TestLifecycleCapture:
                 a._coalesced_reply_tasks["mid-other-bot"] = other_task
                 stuck_task = asyncio.create_task(stuck())
                 a._outbound_tasks_by_chat.setdefault(copilot, set()).add(stuck_task)
+                # Reach the sleep before uninstall. A cancel delivered before
+                # the first await ends the task without entering the handler.
+                await asyncio.sleep(0)
 
                 uninstall_body = self._lifecycle_body(
                     conv_id="a:personal",
@@ -2735,6 +2903,132 @@ class TestLifecycleCapture:
             if stuck_task is not None and not stuck_task.done():
                 stuck_task.cancel()
                 await asyncio.wait_for(stuck_task, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_uninstall_does_not_stick_sibling(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Cancel after siblings are armed, while the first eviction is still
+        # inside teardown. The sibling must be retired or rolled back — it
+        # must not stay in ``_retiring_chats`` without a teardown owner.
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        a = _make_adapter(monkeypatch)
+
+        def seed(conv_id: str, conv_type: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            activity["recipient"] = {"id": f"28:{app_id}", "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed(personal, "personal")
+        seed(copilot, "groupChat")
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        original = a._evict_conversation_impl
+
+        async def blocked(
+            chat_id: str, reservation: tuple[dict[str, Any], int, int]
+        ) -> bool:
+            if chat_id == personal:
+                entered.set()
+                await release.wait()
+            return await original(chat_id, reservation)
+
+        monkeypatch.setattr(a, "_evict_conversation_impl", blocked)
+        eviction = asyncio.create_task(a._evict_conversations([personal, copilot]))
+        await entered.wait()
+        assert copilot in a._retiring_chats
+        eviction.cancel()
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(eviction, timeout=2)
+
+        assert personal not in a._conversations
+        assert copilot not in a._conversations
+        assert personal not in a._retiring_chats
+        assert copilot not in a._retiring_chats
+        assert a._chat_teardown_tasks == {}
+        assert a._registry_evicting_chats == set()
+
+    @pytest.mark.asyncio
+    async def test_uninstall_cancels_matched_outbound_before_personal_teardown(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Outbound posts on every matched chat are cancelled together, before
+        # the personal chat's teardown waits. A resistant personal post must
+        # not delay cancellation of the Copilot post.
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.2)
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        a = _make_adapter(monkeypatch)
+
+        def seed(conv_id: str, conv_type: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            activity["recipient"] = {"id": app_id, "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed(personal, "personal")
+        seed(copilot, "groupChat")
+        personal_started = asyncio.Event()
+        sibling_cancelled = asyncio.Event()
+        cancelled_before_personal: dict[str, bool] = {}
+
+        async def sibling_post() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled_before_personal["ok"] = not personal_started.is_set()
+                sibling_cancelled.set()
+                raise
+
+        async def resistant_personal_post() -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                await asyncio.sleep(60)
+                raise
+
+        sibling_task = asyncio.create_task(sibling_post())
+        personal_task = asyncio.create_task(resistant_personal_post())
+        a._outbound_tasks_by_chat[copilot] = {sibling_task}
+        a._outbound_tasks_by_chat[personal] = {personal_task}
+        await asyncio.sleep(0)
+        original = a._evict_conversation_impl
+
+        async def mark_personal(
+            chat_id: str, reservation: tuple[dict[str, Any], int, int]
+        ) -> bool:
+            if chat_id == personal:
+                personal_started.set()
+            return await original(chat_id, reservation)
+
+        monkeypatch.setattr(a, "_evict_conversation_impl", mark_personal)
+        eviction = asyncio.create_task(a._evict_conversations([personal, copilot]))
+        try:
+            await asyncio.wait_for(sibling_cancelled.wait(), timeout=0.5)
+            assert cancelled_before_personal["ok"] is True
+            assert await asyncio.wait_for(eviction, timeout=2) is True
+            assert personal not in a._conversations
+            assert copilot not in a._conversations
+            assert copilot not in a._retiring_chats
+        finally:
+            personal_task.cancel()
+            sibling_task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(personal_task, sibling_task, return_exceptions=True),
+                timeout=1,
+            )
+        await asyncio.sleep(0)
+        assert personal not in a._retiring_chats
 
     @pytest.mark.asyncio
     async def test_request_blocked_in_jwt_cannot_cross_uninstall(

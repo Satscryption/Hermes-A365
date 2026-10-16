@@ -17,8 +17,16 @@ this heading is dated at release.
   Chat uninstall arrives on the personal ``a:…`` conversation while the
   in-flight turn lives on the sibling ``19:…`` groupChat. The adapter now
   cancels those turns, clears their buffers, and blocks a late post through
-  the existing ``_retiring_chats`` teardown. A different user or a different
-  bot is left in place. Removing the bot from a single chat
+  the existing ``_retiring_chats`` teardown. Matching fails closed: both
+  sides must carry the same ``aadObjectId`` (a shared ``from.id`` never
+  selects a sibling, and disagreeing object ids do not fan out) and the
+  same normalized app GUID (``28:`` / ``28:orgid:``). A non-GUID app id or
+  a JWT ``aud`` cannot by itself retire another conversation. In-flight
+  outbound posts on every matched chat are cancelled together before
+  per-chat teardown. If that handling is cancelled after siblings are
+  armed, teardown finishes or the arming is rolled back so those chats do
+  not stay in ``_retiring_chats``. A different user or a different bot is
+  left in place. Removing the bot from a single chat
   (``conversationUpdate`` / ``membersRemoved``) still evicts only that chat.
 
 ### Walk findings (#102, #123)
