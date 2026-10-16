@@ -5753,6 +5753,216 @@ class TestEditMessage:
         )
 
     @pytest.mark.asyncio
+    async def test_turn_buffer_keeps_one_line_answers_sharing_progress_shape(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A sentence that starts with an emoji and a progress verb is an
+        # answer. Only Hermes's registered emoji + verb + preview is dropped.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-answer", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-answer"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        for content in (
+            "📝 Writing the patch is done.",
+            "💬 Running through it: the date is Thursday.",
+            "\u270d\ufe0f Writing the patch is done.",
+            "💻 Running date",
+        ):
+            result = await a.send(
+                chat_id="conv-G-answer", content=content, reply_to=None
+            )
+            assert result.success is True
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == (
+            "📝 Writing the patch is done.\n\n"
+            "💬 Running through it: the date is Thursday.\n\n"
+            "\u270d\ufe0f Writing the patch is done."
+        )
+        assert "conv-G-answer" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_nested_processing_start_flushes_turns_in_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A queued follow-up calls start+complete before the outer complete.
+        # The outer segments must survive that nested start and post first.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-nest", activity_id="act-outer")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="first",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-nest"),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(event)
+        outer = await a.send(
+            chat_id="conv-G-nest", content="Outer reply", reply_to=None
+        )
+        assert outer.success is True
+        inbound["id"] = "act-followup"
+        await a.on_processing_start(event)
+        assert a._turn_buffers["conv-G-nest"]["inbound"]["id"] == "act-outer"
+        assert a._turn_buffers["conv-G-nest"]["depth"] == 2
+        assert [segment["text"] for segment in a._turn_buffers["conv-G-nest"]["segments"]] == [
+            "Outer reply"
+        ]
+        follow = await a.send(
+            chat_id="conv-G-nest", content="Follow-up reply", reply_to=None
+        )
+        assert follow.success is True
+        await a.on_processing_complete(event, outcome="success")
+        texts = [
+            call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list
+        ]
+        assert texts == ["Outer reply", "Follow-up reply"]
+        assert send_reply_mock.await_args_list[0].kwargs["inbound"]["id"] == "act-outer"
+        assert "conv-G-nest" in a._turn_buffers
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 2
+        assert "conv-G-nest" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_kept_until_post_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-retry", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(side_effect=RuntimeError("post failed"))
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-retry"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-retry", content="Keep me", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == adapter_mod._TURN_BUFFER_POST_ATTEMPTS
+        assert [segment["text"] for segment in a._turn_buffers["conv-G-retry"]["segments"]] == [
+            "Keep me"
+        ]
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        await a.on_processing_complete(event, outcome="success")
+        assert a._turn_buffers == {}
+        posted = bridge.send_reply.await_args.kwargs["reply"]["text"]
+        assert posted == "Keep me"
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_flush_cancel_keeps_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-cancel", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        started = asyncio.Event()
+
+        async def hang(**_kwargs: Any) -> None:
+            started.set()
+            await asyncio.Event().wait()
+
+        monkeypatch.setattr(bridge, "send_reply", hang)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-cancel"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-cancel", content="Still here", reply_to=None)
+        flushing = asyncio.create_task(a.on_processing_complete(event, outcome="success"))
+        await started.wait()
+        flushing.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await flushing
+        assert [segment["text"] for segment in a._turn_buffers["conv-G-cancel"]["segments"]] == [
+            "Still here"
+        ]
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Still here"
+        assert "conv-G-cancel" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_splits_merged_body_over_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-split", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-split"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        parts = [char * 1500 for char in ("A", "B", "C")]
+        for part in parts:
+            result = await a.send(chat_id="conv-G-split", content=part, reply_to=None)
+            assert result.success is True
+        await a.on_processing_complete(event, outcome="success")
+        texts = [
+            call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list
+        ]
+        # 1500 + blank line + 1500 fits; the third segment does not.
+        assert texts == [f"{parts[0]}\n\n{parts[1]}", parts[2]]
+        assert all(len(text) <= a.MAX_MESSAGE_LENGTH for text in texts)
+        assert "conv-G-split" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_watchdog_posts_stale_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_FLUSH_AFTER_SEC", 0.0)
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-stale", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-stale"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-stale", content="Posted by the watchdog", reply_to=None)
+
+        async def _posted() -> None:
+            while send_reply_mock.await_count == 0:
+                await asyncio.sleep(0)
+
+        await asyncio.wait_for(_posted(), timeout=1)
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Posted by the watchdog"
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert "conv-G-stale" not in a._turn_buffers
+
+    @pytest.mark.asyncio
     async def test_personal_chat_is_not_turn_buffered(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

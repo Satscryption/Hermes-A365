@@ -309,10 +309,14 @@ this heading is dated at release.
   merged reply — segments joined by a blank line, plus the opt-in handoff
   link — via `_send_reply_activity`, then runs the existing coalesced
   flush. The buffer is cleared on disconnect and on chat eviction.
-  Personal chats are not buffered. A segment that is only a Hermes
-  tool-progress line (``💻 Running date``, and the same shape for the
-  other built-in verbs) is left out of that merged reply. Walk row 2a
-  passed with typing suppressed: the reply rendered in about 16s.
+  Personal chats are not buffered. A segment that is only an exact
+  Hermes tool-progress line (``💻 Running date``, registered emoji plus
+  verb) is left out of that merged reply. A one-line answer that merely
+  shares the verb is kept. A nested ``on_processing_start`` keeps the
+  open buffer and later flushes turns in order. The buffer stays until
+  each post succeeds; oversize joins are split; a failed post is retried
+  and a stale buffer is flushed again. Walk row 2a passed with typing
+  suppressed: the reply rendered in about 16s.
 - **Copilot turn-end cleanup no longer hangs on a swallowed typing cancel (F8).**
   `Agent365Adapter._await_outbound` turned every `CancelledError` into
   `RuntimeError("agent365 outbound operation cancelled")`. Hermes cancels
