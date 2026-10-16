@@ -393,10 +393,31 @@ this heading is dated at release.
   `send_typing` is a no-op unless the cached `conversationType` is
   exactly `personal`. Teams 1:1 chats still get the indicator. With
   typing suppressed, live walk row 2a rendered the reply in about 16s
-  (3 segments, 166 characters, one activity). The per-turn buffer,
-  flush, segment rework, and progress-line filter are not in this
-  change. That buffering and retry work moves to a follow-up after
-  0.9.0.
+  (3 segments, 166 characters, one activity).
+- **Copilot Chat posts one reply per non-personal turn.** A live retest
+  on main posted the interim line `Checking the current time now.`, ran
+  a tool, then lost the final reply with `agent365 send send_reply
+  failed: agent365 outbound operation cancelled`. Copilot kept only the
+  interim line. Copilot accepts one reply per turn, so a non-personal
+  chat that has seen an inbound this gateway lifetime now opens
+  `_turn_buffers[chat_id]` in `on_processing_start`. The buffer has a
+  depth and a turn id. `send` appends a segment and returns without a
+  network await. `edit_message` on `turnbuf:<n>` replaces that segment.
+  A nested complete flushes only the finished turn, using the inbound
+  snapshotted at that turn's start. Personal chats are not buffered.
+  A segment that is only a registered Hermes tool-progress line (emoji,
+  verb, and connector, such as ``💻 Running date``) is left out. A
+  one-line answer that only shares that shape is kept. Each chunk is
+  posted once, and its segment ids are removed only after the post
+  returns success. A failed flush does not retry inside that call.
+  When no turn is open and segments remain, a deferred retry posts
+  them, so one reply is not stranded until the next user turn. A chunk
+  that timed out after the request was sent is treated as possibly
+  delivered and is not posted again. Operational notices default to
+  `config.extra["notice_delivery"] = "private"` and are withheld on
+  non-personal chats. A caller cancellation of `_await_outbound`
+  propagates unless the adapter is tearing the chat down, so turn-end
+  typing cleanup can reach `on_processing_complete`.
 - **H4 — sequential coalesced reply segments are no longer swallowed.**
   Non-personal chats now assign a fresh synthetic message id to every newly
   opened coalesced segment. Multiple segments for the same inbound activity
