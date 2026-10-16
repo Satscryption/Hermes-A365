@@ -4,11 +4,38 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [0.9.0] — Unreleased
+## [0.9.0] — 2026-10-16
 
 Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
-Gated by the #123 focused hardening walk. Entries accumulate here per PR and
-this heading is dated at release.
+Gated by the #123 focused hardening walk, which passed every row on
+`main@ff020c7` (2026-10-16, both paths, production tenant, dev resources torn
+down afterwards).
+
+### Merged for the walk (PRs #149–#157)
+
+- #149: unanswered approval chats are kept out of registry eviction (#130).
+- #150: Python 3.14 support; documents the Hermes PyJWT override. The
+  `pyjwt[crypto]>=2.15.0` floor is kept (refs #148, still open upstream).
+- #151: `register` no longer claims it auto-detects a tenant.
+- #152: Teams instance agent identities can mint outbound tokens.
+- #153: walk fixes for orphan ownership (cleanup refuses unproven orphan
+  owners) and verify error reporting.
+- #154: Copilot Chat typing is limited to personal chats.
+- #156: uninstall retires every cached chat for the same user and bot,
+  matched on the exact aadObjectId and app GUID.
+- #157: non-personal (Copilot groupChat) turns are buffered into one reply,
+  with a deferred retry, no re-post after an ambiguous POST timeout, and
+  token-mint timeouts treated as definite failures.
+
+### Known follow-ups (not blocking)
+
+- #155: keep Copilot Chat alive for buffered turns longer than ~45s.
+- #158: uninstall drops the reply but does not yet cancel the in-flight
+  model turn (cost only).
+- #159: the orphan-cleanup Graph ownership check also refuses the real
+  owner (fails closed).
+- #160: the bridge allowlist is read only from the per-agent env.
+- #161: Teams 1:1 replies can stay greyed with a Stop button.
 
 ### Uninstall scope (walk row 2b)
 
@@ -16,8 +43,10 @@ this heading is dated at release.
   that user and bot, not only the chat named on the activity.** Copilot
   Chat uninstall arrives on the personal ``a:…`` conversation while the
   in-flight turn lives on the sibling ``19:…`` groupChat. The adapter now
-  cancels those turns, clears their buffers, and blocks a late post through
-  the existing ``_retiring_chats`` teardown. Matching fails closed: both
+  drops the buffered or pending reply and posts nothing, clears their
+  buffers, and blocks a late post through the existing ``_retiring_chats``
+  teardown. The in-flight model turn is not cancelled (follow-up #158).
+  Matching fails closed: both
   sides must carry the same ``aadObjectId`` (a shared ``from.id`` never
   selects a sibling, and disagreeing object ids do not fan out) and the
   same normalized app GUID (``28:`` / ``28:orgid:``). A non-GUID app id or
