@@ -99,6 +99,17 @@ or process-restart evidence. Total for these two disjoint selections: 322 tests.
    section 9c. This branch requires free-port checks, foreground responder
    and bridge startup, listener-ownership verification and `/healthz`
    success before starting the tunnel. No tunnel was launched for validation.
+4. #148 re-checked on 2026-10-16 against Hermes `main`
+   `e6899c8090da3bd48c829893e4103ce989d3482d`. The supported Python 3.14
+   runtime still pins `PyJWT[crypto]==2.13.0`, which does not satisfy
+   `pyjwt[crypto]>=2.15.0`.
+   [NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
+   tracks the PyJWT pin only and is not the FastAPI exit. Separately,
+   `hermes-agent[web]` pins `fastapi==0.133.1`, which does not meet
+   `fastapi>=0.141.1`. The floors stay. The 0.9.0 gateway install uses the
+   documented `overrides.txt` (`pyjwt[crypto]>=2.15.0` and `fastapi>=0.143`)
+   until each pin moves. refs #148. The contract is
+   [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md).
 
 Remediation verification on the branch integrating the merged dependencies:
 

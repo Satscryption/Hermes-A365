@@ -11,7 +11,17 @@ license = {text = "MIT"}
 authors = [
   {name = "Sadiq Jaffer", email = "sadiq.jaffer@satscryption.io"},
 ]
+# 3.11 is the minimum. 3.14 is the Hermes gateway runtime this release ships
+# against: NousResearch/hermes-agent requires-python is >=3.11,<3.15 and
+# documents 3.14 as its supported runtime. CI tests both. #148.
 requires-python = ">=3.11"
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+]
 dependencies = [
   "jinja2>=3.1",
   # doctor reads the gateway's config.yaml (profile file-host allowlist, #76 R4).
@@ -81,6 +91,7 @@ include = [
   "CHANGELOG.md",
   "LICENSE",
   "pyproject.toml",
+  "overrides.txt",
 ]
 
 [tool.ruff]

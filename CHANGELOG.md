@@ -187,6 +187,30 @@ this heading is dated at release.
   triage also removed exception text and upstream response excerpts from the
   externally visible `reply_failed` response; sanitized diagnostics remain in
   server logs.
+- **#148: ship 0.9.0 on Python 3.14 and keep the security floors.**
+  `requires-python` stays `>=3.11` (which includes 3.14) and CI now runs
+  ruff and pytest on 3.11 and 3.14, the Hermes gateway runtime. Floors stay
+  at `pyjwt[crypto]>=2.15.0` and the other #125 minimums, including
+  `fastapi>=0.141.1` and `idna>=3.15`. Hermes `main` still pins
+  `PyJWT[crypto]==2.13.0` on Python 3.14.
+  [NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
+  tracks the PyJWT pin only and is not the FastAPI exit. Separately,
+  `hermes-agent[web]` pins `fastapi==0.133.1`, which does not meet
+  `fastapi>=0.141.1`. Until each of those pins moves, install with the
+  repo's `overrides.txt`:
+
+  ```text
+  pyjwt[crypto]>=2.15.0
+  fastapi>=0.143
+  ```
+
+  ```bash
+  uv pip install --override overrides.txt 'hermes-a365[bridge]'
+  ```
+
+  `fastapi>=0.143` covers the web extra and is above our floor. refs #148.
+  #148 stays open. `--no-deps` is not the install path.
+  [`references/hermes-runtime-compatibility.md`](references/hermes-runtime-compatibility.md).
 - **v0.9.0 hardening migration notes.** Inbound bearer headers are bounded and
   structurally validated before issuer routing; callers receive fixed auth
   failures while bounded diagnostics remain server-side. End-user allowlists

@@ -18,19 +18,26 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # 3.11 is the package minimum. 3.14 is the Hermes gateway runtime
+        # (NousResearch/hermes-agent; #148).
+        python-version: ["3.11", "3.14"]
+    name: test (Python ${{ matrix.python-version }})
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Install uv
         uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
         with:
-          python-version: "3.11"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install deps
-        run: uv sync --all-extras
+        run: uv sync --all-extras --frozen --python ${{ matrix.python-version }}
 
       - name: ruff
-        run: uv run ruff check .
+        run: uv run --python ${{ matrix.python-version }} ruff check .
 
       - name: pytest
-        run: uv run pytest
+        run: uv run --python ${{ matrix.python-version }} pytest

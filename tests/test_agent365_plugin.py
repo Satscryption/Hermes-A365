@@ -9619,6 +9619,11 @@ class TestPruneConversations:
     async def test_replacement_adapter_write_orders_after_old_shielded_save(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
+        # Overlap is established with adapter state, not sleeps. A short
+        # asyncio.wait_for around activation cancels that task; activation
+        # finishes the handoff and then re-raises CancelledError, which
+        # wait_for reports as TimeoutError whenever the shielded write
+        # outlasts the deadline (Python 3.14 CI, run 38927499818).
         import asyncio as _asyncio
         import threading as _threading
 
@@ -9626,6 +9631,13 @@ class TestPruneConversations:
             ConversationRef,
             ConversationRegistry,
         )
+
+        async def _until(predicate: Any, detail: str) -> None:
+            for _ in range(200):
+                if predicate():
+                    return
+                await _asyncio.sleep(0)
+            raise AssertionError(detail)
 
         monkeypatch.setattr(
             adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
@@ -9638,6 +9650,7 @@ class TestPruneConversations:
         real_write = ConversationRegistry.write_payload
         old_started = _threading.Event()
         release_old = _threading.Event()
+        write_ids: list[set[str]] = []
 
         def blocked_old_write(path: Path, payload: Any) -> None:
             ids = {
@@ -9646,54 +9659,73 @@ class TestPruneConversations:
             }
             if ids == {"old"}:
                 old_started.set()
-                assert release_old.wait(timeout=1.0)
+                release_old.wait()
             real_write(path, payload)
+            write_ids.append(ids)
 
         monkeypatch.setattr(
             ConversationRegistry,
             "write_payload",
             staticmethod(blocked_old_write),
         )
-        old._conversations.upsert(
-            ConversationRef(conversation_id="old", service_url="https://x/")
-        )
-        old_save = _asyncio.create_task(old._persist_conversations())
-        assert await _asyncio.to_thread(old_started.wait, 1.0)
-        old._conversations.upsert(
-            ConversationRef(
-                conversation_id="queued-stale", service_url="https://x/"
+        try:
+            old._conversations.upsert(
+                ConversationRef(conversation_id="old", service_url="https://x/")
             )
-        )
-        queued_stale_save = _asyncio.create_task(old._persist_conversations())
-        await _asyncio.sleep(0.02)
-        old_save.cancel()
-        with pytest.raises(_asyncio.CancelledError):
-            await old_save
-        queued_stale_save.cancel()
-        with pytest.raises(_asyncio.CancelledError):
-            await queued_stale_save
-
-        await _asyncio.wait_for(old.disconnect(), timeout=0.5)
-        assert old._disconnecting is True
-        replacement_activation = _asyncio.create_task(
-            replacement._activate_persist_owner()
-        )
-        await _asyncio.sleep(0.02)
-        release_old.set()
-        await _asyncio.wait_for(replacement_activation, timeout=0.5)
-        replacement._conversations.upsert(
-            ConversationRef(
-                conversation_id="replacement", service_url="https://x/"
+            old_save = _asyncio.create_task(old._persist_conversations())
+            # Fuse only: the write task sets this as soon as it blocks.
+            assert await _asyncio.to_thread(old_started.wait, 10)
+            old._conversations.upsert(
+                ConversationRef(
+                    conversation_id="queued-stale", service_url="https://x/"
+                )
             )
-        )
-        replacement_save = _asyncio.create_task(
-            replacement._persist_conversations()
-        )
-        await _asyncio.wait_for(replacement_save, timeout=0.5)
-        await _asyncio.sleep(0)
+            queued_stale_save = _asyncio.create_task(old._persist_conversations())
+            await _until(
+                lambda: len(old._persist_tasks) >= 2,
+                "queued stale save never became a shielded write",
+            )
+            old_save.cancel()
+            with pytest.raises(_asyncio.CancelledError):
+                await old_save
+            queued_stale_save.cancel()
+            with pytest.raises(_asyncio.CancelledError):
+                await queued_stale_save
 
-        reloaded = ConversationRegistry.load(conv_path)
-        assert "replacement" in reloaded
+            await old.disconnect()
+            assert old._disconnecting is True
+            replacement_activation = _asyncio.create_task(
+                replacement._activate_persist_owner()
+            )
+
+            def _replacement_waiting_on_shielded_write() -> bool:
+                with adapter_mod._PERSIST_STATE_GUARD:
+                    state = adapter_mod._persist_state(old._conversations_path)
+                    return bool(int(state["handoff_owner"])) and bool(
+                        state["pending"]
+                    )
+
+            await _until(
+                _replacement_waiting_on_shielded_write,
+                "replacement owner did not block on the shielded save",
+            )
+            assert not replacement_activation.done()
+            release_old.set()
+            await replacement_activation
+            replacement._conversations.upsert(
+                ConversationRef(
+                    conversation_id="replacement", service_url="https://x/"
+                )
+            )
+            await replacement._persist_conversations()
+            await _asyncio.sleep(0)
+
+            reloaded = ConversationRegistry.load(conv_path)
+            assert "replacement" in reloaded
+            assert {"old"} in write_ids
+            assert "replacement" in write_ids[-1]
+        finally:
+            release_old.set()
 
     @pytest.mark.asyncio
     async def test_replacement_write_beats_older_save_waiting_for_admission(
