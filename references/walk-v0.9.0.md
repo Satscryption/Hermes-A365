@@ -103,8 +103,10 @@ or process-restart evidence. Total for these two disjoint selections: 322 tests.
    `e6899c8090da3bd48c829893e4103ce989d3482d`. The supported Python 3.14
    runtime still pins `PyJWT[crypto]==2.13.0`, which does not satisfy
    `pyjwt[crypto]>=2.15.0`. `hermes-agent[web]` additionally pins
-   `fastapi==0.133.1`. The floors stay. A uv override used to start a
-   gateway is not acceptance for rows 2a–2d. The contract is
+   `fastapi==0.133.1`. The floors stay. The 0.9.0 gateway install uses the
+   documented `overrides.txt` (`pyjwt[crypto]>=2.15.0` and `fastapi>=0.143`)
+   until [NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
+   relaxes those pins. #148 stays open as that tracker. The contract is
    [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md).
 
 Remediation verification on the branch integrating the merged dependencies:

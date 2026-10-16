@@ -3,10 +3,10 @@
 Snapshot date: 2026-10-16.
 
 This note is the installation contract for running Hermes Agent and
-`hermes-a365[bridge]` in one environment. It exists because issue
-[#148](https://github.com/Satscryption/Hermes-A365/issues/148) blocks the
-v0.9.0 gateway walk (#123) until that combined install resolves with
-ordinary dependency resolution.
+`hermes-a365[bridge]` in one environment. v0.9.0 ships against Hermes'
+Python 3.14 runtime and keeps `pyjwt[crypto]>=2.15.0`. Issue
+[#148](https://github.com/Satscryption/Hermes-A365/issues/148) stays open
+to track the upstream pin, not as a reason to lower our floor.
 
 ## Floors this package will not lower
 
@@ -21,10 +21,10 @@ ordinary dependency resolution.
 | `starlette` | `>=1.3.1` |
 
 These are security minimums from the #125 baseline and the #123
-preflight (PyJWT advisories 18–30, AnyIO alerts 16–17). A combined
-install that needs `--no-deps`, a uv `override-dependencies` entry, or a
-lower floor is not a supported installation and is not evidence that
-#148 or the #123 gateway rows passed.
+preflight (PyJWT advisories 18–30, AnyIO alerts 16–17). Do not lower
+them to satisfy Hermes' pins, and do not install with `--no-deps`. The
+supported combined install is the uv override below, which forces the
+patched versions instead of the pinned ones.
 
 ## What Hermes currently declares
 
@@ -82,28 +82,47 @@ AnyIO is not a direct Hermes pin in this revision. The #148 host
 observation of AnyIO 4.12.1 was an installed environment, not a second
 metadata conflict in current `pyproject.toml`.
 
-## Compatible path
+## Supported install until the upstream pins move
 
-There is no Hermes revision identified here that installs next to this
-package under ordinary resolution on Python 3.14. The repair is upstream,
-in Hermes' exact-pin style:
+Ordinary resolution on Python 3.14 is still unsatisfiable. The upstream
+repair is [NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394):
+Hermes should move `PyJWT[crypto]==2.13.0` to an exact pin that satisfies
+`>=2.15.0`, and move `fastapi==0.133.1` in `hermes-agent[web]` to a release
+that satisfies `fastapi>=0.141.1`. #148 stays open until that lands. Our
+floors do not move in the meantime.
 
-1. Change the core marker line from `PyJWT[crypto]==2.13.0` to
-   `PyJWT[crypto]==2.15.0` (or a newer exact release) and regenerate
-   Hermes' lock. Our floor stays `>=2.15.0`.
-2. If the walk or the operator also installs `hermes-agent[web]`, move
-   `fastapi==0.133.1` to an exact release that satisfies
-   `fastapi>=0.141.1`, keeping `starlette` at a release that satisfies
-   `>=1.3.1`.
-3. Resolve and install with a normal installer. Read back `pyjwt`,
-   `cryptography`, `fastapi`, `starlette`, and `anyio`. Then run plugin
-   discovery and the gateway checks in #123 section 2.
+Until then, install this package into the Hermes Python 3.14 environment
+with `overrides.txt` from this repository:
 
-Do not close #148, and do not mark #123 rows 2a–2d passed, on the basis
-of a uv override or `--no-deps` install. Those hide the conflict instead
-of satisfying it. Azure-only #123 probes do not need this install and
-can proceed on their own.
+```text
+pyjwt[crypto]>=2.15.0
+fastapi>=0.143
+```
 
-Python 3.11 is what this repository's CI runs. It does not prove the
-combined Python 3.14 install, because current Hermes applies the PyJWT
-pin only on `>=3.14` and does not support 3.11 as the gateway runtime.
+```bash
+uv pip install --override overrides.txt 'hermes-a365[bridge]'
+```
+
+`pyjwt[crypto]>=2.15.0` replaces Hermes' Python 3.14 pin and matches our
+floor. `fastapi>=0.143` replaces `fastapi==0.133.1` from
+`hermes-agent[web]` (including `hermes-agent[all]`). It is above our
+`fastapi>=0.141.1` floor, so it does not weaken the package. If that extra
+is not installed, the FastAPI line is unused by the conflict but remains
+in the file so one override covers both pins. `starlette==1.3.1` in the
+web extra already meets `starlette>=1.3.1`.
+
+If the Hermes venv is not the environment `uv` is using, pass it
+explicitly:
+
+```bash
+uv pip install --python ~/.hermes/hermes-agent/venv/bin/python --override overrides.txt 'hermes-a365[bridge]'
+```
+
+`--no-deps` is not this path: it would skip the floors entirely. After
+install, read back `pyjwt`, `cryptography`, `fastapi`, `starlette`, and
+`anyio` before the #123 gateway rows.
+
+This repository's CI runs ruff and the full pytest suite on Python 3.11
+and Python 3.14. That proves this package on the Hermes runtime. It does
+not, by itself, prove the combined Hermes resolve; the override above is
+what makes that resolve succeed while the upstream pins remain.
