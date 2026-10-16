@@ -19,6 +19,7 @@ to track the upstream pin, not as a reason to lower our floor.
 | `anyio` | `>=4.14.2` |
 | `fastapi` | `>=0.141.1` |
 | `starlette` | `>=1.3.1` |
+| `idna` | `>=3.15` |
 
 These are security minimums from the #125 baseline and the #123
 preflight (PyJWT advisories 18–30, AnyIO alerts 16–17). Do not lower
@@ -31,11 +32,18 @@ patched versions instead of the pinned ones.
 Two revisions were read. Neither resolves together with the floors above
 on the runtime Hermes actually supports.
 
-### Hermes Agent 0.20.0
+### Host checkout #148 inspected
 
-Commit `f60f6d534375ccd6ec78d47ff1b5a97371cd8d60`, the revision #148
-inspected. Core dependencies pin `PyJWT[crypto]==2.13.0` with no Python
-marker. `uv pip compile --python-version 3.11` of `hermes-agent` plus
+`f60f6d534375ccd6ec78d47ff1b5a97371cd8d60` is the host checkout #148
+inspected. It is not a commit on
+[NousResearch/hermes-agent](https://github.com/NousResearch/hermes-agent),
+and PyPI `hermes-agent` has no `0.20.0` release (latest public release
+`0.19.0`). The installed distribution reported `hermes-agent==0.20.0`;
+that version string is the resolver's label for the local tree, not a
+revision a reader can open upstream.
+
+That checkout's core dependencies pin `PyJWT[crypto]==2.13.0` with no
+Python marker. `uv pip compile --python-version 3.11` of that tree plus
 `hermes-a365[bridge]` is unsatisfiable:
 
 ```text
@@ -43,8 +51,8 @@ hermes-agent==0.20.0 depends on pyjwt[crypto]==2.13.0
 hermes-a365[bridge] depends on pyjwt[crypto]>=2.15.0
 ```
 
-That release also ships an optional `web` extra pinned to FastAPI
-0.133.1, below `fastapi>=0.141.1`.
+The same checkout's optional `web` extra pins FastAPI 0.133.1, below
+`fastapi>=0.141.1`. That FastAPI pin is separate from the PyJWT pin.
 
 ### Hermes `main` on 2026-10-16
 
@@ -84,12 +92,20 @@ metadata conflict in current `pyproject.toml`.
 
 ## Supported install until the upstream pins move
 
-Ordinary resolution on Python 3.14 is still unsatisfiable. The upstream
-repair is [NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394):
-Hermes should move `PyJWT[crypto]==2.13.0` to an exact pin that satisfies
-`>=2.15.0`, and move `fastapi==0.133.1` in `hermes-agent[web]` to a release
-that satisfies `fastapi>=0.141.1`. #148 stays open until that lands. Our
-floors do not move in the meantime.
+Ordinary resolution on Python 3.14 is still unsatisfiable. Two pins block
+it, and they do not share an upstream exit.
+
+[NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
+tracks the PyJWT pin only and is not the FastAPI exit. It asks to raise
+`PyJWT[crypto]==2.13.0` to `>=2.14` / `>=2.15`, plus httpx2, urllib3, and
+oauthlib. It does not mention FastAPI or the `web` extra. #148 stays open
+for the PyJWT conflict until that pin satisfies `pyjwt[crypto]>=2.15.0`.
+
+`fastapi==0.133.1` in `hermes-agent[web]` (including `hermes-agent[all]`)
+is a separate pin. It does not satisfy `fastapi>=0.141.1`. No upstream
+issue is cited here as its exit. refs #148 until that pin moves on its own.
+
+Our floors do not move in the meantime.
 
 Until then, install this package into the Hermes Python 3.14 environment
 with `overrides.txt` from this repository:

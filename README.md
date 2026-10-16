@@ -435,11 +435,14 @@ directory required:
 
 0.9.0 ships against Hermes' Python 3.14 runtime. This package still requires
 `pyjwt[crypto]>=2.15.0` and does not lower that floor. Hermes `main` pins
-`PyJWT[crypto]==2.13.0` on Python 3.14, and `hermes-agent[web]` pins
-`fastapi==0.133.1`. Until those pins move
-([NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394),
-tracked here as [#148](https://github.com/Satscryption/Hermes-A365/issues/148)),
-install into the Hermes 3.14 environment with the override file in this repo:
+`PyJWT[crypto]==2.13.0` on Python 3.14.
+[NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
+tracks the PyJWT pin only and is not the FastAPI exit. Separately,
+`hermes-agent[web]` pins `fastapi==0.133.1`, which does not meet
+`fastapi>=0.141.1`. refs #148
+([#148](https://github.com/Satscryption/Hermes-A365/issues/148)).
+Until each of those pins moves, install into the Hermes 3.14 environment
+with the override file in this repo:
 
 ```text
 pyjwt[crypto]>=2.15.0

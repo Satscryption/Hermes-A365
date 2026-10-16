@@ -1,8 +1,8 @@
 """#148: keep the bridge security floors, and document the Hermes 3.14 override.
 
 v0.9.0 ships against Python 3.14 without lowering pyjwt[crypto]>=2.15.0.
-Until NousResearch/hermes-agent#134394 relaxes the upstream pins, the
-combined install is `uv pip install --override overrides.txt`.
+NousResearch/hermes-agent#134394 tracks the PyJWT pin only and is not the
+FastAPI exit. The combined install is `uv pip install --override overrides.txt`.
 """
 
 from __future__ import annotations
@@ -29,6 +29,7 @@ FLOORS = {
     "anyio": (Version("4.14.1"), Version("4.14.2")),
     "fastapi": (Version("0.133.1"), Version("0.141.1")),
     "starlette": (Version("1.0.0"), Version("1.3.1")),
+    "idna": (Version("3.14"), Version("3.15")),
 }
 
 OVERRIDE_LINES = (
@@ -96,6 +97,9 @@ def test_bridge_and_dev_keep_security_floors() -> None:
         # The Hermes override may require a newer FastAPI. Our published floor
         # stays the security minimum and is not raised or lowered here.
         assert _specifier_for(requirements, "fastapi") == SpecifierSet(">=0.141.1")
+        assert _specifier_for(requirements, "idna") == SpecifierSet(">=3.15")
+    note = NOTE.read_text()
+    assert "| `idna` | `>=3.15` |" in note
 
 
 def test_docs_show_the_override_install_and_upstream_issue() -> None:
@@ -107,12 +111,26 @@ def test_docs_show_the_override_install_and_upstream_issue() -> None:
         assert "PyJWT[crypto]==2.13.0" in text
         assert "fastapi==0.133.1" in text
         assert "134394" in text
-        assert "#148" in text or "issues/148" in text
+        assert "tracks the PyJWT pin only" in text
+        assert "is not the FastAPI exit" in text
+        assert "refs #148" in text
+        for chunk in text.split("."):
+            if "134394" not in chunk or "fastapi" not in chunk.lower():
+                continue
+            lowered = chunk.lower()
+            assert (
+                "is not the fastapi exit" in lowered
+                or "does not mention fastapi" in lowered
+            ), chunk
     note = NOTE.read_text()
     assert "do not lower" in note.lower()
     assert "--no-deps" in note
     assert "e6899c8090da3bd48c829893e4103ce989d3482d" in note
     assert "f60f6d534375ccd6ec78d47ff1b5a97371cd8d60" in note
+    assert "### Host checkout #148 inspected" in note
+    assert "not a commit on" in note
+    assert "no `0.20.0` release" in note
+    assert "### Hermes Agent 0.20.0" not in note
 
 
 def test_documented_hermes_pins_do_not_satisfy_our_floors() -> None:
