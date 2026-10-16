@@ -5370,6 +5370,147 @@ class TestEditMessage:
         assert a._coalesced_replies == {}
 
     @pytest.mark.asyncio
+    async def test_turn_buffer_merges_commentary_edited_segment_and_duplicate_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Live retest: the stream consumer is cancelled while send() is
+        # still posting, so the post must not happen inside send/edit.
+        # Commentary, an edited stream segment, and a duplicate final
+        # become one ordered reply at turn end.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-buf", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        a._handoff_link_enabled = True
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-buf"),
+            message_id="act-1",
+        )
+        a._seen_inbounds_this_lifetime.discard("conv-G-buf")
+        await a.on_processing_start(event)
+        assert "conv-G-buf" not in a._turn_buffers
+        a._seen_inbounds_this_lifetime.add("conv-G-buf")
+        await a.on_processing_start(event)
+        assert "conv-G-buf" in a._turn_buffers
+        stored = a._turn_buffers["conv-G-buf"]["inbound"]
+        assert stored is not inbound
+        assert stored["id"] == "act-1"
+        assert a._turn_buffers["conv-G-buf"]["validated_path"] == "A"
+        # A later registry write must not retarget the buffered reply.
+        inbound["id"] = "act-mutated"
+
+        commentary = await a.send(
+            chat_id="conv-G-buf",
+            content="Using the tool.",
+            reply_to=None,
+        )
+        streamed = await a.send(
+            chat_id="conv-G-buf",
+            content="Draft answer ▉",
+            reply_to="act-1",
+        )
+        assert commentary.success is True
+        assert streamed.success is True
+        assert str(streamed.message_id).startswith("turnbuf:")
+        assert streamed.message_id != commentary.message_id
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_count == 0
+
+        edited = await a.edit_message(
+            "conv-G-buf",
+            str(streamed.message_id),
+            "Final answer ▉",
+            finalize=False,
+        )
+        duplicate = await a.edit_message(
+            "conv-G-buf",
+            str(streamed.message_id),
+            "Final answer",
+            finalize=True,
+        )
+        repeated = await a.send(
+            chat_id="conv-G-buf",
+            content="Final answer",
+            reply_to=None,
+        )
+        assert edited.success is True
+        assert duplicate.success is True
+        assert repeated.success is True
+        assert repeated.message_id == streamed.message_id
+        segments = a._turn_buffers["conv-G-buf"]["segments"]
+        assert [segment["text"] for segment in segments] == [
+            "Using the tool.",
+            "Final answer",
+        ]
+        assert send_reply_mock.await_count == 0
+        assert a._coalesced_replies == {}
+
+        await a.on_processing_complete(event, outcome="success")
+        await a.on_processing_complete(event, outcome="success")
+
+        assert send_reply_mock.await_count == 1
+        kwargs = send_reply_mock.await_args.kwargs
+        assert kwargs["inbound"]["id"] == "act-1"
+        assert kwargs["validated_path"] == "A"
+        text = kwargs["reply"]["text"]
+        assert text.startswith("Using the tool.\n\nFinal answer\n\n[Continue in Teams](")
+        assert "conv-G-buf" not in a._turn_buffers
+        assert post_mock.await_count == 0
+
+        await a.on_processing_start(event)
+        assert "conv-G-buf" in a._turn_buffers
+        await a._teardown_chat_state_impl("conv-G-buf")
+        assert "conv-G-buf" not in a._turn_buffers
+
+        await a.on_processing_start(event)
+        assert "conv-G-buf" in a._turn_buffers
+        await a._finish_disconnect(None, None)
+        assert a._turn_buffers == {}
+
+    @pytest.mark.asyncio
+    async def test_personal_chat_is_not_turn_buffered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-P-buf", activity_id="act-1")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-personal"})
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=first)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-P-buf"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        assert "conv-P-buf" not in a._turn_buffers
+
+        result = await a.send(
+            chat_id="conv-P-buf",
+            content="Hello ▉",
+            reply_to="act-1",
+        )
+        assert result.success is True
+        assert result.message_id == "bf-personal"
+        assert "conv-P-buf" not in a._turn_buffers
+        assert post_mock.await_count == 1
+        assert send_reply_mock.await_count == 0
+
+        await a.on_processing_complete(event, outcome="success")
+        assert post_mock.await_count == 1
+        assert send_reply_mock.await_count == 0
+        assert "conv-P-buf" not in a._turn_buffers
+
+    @pytest.mark.asyncio
     async def test_next_turn_send_not_suppressed_by_prior_coalesced_buffer(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:

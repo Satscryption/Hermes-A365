@@ -1129,6 +1129,19 @@ class Agent365Adapter(BasePlatformAdapter):
         ] = {}
         self._coalesced_turn_target_count_by_chat: dict[str, int] = {}
 
+        # #123 live retest: Hermes cancels the stream-consumer task at turn
+        # end while a non-personal ``send()`` is still awaiting its POST.
+        # That cancellation is reported as "outbound operation cancelled",
+        # and Hermes treats the chunk as already streamed, so the rest of
+        # the answer is dropped. While a turn buffer is open, ``send`` and
+        # ``edit_message`` only mutate local segments (ids ``turnbuf:<n>``);
+        # ``on_processing_complete`` posts one merged reply on the session
+        # task, which is not the cancelled consumer. Opened only for a
+        # non-personal chat that has seen an inbound this lifetime.
+        # ``{"inbound", "validated_path", "segments": [{"id", "text"}, ...]}``.
+        self._turn_buffers: dict[str, dict[str, Any]] = {}
+        self._turn_buffer_seq = 0
+
         # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
         # captured an inbound for since boot. Used as ``send()``'s gate
         # for routing through the proactive ``sendToConversation`` path
@@ -2856,6 +2869,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_targets.clear()
         self._coalesced_turn_target_order_by_chat.clear()
         self._coalesced_turn_target_count_by_chat.clear()
+        self._turn_buffers.clear()
         for stream_key in list(self._streams):
             message_id = stream_key[1]
             chat_id = stream_key[0]
@@ -3766,13 +3780,15 @@ class Agent365Adapter(BasePlatformAdapter):
 
         #54 branch-walk correction: Copilot Chat arrives as
         ``groupChat`` and does not visibly render BF streaming
-        activities. For non-personal chats, a stream-consumer first
-        chunk (``reply_to`` present) starts a local coalescing buffer
-        instead of POSTing immediately. ``edit_message(finalize=True)``
-        later emits one normal ``send_reply`` with the final text.
-        A plain final reply never sends that finalize signal (#123
-        live walk). ``on_processing_complete`` flushes the buffer when
-        the turn ends so it does not wait on the stale-buffer watchdog.
+        activities. When ``on_processing_start`` has opened a per-turn
+        buffer for this non-personal chat, ``send`` appends a local
+        segment and returns without a network await. The merged reply
+        is posted once from ``on_processing_complete``, after Hermes
+        has cancelled the stream-consumer task. Chats with no open
+        turn buffer keep the coalesced path: a stream-consumer first
+        chunk (``reply_to`` present) buffers locally, and
+        ``edit_message(finalize=True)`` or the turn-end coalesced
+        flush emits one normal ``send_reply``.
 
         Suppress one-shot non-streaming sends while a stream is active;
         Copilot Chat renders interleaved progress/fallback activities
@@ -3795,6 +3811,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 send: adapter or chat is disconnecting",
             )
+        # Open turn buffer: stay on the caller task. Awaiting a POST here
+        # is what Hermes cancels when it stops the stream consumer.
+        if str(chat_id) in self._turn_buffers:
+            self._conversations.mark_used(chat_id)
+            return self._append_turn_buffer_segment(str(chat_id), content)
+
         turn_key: tuple[str, str] | None = None
         turn_validated_path: str | None = None
         if reply_to is not None:
@@ -4037,21 +4059,148 @@ class Agent365Adapter(BasePlatformAdapter):
                 return str(conv["id"])
         return ""
 
-    async def on_processing_complete(self, event: Any, outcome: Any = None) -> None:
-        """Flush this chat's pending non-personal replies when the turn ends.
+    async def on_processing_start(self, event: Any) -> None:
+        """Open a local per-turn buffer for a live non-personal chat.
 
-        Hermes calls this after the agent turn, including the plain-final
-        path that buffers a coalesced reply and never calls
-        ``edit_message(finalize=True)``. Without the flush the reply sits
-        until the stale-buffer watchdog (~130s) and the next turn's sends
-        see a still-open coalesced reply.
+        Hermes calls this on the session task before the stream consumer
+        starts sending. The buffer holds a copy of the cached inbound and
+        its validated path so the later merged POST does not follow a
+        registry update mid-turn. Personal chats keep streaming. A chat
+        with no inbound this gateway lifetime is left alone (proactive
+        sends stay on ``sendToConversation``).
+        """
+        chat_id = self._chat_id_from_processing_event(event)
+        if chat_id and chat_id in self._seen_inbounds_this_lifetime:
+            inbound = self._cached_inbound_for(chat_id)
+            conv = (inbound or {}).get("conversation") or {}
+            chat_type = str(conv.get("conversationType") or "")
+            if inbound and chat_type and chat_type != "personal":
+                self._turn_buffers[chat_id] = {
+                    "inbound": copy.deepcopy(inbound),
+                    "validated_path": self._validated_path_for(chat_id),
+                    "segments": [],
+                }
+        parent = getattr(super(), "on_processing_start", None)
+        if callable(parent):
+            await parent(event)
+
+    async def on_processing_complete(self, event: Any, outcome: Any = None) -> None:
+        """Post this turn's merged non-personal reply, then flush leftovers.
+
+        The merged post runs on the session task, after Hermes has
+        cancelled the stream consumer, so it is not the in-flight
+        ``send()`` that used to die as ``outbound operation cancelled``.
+        Any coalesced buffer still open (a turn that never opened a
+        per-turn buffer, or a finalize that never arrived) is flushed
+        afterwards.
         """
         chat_id = self._chat_id_from_processing_event(event)
         if chat_id:
+            await self._flush_turn_buffer(chat_id)
             await self._flush_pending_coalesced_replies(chat_id)
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
             await parent(event, outcome)
+
+    def _append_turn_buffer_segment(self, chat_id: str, content: str) -> SendResult:
+        """Append one local segment. No network, no await."""
+        buf = self._turn_buffers.get(chat_id)
+        if buf is None:
+            return SendResult(
+                success=False,
+                error=f"agent365 send: no turn buffer for chat_id={chat_id!r}",
+            )
+        text = _strip_streaming_cursor(content)
+        if len(text) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error=(
+                    "agent365 send: turn buffer segment exceeds "
+                    f"{self.MAX_MESSAGE_LENGTH} characters"
+                ),
+            )
+        segments: list[dict[str, str]] = buf["segments"]
+        if segments and segments[-1]["text"] == text:
+            return SendResult(success=True, message_id=segments[-1]["id"])
+        self._turn_buffer_seq += 1
+        segment_id = f"turnbuf:{self._turn_buffer_seq}"
+        segments.append({"id": segment_id, "text": text})
+        return SendResult(success=True, message_id=segment_id)
+
+    def _replace_turn_buffer_segment(
+        self, chat_id: str, message_id: str, content: str
+    ) -> SendResult:
+        """Replace one ``turnbuf:<n>`` segment in place. No network."""
+        text = _strip_streaming_cursor(content)
+        if len(text) > self.MAX_MESSAGE_LENGTH:
+            return SendResult(
+                success=False,
+                error=(
+                    "agent365 edit_message: turn buffer segment exceeds "
+                    f"{self.MAX_MESSAGE_LENGTH} characters"
+                ),
+            )
+        chat_id = str(chat_id)
+        message_id = str(message_id)
+        own = self._turn_buffers.get(chat_id)
+        if own is not None:
+            for segment in own["segments"]:
+                if segment["id"] == message_id:
+                    segment["text"] = text
+                    return SendResult(success=True, message_id=message_id)
+        for other_id, buf in self._turn_buffers.items():
+            if other_id == chat_id:
+                continue
+            if any(segment["id"] == message_id for segment in buf["segments"]):
+                return SendResult(
+                    success=False,
+                    error=(
+                        "agent365 edit_message: turn buffer segment belongs "
+                        "to another chat"
+                    ),
+                )
+        return SendResult(
+            success=False,
+            error="agent365 edit_message: unknown turn buffer segment",
+        )
+
+    async def _flush_turn_buffer(self, chat_id: str) -> None:
+        """Post the turn's segments as one reply, then drop the buffer.
+
+        Dropped on success and on failure so a second complete cannot
+        post the same text again. Empty buffers post nothing.
+        """
+        buf = self._turn_buffers.pop(str(chat_id), None)
+        if not buf:
+            return
+        parts = [
+            str(segment.get("text") or "")
+            for segment in buf.get("segments") or []
+            if str(segment.get("text") or "")
+        ]
+        if not parts:
+            return
+        inbound = buf.get("inbound")
+        if not isinstance(inbound, dict):
+            logger.warning(
+                "agent365 turn buffer flush skipped: invalid inbound chat_id=%s",
+                chat_id,
+            )
+            return
+        content = self._maybe_append_handoff_link(chat_id, "\n\n".join(parts))
+        validated_path = buf.get("validated_path")
+        result = await self._send_reply_activity(
+            inbound=inbound,
+            content=content,
+            log_context="turn buffer",
+            validated_path=validated_path if isinstance(validated_path, str) else None,
+        )
+        if not result.success:
+            logger.warning(
+                "agent365 turn buffer flush failed: chat_id=%s error=%s",
+                chat_id,
+                result.error,
+            )
 
     async def send_private_notice(
         self,
@@ -6449,6 +6598,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 edit_message: adapter or chat is disconnecting",
             )
+        if str(message_id).startswith("turnbuf:"):
+            self._conversations.mark_used(chat_id)
+            return self._replace_turn_buffer_segment(chat_id, message_id, content)
+
         # Slice 19x-d (#4): streaming edits are clear outbound traffic;
         # mark the conversation as recently used so prune respects it.
         self._conversations.mark_used(chat_id)
@@ -7186,6 +7339,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for turn_key in target_order:
             self._drop_coalesced_turn_target(turn_key)
         self._coalesced_turn_target_count_by_chat.pop(chat_id, None)
+        self._turn_buffers.pop(chat_id, None)
         for key in list(self._recently_finalized):
             if key[0] == chat_id:
                 self._recently_finalized.pop(key, None)

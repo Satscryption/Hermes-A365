@@ -294,6 +294,23 @@ this heading is dated at release.
   to `config.extra["notice_delivery"] = "private"`. `send_private_notice`
   withholds them on non-personal chats (INFO; success so the gateway does
   not fall back to a public post) and sends them normally in personal chats.
+- **Copilot Chat replies no longer die inside a cancelled stream send (#123).**
+  On non-personal chats Hermes cancels the stream-consumer task at turn
+  end while its post-tool `send` is still awaiting the Bot Framework POST.
+  `_await_outbound` raises `outbound operation cancelled`, and Hermes
+  treats that text as already streamed, so the rest of the answer is lost.
+  A live non-personal turn (cached `conversationType` other than
+  `personal`, and an inbound seen this gateway lifetime) now opens
+  `_turn_buffers[chat_id]` in `on_processing_start`, holding a copy of the
+  inbound and its validated path. `send` appends a segment and returns
+  without a network await (streaming cursor stripped, a repeat of the last
+  segment deduped, `MAX_MESSAGE_LENGTH` enforced). `edit_message` on
+  `turnbuf:<n>` replaces that segment. `on_processing_complete` posts one
+  merged reply — segments joined by a blank line, plus the opt-in handoff
+  link — via `_send_reply_activity`, then runs the existing coalesced
+  flush. The buffer is cleared on disconnect and on chat eviction.
+  Personal chats are not buffered. The live section 2a retest is still
+  pending.
 - **H4 — sequential coalesced reply segments are no longer swallowed.**
   Non-personal chats now assign a fresh synthetic message id to every newly
   opened coalesced segment. Multiple segments for the same inbound activity
