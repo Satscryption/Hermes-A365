@@ -476,10 +476,13 @@ hermes a365 doctor --human                                # exit 0/1/2
 hermes a365 license --users 12 --agents 3 --plan E5
 
 # 3. Register the blueprint + MCP/Bot permissions.
-#    --m365 routes Teams via MCP Platform. --auto-recover-secret patches
-#    the GA CLI's macOS / Linux secret-null regression (Microsoft#408)
-#    in place.
+#    --tenant-id (or A365_TENANT_ID) is required; az account show is only
+#    checked against that pin. --m365 is forwarded to setup blueprint and
+#    does not register the messaging endpoint — step 8 does that.
+#    --auto-recover-secret patches the GA CLI's macOS / Linux secret-null
+#    regression (Microsoft#408) in place.
 hermes a365 register --agent-name "Inbox Helper" \
+    --tenant-id "<tenant-guid>" \
     --m365 --apply --auto-recover-secret
 
 # 4. (Verify admin consent — usually granted automatically by setup blueprint;
@@ -597,13 +600,17 @@ as `ok`.
 >
 > …paired with `A365_TENANT_ID`, `A365_APP_ID`, `A365_BLUEPRINT_CLIENT_SECRET`,
 > and either `A365_ALLOW_ALL_USERS=true` (testing) or
-> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Entries may be
+> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Allowlist
+> entries may be
 > AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
 > includes those aliases in the signed activity. Bot Framework `personal` /
 > `groupChat` / `channel` values
 > are normalized to Hermes `dm` / `group` / `channel`; JWT-authenticated
 > lifecycle/control activities are acknowledged without pretending their
-> Microsoft system identity is an end user.
+> Microsoft system identity is an end user. Teams Create-instance agents
+> also need `A365_AGENT_IDENTITY_IDS` (comma-separated Entra agentIdentity
+> app ids) or `extra.agent_identity_ids`; without it, outbound replies
+> under those instance ids are refused.
 
 ## Subcommand reference
 

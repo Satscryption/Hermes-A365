@@ -10,6 +10,54 @@ Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
 Gated by the #123 focused hardening walk. Entries accumulate here per PR and
 this heading is dated at release.
 
+### Walk findings (#102, #123)
+
+- **Orphan deletion requires a Graph ownership proof.** `cleanup` (including
+  its bot-service step) no longer plans deletion of an agent instance, agent
+  identity, or agentic user just because the object id was typed twice.
+  The only local anchor is per-agent `A365_APP_ID`. A sidecar `msaAppId`
+  counts only when it is that same id. Object and identity GUIDs in the
+  cwd `a365.generated.config.json` are not anchors. Graph is asked for the
+  application object id of `A365_APP_ID`, and a record matches only when
+  its `agentIdentityBlueprintId` or `managedBy` is that app id or object
+  id. `agentIdentityId` is not proof. The returned instance `id`, each
+  filtered instance's `agentUserId`, and a service principal `id` must
+  equal the typed id. A live user of a different agent is refused, and a
+  lookup that cannot prove ownership is refused. Double entry remains a
+  second gate after that proof.
+- **Direct Line verify distinguishes an allowlist 403.** After the bot token
+  check succeeds, HTTP 403 is reported as "auth OK, probe user
+  `hermes-a365-verify` is not allowlisted", with guidance to set
+  `A365_ALLOWED_USERS` or `A365_ALLOW_ALL_USERS`. It is not reported as a
+  Bot Framework credential rejection. The gateway logs that case as
+  `403 reason=unauthorized-end-user`.
+- **`publish --apply` names a missing `a365` CLI.** When the a365 binary is
+  not on PATH, the command says so instead of "could not verify the active
+  Azure tenant". The runner rejects every invocation, including
+  `az account show`, until the CLI is installed.
+
+### Path A instance identities
+
+- **Teams Create-instance agents can mint under their own Entra
+  agentIdentity.** A live 0.9.0 walk showed `recipient.agenticAppId` is the
+  instance app id, while `recipient.agenticAppBlueprintId` names the
+  blueprint. Graph `servicePrincipals(appId=<instance>)` returns
+  `#microsoft.graph.agentIdentity` with `agentIdentityBlueprintId` equal to
+  that blueprint, and a T1 → T2 → user_fic chain succeeds under the instance
+  identity once it is allowlisted. The H1 guard required
+  `agenticAppId == blueprint`, so every reply from such an instance was
+  refused. Operators set `A365_AGENT_IDENTITY_IDS` (comma-separated; gateway
+  `extra.agent_identity_ids` is the fallback when the env var is unset).
+  `parse_agent_identity_ids` fills `BridgeConfig.agent_identity_ids` from
+  `load_bridge_config` and from the adapter bridge-config builder. The guard
+  stays deny-by-default: it accepts the configured blueprint id or an
+  allowlisted instance id, and it refuses when the body carries an
+  `agenticAppBlueprintId` that differs from the configured blueprint. The
+  mint identity is the accepted `agenticAppId`. It is never taken from the
+  body blueprint field. `hermes a365 doctor` warns when a listed agent
+  identity of the configured blueprint is absent from that allowlist.
+  Refs #107, #123.
+
 ### Secrets at rest (#19)
 
 - **A `SecretsProvider` seam now backs both client secrets.** New
@@ -233,7 +281,8 @@ this heading is dated at release.
   delete`, the `az rest` Graph DELETE) have no per-call tenant flag at all;
   the a365 subcommands additionally carry an explicit `--tenant-id`
   (visible in the plan) instead of auto-detecting. With no pin available
-  anywhere (fresh setup), behaviour is unchanged but a warning says so.
+  anywhere, `--apply` refuses. Ambient `az account show` is not accepted
+  as the pin.
   An existing but unreadable operator env now fails closed instead of silently
   downgrading to that warning path; this applies to the dry-run as well as
   `--apply`, because the plan must not advertise a tenant it could not safely
@@ -278,6 +327,20 @@ this heading is dated at release.
   can run. Unmatched confirmations fail before mutation.
 
   (M15 is split out to #127.)
+- **Tenant pins are not `az account show`.** `register`, `cleanup`, and
+  `publish` `--apply` already refuse when no canonical tenant pin was
+  resolved (`--tenant-id`, else `A365_TENANT_ID`). Dry-run text and
+  `--help` still said the default was to auto-detect from the ambient az
+  account, which is the check target, not the pin. The plan now says
+  `--apply` will refuse, and the help text matches. An operator who sees
+  a tenant in `az account show` still has to pass it explicitly or set
+  `A365_TENANT_ID` before the first register.
+- **`register --m365` does not register the messaging endpoint.** The flag
+  is still forwarded to `a365 setup blueprint`. Current a365 CLI builds
+  report that `--m365` has no effect on that command by itself. The plan
+  and help text say to run `activity-bridge update-endpoint` after the
+  tunnel exists. Wiring `reconcile_app` / `reconcile_blueprint` remains
+  #127 and is not in this change.
 
 ### Reliability (#105)
 
@@ -539,6 +602,16 @@ this heading is dated at release.
   write is sequenced under a process-wide per-path lock, so cancelling an
   in-flight older save (e.g. on shutdown) cannot let it `os.replace` a stale
   snapshot over a newer replacement-adapter save.
+- **#130 — an unanswered approval or clarify is not evicted while the human
+  is still deciding.** The registry cap and prune already skip pinned entries
+  and conversations whose Hermes turn is still in `_active_sessions`. That
+  in-flight set does not cover a card whose turn has returned. Cap and prune
+  now also skip a conversation with a live approval, slash-confirm, or clarify
+  card, and a free-text clarify wait, for the same 15-minute card TTL.
+  Choosing "Something else" consumes the choice card and arms that same
+  wait, so the typed-answer window stays protected until the answer arrives.
+  An expired card or wait is evictable again. The answering inbound clears the
+  free-text mark; uninstall and disconnect clear it with the card state.
 ### Tests
 
 - **#118 — test suite is hermetic under randomized order.** An autouse

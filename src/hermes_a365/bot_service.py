@@ -1961,25 +1961,73 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
         token=token,
         body={
             "type": "message",
-            "from": {"id": "hermes-a365-verify"},
+            "from": {"id": _PROBE_USER_ID},
             "text": "hermes-a365 bot-service verify",
         },
     )
     if status >= 400:
-        detail = json.dumps(response, sort_keys=True)
-        if "403" in detail or "Failed to send activity" in detail or "BotError" in detail:
-            return ProbeResult(
-                "runtime_auth",
-                "ERROR",
-                "configured endpoint rejected a Path B BF Connector token "
-                f"(HTTP {status}): {detail}",
-            )
+        return _directline_activity_failure(status, response)
+    return ProbeResult("runtime_auth", "OK", "Direct Line activity accepted by Bot Service")
+
+
+_PROBE_USER_ID = "hermes-a365-verify"
+_TOKEN_FAILURE_MARKERS = (
+    "aadsts",
+    "authorization has been denied",
+    "consent",
+    "invalid jwt",
+    "invalid token",
+    "invalid_token",
+    "token validation",
+)
+_ALLOWLIST_MARKERS = (
+    "allowed_users",
+    "end user is not authorized",
+    "not allowlisted",
+    "unauthorized-end-user",
+)
+
+
+def _directline_activity_failure(status: int, response: dict[str, Any]) -> ProbeResult:
+    """Classify a Direct Line activity POST that the bot endpoint rejected.
+
+    Conversation start has already succeeded, so the Direct Line secret and
+    bot token check passed. A 403 from this gateway is the allowlist
+    (``403 reason=unauthorized-end-user``) when the probe user is absent
+    from ``A365_ALLOWED_USERS``, not a Bot Framework credential failure.
+    """
+    detail = json.dumps(response, sort_keys=True)
+    lowered = detail.lower()
+    token_failed = any(marker in lowered for marker in _TOKEN_FAILURE_MARKERS)
+    allowlist = any(marker in lowered for marker in _ALLOWLIST_MARKERS)
+    if status == 403 and not token_failed:
+        why = (
+            "the activity body names unauthorized-end-user / the end-user allowlist"
+            if allowlist
+            else "the gateway logs `403 reason=unauthorized-end-user` for this case"
+        )
         return ProbeResult(
             "runtime_auth",
             "ERROR",
-            f"Direct Line activity returned HTTP {status}: {detail}",
+            "auth OK (Direct Line conversation started and the bot token check "
+            f"passed), but the probe user {_PROBE_USER_ID!r} is not allowlisted "
+            f"(HTTP {status}; {why}). Add {_PROBE_USER_ID} to A365_ALLOWED_USERS "
+            "for the probed agent, or set A365_ALLOW_ALL_USERS on a disposable "
+            "probe, then re-run `bot-service verify --directline-probe`. "
+            f"Response: {detail}",
         )
-    return ProbeResult("runtime_auth", "OK", "Direct Line activity accepted by Bot Service")
+    if "403" in detail or "Failed to send activity" in detail or "BotError" in detail:
+        return ProbeResult(
+            "runtime_auth",
+            "ERROR",
+            "configured endpoint rejected a Path B BF Connector token "
+            f"(HTTP {status}): {detail}",
+        )
+    return ProbeResult(
+        "runtime_auth",
+        "ERROR",
+        f"Direct Line activity returned HTTP {status}: {detail}",
+    )
 
 
 def _path_endpoint_parity_probe(
