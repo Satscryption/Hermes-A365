@@ -107,6 +107,14 @@ Required env vars (already populated by the wrapper's
   `extra.file_host_allowlist`; comma-separated exact hosts, e.g.
   `contoso.sharepoint.com,contoso-my.sharepoint.com`). Required to enable #76
   file transfer; unset ⇒ files degrade to text (fail-closed).
+- `A365_AGENT_IDENTITY_IDS` (optional comma-separated Entra agentIdentity
+  app ids). Teams "Create instance" agents reply as their own agent
+  identity, so `recipient.agenticAppId` differs from the blueprint app id
+  while `recipient.agenticAppBlueprintId` names the blueprint. Unset ⇒
+  only the blueprint id may mint outbound tokens (deny-by-default).
+  Gateway fallback when the env var is unset: `extra.agent_identity_ids`
+  (a comma-separated string or a list). The activity body is never a
+  source for this list.
 
 ## Slice plan
 

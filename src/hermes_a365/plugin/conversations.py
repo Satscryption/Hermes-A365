@@ -112,7 +112,17 @@ class ConversationRef:
     # allowlisted raw overflows _RAW_MAX_BYTES.
     _RAW_MIN_PROJECTION: ClassVar[dict[str, tuple[str, ...]]] = {
         "conversation": ("id", "tenantId", "conversationType", "name"),
-        "recipient": ("id", "name", "agenticAppId", "agenticUserId", "tenantId"),
+        # agenticAppBlueprintId stays: a later mint refuses a cached activity
+        # whose body blueprint differs from the configured blueprint, and the
+        # overflow projection must not strip that check.
+        "recipient": (
+            "id",
+            "name",
+            "agenticAppId",
+            "agenticUserId",
+            "agenticAppBlueprintId",
+            "tenantId",
+        ),
         "from": ("id", "name"),
     }
 

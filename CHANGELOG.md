@@ -10,6 +10,28 @@ Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).
 Gated by the #123 focused hardening walk. Entries accumulate here per PR and
 this heading is dated at release.
 
+### Path A instance identities
+
+- **Teams Create-instance agents can mint under their own Entra
+  agentIdentity.** A live 0.9.0 walk showed `recipient.agenticAppId` is the
+  instance app id, while `recipient.agenticAppBlueprintId` names the
+  blueprint. Graph `servicePrincipals(appId=<instance>)` returns
+  `#microsoft.graph.agentIdentity` with `agentIdentityBlueprintId` equal to
+  that blueprint, and a T1 → T2 → user_fic chain succeeds under the instance
+  identity once it is allowlisted. The H1 guard required
+  `agenticAppId == blueprint`, so every reply from such an instance was
+  refused. Operators set `A365_AGENT_IDENTITY_IDS` (comma-separated; gateway
+  `extra.agent_identity_ids` is the fallback when the env var is unset).
+  `parse_agent_identity_ids` fills `BridgeConfig.agent_identity_ids` from
+  `load_bridge_config` and from the adapter bridge-config builder. The guard
+  stays deny-by-default: it accepts the configured blueprint id or an
+  allowlisted instance id, and it refuses when the body carries an
+  `agenticAppBlueprintId` that differs from the configured blueprint. The
+  mint identity is the accepted `agenticAppId`. It is never taken from the
+  body blueprint field. `hermes a365 doctor` warns when a listed agent
+  identity of the configured blueprint is absent from that allowlist.
+  Refs #107, #123.
+
 ### Secrets at rest (#19)
 
 - **A `SecretsProvider` seam now backs both client secrets.** New

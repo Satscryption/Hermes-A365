@@ -75,6 +75,12 @@ Auth wiring (validated end-to-end against the satscryption tenant
   Messaging Bot API resource (``5a807f24-…/.default``). Two-tier
   cache (T1/T2 shared across users; final per-user). Reply POSTs to
   ``{serviceUrl}/v3/conversations/{conv}/activities/{activity}``.
+  The mint identity is the configured blueprint app id, or an Entra
+  agentIdentity app id listed in ``A365_AGENT_IDENTITY_IDS``. Teams
+  Create-instance agents use their own agentIdentity (``agenticAppId``
+  differs from the blueprint; ``agenticAppBlueprintId`` names the
+  blueprint). The guard stays deny-by-default and never takes the mint
+  identity from the activity body alone.
 
 CLI use::
 
@@ -1228,8 +1234,12 @@ class BridgeConfig:
     ``blueprint_client_id`` and ``blueprint_client_secret`` are the
     blueprint Entra app's id + secret — used as the *bootstrap*
     credential at the start of the three-stage agentic-user token
-    chain. The agent app instance id (``recipient.agentic_app_id`` on
-    the inbound activity) is what the chain swaps in for steps 2-3.
+    chain. The agent app instance id (``recipient.agenticAppId`` on
+    the inbound activity) is what the chain swaps in for steps 2-3,
+    but only when it is the blueprint id or a member of
+    ``agent_identity_ids``. That allowlist is operator config
+    (``A365_AGENT_IDENTITY_IDS``); it is never filled from the
+    activity body.
 
     ``bf_app_id`` / ``bf_client_secret`` (#36) are the optional
     separate non-agentic Entra app used as the Azure Bot Service
@@ -1276,6 +1286,42 @@ class BridgeConfig:
     # the plugin registration.
     allowed_users: tuple[str, ...] = ()
     allow_all_users: bool = False
+    # Teams Create-instance agents are a distinct Entra agentIdentity.
+    # Their app id may be minted under only when the operator listed it.
+    # Empty means "blueprint id only" (deny-by-default).
+    agent_identity_ids: tuple[str, ...] = ()
+
+
+def parse_agent_identity_ids(raw: Any) -> tuple[str, ...]:
+    """Parse an operator allowlist of Entra agentIdentity app ids.
+
+    ``A365_AGENT_IDENTITY_IDS`` is comma-separated. The gateway plugin
+    key ``agent_identity_ids`` may be that same string or a list of
+    ids. Blank input is an empty allowlist, so the mint guard accepts
+    only the configured blueprint id. Entries are stripped,
+    case-folded, and de-duplicated in first-seen order. A non-string
+    scalar (``true``, ``5``, a mapping) is ignored rather than
+    stringified into an accidental id.
+    """
+    parts: list[Any]
+    if raw is None or isinstance(raw, str):
+        parts = [] if raw is None else raw.split(",")
+    elif isinstance(raw, (list, tuple)):
+        parts = []
+        for item in raw:
+            if isinstance(item, str):
+                parts.extend(item.split(","))
+    else:
+        parts = []
+    seen: set[str] = set()
+    parsed: list[str] = []
+    for part in parts:
+        token = str(part).strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        parsed.append(token)
+    return tuple(parsed)
 
 
 def load_bridge_config(
@@ -1402,6 +1448,9 @@ def load_bridge_config(
         ),
         allow_all_users=agent_env.get("A365_ALLOW_ALL_USERS", "").strip().lower()
         in {"1", "true", "yes", "on"},
+        agent_identity_ids=parse_agent_identity_ids(
+            agent_env.get("A365_AGENT_IDENTITY_IDS")
+        ),
     )
 
 
@@ -2161,6 +2210,31 @@ async def acquire_user_fic_token(
     return payload["access_token"], float(payload.get("expires_in", 3600))
 
 
+def _recipient_agentic_app_blueprint_id(activity: dict[str, Any]) -> str:
+    """Return ``recipient.agenticAppBlueprintId`` when the body carries one.
+
+    Teams serializes this on the recipient ``ChannelAccount``, next to
+    ``agenticAppId``. Blank and missing values are absent. The string is
+    a claim to check, never the identity the chain mints under.
+    """
+    recipient = activity.get("recipient")
+    if not isinstance(recipient, dict):
+        return ""
+    raw = recipient.get("agenticAppBlueprintId")
+    if raw is None:
+        return ""
+    return str(raw).strip()
+
+
+def _configured_agent_identity_ids(cfg: BridgeConfig) -> frozenset[str]:
+    """Case-folded operator allowlist. Does not include the blueprint id."""
+    return frozenset(
+        item.strip().lower()
+        for item in cfg.agent_identity_ids
+        if isinstance(item, str) and item.strip()
+    )
+
+
 async def acquire_outbound_token(
     *,
     client: Any,
@@ -2185,20 +2259,41 @@ async def acquire_outbound_token(
         activity
     )
 
-    # H1 (#100) — recipient.agenticAppId is an UNAUTHENTICATED body field, yet it
-    # names the identity every FMI stage mints under (fmi_path, T2/user_fic
-    # client_id). The A365 invariant is that the blueprint Entra app *is* the
-    # agent identity (agenticAppId == blueprint_client_id; round-3 confirmed, see
-    # probe_fmi_exchange), and the inbound JWT aud is pinned to blueprint_client_id
-    # — so a body agenticAppId differing from the configured blueprint is misrouted
-    # or an impersonation attempt. Refuse to mint under a body-named identity.
+    # H1 (#100, #123 walk) — recipient.agenticAppId is an UNAUTHENTICATED body
+    # field, yet it names the identity every FMI stage mints under (fmi_path,
+    # T2/user_fic client_id). A blueprint-only deployment still has
+    # agenticAppId == blueprint_client_id. Teams "Create instance" agents are
+    # a separate Entra agentIdentity: agenticAppId is that instance's app id
+    # and recipient.agenticAppBlueprintId names the blueprint (Graph
+    # servicePrincipals(appId=<instance>) returns #microsoft.graph.agentIdentity
+    # with agentIdentityBlueprintId = blueprint). Accept the configured
+    # blueprint id or an operator allowlist entry (A365_AGENT_IDENTITY_IDS).
+    # Anything else is misrouted or an impersonation attempt.
+    #
+    # The allowlist is config, never the body. A body agenticAppBlueprintId
+    # that is present and differs from the configured blueprint is refused
+    # even when agenticAppId itself is allowlisted — that field must not
+    # widen who we mint as, and we never copy it into fmi_path / client_id.
     # (Entra's FIC grant backstops this server-side; this is fail-fast local
-    # defense-in-depth — we never derive the mint identity from the request body.)
-    if agent_app_instance_id.lower() != cfg.blueprint_client_id.lower():
+    # defense-in-depth.)
+    configured_blueprint = cfg.blueprint_client_id.strip().lower()
+    body_blueprint = _recipient_agentic_app_blueprint_id(activity)
+    if body_blueprint and body_blueprint.lower() != configured_blueprint:
         raise RuntimeError(
-            "inbound recipient.agenticAppId does not match the configured "
-            "blueprint app id; refusing to mint an outbound token under a "
-            "body-supplied agent identity (possible impersonation)"
+            "inbound recipient.agenticAppBlueprintId does not match the "
+            "configured blueprint app id; refusing to mint an outbound token "
+            "for an instance of a different blueprint"
+        )
+    accepted_instance = agent_app_instance_id.strip().lower()
+    if (
+        accepted_instance != configured_blueprint
+        and accepted_instance not in _configured_agent_identity_ids(cfg)
+    ):
+        raise RuntimeError(
+            "inbound recipient.agenticAppId is not the configured blueprint "
+            "app id and is not an allowlisted agent identity; refusing to "
+            "mint an outbound token under a body-supplied agent identity "
+            "(possible impersonation)"
         )
     # H1/tenant (#100, #106 review) — tenant_id is likewise a body field
     # (recipient.tenantId / conversation.tenantId), yet it selects the token
