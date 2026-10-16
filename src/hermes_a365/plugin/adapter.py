@@ -5301,14 +5301,22 @@ class Agent365Adapter(BasePlatformAdapter):
     async def send_typing(
         self, chat_id: str, metadata: dict[str, Any] | None = None
     ) -> None:
-        """Send a BF ``typing`` activity to the conversation. Renders
-        as the trailing-dots indicator on Teams 1:1 chats."""
+        """Send a BF ``typing`` activity on a personal (Teams 1:1) chat.
+
+        Copilot Chat arrives as ``groupChat``. A typing activity there is
+        accepted, but the reply that follows is never rendered and the
+        client times out. ``send_typing`` is a no-op unless the cached
+        ``conversationType`` is exactly ``personal``.
+        """
         if not self._agent_turn_lifecycle_is_current():
             return None
         inbound = self._cached_inbound_for(chat_id)
         if not inbound:
             # No-op: the gateway pulses typing periodically; without
             # a cached inbound we have nowhere to post.
+            return None
+        conv = inbound.get("conversation") if isinstance(inbound.get("conversation"), dict) else {}
+        if str(conv.get("conversationType") or "") != "personal":
             return None
         # Slice 19x-d (#4): bump last_used_at on typing too.
         self._conversations.mark_used(chat_id)

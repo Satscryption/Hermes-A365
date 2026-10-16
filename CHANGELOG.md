@@ -368,6 +368,16 @@ this heading is dated at release.
 
 ### Reliability (#105)
 
+- **Copilot Chat typing is limited to personal chats.** Copilot Chat
+  arrives as `groupChat`. A typing activity is accepted, but the reply
+  that follows is never rendered and the client times out at 45s.
+  `send_typing` is a no-op unless the cached `conversationType` is
+  exactly `personal`. Teams 1:1 chats still get the indicator. With
+  typing suppressed, live walk row 2a rendered the reply in about 16s
+  (3 segments, 166 characters, one activity). The per-turn buffer,
+  flush, segment rework, and progress-line filter are not in this
+  change. That buffering and retry work moves to a follow-up after
+  0.9.0.
 - **H4 — sequential coalesced reply segments are no longer swallowed.**
   Non-personal chats now assign a fresh synthetic message id to every newly
   opened coalesced segment. Multiple segments for the same inbound activity
