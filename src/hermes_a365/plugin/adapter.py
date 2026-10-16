@@ -594,6 +594,63 @@ def _strip_streaming_cursor(text: str) -> str:
     return text
 
 
+# Friendly Hermes tool-progress lines (``display.friendly_tool_labels``,
+# default on). ``gateway/run_turn_progress.py`` renders
+# ``{emoji} {verb}{connector}{preview}`` — terminal ``date`` is
+# ``💻 Running date``. Longest verb first so ``Running code`` is not
+# classified only as ``Running``.
+_HERMES_TOOL_PROGRESS_VERBS: tuple[str, ...] = (
+    "Searching past sessions",
+    "Looking at the image",
+    "Searching the web",
+    "Generating speech",
+    "Generating image",
+    "Generating video",
+    "Searching files",
+    "Updating memory",
+    "Updating tasks",
+    "Updating skill",
+    "Reading skill",
+    "Listing skills",
+    "Running code",
+    "Delegating",
+    "Scheduling",
+    "Browsing",
+    "Clicking",
+    "Reading",
+    "Writing",
+    "Editing",
+    "Running",
+    "Typing",
+    "Asking",
+)
+# Hermes appends a parenthesized repeat count that uses U+00D7. The
+# code point keeps that marker out of an ASCII "x".
+_HERMES_TOOL_PROGRESS_REPEAT = re.compile(" \\(\u00d7\\d+\\)$")
+
+
+def _is_hermes_tool_progress_segment(text: str) -> bool:
+    """True when every non-empty line is a Hermes tool-progress bubble.
+
+    A merged non-personal reply joins every ``send`` from the turn.
+    Tool progress is its own segment (one line, or several when Hermes
+    edits the bubble in place) and must not become part of the answer.
+    A segment that also contains answer text is kept whole.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return all(_is_hermes_tool_progress_line(line) for line in lines)
+
+
+def _is_hermes_tool_progress_line(line: str) -> bool:
+    stripped = _HERMES_TOOL_PROGRESS_REPEAT.sub("", line.strip())
+    emoji, sep, rest = stripped.partition(" ")
+    if not sep or not rest or emoji.isascii() or len(emoji) > 8:
+        return False
+    return any(rest == verb or rest.startswith(verb + " ") for verb in _HERMES_TOOL_PROGRESS_VERBS)
+
+
 def _strip_one_mention(text: str, mention_text: str) -> str:
     """Remove every occurrence of ``mention_text`` plus the horizontal
     whitespace immediately around it.
@@ -4194,16 +4251,25 @@ class Agent365Adapter(BasePlatformAdapter):
         """Post the turn's segments as one reply, then drop the buffer.
 
         Dropped on success and on failure so a second complete cannot
-        post the same text again. Empty buffers post nothing.
+        post the same text again. Empty buffers post nothing. A segment
+        that is only Hermes tool-progress text (``💻 Running date``) is
+        omitted; answer text in the same segment is kept.
         """
         buf = self._turn_buffers.pop(str(chat_id), None)
         if not buf:
             return
-        parts = [
-            str(segment.get("text") or "")
-            for segment in buf.get("segments") or []
-            if str(segment.get("text") or "")
-        ]
+        parts: list[str] = []
+        for segment in buf.get("segments") or []:
+            text = str(segment.get("text") or "")
+            if not text:
+                continue
+            if _is_hermes_tool_progress_segment(text):
+                logger.debug(
+                    "agent365 turn buffer omitting tool-progress segment: chat_id=%s",
+                    chat_id,
+                )
+                continue
+            parts.append(text)
         if not parts:
             return
         inbound = buf.get("inbound")

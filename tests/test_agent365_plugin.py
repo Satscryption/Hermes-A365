@@ -5655,6 +5655,104 @@ class TestEditMessage:
         assert a._turn_buffers == {}
 
     @pytest.mark.asyncio
+    async def test_turn_buffer_omits_hermes_tool_progress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Friendly tool-progress bubbles (laptop emoji + "Running date")
+        # are their own sends. They must not land in the merged reply.
+        # An edit that replaces the progress segment with the answer, and
+        # a segment that also contains answer text, are kept.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-progress", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        event = _StubMessageEvent(
+            text="what is the date",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-progress"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+
+        progress = await a.send(
+            chat_id="conv-G-progress",
+            content="💻 Running date",
+            reply_to=None,
+        )
+        accumulated = await a.send(
+            chat_id="conv-G-progress",
+            content="💻 Running date\n📖 Reading /etc/hostname",
+            reply_to=None,
+        )
+        repeated = await a.send(
+            chat_id="conv-G-progress",
+            content="💻 Running date (\u00d72)",
+            reply_to=None,
+        )
+        answer = await a.send(
+            chat_id="conv-G-progress",
+            content="Thursday, 16 October.",
+            reply_to="act-1",
+        )
+        assert progress.success is True
+        assert accumulated.success is True
+        assert repeated.success is True
+        assert answer.success is True
+
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert (
+            send_reply_mock.await_args.kwargs["reply"]["text"]
+            == "Thursday, 16 October."
+        )
+
+        await a.on_processing_start(event)
+        only_progress = await a.send(
+            chat_id="conv-G-progress",
+            content="💻 Running date",
+            reply_to=None,
+        )
+        assert only_progress.success is True
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+
+        await a.on_processing_start(event)
+        edited = await a.send(
+            chat_id="conv-G-progress",
+            content="💻 Running date",
+            reply_to=None,
+        )
+        replaced = await a.edit_message(
+            "conv-G-progress",
+            str(edited.message_id),
+            "Replaced with the answer.",
+            finalize=True,
+        )
+        mixed = await a.send(
+            chat_id="conv-G-progress",
+            content="The command was date.\n💻 Running date is not the whole reply.",
+            reply_to=None,
+        )
+        prose = await a.send(
+            chat_id="conv-G-progress",
+            content="Running date locally is fine.",
+            reply_to=None,
+        )
+        assert replaced.success is True
+        assert mixed.success is True
+        assert prose.success is True
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 2
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == (
+            "Replaced with the answer.\n\n"
+            "The command was date.\n💻 Running date is not the whole reply.\n\n"
+            "Running date locally is fine."
+        )
+
+    @pytest.mark.asyncio
     async def test_personal_chat_is_not_turn_buffered(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
