@@ -4950,6 +4950,49 @@ class TestSendTyping:
         assert headers["Authorization"] == "Bearer bearer-xyz"
 
     @pytest.mark.asyncio
+    async def test_no_typing_on_non_personal_chat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Copilot Chat arrives as groupChat. A typing activity there is
+        # accepted, but the merged reply never renders. Personal 1:1
+        # still posts the indicator.
+        a = _make_adapter(monkeypatch)
+        group = _make_inbound(conv_id="conv-group", activity_id="g1")
+        group["conversation"]["conversationType"] = "groupChat"
+        channel = _make_inbound(conv_id="conv-channel", activity_id="c1")
+        channel["conversation"]["conversationType"] = "channel"
+        personal = _make_inbound(conv_id="conv-personal", activity_id="p1")
+        for inbound in (group, channel, personal):
+            ref = adapter_mod.ConversationRef.from_activity(inbound)
+            assert ref is not None
+            a._conversations.upsert(ref)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-xyz"),
+        )
+        post_mock = AsyncMock(return_value=MagicMock(status_code=200, text=""))
+        a._http_client.post = post_mock
+
+        group_before = a._conversations.get("conv-group").last_used_at
+        await a.send_typing("conv-group")
+        await a.send_typing("conv-channel")
+        assert post_mock.await_count == 0
+        assert a._conversations.get("conv-group").last_used_at == group_before
+
+        await a.send_typing("conv-personal")
+        assert post_mock.await_count == 1
+        body = post_mock.await_args.kwargs["json"]
+        assert body["type"] == "typing"
+        assert body["conversation"]["id"] == "conv-personal"
+        assert body["conversation"]["conversationType"] == "personal"
+
+    @pytest.mark.asyncio
     async def test_typing_failure_swallowed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

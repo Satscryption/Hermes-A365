@@ -309,8 +309,8 @@ this heading is dated at release.
   merged reply — segments joined by a blank line, plus the opt-in handoff
   link — via `_send_reply_activity`, then runs the existing coalesced
   flush. The buffer is cleared on disconnect and on chat eviction.
-  Personal chats are not buffered. The live section 2a retest is still
-  pending.
+  Personal chats are not buffered. Walk row 2a passed with typing
+  suppressed: the reply rendered in about 16s.
 - **Copilot turn-end cleanup no longer hangs on a swallowed typing cancel (F8).**
   `Agent365Adapter._await_outbound` turned every `CancelledError` into
   `RuntimeError("agent365 outbound operation cancelled")`. Hermes cancels
@@ -324,6 +324,14 @@ this heading is dated at release.
   other `send_typing` failure stays a warning. PR #153 F6 only downgrades
   the cancellation log; that log was this hang's symptom, and a log-level
   change must not hide a real typing failure.
+- **Copilot Chat typing is limited to personal chats.** After caller
+  cancellation let typing activities reach Copilot, the merged reply
+  posted (about 10s) but the client never rendered it and timed out at
+  45s. `send_typing` is now a no-op unless the cached `conversationType`
+  is `personal`. Teams 1:1 chats still get the indicator. With typing
+  suppressed, walk row 2a rendered in about 16s (3 segments, 166
+  characters, one activity). Turns longer than about 45s still need the
+  keep-alive in #155.
 - **H4 — sequential coalesced reply segments are no longer swallowed.**
   Non-personal chats now assign a fresh synthetic message id to every newly
   opened coalesced segment. Multiple segments for the same inbound activity
