@@ -7,6 +7,7 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -80,19 +81,52 @@ class FakeMutator:
         return RunResult(argv=list(argv), returncode=0, stdout="", stderr="")
 
 
-def _graph_owned_by(blueprint_id: str):
-    """Graph lookup whose every record is linked to ``blueprint_id``."""
+_BLUEPRINT_OBJECT_ID = "12121212-1212-1212-1212-121212121212"
+# Shared AI Teammate managing app. It is not a per-agent blueprint anchor.
+_SHARED_MANAGED_BY = "9b975845-388f-4429-889e-eab1ef63949c"
+_INSTANCE_IN_URL = re.compile(r"agentRegistry/agentInstances/([0-9a-fA-F-]{36})")
+_USER_IN_URL = re.compile(r"agentUserId eq '([0-9a-fA-F-]{36})'")
+_SP_IN_URL = re.compile(r"servicePrincipals/([0-9a-fA-F-]{36})")
+_APP_IN_URL = re.compile(r"applications\(appId='([0-9a-fA-F-]{36})'\)")
 
-    def graph_get(url: str) -> dict[str, str | list[dict[str, str]]]:
-        record = {
-            "id": "owned-object",
+
+def _graph_owned_by(blueprint_id: str):
+    """Graph lookup whose blueprint fields name ``blueprint_id``.
+
+    Payload ids are taken from the requested URL so the ownership check can
+    require them to equal the typed id. ``agentIdentityId`` is intentionally
+    absent: it is not an ownership signal.
+    """
+
+    def graph_get(url: str) -> dict[str, Any]:
+        if _APP_IN_URL.search(url):
+            return {"id": _BLUEPRINT_OBJECT_ID, "appId": blueprint_id}
+        user = _USER_IN_URL.search(url)
+        if user:
+            return {
+                "value": [
+                    {
+                        "id": "33333333-3333-3333-3333-333333333333",
+                        "agentUserId": user.group(1).lower(),
+                        "agentIdentityBlueprintId": blueprint_id,
+                        "managedBy": blueprint_id,
+                    }
+                ]
+            }
+        principal = _SP_IN_URL.search(url)
+        if principal:
+            return {
+                "id": principal.group(1).lower(),
+                "appId": blueprint_id,
+                "agentIdentityBlueprintId": blueprint_id,
+                "managedBy": blueprint_id,
+            }
+        instance = _INSTANCE_IN_URL.search(url)
+        return {
+            "id": instance.group(1).lower() if instance else "",
             "agentIdentityBlueprintId": blueprint_id,
             "managedBy": blueprint_id,
-            "agentIdentityId": blueprint_id,
         }
-        if "$filter=" in url:
-            return {"value": [record]}
-        return record
 
     return graph_get
 
@@ -1761,7 +1795,7 @@ class TestOrphanOwnership:
     def test_missing_local_anchor_refuses_even_when_graph_matches_something(
         self, tmp_path: Path
     ) -> None:
-        with pytest.raises(CleanupError, match="no blueprint or sidecar"):
+        with pytest.raises(CleanupError, match="no per-agent A365_APP_ID"):
             build_cleanup_plan(
                 CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
                 hermes_home=tmp_path,
@@ -1769,12 +1803,35 @@ class TestOrphanOwnership:
                 graph_get=_graph_owned_by(_OWNERSHIP_BLUEPRINT),
             )
 
-    def test_sidecar_msa_app_id_proves_instance_ownership(
-        self, tmp_path: Path
-    ) -> None:
+    def test_forged_sidecar_msa_app_id_is_not_an_anchor(self, tmp_path: Path) -> None:
+        # agentName matches and msaAppId is a foreign blueprint. That used to
+        # authorize the foreign user. Only per-agent A365_APP_ID is an anchor,
+        # and only when msaAppId equals it.
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
         sidecar = _seed_bot_service_sidecar(tmp_path, agent_name="inbox-helper")
         payload = json.loads(sidecar.read_text())
-        payload["msaAppId"] = self._SIDECAR_APP
+        payload["msaAppId"] = _FOREIGN_BLUEPRINT
+        sidecar.write_text(json.dumps(payload))
+        with pytest.raises(CleanupError, match="different agent") as exc:
+            build_cleanup_plan(
+                CleanupInputs(
+                    agent_name="inbox-helper",
+                    kinds=("bot-service",),
+                    bot_service_sidecar_path=sidecar,
+                ),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=_graph_owned_by(_FOREIGN_BLUEPRINT),
+            )
+        assert "--confirm-orphan-user" not in str(exc.value)
+
+    def test_forged_sidecar_does_not_delete_on_apply(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+        sidecar = _seed_bot_service_sidecar(tmp_path, agent_name="inbox-helper")
+        payload = json.loads(sidecar.read_text())
+        payload["msaAppId"] = _FOREIGN_BLUEPRINT
         sidecar.write_text(json.dumps(payload))
         plan = build_cleanup_plan(
             CleanupInputs(
@@ -1783,10 +1840,191 @@ class TestOrphanOwnership:
                 bot_service_sidecar_path=sidecar,
             ),
             hermes_home=tmp_path,
+        )
+        mutator = FakeMutator()
+        with pytest.raises(CleanupError, match="different agent"):
+            _apply_cleanup_plan(
+                plan,
+                mutator=mutator,
+                hermes_home=tmp_path,
+                purge_orphans=True,
+                additional_orphan_user_ids=(self._USER,),
+                confirmed_orphan_user_ids=(self._USER,),
+                graph_get=_graph_owned_by(_FOREIGN_BLUEPRINT),
+            )
+        assert mutator.calls == []
+
+    def test_generated_config_guids_are_not_anchors(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+        generated = _seed_generated_config(tmp_path, instance_id=_TEST_INSTANCE_ID)
+        planted = json.loads(generated.read_text())
+        planted["agentBlueprintId"] = _OWNERSHIP_BLUEPRINT
+        planted["agentBlueprintObjectId"] = _SHARED_MANAGED_BY
+        planted["agentBlueprintServicePrincipalObjectId"] = _FOREIGN_BLUEPRINT
+        planted["agentIdentityId"] = _SHARED_MANAGED_BY
+        planted["agentIdentityObjectId"] = _FOREIGN_BLUEPRINT
+        generated.write_text(json.dumps(planted))
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                # A payload for a different app must not become an anchor.
+                return {"id": _SHARED_MANAGED_BY, "appId": _FOREIGN_BLUEPRINT}
+            if _USER_IN_URL.search(url):
+                return {
+                    "value": [
+                        {
+                            "id": "33333333-3333-3333-3333-333333333333",
+                            "agentUserId": self._USER,
+                            "managedBy": _SHARED_MANAGED_BY,
+                            "agentIdentityId": _SHARED_MANAGED_BY,
+                            "agentIdentityBlueprintId": _FOREIGN_BLUEPRINT,
+                        }
+                    ]
+                }
+            return {
+                "id": _TEST_INSTANCE_ID,
+                "managedBy": _SHARED_MANAGED_BY,
+                "agentIdentityId": _FOREIGN_BLUEPRINT,
+                "agentIdentityBlueprintId": _SHARED_MANAGED_BY,
+            }
+
+        with pytest.raises(CleanupError, match="different blueprint"):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                generated_config_path=generated,
+                additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+                graph_get=graph_get,
+            )
+
+    def test_shared_managed_by_app_is_not_ownership(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            return {
+                "id": _TEST_INSTANCE_ID,
+                "managedBy": _SHARED_MANAGED_BY,
+                "agentIdentityId": _SHARED_MANAGED_BY,
+            }
+
+        with pytest.raises(CleanupError, match="different blueprint"):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+                graph_get=graph_get,
+            )
+
+    def test_blueprint_object_id_from_graph_still_proves_ownership(
+        self, tmp_path: Path
+    ) -> None:
+        # A real instance can be managedBy the shared AI Teammate app and
+        # still belong to this blueprint via the application object id.
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            return {
+                "id": _TEST_INSTANCE_ID,
+                "agentIdentityBlueprintId": _BLUEPRINT_OBJECT_ID,
+                "managedBy": _SHARED_MANAGED_BY,
+            }
+
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+            hermes_home=tmp_path,
             additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
-            graph_get=_graph_owned_by(self._SIDECAR_APP),
+            graph_get=graph_get,
         )
         assert plan.orphan_instance_ids == (_TEST_INSTANCE_ID.lower(),)
+
+    def test_error_body_lookup_refuses(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(_url: str) -> dict[str, Any]:
+            return {"error": {"code": "Request_ResourceNotFound", "message": "missing"}}
+
+        with pytest.raises(CleanupError, match="did not prove"):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+                graph_get=graph_get,
+            )
+
+    def test_payload_id_mismatch_refuses(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            if _USER_IN_URL.search(url):
+                return {
+                    "value": [
+                        {
+                            "id": "33333333-3333-3333-3333-333333333333",
+                            "agentUserId": "99999999-9999-9999-9999-999999999999",
+                            "agentIdentityBlueprintId": _OWNERSHIP_BLUEPRINT,
+                        }
+                    ]
+                }
+            if _SP_IN_URL.search(url):
+                return {
+                    "id": "99999999-9999-9999-9999-999999999999",
+                    "agentIdentityBlueprintId": _OWNERSHIP_BLUEPRINT,
+                }
+            return {
+                "id": "not-the-requested-id",
+                "agentIdentityBlueprintId": _OWNERSHIP_BLUEPRINT,
+                "managedBy": _OWNERSHIP_BLUEPRINT,
+            }
+
+        with pytest.raises(CleanupError, match="does not match the typed id") as instance_exc:
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
+                graph_get=graph_get,
+            )
+        assert "not-the-requested-id" in str(instance_exc.value)
+
+        with pytest.raises(CleanupError, match="does not match the typed id"):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
+
+    def test_service_principal_id_mismatch_refuses(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            if "$filter=" in url:
+                return {"value": []}
+            return {
+                "id": "99999999-9999-9999-9999-999999999999",
+                "agentIdentityBlueprintId": _OWNERSHIP_BLUEPRINT,
+            }
+
+        with pytest.raises(CleanupError, match="does not match the typed id"):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
 
     def test_sidecar_for_a_different_agent_is_not_an_anchor(
         self, tmp_path: Path
@@ -1795,7 +2033,7 @@ class TestOrphanOwnership:
         payload = json.loads(sidecar.read_text())
         payload["msaAppId"] = self._SIDECAR_APP
         sidecar.write_text(json.dumps(payload))
-        with pytest.raises(CleanupError, match="no blueprint or sidecar"):
+        with pytest.raises(CleanupError, match="no per-agent A365_APP_ID"):
             build_cleanup_plan(
                 CleanupInputs(
                     agent_name="inbox-helper",
@@ -1878,12 +2116,29 @@ class TestOrphanOwnership:
             ) -> RunResult:
                 if argv[:4] == ["az", "rest", "--method", "GET"]:
                     self.calls.append(list(argv))
-                    record = {
-                        "agentIdentityBlueprintId": _FOREIGN_BLUEPRINT,
-                        "managedBy": _FOREIGN_BLUEPRINT,
-                        "agentIdentityId": _FOREIGN_BLUEPRINT,
-                    }
-                    body = {"value": [record]} if "$filter=" in argv[-1] else record
+                    uri = argv[-1]
+                    if _APP_IN_URL.search(uri):
+                        body: dict[str, Any] = {
+                            "id": _BLUEPRINT_OBJECT_ID,
+                            "appId": _FOREIGN_BLUEPRINT,
+                        }
+                    elif (user := _USER_IN_URL.search(uri)):
+                        body = {
+                            "value": [
+                                {
+                                    "id": "33333333-3333-3333-3333-333333333333",
+                                    "agentUserId": user.group(1).lower(),
+                                    "agentIdentityBlueprintId": _FOREIGN_BLUEPRINT,
+                                    "managedBy": _FOREIGN_BLUEPRINT,
+                                }
+                            ]
+                        }
+                    else:
+                        body = {
+                            "id": _FOREIGN_BLUEPRINT,
+                            "agentIdentityBlueprintId": _FOREIGN_BLUEPRINT,
+                            "managedBy": _FOREIGN_BLUEPRINT,
+                        }
                     return RunResult(
                         argv=list(argv), returncode=0, stdout=json.dumps(body), stderr=""
                     )

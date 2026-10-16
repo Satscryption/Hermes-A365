@@ -15,13 +15,16 @@ this heading is dated at release.
 - **Orphan deletion requires a Graph ownership proof.** `cleanup` (including
   its bot-service step) no longer plans deletion of an agent instance, agent
   identity, or agentic user just because the object id was typed twice.
-  Before the id is listed, Graph must show that the instance's blueprint /
-  managing app, or the user's agent instance / agent identity, matches this
-  agent's bound blueprint record (`A365_APP_ID` and a generated config with
-  the same `agentBlueprintId`) or Bot Service sidecar (`agentName` plus
-  `msaAppId`). A live user of a different agent is refused, and a lookup
-  that cannot prove ownership is refused. Double entry remains a second
-  gate after that proof.
+  The only local anchor is per-agent `A365_APP_ID`. A sidecar `msaAppId`
+  counts only when it is that same id. Object and identity GUIDs in the
+  cwd `a365.generated.config.json` are not anchors. Graph is asked for the
+  application object id of `A365_APP_ID`, and a record matches only when
+  its `agentIdentityBlueprintId` or `managedBy` is that app id or object
+  id. `agentIdentityId` is not proof. The returned instance `id`, each
+  filtered instance's `agentUserId`, and a service principal `id` must
+  equal the typed id. A live user of a different agent is refused, and a
+  lookup that cannot prove ownership is refused. Double entry remains a
+  second gate after that proof.
 - **Direct Line verify distinguishes an allowlist 403.** After the bot token
   check succeeds, HTTP 403 is reported as "auth OK, probe user
   `hermes-a365-verify` is not allowlisted", with guidance to set
@@ -32,9 +35,6 @@ this heading is dated at release.
   not on PATH, the command says so instead of "could not verify the active
   Azure tenant". The runner rejects every invocation, including
   `az account show`, until the CLI is installed.
-- **Benign typing cancellation is a debug log.** A Teams turn cancels the
-  in-flight typing POST when the reply supersedes it. That expected
-  cancellation is logged at debug, not as a warning.
 
 ### Secrets at rest (#19)
 

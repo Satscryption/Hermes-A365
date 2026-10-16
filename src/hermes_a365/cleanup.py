@@ -328,8 +328,8 @@ def build_cleanup_plan(
         generated_config_path, additional_orphan_instance_ids
     )
     # #123 4f / #102 L6: do not plan a deletion until Graph proves the object
-    # belongs to this agent's blueprint or sidecar records. Double entry alone
-    # offered to delete another agent's live agentic user.
+    # belongs to this agent's A365_APP_ID. Double entry alone offered to
+    # delete another agent's live agentic user.
     _require_verified_orphan_ownership(
         agent_name=inputs.agent_name,
         hermes_home=hermes_home,
@@ -461,10 +461,15 @@ def _collect_orphan_user_ids(
 
 
 # Graph ownership (#123 walk 4f / #102 L6). Typing an object id twice is not
-# proof it belongs to this agent: a throwaway cleanup planned deletion of a
-# different agent's live agentic user. agentInstance.agentIdentityBlueprintId
-# is the blueprint object id, agentIdentity.agentIdentityBlueprintId is the
-# blueprint app id, and managedBy is the managing app's appId.
+# proof it belongs to this agent. Anchors are the per-agent A365_APP_ID and,
+# when Graph returns it, that application's object id. The cwd sidecar and
+# a365.generated.config.json are not anchor sources: a matching agentName or
+# a copied object/identity GUID would let one agent delete another's user.
+# agentInstance.agentIdentityBlueprintId is the blueprint object id,
+# agentIdentity.agentIdentityBlueprintId is the blueprint app id, and
+# managedBy is compared to those same blueprint anchors. agentIdentityId is
+# not an ownership signal. The shared AI Teammate managing app
+# (9b975845-388f-4429-889e-eab1ef63949c) is not an anchor.
 GraphGet = Callable[[str], dict[str, Any] | None]
 _AGENT_USER_FILTER_URL = (
     "https://graph.microsoft.com/beta/agentRegistry/agentInstances"
@@ -474,12 +479,9 @@ _AGENT_IDENTITY_URL = (
     "https://graph.microsoft.com/beta/servicePrincipals/{object_id}"
     "?$select=id,appId,servicePrincipalType,agentIdentityBlueprintId"
 )
-
-
-@dataclass(frozen=True)
-class _OwnershipAnchors:
-    blueprint_ids: frozenset[str]
-    agent_identity_ids: frozenset[str]
+_APPLICATION_BY_APP_ID_URL = (
+    "https://graph.microsoft.com/beta/applications(appId='{app_id}')?$select=id,appId"
+)
 
 
 def _uuid_text(value: object) -> str:
@@ -491,29 +493,13 @@ def _uuid_text(value: object) -> str:
         return ""
 
 
-def _read_json_dict(path: Path) -> dict[str, Any] | None:
-    try:
-        raw = path.read_text()
-    except OSError:
-        return None
-    try:
-        parsed = json.loads(raw)
-    except json.JSONDecodeError:
-        return None
-    return parsed if isinstance(parsed, dict) else None
+def _per_agent_blueprint_app_id(*, hermes_home: Path, slug: str) -> str:
+    """Return this agent's A365_APP_ID.
 
-
-def _ownership_anchors(
-    *,
-    agent_name: str,
-    hermes_home: Path,
-    slug: str,
-    generated_config_path: Path,
-    sidecar_config: bot_service.BotServiceConfig | None,
-) -> _OwnershipAnchors:
-    """Ids from records bound to this agent, not from the orphan id itself."""
-    blueprint: set[str] = set()
-    identities: set[str] = set()
+    The cwd sidecar and ``a365.generated.config.json`` are not read. A
+    sidecar ``msaAppId`` is the same anchor only when it equals this id,
+    so it never contributes a second GUID.
+    """
     env_path = _agent_dir(hermes_home, slug) / ".env"
     env: dict[str, str] = {}
     if env_path.is_file():
@@ -521,43 +507,51 @@ def _ownership_anchors(
             env = parse_env(env_path.read_text())
         except OSError:
             env = {}
-    app_id = _uuid_text(env.get("A365_APP_ID", ""))
-    if app_id:
-        blueprint.add(app_id)
-    if sidecar_config is not None and sidecar_config.agentName == agent_name:
-        msa_app_id = _uuid_text(sidecar_config.msaAppId)
-        if msa_app_id:
-            blueprint.add(msa_app_id)
-    generated = _read_json_dict(generated_config_path)
-    # The generated file is selected by cwd. Trust its blueprint object ids
-    # only when its app id matches the per-agent env, which is bound to --agent-name.
-    if generated and app_id and _uuid_text(generated.get("agentBlueprintId")) == app_id:
-        for key in (
-            "agentBlueprintId",
-            "agentBlueprintObjectId",
-            "agentBlueprintServicePrincipalObjectId",
-        ):
-            found = _uuid_text(generated.get(key))
-            if found:
-                blueprint.add(found)
-        for key in ("agentIdentityId", "agentIdentityObjectId"):
-            found = _uuid_text(generated.get(key))
-            if found:
-                identities.add(found)
-    return _OwnershipAnchors(frozenset(blueprint), frozenset(identities))
+    return _uuid_text(env.get("A365_APP_ID", ""))
 
 
-def _linked_ids(record: dict[str, Any]) -> set[str]:
+def _blueprint_association(record: dict[str, Any]) -> set[str]:
+    """Blueprint app/object ids on a Graph record. Not agentIdentityId."""
     found: set[str] = set()
-    for key in ("agentIdentityBlueprintId", "managedBy", "agentIdentityId"):
+    for key in ("agentIdentityBlueprintId", "managedBy"):
         parsed = _uuid_text(record.get(key))
         if parsed:
             found.add(parsed)
     return found
 
 
-def _record_belongs(record: dict[str, Any], anchors: _OwnershipAnchors) -> bool:
-    return bool(_linked_ids(record) & (anchors.blueprint_ids | anchors.agent_identity_ids))
+def _record_belongs(record: dict[str, Any], anchors: frozenset[str]) -> bool:
+    return bool(_blueprint_association(record) & anchors)
+
+
+def _application_object_id(payload: dict[str, Any] | None, app_id: str) -> str:
+    """Object id from a Graph application read, only if it is this app."""
+    if not isinstance(payload, dict) or payload.get("error"):
+        return ""
+    value = payload.get("value")
+    if isinstance(value, list):
+        candidates = [item for item in value if isinstance(item, dict)]
+    elif payload.get("id") or payload.get("appId"):
+        candidates = [payload]
+    else:
+        candidates = []
+    matched = [item for item in candidates if _uuid_text(item.get("appId")) == app_id]
+    if len(matched) != 1:
+        return ""
+    return _uuid_text(matched[0].get("id"))
+
+
+def _blueprint_anchors(app_id: str, graph_get: GraphGet) -> frozenset[str]:
+    """App id plus the object id Graph reports for that same application."""
+    anchors = {app_id}
+    try:
+        payload = graph_get(_APPLICATION_BY_APP_ID_URL.format(app_id=app_id))
+    except (CliInvocationError, AADSTSError, OSError):
+        payload = None
+    object_id = _application_object_id(payload, app_id)
+    if object_id:
+        anchors.add(object_id)
+    return frozenset(anchors)
 
 
 def _instances_from_graph(payload: dict[str, Any] | None) -> list[dict[str, Any]]:
@@ -590,6 +584,31 @@ def _graph_get_from_mutator(mutator: Mutator) -> GraphGet:
     return graph_get
 
 
+def _graph_dict(graph_get: GraphGet, url: str) -> dict[str, Any] | None:
+    """Return a Graph JSON object, or None when the lookup cannot be trusted."""
+    try:
+        payload = graph_get(url)
+    except (CliInvocationError, AADSTSError, OSError):
+        return None
+    if not isinstance(payload, dict) or payload.get("error"):
+        return None
+    return payload
+
+
+def _require_matching_blueprint(
+    record: dict[str, Any],
+    anchors: frozenset[str],
+    *,
+    refusal: str,
+    unproven: str,
+) -> None:
+    if _record_belongs(record, anchors):
+        return
+    if _blueprint_association(record):
+        raise CleanupError(refusal)
+    raise CleanupError(unproven)
+
+
 def _require_verified_orphan_ownership(
     *,
     agent_name: str,
@@ -601,7 +620,13 @@ def _require_verified_orphan_ownership(
     instance_ids: tuple[str, ...],
     graph_get: GraphGet | None,
 ) -> None:
-    """Raise unless every candidate is Graph-proven to belong to this agent."""
+    """Raise unless every candidate is Graph-proven to belong to this agent.
+
+    ``generated_config_path`` is unused on purpose: object and identity
+    GUIDs in the cwd generated file are not anchors. ``sidecar_config``
+    contributes ``msaAppId`` only when that id equals per-agent
+    ``A365_APP_ID``; a different sidecar app id is ignored.
+    """
     if not user_ids and not instance_ids:
         return
     if graph_get is None:
@@ -610,70 +635,98 @@ def _require_verified_orphan_ownership(
             "Typing the object id twice does not prove the agentic user or agent "
             "identity belongs to this agent."
         )
-    anchors = _ownership_anchors(
-        agent_name=agent_name,
-        hermes_home=hermes_home,
-        slug=slug,
-        generated_config_path=generated_config_path,
-        sidecar_config=sidecar_config,
-    )
-    if not anchors.blueprint_ids and not anchors.agent_identity_ids:
+    app_id = _per_agent_blueprint_app_id(hermes_home=hermes_home, slug=slug)
+    if not app_id:
         raise CleanupError(
-            "refusing to plan orphan deletion: no blueprint or sidecar record is "
-            f"bound to {agent_name!r}. Bind per-agent A365_APP_ID, a generated "
-            "config whose agentBlueprintId matches it, or a Bot Service sidecar "
-            "whose agentName matches, then re-run so Graph can prove ownership."
+            "refusing to plan orphan deletion: no per-agent A365_APP_ID is bound "
+            f"to {agent_name!r}. Set A365_APP_ID in that agent's env. A cwd "
+            "sidecar msaAppId or a365.generated.config.json GUID is not proof."
         )
+    if sidecar_config is not None and sidecar_config.agentName == agent_name:
+        msa_app_id = _uuid_text(sidecar_config.msaAppId)
+        if msa_app_id == app_id:
+            app_id = msa_app_id
+    anchors = _blueprint_anchors(app_id, graph_get)
+    del generated_config_path
     for instance_id in instance_ids:
-        payload = graph_get(_AGENT_INSTANCES_GRAPH_URL.format(instance_id=instance_id))
-        record = payload if isinstance(payload, dict) and not payload.get("error") else None
-        if record is not None and _record_belongs(record, anchors):
-            continue
-        if record is not None and _linked_ids(record):
+        payload = _graph_dict(
+            graph_get, _AGENT_INSTANCES_GRAPH_URL.format(instance_id=instance_id)
+        )
+        if payload is None:
             raise CleanupError(
                 f"refusing to plan deletion of agent instance {instance_id}: "
-                "Graph shows it belongs to a different blueprint or agent "
-                "identity than this agent's sidecar and blueprint records."
+                "Graph lookup did not prove it belongs to this agent's blueprint."
             )
-        raise CleanupError(
-            f"refusing to plan deletion of agent instance {instance_id}: "
-            "Graph lookup did not prove it belongs to this agent's blueprint "
-            "or sidecar records."
+        if _uuid_text(payload.get("id")) != instance_id:
+            raise CleanupError(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                f"Graph payload id {payload.get('id')!r} does not match the typed id."
+            )
+        _require_matching_blueprint(
+            payload,
+            anchors,
+            refusal=(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                "Graph shows it belongs to a different blueprint than this "
+                "agent's A365_APP_ID."
+            ),
+            unproven=(
+                f"refusing to plan deletion of agent instance {instance_id}: "
+                "Graph lookup did not prove it belongs to this agent's blueprint."
+            ),
         )
     for user_id in user_ids:
-        listed = graph_get(_AGENT_USER_FILTER_URL.format(user_id=user_id))
-        instances = _instances_from_graph(listed if isinstance(listed, dict) else None)
+        listed = _graph_dict(graph_get, _AGENT_USER_FILTER_URL.format(user_id=user_id))
+        instances = _instances_from_graph(listed)
         if instances:
-            if all(_record_belongs(item, anchors) for item in instances):
-                continue
-            if any(_linked_ids(item) for item in instances):
-                raise CleanupError(
-                    f"refusing to plan deletion of agentic user {user_id}: Graph "
-                    "shows this is the live agent user of a different agent's "
-                    "identity, not this agent's blueprint or sidecar records."
+            for item in instances:
+                if _uuid_text(item.get("agentUserId")) != user_id:
+                    raise CleanupError(
+                        f"refusing to plan deletion of agentic user {user_id}: "
+                        f"Graph agentUserId {item.get('agentUserId')!r} does not "
+                        "match the typed id."
+                    )
+                _require_matching_blueprint(
+                    item,
+                    anchors,
+                    refusal=(
+                        f"refusing to plan deletion of agentic user {user_id}: "
+                        "Graph shows this is the live agent user of a different "
+                        "agent's blueprint, not this agent's A365_APP_ID."
+                    ),
+                    unproven=(
+                        f"refusing to plan deletion of agentic user {user_id}: "
+                        "Graph lookup did not prove the agentic user belongs to "
+                        "this agent's blueprint."
+                    ),
                 )
+            continue
+        identity = _graph_dict(graph_get, _AGENT_IDENTITY_URL.format(object_id=user_id))
+        if identity is None:
             raise CleanupError(
                 f"refusing to plan deletion of agentic user {user_id}: Graph "
-                "lookup did not prove the agentic user belongs to this agent's "
-                "blueprint or sidecar records."
+                "lookup did not prove the agentic user or agent identity "
+                "belongs to this agent's blueprint."
             )
-        identity = graph_get(_AGENT_IDENTITY_URL.format(object_id=user_id))
-        if (
-            isinstance(identity, dict)
-            and not identity.get("error")
-            and _record_belongs(identity, anchors)
-        ):
-            continue
-        if isinstance(identity, dict) and _linked_ids(identity):
+        if _uuid_text(identity.get("id")) != user_id:
             raise CleanupError(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                f"service principal id {identity.get('id')!r} does not match "
+                "the typed id."
+            )
+        _require_matching_blueprint(
+            identity,
+            anchors,
+            refusal=(
                 f"refusing to plan deletion of agentic user {user_id}: Graph "
                 "shows this agent identity belongs to a different blueprint "
-                "than this agent's sidecar and blueprint records."
-            )
-        raise CleanupError(
-            f"refusing to plan deletion of agentic user {user_id}: Graph lookup "
-            "did not prove the agentic user or agent identity belongs to this "
-            "agent's blueprint or sidecar records."
+                "than this agent's A365_APP_ID."
+            ),
+            unproven=(
+                f"refusing to plan deletion of agentic user {user_id}: Graph "
+                "lookup did not prove the agentic user or agent identity "
+                "belongs to this agent's blueprint."
+            ),
         )
 
 
@@ -1211,7 +1264,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         metavar="GUID",
         help=(
             "re-type an orphan instance id whose Graph ownership was already "
-            "verified against this agent's blueprint or sidecar records. "
+            "verified against this agent's per-agent blueprint (A365_APP_ID). "
             "Double entry alone does not authorise deletion. May be repeated."
         ),
     )
@@ -1232,8 +1285,8 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         metavar="GUID",
         help=(
             "re-type an orphaned agentic-user id whose Graph ownership was "
-            "already verified against this agent's blueprint or sidecar "
-            "records. May be repeated."
+            "already verified against this agent's per-agent blueprint "
+            "(A365_APP_ID). May be repeated."
         ),
     )
     return parser
