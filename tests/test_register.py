@@ -268,9 +268,19 @@ class TestPlanRender:
         assert "permissions-bot" in text
         assert "$ a365 setup blueprint --agent-name inbox-helper" in text
 
-    def test_human_shows_auto_detect_when_tenant_unset(self) -> None:
+    def test_human_says_apply_refuses_without_a_tenant_pin(self) -> None:
         plan = build_register_plan(RegisterInputs(agent_name="x"))
-        assert "auto-detect" in plan.render_human()
+        text = plan.render_human()
+        assert "no canonical pin" in text
+        assert "refuses" in text
+        assert "auto-detect" not in text
+
+    def test_human_notes_that_m365_does_not_register_the_endpoint(self) -> None:
+        plan = build_register_plan(RegisterInputs(agent_name="x", m365=True, tenant_id="tid"))
+        text = plan.render_human()
+        assert "--m365" in text
+        assert "does not register the messaging endpoint" in text
+        assert "update-endpoint" in text
 
     def test_human_shows_explicit_tenant(self) -> None:
         plan = build_register_plan(RegisterInputs(agent_name="x", tenant_id="foo"))

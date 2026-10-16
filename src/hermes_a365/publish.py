@@ -38,6 +38,8 @@ from pathlib import Path
 from typing import Any
 
 from ._common import (
+    TENANT_ID_HELP,
+    UNPINNED_TENANT_PLAN_LINE,
     TenantResolutionError,
     active_az_tenant,
     resolve_expected_tenant,
@@ -281,7 +283,7 @@ class PublishPlan:
         if self.inputs.tenant_id:
             lines.append(f"  tenant: {self.inputs.tenant_id}")
         else:
-            lines.append("  tenant: (auto-detect from `az account show`)")
+            lines.append(UNPINNED_TENANT_PLAN_LINE)
         if self.inputs.aiteammate and self.inputs.copilot_chat:
             flavour = "AI Teammate + Custom Engine Agent (both surfaces)"
         elif self.inputs.copilot_chat:
@@ -848,6 +850,17 @@ def apply_publish_plan(
             "no canonical tenant pin was resolved; pass --tenant-id or set "
             "A365_TENANT_ID before publishing"
         )
+    # The a365 mutator refuses every argv, including `az account show`, when
+    # the a365 binary is missing. That used to surface as a tenant-verification
+    # failure (#123 F5).
+    if getattr(mutator, "available", True) is False:
+        raise PublishError(
+            "a365 CLI not found on PATH. Install the Agent 365 CLI "
+            "(dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease) "
+            "and put its directory on PATH. publish --apply did not verify the "
+            "Azure tenant because the a365 command runner rejects every "
+            "invocation, including `az account show`, when that binary is missing."
+        )
     active = active_az_tenant(lambda argv: mutator.run(argv))
     if active is None:
         raise PublishError("could not verify the active Azure tenant")
@@ -1031,7 +1044,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     parser.add_argument("--agent-name", required=True, help="agent base name")
     parser.add_argument(
         "--tenant-id",
-        help="tenant id; default auto-detects via `az account show`",
+        help=TENANT_ID_HELP,
     )
     parser.add_argument(
         "--aiteammate",
