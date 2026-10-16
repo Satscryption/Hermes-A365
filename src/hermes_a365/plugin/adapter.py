@@ -51,6 +51,10 @@ Or via environment variables:
 - ``HERMES_BRIDGE_PORT`` — port for FastAPI (default 3978)
 - ``A365_BLUEPRINT_CLIENT_SECRET`` — bootstrap credential for
   user-FIC chain (otherwise read from generated config)
+- ``A365_AGENT_IDENTITY_IDS`` — optional comma-separated Entra
+  agentIdentity app ids that may mint outbound tokens. Gateway
+  fallback is ``extra.agent_identity_ids``. Unset means only the
+  blueprint id is accepted.
 
 The plugin imports the Hermes harness's ``BasePlatformAdapter`` at
 module level. When running outside a Hermes process (CI / unit tests
@@ -1379,6 +1383,14 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         log_path = self._hermes_home / "agents" / (self.slug or "default") / "bridge.log"
         pid_path = log_path.with_name("bridge.pid")
+        # Env wins. ``extra.agent_identity_ids`` (string or list) is the
+        # fallback when the env var is unset or blank. Parsed here, at
+        # the BridgeConfig boundary, so a reconnect observes a rotated
+        # allowlist. The activity body is not an input.
+        extra = getattr(self.config, "extra", {}) or {}
+        raw_identity_ids = _profile_env("A365_AGENT_IDENTITY_IDS")
+        if not (isinstance(raw_identity_ids, str) and raw_identity_ids.strip()):
+            raw_identity_ids = extra.get("agent_identity_ids")
         return bridge.BridgeConfig(
             slug=self.slug or "default",
             tenant_id=self.tenant_id,
@@ -1390,6 +1402,7 @@ class Agent365Adapter(BasePlatformAdapter):
             bf_app_id=self.bf_app_id,
             bf_client_secret=bf_secret,
             idempotency_max_entries=self._idempotency_max_entries,
+            agent_identity_ids=bridge.parse_agent_identity_ids(raw_identity_ids),
         )
 
     # ── FastAPI app construction (separated for testability) ──────────────

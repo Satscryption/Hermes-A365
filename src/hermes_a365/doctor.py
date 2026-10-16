@@ -15,6 +15,9 @@ verified 2026-05-04) and checks the prereqs the real CLI's own
 - OS keychain backend.
 - Local config (``~/.hermes/.env``).
 - Hermes harness version.
+- Entra agentIdentity app ids of the configured blueprint that are
+  absent from ``A365_AGENT_IDENTITY_IDS`` (hint only; a failed Graph
+  lookup does not warn).
 
 Frontier Preview Program enrollment is not auto-verifiable; doctor
 mentions it in prose. Deeper, auth-requiring checks (license posture,
@@ -34,13 +37,17 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
+import urllib.parse
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
+from uuid import UUID
 
 from . import bot_service, bot_service_diagnostics
 from ._common import parse_env, safe_run, tcp_reachable
+from .activity_bridge import parse_agent_identity_ids
 
 ProbeState = Literal["ok", "warn", "error"]
 
@@ -507,6 +514,279 @@ def probe_file_transfer() -> ProbeResult:
     )
 
 
+_GRAPH_AGENT_IDENTITY_COLLECTION = (
+    "https://graph.microsoft.com/v1.0/servicePrincipals/microsoft.graph.agentIdentity"
+)
+_MAX_AGENT_IDENTITY_BLUEPRINTS = 4
+_MAX_AGENT_IDENTITY_PAGES = 3
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    if not path.is_file():
+        return {}
+    try:
+        return parse_env(path.read_text())
+    except OSError:
+        return {}
+
+
+def _plugin_agent_identity_ids(home: Path) -> Any:
+    """Return ``extra.agent_identity_ids`` from the default profile, or None."""
+    cfg = home / "config.yaml"
+    if not cfg.is_file():
+        return None
+    try:
+        import yaml
+
+        data = yaml.safe_load(cfg.read_text()) or {}
+    except Exception:
+        return None
+    node: Any = data
+    for key in ("gateway", "platforms", "agent365", "extra"):
+        node = node.get(key) if isinstance(node, dict) else None
+        if node is None:
+            return None
+    if not isinstance(node, dict) or "agent_identity_ids" not in node:
+        return None
+    return node.get("agent_identity_ids")
+
+
+def _generated_blueprint_id(home: Path) -> str:
+    candidates = [
+        os.environ.get("A365_GENERATED_CONFIG_PATH") or "",
+        str(Path.cwd() / "a365.generated.config.json"),
+        str(home / "a365.generated.config.json"),
+    ]
+    for raw in candidates:
+        if not raw:
+            continue
+        path = Path(os.path.expanduser(raw))
+        if not path.is_file():
+            continue
+        try:
+            payload = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            continue
+        if isinstance(payload, dict):
+            blueprint = str(payload.get("agentBlueprintId") or "").strip()
+            if blueprint:
+                return blueprint
+    return ""
+
+
+def _collect_agent_identity_targets() -> list[tuple[str, frozenset[str]]]:
+    """Return ``(blueprint app id, allowlist)`` pairs the local config names.
+
+    Gateway precedence matches the adapter: process
+    ``A365_AGENT_IDENTITY_IDS`` when set, else the operator ``.env``, else
+    ``extra.agent_identity_ids``. Each per-agent ``.env`` contributes its
+    own allowlist for its ``A365_APP_ID``. Ids are unioned per blueprint
+    so an instance listed for the runtime that serves it does not warn.
+    """
+    home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
+    home_env = _read_env_file(home / ".env")
+    gateway_blueprint = (
+        (os.environ.get("A365_APP_ID") or "").strip()
+        or (home_env.get("A365_APP_ID") or "").strip()
+        or _generated_blueprint_id(home)
+    )
+    if "A365_AGENT_IDENTITY_IDS" in os.environ:
+        gateway_allow: Any = os.environ.get("A365_AGENT_IDENTITY_IDS", "")
+    elif "A365_AGENT_IDENTITY_IDS" in home_env:
+        gateway_allow = home_env.get("A365_AGENT_IDENTITY_IDS", "")
+    else:
+        gateway_allow = _plugin_agent_identity_ids(home)
+
+    by_blueprint: dict[str, tuple[str, set[str]]] = {}
+
+    def add(blueprint: str, raw_allow: Any) -> None:
+        text = blueprint.strip()
+        if not text:
+            return
+        key = text.lower()
+        current = by_blueprint.get(key)
+        if current is None:
+            current = (text, set())
+            by_blueprint[key] = current
+        current[1].update(parse_agent_identity_ids(raw_allow))
+
+    if gateway_blueprint:
+        add(gateway_blueprint, gateway_allow)
+    agents = home / "agents"
+    if agents.is_dir():
+        for env_path in sorted(agents.glob("*/.env")):
+            parsed = _read_env_file(env_path)
+            agent_blueprint = (parsed.get("A365_APP_ID") or "").strip() or gateway_blueprint
+            add(agent_blueprint, parsed.get("A365_AGENT_IDENTITY_IDS"))
+    return [(blueprint, frozenset(allow)) for blueprint, allow in by_blueprint.values()]
+
+
+def _az_rest_json(url: str) -> dict[str, Any] | None:
+    """GET one Graph URL via ``az rest``. Stdout only, so warnings stay out of the JSON."""
+    if not shutil.which("az"):
+        return None
+    if urllib.parse.urlparse(url).hostname != "graph.microsoft.com":
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "az",
+                "rest",
+                "--method",
+                "GET",
+                "--url",
+                url,
+                "--headers",
+                "ConsistencyLevel=eventual",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15.0,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _list_blueprint_agent_identities(blueprint_app_id: str) -> list[dict[str, Any]] | None:
+    """List agentIdentity service principals for one blueprint app id.
+
+    Returns ``None`` when the lookup cannot run. The filter value is a
+    canonical UUID so it cannot change the OData query shape.
+    """
+    try:
+        canonical = str(UUID(blueprint_app_id))
+    except ValueError:
+        return None
+    query = urllib.parse.urlencode(
+        {
+            "$select": "appId,agentIdentityBlueprintId",
+            "$filter": f"agentIdentityBlueprintId eq '{canonical}'",
+            "$top": "100",
+        }
+    )
+    url = f"{_GRAPH_AGENT_IDENTITY_COLLECTION}?{query}"
+    rows: list[dict[str, Any]] = []
+    for page in range(_MAX_AGENT_IDENTITY_PAGES):
+        payload = _az_rest_json(url)
+        if payload is None:
+            return None if page == 0 else rows
+        value = payload.get("value")
+        if not isinstance(value, list):
+            return None if page == 0 else rows
+        rows.extend(item for item in value if isinstance(item, dict))
+        next_link = payload.get("@odata.nextLink")
+        if not isinstance(next_link, str) or not next_link:
+            return rows
+        url = next_link
+    return rows
+
+
+def _unlisted_agent_identity_ids(
+    blueprint_app_id: str,
+    allowlist: frozenset[str],
+    identities: list[dict[str, Any]],
+) -> list[str]:
+    """App ids of this blueprint's agent identities that the guard would refuse."""
+    blueprint = blueprint_app_id.strip().lower()
+    allowed = {item.strip().lower() for item in allowlist if item.strip()}
+    unlisted: list[str] = []
+    seen: set[str] = set()
+    for item in identities:
+        app_id = str(item.get("appId") or "").strip()
+        if not app_id:
+            continue
+        folded = app_id.lower()
+        claimed = str(item.get("agentIdentityBlueprintId") or "").strip().lower()
+        if claimed and claimed != blueprint:
+            continue
+        if folded == blueprint or folded in allowed or folded in seen:
+            continue
+        seen.add(folded)
+        unlisted.append(app_id)
+    return unlisted
+
+
+def probe_agent_instance_allowlist(
+    *,
+    blueprint_app_id: str | None = None,
+    allowlist: tuple[str, ...] | frozenset[str] | None = None,
+    identities: list[dict[str, Any]] | None = None,
+    skip_reason: str | None = None,
+) -> ProbeResult:
+    """Warn when an instance agentIdentity of the blueprint is not allowlisted.
+
+    A missing blueprint, ``--no-network``, or a Graph lookup that cannot
+    run stays ``ok``. The warning is only a positive finding: Graph
+    returned an agentIdentity whose ``agentIdentityBlueprintId`` is the
+    configured blueprint and whose ``appId`` is neither that blueprint
+    nor ``A365_AGENT_IDENTITY_IDS`` / ``extra.agent_identity_ids``.
+    """
+    if skip_reason:
+        return ProbeResult(
+            "agent_instance_allowlist",
+            _OK,
+            f"skipped; {skip_reason}",
+        )
+    if blueprint_app_id is None or allowlist is None:
+        targets = _collect_agent_identity_targets()
+    else:
+        targets = [(blueprint_app_id, frozenset(allowlist))]
+    targets = [(bp, allow) for bp, allow in targets if bp.strip()]
+    if not targets:
+        return ProbeResult(
+            "agent_instance_allowlist",
+            _OK,
+            "skipped; no blueprint app id configured "
+            "(A365_APP_ID or generated config agentBlueprintId)",
+        )
+    unlisted: list[str] = []
+    checked = 0
+    lookup_failed = False
+    for blueprint, allow in targets[:_MAX_AGENT_IDENTITY_BLUEPRINTS]:
+        rows = (
+            identities
+            if identities is not None
+            else _list_blueprint_agent_identities(blueprint)
+        )
+        if rows is None:
+            lookup_failed = True
+            continue
+        checked += 1
+        unlisted.extend(_unlisted_agent_identity_ids(blueprint, allow, rows))
+    if checked == 0 and lookup_failed:
+        return ProbeResult(
+            "agent_instance_allowlist",
+            _OK,
+            "skipped; could not list Entra agent identities for the configured blueprint",
+        )
+    if not unlisted:
+        return ProbeResult(
+            "agent_instance_allowlist",
+            _OK,
+            "configured blueprint agent identities are allowlisted or absent",
+            {"checked_blueprints": checked},
+        )
+    shown = ", ".join(unlisted[:5])
+    extra = f" (+{len(unlisted) - 5} more)" if len(unlisted) > 5 else ""
+    return ProbeResult(
+        "agent_instance_allowlist",
+        _WARN,
+        "Entra agentIdentity app id(s) of this blueprint are not in "
+        "A365_AGENT_IDENTITY_IDS or extra.agent_identity_ids: "
+        f"{shown}{extra}. Teams Create-instance replies under those ids "
+        "are refused until they are allowlisted.",
+        {"unlisted_app_ids": unlisted[:20]},
+    )
+
+
 def probe_hermes_harness() -> ProbeResult:
     binary = shutil.which("hermes")
     if not binary:
@@ -567,6 +847,11 @@ def run_all_probes(
     probes.append(probe_custom_client_app())
     if not no_network:
         probes.append(probe_network())
+        probes.append(probe_agent_instance_allowlist())
+    else:
+        probes.append(
+            probe_agent_instance_allowlist(skip_reason="--no-network")
+        )
     probes.append(probe_keychain())
     probes.append(probe_local_config())
     probes.append(probe_file_transfer())

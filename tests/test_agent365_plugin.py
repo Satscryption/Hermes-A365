@@ -1248,6 +1248,38 @@ class TestAdapterConstruction:
         with pytest.raises(RuntimeError, match="missing"):
             a._make_bridge_config()
 
+    def test_make_bridge_config_allowlist_env_beats_extra(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_TENANT_ID", "tenant")
+        monkeypatch.setenv("A365_APP_ID", "app")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "secret")
+        monkeypatch.setenv("A365_AGENT_IDENTITY_IDS", "From-Env, second")
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(extra={"agent_identity_ids": "from-extra"})
+        )
+        assert adapter._make_bridge_config().agent_identity_ids == (
+            "from-env",
+            "second",
+        )
+
+    def test_make_bridge_config_allowlist_falls_back_to_extra(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_TENANT_ID", "tenant")
+        monkeypatch.setenv("A365_APP_ID", "app")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "secret")
+        monkeypatch.delenv("A365_AGENT_IDENTITY_IDS", raising=False)
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(
+                extra={"agent_identity_ids": ["From-Extra", "second"]}
+            )
+        )
+        assert adapter._make_bridge_config().agent_identity_ids == (
+            "from-extra",
+            "second",
+        )
+
 
 # ---------------------------------------------------------------------------
 # /api/messages route — drive via FastAPI TestClient.
@@ -4299,6 +4331,11 @@ class TestConversationRef:
         assert conv.get("description") is None
         assert conv["id"] == activity["conversation"]["id"]
         assert conv.get("tenantId") == activity["conversation"].get("tenantId")
+        # The overflow projection keeps the blueprint claim the mint guard reads.
+        activity["recipient"]["agenticAppBlueprintId"] = "blueprint-app-id"
+        ref = adapter_mod.ConversationRef.from_activity(activity)
+        assert ref is not None
+        assert ref.raw["recipient"]["agenticAppBlueprintId"] == "blueprint-app-id"
         # Whole cached raw is bounded well under the huge inbound.
         assert len(json.dumps(ref.raw, default=str)) < 16_384
 

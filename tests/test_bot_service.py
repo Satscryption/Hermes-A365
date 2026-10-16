@@ -419,7 +419,15 @@ def test_verify_reports_green_resource_and_channel_state(tmp_path: Path) -> None
     sidecar = _write_sidecar(tmp_path)
     runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
 
-    report = verify_bot_service(sidecar, runner=runner)
+    # Pin the generated-config path. verify_bot_service otherwise reads
+    # Path.cwd()/a365.generated.config.json, so a checkout that has that file
+    # with a different messagingEndpoint makes path_endpoint_parity WARN.
+    # The probe itself is correct; this fixture was coupled to the cwd.
+    report = verify_bot_service(
+        sidecar,
+        runner=runner,
+        generated_config_path=tmp_path / "a365.generated.config.json",
+    )
 
     assert report.ok is True
     statuses = {result.name: result.status for result in report.results}

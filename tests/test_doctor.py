@@ -20,6 +20,7 @@ from hermes_a365.doctor import (
     overall_to_exit_code,
     parse_a365_cli_version,
     probe_a365_cli,
+    probe_agent_instance_allowlist,
     probe_az_cli,
     probe_custom_client_app,
     probe_file_transfer,
@@ -494,6 +495,101 @@ class TestProbeHermesHarness:
             r = probe_hermes_harness()
         assert r.state == "ok"
         assert "Hermes Agent" in r.detail
+
+
+# ---------------------------------------------------------------------------
+# probe_agent_instance_allowlist
+# ---------------------------------------------------------------------------
+
+
+class TestProbeAgentInstanceAllowlist:
+    def test_warns_when_instance_is_not_allowlisted(self) -> None:
+        result = probe_agent_instance_allowlist(
+            blueprint_app_id="blueprint-id",
+            allowlist=("listed-id",),
+            identities=[
+                {
+                    "appId": "listed-id",
+                    "agentIdentityBlueprintId": "blueprint-id",
+                },
+                {
+                    "appId": "missing-id",
+                    "agentIdentityBlueprintId": "BLUEPRINT-ID",
+                },
+                {
+                    "appId": "foreign-id",
+                    "agentIdentityBlueprintId": "other-blueprint",
+                },
+                {
+                    "appId": "blueprint-id",
+                    "agentIdentityBlueprintId": "blueprint-id",
+                },
+                {"agentIdentityBlueprintId": "blueprint-id"},
+            ],
+        )
+        assert result.state == "warn"
+        assert result.name == "agent_instance_allowlist"
+        assert "missing-id" in result.detail
+        assert "foreign-id" not in result.detail
+        assert result.data["unlisted_app_ids"] == ["missing-id"]
+
+    def test_ok_when_instance_is_allowlisted(self) -> None:
+        result = probe_agent_instance_allowlist(
+            blueprint_app_id="blueprint-id",
+            allowlist=("Instance-ID",),
+            identities=[
+                {
+                    "appId": "instance-id",
+                    "agentIdentityBlueprintId": "blueprint-id",
+                }
+            ],
+        )
+        assert result.state == "ok"
+        assert "allowlisted or absent" in result.detail
+
+    def test_skip_without_blueprint(self) -> None:
+        result = probe_agent_instance_allowlist(
+            blueprint_app_id="  ",
+            allowlist=(),
+            identities=[],
+        )
+        assert result.state == "ok"
+        assert "no blueprint" in result.detail
+
+    def test_skip_when_lookup_cannot_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr(
+            "hermes_a365.doctor._collect_agent_identity_targets",
+            lambda: [("blueprint-id", frozenset())],
+        )
+        monkeypatch.setattr(
+            "hermes_a365.doctor._list_blueprint_agent_identities",
+            lambda _blueprint: None,
+        )
+        result = probe_agent_instance_allowlist()
+        assert result.state == "ok"
+        assert "could not list" in result.detail
+
+    def test_agent_env_allowlist_suppresses_warning(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.delenv("A365_APP_ID", raising=False)
+        monkeypatch.delenv("A365_AGENT_IDENTITY_IDS", raising=False)
+        monkeypatch.delenv("A365_GENERATED_CONFIG_PATH", raising=False)
+        agent = tmp_path / "agents" / "inbox"
+        agent.mkdir(parents=True)
+        (agent / ".env").write_text(
+            "A365_APP_ID=blueprint-app\nA365_AGENT_IDENTITY_IDS=instance-app\n"
+        )
+        result = probe_agent_instance_allowlist(
+            identities=[
+                {
+                    "appId": "instance-app",
+                    "agentIdentityBlueprintId": "blueprint-app",
+                }
+            ]
+        )
+        assert result.state == "ok"
 
 
 # ---------------------------------------------------------------------------
