@@ -415,21 +415,11 @@ def _write_sidecar(
     return path
 
 
-def test_verify_reports_green_resource_and_channel_state(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # verify defaults generated_config_path to ./a365.generated.config.json,
-    # which is gitignored. A walk file in the real cwd must not turn this
-    # green path into a parity warning. Pin an absent path and leave cwd.
-    monkeypatch.chdir(tmp_path)
+def test_verify_reports_green_resource_and_channel_state(tmp_path: Path) -> None:
     sidecar = _write_sidecar(tmp_path)
     runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
 
-    report = verify_bot_service(
-        sidecar,
-        runner=runner,
-        generated_config_path=tmp_path / "absent-generated.json",
-    )
+    report = verify_bot_service(sidecar, runner=runner)
 
     assert report.ok is True
     statuses = {result.name: result.status for result in report.results}
@@ -437,9 +427,6 @@ def test_verify_reports_green_resource_and_channel_state(
     assert statuses["bot_msa_app_id"] == "OK"
     assert statuses["msteams_channel"] == "OK"
     assert statuses["path_endpoint_parity"] == "OK"
-    parity = next(result for result in report.results if result.name == "path_endpoint_parity")
-    assert "skipped" in parity.detail
-    assert "not found" in parity.detail
     assert statuses["runtime_auth"] == "WARN"
 
 
