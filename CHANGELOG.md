@@ -6,6 +6,42 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased / 0.9.1]
 
+### Breaking
+
+- **A sender allowlist that exists only in the process environment is refused (#160).**
+  `A365_ALLOWED_USERS` and `A365_ALLOW_ALL_USERS` are read from
+  `~/.hermes/.env`. A value set only in the process environment, with that
+  file missing or silent, no longer opens the gateway or `activity-bridge
+  serve`. To keep the previous allowlist: put `A365_ALLOWED_USERS` or
+  `A365_ALLOW_ALL_USERS` in `~/.hermes/.env`, run `chmod 600 ~/.hermes/.env`,
+  and remove the process-env value or set it to the same policy. A process
+  value that disagrees with the file is refused. A silent process adopts
+  the file.
+
+### Security
+
+- **The gateway and the activity bridge share one sender allowlist (#160).**
+  Both enforce `A365_ALLOWED_USERS` / `A365_ALLOW_ALL_USERS` from the profile
+  `~/.hermes/.env`. A silent process adopts that file. A policy that exists
+  only in the process environment is refused by both runtimes, whether the
+  profile file is missing or present and silent. Startup also refuses when
+  the file and the process disagree, when the per-agent file sets a policy
+  the profile does not, or when the two files differ. An unscoped gateway
+  (no slug) still refuses if any per-agent env states a conflicting policy,
+  including when that agent directory is a symlink. A directory name that
+  fails the slug check does not count as that path, so a sibling symlink
+  whose name contains a backslash cannot hide the real agent.
+  If neither file sets a policy, both runtimes deny every end user. An empty
+  allowlist is not allow-all. A Hermes allow does not widen the shared policy,
+  and a Hermes deny does not reject a sender the list admits. When Hermes
+  authorizes opaque `from.id` and the list names that sender's AAD object id
+  or UPN, the gateway and `serve` both admit them.
+- **`activity-bridge serve` refuses a group- or world-readable profile `.env`.**
+  Startup exits before bind when `~/.hermes/.env` is readable by group or
+  other. The error names the mode and the path and tells the operator to
+  run `chmod 600` on that file. It does not print allowlist values or any
+  other file contents. The gateway already rejected this mode.
+
 ### Fixed
 
 - **Copilot Chat publish auto-increments the Teams app `version`.** Each
@@ -93,7 +129,7 @@ down afterwards).
 - #158: fixed in 0.9.1 (see [Unreleased / 0.9.1]).
 - #159: the orphan-cleanup Graph ownership check also refused the real
   owner (fixed in 0.9.1).
-- #160: the bridge allowlist is read only from the per-agent env.
+- #160: the bridge allowlist was read only from the per-agent env (fixed in 0.9.1).
 - #161: Teams 1:1 replies can stay greyed with a Stop button.
 
 ### Uninstall scope (walk row 2b)

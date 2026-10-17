@@ -592,12 +592,17 @@ where possible. The `config.yaml` write is skipped when the
 agent365 stanza hasn't materially changed, keeping the file
 git-reviewable across wizard re-runs.
 
-After the wizard, source the per-agent .env into the gateway's process
-shell so the adapter inherits the runtime config, then start the
-gateway:
+After the wizard, source the profile `~/.hermes/.env` — that file is the
+sender allowlist for both the gateway and `activity-bridge serve` — and
+then the per-agent env for agent-scoped settings. Do not put a different
+`A365_ALLOWED_USERS` or `A365_ALLOW_ALL_USERS` in the per-agent file.
+Then start the gateway:
 
 ```bash
-set -a; . ~/.hermes/agents/<slug>/.env; set +a
+set -a
+. ~/.hermes/.env
+. ~/.hermes/agents/<slug>/.env
+set +a
 hermes gateway run
 ```
 
@@ -625,7 +630,18 @@ as `ok`.
 >
 > …paired with `A365_TENANT_ID`, `A365_APP_ID`, `A365_BLUEPRINT_CLIENT_SECRET`,
 > and either `A365_ALLOW_ALL_USERS=true` (testing) or
-> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Allowlist
+> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. That profile
+> file is the sender allowlist for both the gateway and `activity-bridge serve`.
+> A silent process adopts that file, so `serve` does not need the allowlist
+> exported when the keys are in `~/.hermes/.env`. A policy that exists only
+> in the process environment is refused by both, whether or not the profile
+> file exists. A disagreement between the file and the process is refused by
+> both. A different value in `~/.hermes/agents/<slug>/.env` is
+> refused at startup, including when the gateway has no slug and any agent
+> directory states a different policy. If neither file sets a policy, both
+> runtimes deny every end user. The profile file must be owner-only
+> (`chmod 600`); a group- or world-readable file is refused without printing
+> its contents. Allowlist
 > entries may be
 > AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
 > includes those aliases in the signed activity. Bot Framework `personal` /
