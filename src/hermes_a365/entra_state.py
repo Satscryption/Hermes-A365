@@ -14,12 +14,17 @@ Contract (the behaviour #117 will document):
 - No existing application → create (blueprint, then MCP and bot permissions).
 - Exactly one blueprint application whose appId is that anchor, which Graph
   shows is an agent-identity blueprint, whose display name and slug match,
-  and which already has a service principal and at least one permission
-  grant → no-op. No ``a365`` call, so nothing is duplicated, consented, or
-  rotated.
-- The same owned blueprint with a service principal but no grants → run
-  only the permission steps. That finishes a consent-deferred register; it
-  does not re-enter ``setup blueprint``.
+  and whose service principal already has both permission-step markers →
+  no-op. No ``a365`` call, so nothing is duplicated, consented, or rotated.
+  The markers are an Observability app-role assignment (``setup permissions
+  bot``) and a delegated grant for a resource other than Microsoft Graph,
+  Messaging Bot, Observability, or Power Platform (``setup permissions
+  mcp``). Microsoft Graph admin consent, which ``setup blueprint`` writes,
+  is not one of those markers.
+- The same owned blueprint with a service principal but a missing marker →
+  run only the permission step that has not landed. That finishes a
+  consent-deferred register; it does not re-enter ``setup blueprint`` and
+  it does not re-grant a step that already landed.
 - Anything else (unowned name, several matches, a paged or unreadable
   result, a missing anchor app, a tier or slug mismatch, audience drift,
   a missing service principal, unreadable grants) → fail closed with an
@@ -76,7 +81,26 @@ PERMISSION_STEPS: tuple[StepName, ...] = ("permissions-mcp", "permissions-bot")
 _GRAPH_HOST = "graph.microsoft.com"
 _APP_SELECT = "id,appId,displayName,signInAudience"
 _SP_SELECT = "id,appId"
-_GRANT_SELECT = "id"
+_ROLE_SELECT = "id,resourceId,appRoleId"
+_OAUTH_SELECT = "id,resourceId"
+_RESOURCE_SELECT = "appId"
+# Resource appIds. Graph admin consent is what ``setup blueprint`` writes.
+# The other three are what ``setup permissions bot`` writes. A delegated
+# grant for any other resource is the MCP (or custom) marker.
+_GRAPH_APP_ID = "00000003-0000-0000-c000-000000000000"
+_MESSAGING_BOT_APP_ID = "5a807f24-c9de-44ee-a3a7-329e88a00ffc"
+_POWER_PLATFORM_APP_ID = "8578e004-a5c6-46e7-913e-12f58912df43"
+_OBSERVABILITY_APP_IDS = frozenset(
+    {
+        "9b975845-388f-4429-889e-eab1ef63949c",
+        "2c672ad5-b104-44ed-8069-bb68dd138546",
+        "009c6bd0-82e4-4466-95b3-4c996521f3d7",
+        "a9e04047-c6a7-430b-a7ae-faf8f8eed1b7",
+    }
+)
+_BOT_FIXED_APP_IDS = frozenset(
+    {_GRAPH_APP_ID, _MESSAGING_BOT_APP_ID, _POWER_PLATFORM_APP_ID}
+) | _OBSERVABILITY_APP_IDS
 _BLUEPRINT_ODATA_CAST = "microsoft.graph.agentIdentityBlueprint"
 _MULTI_TENANT_AUDIENCE = "AzureADMultipleOrgs"
 _DESIRED_TIER = 1  # agent identity blueprint; other classes are tier 2
@@ -99,7 +123,7 @@ _NOT_FOUND_CODES = frozenset(
 _SELECT_ALLOWLIST: dict[str, frozenset[str]] = {
     "application": frozenset({"id", "appId", "displayName", "signInAudience"}),
     "servicePrincipal": frozenset({"id", "appId"}),
-    "grant": frozenset({"id"}),
+    "grant": frozenset({"id", "resourceId", "appRoleId"}),
 }
 _FORBIDDEN_URL_RE = re.compile(
     r"(?i)(password|secret|credential|token|keyCredentials|passwordCredentials)"
@@ -155,6 +179,8 @@ class RegistrationSnapshot:
     service_principal_state: SpState
     grant_state: GrantState
     grant_detail: str = ""
+    mcp_permission_configured: bool = False
+    bot_permission_configured: bool = False
 
 
 @dataclass
@@ -342,7 +368,7 @@ def app_role_assignments_url(service_principal_id: str) -> str:
     canonical = str(UUID(service_principal_id))
     return (
         f"https://{_GRAPH_HOST}/v1.0/servicePrincipals/{canonical}/appRoleAssignments"
-        f"?{_select_query(_GRANT_SELECT)}"
+        f"?{_select_query(_ROLE_SELECT)}"
     )
 
 
@@ -351,7 +377,16 @@ def oauth2_permission_grants_url(service_principal_id: str) -> str:
     filter_query = "$filter=" + quote(f"clientId eq '{canonical}'", safe="")
     return (
         f"https://{_GRAPH_HOST}/v1.0/oauth2PermissionGrants?{filter_query}"
-        f"&{_select_query(_GRANT_SELECT)}"
+        f"&{_select_query(_OAUTH_SELECT)}"
+    )
+
+
+def service_principal_by_id_url(object_id: str) -> str:
+    """Read a resource service principal's appId. No credentials."""
+    canonical = str(UUID(object_id))
+    return (
+        f"https://{_GRAPH_HOST}/v1.0/servicePrincipals/{canonical}"
+        f"?{_select_query(_RESOURCE_SELECT)}"
     )
 
 
@@ -410,6 +445,11 @@ def _url_kind(path: str) -> str | None:
         object_id = path[len(marker) : -len("/appRoleAssignments")]
         if _is_guid(object_id):
             return "grant"
+        return None
+    if path.startswith(marker):
+        object_id = path[len(marker) :]
+        if _is_guid(object_id):
+            return "servicePrincipal"
         return None
     if path == "/v1.0/oauth2PermissionGrants":
         return "grant"
@@ -705,34 +745,91 @@ def _service_principal_id(graph_get: GraphGet, app_id: str) -> tuple[str, SpStat
     return parsed[0], "found", ""
 
 
-def _grant_rows(graph_get: GraphGet, url: str, *, what: str) -> tuple[int | None, str]:
+def _grant_rows(
+    graph_get: GraphGet, url: str, *, what: str
+) -> tuple[list[dict[str, Any]] | None, str]:
     payload = _read(graph_get, url)
     try:
         rows = _collection(payload, what=what)
     except EntraStateError as exc:
         return None, str(exc)
-    return len(rows), ""
+    return rows, ""
+
+
+def _resource_app_id(
+    graph_get: GraphGet, object_id: str, cache: dict[str, str]
+) -> str:
+    cached = cache.get(object_id)
+    if cached is not None:
+        return cached
+    payload = _read(graph_get, service_principal_by_id_url(object_id))
+    if payload is None:
+        raise EntraStateError(
+            "could not read the resource service principal for a permission grant. "
+            "Refusing to treat the grant as absent."
+        )
+    if payload.get("error"):
+        if _is_denied(payload):
+            raise EntraStateError(f"{GRAPH_READ_PERMISSION_HINT} {_public_error(payload)}")
+        raise EntraStateError(
+            "could not read the resource service principal for a permission grant "
+            f"({_public_error(payload)}). Refusing to treat the grant as absent."
+        )
+    app_id = _require_guid(payload.get("appId"), what="resource service principal appId")
+    cache[object_id] = app_id
+    return app_id
+
+
+def _row_resource_id(row: Mapping[str, Any], *, what: str) -> str:
+    try:
+        return _require_guid(row.get("resourceId"), what=f"{what} resourceId")
+    except EntraStateError as exc:
+        raise EntraStateError(
+            f"Graph {what} row had no resourceId. Refusing to treat it as absent "
+            "or as a finished permission step."
+        ) from exc
 
 
 def _permission_state(
     graph_get: GraphGet, service_principal_id: str
-) -> tuple[GrantState, str]:
-    role_count, role_detail = _grant_rows(
+) -> tuple[GrantState, str, bool, bool]:
+    """Classify grants. Graph admin consent is not MCP or bot setup.
+
+    ``setup blueprint`` writes Microsoft Graph delegated consent. ``setup
+    permissions mcp`` writes a delegated grant for some other resource.
+    ``setup permissions bot`` writes the Observability app-role assignment.
+    A row we cannot classify fails closed instead of looking finished.
+    """
+    roles, role_detail = _grant_rows(
         graph_get,
         app_role_assignments_url(service_principal_id),
         what="app role assignments",
     )
-    grant_count, grant_detail = _grant_rows(
+    grants, grant_detail = _grant_rows(
         graph_get,
         oauth2_permission_grants_url(service_principal_id),
         what="delegated permission grants",
     )
-    if role_count is None or grant_count is None:
-        detail = role_detail or grant_detail
-        return "unreadable", detail
-    if role_count > 0 or grant_count > 0:
-        return "present", ""
-    return "absent", ""
+    if roles is None or grants is None:
+        return "unreadable", role_detail or grant_detail, False, False
+    cache: dict[str, str] = {}
+    try:
+        bot = False
+        for row in roles:
+            resource = _row_resource_id(row, what="app role assignment")
+            if _resource_app_id(graph_get, resource, cache) in _OBSERVABILITY_APP_IDS:
+                bot = True
+        mcp = False
+        for row in grants:
+            resource = _row_resource_id(row, what="delegated permission grant")
+            app_id = _resource_app_id(graph_get, resource, cache)
+            if app_id not in _BOT_FIXED_APP_IDS:
+                mcp = True
+    except EntraStateError as exc:
+        return "unreadable", str(exc), False, False
+    if mcp or bot or roles or grants:
+        return "present", "", mcp, bot
+    return "absent", "", False, False
 
 
 def confirmed_created_app_id(
@@ -819,6 +916,8 @@ def read_registration_snapshot(
     service_principal_state: SpState = "not-queried"
     grant_state: GrantState = "not-queried"
     grant_detail = ""
+    mcp_permission_configured = False
+    bot_permission_configured = False
     owned = (
         anchor_app is not None
         and len(blueprint_apps) == 1
@@ -835,7 +934,12 @@ def read_registration_snapshot(
                 graph_get, confirmed.app_id
             )
             if service_principal_state == "found":
-                grant_state, grant_detail = _permission_state(graph_get, service_principal_id)
+                (
+                    grant_state,
+                    grant_detail,
+                    mcp_permission_configured,
+                    bot_permission_configured,
+                ) = _permission_state(graph_get, service_principal_id)
 
     return RegistrationSnapshot(
         agent_name=agent_name,
@@ -848,6 +952,8 @@ def read_registration_snapshot(
         service_principal_state=service_principal_state,
         grant_state=grant_state,
         grant_detail=grant_detail,
+        mcp_permission_configured=mcp_permission_configured,
+        bot_permission_configured=bot_permission_configured,
     )
 
 
@@ -1087,7 +1193,7 @@ def decide_registration(
     if snapshot.grant_state == "unreadable":
         detail = snapshot.grant_detail or GRAPH_READ_PERMISSION_HINT
         return _abort(
-            "could not tell whether permission grants already exist on "
+            "could not tell whether MCP and bot permission setup already exist on "
             f"{blueprint.app_id}: {detail} Refusing to run permission setup."
         )
     if snapshot.grant_state == "not-queried":
@@ -1096,20 +1202,22 @@ def decide_registration(
             "Refusing to run permission setup."
         )
 
-    if snapshot.grant_state == "present" and not update_permissions:
+    mcp_done = snapshot.mcp_permission_configured
+    bot_done = snapshot.bot_permission_configured
+    if mcp_done and bot_done and not update_permissions:
         return RegistrationDecision(
             action="noop",
             step_names=(),
             reason=None,
             messages=(
                 f"entra: blueprint {blueprint.app_id} matches desired state and "
-                "already has permission grants. No Entra changes."
+                "MCP and bot permission setup have already landed. No Entra changes."
                 + identity_note,
             ),
             app_plan=app_plan,
             blueprint_plan=blueprint_plan,
         )
-    if snapshot.grant_state == "present" and update_permissions:
+    if mcp_done and bot_done and update_permissions:
         return RegistrationDecision(
             action="repair",
             step_names=PERMISSION_STEPS,
@@ -1124,16 +1232,33 @@ def decide_registration(
             blueprint_plan=blueprint_plan,
         )
 
-    # Grants were read and both collections are empty: the permission steps
-    # have not landed. Running them finishes registration. setup blueprint
-    # stays skipped so a consent-deferred re-run cannot mint a secret.
+    # A missing marker is unfinished permission setup. Microsoft Graph admin
+    # consent (what setup blueprint writes) is not a marker, so it does not
+    # skip these steps. A marker that already landed is not run again.
+    step_names: tuple[StepName, ...] = tuple(
+        name
+        for name, done in (
+            ("permissions-mcp", mcp_done),
+            ("permissions-bot", bot_done),
+        )
+        if not done
+    )
+    missing = [
+        label
+        for label, done in (("MCP", mcp_done), ("bot", bot_done))
+        if not done
+    ]
+    joined = " and ".join(missing)
     return RegistrationDecision(
         action="repair",
-        step_names=PERMISSION_STEPS,
+        step_names=step_names,
         reason=None,
         messages=(
-            f"entra: blueprint {blueprint.app_id} matches and has no permission "
-            "grants. Permission setup will run. setup blueprint will not run."
+            f"entra: blueprint {blueprint.app_id} matches. {joined} permission "
+            "setup has not landed (Microsoft Graph admin consent from "
+            "`a365 setup blueprint` does not count). "
+            + " ".join(step_names)
+            + " will run. setup blueprint will not run."
             + identity_note,
         ),
         app_plan=app_plan,

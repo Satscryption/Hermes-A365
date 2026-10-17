@@ -18,7 +18,11 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   missing service principal, or a paged/unreadable Graph result fails
   closed with an error that says what to fix. `--update-permissions` is
   required to re-grant on an owned blueprint and does not override an
-  ownership, tier, or name refusal. Reads are GET-only with a tight
+  ownership, tier, or name refusal. Microsoft Graph admin consent, which
+  `a365 setup blueprint` writes, is not treated as finished MCP or bot
+  permission setup: a re-run executes only the permission step whose
+  marker is missing and does not re-run `setup blueprint`. Reads are
+  GET-only with a tight
   `$select` (no credentials or tokens). The generated-config GUID is not
   an ownership anchor. Refs #127, #159.
 

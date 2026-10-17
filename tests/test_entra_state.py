@@ -38,6 +38,13 @@ OTHER = "dddddddd-dddd-dddd-dddd-dddddddddddd"
 OTHER_OBJ = "eeeeeeee-eeee-eeee-eeee-eeeeeeeeeeee"
 TENANT = "aaaa1111-0000-0000-0000-000000000001"
 SECRET = "super-secret-client-value"
+OBS_SP = "11111111-1111-1111-1111-111111111111"
+MCP_SP = "22222222-2222-2222-2222-222222222222"
+GRAPH_SP = "33333333-3333-3333-3333-333333333333"
+OBS_APP = "9b975845-388f-4429-889e-eab1ef63949c"
+MCP_APP = "99999999-9999-9999-9999-999999999999"
+GRAPH_APP = "00000003-0000-0000-c000-000000000000"
+ROLE = "8f71190c-00c8-461d-a63b-f74abde9ba52"
 
 
 def _app(
@@ -79,20 +86,34 @@ def _owned_responses(
     principals: dict[str, Any] | None = None,
     roles: dict[str, Any] | None = None,
     grants: dict[str, Any] | None = None,
+    resources: dict[str, dict[str, Any]] | None = None,
     extra_apps: list[dict[str, Any]] | None = None,
 ) -> list[tuple[str, dict[str, Any]]]:
     blueprint = _app(blueprint_display_name(agent), audience=audience)
     rows = [blueprint, *(extra_apps or [])]
-    return [
+    role_body = roles if roles is not None else {
+        "value": [{"id": ROLE, "resourceId": OBS_SP, "appRoleId": ROLE}]
+    }
+    grant_body = grants if grants is not None else {
+        "value": [{"id": MCP_SP, "resourceId": MCP_SP}]
+    }
+    resource_map = resources if resources is not None else {
+        OBS_SP: {"appId": OBS_APP},
+        MCP_SP: {"appId": MCP_APP},
+    }
+    pairs: list[tuple[str, dict[str, Any]]] = [
         ("/beta/applications?", {"value": rows}),
         ("applications(appId=", blueprint),
         ("agentIdentityBlueprint", cast if cast is not None else blueprint),
         ("servicePrincipals?", principals if principals is not None else {
             "value": [{"id": SP, "appId": APP}]
         }),
-        ("appRoleAssignments", roles if roles is not None else {"value": [{"id": SP}]}),
-        ("oauth2PermissionGrants", grants if grants is not None else {"value": []}),
+        ("appRoleAssignments", role_body),
+        ("oauth2PermissionGrants", grant_body),
     ]
+    for object_id, body in resource_map.items():
+        pairs.append((f"/servicePrincipals/{object_id}?", body))
+    return pairs
 
 
 def _write_anchor(home: Path, agent: str, app_id: str) -> Path:
@@ -185,6 +206,91 @@ class TestReadAndDecide:
         decision = decide_registration(_snapshot(tmp_path, "inbox-helper", router))
         assert decision.action == "repair"
         assert decision.step_names == ("permissions-mcp", "permissions-bot")
+        assert "does not count" in decision.messages[0]
+
+    def test_graph_admin_consent_does_not_skip_permission_steps(
+        self, tmp_path: Path
+    ) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        decision = decide_registration(
+            _snapshot(
+                tmp_path,
+                "inbox-helper",
+                Router(
+                    _owned_responses(
+                        roles={"value": []},
+                        grants={"value": [{"id": "graph-grant", "resourceId": GRAPH_SP}]},
+                        resources={GRAPH_SP: {"appId": GRAPH_APP}},
+                    )
+                ),
+            )
+        )
+        assert decision.action == "repair"
+        assert decision.step_names == ("permissions-mcp", "permissions-bot")
+        assert "setup blueprint will not run" in decision.messages[0]
+
+    def test_mcp_marker_without_bot_runs_only_bot(self, tmp_path: Path) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        decision = decide_registration(
+            _snapshot(
+                tmp_path,
+                "inbox-helper",
+                Router(
+                    _owned_responses(
+                        roles={"value": []},
+                        grants={"value": [{"id": "mcp-grant", "resourceId": MCP_SP}]},
+                        resources={MCP_SP: {"appId": MCP_APP}},
+                    )
+                ),
+            )
+        )
+        assert decision.step_names == ("permissions-bot",)
+
+    def test_bot_marker_without_mcp_runs_only_mcp(self, tmp_path: Path) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        decision = decide_registration(
+            _snapshot(
+                tmp_path,
+                "inbox-helper",
+                Router(
+                    _owned_responses(
+                        roles={"value": [{"id": ROLE, "resourceId": OBS_SP, "appRoleId": ROLE}]},
+                        grants={"value": [{"id": "graph-grant", "resourceId": GRAPH_SP}]},
+                        resources={
+                            OBS_SP: {"appId": OBS_APP},
+                            GRAPH_SP: {"appId": GRAPH_APP},
+                        },
+                    )
+                ),
+            )
+        )
+        assert decision.step_names == ("permissions-mcp",)
+
+    def test_unclassified_grant_fails_closed(self, tmp_path: Path) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        denied = {
+            "error": {
+                "code": "Authorization_RequestDenied",
+                "message": "need Directory.Read.All",
+            }
+        }
+        decision = decide_registration(
+            _snapshot(
+                tmp_path,
+                "inbox-helper",
+                Router(
+                    _owned_responses(
+                        roles={"value": []},
+                        grants={"value": [{"id": "graph-grant", "resourceId": GRAPH_SP}]},
+                        resources={GRAPH_SP: denied},
+                    )
+                ),
+            )
+        )
+        assert decision.action == "abort"
+        assert decision.step_names == ()
+        assert "Authorization_RequestDenied" in (decision.reason or "")
+        assert "will run" not in (decision.reason or "")
 
     def test_update_permissions_regrants_without_rerunning_blueprint(
         self, tmp_path: Path
