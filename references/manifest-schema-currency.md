@@ -74,11 +74,17 @@ Hermes records the last published app `version` per agent in:
 (`<slug>` defaults to `slugify(--agent-name)`; override with `--slug`.)
 
 The file is keyed by Teams catalog `manifestId` and holds `lastAppVersion`.
-Each successful `hermes a365 publish --copilot-chat --apply` stamps a strictly
-higher `version` into the CEA zip (auto-bump patch when the CLI template is
-unchanged; honour a higher CLI template when Microsoft bumps it upstream).
-Operators may override with `--app-version X.Y.Z`, which must still beat the
-recorded last publish.
+When that file already records `lastAppVersion` for the **same**
+`manifestId` as the zip being built, `hermes a365 publish --copilot-chat
+--apply` stamps a strictly higher `version` (patch-bump when the CLI
+template is unchanged; honour a higher CLI template when Microsoft bumps
+it upstream). With no matching state entry, the CLI template version is
+reused unchanged. `--manifest-id auto` mints a new catalog id each run, so
+state never matches and no automatic bump occurs — use a stable
+`--manifest-id <guid>` for in-place MAC updates. Operators may always pass
+`--app-version X.Y.Z` (required for the first Hermes re-upload when MAC
+already holds a higher version than the CLI template); the override must
+still beat the recorded last publish when state exists.
 
 ## Current state in the wrapper
 

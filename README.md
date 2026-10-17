@@ -569,6 +569,52 @@ hermes a365 cleanup --agent-name "Inbox Helper" \
 > `hermes-a365` script comes with `pipx install hermes-a365` and is
 > handy when iterating without a configured Hermes harness.
 
+### Quick start — Path B (Custom Engine Agent / Copilot Chat)
+
+Path B layers Azure Bot Service + a CEA manifest on the same Path A
+blueprint. Prerequisites: Path A steps 1–5 above (blueprint +
+`instance create`), plus an **Azure subscription**, the separate
+non-agentic BF app (`A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`), and a
+public HTTPS tunnel to `/api/messages`. Full walk:
+[`references/live-tenant-test.md`](references/live-tenant-test.md) §11
+(CEA contract in §11.0).
+
+```bash
+# 1. Path B Entra app + BF secret in ~/.hermes/.env (portal or az).
+#    Re-run instance create so the per-agent .env picks up A365_BF_*.
+
+# 2. Azure Bot Service bound to the BF app (not the blueprint app id).
+hermes a365 bot-service create \
+    --agent-name "Inbox Helper" \
+    --resource-group hermes-a365-bots \
+    --endpoint https://<tunnel-host>/api/messages \
+    --appid <bf-app-id> \
+    --apply
+
+# 3. MCP Platform messaging endpoint (independent of register --m365).
+#    Runs a365 setup blueprint --m365 --update-endpoint (consent/secret risk;
+#    on "already exists" may cleanup blueprint --endpoint-only — see §11.0).
+hermes a365 activity-bridge update-endpoint \
+    --agent-name "Inbox Helper" \
+    --tenant-id "<tenant-guid>" \
+    --url https://<tunnel-host>/api/messages --apply
+
+# 4. CEA zip — bots.botId MUST be the BF app id registered in step 2.
+hermes a365 publish --agent-name "Inbox Helper" \
+    --tenant-id "<tenant-guid>" \
+    --copilot-chat --bot-id <bf-app-id> --apply
+# Upload ~/manifest/manifest.zip at MAC → Agents → Upload custom agent.
+# Re-uploads: stable manifest.id + copilot-chat-publish.json state enables
+# auto patch-bump; first update of an app already in MAC needs --app-version.
+
+# 5. Same runtime as Path A
+hermes gateway run --profile inbox-helper
+```
+
+Skipping step 2 or publishing without `--bot-id <bf-app-id>` leaves
+`bots.botId` on the blueprint and surfaces **"Invalid bot"** in Teams
+(#117).
+
 ## Operator setup
 
 After the gateway-plugin pip install above (`~/.hermes/hermes-agent/venv/bin/pip
