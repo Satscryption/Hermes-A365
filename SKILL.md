@@ -151,7 +151,7 @@ Read-only. Recommends the A365 add-on or E7 based on the decision matrix
 in [`references/license-cost-table.md`](references/license-cost-table.md).
 Records the chosen model in `~/.hermes/.env` as `A365_LICENSE_MODEL`.
 
-### `hermes a365 register --agent-name <name> [--tenant-id <id>] [--m365] [--no-endpoint] [--skip-requirements]`
+### `hermes a365 register --agent-name <name> [--tenant-id <id>] [--m365] [--no-endpoint] [--skip-requirements] [--apply] [--update-permissions] [--auto-recover-secret]`
 
 Composite plan that orchestrates the three real CLI steps a blueprint
 needs:
@@ -172,10 +172,17 @@ markers are already present: an Observability app-role assignment, and a
 delegated grant for
 a resource other than Microsoft Graph, Messaging Bot, Observability, or
 Power Platform. Graph admin consent from `a365 setup blueprint` does not
-count, so a re-run still finishes the missing MCP or bot step. It
-does not adopt an application because the display name matches, and it
-does not re-run `a365 setup blueprint` against an application it already
-owns — that command grants consent and may mint a client secret.
+count as either marker, so a consent-deferred re-run resumes only the
+permission steps that are still missing:
+
+- MCP marker present, bot marker missing → run `setup permissions bot` only.
+- Neither marker present (blueprint admin consent alone) → run MCP, then bot.
+- Both markers present → no-op: no `a365` call, no consent, no secret mint.
+- An application that matches by display name but is not anchored by the
+  per-agent `A365_APP_ID` → abort; register does not adopt unowned apps.
+
+It does not re-run `a365 setup blueprint` against an application it
+already owns — that command grants consent and may mint a client secret.
 `--update-permissions` re-grants on an owned blueprint only; it does not
 override an ownership, tier, or name-collision refusal. A missing,
 ambiguous, or unreadable directory fails closed. After a create that
@@ -366,7 +373,7 @@ the split.
 
 | Conflict | Behaviour |
 |---|---|
-| Blueprint app already exists for the same name | Read first. No-op when per-agent `A365_APP_ID` proves ownership and grants already exist. Otherwise refuse; do not create a duplicate or adopt an unowned app. `--update-permissions` re-grants only on an owned blueprint. |
+| Blueprint app already exists for the same name | Read first. No-op when per-agent `A365_APP_ID` proves ownership and both MCP and bot permission-step markers are present (Graph admin consent from `setup blueprint` does not count). A missing marker resumes only that permission step; unowned or ambiguous apps abort. `--update-permissions` re-grants on an owned blueprint only; it does not override ownership, tier, or name refusal. |
 | Permissions step fails with `AADSTS90094` | Reported as "deferred — run `hermes a365 consent`"; blueprint stays created. |
 | Instance .env exists with a previous `AA_INSTANCE_ID` | `instance create` preserves the id (cloud state is unchanged). |
 | Cleanup target has no recorded state | The corresponding kind is skipped, not errored. |

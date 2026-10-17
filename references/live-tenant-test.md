@@ -1169,6 +1169,74 @@ record — every row is now closed (the architectural one too).
 >
 > Path A (§§0–10) remains the validated end-to-end path.
 
+### 11.0 — CEA provisioning contract (#117)
+
+Custom Engine Agent (`publish --copilot-chat`) zips carry a `bots[]`
+block whose `botId` must be the **msaAppId of a registered Azure Bot
+Service** resource — not the Path A blueprint app id. Provisioning only
+the blueprint (`register --m365` + Path A §§3–6) and uploading a CEA
+manifest that still points `bots.botId` at the blueprint yields
+**"Invalid bot"** in Teams when adding the app. The blueprint's
+MCP-platform messaging endpoint is not a classic Teams bot identity.
+
+**Canonical Path B shape (walk-validated #89, 2026-07-16):**
+
+1. Complete Path A blueprint registration (§3) so the agentic blueprint
+   exists — Path B shares the same Hermes install and `/api/messages`
+   handler.
+2. Register the **separate non-agentic** Path B Entra app (§11.2.5) and
+   set `A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET` in `~/.hermes/.env`.
+3. Provision Azure Bot Service against that identity and your tunnel:
+
+   ```bash
+   hermes-a365 bot-service create \
+       --agent-name "<display-name>" \
+       --resource-group <azure-rg> \
+       --endpoint <tunnel-url>/api/messages \
+       --appid <bf-app-id> \
+       --apply
+   ```
+
+   (`--appid` is an alias for `--bf-app-id`; when omitted, the wrapper
+   reads `A365_BF_APP_ID` from `~/.hermes/.env`.)
+4. Publish and upload with the **same** BF app id:
+
+   ```bash
+   hermes-a365 publish \
+       --agent-name "<display-name>" \
+       --tenant-id <tenant-id> \
+       --copilot-chat \
+       --bot-id <bf-app-id> \
+       --manifest-id auto \
+       --apply
+   ```
+
+   Then MAC → Agents → Upload custom agent (§11.7).
+
+**Messaging endpoint registration is separate from `register --m365`.**
+The GA CLI prints that `--m365` has no effect on `setup blueprint` by
+itself. After the tunnel exists, register the MCP Platform endpoint with
+either:
+
+- `a365 setup blueprint --agent-name "<display-name>" --endpoint-only --m365`
+  (and `--update-endpoint <url>` when re-pointing), or
+- `hermes-a365 activity-bridge update-endpoint --agent-name "<display-name>" \
+  --url <tunnel-url>/api/messages --apply` (wrapper around
+  `setup blueprint --m365 --update-endpoint`).
+
+Path B also needs `bot-service update-endpoint` when the tunnel URL
+changes (§11.5) — ARM and MCP Platform registrations are independent.
+
+**Manifest `version` on update uploads.** Microsoft Admin Center rejects
+a CEA re-upload when the zip's app `version` is not strictly greater
+than the installed package for the same catalog `manifest.id` (#109).
+`hermes-a365 publish --copilot-chat --apply` now auto-stamps a higher
+`version` (tracked in
+`~/.hermes/agents/<slug>/copilot-chat-publish.json`; see
+[`manifest-schema-currency.md`](manifest-schema-currency.md)). Override
+with `--app-version` only when you need a specific semver that still
+beats the last publish.
+
 Path B layers Azure Bot Service registration on top of Path A's
 blueprint work. The blueprint Entra app from §3 + its client secret
 (per §3's `--auto-recover-secret`) + its service principal stay
@@ -1581,6 +1649,11 @@ The wrapper parser now handles emitted zip paths that contain spaces
 (for example the live `Hermes A365` workspace path), so the transform
 should run without the manual `_patch_manifest_to_copilot_chat(...)`
 workaround used during the 2026-05-18 walk.
+
+On **update** re-uploads to MAC, rely on `publish --copilot-chat --apply`
+to bump `manifest.version` automatically (#109 / PR #168) instead of
+hand-editing the zip — the #89 walk had to patch `1.1.4` manually before
+that fix landed.
 
 ### 11.7 — Upload via Microsoft Admin Portal → Agents
 

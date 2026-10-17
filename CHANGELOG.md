@@ -6,6 +6,20 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased / 0.9.1]
 
+### Added
+
+- **Docs: CEA provisioning contract (#117).** §11.0 in
+  `references/live-tenant-test.md` and the Path B quick start in
+  `README.md` document the Azure Bot Service prerequisite for
+  `publish --copilot-chat` (`bot-service create --appid` +
+  `publish --bot-id`), separate MCP endpoint registration from
+  `register --m365`, and auto `version` bump on CEA re-upload (current
+  `main` behaviour after #168).
+- **Docs: `register --apply` Entra reconcile (#127).** `SKILL.md` now
+  spells out the MCP vs bot permission-marker resume rules, unowned-app
+  abort, and the conflict-resolution table matches marker-based no-op
+  (not "grants already exist").
+
 ### Breaking
 
 - **A sender allowlist that exists only in the process environment is refused (#160).**
