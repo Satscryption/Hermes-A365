@@ -3003,7 +3003,298 @@ class TestLifecycleCapture:
 
         assert cancelled_sessions == [session_key]
         assert turn_task.cancelled()
+        assert session_key not in a._session_key_to_conv
         release_turn.set()
+
+    @pytest.mark.asyncio
+    async def test_uninstall_interrupts_executor_turn_and_blocks_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #158: the model runs on an executor thread. Cancelling the session
+        # awaitable does not stop it; uninstall must hard-interrupt that
+        # agent. A later send from the turn is refused, and the mapping is
+        # released once the worker has actually finished.
+        import threading
+
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.05)
+        a = _make_adapter(monkeypatch)
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        session_key = "sk:executor-turn"
+        stop = threading.Event()
+        started = threading.Event()
+        ticks = {"n": 0}
+        guard = asyncio.Event()
+        a._agent_turn_guards[session_key] = guard
+        posted: list[str] = []
+
+        class _Agent:
+            def hard_interrupt(
+                self, message: str | None = None, tool_reason: str | None = None
+            ) -> None:
+                del message, tool_reason
+                stop.set()
+
+        agent = _Agent()
+
+        class _Runner:
+            def __init__(self) -> None:
+                self._running_agents = {session_key: agent}
+
+        runner = _Runner()
+        a.gateway_runner = runner
+
+        def worker() -> None:
+            started.set()
+            while not stop.wait(0.01):
+                ticks["n"] += 1
+            runner._running_agents.pop(session_key, None)
+
+        async def session_turn() -> None:
+            adapter_mod._AGENT_TURN_LIFECYCLE.set(
+                (id(a), copilot, 0, a._chat_generation(copilot), guard)
+            )
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, worker)
+
+        turn_task = asyncio.create_task(session_turn())
+        a._session_tasks[session_key] = turn_task
+        a._session_key_to_conv[session_key] = copilot
+        turn_task._agent365_chat_id = copilot  # type: ignore[attr-defined]
+        for conv_id in (personal, copilot):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        async def record_send(**_kwargs: Any) -> Any:
+            posted.append("sent")
+            return adapter_mod.SendResult(success=True)
+
+        monkeypatch.setattr(a, "_send_reply_activity", record_send)
+        await asyncio.to_thread(started.wait)
+
+        await asyncio.wait_for(a._evict_conversations([personal, copilot]), timeout=2)
+
+        assert stop.is_set()
+        _done, pending = await asyncio.wait({turn_task}, timeout=1)
+        assert not pending
+        import contextlib
+        with contextlib.suppress(asyncio.CancelledError):
+            turn_task.result()
+        frozen = ticks["n"]
+        await asyncio.sleep(0.05)
+        assert ticks["n"] == frozen
+        assert session_key not in runner._running_agents
+        a._active_conversation_ids()
+        assert session_key not in a._session_key_to_conv
+        late = await a.send(copilot, "after uninstall")
+        assert late.success is False
+        assert posted == []
+
+    @pytest.mark.asyncio
+    async def test_copilot_turn_cancelled_before_personal_teardown_waits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Sibling cancel is issued before personal teardown waits, and the
+        # in-flight turn cannot post after uninstall.
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.05)
+        a = _make_adapter(monkeypatch)
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        session_key = "sk:copilot"
+        guard = asyncio.Event()
+        a._agent_turn_guards[session_key] = guard
+        saw_cancel: list[bool] = []
+        results: list[Any] = []
+        posted: list[str] = []
+        entered = asyncio.Event()
+
+        async def model_turn() -> None:
+            adapter_mod._AGENT_TURN_LIFECYCLE.set(
+                (id(a), copilot, 0, a._chat_generation(copilot), guard)
+            )
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                saw_cancel.append(True)
+            results.append(await a.send(copilot, "after uninstall"))
+
+        turn_task = asyncio.create_task(model_turn())
+        await entered.wait()
+        a._session_tasks[session_key] = turn_task
+        a._session_key_to_conv[session_key] = copilot
+        for conv_id in (personal, copilot):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        async def record_send(**_kwargs: Any) -> Any:
+            posted.append("sent")
+            return adapter_mod.SendResult(success=True)
+
+        monkeypatch.setattr(a, "_send_reply_activity", record_send)
+        original_teardown = a._teardown_chat_state
+
+        async def watch_teardown(chat_id: str) -> bool:
+            if chat_id == personal:
+                assert saw_cancel == [True] or turn_task.cancelled() or turn_task.cancelling()
+            return await original_teardown(chat_id)
+
+        monkeypatch.setattr(a, "_teardown_chat_state", watch_teardown)
+        await asyncio.wait_for(a._evict_conversations([personal, copilot]), timeout=2)
+        await asyncio.wait_for(turn_task, timeout=1)
+        assert results[0].success is False
+        assert posted == []
+
+    @pytest.mark.asyncio
+    async def test_second_uninstall_cancel_keeps_unadopted_sibling_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Recovery must not cancel a sibling that never entered teardown.
+        # Rolling it back clears the guard so the turn can still finish.
+        a = _make_adapter(monkeypatch)
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        session_key = "sk:copilot"
+        release = asyncio.Event()
+        guard = asyncio.Event()
+
+        async def model_turn() -> None:
+            await release.wait()
+
+        turn_task = asyncio.create_task(model_turn())
+        a._session_tasks[session_key] = turn_task
+        a._session_key_to_conv[session_key] = copilot
+        a._agent_turn_guards[session_key] = guard
+        turn_task._agent365_chat_id = copilot  # type: ignore[attr-defined]
+        for conv_id in (personal, copilot):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        def signal(_chat_ids: list[str]) -> list[dict[str, Any]]:
+            raise asyncio.CancelledError
+
+        async def armed(*_args: Any, **_kwargs: Any) -> bool:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(a, "_signal_matched_agent_turns", signal)
+        monkeypatch.setattr(a, "_evict_armed_conversations", armed)
+        eviction = asyncio.create_task(a._evict_conversations([personal, copilot]))
+        with pytest.raises(asyncio.CancelledError):
+            await eviction
+
+        assert not turn_task.cancelled()
+        assert not guard.is_set()
+        assert copilot not in a._retiring_chats
+        assert personal not in a._retiring_chats
+        assert a._session_key_to_conv.get(session_key) == copilot
+        release.set()
+        await asyncio.wait_for(turn_task, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_failed_cancel_and_drain_task_keep_session_mapping(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        session_key = "sk:copilot"
+
+        async def model_turn() -> None:
+            await asyncio.Event().wait()
+
+        turn_task = asyncio.create_task(model_turn())
+        a._session_tasks[session_key] = turn_task
+        a._session_key_to_conv[session_key] = copilot
+        for conv_id in (personal, copilot):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        async def fail_cancel(_session_key: str, **_kwargs: Any) -> None:
+            raise RuntimeError("cancel failed")
+
+        monkeypatch.setattr(a, "cancel_session_processing", fail_cancel)
+        await a._evict_conversations([personal, copilot])
+        assert a._session_key_to_conv.get(session_key) == copilot
+        turn_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await turn_task
+
+        drain_key = "sk:drain"
+        prior = asyncio.create_task(model_turn())
+        a._session_tasks[drain_key] = prior
+        a._session_key_to_conv[drain_key] = copilot
+        drain: asyncio.Task[Any] | None = None
+
+        async def install_drain(sk: str, **_kwargs: Any) -> None:
+            nonlocal drain
+            drain = asyncio.create_task(model_turn())
+            a._session_tasks[sk] = drain
+
+        monkeypatch.setattr(a, "cancel_session_processing", install_drain)
+        await a._evict_conversations([copilot])
+        assert a._session_key_to_conv.get(drain_key) == copilot
+        prior.cancel()
+        assert drain is not None
+        drain.cancel()
+        for task in (prior, drain):
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_unmapped_live_task_is_found_by_chat_stamp(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(hang())
+        try:
+            a._session_tasks["sk-stamped"] = task
+            task._agent365_chat_id = "conv-stamped"  # type: ignore[attr-defined]
+            assert a._session_keys_for_chat("conv-stamped") == ["sk-stamped"]
+            assert a._session_key_to_conv["sk-stamped"] == "conv-stamped"
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+
+    @pytest.mark.asyncio
+    async def test_mapping_released_when_session_task_completes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+
+        async def finished() -> None:
+            return None
+
+        task = asyncio.create_task(finished())
+        await task
+        a._session_tasks["sk-done"] = task
+        a._session_key_to_conv["sk-done"] = "conv-done"
+        assert "conv-done" not in a._active_conversation_ids()
+        assert "sk-done" not in a._session_key_to_conv
+
+    @pytest.mark.asyncio
+    async def test_live_session_task_counts_toward_active_turn_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_ACTIVE_AGENT_TURNS", 1)
+        a = _make_adapter(monkeypatch)
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        task = asyncio.create_task(hang())
+        a._session_tasks["sk-live"] = task
+        try:
+            assert a._reserve_agent_turn_admission("other-session") is False
+        finally:
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert a._reserve_agent_turn_admission("other-session") is True
 
     @pytest.mark.asyncio
     async def test_cancelled_uninstall_does_not_stick_sibling(

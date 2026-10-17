@@ -8,11 +8,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **#158:** ``installationUpdate`` remove now cancels in-flight Hermes model
-  turns on every matched conversation, not only outbound posts and buffered
-  replies. The session-key → conversation mapping is kept while the base
-  session task is still running even after ``_active_sessions`` is released,
-  and uninstall cancels all matched sessions before per-chat teardown begins.
+- **#158:** ``installationUpdate`` remove hard-interrupts the in-flight Hermes
+  model turn (the same ``request_hard_interrupt`` path as the inactivity
+  watchdog) on every matched conversation, not only the asyncio session
+  waiter. Sibling turns are signalled together before any 5s cancel wait.
+  The session-key mapping stays until that turn has finished or the
+  interrupt succeeded with no worker left, including when
+  ``_active_sessions`` was already released, and is not dropped when cancel
+  fails or a drain task replaced the slot. Live session tasks count toward
+  the active-turn cap. A second cancel of uninstall still rolls back a chat
+  that never entered teardown without leaving its turn guard set.
 
 ## [0.9.0] — 2026-10-16
 
@@ -40,8 +45,7 @@ down afterwards).
 ### Known follow-ups (not blocking)
 
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
-- #158: uninstall drops the reply but does not yet cancel the in-flight
-  model turn (cost only).
+- #158: fixed in 0.9.1 (see [Unreleased]).
 - #159: the orphan-cleanup Graph ownership check also refuses the real
   owner (fails closed).
 - #160: the bridge allowlist is read only from the per-agent env.

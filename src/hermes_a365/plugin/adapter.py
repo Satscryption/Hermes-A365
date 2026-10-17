@@ -2318,6 +2318,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if sk is not None:
                 owner = getattr(self, "_session_tasks", {}).get(sk)
                 if isinstance(owner, asyncio.Task):
+                    self._note_session_task_chat(sk)
                     self._watch_agent_turn_owner(sk, turn_guard, owner)
                 elif sk not in getattr(self, "_active_sessions", {}):
                     self._agent_turn_guards.pop(sk, None)
@@ -3504,14 +3505,33 @@ class Agent365Adapter(BasePlatformAdapter):
         self._chat_lifecycle_generation[chat_id] = self._chat_lifecycle_sequence
         return self._chat_lifecycle_sequence
 
+    def _live_session_task_keys(self) -> set[str]:
+        """Session keys whose base task is still running.
+
+        Hermes can drop ``_active_sessions`` while ``_session_tasks`` still
+        holds the turn. Those tasks pin a chat, so admission must count them
+        toward ``_MAX_ACTIVE_AGENT_TURNS`` (#158)."""
+        session_tasks = getattr(self, "_session_tasks", {}) or {}
+        return {
+            str(session_key)
+            for session_key, task in session_tasks.items()
+            if isinstance(task, asyncio.Task) and not task.done()
+        }
+
     def _reserve_agent_turn_admission(self, session_key: str) -> bool:
         active = set(getattr(self, "_active_sessions", {}) or {})
+        live_tasks = self._live_session_task_keys()
         for key, task in list(self._agent_turn_admissions.items()):
             if task.done():
                 self._agent_turn_admissions.pop(key, None)
-        if session_key in active or session_key in self._agent_turn_admissions:
+        if (
+            session_key in active
+            or session_key in self._agent_turn_admissions
+            or session_key in live_tasks
+        ):
             return True
-        if len(active | set(self._agent_turn_admissions)) >= _MAX_ACTIVE_AGENT_TURNS:
+        occupied = active | set(self._agent_turn_admissions) | live_tasks
+        if len(occupied) >= _MAX_ACTIVE_AGENT_TURNS:
             return False
         task = asyncio.current_task()
         if task is None:
@@ -3588,12 +3608,26 @@ class Agent365Adapter(BasePlatformAdapter):
         for guard in self._agent_turn_guards.values():
             guard.set()
 
+    def _note_session_task_chat(self, session_key: str) -> None:
+        """Stamp the owner chat on the live session task.
+
+        ``_session_key_to_conv`` can be dropped while the task is still
+        running. The stamp lets uninstall find that task again (#158).
+        """
+        chat_id = self._session_key_to_conv.get(session_key)
+        if not chat_id:
+            return
+        task = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
+        if isinstance(task, asyncio.Task):
+            task._agent365_chat_id = chat_id  # type: ignore[attr-defined]
+
     def _session_keys_for_chat(self, chat_id: str) -> list[str]:
         """Session keys whose Hermes turn targets ``chat_id``.
 
-        Hermes may drop ``_active_sessions`` while the background session task
-        is still running; the dispatch mapping must stay until that task ends
-        so uninstall teardown can call ``cancel_session_processing`` (#158).
+        Live ``_session_tasks`` are consulted first, including a task whose
+        mapping was already dropped but which still carries the chat stamp.
+        Mapped keys with no task entry (the runner still holds the agent, or
+        the task has not been spawned) are included after that.
         """
         target = str(chat_id)
         keys: list[str] = []
@@ -3607,33 +3641,131 @@ class Agent365Adapter(BasePlatformAdapter):
             seen.add(sk)
             keys.append(sk)
 
-        for session_key, owner_chat_id in self._session_key_to_conv.items():
+        for session_key, task in list(session_tasks.items()):
+            if not isinstance(task, asyncio.Task) or task.done():
+                continue
+            stamped = getattr(task, "_agent365_chat_id", None)
+            mapped = self._session_key_to_conv.get(session_key)
+            owner = stamped or mapped
+            if owner != target:
+                continue
+            if mapped != target:
+                self._session_key_to_conv[str(session_key)] = target
+            elif stamped is None:
+                task._agent365_chat_id = target  # type: ignore[attr-defined]
+            add(session_key)
+        for session_key, owner_chat_id in list(self._session_key_to_conv.items()):
             if owner_chat_id == target:
                 add(session_key)
-        for session_key, task in session_tasks.items():
-            if (
-                isinstance(task, asyncio.Task)
-                and not task.done()
-                and self._session_key_to_conv.get(session_key) == target
-            ):
-                add(session_key)
+                self._note_session_task_chat(session_key)
         return keys
 
-    async def _retire_chat_agent_turns(self, chat_id: str) -> None:
-        session_keys = self._session_keys_for_chat(chat_id)
-        for session_key in session_keys:
-            guard = self._agent_turn_guards.pop(session_key, None)
-            if guard is not None:
-                guard.set()
-            try:
-                await self.cancel_session_processing(session_key)
-            except Exception:
-                logger.warning(
-                    "agent365 failed to cancel retired session %s",
-                    session_key,
-                    exc_info=True,
+    def _running_agent(self, session_key: str) -> Any | None:
+        """Agent object Hermes is running for ``session_key``, if any.
+
+        The model turn lives on this object inside ``run_conversation``.
+        ``cancel_session_processing`` only cancels the asyncio waiter.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return None
+        agents = getattr(runner, "_running_agents", None)
+        getter = getattr(agents, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            agent = getter(session_key)
+        except Exception:
+            return None
+        if agent is None or self._interrupt_callable(agent) is None:
+            return None
+        sentinel = getattr(runner, "_AGENT_PENDING_SENTINEL", None)
+        if sentinel is not None and agent is sentinel:
+            return None
+        return agent
+
+    @staticmethod
+    def _interrupt_callable(agent: Any) -> Any | None:
+        """Real ``hard_interrupt`` / ``interrupt``, ignoring mock proxies."""
+        if agent is None:
+            return None
+        if getattr(type(agent), "__module__", "").startswith("unittest.mock"):
+            return None
+        for name in ("hard_interrupt", "interrupt"):
+            candidate = None
+            agent_dict = getattr(agent, "__dict__", None)
+            if isinstance(agent_dict, dict):
+                candidate = agent_dict.get(name)
+            if candidate is None:
+                candidate = getattr(type(agent), name, None)
+            if not callable(candidate):
+                continue
+            if getattr(type(candidate), "__module__", "").startswith("unittest.mock"):
+                continue
+            return candidate
+        return None
+
+    def _hard_interrupt_session(self, session_key: str) -> bool:
+        """Stop the executor-thread model turn, same path as inactivity timeout.
+
+        Returns True only when an interrupt callable accepted the request.
+        """
+        agent = self._running_agent(session_key)
+        if agent is None:
+            return False
+        message = "Session ended while the turn was running"
+        tool_reason = "agent uninstalled"
+        try:
+            from agent.interrupt_compat import request_hard_interrupt
+        except Exception:
+            request_hard_interrupt = None
+        try:
+            if request_hard_interrupt is not None:
+                return bool(
+                    request_hard_interrupt(
+                        agent, message, tool_reason=tool_reason
+                    )
                 )
-            self._session_key_to_conv.pop(session_key, None)
+            interrupt = self._interrupt_callable(agent)
+            if interrupt is None:
+                return False
+            interrupt(message)
+            return True
+        except Exception:
+            logger.warning(
+                "agent365 hard interrupt failed for session %s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+    def _turn_mapping_releasable(
+        self,
+        session_key: str,
+        prior: Any,
+        interrupted: bool,
+    ) -> bool:
+        """True when the session-key mapping may be dropped (#158).
+
+        Keep it while the runner still holds the agent, while cancel failed,
+        and while a drain task replaced the slot during the wait. Release
+        once that turn has finished, or the hard interrupt was accepted and
+        no worker remains.
+        """
+        current = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
+        if (
+            isinstance(current, asyncio.Task)
+            and not current.done()
+            and current is not prior
+        ):
+            return False
+        if self._running_agent(session_key) is not None:
+            return False
+        prior_done = not isinstance(prior, asyncio.Task) or prior.done()
+        return bool(prior_done or interrupted)
+
+    async def _retire_chat_agent_turns(self, chat_id: str) -> None:
+        await self._cancel_matched_agent_turns([chat_id])
 
     def _active_conversation_ids(self) -> set[str]:
         """Conversation ids whose Hermes turn is currently in flight.
@@ -3642,22 +3774,18 @@ class Agent365Adapter(BasePlatformAdapter):
         it to the registry's conversation-id space via ``_session_key_to_conv``
         (recorded at dispatch), self-cleaning any mapping whose session has
         since ended. Keep mappings while the base's ``_session_tasks`` entry
-        is still running even if ``_active_sessions`` was already released
-        (#158). This set does not cover a conversation whose turn has already
-        returned while an approval or clarify card is still outstanding (#130);
-        use ``_registry_protected_conversation_ids``."""
+        is still running, or the gateway runner still holds the agent, even
+        if ``_active_sessions`` was already released (#158). This set does not
+        cover a conversation whose turn has already returned while an approval
+        or clarify card is still outstanding (#130); use
+        ``_registry_protected_conversation_ids``."""
         active_sks = set(getattr(self, "_active_sessions", {}) or {})
-        session_tasks = getattr(self, "_session_tasks", {}) or {}
-        live_task_keys = {
-            sk
-            for sk, task in session_tasks.items()
-            if isinstance(task, asyncio.Task) and not task.done()
-        }
-        for sk in [
-            k
-            for k in self._session_key_to_conv
-            if k not in active_sks and k not in live_task_keys
-        ]:
+        live_task_keys = self._live_session_task_keys()
+        for sk in list(self._session_key_to_conv):
+            if sk in active_sks or sk in live_task_keys:
+                continue
+            if self._running_agent(sk) is not None:
+                continue
             self._session_key_to_conv.pop(sk, None)
         return set(self._session_key_to_conv.values())
 
@@ -7948,29 +8076,62 @@ class Agent365Adapter(BasePlatformAdapter):
 
     def _release_unadopted_retirements(self, armed: list[str]) -> None:
         for chat_id in armed:
-            if self._retirement_not_adopted(chat_id):
-                self._retiring_chats.discard(chat_id)
+            if not self._retirement_not_adopted(chat_id):
+                continue
+            self._retiring_chats.discard(chat_id)
+            # A second cancel rolls the chat back before teardown. Clear a
+            # guard set by an in-progress interrupt so a worker that is still
+            # running can finish. Leave the mapping in place while that
+            # worker is reachable (#156 rollback, #158).
+            for session_key in self._session_keys_for_chat(chat_id):
+                guard = self._agent_turn_guards.get(session_key)
+                if guard is not None:
+                    guard.clear()
 
-    async def _cancel_matched_agent_turns(self, chat_ids: list[str]) -> None:
-        """Cancel in-flight Hermes turns on every matched chat at once (#158).
+    def _signal_matched_agent_turns(
+        self, chat_ids: list[str]
+    ) -> list[dict[str, Any]]:
+        """Hard-interrupt and cancel every matched turn without waiting.
 
-        Per-chat teardown also asks Hermes to cancel, but it runs sequentially
-        and only after the first chat's teardown begins. Cancelling every
-        matched session up front stops model spend on a sibling Copilot
-        groupChat while the personal ``installationUpdate`` chat is still
-        tearing down.
+        Sibling Copilot turns are signalled together, before any per-session
+        5s ``cancel_session_processing`` wait and before personal teardown
+        waits (#158).
         """
-        session_keys: list[str] = []
+        specs: list[dict[str, Any]] = []
         seen: set[str] = set()
+        current = asyncio.current_task()
         for chat_id in chat_ids:
             for session_key in self._session_keys_for_chat(chat_id):
-                if session_key not in seen:
-                    seen.add(session_key)
-                    session_keys.append(session_key)
-        for session_key in session_keys:
-            guard = self._agent_turn_guards.pop(session_key, None)
-            if guard is not None:
-                guard.set()
+                if session_key in seen:
+                    continue
+                seen.add(session_key)
+                guard = self._agent_turn_guards.get(session_key)
+                if guard is not None:
+                    guard.set()
+                prior = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
+                interrupted = self._hard_interrupt_session(session_key)
+                if (
+                    isinstance(prior, asyncio.Task)
+                    and not prior.done()
+                    and prior is not current
+                ):
+                    prior.cancel()
+                specs.append(
+                    {
+                        "session_key": session_key,
+                        "prior": prior,
+                        "interrupted": interrupted,
+                    }
+                )
+        return specs
+
+    async def _finish_matched_agent_turns(self, specs: list[dict[str, Any]]) -> None:
+        """Await session-task cancellation concurrently and release settled mappings."""
+        if not specs:
+            return
+
+        async def finish_one(spec: dict[str, Any]) -> None:
+            session_key = str(spec["session_key"])
             try:
                 await self.cancel_session_processing(session_key)
             except Exception:
@@ -7979,7 +8140,24 @@ class Agent365Adapter(BasePlatformAdapter):
                     session_key,
                     exc_info=True,
                 )
+                return
+            # Let a just-cancelled asyncio task settle before deciding the
+            # mapping. Do not wait out a cancellation-resistant body here;
+            # Hermes' own cancel already bounds that wait at 5s.
+            await asyncio.sleep(0)
+            if not self._turn_mapping_releasable(
+                session_key, spec.get("prior"), bool(spec.get("interrupted"))
+            ):
+                return
             self._session_key_to_conv.pop(session_key, None)
+            self._agent_turn_guards.pop(session_key, None)
+
+        await asyncio.gather(*(finish_one(spec) for spec in specs))
+
+    async def _cancel_matched_agent_turns(self, chat_ids: list[str]) -> None:
+        """Interrupt every matched Hermes turn, then wait for them together."""
+        specs = self._signal_matched_agent_turns(chat_ids)
+        await self._finish_matched_agent_turns(specs)
 
     async def _cancel_matched_outbound(self, chat_ids: list[str]) -> None:
         """Cancel in-flight outbound posts on every matched chat at once.
@@ -8072,7 +8250,10 @@ class Agent365Adapter(BasePlatformAdapter):
             while current.cancelling():
                 current.uncancel()
         try:
-            await self._cancel_matched_agent_turns(ordered)
+            # Do not interrupt agent turns here. A second cancel rolls back
+            # chats that never entered teardown; those turns must still be
+            # able to finish. Per-chat teardown interrupts a turn only once
+            # that chat is adopted (#156, #158).
             await self._cancel_matched_outbound(ordered)
             return await self._evict_armed_conversations(
                 ordered, armed, finished, failed_holder
@@ -8108,8 +8289,14 @@ class Agent365Adapter(BasePlatformAdapter):
         failed_holder = [False]
         outcome: bool | None = None
         try:
-            await self._cancel_matched_agent_turns(ordered)
-            await self._cancel_matched_outbound(ordered)
+            # Signal every model turn before the first wait so a sibling is
+            # not stuck behind another session's 5s cancel bound or behind
+            # personal teardown. The waits then overlap outbound cancellation.
+            specs = self._signal_matched_agent_turns(ordered)
+            await asyncio.gather(
+                self._finish_matched_agent_turns(specs),
+                self._cancel_matched_outbound(ordered),
+            )
             outcome = await self._evict_armed_conversations(
                 ordered, armed, finished, failed_holder
             )
