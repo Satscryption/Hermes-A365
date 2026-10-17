@@ -859,6 +859,10 @@ _MAX_COALESCED_TURN_TARGETS = 2048
 _COALESCED_TURN_TARGET_TTL_SEC = 300.0
 _MAX_RECENTLY_FINALIZED = 4096
 _COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC = 10.0
+# Hermes ``interrupt()`` can block in CompressionCommitFence with no
+# timeout. Uninstall waits at most this long, off the event loop, then
+# continues. Matches the session-cancel budget in cancel_session_processing.
+_HARD_INTERRUPT_TIMEOUT_SEC = 5.0
 
 # #53 — Hermes' status/lifecycle callbacks (retry/fallback traces, a
 # terminal-failure summary) arrive as a rapid burst of same-``status_key``
@@ -1386,6 +1390,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._chat_lifecycle_sequence = 0
         self._chat_lifecycle_generation: dict[str, int] = {}
         self._retiring_chats: set[str] = set()
+        # Session keys whose hard interrupt is still inside the worker
+        # thread. A timed-out wait must not start a second fence wait.
+        self._hard_interrupt_inflight: set[str] = set()
         self._registry_evicting_chats: set[str] = set()
         self._registry_eviction_tasks: dict[str, asyncio.Task[bool]] = {}
         self._chat_teardown_tasks: dict[str, asyncio.Task[None]] = {}
@@ -2445,6 +2452,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if sk is not None:
                 owner = getattr(self, "_session_tasks", {}).get(sk)
                 if isinstance(owner, asyncio.Task):
+                    self._note_session_task_chat(sk)
                     self._watch_agent_turn_owner(sk, turn_guard, owner)
                 elif sk not in getattr(self, "_active_sessions", {}):
                     self._agent_turn_guards.pop(sk, None)
@@ -3634,14 +3642,33 @@ class Agent365Adapter(BasePlatformAdapter):
         self._chat_lifecycle_generation[chat_id] = self._chat_lifecycle_sequence
         return self._chat_lifecycle_sequence
 
+    def _live_session_task_keys(self) -> set[str]:
+        """Session keys whose base task is still running.
+
+        Hermes can drop ``_active_sessions`` while ``_session_tasks`` still
+        holds the turn. Those tasks pin a chat, so admission must count them
+        toward ``_MAX_ACTIVE_AGENT_TURNS`` (#158)."""
+        session_tasks = getattr(self, "_session_tasks", {}) or {}
+        return {
+            str(session_key)
+            for session_key, task in session_tasks.items()
+            if isinstance(task, asyncio.Task) and not task.done()
+        }
+
     def _reserve_agent_turn_admission(self, session_key: str) -> bool:
         active = set(getattr(self, "_active_sessions", {}) or {})
+        live_tasks = self._live_session_task_keys()
         for key, task in list(self._agent_turn_admissions.items()):
             if task.done():
                 self._agent_turn_admissions.pop(key, None)
-        if session_key in active or session_key in self._agent_turn_admissions:
+        if (
+            session_key in active
+            or session_key in self._agent_turn_admissions
+            or session_key in live_tasks
+        ):
             return True
-        if len(active | set(self._agent_turn_admissions)) >= _MAX_ACTIVE_AGENT_TURNS:
+        occupied = active | set(self._agent_turn_admissions) | live_tasks
+        if len(occupied) >= _MAX_ACTIVE_AGENT_TURNS:
             return False
         task = asyncio.current_task()
         if task is None:
@@ -3701,6 +3728,17 @@ class Agent365Adapter(BasePlatformAdapter):
             self._agent_turn_guards.pop(session_key, None)
         self._release_session_media_leases(session_key)
 
+    def _turn_reply_blocked(self, chat_id: str) -> bool:
+        """True when this chat must not open a buffer or post a reply.
+
+        Uninstall arms ``_retiring_chats`` before any await. The turn guard
+        stays set for a session whose interrupt has not finished. Either one
+        blocks a later ``on_processing_start``, flush, or reply post (#158).
+        """
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return True
+        return not self._agent_turn_lifecycle_is_current()
+
     def _agent_turn_lifecycle_is_current(self) -> bool:
         token = _AGENT_TURN_LIFECYCLE.get()
         if token is None:
@@ -3718,25 +3756,219 @@ class Agent365Adapter(BasePlatformAdapter):
         for guard in self._agent_turn_guards.values():
             guard.set()
 
-    async def _retire_chat_agent_turns(self, chat_id: str) -> None:
-        session_keys = [
-            session_key
-            for session_key, owner_chat_id in self._session_key_to_conv.items()
-            if owner_chat_id == str(chat_id)
-        ]
-        for session_key in session_keys:
-            guard = self._agent_turn_guards.pop(session_key, None)
-            if guard is not None:
-                guard.set()
+    def _note_session_task_chat(self, session_key: str) -> None:
+        """Stamp the owner chat on the live session task.
+
+        ``_session_key_to_conv`` can be dropped while the task is still
+        running. The stamp lets uninstall find that task again (#158).
+        """
+        chat_id = self._session_key_to_conv.get(session_key)
+        if not chat_id:
+            return
+        task = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
+        if isinstance(task, asyncio.Task):
+            task._agent365_chat_id = chat_id  # type: ignore[attr-defined]
+
+    def _session_keys_for_chat(self, chat_id: str) -> list[str]:
+        """Session keys whose Hermes turn targets ``chat_id``.
+
+        Live ``_session_tasks`` are consulted first, including a task whose
+        mapping was already dropped but which still carries the chat stamp.
+        Mapped keys with no task entry (the runner still holds the agent, or
+        the task has not been spawned) are included after that.
+        """
+        target = str(chat_id)
+        keys: list[str] = []
+        seen: set[str] = set()
+        session_tasks = getattr(self, "_session_tasks", {}) or {}
+
+        def add(session_key: str) -> None:
+            sk = str(session_key)
+            if not sk or sk in seen:
+                return
+            seen.add(sk)
+            keys.append(sk)
+
+        for session_key, task in list(session_tasks.items()):
+            if not isinstance(task, asyncio.Task) or task.done():
+                continue
+            stamped = getattr(task, "_agent365_chat_id", None)
+            mapped = self._session_key_to_conv.get(session_key)
+            owner = stamped or mapped
+            if owner != target:
+                continue
+            if mapped != target:
+                self._session_key_to_conv[str(session_key)] = target
+            elif stamped is None:
+                task._agent365_chat_id = target  # type: ignore[attr-defined]
+            add(session_key)
+        for session_key, owner_chat_id in list(self._session_key_to_conv.items()):
+            if owner_chat_id == target:
+                add(session_key)
+                self._note_session_task_chat(session_key)
+        return keys
+
+    def _running_agent(self, session_key: str) -> Any | None:
+        """Agent object Hermes is running for ``session_key``, if any.
+
+        The model turn lives on this object inside ``run_conversation``.
+        ``cancel_session_processing`` only cancels the asyncio waiter.
+        """
+        runner = getattr(self, "gateway_runner", None)
+        if runner is None:
+            return None
+        agents = getattr(runner, "_running_agents", None)
+        getter = getattr(agents, "get", None)
+        if not callable(getter):
+            return None
+        try:
+            agent = getter(session_key)
+        except Exception:
+            return None
+        if agent is None or self._interrupt_callable(agent) is None:
+            return None
+        sentinel = getattr(runner, "_AGENT_PENDING_SENTINEL", None)
+        if sentinel is not None and agent is sentinel:
+            return None
+        return agent
+
+    @staticmethod
+    def _interrupt_callable(agent: Any) -> Any | None:
+        """Bound ``hard_interrupt`` / ``interrupt``, ignoring mock proxies.
+
+        ``getattr(agent, name)`` binds the method. ``type(agent).hard_interrupt``
+        is an unbound function, and calling it as ``interrupt(message)`` drops
+        ``self``.
+        """
+        if agent is None:
+            return None
+        if getattr(type(agent), "__module__", "").startswith("unittest.mock"):
+            return None
+        for name in ("hard_interrupt", "interrupt"):
+            candidate = getattr(agent, name, None)
+            if not callable(candidate):
+                continue
+            if getattr(type(candidate), "__module__", "").startswith("unittest.mock"):
+                continue
+            func = getattr(candidate, "__func__", candidate)
+            if getattr(type(func), "__module__", "").startswith("unittest.mock"):
+                continue
+            return candidate
+        return None
+
+    async def _hard_interrupt_session(self, session_key: str) -> bool:
+        """Stop the executor-thread model turn, off the event loop.
+
+        Hermes ``interrupt()`` can block in
+        ``CompressionCommitFence.cancel_before_commit`` with no timeout.
+        That wait must not run on the gateway loop: the commit body can be
+        waiting on this loop while it holds the fence. The call runs in a
+        worker thread inside ``_HARD_INTERRUPT_TIMEOUT_SEC``. On timeout a
+        warning is logged and uninstall continues; the fence thread is not
+        joined.
+
+        Returns True only when an interrupt callable accepted the request.
+        """
+        if session_key in self._hard_interrupt_inflight:
+            return False
+        agent = self._running_agent(session_key)
+        if agent is None:
+            return False
+        message = "Session ended while the turn was running"
+        tool_reason = "agent uninstalled"
+        try:
+            from agent.interrupt_compat import request_hard_interrupt
+        except Exception:
+            request_hard_interrupt = None
+        interrupt = (
+            None
+            if request_hard_interrupt is not None
+            else self._interrupt_callable(agent)
+        )
+        if request_hard_interrupt is None and interrupt is None:
+            return False
+
+        self._hard_interrupt_inflight.add(session_key)
+        loop = asyncio.get_running_loop()
+
+        def _clear_inflight() -> None:
+            self._hard_interrupt_inflight.discard(session_key)
+
+        def _call() -> bool:
             try:
-                await self.cancel_session_processing(session_key)
+                if request_hard_interrupt is not None:
+                    return bool(
+                        request_hard_interrupt(
+                            agent, message, tool_reason=tool_reason
+                        )
+                    )
+                if interrupt is None:
+                    return False
+                interrupt(message)
+                return True
             except Exception:
                 logger.warning(
-                    "agent365 failed to cancel retired session %s",
+                    "agent365 hard interrupt failed for session %s",
                     session_key,
                     exc_info=True,
                 )
-            self._session_key_to_conv.pop(session_key, None)
+                return False
+            finally:
+                try:
+                    loop.call_soon_threadsafe(_clear_inflight)
+                except RuntimeError:
+                    _clear_inflight()
+
+        try:
+            return bool(
+                await asyncio.wait_for(
+                    asyncio.to_thread(_call),
+                    timeout=_HARD_INTERRUPT_TIMEOUT_SEC,
+                )
+            )
+        except TimeoutError:
+            logger.warning(
+                "agent365 hard interrupt timed out for session %s; "
+                "continuing uninstall",
+                session_key,
+            )
+            return False
+        except Exception:
+            self._hard_interrupt_inflight.discard(session_key)
+            logger.warning(
+                "agent365 hard interrupt failed for session %s",
+                session_key,
+                exc_info=True,
+            )
+            return False
+
+    def _turn_mapping_releasable(
+        self,
+        session_key: str,
+        prior: Any,
+        interrupted: bool,
+    ) -> bool:
+        """True when the session-key mapping may be dropped (#158).
+
+        Keep it while the runner still holds the agent, while cancel failed,
+        and while a drain task replaced the slot during the wait. Release
+        once that turn has finished, or the hard interrupt was accepted and
+        no worker remains.
+        """
+        current = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
+        if (
+            isinstance(current, asyncio.Task)
+            and not current.done()
+            and current is not prior
+        ):
+            return False
+        if self._running_agent(session_key) is not None:
+            return False
+        prior_done = not isinstance(prior, asyncio.Task) or prior.done()
+        return bool(prior_done or interrupted)
+
+    async def _retire_chat_agent_turns(self, chat_id: str) -> None:
+        await self._cancel_matched_agent_turns([chat_id])
 
     def _active_conversation_ids(self) -> set[str]:
         """Conversation ids whose Hermes turn is currently in flight.
@@ -3744,11 +3976,19 @@ class Agent365Adapter(BasePlatformAdapter):
         The base's ``_active_sessions`` guard is keyed by session key. Bridge
         it to the registry's conversation-id space via ``_session_key_to_conv``
         (recorded at dispatch), self-cleaning any mapping whose session has
-        since ended. This set does not cover a conversation whose turn has
-        already returned while an approval or clarify card is still
-        outstanding (#130); use ``_registry_protected_conversation_ids``."""
+        since ended. Keep mappings while the base's ``_session_tasks`` entry
+        is still running, or the gateway runner still holds the agent, even
+        if ``_active_sessions`` was already released (#158). This set does not
+        cover a conversation whose turn has already returned while an approval
+        or clarify card is still outstanding (#130); use
+        ``_registry_protected_conversation_ids``."""
         active_sks = set(getattr(self, "_active_sessions", {}) or {})
-        for sk in [k for k in self._session_key_to_conv if k not in active_sks]:
+        live_task_keys = self._live_session_task_keys()
+        for sk in list(self._session_key_to_conv):
+            if sk in active_sks or sk in live_task_keys:
+                continue
+            if self._running_agent(sk) is not None:
+                continue
             self._session_key_to_conv.pop(sk, None)
         return set(self._session_key_to_conv.values())
 
@@ -4467,6 +4707,11 @@ class Agent365Adapter(BasePlatformAdapter):
         bridge = _import_bridge()
         generation = self._lifecycle_generation
         chat_id = str((inbound.get("conversation") or {}).get("id") or "")
+        if self._turn_reply_blocked(chat_id):
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: adapter or chat is disconnecting",
+            )
         chat_generation = self._chat_generation(chat_id)
         client = self._http_client
         if (
@@ -4545,7 +4790,11 @@ class Agent365Adapter(BasePlatformAdapter):
         posts only after the short-turn window. ``send`` does not await it.
         """
         chat_id = self._chat_id_from_processing_event(event)
-        if chat_id and chat_id in self._seen_inbounds_this_lifetime:
+        if (
+            chat_id
+            and chat_id in self._seen_inbounds_this_lifetime
+            and not self._turn_reply_blocked(chat_id)
+        ):
             inbound = self._cached_inbound_for(chat_id)
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
@@ -4562,6 +4811,8 @@ class Agent365Adapter(BasePlatformAdapter):
         self, chat_id: str, inbound: dict[str, Any], *, activity_id: str
     ) -> None:
         """Open a buffer, or append a turn inside the one already open."""
+        if self._turn_reply_blocked(chat_id):
+            return
         snapshot = copy.deepcopy(inbound)
         if activity_id:
             snapshot["id"] = activity_id
@@ -4601,12 +4852,17 @@ class Agent365Adapter(BasePlatformAdapter):
         buf["depth"] = sum(1 for turn in buf.get("turns") or [] if turn.get("open"))
 
     async def _drop_turn_buffer(self, chat_id: str) -> None:
+        """Drop the buffer, cancel its retry, and close a keep-alive stream.
+
+        The buffer is removed before the keep-alive final is awaited so a
+        cancellation during that final cannot leave a deferred retry able
+        to post.
+        """
         chat_id = str(chat_id)
-        buf = self._turn_buffers.get(chat_id)
+        buf = self._turn_buffers.pop(chat_id, None)
         if buf is not None:
             self._cancel_turn_buffer_retry(buf)
             await self._cancel_keepalive_and_close(chat_id, buf)
-        self._turn_buffers.pop(chat_id, None)
         self._orphan_keepalive.pop(chat_id, None)
 
     @staticmethod
@@ -5483,7 +5739,7 @@ class Agent365Adapter(BasePlatformAdapter):
         """
         chat_id = str(chat_id)
         buf = self._turn_buffers.get(chat_id)
-        if not buf or self._disconnecting:
+        if not buf or self._turn_reply_blocked(chat_id):
             return
         lock = buf.get("lock")
         if not isinstance(lock, asyncio.Lock):
@@ -5559,14 +5815,18 @@ class Agent365Adapter(BasePlatformAdapter):
             validated_path = turn.get("validated_path")
             path = validated_path if isinstance(validated_path, str) else None
             for chunk_segments, content in chunks:
-                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
+                    chat_id
+                ):
                     return
                 # Close the informative sequence before the visible reply.
                 # An open stream is what made a later message disappear
                 # after a bare typing activity (#154). A final that did
                 # not close it leaves the id and the segments in place.
                 closed = await self._close_turn_buffer_keepalive_locked(chat_id)
-                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
+                    chat_id
+                ):
                     return
                 if not closed:
                     self._schedule_turn_buffer_retry(chat_id)
@@ -5618,7 +5878,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             if link_alone and suffix.strip():
                 link_closed = await self._close_turn_buffer_keepalive_locked(chat_id)
-                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
+                    chat_id
+                ):
                     return
                 if not link_closed:
                     self._schedule_turn_buffer_retry(chat_id)
@@ -8700,10 +8962,158 @@ class Agent365Adapter(BasePlatformAdapter):
             and not self._lifecycle_owner_survivor_count_by_chat.get(chat_id, 0)
         )
 
-    def _release_unadopted_retirements(self, armed: list[str]) -> None:
+    async def _release_unadopted_retirements(
+        self, armed: list[str], committed: set[str]
+    ) -> None:
         for chat_id in armed:
-            if self._retirement_not_adopted(chat_id):
-                self._retiring_chats.discard(chat_id)
+            if not self._retirement_not_adopted(chat_id):
+                continue
+            if chat_id in committed:
+                # The turn was already interrupted. Dropping the buffer
+                # cancels a deferred retry that posts through
+                # ``_send_reply_activity``, which does not consult
+                # ``_retiring_chats``. Leave the Event set for the dying
+                # turn's ContextVar, but drop it from the map so a later
+                # turn is not stuck on it.
+                await self._drop_turn_buffer(chat_id)
+                for session_key in self._session_keys_for_chat(chat_id):
+                    guard = self._agent_turn_guards.pop(session_key, None)
+                    if guard is not None:
+                        guard.set()
+            else:
+                # The turn is still alive. Clear a guard so it can finish,
+                # and leave its buffer in place.
+                for session_key in self._session_keys_for_chat(chat_id):
+                    guard = self._agent_turn_guards.get(session_key)
+                    if guard is not None:
+                        guard.clear()
+            self._retiring_chats.discard(chat_id)
+
+    async def _signal_matched_agent_turns(
+        self,
+        chat_ids: list[str],
+        committed: set[str] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Hard-interrupt and cancel every matched turn.
+
+        Sibling turns are signalled together so one fence wait cannot
+        serialise the rest. The interrupt runs off the loop. ``committed``
+        records chats whose turn can no longer be rolled back: the fence
+        wait is not undoable (#158).
+        """
+        pending: list[tuple[str, str, Any, Any]] = []
+        seen: set[str] = set()
+        current = asyncio.current_task()
+        for chat_id in chat_ids:
+            for session_key in self._session_keys_for_chat(chat_id):
+                if session_key in seen:
+                    continue
+                seen.add(session_key)
+                guard = self._agent_turn_guards.get(session_key)
+                prior = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
+                pending.append((chat_id, session_key, guard, prior))
+
+        async def signal_one(
+            chat_id: str,
+            session_key: str,
+            guard: Any,
+            prior: Any,
+        ) -> dict[str, Any]:
+            if committed is not None:
+                # The fence wait cannot be undone. Cancel the deferred retry
+                # now so it cannot post through ``_send_reply_activity``
+                # while this turn is being killed.
+                committed.add(chat_id)
+                await self._drop_turn_buffer(chat_id)
+            interrupted = await self._hard_interrupt_session(session_key)
+            if guard is not None:
+                guard.set()
+            if (
+                isinstance(prior, asyncio.Task)
+                and not prior.done()
+                and prior is not current
+            ):
+                prior.cancel()
+            return {
+                "session_key": session_key,
+                "prior": prior,
+                "interrupted": interrupted,
+            }
+
+        if not pending:
+            return []
+        return list(
+            await asyncio.gather(*(signal_one(*item) for item in pending))
+        )
+
+    async def _finish_matched_agent_turns(self, specs: list[dict[str, Any]]) -> None:
+        """Await session-task cancellation concurrently and release settled mappings."""
+        if not specs:
+            return
+
+        async def finish_one(spec: dict[str, Any]) -> None:
+            session_key = str(spec["session_key"])
+            try:
+                await self.cancel_session_processing(session_key)
+            except Exception:
+                logger.warning(
+                    "agent365 failed to cancel retired session %s",
+                    session_key,
+                    exc_info=True,
+                )
+                return
+            # Let a just-cancelled asyncio task settle before deciding the
+            # mapping. Do not wait out a cancellation-resistant body here;
+            # Hermes' own cancel already bounds that wait at 5s.
+            await asyncio.sleep(0)
+            if not self._turn_mapping_releasable(
+                session_key, spec.get("prior"), bool(spec.get("interrupted"))
+            ):
+                return
+            self._session_key_to_conv.pop(session_key, None)
+            self._agent_turn_guards.pop(session_key, None)
+
+        await asyncio.gather(*(finish_one(spec) for spec in specs))
+
+    async def _cancel_matched_agent_turns(self, chat_ids: list[str]) -> None:
+        """Interrupt every matched Hermes turn, then wait for them together."""
+        specs = await self._signal_matched_agent_turns(chat_ids)
+        await self._finish_matched_agent_turns(specs)
+
+    async def _commit_matched_agent_turns(
+        self, chat_ids: list[str], committed: set[str]
+    ) -> None:
+        """Interrupt matched turns, then wait for their session tasks.
+
+        Irreversible. Call only after the cancellable uninstall phase has
+        returned, and only from a shielded task so a cancel cannot observe
+        a half-signalled sibling.
+        """
+        specs = await self._signal_matched_agent_turns(chat_ids, committed)
+        await self._finish_matched_agent_turns(specs)
+
+    async def _await_uninstall_commit(self, task: asyncio.Task[Any]) -> None:
+        """Finish ``task`` even if this uninstall is cancelled more than once.
+
+        Every wait is shielded, including the wait after the first cancel.
+        A second cancel must not cancel the commit child mid-gather, or some
+        matched turns would be interrupted and others left running. The
+        caller still observes ``CancelledError`` after the child finishes.
+        Same shape as ``_teardown_chat_state``.
+        """
+        cancelled = False
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if task.cancelled():
+            raise asyncio.CancelledError()
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def _cancel_matched_outbound(self, chat_ids: list[str]) -> None:
         """Cancel in-flight outbound posts on every matched chat at once.
@@ -8754,6 +9164,7 @@ class Agent365Adapter(BasePlatformAdapter):
         armed: list[str],
         finished: set[str],
         failed_holder: list[bool],
+        committed: set[str],
     ) -> bool:
         """Evict ``ordered``, skipping chats already settled in this call."""
         for chat_id in ordered:
@@ -8774,7 +9185,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if not adopted:
                 failed_holder[0] = True
         if failed_holder[0]:
-            self._release_unadopted_retirements(armed)
+            await self._release_unadopted_retirements(armed, committed)
         return not failed_holder[0]
 
     async def _evict_armed_after_cancel(
@@ -8783,6 +9194,7 @@ class Agent365Adapter(BasePlatformAdapter):
         armed: list[str],
         finished: set[str],
         failed_holder: list[bool],
+        committed: set[str],
     ) -> bool:
         """Finish armed teardowns after this uninstall task was cancelled.
 
@@ -8796,9 +9208,14 @@ class Agent365Adapter(BasePlatformAdapter):
             while current.cancelling():
                 current.uncancel()
         try:
+            # Do not interrupt agent turns here. A second cancel rolls back
+            # chats that never entered teardown; those turns must still be
+            # able to finish. Turns are interrupted only after the
+            # cancellable phase returns, or from per-chat teardown once
+            # that chat is adopted (#156, #158).
             await self._cancel_matched_outbound(ordered)
             return await self._evict_armed_conversations(
-                ordered, armed, finished, failed_holder
+                ordered, armed, finished, failed_holder, committed
             )
         finally:
             if current is not None and current.cancelling() == 0:
@@ -8810,10 +9227,13 @@ class Agent365Adapter(BasePlatformAdapter):
         Every target is added to ``_retiring_chats`` before the first await
         so a sibling turn cannot post while this chat's teardown is still
         starting. In-flight outbound posts on all of those chats are
-        cancelled together before any per-chat teardown waits. If this task
-        is cancelled after that arming, teardown is finished (or, if a
-        second cancel arrives, unadopted chats are dropped) so a sibling
-        cannot stay stuck in ``_retiring_chats``.
+        cancelled together before any model turn is interrupted. That
+        outbound wait is the cancellable phase: a second cancel there rolls
+        the sibling back with its turn still running. Only after that wait
+        returns are matched turns hard-interrupted, still before personal
+        teardown waits. If this task is cancelled after arming, teardown is
+        finished (or, if a second cancel arrives, unadopted chats are
+        dropped) so a sibling cannot stay stuck in ``_retiring_chats``.
         """
         ordered: list[str] = []
         seen: set[str] = set()
@@ -8829,25 +9249,33 @@ class Agent365Adapter(BasePlatformAdapter):
                 armed.append(chat_id)
         finished: set[str] = set()
         failed_holder = [False]
+        # Chats whose model turn has been interrupted. A later rollback
+        # cannot revive that turn, so it must drop the deferred retry.
+        committed: set[str] = set()
         outcome: bool | None = None
         try:
             await self._cancel_matched_outbound(ordered)
+            commit = asyncio.create_task(
+                self._commit_matched_agent_turns(ordered, committed),
+                name="agent365-uninstall-turn-shutdown",
+            )
+            await self._await_uninstall_commit(commit)
             outcome = await self._evict_armed_conversations(
-                ordered, armed, finished, failed_holder
+                ordered, armed, finished, failed_holder, committed
             )
             return outcome
         except asyncio.CancelledError:
             try:
                 outcome = await self._evict_armed_after_cancel(
-                    ordered, armed, finished, failed_holder
+                    ordered, armed, finished, failed_holder, committed
                 )
             except asyncio.CancelledError:
-                self._release_unadopted_retirements(armed)
+                await self._release_unadopted_retirements(armed, committed)
                 raise
             raise
         finally:
             if outcome is None:
-                self._release_unadopted_retirements(armed)
+                await self._release_unadopted_retirements(armed, committed)
 
     async def _evict_conversation(self, chat_id: str) -> bool:
         chat_id = str(chat_id)

@@ -86,6 +86,26 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   informative text is a keep-alive, not the answer. Short turns send
   nothing. Personal chats are unchanged. `send` does not await the
   keep-alive POST.
+- **#158:** ``installationUpdate`` remove hard-interrupts the in-flight Hermes
+  model turn (the same ``request_hard_interrupt`` path as the inactivity
+  watchdog) on every matched conversation, not only the asyncio session
+  waiter. The interrupt runs on a worker thread inside a 5s bound so a
+  blocked commit fence cannot stall the gateway loop; on timeout uninstall
+  logs and continues. Sibling turns are interrupted together only after the
+  cancellable outbound phase returns, and still before personal teardown
+  waits, so one session cannot serialise the rest. The commit stays
+  shielded until every matched turn is signalled, including a second
+  cancel. A second cancel before that commit leaves the sibling turn
+  running. If a turn was already interrupted, rollback drops its deferred
+  turn-buffer retry so that retry cannot post. A retired session cannot
+  open another buffer or flush one through the reply post. A failed
+  keep-alive close does not schedule a deferred flush retry once that
+  chat is retiring. The fallback
+  interrupt calls the bound ``agent.hard_interrupt``. The session-key mapping stays until that turn has finished
+  or the interrupt succeeded with no worker left, including when
+  ``_active_sessions`` was already released, and is not dropped when cancel
+  fails or a drain task replaced the slot. Live session tasks count toward
+  the active-turn cap.
 
 ### Added
 
@@ -138,8 +158,7 @@ down afterwards).
 ### Known follow-ups (not blocking)
 
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
-- #158: uninstall drops the reply but does not yet cancel the in-flight
-  model turn (cost only).
+- #158: fixed in 0.9.1 (see [Unreleased / 0.9.1]).
 - #159: the orphan-cleanup Graph ownership check also refused the real
   owner (fixed in 0.9.1).
 - #160: the bridge allowlist was read only from the per-agent env (fixed in 0.9.1).
