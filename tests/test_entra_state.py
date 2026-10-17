@@ -23,11 +23,13 @@ from hermes_a365.entra_state import (
     blueprint_display_name,
     confirmed_created_app_id,
     decide_registration,
+    graph_get_from_mutator,
     identity_display_name,
     load_anchor_app_id,
     read_registration_snapshot,
     record_ownership_anchor,
     redact,
+    registration_slug,
 )
 from hermes_a365.register import RegisterError, RegisterInputs, apply_register_plan
 
@@ -104,7 +106,12 @@ def _owned_responses(
     pairs: list[tuple[str, dict[str, Any]]] = [
         ("/beta/applications?", {"value": rows}),
         ("applications(appId=", blueprint),
-        ("agentIdentityBlueprint", cast if cast is not None else blueprint),
+        (
+            "agentIdentityBlueprint",
+            cast
+            if cast is not None
+            else {**blueprint, "uniqueName": registration_slug(agent)},
+        ),
         ("servicePrincipals?", principals if principals is not None else {
             "value": [{"id": SP, "appId": APP}]
         }),
@@ -266,6 +273,40 @@ class TestReadAndDecide:
         )
         assert decision.step_names == ("permissions-mcp",)
 
+    def test_unique_name_drift_aborts_even_when_display_names_match(
+        self, tmp_path: Path
+    ) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        cast = _app(blueprint_display_name("inbox-helper"))
+        cast["uniqueName"] = "someone-else"
+        decision = decide_registration(
+            _snapshot(tmp_path, "inbox-helper", Router(_owned_responses(cast=cast)))
+        )
+        assert decision.action == "abort"
+        assert decision.step_names == ()
+        assert "slug" in (decision.reason or "")
+
+    def test_missing_unique_name_is_not_derived_from_the_display_name(
+        self, tmp_path: Path
+    ) -> None:
+        from hermes_a365._common import slugify
+
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        decision = decide_registration(
+            _snapshot(
+                tmp_path,
+                "inbox-helper",
+                Router(_owned_responses(cast=_app(blueprint_display_name("inbox-helper")))),
+            )
+        )
+        assert decision.action == "noop"
+        assert decision.blueprint_plan is not None
+        actual = decision.blueprint_plan.actual
+        assert actual is not None
+        compared = actual["agentIdentity"]["slug"]
+        assert compared == registration_slug("inbox-helper")
+        assert compared != slugify(blueprint_display_name("inbox-helper"))
+
     def test_unclassified_grant_fails_closed(self, tmp_path: Path) -> None:
         _write_anchor(tmp_path, "inbox-helper", APP)
         denied = {
@@ -357,10 +398,13 @@ class TestReadAndDecide:
 
     def test_anchor_name_mismatch_aborts_via_blueprint_reconcile(self, tmp_path: Path) -> None:
         _write_anchor(tmp_path, "inbox-helper", APP)
+        other = _app("Other Blueprint")
+        other["uniqueName"] = "other"
         router = Router(
             [
                 ("/beta/applications?", {"value": []}),
-                ("applications(appId=", _app("Other Blueprint")),
+                ("applications(appId=", other),
+                ("agentIdentityBlueprint", other),
             ]
         )
         decision = decide_registration(_snapshot(tmp_path, "inbox-helper", router))
@@ -462,7 +506,28 @@ class TestReadAndDecide:
         link_dir = tmp_path / "agents" / slugify("inbox-helper")
         link_dir.mkdir(parents=True)
         (link_dir / ".env").symlink_to(real)
-        with pytest.raises(EntraStateError, match="not a regular file"):
+        with pytest.raises(EntraStateError, match="symlink"):
+            load_anchor_app_id(tmp_path, "inbox-helper")
+
+    def test_dangling_symlink_anchor_fails_closed(self, tmp_path: Path) -> None:
+        from hermes_a365._common import slugify
+
+        link_dir = tmp_path / "agents" / slugify("inbox-helper")
+        link_dir.mkdir(parents=True)
+        (link_dir / ".env").symlink_to(tmp_path / "missing.env")
+        with pytest.raises(EntraStateError, match="symlink"):
+            load_anchor_app_id(tmp_path, "inbox-helper")
+
+    def test_symlinked_agent_directory_fails_closed(self, tmp_path: Path) -> None:
+        from hermes_a365._common import slugify
+
+        real_dir = tmp_path / "elsewhere"
+        real_dir.mkdir()
+        (real_dir / ".env").write_text(f"A365_APP_ID={APP}\n")
+        agents = tmp_path / "agents"
+        agents.mkdir()
+        (agents / slugify("inbox-helper")).symlink_to(real_dir, target_is_directory=True)
+        with pytest.raises(EntraStateError, match="symlink"):
             load_anchor_app_id(tmp_path, "inbox-helper")
 
     def test_graph_403_names_the_read_permission(self, tmp_path: Path) -> None:
@@ -627,6 +692,29 @@ class TestAnchorRecord:
         assert router.urls == []
 
 
+def _tenant_mutator():
+    from hermes_a365.mutator import RunResult
+
+    class Recording:
+        available = True
+
+        def __init__(self) -> None:
+            self.calls: list[list[str]] = []
+
+        def run(self, argv: list[str], **_: Any) -> RunResult:
+            self.calls.append(list(argv))
+            if argv[:3] == ["az", "account", "show"]:
+                return RunResult(
+                    argv=argv,
+                    returncode=0,
+                    stdout=json.dumps({"tenantId": TENANT}),
+                    stderr="",
+                )
+            return RunResult(argv=argv, returncode=0, stdout="ok", stderr="")
+
+    return Recording()
+
+
 def _apply(tmp_path: Path, router: Router, *, agent: str = "inbox-helper", **kwargs: Any):
     from hermes_a365.register import build_register_plan
 
@@ -674,6 +762,49 @@ class TestApplyUsesTheDecision:
         assert SECRET not in "\n".join(result.messages)
         on_disk = json.loads(config.read_text())
         assert on_disk["agentBlueprintDisplayName"] == "inbox-helper Blueprint"
+
+    def test_mcp_grants_without_bot_resume_only_the_bot_step(self, tmp_path: Path) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        mutator = _tenant_mutator()
+        result = _apply(
+            tmp_path,
+            Router(
+                _owned_responses(
+                    roles={"value": []},
+                    grants={"value": [{"id": "mcp-grant", "resourceId": MCP_SP}]},
+                    resources={MCP_SP: {"appId": MCP_APP}},
+                )
+            ),
+            mutator=mutator,
+        )
+        assert result.completed == ["permissions-bot"]
+        assert not any(call[:3] == ["a365", "setup", "blueprint"] for call in mutator.calls)
+
+    def test_graph_admin_consent_only_resumes_both_permission_steps(
+        self, tmp_path: Path
+    ) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        mutator = _tenant_mutator()
+        result = _apply(
+            tmp_path,
+            Router(
+                _owned_responses(
+                    roles={"value": []},
+                    grants={"value": [{"id": "graph-grant", "resourceId": GRAPH_SP}]},
+                    resources={GRAPH_SP: {"appId": GRAPH_APP}},
+                )
+            ),
+            mutator=mutator,
+        )
+        assert result.completed == ["permissions-mcp", "permissions-bot"]
+        assert not any(call[:3] == ["a365", "setup", "blueprint"] for call in mutator.calls)
+
+    def test_complete_registration_stays_a_noop(self, tmp_path: Path) -> None:
+        _write_anchor(tmp_path, "inbox-helper", APP)
+        mutator = _tenant_mutator()
+        result = _apply(tmp_path, Router(_owned_responses()), mutator=mutator)
+        assert result.completed == []
+        assert not any(call[0] == "a365" for call in mutator.calls)
 
     def test_abort_leaves_config_and_skips_a365(self, tmp_path: Path) -> None:
         from hermes_a365.mutator import RunResult
@@ -789,6 +920,37 @@ class TestApplyUsesTheDecision:
         assert SECRET not in text
         assert SECRET not in "\n".join(result.messages)
         assert (env.stat().st_mode & 0o777) == 0o600
+
+
+def test_graph_get_is_sensitive_and_redacts_the_error_body(
+    capfd: pytest.CaptureFixture[str],
+) -> None:
+    from hermes_a365.mutator import CliInvocationError
+
+    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.aaa.bbb"
+
+    class Spy:
+        available = True
+
+        def run(self, argv: list[str], **kwargs: Any) -> Any:
+            assert kwargs.get("sensitive") is True
+            raise CliInvocationError(
+                argv,
+                1,
+                "<output suppressed>",
+                captured_output=(
+                    '{"error":{"code":"Authorization_RequestDenied",'
+                    f'"message":"Bearer {token}"}}'
+                ),
+            )
+
+    getter = graph_get_from_mutator(Spy())  # type: ignore[arg-type]
+    with pytest.raises(EntraStateError) as excinfo:
+        read_registration_snapshot(getter, agent_name="inbox-helper", anchor_app_id="")
+    assert token not in str(excinfo.value)
+    assert "eyJ" not in str(excinfo.value)
+    out, err = capfd.readouterr()
+    assert token not in out + err
 
 
 def test_graph_app_shape_is_the_fields_we_read() -> None:

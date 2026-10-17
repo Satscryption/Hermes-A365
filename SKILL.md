@@ -166,8 +166,10 @@ needs:
 Register reads Entra before it composes a mutating argv. A re-run is a
 no-op when the per-agent `A365_APP_ID` (in
 `~/.hermes/agents/<slug>/.env`) is the existing agent-identity blueprint,
-the display name matches, and both permission-step markers are already
-present: an Observability app-role assignment, and a delegated grant for
+the display name matches, a Graph `uniqueName` (when the blueprint
+cast returns one) matches the registration slug, and both permission-step
+markers are already present: an Observability app-role assignment, and a
+delegated grant for
 a resource other than Microsoft Graph, Messaging Bot, Observability, or
 Power Platform. Graph admin consent from `a365 setup blueprint` does not
 count, so a re-run still finishes the missing MCP or bot step. It

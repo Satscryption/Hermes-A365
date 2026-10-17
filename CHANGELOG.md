@@ -60,7 +60,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   only the permission step whose marker is missing and does not re-run
   `setup blueprint`. Reads are GET-only with a tight `$select` (no
   credentials or tokens). The generated-config GUID is not an ownership
-  anchor. Refs #127, #159.
+  anchor. A dangling per-agent env symlink fails closed. When the
+  blueprint cast returns `uniqueName`, that value is the slug and a
+  different value fails closed; a missing `uniqueName` is not invented
+  from the display name (`a365 setup blueprint` does not set it).
+  Registration Graph GETs are captured as sensitive commands so an error
+  body is not streamed before redaction.
+  Refs #127, #159.
 - **Copilot Chat publish auto-increments the Teams app `version`.** Each
   successful `publish --copilot-chat --apply` now stamps a strictly higher
   manifest `version` than the last upload for the same catalog `manifest.id`,

@@ -36,8 +36,11 @@ Contract (the behaviour #117 will document):
 
 Desired tier 1 means "agent identity blueprint" (what ``setup blueprint``
 creates). Any other application class is tier 2, which ``reconcile_app``
-aborts on. The blueprint slug is the agent name derived from the display
-name; a different name aborts via ``reconcile_blueprint`` (SPEC §6.13).
+aborts on. When the blueprint cast returns ``uniqueName``, that value is
+the slug. A different slug aborts via ``reconcile_blueprint`` (SPEC §6.13).
+A missing ``uniqueName`` is not filled in from the display name:
+``a365 setup blueprint`` does not set the property, so requiring it would
+refuse a finished registration and the confirmation after create.
 """
 
 from __future__ import annotations
@@ -80,6 +83,9 @@ PERMISSION_STEPS: tuple[StepName, ...] = ("permissions-mcp", "permissions-bot")
 
 _GRAPH_HOST = "graph.microsoft.com"
 _APP_SELECT = "id,appId,displayName,signInAudience"
+# ``uniqueName`` is the immutable Graph slug. It is selected only on the
+# agent-identity-blueprint cast, not on the directory list.
+_CAST_SELECT = "id,appId,displayName,signInAudience,uniqueName"
 _SP_SELECT = "id,appId"
 _ROLE_SELECT = "id,resourceId,appRoleId"
 _OAUTH_SELECT = "id,resourceId"
@@ -121,7 +127,7 @@ _NOT_FOUND_CODES = frozenset(
     }
 )
 _SELECT_ALLOWLIST: dict[str, frozenset[str]] = {
-    "application": frozenset({"id", "appId", "displayName", "signInAudience"}),
+    "application": frozenset({"id", "appId", "displayName", "signInAudience", "uniqueName"}),
     "servicePrincipal": frozenset({"id", "appId"}),
     "grant": frozenset({"id", "resourceId", "appRoleId"}),
 }
@@ -158,6 +164,7 @@ class GraphApp:
     display_name: str
     sign_in_audience: str
     is_agent_blueprint: bool | None = None
+    blueprint_slug: str | None = None
 
 
 @dataclass(frozen=True)
@@ -234,14 +241,28 @@ def load_anchor_app_id(hermes_home: Path, agent_name: str) -> str:
     register create a second blueprint beside a corrupt anchor.
     """
     slug = registration_slug(agent_name)
-    env_path = hermes_home / "agents" / slug / ".env"
+    root = hermes_home / "agents"
+    env_path = root / slug / ".env"
+    # ``Path.exists()`` follows links and is false for a dangling symlink, so
+    # the symlink check has to come first. A symlink is never "no anchor".
+    if root.is_symlink() or env_path.parent.is_symlink() or env_path.is_symlink():
+        raise EntraStateError(
+            "refusing to read the ownership anchor: the per-agent env path is a "
+            f"symlink ({env_path})."
+        )
     if not env_path.exists():
         return ""
-    if env_path.is_symlink() or not env_path.is_file():
+    if not env_path.is_file():
         raise EntraStateError(
             "refusing to read the ownership anchor: the per-agent env is not "
             f"a regular file ({env_path})."
         )
+    try:
+        ensure_contained(env_path, root)
+    except ValueError as exc:
+        raise EntraStateError(
+            f"refusing to read the ownership anchor: {exc}"
+        ) from exc
     try:
         text = env_path.read_text()
     except OSError as exc:
@@ -275,6 +296,10 @@ def record_ownership_anchor(hermes_home: Path, agent_name: str, app_id: str) -> 
     slug = registration_slug(agent_name)
     root = hermes_home / "agents"
     env_path = root / slug / ".env"
+    if root.is_symlink() or env_path.parent.is_symlink() or env_path.is_symlink():
+        raise EntraStateError(
+            "refusing to record A365_APP_ID: the per-agent env path is a symlink."
+        )
     ensure_contained(env_path, root)
     existing: dict[str, str] = {}
     if env_path.exists():
@@ -352,7 +377,7 @@ def blueprint_cast_url(object_id: str) -> str:
     canonical = str(UUID(object_id))
     return (
         f"https://{_GRAPH_HOST}/beta/applications/{canonical}/{_BLUEPRINT_ODATA_CAST}"
-        f"?{_select_query(_APP_SELECT)}"
+        f"?{_select_query(_CAST_SELECT)}"
     )
 
 
@@ -529,15 +554,22 @@ def graph_get_from_mutator(mutator: Mutator) -> GraphGet:
     def graph_get(url: str) -> dict[str, Any] | None:
         assert_registration_read_url(url)
         try:
-            result = mutator.run(["az", "rest", "--method", "GET", "--uri", url])
+            # sensitive=True captures the body instead of streaming it. A Graph
+            # error can contain a bearer token; redact() runs before any of that
+            # text is shown to the operator.
+            result = mutator.run(
+                ["az", "rest", "--method", "GET", "--uri", url],
+                sensitive=True,
+            )
         except CliInvocationError as exc:
-            parsed = _parse_graph_json(exc.output or "")
+            raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
+            parsed = _parse_graph_json(raw)
             if parsed is not None:
                 return parsed
             return {
                 "error": {
                     "code": "UnreadableGraphResponse",
-                    "message": redact(exc.output or "az rest failed"),
+                    "message": redact(raw or "az rest failed"),
                 }
             }
         except (AADSTSError, OSError):
@@ -567,12 +599,24 @@ def _parse_app(item: Mapping[str, Any], *, is_agent_blueprint: bool | None) -> G
         raise EntraStateError(
             "Graph application is missing signInAudience; refusing to reconcile."
         )
+    blueprint_slug: str | None = None
+    if "uniqueName" in item and item.get("uniqueName") not in (None, ""):
+        slug = item.get("uniqueName")
+        if not isinstance(slug, str) or slug.strip() == "" or any(
+            char in slug for char in ("\x00", "\r", "\n")
+        ):
+            raise EntraStateError(
+                "Graph uniqueName was not a usable blueprint slug; refusing to "
+                "derive one from the display name."
+            )
+        blueprint_slug = slug.strip()
     return GraphApp(
         object_id=_require_guid(item.get("id"), what="application object id"),
         app_id=_require_guid(item.get("appId"), what="application appId"),
         display_name=display_name,
         sign_in_audience=audience,
         is_agent_blueprint=is_agent_blueprint,
+        blueprint_slug=blueprint_slug,
     )
 
 
@@ -940,6 +984,11 @@ def read_registration_snapshot(
                     mcp_permission_configured,
                     bot_permission_configured,
                 ) = _permission_state(graph_get, service_principal_id)
+    elif anchor_app is not None and not blueprint_apps:
+        # The name query missed this app. The cast supplies uniqueName when
+        # Graph has one, so a renamed anchor is not compared to a slug
+        # invented from its display name.
+        anchor_app = _confirm_blueprint(graph_get, anchor_app)
 
     return RegistrationSnapshot(
         agent_name=agent_name,
@@ -962,17 +1011,39 @@ def read_registration_snapshot(
 # ---------------------------------------------------------------------------
 
 
-def _slug_from_display_name(display_name: str) -> str:
-    suffix = " Blueprint"
-    base = display_name[: -len(suffix)] if display_name.endswith(suffix) else display_name
-    return slugify(base) or "unknown"
+def _blueprint_body(display_name: str, slug: str) -> dict[str, Any]:
+    """Desired or actual blueprint fields reconcile_blueprint compares.
 
-
-def _blueprint_body(display_name: str) -> dict[str, Any]:
+    ``slug`` is the registration slug for the desired body, and Graph
+    ``uniqueName`` for the actual body when Graph returned one. It is not
+    derived from the display name.
+    """
     return {
         "displayName": display_name,
-        "agentIdentity": {"slug": _slug_from_display_name(display_name)},
+        "agentIdentity": {"slug": slug},
     }
+
+
+def _blueprint_plan_for(
+    *,
+    desired_name: str,
+    desired_slug: str,
+    actual_name: str,
+    actual_slug: str | None,
+) -> BlueprintPlan:
+    """Compare the display name, and ``uniqueName`` when Graph returned it.
+
+    ``a365 setup blueprint`` does not assign ``uniqueName``. Deriving a
+    slug from the display name would hide a real Graph slug, and refusing
+    a missing value would abort a finished registration. When Graph omits
+    it, both sides use the registration slug so only the display name can
+    differ. That placeholder is not a display-name slug.
+    """
+    compared = actual_slug if actual_slug else desired_slug
+    return reconcile_blueprint(
+        _blueprint_body(desired_name, desired_slug),
+        _blueprint_body(actual_name, compared),
+    )
 
 
 def _abort(reason: str, *, messages: tuple[str, ...] = ()) -> RegistrationDecision:
@@ -1035,9 +1106,17 @@ def decide_registration(
                 "Refusing to modify either application or to create a duplicate."
             )
     if snapshot.anchor_app is not None and blueprint is None:
-        blueprint_plan = reconcile_blueprint(
-            _blueprint_body(blueprint_name),
-            _blueprint_body(snapshot.anchor_app.display_name),
+        if snapshot.anchor_app.is_agent_blueprint is False:
+            return _abort(
+                f"per-agent A365_APP_ID {anchor} ({snapshot.anchor_app.display_name!r}) "
+                "is not an agent identity blueprint. Refusing to create another "
+                "application or to modify this one."
+            )
+        blueprint_plan = _blueprint_plan_for(
+            desired_name=blueprint_name,
+            desired_slug=slug,
+            actual_name=snapshot.anchor_app.display_name,
+            actual_slug=snapshot.anchor_app.blueprint_slug,
         )
         if blueprint_plan.action == "abort":
             return RegistrationDecision(
@@ -1111,10 +1190,11 @@ def decide_registration(
         fic_configured=False,
     )
     app_plan = reconcile_app(desired_app, actual_app)
-    desired_blueprint_name = blueprint_name
-    blueprint_plan = reconcile_blueprint(
-        _blueprint_body(desired_blueprint_name),
-        _blueprint_body(blueprint.display_name),
+    blueprint_plan = _blueprint_plan_for(
+        desired_name=blueprint_name,
+        desired_slug=slug,
+        actual_name=blueprint.display_name,
+        actual_slug=blueprint.blueprint_slug,
     )
     if app_plan.action == "abort" or blueprint_plan.action == "abort":
         reason = app_plan.abort_reason or blueprint_plan.abort_reason or "reconciliation aborted"
