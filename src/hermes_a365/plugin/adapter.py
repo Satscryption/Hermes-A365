@@ -3694,6 +3694,17 @@ class Agent365Adapter(BasePlatformAdapter):
             self._agent_turn_guards.pop(session_key, None)
         self._release_session_media_leases(session_key)
 
+    def _turn_reply_blocked(self, chat_id: str) -> bool:
+        """True when this chat must not open a buffer or post a reply.
+
+        Uninstall arms ``_retiring_chats`` before any await. The turn guard
+        stays set for a session whose interrupt has not finished. Either one
+        blocks a later ``on_processing_start``, flush, or reply post (#158).
+        """
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return True
+        return not self._agent_turn_lifecycle_is_current()
+
     def _agent_turn_lifecycle_is_current(self) -> bool:
         token = _AGENT_TURN_LIFECYCLE.get()
         if token is None:
@@ -3789,21 +3800,24 @@ class Agent365Adapter(BasePlatformAdapter):
 
     @staticmethod
     def _interrupt_callable(agent: Any) -> Any | None:
-        """Real ``hard_interrupt`` / ``interrupt``, ignoring mock proxies."""
+        """Bound ``hard_interrupt`` / ``interrupt``, ignoring mock proxies.
+
+        ``getattr(agent, name)`` binds the method. ``type(agent).hard_interrupt``
+        is an unbound function, and calling it as ``interrupt(message)`` drops
+        ``self``.
+        """
         if agent is None:
             return None
         if getattr(type(agent), "__module__", "").startswith("unittest.mock"):
             return None
         for name in ("hard_interrupt", "interrupt"):
-            candidate = None
-            agent_dict = getattr(agent, "__dict__", None)
-            if isinstance(agent_dict, dict):
-                candidate = agent_dict.get(name)
-            if candidate is None:
-                candidate = getattr(type(agent), name, None)
+            candidate = getattr(agent, name, None)
             if not callable(candidate):
                 continue
             if getattr(type(candidate), "__module__", "").startswith("unittest.mock"):
+                continue
+            func = getattr(candidate, "__func__", candidate)
+            if getattr(type(func), "__module__", "").startswith("unittest.mock"):
                 continue
             return candidate
         return None
@@ -4659,6 +4673,11 @@ class Agent365Adapter(BasePlatformAdapter):
         bridge = _import_bridge()
         generation = self._lifecycle_generation
         chat_id = str((inbound.get("conversation") or {}).get("id") or "")
+        if self._turn_reply_blocked(chat_id):
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: adapter or chat is disconnecting",
+            )
         chat_generation = self._chat_generation(chat_id)
         client = self._http_client
         if (
@@ -4737,7 +4756,11 @@ class Agent365Adapter(BasePlatformAdapter):
         posts only after the short-turn window. ``send`` does not await it.
         """
         chat_id = self._chat_id_from_processing_event(event)
-        if chat_id and chat_id in self._seen_inbounds_this_lifetime:
+        if (
+            chat_id
+            and chat_id in self._seen_inbounds_this_lifetime
+            and not self._turn_reply_blocked(chat_id)
+        ):
             inbound = self._cached_inbound_for(chat_id)
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
@@ -4754,6 +4777,8 @@ class Agent365Adapter(BasePlatformAdapter):
         self, chat_id: str, inbound: dict[str, Any], *, activity_id: str
     ) -> None:
         """Open a buffer, or append a turn inside the one already open."""
+        if self._turn_reply_blocked(chat_id):
+            return
         snapshot = copy.deepcopy(inbound)
         if activity_id:
             snapshot["id"] = activity_id
@@ -5680,7 +5705,7 @@ class Agent365Adapter(BasePlatformAdapter):
         """
         chat_id = str(chat_id)
         buf = self._turn_buffers.get(chat_id)
-        if not buf or self._disconnecting:
+        if not buf or self._turn_reply_blocked(chat_id):
             return
         lock = buf.get("lock")
         if not isinstance(lock, asyncio.Lock):
@@ -5756,7 +5781,9 @@ class Agent365Adapter(BasePlatformAdapter):
             validated_path = turn.get("validated_path")
             path = validated_path if isinstance(validated_path, str) else None
             for chunk_segments, content in chunks:
-                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
+                    chat_id
+                ):
                     return
                 # Close the informative sequence before the visible reply.
                 # An open stream is what made a later message disappear
@@ -5815,7 +5842,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             if link_alone and suffix.strip():
                 link_closed = await self._close_turn_buffer_keepalive_locked(chat_id)
-                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
+                    chat_id
+                ):
                     return
                 if not link_closed:
                     self._schedule_turn_buffer_retry(chat_id)
@@ -9028,26 +9057,27 @@ class Agent365Adapter(BasePlatformAdapter):
         await self._finish_matched_agent_turns(specs)
 
     async def _await_uninstall_commit(self, task: asyncio.Task[Any]) -> None:
-        """Finish ``task`` even if this uninstall is cancelled.
+        """Finish ``task`` even if this uninstall is cancelled more than once.
 
-        A cancel delivered while the commit is running is restored after
-        the commit finishes, so the caller still observes ``CancelledError``
-        at its next await. The commit itself is not cancelled.
+        Every wait is shielded, including the wait after the first cancel.
+        A second cancel must not cancel the commit child mid-gather, or some
+        matched turns would be interrupted and others left running. The
+        caller still observes ``CancelledError`` after the child finishes.
+        Same shape as ``_teardown_chat_state``.
         """
-        current = asyncio.current_task()
-        try:
-            await asyncio.shield(task)
-            return
-        except asyncio.CancelledError:
-            if current is None or current.cancelling() == 0:
-                raise
-            while current.cancelling():
-                current.uncancel()
+        cancelled = False
+        while not task.done():
             try:
-                await task
-            finally:
-                if current.cancelling() == 0:
-                    current.cancel()
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                cancelled = True
+        if task.cancelled():
+            raise asyncio.CancelledError()
+        exc = task.exception()
+        if exc is not None:
+            raise exc
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def _cancel_matched_outbound(self, chat_ids: list[str]) -> None:
         """Cancel in-flight outbound posts on every matched chat at once.

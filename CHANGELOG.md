@@ -50,10 +50,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   blocked commit fence cannot stall the gateway loop; on timeout uninstall
   logs and continues. Sibling turns are interrupted together only after the
   cancellable outbound phase returns, and still before personal teardown
-  waits, so one session cannot serialise the rest. A second cancel before
-  that commit leaves the sibling turn running. If a turn was already
-  interrupted, rollback drops its deferred turn-buffer retry so that retry
-  cannot post. The session-key mapping stays until that turn has finished
+  waits, so one session cannot serialise the rest. The commit stays
+  shielded until every matched turn is signalled, including a second
+  cancel. A second cancel before that commit leaves the sibling turn
+  running. If a turn was already interrupted, rollback drops its deferred
+  turn-buffer retry so that retry cannot post. A retired session cannot
+  open another buffer or flush one through the reply post. The fallback
+  interrupt calls the bound ``agent.hard_interrupt``. The session-key mapping stays until that turn has finished
   or the interrupt succeeded with no worker left, including when
   ``_active_sessions`` was already released, and is not dropped when cancel
   fails or a drain task replaced the slot. Live session tasks count toward

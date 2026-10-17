@@ -3449,6 +3449,293 @@ class TestLifecycleCapture:
                     await asyncio.wait_for(turn_task, timeout=1)
 
     @pytest.mark.asyncio
+    async def test_hard_interrupt_fallback_binds_agent_self(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The Hermes import is absent in tests, so uninstall uses the bound
+        # agent.hard_interrupt. An unbound function would take the message as self.
+        a = _make_adapter(monkeypatch)
+        session_key = "sk:bind"
+        seen: dict[str, Any] = {}
+
+        class _Agent:
+            def hard_interrupt(
+                self, message: str | None = None, tool_reason: str | None = None
+            ) -> None:
+                seen["self"] = self
+                seen["message"] = message
+                seen["tool_reason"] = tool_reason
+
+        agent = _Agent()
+
+        class _Runner:
+            def __init__(self) -> None:
+                self._running_agents = {session_key: agent}
+
+        a.gateway_runner = _Runner()
+        assert await a._hard_interrupt_session(session_key) is True
+        assert seen["self"] is agent
+        assert seen["message"] == "Session ended while the turn was running"
+
+    @pytest.mark.asyncio
+    async def test_second_cancel_mid_commit_signals_every_matched_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A second cancel while the commit child is still gathering must not
+        # cancel that child. Every matched turn is interrupted.
+        import threading
+
+        a = _make_adapter(monkeypatch)
+        personal = "a:personal"
+        chat_a = "19:alpha@thread.v2"
+        chat_b = "19:beta@thread.v2"
+        key_a = "sk:alpha"
+        key_b = "sk:beta"
+        release_a = threading.Event()
+        release_b = threading.Event()
+        entered = {key_a: threading.Event(), key_b: threading.Event()}
+        interrupts: list[str] = []
+        recovery_entered = asyncio.Event()
+        observed: dict[str, bool] = {}
+
+        class _Agent:
+            def __init__(self, key: str) -> None:
+                self.key = key
+
+            def hard_interrupt(
+                self, message: str | None = None, tool_reason: str | None = None
+            ) -> None:
+                del message, tool_reason
+                interrupts.append(self.key)
+                entered[self.key].set()
+                if self.key == key_a:
+                    release_a.wait()
+                else:
+                    release_b.wait()
+
+        class _Runner:
+            def __init__(self) -> None:
+                self._running_agents = {
+                    key_a: _Agent(key_a),
+                    key_b: _Agent(key_b),
+                }
+
+        a.gateway_runner = _Runner()
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        task_a = asyncio.create_task(hang())
+        task_b = asyncio.create_task(hang())
+        a._session_tasks[key_a] = task_a
+        a._session_tasks[key_b] = task_b
+        a._session_key_to_conv[key_a] = chat_a
+        a._session_key_to_conv[key_b] = chat_b
+        for conv_id in (personal, chat_a, chat_b):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        original_recovery = a._evict_armed_after_cancel
+
+        async def watch_recovery(*args: Any, **kwargs: Any) -> bool:
+            observed["a"] = task_a.cancelled() or task_a.cancelling() > 0
+            observed["b"] = task_b.cancelled() or task_b.cancelling() > 0
+            recovery_entered.set()
+            return await original_recovery(*args, **kwargs)
+
+        monkeypatch.setattr(a, "_evict_armed_after_cancel", watch_recovery)
+        eviction = asyncio.create_task(
+            a._evict_conversations([personal, chat_a, chat_b])
+        )
+        try:
+            assert await asyncio.to_thread(entered[key_a].wait, 2)
+            assert await asyncio.to_thread(entered[key_b].wait, 2)
+            release_a.set()
+            for _ in range(50):
+                if task_a.cancelled() or task_a.cancelling() > 0:
+                    break
+                await asyncio.sleep(0.01)
+            assert task_a.cancelled() or task_a.cancelling() > 0
+            assert not task_b.cancelled()
+            assert task_b.cancelling() == 0
+            eviction.cancel()
+            await asyncio.sleep(0)
+            eviction.cancel()
+            await asyncio.sleep(0)
+            release_b.set()
+            await asyncio.wait_for(recovery_entered.wait(), timeout=2)
+            assert observed == {"a": True, "b": True}
+            assert set(interrupts) == {key_a, key_b}
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(eviction, timeout=2)
+        finally:
+            release_a.set()
+            release_b.set()
+            if not eviction.done():
+                eviction.cancel()
+            for task in (task_a, task_b):
+                if not task.done():
+                    task.cancel()
+            await asyncio.wait_for(
+                asyncio.gather(task_a, task_b, return_exceptions=True),
+                timeout=1,
+            )
+
+    @pytest.mark.asyncio
+    async def test_commit_blocks_reopened_buffer_and_reply_post(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # After the buffer is dropped, a still-running session must not open
+        # another one or flush a reply. _send_reply_activity is the post.
+        a = _make_adapter(monkeypatch)
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        session_key = "sk:copilot"
+        first_owner = asyncio.Event()
+        release_owner = asyncio.Event()
+        guard = asyncio.Event()
+
+        class _Agent:
+            def hard_interrupt(
+                self, message: str | None = None, tool_reason: str | None = None
+            ) -> None:
+                del message, tool_reason
+
+        class _Runner:
+            def __init__(self) -> None:
+                self._running_agents = {session_key: _Agent()}
+
+        a.gateway_runner = _Runner()
+        a._agent_turn_guards[session_key] = guard
+
+        async def hang() -> None:
+            await asyncio.Event().wait()
+
+        turn_task = asyncio.create_task(hang())
+        a._session_tasks[session_key] = turn_task
+        a._session_key_to_conv[session_key] = copilot
+        for conv_id, conv_type in ((personal, "personal"), (copilot, "groupChat")):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+        a._seen_inbounds_this_lifetime.add(copilot)
+        a._turn_buffers[copilot] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": {"conversation": {"id": copilot}},
+                    "validated_path": None,
+                    "activity_id": "turn-1",
+                    "open": False,
+                }
+            ],
+            "segments": [{"id": "turnbuf:1", "text": "buffered", "turn": "1"}],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+            "retry_attempts": 0,
+        }
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock()
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        original_owner = a._activate_persist_owner
+        owner_calls = {"n": 0}
+
+        async def blocking_owner(*args: Any, **kwargs: Any) -> int:
+            owner_calls["n"] += 1
+            if owner_calls["n"] == 1:
+                first_owner.set()
+                await release_owner.wait()
+            return await original_owner(*args, **kwargs)
+
+        monkeypatch.setattr(a, "_activate_persist_owner", blocking_owner)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=copilot),
+            message_id="act-late",
+        )
+        eviction = asyncio.create_task(a._evict_conversations([personal, copilot]))
+        try:
+            await asyncio.wait_for(first_owner.wait(), timeout=2)
+            assert copilot in a._retiring_chats
+            assert copilot not in a._turn_buffers
+            await a.on_processing_start(event)
+            assert copilot not in a._turn_buffers
+            a._turn_buffers[copilot] = {
+                "turns": [
+                    {
+                        "seq": "1",
+                        "inbound": a._cached_inbound_for(copilot),
+                        "validated_path": None,
+                        "activity_id": "turn-1",
+                        "open": False,
+                    }
+                ],
+                "segments": [{"id": "turnbuf:1", "text": "late", "turn": "1"}],
+                "depth": 0,
+                "lock": asyncio.Lock(),
+            }
+            await a._flush_turn_buffer(copilot)
+            inbound = a._cached_inbound_for(copilot)
+            assert inbound is not None
+            posted = await a._send_reply_activity(
+                inbound=inbound,
+                content="late",
+                log_context="turn buffer",
+            )
+            assert posted.success is False
+            assert send_reply.await_count == 0
+
+            a._retiring_chats.discard(copilot)
+            a._turn_buffers.pop(copilot, None)
+            guard.set()
+            token = adapter_mod._AGENT_TURN_LIFECYCLE.set(
+                (
+                    id(a),
+                    copilot,
+                    a._lifecycle_generation,
+                    a._chat_generation(copilot),
+                    guard,
+                )
+            )
+            try:
+                await a.on_processing_start(event)
+                assert copilot not in a._turn_buffers
+                a._turn_buffers[copilot] = {
+                    "turns": [
+                        {
+                            "seq": "1",
+                            "inbound": inbound,
+                            "validated_path": None,
+                            "activity_id": "turn-1",
+                            "open": False,
+                        }
+                    ],
+                    "segments": [{"id": "turnbuf:2", "text": "late", "turn": "1"}],
+                    "depth": 0,
+                    "lock": asyncio.Lock(),
+                }
+                await a._flush_turn_buffer(copilot)
+                guarded = await a._send_reply_activity(
+                    inbound=inbound,
+                    content="late",
+                    log_context="turn buffer",
+                )
+                assert guarded.success is False
+                assert send_reply.await_count == 0
+            finally:
+                adapter_mod._AGENT_TURN_LIFECYCLE.reset(token)
+            release_owner.set()
+            assert await asyncio.wait_for(eviction, timeout=2) is True
+        finally:
+            release_owner.set()
+            if not eviction.done():
+                eviction.cancel()
+            if not turn_task.done():
+                turn_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(turn_task, timeout=1)
+
+    @pytest.mark.asyncio
     async def test_failed_cancel_and_drain_task_keep_session_mapping(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
