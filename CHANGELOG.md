@@ -4,6 +4,20 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased / 0.9.1]
+
+### Security
+
+- **The gateway and the activity bridge share one sender allowlist (#160).**
+  Both enforce `A365_ALLOWED_USERS` / `A365_ALLOW_ALL_USERS` from the profile
+  `~/.hermes/.env`, which is the file the gateway already sources. The
+  per-agent env may repeat that policy and must not replace it. Startup
+  refuses when the per-agent file sets a policy the profile does not, when
+  the two policies differ, or when a profile file and the gateway process
+  disagree. If neither source sets a policy, both runtimes deny every end
+  user. An empty allowlist is not allow-all. A Hermes allow does not widen
+  the shared policy.
+
 ## [0.9.0] — 2026-10-16
 
 Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).

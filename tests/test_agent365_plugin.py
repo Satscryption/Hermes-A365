@@ -14,6 +14,7 @@ import asyncio
 import hashlib
 import importlib
 import json
+import os
 import sys
 import time
 import types
@@ -15171,6 +15172,95 @@ class TestGatewaySecretsProviderWiring:
 
         # Not found, but NOT evidence of an empty store.
         assert (found, reachable, label) == (False, False, "exploding")
+
+
+class TestSenderAllowlistAgreement:
+    """#160: the adapter resolves the same profile policy as ``serve``."""
+
+    def _home(self, monkeypatch: pytest.MonkeyPatch) -> Path:
+        home = Path(os.environ["HERMES_HOME"])
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: home
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+        return home
+
+    def _write(self, path: Path, text: str) -> None:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        path.chmod(0o600)
+
+    def test_profile_file_is_the_allowlist_when_process_env_matches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("A365_ALLOWED_USERS", "user-a,user-b")
+        self._write(self._home(monkeypatch) / ".env", "A365_ALLOWED_USERS=user-a,user-b\n")
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(extra={"slug": "inbox-helper"})
+        )
+        assert adapter._allowed_users == ("user-a", "user-b")
+        assert adapter._allow_all_users is False
+        assert adapter._sender_allowlist_configured is True
+
+    def test_per_agent_disagreement_refuses_to_construct(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("A365_ALLOWED_USERS", "user-a")
+        self._write(
+            self._home(monkeypatch) / "agents" / "inbox-helper" / ".env",
+            "A365_ALLOWED_USERS=user-b\nA365_TENANT_ID=t\n",
+        )
+        from hermes_a365.activity_bridge import BridgeConfigError
+
+        with pytest.raises(BridgeConfigError, match="sender allowlists disagree"):
+            adapter_mod.Agent365Adapter(
+                _StubPlatformConfig(extra={"slug": "inbox-helper"})
+            )
+
+    def test_process_only_policy_is_refused_when_profile_file_exists(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_ALLOW_ALL_USERS", "true")
+        self._write(self._home(monkeypatch) / ".env", "A365_TENANT_ID=tenant\n")
+        from hermes_a365.activity_bridge import BridgeConfigError
+
+        with pytest.raises(BridgeConfigError, match="does not state the gateway process"):
+            adapter_mod.Agent365Adapter(_StubPlatformConfig())
+
+    def test_hermes_allow_cannot_widen_the_shared_policy(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        adapter = _make_adapter(
+            monkeypatch,
+            conversations_path=str(tmp_path / "conversations.json"),
+        )
+        adapter._allow_all_users = False
+        adapter._allowed_users = ("user-allowed",)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+
+        def authorize(_user_id: str, _chat_type: str, _chat_id: str) -> bool:
+            return True
+
+        adapter._is_sender_authorized = authorize
+        activity = _make_inbound()
+        activity["from"] = {"id": "intruder", "name": "Intruder"}
+
+        response = TestClient(adapter.build_app()).post(
+            "/api/messages",
+            json=activity,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 403
+        assert adapter._handled_events == []
 
 
 class TestSecurityAuthorizationOrder:

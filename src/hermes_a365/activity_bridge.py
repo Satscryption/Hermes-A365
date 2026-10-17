@@ -102,6 +102,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -274,6 +275,44 @@ def load_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:
             f"agent .env is group/world-readable (mode 0{mode:o}): chmod 600 {path}"
         )
     return parsed
+
+
+@dataclass(frozen=True)
+class ProfileEnv:
+    """``~/.hermes/.env`` as the bridge and gateway both see it.
+
+    ``exists`` is false only when the file is absent. An empty file still
+    exists: it states no sender policy, which is not the same as "no file".
+    """
+
+    exists: bool
+    values: dict[str, str]
+
+
+def load_profile_env(hermes_home: Path) -> ProfileEnv:
+    """Read the profile env file the gateway sources at startup.
+
+    A missing file is an empty, non-existent profile (callers decide whether
+    that is silent). A present file that is unreadable or group/world-readable
+    fails closed — ignoring it could hide a tighter policy or let a looser
+    per-agent file win.
+    """
+    path = hermes_home / ".env"
+    if not path.exists():
+        return ProfileEnv(exists=False, values={})
+    try:
+        parsed = parse_env(path.read_text())
+    except OSError as e:
+        raise BridgeConfigError(f"profile .env unreadable: {e}") from e
+    try:
+        mode = path.stat().st_mode & 0o777
+    except OSError as e:
+        raise BridgeConfigError(f"cannot verify permissions on {path}: {e}") from e
+    if mode & 0o077:
+        raise BridgeConfigError(
+            f"profile .env is group/world-readable (mode 0{mode:o}): chmod 600 {path}"
+        )
+    return ProfileEnv(exists=True, values=parsed)
 
 
 def load_generated_config(path: Path) -> dict[str, Any]:
@@ -1281,11 +1320,15 @@ class BridgeConfig:
     # the `client_id` / `client_secret` for outbound BF S2S mint.
     bf_app_id: str = ""
     bf_client_secret: str = field(default="", repr=False)
-    # Standalone serve has no GatewayRunner authorization layer. It therefore
-    # owns a fail-closed end-user policy, using the same environment names as
-    # the plugin registration.
+    # End-user sender policy shared with the gateway. The profile env
+    # (``~/.hermes/.env``) is the source of truth; ``load_bridge_config``
+    # refuses a per-agent policy that the profile does not also state.
+    # ``sender_allowlist_configured`` is false when neither source sets
+    # ``A365_ALLOWED_USERS`` or ``A365_ALLOW_ALL_USERS`` — that is deny-all,
+    # not allow-all.
     allowed_users: tuple[str, ...] = ()
     allow_all_users: bool = False
+    sender_allowlist_configured: bool = True
     # Teams Create-instance agents are a distinct Entra agentIdentity.
     # Their app id may be minted under only when the operator listed it.
     # Empty means "blueprint id only" (deny-by-default).
@@ -1322,6 +1365,179 @@ def parse_agent_identity_ids(raw: Any) -> tuple[str, ...]:
         seen.add(token)
         parsed.append(token)
     return tuple(parsed)
+
+
+# Profile ``~/.hermes/.env`` is the sender allowlist the Hermes gateway
+# enforces (``allowed_users_env`` / ``allow_all_env``). The per-agent env is
+# not a second policy: it may repeat the profile and must not widen it.
+SENDER_ALLOWLIST_ENV_KEYS = ("A365_ALLOWED_USERS", "A365_ALLOW_ALL_USERS")
+_SENDER_ALLOW_TRUE = frozenset({"1", "true", "yes", "on"})
+_SENDER_ALLOW_FALSE = frozenset({"0", "false", "no", "off", ""})
+
+
+@dataclass(frozen=True)
+class SenderAllowlist:
+    """Resolved end-user policy shared by the gateway adapter and ``serve``.
+
+    ``configured`` is false only when no source stated a policy. That case
+    is deny-all (``allow_all_users`` false and ``allowed_users`` empty), never
+    an implicit allow.
+    """
+
+    allowed_users: tuple[str, ...] = ()
+    allow_all_users: bool = False
+    configured: bool = False
+
+
+def _allowlist_env_view(env: Mapping[str, str]) -> dict[str, str]:
+    return {key: env[key] for key in SENDER_ALLOWLIST_ENV_KEYS if key in env}
+
+
+def _parse_allowed_user_list(raw: str) -> tuple[str, ...]:
+    seen: set[str] = set()
+    parsed: list[str] = []
+    for part in raw.split(","):
+        token = part.strip().lower()
+        if not token or token in seen:
+            continue
+        seen.add(token)
+        parsed.append(token)
+    return tuple(parsed)
+
+
+def _same_sender_policy(left: SenderAllowlist, right: SenderAllowlist) -> bool:
+    return left.allow_all_users == right.allow_all_users and set(left.allowed_users) == set(
+        right.allowed_users
+    )
+
+
+def parse_sender_allowlist(env: Mapping[str, str], *, source: str) -> SenderAllowlist | None:
+    """Parse one env mapping. ``None`` means that source stated no policy.
+
+    A present key is a policy even when the value is empty (explicit deny).
+    An unrecognized ``A365_ALLOW_ALL_USERS`` token, a non-string value, or
+    allow-all combined with a non-empty user list is ambiguous and fails
+    closed. Values are not included in the error text.
+    """
+    has_users = "A365_ALLOWED_USERS" in env
+    has_all = "A365_ALLOW_ALL_USERS" in env
+    if not has_users and not has_all:
+        return None
+    users_raw = env.get("A365_ALLOWED_USERS", "")
+    allow_raw = env.get("A365_ALLOW_ALL_USERS", "")
+    users_are_text = not has_users or isinstance(users_raw, str)
+    allow_is_text = not has_all or isinstance(allow_raw, str)
+    if not users_are_text or not allow_is_text:
+        raise BridgeConfigError(
+            f"sender allowlist in {source} is not text; refusing to start"
+        )
+    token = allow_raw.strip().lower()
+    if has_all and token not in _SENDER_ALLOW_TRUE | _SENDER_ALLOW_FALSE:
+        raise BridgeConfigError(
+            f"A365_ALLOW_ALL_USERS in {source} is not a recognized on/off value; "
+            "refusing to start"
+        )
+    allow_all = has_all and token in _SENDER_ALLOW_TRUE
+    users = _parse_allowed_user_list(users_raw) if has_users else ()
+    if allow_all and users:
+        raise BridgeConfigError(
+            "A365_ALLOW_ALL_USERS is enabled alongside a non-empty "
+            f"A365_ALLOWED_USERS in {source}; refusing to guess which policy applies"
+        )
+    return SenderAllowlist(
+        allowed_users=users,
+        allow_all_users=allow_all,
+        configured=True,
+    )
+
+
+def select_profile_sender_env(
+    file_env: Mapping[str, str],
+    scoped_env: Mapping[str, str],
+    *,
+    profile_file_exists: bool,
+) -> dict[str, str]:
+    """Choose the profile policy the gateway and the bridge can both see.
+
+    The profile file is the durable source ``serve`` reads. The gateway
+    process environment is what Hermes enforces after it sources that file.
+    When the file exists, a process-only policy or a disagreement fails
+    closed. When the file is absent, the process environment is the profile
+    (tests and a gateway that has not written ``~/.hermes/.env`` yet).
+    """
+    file_policy = (
+        parse_sender_allowlist(file_env, source="the profile env file")
+        if profile_file_exists
+        else None
+    )
+    scoped_policy = parse_sender_allowlist(
+        scoped_env, source="the gateway process environment"
+    )
+    if profile_file_exists:
+        if file_policy is not None and scoped_policy is None:
+            raise BridgeConfigError(
+                "profile .env states a sender allowlist that the gateway process "
+                "environment does not. Refusing to start: Hermes enforces the "
+                "process environment and would not apply the file policy the "
+                "activity bridge reads. Source ~/.hermes/.env into the gateway."
+            )
+        if file_policy is None and scoped_policy is not None:
+            raise BridgeConfigError(
+                "profile .env does not state the gateway process allowlist. "
+                "Refusing to start: the activity bridge reads ~/.hermes/.env and "
+                "would not apply A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS that "
+                "exist only in the process environment. Put the policy in the "
+                "profile file."
+            )
+        if (
+            file_policy is not None
+            and scoped_policy is not None
+            and not _same_sender_policy(file_policy, scoped_policy)
+        ):
+            raise BridgeConfigError(
+                "profile .env and the gateway process allowlist disagree. "
+                "Refusing to start so the gateway cannot authorize end users "
+                "the activity bridge, which reads the profile file, would reject."
+            )
+        if file_policy is not None:
+            return _allowlist_env_view(file_env)
+        return {}
+    return _allowlist_env_view(scoped_env)
+
+
+def resolve_sender_allowlist(
+    profile_env: Mapping[str, str],
+    agent_env: Mapping[str, str],
+) -> SenderAllowlist:
+    """Resolve the one sender policy both runtimes enforce.
+
+    The profile env wins when it is the only policy, or when the per-agent
+    env repeats it. A per-agent policy with no profile policy, or two
+    policies that are not equal, fails closed. Neither source configured is
+    deny-all rather than allow-all.
+    """
+    profile = parse_sender_allowlist(
+        profile_env, source="the profile env (~/.hermes/.env)"
+    )
+    agent = parse_sender_allowlist(agent_env, source="the per-agent env")
+    if agent is not None and profile is None:
+        raise BridgeConfigError(
+            "per-agent env sets a sender allowlist but the profile env does not. "
+            "The gateway enforces ~/.hermes/.env. Refusing a bridge policy the "
+            "gateway would not apply. Set the same A365_ALLOWED_USERS or "
+            "A365_ALLOW_ALL_USERS in the profile env, or remove them from the "
+            "per-agent env."
+        )
+    if profile is None:
+        return SenderAllowlist()
+    if agent is not None and not _same_sender_policy(profile, agent):
+        raise BridgeConfigError(
+            "profile env and per-agent env sender allowlists disagree. "
+            "Refusing to start so the gateway and the bridge cannot authorize "
+            "different end users. Make A365_ALLOWED_USERS and "
+            "A365_ALLOW_ALL_USERS match, or remove them from the per-agent env."
+        )
+    return profile
 
 
 def load_bridge_config(
@@ -1430,6 +1646,16 @@ def load_bridge_config(
             "Path B identity is only partially configured; "
             f"{missing} is required when its matching value is set"
         )
+    # #160: the profile file is the sender allowlist the gateway enforces.
+    # The per-agent env may only repeat it. Missing and ambiguous policies
+    # fail closed (deny-all, or refuse to start).
+    profile_env = load_profile_env(hermes_home)
+    sender_policy = resolve_sender_allowlist(profile_env.values, agent_env)
+    if not sender_policy.configured:
+        logger.warning(
+            "sender allowlist is not configured; denying every end user. "
+            "Set A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS in ~/.hermes/.env"
+        )
     return BridgeConfig(
         slug=slug,
         tenant_id=agent_env["A365_TENANT_ID"],
@@ -1441,13 +1667,9 @@ def load_bridge_config(
         skip_jwt_validation=skip_jwt_validation,
         bf_app_id=bf_app_id,
         bf_client_secret=bf_client_secret,
-        allowed_users=tuple(
-            value.strip().lower()
-            for value in agent_env.get("A365_ALLOWED_USERS", "").split(",")
-            if value.strip()
-        ),
-        allow_all_users=agent_env.get("A365_ALLOW_ALL_USERS", "").strip().lower()
-        in {"1", "true", "yes", "on"},
+        allowed_users=sender_policy.allowed_users,
+        allow_all_users=sender_policy.allow_all_users,
+        sender_allowlist_configured=sender_policy.configured,
         agent_identity_ids=parse_agent_identity_ids(
             agent_env.get("A365_AGENT_IDENTITY_IDS")
         ),
@@ -3328,6 +3550,12 @@ def cmd_serve(args: argparse.Namespace) -> int:
     import uvicorn  # type: ignore[import-not-found]
 
     write_pid_file(cfg.pid_path)
+    if cfg.allow_all_users:
+        allowlist_line = "allow-all (testing)"
+    elif cfg.allowed_users:
+        allowlist_line = f"{len(cfg.allowed_users)} entries"
+    else:
+        allowlist_line = "deny-all"
     sys.stdout.write(
         f"hermes a365 activity-bridge serving {cfg.slug} "
         f"on http://{args.host}:{args.port}\n"
@@ -3335,6 +3563,7 @@ def cmd_serve(args: argparse.Namespace) -> int:
         f"  pid:     {cfg.pid_path}\n"
         f"  log:     {cfg.log_path}\n"
         f"  jwt:     {'DISABLED — DEV ONLY' if cfg.skip_jwt_validation else 'enabled'}\n"
+        f"  allowlist: {allowlist_line}\n"
         f"  outbound auth: agentic user-FIC (3-stage chain) → "
         f"{APX_PRODUCTION_SCOPE.split('/')[0][:8]}…\n"
     )

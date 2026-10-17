@@ -1216,14 +1216,19 @@ class Agent365Adapter(BasePlatformAdapter):
             or generated_config_default
         )
 
-        self._allowed_users: tuple[str, ...] = tuple(
-            value.strip().lower()
-            for value in (_profile_env("A365_ALLOWED_USERS", "") or "").split(",")
-            if value.strip()
-        )
-        self._allow_all_users = (_profile_env(
-            "A365_ALLOW_ALL_USERS", ""
-        ) or "").strip().lower() in {"1", "true", "yes", "on"}
+        # #160: same resolver as ``load_bridge_config``. The profile env is
+        # the source of truth; a conflicting per-agent policy fails closed
+        # here so the gateway cannot serve a list the bridge would refuse.
+        sender_policy = self._load_sender_allowlist()
+        self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
+        self._allow_all_users = sender_policy.allow_all_users
+        self._sender_allowlist_configured = sender_policy.configured
+        if not sender_policy.configured:
+            logger.warning(
+                "agent365 sender allowlist is not configured; denying every "
+                "end user until A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS "
+                "is set in the profile env"
+            )
 
         # Slice 19o — durable conversation registry keyed on
         # `conversation.id`. Persists to
@@ -1626,6 +1631,27 @@ class Agent365Adapter(BasePlatformAdapter):
         self._provider_secret = ""
         self._provider_bf_secret = ""
 
+    def _load_sender_allowlist(self) -> Any:
+        """Resolve the sender policy shared with ``activity-bridge serve``."""
+        bridge = _import_bridge()
+        profile_file = bridge.load_profile_env(self._hermes_home)
+        scoped: dict[str, str] = {}
+        for key in bridge.SENDER_ALLOWLIST_ENV_KEYS:
+            value = _profile_env(key)
+            if value is not None:
+                scoped[key] = value
+        profile = bridge.select_profile_sender_env(
+            profile_file.values,
+            scoped,
+            profile_file_exists=profile_file.exists,
+        )
+        agent: dict[str, str] = {}
+        if self.slug:
+            agent_path = self._hermes_home / "agents" / self.slug / ".env"
+            if agent_path.exists():
+                agent = bridge.load_agent_env(self._hermes_home, self.slug)
+        return bridge.resolve_sender_allowlist(profile, agent)
+
     def _make_bridge_config(self) -> Any:
         """Construct a `BridgeConfig` for the bridge helpers (token
         acquisition, JWT validation, send_reply)."""
@@ -1869,6 +1895,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_type = bridge._activity_chat_type(activity)
             if bridge._activity_requires_end_user_auth(activity):
                 auth_check = getattr(self, "_is_sender_authorized", None)
+                alias_decisions: list[Any] = []
                 if callable(auth_check):
                     alias_decisions = [
                         auth_check(sender_id, chat_type, chat_id)
@@ -1891,21 +1918,44 @@ class Agent365Adapter(BasePlatformAdapter):
                         )
                 else:
                     decision = None
-                if decision is None:
-                    decision = bridge._activity_user_authorized(
-                        activity,
-                        allowed_users=self._allowed_users,
-                        allow_all=self._allow_all_users,
-                    )
-                    if decision and not self._allow_all_users:
+                # #160: the shared profile policy is mandatory. Hermes may
+                # tighten it (a False denies) but must not widen it — an
+                # allow-all process flag or a stale gateway check cannot
+                # admit someone ``serve`` would reject.
+                hermes_decision = decision
+                local_ok = bridge._activity_user_authorized(
+                    activity,
+                    allowed_users=self._allowed_users,
+                    allow_all=self._allow_all_users,
+                )
+                if hermes_decision is False or not local_ok:
+                    decision = False
+                else:
+                    decision = True
+                    if not self._allow_all_users:
                         allowed = {
                             value.strip().lower()
                             for value in self._allowed_users
                             if value.strip()
                         }
-                        authorized_sender_id = next(
-                            candidate for candidate in sender_ids if candidate in allowed
-                        )
+                        if hermes_decision is True:
+                            pool = [
+                                sender_id
+                                for sender_id, alias_decision in zip(
+                                    sender_ids, alias_decisions, strict=True
+                                )
+                                if alias_decision is True and sender_id in allowed
+                            ]
+                        else:
+                            pool = [
+                                sender_id
+                                for sender_id in sender_ids
+                                if sender_id in allowed
+                            ]
+                        if not pool:
+                            decision = False
+                        else:
+                            authorized_sender_id = pool[0]
                 if not decision:
                     logger.warning("inbound 403 reason=unauthorized-end-user")
                     raise HTTPException(status_code=403, detail="end user is not authorized")

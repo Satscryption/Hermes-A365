@@ -44,6 +44,7 @@ from hermes_a365.activity_bridge import (
     VerifyReport,
     _activity_chat_type,
     _activity_delivery_id,
+    _activity_user_authorized,
     _agentic_ids_from_activity,
     _BfTokenCache,
     _FmiCache,
@@ -64,6 +65,7 @@ from hermes_a365.activity_bridge import (
     load_agent_env,
     load_bridge_config,
     load_generated_config,
+    load_profile_env,
     main,
     make_app,
     parse_agent_identity_ids,
@@ -77,7 +79,9 @@ from hermes_a365.activity_bridge import (
     render_human,
     render_json,
     render_reply_activity,
+    resolve_sender_allowlist,
     run_verify,
+    select_profile_sender_env,
     validate_inbound_jwt,
     validate_inbound_jwt_bf,
 )
@@ -2335,6 +2339,165 @@ class TestLoadBridgeConfig:
 
         with pytest.raises(BridgeConfigError, match="generated config"):
             load_generated_config(path)
+
+
+def _write_profile_env(home: Path, **entries: str) -> Path:
+    path = home / ".env"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("".join(f"{key}={value}\n" for key, value in entries.items()))
+    os.chmod(path, 0o600)
+    return path
+
+
+class TestSenderAllowlist:
+    """#160: gateway and bridge share the profile env, and fail closed."""
+
+    def test_missing_policy_denies_everyone(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path)
+        path = _seed_generated_config(tmp_path)
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.sender_allowlist_configured is False
+        assert cfg.allow_all_users is False
+        assert cfg.allowed_users == ()
+        activity = _inbound_message_activity()
+        assert (
+            _activity_user_authorized(
+                activity, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+            )
+            is False
+        )
+
+    def test_profile_list_applies_when_per_agent_env_is_silent(self, tmp_path: Path) -> None:
+        # Walk #123 row 3d: the list lived in ~/.hermes/.env and the per-agent
+        # file did not mention it. serve must enforce the profile list.
+        _seed_agent_env(tmp_path)
+        _write_profile_env(tmp_path, A365_ALLOWED_USERS="User-A, user-b")
+        path = _seed_generated_config(tmp_path)
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.sender_allowlist_configured is True
+        assert cfg.allow_all_users is False
+        assert cfg.allowed_users == ("user-a", "user-b")
+        listed = _inbound_message_activity()
+        listed["from"] = {"id": "USER-A"}
+        outsider = _inbound_message_activity()
+        outsider["from"] = {"id": "someone-else"}
+        assert (
+            _activity_user_authorized(
+                listed, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+            )
+            is True
+        )
+        assert (
+            _activity_user_authorized(
+                outsider, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+            )
+            is False
+        )
+
+    def test_matching_per_agent_policy_is_accepted(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path, A365_ALLOWED_USERS="user-b, USER-A")
+        _write_profile_env(tmp_path, A365_ALLOWED_USERS="user-a,user-b")
+        path = _seed_generated_config(tmp_path)
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.allowed_users == ("user-a", "user-b")
+
+    def test_per_agent_only_policy_is_refused(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path, A365_ALLOW_ALL_USERS="true")
+        path = _seed_generated_config(tmp_path)
+        with pytest.raises(BridgeConfigError, match="per-agent env sets a sender allowlist"):
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="https://hook",
+                hermes_home=tmp_path,
+                generated_config_path=path,
+            )
+
+    def test_disagreement_is_refused_without_echoing_entries(self, tmp_path: Path) -> None:
+        listed = "hidden-user@contoso.example"
+        _seed_agent_env(tmp_path, A365_ALLOWED_USERS=listed)
+        _write_profile_env(tmp_path, A365_ALLOWED_USERS="other-user")
+        path = _seed_generated_config(tmp_path)
+        with pytest.raises(BridgeConfigError, match="sender allowlists disagree") as raised:
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="https://hook",
+                hermes_home=tmp_path,
+                generated_config_path=path,
+            )
+        assert listed not in str(raised.value)
+
+    def test_allow_all_plus_user_list_is_ambiguous(self) -> None:
+        with pytest.raises(BridgeConfigError, match="alongside a non-empty"):
+            resolve_sender_allowlist(
+                {"A365_ALLOW_ALL_USERS": "true", "A365_ALLOWED_USERS": "user-a"},
+                {},
+            )
+
+    def test_unrecognized_allow_all_token_fails_closed(self) -> None:
+        with pytest.raises(BridgeConfigError, match="not a recognized on/off value"):
+            resolve_sender_allowlist({"A365_ALLOW_ALL_USERS": "maybe"}, {})
+
+    def test_explicit_empty_profile_list_is_deny_all_not_missing(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path)
+        _write_profile_env(tmp_path, A365_ALLOWED_USERS="", A365_ALLOW_ALL_USERS="false")
+        path = _seed_generated_config(tmp_path)
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.sender_allowlist_configured is True
+        assert cfg.allow_all_users is False
+        assert cfg.allowed_users == ()
+
+    def test_loose_profile_env_is_refused(self, tmp_path: Path) -> None:
+        _seed_agent_env(tmp_path)
+        path = _write_profile_env(tmp_path, A365_ALLOWED_USERS="user-a")
+        os.chmod(path, 0o644)
+        with pytest.raises(BridgeConfigError, match=r"profile \.env"):
+            load_profile_env(tmp_path)
+
+    def test_process_allowlist_absent_from_existing_profile_file_is_refused(self) -> None:
+        with pytest.raises(BridgeConfigError, match="does not state the gateway process"):
+            select_profile_sender_env(
+                {"A365_TENANT_ID": "tenant"},
+                {"A365_ALLOWED_USERS": "user-a"},
+                profile_file_exists=True,
+            )
+
+    def test_profile_file_and_process_disagreement_is_refused(self) -> None:
+        with pytest.raises(BridgeConfigError, match="gateway process allowlist disagree"):
+            select_profile_sender_env(
+                {"A365_ALLOWED_USERS": "file-user"},
+                {"A365_ALLOW_ALL_USERS": "true"},
+                profile_file_exists=True,
+            )
+
+    def test_absent_profile_file_uses_process_environment(self) -> None:
+        selected = select_profile_sender_env(
+            {},
+            {"A365_ALLOWED_USERS": "User-A"},
+            profile_file_exists=False,
+        )
+        policy = resolve_sender_allowlist(selected, {})
+        assert policy.allowed_users == ("user-a",)
+        assert policy.configured is True
 
 
 class TestParseAgentIdentityIds:

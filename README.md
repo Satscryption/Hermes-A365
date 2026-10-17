@@ -625,7 +625,10 @@ as `ok`.
 >
 > …paired with `A365_TENANT_ID`, `A365_APP_ID`, `A365_BLUEPRINT_CLIENT_SECRET`,
 > and either `A365_ALLOW_ALL_USERS=true` (testing) or
-> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Allowlist
+> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. That profile
+> file is the sender allowlist for both the gateway and `activity-bridge serve`.
+> A different value in `~/.hermes/agents/<slug>/.env` is refused at startup.
+> If neither file sets a policy, both runtimes deny every end user. Allowlist
 > entries may be
 > AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
 > includes those aliases in the signed activity. Bot Framework `personal` /
