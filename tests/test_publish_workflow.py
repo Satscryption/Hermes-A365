@@ -111,18 +111,64 @@ def test_release_job_finalizes_after_pypi_without_pushing_tags() -> None:
     )
 
     assert _needs(release) == {"publish"}
-    assert release["if"] == "startsWith(github.ref, 'refs/tags/v')"
+    assert release["if"] == (
+        "startsWith(github.ref, 'refs/tags/v') && "
+        "(github.event_name != 'workflow_dispatch' || inputs.approval_test != true)"
+    )
+    assert "always()" not in release["if"]
     assert release["permissions"] == {"contents": "write"}
     assert "environment" not in release
     assert "id-token" not in release["permissions"]
     assert checkout["with"]["persist-credentials"] == "false"
     assert "publish-release" in finalize["run"]
+    assert '--sha "$RELEASE_SHA"' in finalize["run"]
+    assert finalize["env"]["RELEASE_SHA"] == "${{ github.sha }}"
     assert "git push" not in text
     assert "git tag" not in text
     environments = [
         job["environment"] for job in workflow["jobs"].values() if "environment" in job
     ]
     assert environments == ["pypi"]
+
+
+def test_digest_verification_survives_smoke_and_gates_the_upload() -> None:
+    workflow = _workflow()
+    publish = workflow["jobs"]["publish"]
+    verify = next(
+        step for step in _steps(publish) if step.get("name") == "Verify artefact digests"
+    )
+    script = verify["run"]
+    publish_names = [step.get("name") for step in _steps(publish)]
+
+    assert "SHA256SUMS must be a regular file" in script
+    assert "path.parent != dist" in script
+    assert "duplicate SHA256SUMS path" in script
+    assert "exactly one wheel and one sdist" in script
+    assert "sha256sum --check --strict dist/SHA256SUMS" in script
+    assert "rm dist/SHA256SUMS" in script
+    assert publish_names.index("Verify artefact digests") < publish_names.index("Publish to PyPI")
+
+    build = workflow["jobs"]["build"]
+    build_steps = {step.get("name"): step for step in _steps(build)}
+    build_names = [step.get("name") for step in _steps(build)]
+    record = build_steps["Record artefact digests"]["run"]
+    rebuild = build_steps["Build sdist + wheel"]["run"]
+    recheck = build_steps["Re-verify artefact digests after smoke"]["run"]
+
+    assert 'export SOURCE_DATE_EPOCH="$epoch"' in rebuild
+    assert "git log -1 --format=%ct HEAD" in rebuild
+    assert "SHA256SUMS.before-smoke" in record
+    assert 'sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS.before-smoke"' in recheck
+    assert "cmp dist/SHA256SUMS" in recheck
+    assert build_names.index("Record artefact digests") < build_names.index(
+        "Smoke-install the wheel"
+    )
+    assert build_names.index("Smoke-install the wheel") < build_names.index(
+        "Re-verify artefact digests after smoke"
+    )
+    assert build_names.index("Re-verify artefact digests after smoke") < build_names.index(
+        "Upload artefacts for the publish job"
+    )
 
 
 def test_called_test_workflow_keeps_python_3_14() -> None:

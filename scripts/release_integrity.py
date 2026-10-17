@@ -41,6 +41,8 @@ ENTRY_POINT_NAME = "agent365"
 TITLE_LIMIT = 250
 NOTES_LIMIT = 125_000
 ALLOWED_HOSTS = frozenset({"api.github.com", "uploads.github.com"})
+PYPI_HOSTS = frozenset({"pypi.org"})
+_MAX_RELEASE_PAGES = 100
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _TOKEN_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+\b")
@@ -344,27 +346,57 @@ def evaluate(repo: Path, tag_ref: str) -> ReleaseNotes:
     )
 
 
-def assert_reachable(repo: Path, sha: str) -> None:
-    """Fail unless ``sha`` is contained in ``origin/main``."""
-    if _SHA.fullmatch(sha) is None:
-        raise ReleaseIntegrityError("release sha must be a 40-character hex commit id")
+def _git(repo: Path, args: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    if not args or args[0] != "git":
+        raise ReleaseIntegrityError("refusing to run a non-git command")
     try:
-        completed = subprocess.run(
-            ["git", "merge-base", "--is-ancestor", sha, "origin/main"],
+        return subprocess.run(
+            list(args),
             cwd=repo,
             check=False,
             capture_output=True,
             text=True,
         )
     except OSError as exc:
-        raise ReleaseIntegrityError(f"could not run git merge-base: {exc}") from exc
+        raise ReleaseIntegrityError(f"could not run git: {exc}") from exc
+
+
+def assert_reachable(repo: Path, sha: str) -> None:
+    """Fail unless ``sha`` is contained in ``origin/main``."""
+    if _SHA.fullmatch(sha) is None:
+        raise ReleaseIntegrityError("release sha must be a 40-character hex commit id")
+    completed = _git(repo, ["git", "merge-base", "--is-ancestor", sha, "origin/main"])
     if completed.returncode != 0:
         raise ReleaseIntegrityError(
             f"{sha} is not reachable from origin/main; refusing to publish"
         )
 
 
+def assert_worktree(repo: Path, sha: str) -> None:
+    """Fail unless HEAD is ``sha`` and the worktree matches that commit.
+
+    ``evaluate`` reads the working tree. Ancestry alone would let a dirty
+    tree, or a checkout of a different commit, describe files that are not
+    the tagged commit.
+    """
+    if _SHA.fullmatch(sha) is None:
+        raise ReleaseIntegrityError("release sha must be a 40-character hex commit id")
+    head = _git(repo, ["git", "rev-parse", "HEAD"])
+    resolved = head.stdout.strip()
+    if head.returncode != 0 or resolved != sha:
+        raise ReleaseIntegrityError(
+            f"worktree HEAD is not {sha}; refusing to publish a tree other than "
+            "the tagged commit"
+        )
+    status = _git(repo, ["git", "status", "--porcelain", "--untracked-files=no"])
+    if status.returncode != 0 or status.stdout.strip():
+        raise ReleaseIntegrityError(
+            "worktree differs from the tagged commit; refusing to publish"
+        )
+
+
 def check(repo: Path, tag_ref: str, sha: str | None = None) -> ReleaseNotes:
+    """Compare versions and, when ``sha`` is set, bind the worktree to it."""
     problems: list[str] = []
     notes: ReleaseNotes | None = None
     try:
@@ -372,6 +404,10 @@ def check(repo: Path, tag_ref: str, sha: str | None = None) -> ReleaseNotes:
     except ReleaseIntegrityError as exc:
         problems.extend(exc.problems)
     if sha is not None:
+        try:
+            assert_worktree(repo, sha)
+        except ReleaseIntegrityError as exc:
+            problems.extend(exc.problems)
         try:
             assert_reachable(repo, sha)
         except ReleaseIntegrityError as exc:
@@ -676,6 +712,121 @@ def _guard_url(url: str) -> None:
         raise ReleaseIntegrityError("refusing a URL that embeds credentials")
 
 
+def _guard_pypi_url(url: str) -> None:
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme != "https" or parsed.hostname not in PYPI_HOSTS:
+        host = parsed.hostname or "unknown"
+        raise ReleaseIntegrityError(f"refusing PyPI digest lookup to {host}")
+    if parsed.username or parsed.password:
+        raise ReleaseIntegrityError("refusing a URL that embeds credentials")
+
+
+def _pypi_json_url(version: str) -> str:
+    tag_from_ref(f"v{version}")
+    quoted = urllib.parse.quote(version, safe="")
+    return f"https://pypi.org/pypi/{PACKAGE_NAME}/{quoted}/json"
+
+
+def pypi_sha256(version: str, transport: Transport) -> dict[str, str]:
+    """Return filename → sha256 from the PyPI JSON API. No credentials are sent."""
+    url = _pypi_json_url(version)
+    _guard_pypi_url(url)
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "hermes-a365-release-integrity",
+    }
+    try:
+        result = transport("GET", url, None, headers)
+    except ReleaseIntegrityError:
+        raise
+    except Exception as exc:
+        raise ReleaseIntegrityError(f"PyPI digest lookup failed: {exc}") from None
+    if result.status == 404:
+        raise ReleaseIntegrityError(
+            f"PyPI has no {PACKAGE_NAME} {version}; refusing to upload release assets"
+        )
+    if result.status != 200:
+        raise ReleaseIntegrityError(
+            f"PyPI digest lookup returned {result.status}; refusing to upload release assets"
+        )
+    try:
+        payload = json.loads(result.body.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise ReleaseIntegrityError("PyPI digest response was not JSON") from exc
+    urls = payload.get("urls") if isinstance(payload, dict) else None
+    if not isinstance(urls, list):
+        raise ReleaseIntegrityError("PyPI digest response has no file list")
+    digests: dict[str, str] = {}
+    for item in urls:
+        if not isinstance(item, dict):
+            raise ReleaseIntegrityError("PyPI file entry was not an object")
+        filename = item.get("filename")
+        digest_map = item.get("digests")
+        if not isinstance(filename, str) or not filename:
+            raise ReleaseIntegrityError("PyPI file entry is missing a filename")
+        if not isinstance(digest_map, dict):
+            raise ReleaseIntegrityError(f"PyPI file {filename} has no digests")
+        digest = digest_map.get("sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise ReleaseIntegrityError(f"PyPI file {filename} has no sha256 digest")
+        try:
+            int(digest, 16)
+        except ValueError as exc:
+            raise ReleaseIntegrityError(f"PyPI file {filename} has a malformed sha256") from exc
+        normalized = digest.lower()
+        previous = digests.get(filename)
+        if previous is not None and previous != normalized:
+            raise ReleaseIntegrityError(f"PyPI returned conflicting sha256 values for {filename}")
+        digests[filename] = normalized
+    return digests
+
+
+def assert_pypi_digests(
+    version: str,
+    paths: Sequence[Path],
+    transport: Transport,
+) -> None:
+    """Refuse unless each file's sha256 is the digest PyPI publishes for that name."""
+    digests = pypi_sha256(version, transport)
+    for path in paths:
+        remote = digests.get(path.name)
+        if remote is None:
+            raise ReleaseIntegrityError(
+                f"PyPI has no {path.name} for {version}; refusing to upload release assets"
+            )
+        local = hashlib.sha256(path.read_bytes()).hexdigest()
+        if remote != local:
+            raise ReleaseIntegrityError(
+                f"sha256 of {path.name} does not match PyPI; refusing to upload release assets"
+            )
+
+
+def _default_pypi_transport() -> Transport:
+    def transport(
+        method: str,
+        url: str,
+        body: bytes | None,
+        headers: Mapping[str, str],
+    ) -> HttpResult:
+        _guard_pypi_url(url)
+        if any(key.lower() == "authorization" for key in headers):
+            raise ReleaseIntegrityError("refusing to send credentials to pypi.org")
+        request = urllib.request.Request(url, data=body, headers=dict(headers), method=method)
+        opener = urllib.request.build_opener(_NoRedirect())
+        try:
+            with opener.open(request, timeout=120) as response:
+                raw_headers = {key: value for key, value in response.headers.items()}
+                return HttpResult(response.status, raw_headers, response.read())
+        except urllib.error.HTTPError as exc:
+            payload = exc.read()
+            raw_headers = {key: value for key, value in exc.headers.items()}
+            return HttpResult(exc.code, raw_headers, payload)
+        except urllib.error.URLError as exc:
+            raise ReleaseIntegrityError(f"PyPI digest lookup failed: {exc.reason}") from None
+
+    return transport
+
+
 def _default_transport(token: str) -> Transport:
     def transport(
         method: str,
@@ -718,7 +869,13 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 class GitHubReleases:
     """Update one release for an existing tag. Never creates a git ref."""
 
-    def __init__(self, repository: str, token: str, transport: Transport) -> None:
+    def __init__(
+        self,
+        repository: str,
+        token: str,
+        transport: Transport,
+        pypi_transport: Transport | None = None,
+    ) -> None:
         if _REPO.fullmatch(repository) is None:
             raise ReleaseIntegrityError(f"unexpected repository id {repository!r}")
         if not token:
@@ -726,10 +883,14 @@ class GitHubReleases:
         self.repository = repository
         self.token = token
         self.transport = transport
+        self.pypi_transport = pypi_transport or _default_pypi_transport()
 
-    def publish(self, notes: ReleaseNotes, dist: Path) -> str:
+    def publish(self, notes: ReleaseNotes, dist: Path, *, expected_sha: str) -> str:
         wheel, sdist, sums = verify_checksums(dist)
-        self._require_tag(notes.tag)
+        self._require_tag(notes.tag, expected_sha)
+        # Compare to the files PyPI holds before any release write. A mismatch
+        # leaves the GitHub Release unchanged.
+        assert_pypi_digests(notes.version, [wheel, sdist], self.pypi_transport)
         existing = self._get_release(notes.tag)
         plan = plan_release(notes, self._list_releases())
         if existing is None:
@@ -795,7 +956,9 @@ class GitHubReleases:
     def _api(self, path: str) -> str:
         return f"https://api.github.com/repos/{self.repository}{path}"
 
-    def _require_tag(self, tag: str) -> None:
+    def _require_tag(self, tag: str, expected_sha: str) -> None:
+        if _SHA.fullmatch(expected_sha) is None:
+            raise ReleaseIntegrityError("release sha must be a 40-character hex commit id")
         tag_from_ref(tag)
         quoted = urllib.parse.quote(tag, safe="")
         result = self._request_status("GET", self._api(f"/git/ref/tags/{quoted}"))
@@ -807,6 +970,32 @@ class GitHubReleases:
             )
         if result.status >= 400:
             self._fail(result)
+        resolved = self._tag_commit_sha(tag, self._json_object(result))
+        if resolved != expected_sha:
+            raise ReleaseIntegrityError(
+                f"tag {tag} resolves to {resolved}, not the workflow commit {expected_sha}"
+            )
+
+    def _tag_commit_sha(self, tag: str, payload: Mapping[str, object]) -> str:
+        obj = payload.get("object")
+        if not isinstance(obj, dict):
+            raise ReleaseIntegrityError(f"tag {tag} response did not include an object")
+        obj_sha = obj.get("sha")
+        obj_type = obj.get("type")
+        if not isinstance(obj_sha, str) or _SHA.fullmatch(obj_sha) is None:
+            raise ReleaseIntegrityError(f"tag {tag} is missing a commit sha")
+        if obj_type == "commit":
+            return obj_sha
+        if obj_type != "tag":
+            raise ReleaseIntegrityError(f"tag {tag} does not resolve to a commit")
+        peeled = self._request("GET", self._api(f"/git/tags/{obj_sha}"))
+        peeled_obj = self._json_object(peeled).get("object")
+        if not isinstance(peeled_obj, dict) or peeled_obj.get("type") != "commit":
+            raise ReleaseIntegrityError(f"annotated tag {tag} did not peel to a commit")
+        commit_sha = peeled_obj.get("sha")
+        if not isinstance(commit_sha, str) or _SHA.fullmatch(commit_sha) is None:
+            raise ReleaseIntegrityError(f"annotated tag {tag} is missing a commit sha")
+        return commit_sha
 
     def _get_release(self, tag: str) -> dict[str, object] | None:
         quoted = urllib.parse.quote(tag, safe="")
@@ -823,9 +1012,14 @@ class GitHubReleases:
     def _list_releases(self) -> list[RemoteRelease]:
         releases: list[RemoteRelease] = []
         url: str | None = self._api("/releases?per_page=100")
-        for _page in range(10):
-            if url is None:
-                break
+        pages = 0
+        while url is not None:
+            if pages >= _MAX_RELEASE_PAGES:
+                raise ReleaseIntegrityError(
+                    "GitHub release list is still paginated after "
+                    f"{_MAX_RELEASE_PAGES} pages; refusing to choose Latest"
+                )
+            pages += 1
             result = self._request("GET", url)
             payload = json.loads(result.body.decode("utf-8"))
             if not isinstance(payload, list):
@@ -1039,6 +1233,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     publish.add_argument("--metadata", type=Path, required=True)
     publish.add_argument("--notes", type=Path, required=True)
     publish.add_argument("--dist", type=Path, required=True)
+    publish.add_argument("--sha", required=True)
 
     args = parser.parse_args(argv)
     token = os.environ.get("GITHUB_TOKEN")
@@ -1072,7 +1267,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 token or "",
                 _default_transport(token or ""),
             )
-            client.publish(notes, args.dist)
+            client.publish(notes, args.dist, expected_sha=args.sha)
         else:  # pragma: no cover - argparse requires a known command
             raise ReleaseIntegrityError(f"unknown command {args.command}")
     except ReleaseIntegrityError as exc:

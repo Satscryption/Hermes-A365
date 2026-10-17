@@ -113,27 +113,54 @@ def _git(repo: Path, *args: str) -> str:
     return completed.stdout.strip()
 
 
+TAG_SHA = "a" * 40
+
+
 class FakeGitHub:
     def __init__(
         self,
         *,
         tag: str = "v1.2.3",
         tag_exists: bool = True,
+        tag_sha: str = TAG_SHA,
+        tag_type: str = "commit",
+        peeled_sha: str | None = None,
         release: dict | None = None,
         others: list[dict] | None = None,
+        release_pages: list[list[dict]] | None = None,
         token: str = "super-secret-token",
         fail: bool = False,
     ) -> None:
         self.tag = tag
         self.tag_exists = tag_exists
+        self.tag_sha = tag_sha
+        self.tag_type = tag_type
+        self.peeled_sha = peeled_sha
         self.release = release
         self.others = list(others or [])
+        self.release_pages = release_pages
         self.token = token
         self.fail = fail
         self.calls: list[tuple[str, str, bytes | None, dict[str, str]]] = []
         self.assets: dict[int, list[dict]] = {}
         if release is not None:
             self.assets[int(release["id"])] = list(release.get("assets") or [])
+
+    def _release_page(self, parsed: urllib.parse.ParseResult) -> mod.HttpResult:
+        query = urllib.parse.parse_qs(parsed.query)
+        page = int(query.get("page", ["1"])[0])
+        index = page - 1
+        pages = self.release_pages or []
+        if index < 0 or index >= len(pages):
+            return mod.HttpResult(200, {}, b"[]")
+        headers: dict[str, str] = {}
+        if index + 1 < len(pages):
+            next_url = (
+                "https://api.github.com/repos/octo/repo/releases?per_page=100&page="
+                f"{page + 1}"
+            )
+            headers["Link"] = f'<{next_url}>; rel="next"'
+        return mod.HttpResult(200, headers, json.dumps(pages[index]).encode())
 
     def __call__(self, method, url, body, headers):
         self.calls.append((method, url, body, dict(headers)))
@@ -148,18 +175,29 @@ class FakeGitHub:
                 raise AssertionError(method)
             if not self.tag_exists:
                 return mod.HttpResult(404, {}, b'{"message":"Not Found"}')
-            return mod.HttpResult(200, {}, b'{"object":{"type":"commit"}}')
+            payload = {"object": {"type": self.tag_type, "sha": self.tag_sha}}
+            return mod.HttpResult(200, {}, json.dumps(payload).encode())
+        if "/git/tags/" in path and method == "GET":
+            payload = {
+                "object": {"type": "commit", "sha": self.peeled_sha or self.tag_sha},
+            }
+            return mod.HttpResult(200, {}, json.dumps(payload).encode())
         if path.endswith("/releases") and method == "GET":
+            if self.release_pages is not None:
+                return self._release_page(parsed)
             payload = self.others + ([] if self.release is None else [self.release])
             return mod.HttpResult(200, {}, json.dumps(payload).encode())
         if "/releases/tags/" in path and method == "GET":
             wanted = path.rsplit("/", 1)[-1]
             if self.release is not None and wanted == urllib.parse.quote(self.tag, safe=""):
                 return mod.HttpResult(200, {}, json.dumps(self.release).encode())
+            candidates = list(self.others)
+            for page in self.release_pages or []:
+                candidates.extend(page)
             winner = next(
                 (
                     item
-                    for item in self.others
+                    for item in candidates
                     if wanted == urllib.parse.quote(item["tag_name"], safe="")
                 ),
                 None,
@@ -195,6 +233,53 @@ class FakeGitHub:
         if parsed.hostname == "uploads.github.com" and method == "POST":
             return mod.HttpResult(201, {}, b'{"state":"uploaded"}')
         raise AssertionError((method, url))
+
+
+class FakePyPI:
+    def __init__(
+        self,
+        digests: dict[str, str] | None = None,
+        *,
+        status: int = 200,
+        fail: bool = False,
+    ) -> None:
+        self.digests = dict(digests or {})
+        self.status = status
+        self.fail = fail
+        self.calls: list[tuple[str, str, dict[str, str]]] = []
+
+    def __call__(self, method, url, body, headers):
+        del body
+        self.calls.append((method, url, dict(headers)))
+        assert "Authorization" not in headers
+        assert urllib.parse.urlparse(url).hostname == "pypi.org"
+        if self.fail:
+            raise RuntimeError("pypi unreachable")
+        if self.status != 200:
+            return mod.HttpResult(self.status, {}, b'{"message":"no"}')
+        urls = [
+            {"filename": name, "digests": {"sha256": digest}}
+            for name, digest in self.digests.items()
+        ]
+        return mod.HttpResult(200, {}, json.dumps({"urls": urls}).encode())
+
+
+def _matching_pypi(dist: Path) -> FakePyPI:
+    digests = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest()
+        for path in dist.iterdir()
+        if path.name != "SHA256SUMS"
+    }
+    return FakePyPI(digests)
+
+
+def _client(github: FakeGitHub, dist: Path, pypi: FakePyPI | None = None) -> mod.GitHubReleases:
+    return mod.GitHubReleases(
+        "octo/repo",
+        github.token,
+        github,
+        pypi_transport=pypi or _matching_pypi(dist),
+    )
 
 
 def _notes(tag: str = "v1.2.3", *, prerelease: bool = False) -> mod.ReleaseNotes:
@@ -354,6 +439,36 @@ def test_sha_must_be_full_hex_before_git_runs(monkeypatch: pytest.MonkeyPatch) -
     monkeypatch.setattr(mod.subprocess, "run", fail_git)
     with pytest.raises(mod.ReleaseIntegrityError, match="40-character"):
         mod.assert_reachable(Path("."), "HEAD; touch pwned")
+    with pytest.raises(mod.ReleaseIntegrityError, match="40-character"):
+        mod.assert_worktree(Path("."), "HEAD; touch pwned")
+
+
+def test_check_binds_the_worktree_to_the_requested_sha(tmp_path: Path) -> None:
+    root = _repo(tmp_path)
+    _git(root, "init", "-b", "main")
+    _git(root, "config", "user.email", "release-integrity@example.com")
+    _git(root, "config", "user.name", "release-integrity")
+    _git(root, "add", ".")
+    _git(root, "commit", "-m", "release")
+    sha = _git(root, "rev-parse", "HEAD")
+    _git(root, "update-ref", "refs/remotes/origin/main", sha)
+
+    mod.check(root, "refs/tags/v1.2.3", sha)
+
+    (root / "CHANGELOG.md").write_text(
+        (root / "CHANGELOG.md").read_text(encoding="utf-8") + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(mod.ReleaseIntegrityError, match="worktree differs"):
+        mod.check(root, "refs/tags/v1.2.3", sha)
+
+    _git(root, "checkout", "--", "CHANGELOG.md")
+    (root / "file").write_text("next\n", encoding="utf-8")
+    _git(root, "add", "file")
+    _git(root, "commit", "-m", "next")
+    _git(root, "update-ref", "refs/remotes/origin/main", _git(root, "rev-parse", "HEAD"))
+    with pytest.raises(mod.ReleaseIntegrityError, match="worktree HEAD is not"):
+        mod.check(root, "refs/tags/v1.2.3", sha)
 
 
 def test_check_combines_version_and_ancestry_failures(tmp_path: Path) -> None:
@@ -424,10 +539,11 @@ def test_smoke_accepts_the_development_install() -> None:
 
 def test_missing_tag_does_not_create_a_release_or_ref(tmp_path: Path) -> None:
     github = FakeGitHub(tag_exists=False)
-    client = mod.GitHubReleases("octo/repo", github.token, github)
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    client = _client(github, dist)
 
     with pytest.raises(mod.ReleaseIntegrityError, match="does not create or push tags"):
-        client.publish(_notes(), _dist(tmp_path, _metadata("1.2.3")))
+        client.publish(_notes(), dist, expected_sha=TAG_SHA)
 
     assert [call[0] for call in github.calls] == ["GET"]
     assert "/git/ref/tags/" in github.calls[0][1]
@@ -440,9 +556,10 @@ def test_existing_release_is_updated_without_touching_the_tag(tmp_path: Path) ->
         others=[_remote("v1.2.3", 4)],
     )
     github.assets[7] = [{"id": 11, "name": "hermes_a365-1.2.4-py3-none-any.whl"}]
-    client = mod.GitHubReleases("octo/repo", github.token, github)
+    dist = _dist(tmp_path, _metadata("1.2.4"), version="1.2.4")
+    client = _client(github, dist)
 
-    client.publish(_notes("v1.2.4"), _dist(tmp_path, _metadata("1.2.4"), version="1.2.4"))
+    client.publish(_notes("v1.2.4"), dist, expected_sha=TAG_SHA)
 
     methods = [call[0] for call in github.calls]
     assert "POST" in methods  # asset upload only
@@ -468,10 +585,10 @@ def test_existing_release_is_updated_without_touching_the_tag(tmp_path: Path) ->
 
 def test_create_uses_the_existing_tag_and_a_rerun_updates(tmp_path: Path) -> None:
     github = FakeGitHub(release=None, others=[_remote("v1.2.2", 3)])
-    client = mod.GitHubReleases("octo/repo", github.token, github)
     dist = _dist(tmp_path, _metadata("1.2.3"))
+    client = _client(github, dist)
 
-    client.publish(_notes(), dist)
+    client.publish(_notes(), dist, expected_sha=TAG_SHA)
     created = [
         json.loads(call[2].decode())
         for call in github.calls
@@ -482,7 +599,7 @@ def test_create_uses_the_existing_tag_and_a_rerun_updates(tmp_path: Path) -> Non
     assert "target_commitish" not in created[0]
     assert created[0]["generate_release_notes"] is False
 
-    client.publish(_notes(), dist)
+    client.publish(_notes(), dist, expected_sha=TAG_SHA)
     created_again = [
         call
         for call in github.calls
@@ -493,9 +610,10 @@ def test_create_uses_the_existing_tag_and_a_rerun_updates(tmp_path: Path) -> Non
 
 def test_older_release_moves_latest_back(tmp_path: Path) -> None:
     github = FakeGitHub(tag="v0.8.6", release=_remote("v0.8.6", 8), others=[_remote("v0.9.0", 4)])
-    client = mod.GitHubReleases("octo/repo", github.token, github)
+    dist = _dist(tmp_path, _metadata("0.8.6"), version="0.8.6")
+    client = _client(github, dist)
 
-    client.publish(_notes("v0.8.6"), _dist(tmp_path, _metadata("0.8.6"), version="0.8.6"))
+    client.publish(_notes("v0.8.6"), dist, expected_sha=TAG_SHA)
 
     patches = [
         (call[1], json.loads(call[2].decode()))
@@ -509,10 +627,11 @@ def test_older_release_moves_latest_back(tmp_path: Path) -> None:
 
 def test_api_errors_do_not_print_the_token(tmp_path: Path) -> None:
     github = FakeGitHub(fail=True, token="super-secret-token")
-    client = mod.GitHubReleases("octo/repo", github.token, github)
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    client = _client(github, dist)
 
     with pytest.raises(mod.ReleaseIntegrityError) as caught:
-        client.publish(_notes(), _dist(tmp_path, _metadata("1.2.3")))
+        client.publish(_notes(), dist, expected_sha=TAG_SHA)
 
     assert "super-secret-token" not in str(caught.value)
     assert "[redacted]" in str(caught.value)
@@ -523,6 +642,115 @@ def test_credentials_are_not_sent_off_github() -> None:
         mod._guard_url("https://evil.example/repos")
     with pytest.raises(mod.ReleaseIntegrityError, match="credentials"):
         mod._guard_url("https://user:super-secret-token@api.github.com/repos")
+    with pytest.raises(mod.ReleaseIntegrityError, match=r"pypi\.org"):
+        mod._guard_url("https://pypi.org/pypi/hermes-a365/1.2.3/json")
+
+
+def test_tag_must_resolve_to_the_workflow_sha(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    github = FakeGitHub(tag_sha="b" * 40)
+    client = _client(github, dist)
+
+    with pytest.raises(mod.ReleaseIntegrityError, match="not the workflow commit"):
+        client.publish(_notes(), dist, expected_sha=TAG_SHA)
+
+    assert [call[0] for call in github.calls] == ["GET"]
+    assert not any(call[0] in {"POST", "PATCH", "DELETE"} for call in github.calls)
+
+
+def test_annotated_tag_is_peeled_before_the_sha_check(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    github = FakeGitHub(tag_type="tag", tag_sha="c" * 40, peeled_sha=TAG_SHA)
+    client = _client(github, dist)
+
+    client.publish(_notes(), dist, expected_sha=TAG_SHA)
+
+    assert any("/git/tags/" in call[1] for call in github.calls)
+
+
+def test_pypi_digest_mismatch_does_not_replace_assets(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    github = FakeGitHub(release=_remote("v1.2.3", 7))
+    pypi = FakePyPI(
+        {
+            "hermes_a365-1.2.3-py3-none-any.whl": "0" * 64,
+            "hermes_a365-1.2.3.tar.gz": "1" * 64,
+        }
+    )
+    client = _client(github, dist, pypi)
+
+    with pytest.raises(mod.ReleaseIntegrityError, match="does not match PyPI"):
+        client.publish(_notes(), dist, expected_sha=TAG_SHA)
+
+    assert pypi.calls
+    assert all("Authorization" not in call[2] for call in pypi.calls)
+    assert not any(call[0] in {"POST", "PATCH", "DELETE"} for call in github.calls)
+
+
+def test_missing_pypi_file_refuses_before_upload(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    github = FakeGitHub()
+    wheel = next(path.name for path in dist.iterdir() if path.suffix == ".whl")
+    pypi = FakePyPI({wheel: hashlib.sha256((dist / wheel).read_bytes()).hexdigest()})
+    client = _client(github, dist, pypi)
+
+    with pytest.raises(mod.ReleaseIntegrityError, match="PyPI has no"):
+        client.publish(_notes(), dist, expected_sha=TAG_SHA)
+
+    assert not any(call[0] in {"POST", "PATCH", "DELETE"} for call in github.calls)
+
+
+def test_unreachable_pypi_refuses_before_upload(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    github = FakeGitHub()
+    client = _client(github, dist, FakePyPI(fail=True))
+
+    with pytest.raises(mod.ReleaseIntegrityError, match="PyPI digest lookup failed"):
+        client.publish(_notes(), dist, expected_sha=TAG_SHA)
+
+    assert not any(call[0] in {"POST", "PATCH", "DELETE"} for call in github.calls)
+
+
+def test_newer_stable_release_past_the_first_page_blocks_latest(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("0.8.6"), version="0.8.6")
+    github = FakeGitHub(
+        tag="v0.8.6",
+        release=_remote("v0.8.6", 8),
+        release_pages=[
+            [_remote("v0.0.1", 1)],
+            [_remote("v9.9.9", 50)],
+        ],
+    )
+    client = _client(github, dist)
+
+    client.publish(_notes("v0.8.6"), dist, expected_sha=TAG_SHA)
+
+    patches = [
+        json.loads(call[2].decode())
+        for call in github.calls
+        if call[0] == "PATCH" and call[2] is not None
+    ]
+    assert patches[0]["make_latest"] == "false"
+    assert patches[1] == {"make_latest": "true"}
+    assert any(call[1].endswith("/releases/50") for call in github.calls)
+
+
+def test_incomplete_release_pagination_refuses_to_choose_latest(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(mod, "_MAX_RELEASE_PAGES", 1)
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    github = FakeGitHub(
+        release=_remote("v1.2.3", 7),
+        release_pages=[[_remote("v0.0.1", 1)], [_remote("v9.9.9", 50)]],
+    )
+    client = _client(github, dist)
+
+    with pytest.raises(mod.ReleaseIntegrityError, match="still paginated"):
+        client.publish(_notes(), dist, expected_sha=TAG_SHA)
+
+    assert not any(call[0] in {"POST", "PATCH", "DELETE"} for call in github.calls)
 
 
 def test_workflow_and_script_do_not_push_tags() -> None:

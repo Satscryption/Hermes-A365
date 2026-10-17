@@ -11,7 +11,8 @@ name: Publish to PyPI
 # push runs integrity and the hermetic test suite, builds once, and only
 # then enters the protected pypi environment. After PyPI accepts those
 # artifacts, the release job rewrites that one GitHub Release. A rerun
-# skips files already on PyPI and edits the same release.
+# skips files already on PyPI. The finalizer uploads assets only when
+# their sha256 matches the PyPI JSON API digests for that version.
 
 on:
   push:
@@ -105,8 +106,20 @@ jobs:
       - name: Build sdist + wheel
         # --no-isolation: use the hash-pinned hatchling above instead of
         # letting `build` resolve an unpinned backend at build time.
+        # SOURCE_DATE_EPOCH is the checked-out commit's committer time so a
+        # later rerun rebuilds the same bytes. The value is a git timestamp,
+        # checked as decimal digits, and is not taken from the shell command line.
         run: |
+          set -euo pipefail
           rm -rf dist
+          epoch="$(git log -1 --format=%ct HEAD)"
+          case "$epoch" in
+            ''|*[!0-9]*)
+              echo "refusing non-numeric commit timestamp" >&2
+              exit 1
+              ;;
+          esac
+          export SOURCE_DATE_EPOCH="$epoch"
           python -m build --no-isolation
 
       - name: Sanity-check artefacts
@@ -118,7 +131,10 @@ jobs:
             || (echo "Missing package data in wheel!" && exit 1)
 
       - name: Record artefact digests
-        run: find dist -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
+        run: |
+          set -euo pipefail
+          find dist -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
+          cp dist/SHA256SUMS "$RUNNER_TEMP/SHA256SUMS.before-smoke"
 
       - name: Check distribution metadata
         run: |
@@ -143,6 +159,15 @@ jobs:
           "$RUNNER_TEMP/wheel-smoke/bin/pip" install --disable-pip-version-check dist/*.whl
           "$RUNNER_TEMP/wheel-smoke/bin/python" scripts/release_integrity.py smoke \
             --expected-version "$version"
+
+      - name: Re-verify artefact digests after smoke
+        # pip install can rewrite the wheel it was given. Compare against the
+        # copy taken before smoke so a rewritten wheel and a rewritten
+        # manifest cannot agree with each other and still be published.
+        run: |
+          set -euo pipefail
+          sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS.before-smoke"
+          cmp dist/SHA256SUMS "$RUNNER_TEMP/SHA256SUMS.before-smoke"
 
       - name: Upload artefacts for the publish job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -231,7 +256,12 @@ jobs:
     # uploads assets. The checkout token is not stored, and the finalizer
     # refuses to create a ref. No id-token, so this job cannot mint PyPI
     # credentials. No environment: the reviewer gate already ran on publish.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # The expression is implicitly success(), so a failed publish job does
+    # not reach here. approval_test skips the PyPI action, so it must not
+    # rewrite the release either.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') &&
+      (github.event_name != 'workflow_dispatch' || inputs.approval_test != true)
     permissions:
       contents: write
     steps:
@@ -260,9 +290,11 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           python scripts/release_integrity.py publish-release \
             --metadata release-metadata/metadata.json \
             --notes release-metadata/notes.md \
-            --dist dist
+            --dist dist \
+            --sha "$RELEASE_SHA"

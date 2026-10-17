@@ -24,9 +24,12 @@ promoted.
 ## Before you mint the tag
 
 1. Merge to protected `main`. The commit that will be tagged has to be
-   reachable from `origin/main`. Target `main` in the Release UI; a
-   side-branch commit fails the workflow and the tag cannot be moved or
-   deleted.
+   reachable from `origin/main`. Target `main` in the Release UI. The
+   preflight rejects a commit that is not an ancestor of `origin/main`
+   when the tagged commit still contains this workflow. A tag cannot be
+   moved or deleted afterwards. Tag pushes run the workflow file that is
+   in the tagged commit, so a side-branch commit that removes the
+   preflight does not fail closed by itself. See the approval note below.
 2. Set `project.version` in `pyproject.toml` and `__version__` in
    `src/hermes_a365/__init__.py` to the same `MAJOR.MINOR.PATCH`.
 3. Rename this file's `## Unreleased / X.Y.Z` heading to exactly:
@@ -52,7 +55,8 @@ promoted.
      --output-dir /tmp/hermes-a365-release-check
    ```
 
-   `--sha` checks that `HEAD` is contained in `origin/main`. Inspect
+   `--sha` checks that `HEAD` is that commit, that the worktree matches
+   it, and that the commit is contained in `origin/main`. Inspect
    `/tmp/hermes-a365-release-check/notes.md` and `metadata.json`. Do not
    publish those files yourself.
 
@@ -80,25 +84,40 @@ Publishing the release creates `refs/tags/vX.Y.Z` and starts
 2. **test:** the same hermetic ruff and pytest suite as pull requests,
    on Python 3.11 and 3.14, against the tagged commit.
 3. **build** (no PyPI credential): hash-pinned `build` / hatchling,
+   with `SOURCE_DATE_EPOCH` set from the tagged commit's committer time,
    sdist and wheel, core-metadata validation (name, version,
    `Requires-Python` covering 3.11 and 3.14, markdown description),
    and a fresh-environment install of that wheel (`import hermes_a365`,
    `hermes-a365 --help`, the `hermes_agent.plugins` entry point,
-   `plugin.yaml`, and the packaged templates).
+   `plugin.yaml`, and the packaged templates). Digests are recorded
+   before that install and checked again afterwards.
 4. **publish:** waits for the required `pypi` environment reviewer,
    checks the artifact checksums, and uploads those same files.
    `skip-existing` makes a rerun skip a file PyPI already has. The
    approval-test dispatch still enters this environment and still skips
-   the PyPI action.
-5. **release** (only after PyPI succeeds, only for a `v*` tag): updates
-   the UI release in place, or creates the release object if the tag
-   already exists and the release object does not. Title is
+   the PyPI action. It does not continue on to rewrite the GitHub Release.
+5. **release** (only after PyPI succeeds, only for a `v*` tag, and not
+   for an approval-test dispatch): updates the UI release in place, or
+   creates the release object if the tag already exists and the release
+   object does not. The tag must resolve to the workflow commit. Title is
    `vX.Y.Z — <first sentence>`. Notes are the changelog section.
    A semver prerelease stays a prerelease and is not Latest. A stable
    version is Latest only when no other stable release is newer or
-   equal, so a back-filled patch cannot steal Latest. The wheel, sdist,
-   and `SHA256SUMS` are attached, replacing any previous copies of
-   those names.
+   equal, so a back-filled patch cannot steal Latest. Before any asset
+   is replaced, the wheel and sdist sha256 must match the digests the
+   PyPI JSON API publishes for that version. The wheel, sdist, and
+   `SHA256SUMS` are then attached, replacing any previous copies of
+   those names. A mismatch fails and leaves the release unchanged.
+
+## Before you approve the pypi deployment
+
+The `pypi` environment has no deployment branch policy, and this
+repository's settings are left that way. A tag push runs
+`.github/workflows/publish.yml` from the tagged commit, not from the
+tip of `main`. Before approving the deployment, confirm the tagged
+commit is on `main` (the run's SHA is an ancestor of `main`). A tag
+that points at a side-branch commit which deletes the preflight still
+reaches this reviewer.
 
 There is still one release for the tag. The workflow never creates a
 second one and never creates a tag.
@@ -109,10 +128,17 @@ second one and never creates a tag.
   be deleted. Fix forward with a new patch version. Do not point the
   tag at a different commit.
 - PyPI succeeded and **Finalize the GitHub Release** failed: use
-  **Re-run failed jobs**. That reruns the release job only. It does not
-  ask for a second PyPI approval and does not upload the files again.
-- **Re-run all jobs** waits for the `pypi` reviewer again, then skips
-  files that are already on PyPI, then edits the same release.
+  **Re-run failed jobs**. That reruns the release job only. It reuses
+  the original artifact, does not ask for a second PyPI approval, and
+  does not upload the distributions to PyPI again. It still refuses to
+  replace GitHub Release assets unless their sha256 matches PyPI.
+- **Re-run all jobs** rebuilds the tagged commit with
+  `SOURCE_DATE_EPOCH` set to that commit's committer time, waits for
+  the `pypi` reviewer again, and skips files PyPI already has. The
+  release job then compares the rebuilt wheel and sdist to the sha256
+  digests PyPI publishes. It uploads those assets only when every
+  digest matches. If the rebuilt bytes differ, the finalizer fails and
+  does not replace the GitHub Release files.
 
 ## What not to change
 
