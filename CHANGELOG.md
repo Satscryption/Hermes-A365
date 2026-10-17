@@ -11,13 +11,18 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - **#158:** ``installationUpdate`` remove hard-interrupts the in-flight Hermes
   model turn (the same ``request_hard_interrupt`` path as the inactivity
   watchdog) on every matched conversation, not only the asyncio session
-  waiter. Sibling turns are signalled together before any 5s cancel wait.
-  The session-key mapping stays until that turn has finished or the
-  interrupt succeeded with no worker left, including when
+  waiter. The interrupt runs on a worker thread inside a 5s bound so a
+  blocked commit fence cannot stall the gateway loop; on timeout uninstall
+  logs and continues. Sibling turns are interrupted together only after the
+  cancellable outbound phase returns, and still before personal teardown
+  waits, so one session cannot serialise the rest. A second cancel before
+  that commit leaves the sibling turn running. If a turn was already
+  interrupted, rollback drops its deferred turn-buffer retry so that retry
+  cannot post. The session-key mapping stays until that turn has finished
+  or the interrupt succeeded with no worker left, including when
   ``_active_sessions`` was already released, and is not dropped when cancel
   fails or a drain task replaced the slot. Live session tasks count toward
-  the active-turn cap. A second cancel of uninstall still rolls back a chat
-  that never entered teardown without leaving its turn guard set.
+  the active-turn cap.
 
 ## [0.9.0] — 2026-10-16
 
