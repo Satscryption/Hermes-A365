@@ -6,6 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased / 0.9.1]
 
+### Fixed
+
+- **Orphan agentic-user ownership accepts the real owner again.** When
+  `agentRegistry` no longer lists an instance for a typed orphan user id,
+  cleanup now follows `users/{id}.identityParentId` to
+  `servicePrincipals/{id}/microsoft.graph.agentIdentity` for the parent
+  blueprint proof (instead of treating the user object id as a service
+  principal). Live `az rest` Graph 403s surface the same permission hint as
+  in-body error JSON (`AgentRegistry.Read.All`, `User.Read.All`,
+  `AgentIdentity.Read.All`, or broader directory read). Wrong-blueprint and
+  unproven lookups are still refused.
 - #155: a buffered Copilot Chat turn that is still open inside the ~45s
   idle window posts a Bot Framework streaming informative update from
   a background task, then a `streamType=final` activity immediately
@@ -43,8 +54,8 @@ down afterwards).
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
 - #158: uninstall drops the reply but does not yet cancel the in-flight
   model turn (cost only).
-- #159: the orphan-cleanup Graph ownership check also refuses the real
-  owner (fails closed).
+- #159: the orphan-cleanup Graph ownership check also refused the real
+  owner (fixed in 0.9.1).
 - #160: the bridge allowlist is read only from the per-agent env.
 - #161: Teams 1:1 replies can stay greyed with a Stop button.
 
