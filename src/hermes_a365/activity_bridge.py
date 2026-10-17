@@ -1541,9 +1541,11 @@ def resolve_sender_allowlist(
 def _agent_envs_for_sender_policy(hermes_home: Path, slug: str) -> list[dict[str, str]]:
     """Per-agent env files that may state a sender policy.
 
-    A slug checks that one agent, the file ``serve --slug`` reads. An
-    empty slug checks every agent directory so an unscoped gateway cannot
-    ignore a per-agent policy ``serve`` would refuse for that slug.
+    A slug checks that one agent, the file ``serve --slug`` reads via
+    :func:`load_agent_env` (symlinks followed). An empty slug checks every
+    agent directory the same way, so an unscoped gateway cannot ignore a
+    per-agent policy behind a symlink that ``serve --slug`` would refuse.
+    Directories that resolve to the same path are checked once.
     """
     if slug:
         path = hermes_home / "agents" / slug / ".env"
@@ -1554,13 +1556,19 @@ def _agent_envs_for_sender_policy(hermes_home: Path, slug: str) -> list[dict[str
     if not root.is_dir():
         return []
     envs: list[dict[str, str]] = []
-    children = sorted(
-        (item for item in root.iterdir() if item.is_dir()),
-        key=lambda item: item.name,
-    )
-    for child in children:
-        if child.is_symlink() or not (child / ".env").exists():
+    seen: set[Path] = set()
+    for child in sorted(root.iterdir(), key=lambda item: item.name):
+        try:
+            if not child.is_dir() or not (child / ".env").exists():
+                continue
+            resolved = child.resolve()
+        except OSError as exc:
+            raise BridgeConfigError(
+                f"cannot inspect agent directory {child.name}; refusing to start"
+            ) from exc
+        if resolved in seen:
             continue
+        seen.add(resolved)
         try:
             validate_slug(child.name)
         except ValueError:

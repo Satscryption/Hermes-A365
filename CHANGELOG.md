@@ -27,7 +27,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   profile file is missing or present and silent. Startup also refuses when
   the file and the process disagree, when the per-agent file sets a policy
   the profile does not, or when the two files differ. An unscoped gateway
-  (no slug) still refuses if any per-agent env states a conflicting policy.
+  (no slug) still refuses if any per-agent env states a conflicting policy,
+  including when that agent directory is a symlink.
   If neither file sets a policy, both runtimes deny every end user. An empty
   allowlist is not allow-all. A Hermes allow does not widen the shared policy.
 - **`activity-bridge serve` refuses a group- or world-readable profile `.env`.**

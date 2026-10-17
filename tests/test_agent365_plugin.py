@@ -15274,6 +15274,57 @@ class TestSenderAllowlistAgreement:
             adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={}))
         assert "user-b" not in str(raised.value)
 
+    def test_symlinked_agent_dir_conflict_refuses_gateway_and_serve(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from hermes_a365.activity_bridge import BridgeConfigError, load_bridge_config
+
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+        monkeypatch.setenv("A365_ALLOWED_USERS", "user-a")
+        home = self._home(monkeypatch)
+        self._write(home / ".env", "A365_ALLOWED_USERS=user-a\n")
+        target = tmp_path / "real-agent"
+        self._write(
+            target / ".env",
+            "A365_TENANT_ID=2699fca3-dac6-40a2-bcea-62ce05e2ee9b\n"
+            "A365_ALLOWED_USERS=user-b\n",
+        )
+        link = home / "agents" / "inbox-helper"
+        link.parent.mkdir(parents=True, exist_ok=True)
+        link.symlink_to(target, target_is_directory=True)
+        generated = tmp_path / "a365.generated.config.json"
+        self._write(
+            generated,
+            '{"agentBlueprintId":"bp","agentBlueprintClientSecret":"sek"}\n',
+        )
+
+        def serve() -> str:
+            try:
+                load_bridge_config(
+                    slug="inbox-helper",
+                    webhook_url="https://hook.test/responder",
+                    hermes_home=home,
+                    generated_config_path=generated,
+                )
+            except BridgeConfigError as exc:
+                return str(exc)
+            raise AssertionError("serve accepted a conflicting symlinked agent env")
+
+        def gateway() -> str:
+            try:
+                adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={}))
+            except BridgeConfigError as exc:
+                return str(exc)
+            raise AssertionError("gateway accepted a conflicting symlinked agent env")
+
+        serve_error = serve()
+        gateway_error = gateway()
+        assert serve_error == gateway_error
+        assert "sender allowlists disagree" in serve_error
+        assert "user-a" not in serve_error
+        assert "user-b" not in serve_error
+
     def test_hermes_allow_cannot_widen_the_shared_policy(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
