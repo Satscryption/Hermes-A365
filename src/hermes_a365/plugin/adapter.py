@@ -1296,14 +1296,19 @@ class Agent365Adapter(BasePlatformAdapter):
             or generated_config_default
         )
 
-        self._allowed_users: tuple[str, ...] = tuple(
-            value.strip().lower()
-            for value in (_profile_env("A365_ALLOWED_USERS", "") or "").split(",")
-            if value.strip()
-        )
-        self._allow_all_users = (_profile_env(
-            "A365_ALLOW_ALL_USERS", ""
-        ) or "").strip().lower() in {"1", "true", "yes", "on"}
+        # #160: same resolver as ``load_bridge_config``. Profile file, process
+        # env, and per-agent env use one refusal rule, including when this
+        # gateway has no slug.
+        sender_policy = self._load_sender_allowlist()
+        self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
+        self._allow_all_users = sender_policy.allow_all_users
+        self._sender_allowlist_configured = sender_policy.configured
+        if not sender_policy.configured:
+            logger.warning(
+                "agent365 sender allowlist is not configured; denying every "
+                "end user until A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS "
+                "is set in the profile env"
+            )
 
         # Slice 19o — durable conversation registry keyed on
         # `conversation.id`. Persists to
@@ -1719,6 +1724,20 @@ class Agent365Adapter(BasePlatformAdapter):
         self._provider_secret = ""
         self._provider_bf_secret = ""
 
+    def _load_sender_allowlist(self) -> Any:
+        """Resolve the sender policy shared with ``activity-bridge serve``."""
+        bridge = _import_bridge()
+        scoped: dict[str, str] = {}
+        for key in bridge.SENDER_ALLOWLIST_ENV_KEYS:
+            value = _profile_env(key)
+            if value is not None:
+                scoped[key] = value
+        return bridge.resolve_runtime_sender_allowlist(
+            self._hermes_home,
+            process_env=scoped,
+            slug=self.slug or "",
+        )
+
     def _make_bridge_config(self) -> Any:
         """Construct a `BridgeConfig` for the bridge helpers (token
         acquisition, JWT validation, send_reply)."""
@@ -1962,6 +1981,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_type = bridge._activity_chat_type(activity)
             if bridge._activity_requires_end_user_auth(activity):
                 auth_check = getattr(self, "_is_sender_authorized", None)
+                alias_decisions: list[Any] = []
                 if callable(auth_check):
                     alias_decisions = [
                         auth_check(sender_id, chat_type, chat_id)
@@ -1984,21 +2004,35 @@ class Agent365Adapter(BasePlatformAdapter):
                         )
                 else:
                     decision = None
-                if decision is None:
-                    decision = bridge._activity_user_authorized(
-                        activity,
-                        allowed_users=self._allowed_users,
-                        allow_all=self._allow_all_users,
-                    )
-                    if decision and not self._allow_all_users:
+                # #160: the profile list is the decision ``serve`` uses.
+                # Hermes may not widen it. A Hermes deny is extra only for
+                # a sender that list also rejects — pairing often returns
+                # True for opaque ``from.id`` while the operator listed an
+                # AAD object id or UPN, and that sender is still admitted.
+                # The event identity is then the listed alias. On allow-all,
+                # the Hermes-true alias chosen above stays the event identity.
+                local_ok = bridge._activity_user_authorized(
+                    activity,
+                    allowed_users=self._allowed_users,
+                    allow_all=self._allow_all_users,
+                )
+                if not local_ok:
+                    decision = False
+                else:
+                    decision = True
+                    if not self._allow_all_users:
                         allowed = {
                             value.strip().lower()
                             for value in self._allowed_users
                             if value.strip()
                         }
-                        authorized_sender_id = next(
-                            candidate for candidate in sender_ids if candidate in allowed
-                        )
+                        listed = [
+                            sender_id
+                            for sender_id in sender_ids
+                            if sender_id in allowed
+                        ]
+                        if listed:
+                            authorized_sender_id = listed[0]
                 if not decision:
                     logger.warning("inbound 403 reason=unauthorized-end-user")
                     raise HTTPException(status_code=403, detail="end user is not authorized")
