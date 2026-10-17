@@ -17,6 +17,7 @@ from hermes_a365.cleanup import (
     CleanupError,
     CleanupInputs,
     CleanupResult,
+    _graph_get_from_mutator,
     _parse_kinds,
     _validate_confirm,
     build_cleanup_plan,
@@ -86,8 +87,12 @@ _BLUEPRINT_OBJECT_ID = "12121212-1212-1212-1212-121212121212"
 _SHARED_MANAGED_BY = "9b975845-388f-4429-889e-eab1ef63949c"
 _INSTANCE_IN_URL = re.compile(r"agentRegistry/agentInstances/([0-9a-fA-F-]{36})")
 _USER_IN_URL = re.compile(r"agentUserId eq '([0-9a-fA-F-]{36})'")
-_SP_IN_URL = re.compile(r"servicePrincipals/([0-9a-fA-F-]{36})")
-_APP_IN_URL = re.compile(r"applications\(appId='([0-9a-fA-F-]{36})'\)")
+_USER_OBJ_URL = re.compile(r"/users/([0-9a-fA-F-]{36})")
+_AGENT_IDENTITY_CAST_IN_URL = re.compile(
+    r"servicePrincipals/([0-9a-fA-F-]{36})/microsoft\.graph\.agentIdentity"
+)
+_APP_IN_URL = re.compile(r"applications\(appId='([0-9a-fA-F-]{36})'")
+_AGENT_IDENTITY_PARENT = "2a2a2a2a-2a2a-2a2a-2a2a-2a2a2a2a2a2a"
 
 
 def _graph_owned_by(blueprint_id: str):
@@ -113,13 +118,25 @@ def _graph_owned_by(blueprint_id: str):
                     }
                 ]
             }
-        principal = _SP_IN_URL.search(url)
-        if principal:
+        user_obj = _USER_OBJ_URL.search(url)
+        if user_obj:
             return {
-                "id": principal.group(1).lower(),
-                "appId": blueprint_id,
-                "agentIdentityBlueprintId": blueprint_id,
-                "managedBy": blueprint_id,
+                "id": user_obj.group(1).lower(),
+                "identityParentId": _AGENT_IDENTITY_PARENT,
+            }
+        cast = _AGENT_IDENTITY_CAST_IN_URL.search(url)
+        if cast:
+            sp_id = cast.group(1).lower()
+            if sp_id == _AGENT_IDENTITY_PARENT.lower():
+                return {
+                    "id": sp_id,
+                    "agentIdentityBlueprintId": blueprint_id,
+                }
+            return {
+                "error": {
+                    "code": "Request_ResourceNotFound",
+                    "message": "missing",
+                }
             }
         instance = _INSTANCE_IN_URL.search(url)
         return {
@@ -1757,6 +1774,181 @@ class TestOrphanOwnership:
                 graph_get=_graph_owned_by(_FOREIGN_BLUEPRINT),
             )
 
+    def test_orphan_user_proven_via_identity_parent_when_registry_empty(
+        self, tmp_path: Path
+    ) -> None:
+        # #159: after blueprint teardown the registry filter is often empty,
+        # but the agentic user still chains to the blueprint via identityParentId.
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            if _USER_IN_URL.search(url):
+                return {"value": []}
+            return _graph_owned_by(_OWNERSHIP_BLUEPRINT)(url)
+
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+            hermes_home=tmp_path,
+            additional_orphan_user_ids=(self._USER,),
+            graph_get=graph_get,
+        )
+        assert plan.orphan_user_ids == (self._USER,)
+
+    def test_orphan_user_requires_identity_parent_cast_not_direct_sp(
+        self, tmp_path: Path
+    ) -> None:
+        # Direct agentIdentity cast on the typed user id must not prove ownership.
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            if _USER_IN_URL.search(url):
+                return {"value": []}
+            if _USER_OBJ_URL.search(url):
+                return {"id": self._USER, "identityParentId": _AGENT_IDENTITY_PARENT}
+            if _AGENT_IDENTITY_CAST_IN_URL.search(url):
+                return {
+                    "error": {
+                        "code": "Request_ResourceNotFound",
+                        "message": "missing",
+                    }
+                }
+            return {"value": []}
+
+        with pytest.raises(CleanupError, match="did not prove"):
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
+
+    def test_orphan_user_foreign_parent_refused_when_registry_empty(
+        self, tmp_path: Path
+    ) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            if _USER_IN_URL.search(url):
+                return {"value": []}
+            if _USER_OBJ_URL.search(url):
+                return {"id": self._USER, "identityParentId": _AGENT_IDENTITY_PARENT}
+            cast = _AGENT_IDENTITY_CAST_IN_URL.search(url)
+            if cast:
+                return {
+                    "id": cast.group(1).lower(),
+                    "agentIdentityBlueprintId": _FOREIGN_BLUEPRINT,
+                }
+            return {"value": []}
+
+        with pytest.raises(CleanupError, match="different blueprint") as exc:
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
+        assert "--confirm-orphan-user" not in str(exc.value)
+
+    def test_graph_access_denied_surfaces_permission_hint(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(_url: str) -> dict[str, Any]:
+            return {
+                "error": {
+                    "code": "Authorization_RequestDenied",
+                    "message": "Insufficient privileges",
+                }
+            }
+
+        with pytest.raises(CleanupError, match="insufficient privileges") as exc:
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
+        assert "AgentRegistry.Read.All" in str(exc.value)
+        assert "AgentIdentity.Read.All" in str(exc.value)
+
+    def test_filter_403_does_not_mask_parent_miss_at_end(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            if _USER_IN_URL.search(url):
+                return {
+                    "error": {
+                        "code": "Authorization_RequestDenied",
+                        "message": "denied",
+                    }
+                }
+            if _USER_OBJ_URL.search(url):
+                return {"id": self._USER, "identityParentId": _AGENT_IDENTITY_PARENT}
+            if _AGENT_IDENTITY_CAST_IN_URL.search(url):
+                return {
+                    "error": {
+                        "code": "Request_ResourceNotFound",
+                        "message": "missing",
+                    }
+                }
+            return {"value": []}
+
+        with pytest.raises(CleanupError, match="did not prove") as exc:
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
+        assert "insufficient privileges" not in str(exc.value).lower()
+
+    def test_graph_access_denied_from_cli_invocation_error(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "Authorization_RequestDenied",
+                    "message": "Insufficient privileges to complete the operation.",
+                }
+            }
+        )
+
+        class _AzRest403(FakeMutator):
+            def run(
+                self,
+                argv: list[str],
+                *,
+                timeout: float = 60.0,
+                stdin_input: str | None = None,
+            ) -> RunResult:
+                if argv[:4] == ["az", "rest", "--method", "GET"]:
+                    raise CliInvocationError(argv, 403, body)
+                return super().run(argv, timeout=timeout, stdin_input=stdin_input)
+
+        graph_get = _graph_get_from_mutator(_AzRest403())
+
+        with pytest.raises(CleanupError, match="insufficient privileges") as exc:
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
+        assert "AgentIdentity.Read.All" in str(exc.value)
+
     def test_owned_user_is_planned_and_still_needs_double_entry(
         self, tmp_path: Path
     ) -> None:
@@ -1978,7 +2170,7 @@ class TestOrphanOwnership:
                         }
                     ]
                 }
-            if _SP_IN_URL.search(url):
+            if _AGENT_IDENTITY_CAST_IN_URL.search(url):
                 return {
                     "id": "99999999-9999-9999-9999-999999999999",
                     "agentIdentityBlueprintId": _OWNERSHIP_BLUEPRINT,
@@ -2015,10 +2207,14 @@ class TestOrphanOwnership:
                 return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
             if "$filter=" in url:
                 return {"value": []}
-            return {
-                "id": "99999999-9999-9999-9999-999999999999",
-                "agentIdentityBlueprintId": _OWNERSHIP_BLUEPRINT,
-            }
+            if _USER_OBJ_URL.search(url):
+                return {"id": self._USER}
+            if _AGENT_IDENTITY_CAST_IN_URL.search(url):
+                return {
+                    "id": "99999999-9999-9999-9999-999999999999",
+                    "agentIdentityBlueprintId": _OWNERSHIP_BLUEPRINT,
+                }
+            return {"value": []}
 
         with pytest.raises(CleanupError, match="does not match the typed id"):
             build_cleanup_plan(

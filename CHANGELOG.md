@@ -6,23 +6,42 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased / 0.9.1
 
+### Fixed
+
+- **Orphan agentic-user ownership accepts the real owner again.** When
+  `agentRegistry` no longer lists an instance for a typed orphan user id,
+  cleanup now follows `users/{id}.identityParentId` to
+  `servicePrincipals/{id}/microsoft.graph.agentIdentity` for the parent
+  blueprint proof (instead of treating the user object id as a service
+  principal). Live `az rest` Graph 403s surface the same permission hint as
+  in-body error JSON (`AgentRegistry.Read.All`, `User.Read.All`,
+  `AgentIdentity.Read.All`, or broader directory read). Wrong-blueprint and
+  unproven lookups are still refused.
+
+### Added
+
 - **#98: release-integrity preflight and GitHub Release finalization.**
   A `v*` tag is published only when it is strict semver, the tagged commit
   is reachable from `origin/main`, and that version is exactly
   `project.version`, `hermes_a365.__version__`, and one
   `## [X.Y.Z] — YYYY-MM-DD` section in this file. The check runs in a
-  credential-free job, before the protected `pypi` environment. The same
-  workflow runs the hermetic 3.11 and 3.14 suite, builds with the
-  hash-pinned toolchain, validates core metadata (including
-  `Requires-Python` covering 3.14), and smoke-installs the wheel. After
-  PyPI accepts those artifacts, the workflow rewrites the single GitHub
-  Release for the tag: changelog notes, title `vX.Y.Z — <theme>`, semver
-  Latest/prerelease classification, and the wheel, sdist, and checksums.
-  It does not create tags. The `Protect release tags` ruleset has no
-  bypass, so the operator mints the tag by publishing a GitHub Release.
-  See [`references/releasing.md`](references/releasing.md). A rerun edits
-  that release and skips files already on PyPI. `pyjwt[crypto]>=2.15.0`
-  is unchanged.
+  credential-free job, before the protected `pypi` environment, and the
+  worktree must be that commit. The same workflow runs the hermetic 3.11
+  and 3.14 suite, builds with the hash-pinned toolchain and
+  `SOURCE_DATE_EPOCH` taken from the commit, validates core metadata
+  (including `Requires-Python` covering 3.14), and smoke-installs the
+  wheel. After PyPI accepts those artifacts, the workflow rewrites the
+  single GitHub Release for the tag: changelog notes, title
+  `vX.Y.Z — <theme>`, semver Latest/prerelease classification, and the
+  wheel, sdist, and checksums. Assets are uploaded only when their sha256
+  matches the files PyPI has for that version, and only when the tag
+  resolves to the workflow commit. An approval-test dispatch does not
+  rewrite the release. The workflow does not create tags. The
+  `Protect release tags` ruleset has no bypass, so the operator mints the
+  tag by publishing a GitHub Release. See
+  [`references/releasing.md`](references/releasing.md). A rerun edits that
+  release and skips files already on PyPI. `pyjwt[crypto]>=2.15.0` is
+  unchanged.
 
 ## [0.9.0] — 2026-10-16
 
@@ -52,8 +71,8 @@ down afterwards).
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
 - #158: uninstall drops the reply but does not yet cancel the in-flight
   model turn (cost only).
-- #159: the orphan-cleanup Graph ownership check also refuses the real
-  owner (fails closed).
+- #159: the orphan-cleanup Graph ownership check also refused the real
+  owner (fixed in 0.9.1).
 - #160: the bridge allowlist is read only from the per-agent env.
 - #161: Teams 1:1 replies can stay greyed with a Stop button.
 
