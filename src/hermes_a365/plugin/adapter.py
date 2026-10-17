@@ -1216,9 +1216,9 @@ class Agent365Adapter(BasePlatformAdapter):
             or generated_config_default
         )
 
-        # #160: same resolver as ``load_bridge_config``. The profile env is
-        # the source of truth; a conflicting per-agent policy fails closed
-        # here so the gateway cannot serve a list the bridge would refuse.
+        # #160: same resolver as ``load_bridge_config``. Profile file, process
+        # env, and per-agent env use one refusal rule, including when this
+        # gateway has no slug.
         sender_policy = self._load_sender_allowlist()
         self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
         self._allow_all_users = sender_policy.allow_all_users
@@ -1634,23 +1634,16 @@ class Agent365Adapter(BasePlatformAdapter):
     def _load_sender_allowlist(self) -> Any:
         """Resolve the sender policy shared with ``activity-bridge serve``."""
         bridge = _import_bridge()
-        profile_file = bridge.load_profile_env(self._hermes_home)
         scoped: dict[str, str] = {}
         for key in bridge.SENDER_ALLOWLIST_ENV_KEYS:
             value = _profile_env(key)
             if value is not None:
                 scoped[key] = value
-        profile = bridge.select_profile_sender_env(
-            profile_file.values,
-            scoped,
-            profile_file_exists=profile_file.exists,
+        return bridge.resolve_runtime_sender_allowlist(
+            self._hermes_home,
+            process_env=scoped,
+            slug=self.slug or "",
         )
-        agent: dict[str, str] = {}
-        if self.slug:
-            agent_path = self._hermes_home / "agents" / self.slug / ".env"
-            if agent_path.exists():
-                agent = bridge.load_agent_env(self._hermes_home, self.slug)
-        return bridge.resolve_sender_allowlist(profile, agent)
 
     def _make_bridge_config(self) -> Any:
         """Construct a `BridgeConfig` for the bridge helpers (token

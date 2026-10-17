@@ -627,8 +627,16 @@ as `ok`.
 > and either `A365_ALLOW_ALL_USERS=true` (testing) or
 > `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. That profile
 > file is the sender allowlist for both the gateway and `activity-bridge serve`.
-> A different value in `~/.hermes/agents/<slug>/.env` is refused at startup.
-> If neither file sets a policy, both runtimes deny every end user. Allowlist
+> The process that starts each runtime must state the same policy (the gateway
+> sources this file; start `serve` with it sourced too). A policy that exists
+> only in the process environment is refused by both, whether or not the
+> profile file exists. A disagreement between the file and the process is
+> refused by both. A different value in `~/.hermes/agents/<slug>/.env` is
+> refused at startup, including when the gateway has no slug and any agent
+> directory states a different policy. If neither file sets a policy, both
+> runtimes deny every end user. The profile file must be owner-only
+> (`chmod 600`); a group- or world-readable file is refused without printing
+> its contents. Allowlist
 > entries may be
 > AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
 > includes those aliases in the signed activity. Bot Framework `personal` /

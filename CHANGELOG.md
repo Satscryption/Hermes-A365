@@ -11,12 +11,19 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - **The gateway and the activity bridge share one sender allowlist (#160).**
   Both enforce `A365_ALLOWED_USERS` / `A365_ALLOW_ALL_USERS` from the profile
   `~/.hermes/.env`, which is the file the gateway already sources. The
-  per-agent env may repeat that policy and must not replace it. Startup
-  refuses when the per-agent file sets a policy the profile does not, when
-  the two policies differ, or when a profile file and the gateway process
-  disagree. If neither source sets a policy, both runtimes deny every end
-  user. An empty allowlist is not allow-all. A Hermes allow does not widen
-  the shared policy.
+  process environment must state that same policy. A policy that exists
+  only in the process environment is refused by both runtimes, whether the
+  profile file is missing or present and silent. Startup also refuses when
+  the file and the process disagree, when the per-agent file sets a policy
+  the profile does not, or when the two files differ. An unscoped gateway
+  (no slug) still refuses if any per-agent env states a conflicting policy.
+  If neither file sets a policy, both runtimes deny every end user. An empty
+  allowlist is not allow-all. A Hermes allow does not widen the shared policy.
+- **`activity-bridge serve` refuses a group- or world-readable profile `.env`.**
+  Startup exits before bind when `~/.hermes/.env` is readable by group or
+  other. The error names the mode and the path and tells the operator to
+  run `chmod 600` on that file. It does not print allowlist values or any
+  other file contents. The gateway already rejected this mode.
 
 ### Fixed
 

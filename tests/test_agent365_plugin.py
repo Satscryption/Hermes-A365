@@ -225,12 +225,33 @@ class _FakeCtx:
 # ---------------------------------------------------------------------------
 
 
+def _write_matching_allow_all_profile() -> None:
+    """Give the default test adapter a profile file that repeats allow-all.
+
+    A process-only ``A365_ALLOW_ALL_USERS`` is refused. Route tests opt into
+    allow-all by stating it in both the process env and the profile file.
+    """
+    home = adapter_mod._active_hermes_home()
+    path = home / ".env"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    existing = path.read_text() if path.exists() else ""
+    if "A365_ALLOW_ALL_USERS" in existing or "A365_ALLOWED_USERS" in existing:
+        return
+    text = existing
+    if text and not text.endswith("\n"):
+        text += "\n"
+    text += "A365_ALLOW_ALL_USERS=true\n"
+    path.write_text(text)
+    path.chmod(0o600)
+
+
 def _make_adapter(monkeypatch: pytest.MonkeyPatch, **extra_overrides: Any) -> Any:
     """Build an Agent365Adapter with sensible defaults for route tests."""
     monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
     monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
     monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
     monkeypatch.setenv("A365_ALLOW_ALL_USERS", "1")
+    _write_matching_allow_all_profile()
     extra = {"slug": "test-agent", "port": 0}
     extra.update(extra_overrides)
     cfg = _StubPlatformConfig(extra=extra)
@@ -1133,6 +1154,11 @@ class TestAdapterConstruction:
         monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "default-secret")
         monkeypatch.setenv("A365_BF_APP_ID", "default-bf-app")
         monkeypatch.setenv("A365_BF_CLIENT_SECRET", "default-bf-secret")
+        home = Path(os.environ["HERMES_HOME"])
+        env_path = home / ".env"
+        env_path.parent.mkdir(parents=True, exist_ok=True)
+        env_path.write_text("A365_ALLOWED_USERS=profile-b-user\n")
+        env_path.chmod(0o600)
 
         adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig())
 
@@ -15207,8 +15233,10 @@ class TestSenderAllowlistAgreement:
     ) -> None:
         monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setenv("A365_ALLOWED_USERS", "user-a")
+        home = self._home(monkeypatch)
+        self._write(home / ".env", "A365_ALLOWED_USERS=user-a\n")
         self._write(
-            self._home(monkeypatch) / "agents" / "inbox-helper" / ".env",
+            home / "agents" / "inbox-helper" / ".env",
             "A365_ALLOWED_USERS=user-b\nA365_TENANT_ID=t\n",
         )
         from hermes_a365.activity_bridge import BridgeConfigError
@@ -15225,20 +15253,49 @@ class TestSenderAllowlistAgreement:
         self._write(self._home(monkeypatch) / ".env", "A365_TENANT_ID=tenant\n")
         from hermes_a365.activity_bridge import BridgeConfigError
 
-        with pytest.raises(BridgeConfigError, match="does not state the gateway process"):
+        with pytest.raises(BridgeConfigError, match="does not state the process allowlist"):
             adapter_mod.Agent365Adapter(_StubPlatformConfig())
+
+    def test_unscoped_gateway_refuses_a_conflicting_per_agent_list(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+        monkeypatch.setenv("A365_ALLOWED_USERS", "user-a")
+        home = self._home(monkeypatch)
+        self._write(home / ".env", "A365_ALLOWED_USERS=user-a\n")
+        self._write(
+            home / "agents" / "inbox-helper" / ".env",
+            "A365_ALLOWED_USERS=user-b\nA365_TENANT_ID=t\n",
+        )
+        from hermes_a365.activity_bridge import BridgeConfigError
+
+        with pytest.raises(BridgeConfigError, match="sender allowlists disagree") as raised:
+            adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={}))
+        assert "user-b" not in str(raised.value)
 
     def test_hermes_allow_cannot_widen_the_shared_policy(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from fastapi.testclient import TestClient
 
-        adapter = _make_adapter(
-            monkeypatch,
-            conversations_path=str(tmp_path / "conversations.json"),
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("A365_ALLOWED_USERS", "user-allowed")
+        monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
+        monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
+        home = self._home(monkeypatch)
+        self._write(home / ".env", "A365_ALLOWED_USERS=user-allowed\n")
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(
+                extra={
+                    "slug": "inbox-helper",
+                    "conversations_path": str(tmp_path / "conversations.json"),
+                }
+            )
         )
-        adapter._allow_all_users = False
-        adapter._allowed_users = ("user-allowed",)
+        assert adapter._allowed_users == ("user-allowed",)
+        assert adapter._allow_all_users is False
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(
             bridge,
@@ -15261,6 +15318,245 @@ class TestSenderAllowlistAgreement:
 
         assert response.status_code == 403
         assert adapter._handled_events == []
+
+    def test_gateway_and_serve_resolve_the_same_matrix(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        """One profile drives both runtimes. Refusal text matches too."""
+        import httpx
+        from fastapi.testclient import TestClient
+
+        from hermes_a365.activity_bridge import (
+            BridgeConfigError,
+            load_bridge_config,
+            make_app,
+        )
+
+        tenant = "2699fca3-dac6-40a2-bcea-62ce05e2ee9b"
+        cases = [
+            {
+                "name": "neither file nor process",
+                "process": {},
+                "profile": None,
+                "agent": f"A365_TENANT_ID={tenant}\n",
+                "expect": ("allow", (), False, False),
+            },
+            {
+                "name": "file and process list",
+                "process": {"A365_ALLOWED_USERS": "user-a,user-b"},
+                "profile": "A365_ALLOWED_USERS=User-A, user-b\n",
+                "agent": f"A365_TENANT_ID={tenant}\n",
+                "expect": ("allow", ("user-a", "user-b"), False, True),
+            },
+            {
+                "name": "file present process absent",
+                "process": {},
+                "profile": "A365_ALLOWED_USERS=user-a\n",
+                "agent": f"A365_TENANT_ID={tenant}\n",
+                "expect": ("refuse", "process environment does not"),
+            },
+            {
+                "name": "file absent process set",
+                "process": {"A365_ALLOW_ALL_USERS": "true"},
+                "profile": None,
+                "agent": f"A365_TENANT_ID={tenant}\n",
+                "expect": ("refuse", "does not state the process allowlist"),
+            },
+            {
+                "name": "empty file process set",
+                "process": {"A365_ALLOWED_USERS": "user-a"},
+                "profile": "",
+                "agent": f"A365_TENANT_ID={tenant}\n",
+                "expect": ("refuse", "does not state the process allowlist"),
+            },
+            {
+                "name": "file and process disagree",
+                "process": {"A365_ALLOWED_USERS": "user-a"},
+                "profile": "A365_ALLOW_ALL_USERS=true\n",
+                "agent": f"A365_TENANT_ID={tenant}\n",
+                "expect": ("refuse", "process allowlist disagree"),
+            },
+            {
+                "name": "agent disagrees",
+                "process": {"A365_ALLOWED_USERS": "user-a"},
+                "profile": "A365_ALLOWED_USERS=user-a\n",
+                "agent": f"A365_TENANT_ID={tenant}\nA365_ALLOWED_USERS=user-b\n",
+                "expect": ("refuse", "sender allowlists disagree"),
+            },
+            {
+                "name": "agent matches",
+                "process": {"A365_ALLOW_ALL_USERS": "true"},
+                "profile": "A365_ALLOW_ALL_USERS=true\n",
+                "agent": f"A365_TENANT_ID={tenant}\nA365_ALLOW_ALL_USERS=yes\n",
+                "expect": ("allow", (), True, True),
+            },
+            {
+                "name": "unscoped gateway sees the conflicting agent",
+                "process": {"A365_ALLOWED_USERS": "user-a"},
+                "profile": "A365_ALLOWED_USERS=user-a\n",
+                "agent": f"A365_TENANT_ID={tenant}\nA365_ALLOWED_USERS=user-b\n",
+                "gateway_slug": None,
+                "expect": ("refuse", "sender allowlists disagree"),
+            },
+        ]
+
+        def outcome(case: dict[str, Any]) -> tuple[Any, ...]:
+            home = tmp_path / case["name"].replace(" ", "-")
+            monkeypatch.delenv("A365_ALLOWED_USERS", raising=False)
+            monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+            monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+            for key, value in case["process"].items():
+                monkeypatch.setenv(key, value)
+            if case["profile"] is not None:
+                self._write(home / ".env", case["profile"])
+            self._write(home / "agents" / "inbox-helper" / ".env", case["agent"])
+            generated = home / "a365.generated.config.json"
+            self._write(
+                generated,
+                '{"agentBlueprintId":"bp","agentBlueprintClientSecret":"sek"}\n',
+            )
+            hermes_constants = types.ModuleType("hermes_constants")
+            hermes_constants.get_hermes_home = lambda bound=home: bound
+            monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+
+            def serve() -> tuple[Any, ...]:
+                try:
+                    cfg = load_bridge_config(
+                        slug="inbox-helper",
+                        webhook_url="https://hook.test/responder",
+                        hermes_home=home,
+                        generated_config_path=generated,
+                        skip_jwt_validation=True,
+                    )
+                except BridgeConfigError as exc:
+                    return ("refuse", str(exc))
+                return (
+                    "allow",
+                    cfg.allowed_users,
+                    cfg.allow_all_users,
+                    cfg.sender_allowlist_configured,
+                )
+
+            def gateway() -> tuple[Any, ...]:
+                extra: dict[str, Any] = {}
+                if case.get("gateway_slug", "inbox-helper") is not None:
+                    extra["slug"] = case.get("gateway_slug", "inbox-helper")
+                try:
+                    adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra=extra))
+                except BridgeConfigError as exc:
+                    return ("refuse", str(exc))
+                return (
+                    "allow",
+                    adapter._allowed_users,
+                    adapter._allow_all_users,
+                    adapter._sender_allowlist_configured,
+                )
+
+            serve_result = serve()
+            gateway_result = gateway()
+            assert serve_result == gateway_result, case["name"]
+            return serve_result
+
+        for case in cases:
+            result = outcome(case)
+            expect = case["expect"]
+            if expect[0] == "refuse":
+                assert result[0] == "refuse", case["name"]
+                assert expect[1] in result[1], case["name"]
+                assert "user-a" not in result[1] and "user-b" not in result[1]
+            else:
+                assert result == expect, case["name"]
+
+        # HTTP admission from the same profile file: listed sender in, outsider out.
+        home = tmp_path / "http"
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.setenv("A365_ALLOWED_USERS", "user-allowed")
+        monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
+        monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
+        self._write(home / ".env", "A365_ALLOWED_USERS=user-allowed\n")
+        self._write(
+            home / "agents" / "inbox-helper" / ".env",
+            f"A365_TENANT_ID={tenant}\n",
+        )
+        generated = home / "a365.generated.config.json"
+        self._write(
+            generated,
+            '{"agentBlueprintId":"bp","agentBlueprintClientSecret":"sek"}\n',
+        )
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda: home
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook.test/responder",
+            hermes_home=home,
+            generated_config_path=generated,
+            skip_jwt_validation=True,
+        )
+
+        def transport(req: httpx.Request) -> httpx.Response:
+            url = str(req.url)
+            if "/oauth2/v2.0/token" in url:
+                return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+            if "/v3/conversations/" in url:
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={"text": "ok"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        serve_app = make_app(cfg, http_client=http_client)
+        serve_client = TestClient(serve_app)
+        listed = {
+            "type": "message",
+            "id": "1234",
+            "channelId": "msteams",
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "conversation": {"id": "conv-1", "tenantId": tenant},
+            "from": {"id": "user-allowed", "name": "Listed"},
+            "recipient": {
+                "id": "bot-1",
+                "tenantId": tenant,
+                "agenticAppId": "bp",
+                "agenticUserId": "agentic-user-1",
+            },
+            "text": "hi",
+        }
+        outsider = dict(listed)
+        outsider["from"] = {"id": "intruder", "name": "Intruder"}
+        outsider["id"] = "1235"
+        assert serve_client.post("/api/messages", json=outsider).status_code == 403
+        assert serve_client.post("/api/messages", json=listed).status_code == 200
+
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(
+                extra={
+                    "slug": "inbox-helper",
+                    "conversations_path": str(home / "conversations.json"),
+                }
+            )
+        )
+        assert adapter._allowed_users == cfg.allowed_users
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        adapter._is_sender_authorized = lambda *_args: True
+        gateway = TestClient(adapter.build_app())
+        denied = _make_inbound()
+        denied["from"] = {"id": "intruder", "name": "Intruder"}
+        admitted = _make_inbound()
+        admitted["from"] = {"id": "user-allowed", "name": "Listed"}
+        denied_response = gateway.post(
+            "/api/messages", json=denied, headers={"Authorization": "Bearer a.b.c"}
+        )
+        admitted_response = gateway.post(
+            "/api/messages", json=admitted, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert denied_response.status_code == 403
+        assert admitted_response.status_code == 200
+        assert adapter._handled_events
 
 
 class TestSecurityAuthorizationOrder:

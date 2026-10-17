@@ -281,8 +281,10 @@ def load_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:
 class ProfileEnv:
     """``~/.hermes/.env`` as the bridge and gateway both see it.
 
-    ``exists`` is false only when the file is absent. An empty file still
-    exists: it states no sender policy, which is not the same as "no file".
+    ``exists`` is false only when the file is absent. For the sender
+    allowlist, an absent file and an empty file state the same policy
+    (none). A present file is still permission-checked; an absent file
+    is not.
     """
 
     exists: bool
@@ -310,7 +312,8 @@ def load_profile_env(hermes_home: Path) -> ProfileEnv:
         raise BridgeConfigError(f"cannot verify permissions on {path}: {e}") from e
     if mode & 0o077:
         raise BridgeConfigError(
-            f"profile .env is group/world-readable (mode 0{mode:o}): chmod 600 {path}"
+            "profile .env is group/world-readable "
+            f"(mode 0{mode:o}); refusing to start. Run: chmod 600 {path}"
         )
     return ProfileEnv(exists=True, values=parsed)
 
@@ -1457,13 +1460,15 @@ def select_profile_sender_env(
     *,
     profile_file_exists: bool,
 ) -> dict[str, str]:
-    """Choose the profile policy the gateway and the bridge can both see.
+    """Choose the profile policy the gateway and ``serve`` both apply.
 
-    The profile file is the durable source ``serve`` reads. The gateway
-    process environment is what Hermes enforces after it sources that file.
-    When the file exists, a process-only policy or a disagreement fails
-    closed. When the file is absent, the process environment is the profile
-    (tests and a gateway that has not written ``~/.hermes/.env`` yet).
+    The profile file is the only source. An absent file and a file that
+    states no sender keys are the same branch: neither is a policy. A
+    policy that exists only in the process environment is refused, a file
+    policy the process does not repeat is refused, and any disagreement
+    between the two is refused. Neither source stating a policy returns
+    an empty mapping (later deny-all), never the process environment.
+    Error text does not include allowlist values.
     """
     file_policy = (
         parse_sender_allowlist(file_env, source="the profile env file")
@@ -1471,38 +1476,37 @@ def select_profile_sender_env(
         else None
     )
     scoped_policy = parse_sender_allowlist(
-        scoped_env, source="the gateway process environment"
+        scoped_env, source="the process environment"
     )
-    if profile_file_exists:
-        if file_policy is not None and scoped_policy is None:
-            raise BridgeConfigError(
-                "profile .env states a sender allowlist that the gateway process "
-                "environment does not. Refusing to start: Hermes enforces the "
-                "process environment and would not apply the file policy the "
-                "activity bridge reads. Source ~/.hermes/.env into the gateway."
-            )
-        if file_policy is None and scoped_policy is not None:
-            raise BridgeConfigError(
-                "profile .env does not state the gateway process allowlist. "
-                "Refusing to start: the activity bridge reads ~/.hermes/.env and "
-                "would not apply A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS that "
-                "exist only in the process environment. Put the policy in the "
-                "profile file."
-            )
-        if (
-            file_policy is not None
-            and scoped_policy is not None
-            and not _same_sender_policy(file_policy, scoped_policy)
-        ):
-            raise BridgeConfigError(
-                "profile .env and the gateway process allowlist disagree. "
-                "Refusing to start so the gateway cannot authorize end users "
-                "the activity bridge, which reads the profile file, would reject."
-            )
-        if file_policy is not None:
-            return _allowlist_env_view(file_env)
-        return {}
-    return _allowlist_env_view(scoped_env)
+    if file_policy is not None and scoped_policy is None:
+        raise BridgeConfigError(
+            "profile .env states a sender allowlist that the process "
+            "environment does not. Refusing to start: the gateway and "
+            "activity-bridge serve must apply the same policy. Source "
+            "~/.hermes/.env into the process."
+        )
+    if file_policy is None and scoped_policy is not None:
+        raise BridgeConfigError(
+            "profile .env does not state the process allowlist. "
+            "Refusing to start: a policy that exists only in the process "
+            "environment is not applied by the gateway or activity-bridge "
+            "serve, whether or not the profile file exists. Put "
+            "A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS in ~/.hermes/.env "
+            "and source that file."
+        )
+    if (
+        file_policy is not None
+        and scoped_policy is not None
+        and not _same_sender_policy(file_policy, scoped_policy)
+    ):
+        raise BridgeConfigError(
+            "profile .env and the process allowlist disagree. "
+            "Refusing to start so the gateway and activity-bridge serve "
+            "cannot authorize different end users."
+        )
+    if file_policy is not None:
+        return _allowlist_env_view(file_env)
+    return {}
 
 
 def resolve_sender_allowlist(
@@ -1538,6 +1542,62 @@ def resolve_sender_allowlist(
             "A365_ALLOW_ALL_USERS match, or remove them from the per-agent env."
         )
     return profile
+
+
+def _agent_envs_for_sender_policy(hermes_home: Path, slug: str) -> list[dict[str, str]]:
+    """Per-agent env files that may state a sender policy.
+
+    A slug checks that one agent, the file ``serve --slug`` reads. An
+    empty slug checks every agent directory so an unscoped gateway cannot
+    ignore a per-agent policy ``serve`` would refuse for that slug.
+    """
+    if slug:
+        path = hermes_home / "agents" / slug / ".env"
+        if not path.exists():
+            return []
+        return [load_agent_env(hermes_home, slug)]
+    root = hermes_home / "agents"
+    if not root.is_dir():
+        return []
+    envs: list[dict[str, str]] = []
+    children = sorted(
+        (item for item in root.iterdir() if item.is_dir()),
+        key=lambda item: item.name,
+    )
+    for child in children:
+        if child.is_symlink() or not (child / ".env").exists():
+            continue
+        try:
+            validate_slug(child.name)
+        except ValueError:
+            continue
+        envs.append(load_agent_env(hermes_home, child.name))
+    return envs
+
+
+def resolve_runtime_sender_allowlist(
+    hermes_home: Path,
+    *,
+    process_env: Mapping[str, str],
+    slug: str = "",
+) -> SenderAllowlist:
+    """Resolve the one sender policy the gateway and ``serve`` both enforce.
+
+    Profile file, process environment, and per-agent env go through the
+    same refusal rules in both runtimes. Callers pass the process view
+    they actually enforce (Hermes' scoped env in the gateway, ``os.environ``
+    in ``serve``).
+    """
+    profile_file = load_profile_env(hermes_home)
+    profile = select_profile_sender_env(
+        profile_file.values,
+        process_env,
+        profile_file_exists=profile_file.exists,
+    )
+    policy = resolve_sender_allowlist(profile, {})
+    for agent_env in _agent_envs_for_sender_policy(hermes_home, slug):
+        policy = resolve_sender_allowlist(profile, agent_env)
+    return policy
 
 
 def load_bridge_config(
@@ -1646,11 +1706,14 @@ def load_bridge_config(
             "Path B identity is only partially configured; "
             f"{missing} is required when its matching value is set"
         )
-    # #160: the profile file is the sender allowlist the gateway enforces.
-    # The per-agent env may only repeat it. Missing and ambiguous policies
-    # fail closed (deny-all, or refuse to start).
-    profile_env = load_profile_env(hermes_home)
-    sender_policy = resolve_sender_allowlist(profile_env.values, agent_env)
+    # #160: one resolver for the gateway and ``serve``. The profile file is
+    # the policy. The process environment must repeat it, and the per-agent
+    # env may only repeat it. Missing and ambiguous policies fail closed.
+    sender_policy = resolve_runtime_sender_allowlist(
+        hermes_home,
+        process_env=os.environ,
+        slug=slug,
+    )
     if not sender_policy.configured:
         logger.warning(
             "sender allowlist is not configured; denying every end user. "
