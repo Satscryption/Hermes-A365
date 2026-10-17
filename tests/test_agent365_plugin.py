@@ -2965,6 +2965,47 @@ class TestLifecycleCapture:
                 await asyncio.wait_for(stuck_task, timeout=1)
 
     @pytest.mark.asyncio
+    async def test_uninstall_cancels_agent_turn_after_active_sessions_released(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #158: Hermes can drop _active_sessions while the background session
+        # task is still running. Uninstall must still call cancel_session_processing.
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.2)
+        a = _make_adapter(monkeypatch)
+        personal = "a:personal"
+        copilot = "19:copilot@thread.v2"
+        session_key = "sk:copilot-turn"
+        release_turn = asyncio.Event()
+        cancelled_sessions: list[str] = []
+
+        async def model_turn() -> None:
+            await release_turn.wait()
+
+        turn_task = asyncio.create_task(model_turn())
+        a._session_tasks[session_key] = turn_task
+        a._session_key_to_conv[session_key] = copilot
+
+        original_cancel = a.cancel_session_processing
+
+        async def record_cancel(sk: str, **_kwargs: Any) -> None:
+            cancelled_sessions.append(sk)
+            await original_cancel(sk)
+
+        monkeypatch.setattr(a, "cancel_session_processing", record_cancel)
+        for conv_id in (personal, copilot):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        a._active_conversation_ids()
+        assert a._session_key_to_conv.get(session_key) == copilot
+
+        await a._evict_conversations([personal, copilot])
+
+        assert cancelled_sessions == [session_key]
+        assert turn_task.cancelled()
+        release_turn.set()
+
+    @pytest.mark.asyncio
     async def test_cancelled_uninstall_does_not_stick_sibling(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

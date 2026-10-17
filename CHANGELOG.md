@@ -4,6 +4,16 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased] — 0.9.1
+
+### Fixed
+
+- **#158:** ``installationUpdate`` remove now cancels in-flight Hermes model
+  turns on every matched conversation, not only outbound posts and buffered
+  replies. The session-key → conversation mapping is kept while the base
+  session task is still running even after ``_active_sessions`` is released,
+  and uninstall cancels all matched sessions before per-chat teardown begins.
+
 ## [0.9.0] — 2026-10-16
 
 Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).

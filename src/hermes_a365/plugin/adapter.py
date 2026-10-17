@@ -3588,12 +3588,39 @@ class Agent365Adapter(BasePlatformAdapter):
         for guard in self._agent_turn_guards.values():
             guard.set()
 
+    def _session_keys_for_chat(self, chat_id: str) -> list[str]:
+        """Session keys whose Hermes turn targets ``chat_id``.
+
+        Hermes may drop ``_active_sessions`` while the background session task
+        is still running; the dispatch mapping must stay until that task ends
+        so uninstall teardown can call ``cancel_session_processing`` (#158).
+        """
+        target = str(chat_id)
+        keys: list[str] = []
+        seen: set[str] = set()
+        session_tasks = getattr(self, "_session_tasks", {}) or {}
+
+        def add(session_key: str) -> None:
+            sk = str(session_key)
+            if not sk or sk in seen:
+                return
+            seen.add(sk)
+            keys.append(sk)
+
+        for session_key, owner_chat_id in self._session_key_to_conv.items():
+            if owner_chat_id == target:
+                add(session_key)
+        for session_key, task in session_tasks.items():
+            if (
+                isinstance(task, asyncio.Task)
+                and not task.done()
+                and self._session_key_to_conv.get(session_key) == target
+            ):
+                add(session_key)
+        return keys
+
     async def _retire_chat_agent_turns(self, chat_id: str) -> None:
-        session_keys = [
-            session_key
-            for session_key, owner_chat_id in self._session_key_to_conv.items()
-            if owner_chat_id == str(chat_id)
-        ]
+        session_keys = self._session_keys_for_chat(chat_id)
         for session_key in session_keys:
             guard = self._agent_turn_guards.pop(session_key, None)
             if guard is not None:
@@ -3614,11 +3641,23 @@ class Agent365Adapter(BasePlatformAdapter):
         The base's ``_active_sessions`` guard is keyed by session key. Bridge
         it to the registry's conversation-id space via ``_session_key_to_conv``
         (recorded at dispatch), self-cleaning any mapping whose session has
-        since ended. This set does not cover a conversation whose turn has
-        already returned while an approval or clarify card is still
-        outstanding (#130); use ``_registry_protected_conversation_ids``."""
+        since ended. Keep mappings while the base's ``_session_tasks`` entry
+        is still running even if ``_active_sessions`` was already released
+        (#158). This set does not cover a conversation whose turn has already
+        returned while an approval or clarify card is still outstanding (#130);
+        use ``_registry_protected_conversation_ids``."""
         active_sks = set(getattr(self, "_active_sessions", {}) or {})
-        for sk in [k for k in self._session_key_to_conv if k not in active_sks]:
+        session_tasks = getattr(self, "_session_tasks", {}) or {}
+        live_task_keys = {
+            sk
+            for sk, task in session_tasks.items()
+            if isinstance(task, asyncio.Task) and not task.done()
+        }
+        for sk in [
+            k
+            for k in self._session_key_to_conv
+            if k not in active_sks and k not in live_task_keys
+        ]:
             self._session_key_to_conv.pop(sk, None)
         return set(self._session_key_to_conv.values())
 
@@ -7912,6 +7951,36 @@ class Agent365Adapter(BasePlatformAdapter):
             if self._retirement_not_adopted(chat_id):
                 self._retiring_chats.discard(chat_id)
 
+    async def _cancel_matched_agent_turns(self, chat_ids: list[str]) -> None:
+        """Cancel in-flight Hermes turns on every matched chat at once (#158).
+
+        Per-chat teardown also asks Hermes to cancel, but it runs sequentially
+        and only after the first chat's teardown begins. Cancelling every
+        matched session up front stops model spend on a sibling Copilot
+        groupChat while the personal ``installationUpdate`` chat is still
+        tearing down.
+        """
+        session_keys: list[str] = []
+        seen: set[str] = set()
+        for chat_id in chat_ids:
+            for session_key in self._session_keys_for_chat(chat_id):
+                if session_key not in seen:
+                    seen.add(session_key)
+                    session_keys.append(session_key)
+        for session_key in session_keys:
+            guard = self._agent_turn_guards.pop(session_key, None)
+            if guard is not None:
+                guard.set()
+            try:
+                await self.cancel_session_processing(session_key)
+            except Exception:
+                logger.warning(
+                    "agent365 failed to cancel retired session %s",
+                    session_key,
+                    exc_info=True,
+                )
+            self._session_key_to_conv.pop(session_key, None)
+
     async def _cancel_matched_outbound(self, chat_ids: list[str]) -> None:
         """Cancel in-flight outbound posts on every matched chat at once.
 
@@ -8003,6 +8072,7 @@ class Agent365Adapter(BasePlatformAdapter):
             while current.cancelling():
                 current.uncancel()
         try:
+            await self._cancel_matched_agent_turns(ordered)
             await self._cancel_matched_outbound(ordered)
             return await self._evict_armed_conversations(
                 ordered, armed, finished, failed_holder
@@ -8038,6 +8108,7 @@ class Agent365Adapter(BasePlatformAdapter):
         failed_holder = [False]
         outcome: bool | None = None
         try:
+            await self._cancel_matched_agent_turns(ordered)
             await self._cancel_matched_outbound(ordered)
             outcome = await self._evict_armed_conversations(
                 ordered, armed, finished, failed_holder
