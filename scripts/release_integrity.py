@@ -506,6 +506,57 @@ def verify_checksums(dist: Path) -> tuple[Path, Path, Path]:
     return wheel, sdist, sums
 
 
+def _pep440(value: str):
+    """Parse a package version. SemVer ``1.2.3-rc.1`` and PEP 440 ``1.2.3rc1`` match.
+
+    Tags, changelog headings, and the source version strings stay SemVer.
+    Distribution filenames, core metadata, and the installed version use the
+    build backend's PEP 440 spelling.
+    """
+    try:
+        from packaging.version import InvalidVersion, Version
+    except ImportError as exc:  # pragma: no cover - present in the build and smoke envs
+        raise ReleaseIntegrityError(
+            "packaging is not installed; version comparison needs the hash-pinned packaging"
+        ) from exc
+    try:
+        return Version(value)
+    except InvalidVersion as exc:
+        raise ReleaseIntegrityError(f"rejecting non-PEP-440 version {value!r}") from exc
+
+
+def _require_same_version(found: str, expected: str, label: str) -> None:
+    if _pep440(found) != _pep440(expected):
+        raise ReleaseIntegrityError(f"{label} is {found!r}, expected {expected!r}")
+
+
+def _require_filename_version(path: Path, expected_version: str) -> None:
+    try:
+        from packaging.utils import (
+            InvalidSdistFilename,
+            InvalidWheelFilename,
+            parse_sdist_filename,
+            parse_wheel_filename,
+        )
+    except ImportError as exc:  # pragma: no cover - present in the build env
+        raise ReleaseIntegrityError(
+            "packaging is not installed; version comparison needs the hash-pinned packaging"
+        ) from exc
+    try:
+        if path.suffix == ".whl":
+            _name, found, _build, _tags = parse_wheel_filename(path.name)
+        elif path.name.endswith(".tar.gz"):
+            _name, found = parse_sdist_filename(path.name)
+        else:
+            raise ReleaseIntegrityError(f"{path.name} is not a wheel or sdist")
+    except (InvalidSdistFilename, InvalidWheelFilename) as exc:
+        raise ReleaseIntegrityError(f"{path.name} has no PEP 440 version") from exc
+    if found != _pep440(expected_version):
+        raise ReleaseIntegrityError(
+            f"{path.name} Version is {found}, expected {expected_version!r}"
+        )
+
+
 def check_distributions(dist: Path, expected_version: str) -> None:
     """Validate wheel and sdist core metadata with the pinned packaging library."""
     try:
@@ -527,11 +578,11 @@ def check_distributions(dist: Path, expected_version: str) -> None:
             raise ReleaseIntegrityError(
                 f"{path.name} Name is {headers.get('Name')!r}, expected {PACKAGE_NAME!r}"
             )
-        if headers.get("Version") != expected_version:
-            raise ReleaseIntegrityError(
-                f"{path.name} Version is {headers.get('Version')!r}, "
-                f"expected {expected_version!r}"
-            )
+        found_version = headers.get("Version")
+        if not isinstance(found_version, str):
+            raise ReleaseIntegrityError(f"{path.name} is missing Version")
+        _require_same_version(found_version, expected_version, f"{path.name} Version")
+        _require_filename_version(path, expected_version)
         requires = headers.get("Requires-Python")
         if not requires:
             raise ReleaseIntegrityError(f"{path.name} is missing Requires-Python")
@@ -565,16 +616,16 @@ def smoke_installed(expected_version: str) -> None:
 
     import hermes_a365
 
-    if hermes_a365.__version__ != expected_version:
-        raise ReleaseIntegrityError(
-            f"installed hermes_a365.__version__ is {hermes_a365.__version__!r}, "
-            f"expected {expected_version!r}"
-        )
-    dist_version = importlib.metadata.version(PACKAGE_NAME)
-    if dist_version != expected_version:
-        raise ReleaseIntegrityError(
-            f"installed distribution version is {dist_version!r}, expected {expected_version!r}"
-        )
+    _require_same_version(
+        hermes_a365.__version__,
+        expected_version,
+        "installed hermes_a365.__version__",
+    )
+    _require_same_version(
+        importlib.metadata.version(PACKAGE_NAME),
+        expected_version,
+        "installed distribution version",
+    )
     _smoke_cli()
     _smoke_entry_point()
     plugin = resources.files("hermes_a365.plugin").joinpath("plugin.yaml")

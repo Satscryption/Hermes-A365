@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import yaml
@@ -169,6 +170,34 @@ def test_digest_verification_survives_smoke_and_gates_the_upload() -> None:
     assert build_names.index("Re-verify artefact digests after smoke") < build_names.index(
         "Upload artefacts for the publish job"
     )
+
+
+def test_smoke_installs_hash_pinned_packaging_for_version_compare() -> None:
+    workflow = _workflow()
+    smoke = next(
+        step
+        for step in _steps(workflow["jobs"]["build"])
+        if step.get("name") == "Smoke-install the wheel"
+    )
+    requirements = (_WORKFLOW_PATH.parent / "publish-requirements.txt").read_text()
+    lines = requirements.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("packaging=="))
+    hashes: list[str] = []
+    for line in lines[start:]:
+        if line[:1].isalpha() and not line.startswith("packaging=="):
+            break
+        hashes.extend(re.findall(r"sha256:[0-9a-f]{64}", line))
+
+    command = smoke["run"]
+    assert "--require-hashes" in command
+    assert "--no-deps" in command
+    assert "packaging==26.2" in command
+    assert len(hashes) >= 2
+    assert all(digest in command for digest in hashes)
+    wheel_install, packaging_install = command.split("bin/pip\" install", maxsplit=2)[1:]
+    assert "dist/*.whl" in wheel_install
+    assert "--require-hashes" not in wheel_install
+    assert "packaging==26.2" in packaging_install
 
 
 def test_called_test_workflow_keeps_python_3_14() -> None:

@@ -8,6 +8,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Prerelease distributions compare as PEP 440 versions.** Tag
+  `v1.2.3-rc.1` accepts wheel and sdist metadata, filenames, and the
+  installed version `1.2.3rc1`. The tag, changelog heading, and source
+  version strings stay SemVer, and a different version still fails.
 - **Orphan agentic-user ownership accepts the real owner again.** When
   `agentRegistry` no longer lists an instance for a typed orphan user id,
   cleanup now follows `users/{id}.identityParentId` to

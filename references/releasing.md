@@ -32,7 +32,7 @@ promoted.
    preflight does not fail closed by itself. See the approval note below.
 2. Set `project.version` in `pyproject.toml` and `__version__` in
    `src/hermes_a365/__init__.py` to the same `MAJOR.MINOR.PATCH`.
-3. Rename this file's `## Unreleased / X.Y.Z` heading to exactly:
+3. Rename the `## Unreleased / X.Y.Z` heading in `CHANGELOG.md` to exactly:
 
    ```markdown
    ## [X.Y.Z] — YYYY-MM-DD

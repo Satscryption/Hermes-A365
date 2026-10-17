@@ -522,6 +522,55 @@ def test_distribution_metadata_must_match_and_keep_python_3_14(tmp_path: Path) -
         mod.check_distributions(mismatched, "1.2.3")
 
 
+_RC_CHANGELOG = """# Changelog
+
+## [1.2.3-rc.1] — 2026-01-02
+
+Release candidate.
+"""
+
+
+def test_prerelease_artifact_accepts_pep440_spelling(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("1.2.3rc1"), version="1.2.3rc1")
+    mod.check_distributions(dist, "1.2.3-rc.1")
+
+
+def test_prerelease_artifact_rejects_a_different_version(tmp_path: Path) -> None:
+    different = _dist(tmp_path, _metadata("1.2.3rc2"), version="1.2.3rc2")
+    with pytest.raises(mod.ReleaseIntegrityError, match="Version"):
+        mod.check_distributions(different, "1.2.3-rc.1")
+
+    renamed = _dist(
+        tmp_path / "name",
+        _metadata("1.2.3rc1"),
+        version="1.2.3rc2",
+    )
+    with pytest.raises(mod.ReleaseIntegrityError, match="Version"):
+        mod.check_distributions(renamed, "1.2.3-rc.1")
+
+
+def test_source_version_keeps_the_semver_spelling(tmp_path: Path) -> None:
+    normalized = _repo(
+        tmp_path,
+        project="1.2.3rc1",
+        module="1.2.3rc1",
+        changelog=_RC_CHANGELOG,
+    )
+    with pytest.raises(mod.ReleaseIntegrityError, match=r"project\.version"):
+        mod.evaluate(normalized, "refs/tags/v1.2.3-rc.1")
+
+    matching = _repo(
+        tmp_path / "semver",
+        project="1.2.3-rc.1",
+        module="1.2.3-rc.1",
+        changelog=_RC_CHANGELOG,
+    )
+    notes = mod.evaluate(matching, "refs/tags/v1.2.3-rc.1")
+    assert notes.version == "1.2.3-rc.1"
+    assert notes.tag == "v1.2.3-rc.1"
+    assert notes.prerelease is True
+
+
 def test_checksum_file_cannot_escape_dist(tmp_path: Path) -> None:
     dist = _dist(tmp_path, _metadata("1.2.3"))
     sums = dist / "SHA256SUMS"
@@ -535,6 +584,23 @@ def test_checksum_file_cannot_escape_dist(tmp_path: Path) -> None:
 def test_smoke_accepts_the_development_install() -> None:
     version = mod.project_version(_ROOT)
     mod.smoke_installed(version)
+
+
+def test_smoke_accepts_a_normalized_prerelease_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hermes_a365
+
+    monkeypatch.setattr(hermes_a365, "__version__", "1.2.3rc1")
+    monkeypatch.setattr(mod.importlib.metadata, "version", lambda _name: "1.2.3rc1")
+    mod.smoke_installed("1.2.3-rc.1")
+
+
+def test_smoke_rejects_a_different_version(monkeypatch: pytest.MonkeyPatch) -> None:
+    import hermes_a365
+
+    monkeypatch.setattr(hermes_a365, "__version__", "1.2.3rc2")
+    monkeypatch.setattr(mod.importlib.metadata, "version", lambda _name: "1.2.3rc2")
+    with pytest.raises(mod.ReleaseIntegrityError, match="__version__"):
+        mod.smoke_installed("1.2.3-rc.1")
 
 
 def test_missing_tag_does_not_create_a_release_or_ref(tmp_path: Path) -> None:

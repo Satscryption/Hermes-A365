@@ -150,13 +150,20 @@ jobs:
             --expected-version "$version"
 
       - name: Smoke-install the wheel
-        # Fresh environment, still without an OIDC credential. Dependencies
-        # come from the wheel's own requirements, not the hash-pinned toolchain.
+        # Fresh environment, still without an OIDC credential. The wheel's
+        # dependencies come from the wheel. packaging is the hash-pinned
+        # copy, installed with --no-deps, so the smoke can compare PEP 440
+        # versions. It is not a project dependency.
         run: |
           set -euo pipefail
           version="$(tr -d '\n' < "$RUNNER_TEMP/expected-version")"
           python -m venv "$RUNNER_TEMP/wheel-smoke"
           "$RUNNER_TEMP/wheel-smoke/bin/pip" install --disable-pip-version-check dist/*.whl
+          "$RUNNER_TEMP/wheel-smoke/bin/pip" install --disable-pip-version-check \
+            --require-hashes --no-deps \
+            "packaging==26.2" \
+            --hash "sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e" \
+            --hash "sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661"
           "$RUNNER_TEMP/wheel-smoke/bin/python" scripts/release_integrity.py smoke \
             --expected-version "$version"
 
