@@ -13,8 +13,9 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   `README.md` document the Azure Bot Service prerequisite for
   `publish --copilot-chat` (`bot-service create --appid` +
   `publish --bot-id`), separate MCP endpoint registration from
-  `register --m365`, and auto `version` bump on CEA re-upload (current
-  `main` behaviour after #168).
+  `register --m365`, and CEA `version` bump semantics on re-upload
+  (state keyed by stable `manifest.id`; `--app-version` when MAC is ahead
+  of local state).
 - **Docs: `register --apply` Entra reconcile (#127).** `SKILL.md` now
   spells out the MCP vs bot permission-marker resume rules, unowned-app
   abort, and the conflict-resolution table matches marker-based no-op

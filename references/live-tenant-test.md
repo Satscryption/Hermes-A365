@@ -1199,7 +1199,9 @@ MCP-platform messaging endpoint is not a classic Teams bot identity.
 
    (`--appid` is an alias for `--bf-app-id`; when omitted, the wrapper
    reads `A365_BF_APP_ID` from `~/.hermes/.env`.)
-4. Publish and upload with the **same** BF app id:
+4. Publish and upload with the **same** BF app id (`--copilot-chat` only —
+   no `--aiteammate`; the CEA zip is the in-place CLI emit, typically
+   `~/manifest/manifest.zip`):
 
    ```bash
    hermes-a365 publish \
@@ -1207,35 +1209,76 @@ MCP-platform messaging endpoint is not a classic Teams bot identity.
        --tenant-id <tenant-id> \
        --copilot-chat \
        --bot-id <bf-app-id> \
-       --manifest-id auto \
        --apply
    ```
 
-   Then MAC → Agents → Upload custom agent (§11.7).
+   Then MAC → Agents → Upload custom agent (§11.7). Reserve
+   `--manifest-id auto` for the combined `--aiteammate --copilot-chat`
+   path (sibling `manifest.copilot-chat.zip`); do **not** use `auto` on
+   Path-B-only publishes you intend to update in place.
 
 **Messaging endpoint registration is separate from `register --m365`.**
 The GA CLI prints that `--m365` has no effect on `setup blueprint` by
-itself. After the tunnel exists, register the MCP Platform endpoint with
-either:
+itself. After the tunnel exists, point the MCP Platform messaging
+endpoint at your public URL.
 
-- `a365 setup blueprint --agent-name "<display-name>" --endpoint-only --m365`
-  (and `--update-endpoint <url>` when re-pointing), or
-- `hermes-a365 activity-bridge update-endpoint --agent-name "<display-name>" \
-  --url <tunnel-url>/api/messages --apply` (wrapper around
-  `setup blueprint --m365 --update-endpoint`).
+Preferred wrapper (runs the full `setup blueprint` mutation path):
+
+```bash
+hermes-a365 activity-bridge update-endpoint \
+    --agent-name "<display-name>" \
+    --tenant-id <tenant-id> \
+    --url <tunnel-url>/api/messages \
+    --apply
+```
+
+Under the hood this is `a365 setup blueprint --agent-name … --m365
+--update-endpoint <tunnel-url>/api/messages` (not
+`--endpoint-only`). **Production warnings:** that CLI step can trigger
+admin-consent flows and may mint or rotate a blueprint client secret on
+disk. If the CLI returns an "already exists" error
+([Agent365-devTools#140](https://github.com/microsoft/Agent365-devTools/issues/140)),
+the wrapper prints a recover notice, auto-confirms the GA CLI's cleanup
+prompt with `y`, runs `a365 cleanup blueprint --endpoint-only` (which
+**deletes the existing MCP messaging endpoint**), then re-applies the
+update. Treat that fallback as destructive on a live tenant.
+
+Equivalent raw `a365` argv (same caveats):
+
+```bash
+a365 setup blueprint \
+    --agent-name "<display-name>" \
+    --tenant-id <tenant-id> \
+    --m365 \
+    --update-endpoint <tunnel-url>/api/messages
+```
 
 Path B also needs `bot-service update-endpoint` when the tunnel URL
 changes (§11.5) — ARM and MCP Platform registrations are independent.
 
-**Manifest `version` on update uploads.** Microsoft Admin Center rejects
-a CEA re-upload when the zip's app `version` is not strictly greater
-than the installed package for the same catalog `manifest.id` (#109).
-`hermes-a365 publish --copilot-chat --apply` now auto-stamps a higher
-`version` (tracked in
-`~/.hermes/agents/<slug>/copilot-chat-publish.json`; see
-[`manifest-schema-currency.md`](manifest-schema-currency.md)). Override
-with `--app-version` only when you need a specific semver that still
-beats the last publish.
+**Manifest `version` on update uploads (#109).** Microsoft Admin Center
+rejects a CEA re-upload when the zip's app `version` is not strictly
+greater than the package already installed for the same catalog
+`manifest.id`.
+
+`publish --copilot-chat --apply` bumps `version` only when
+`~/.hermes/agents/<slug>/copilot-chat-publish.json` already records a
+`lastAppVersion` for the **same** `manifestId` as this zip. If there is
+no state entry (first publish from Hermes, or a new catalog id), the CLI
+template version is reused as-is (often `1.1.4` → `1.1.4`). Passing
+`--manifest-id auto` mints a fresh catalog id every run, so the state
+lookup never matches and **no automatic bump happens**.
+
+Operator rules:
+
+- **First Hermes re-upload** of a CEA already in MAC (no local state
+  yet): pass `--app-version X.Y.Z` strictly above the version MAC shows
+  for that app.
+- **Later updates** to the same MAC entry: reuse a stable
+  `--manifest-id <guid>` (or omit `auto`) so state tracks
+  `lastAppVersion`; then `publish --copilot-chat --apply` patch-bumps
+  when the CLI template is unchanged. See
+  [`manifest-schema-currency.md`](manifest-schema-currency.md).
 
 Path B layers Azure Bot Service registration on top of Path A's
 blueprint work. The blueprint Entra app from §3 + its client secret
@@ -1650,10 +1693,11 @@ The wrapper parser now handles emitted zip paths that contain spaces
 should run without the manual `_patch_manifest_to_copilot_chat(...)`
 workaround used during the 2026-05-18 walk.
 
-On **update** re-uploads to MAC, rely on `publish --copilot-chat --apply`
-to bump `manifest.version` automatically (#109 / PR #168) instead of
-hand-editing the zip — the #89 walk had to patch `1.1.4` manually before
-that fix landed.
+On **update** re-uploads to MAC, use a stable catalog `manifest.id` plus
+the version rules in §11.0 (#109 / PR #168). The #89 walk patched
+`1.1.4` manually before the wrapper tracked publish state; a package
+already in MAC with no local state still needs an explicit
+`--app-version` on the first Hermes-side update.
 
 ### 11.7 — Upload via Microsoft Admin Portal → Agents
 

@@ -592,16 +592,20 @@ hermes a365 bot-service create \
     --apply
 
 # 3. MCP Platform messaging endpoint (independent of register --m365).
+#    Runs a365 setup blueprint --m365 --update-endpoint (consent/secret risk;
+#    on "already exists" may cleanup blueprint --endpoint-only — see §11.0).
 hermes a365 activity-bridge update-endpoint \
     --agent-name "Inbox Helper" \
+    --tenant-id "<tenant-guid>" \
     --url https://<tunnel-host>/api/messages --apply
 
 # 4. CEA zip — bots.botId MUST be the BF app id registered in step 2.
 hermes a365 publish --agent-name "Inbox Helper" \
     --tenant-id "<tenant-guid>" \
-    --copilot-chat --bot-id <bf-app-id> --manifest-id auto --apply
-# Upload the emitted *.copilot-chat.zip at MAC → Agents → Upload custom agent.
-# Re-uploads: publish --copilot-chat --apply auto-bumps manifest version (#109).
+    --copilot-chat --bot-id <bf-app-id> --apply
+# Upload ~/manifest/manifest.zip at MAC → Agents → Upload custom agent.
+# Re-uploads: stable manifest.id + copilot-chat-publish.json state enables
+# auto patch-bump; first update of an app already in MAC needs --app-version.
 
 # 5. Same runtime as Path A
 hermes gateway run --profile inbox-helper

@@ -183,8 +183,12 @@ permission steps that are still missing:
 
 It does not re-run `a365 setup blueprint` against an application it
 already owns — that command grants consent and may mint a client secret.
-`--update-permissions` re-grants on an owned blueprint only; it does not
-override an ownership, tier, or name-collision refusal. A missing,
+`--update-permissions` on an owned blueprint re-runs `setup permissions
+mcp` and `setup permissions bot` when both markers are present; when the
+owned blueprint has **no service principal**, it also re-runs
+`a365 setup blueprint` (full create path), which grants consent and may
+mint a client secret. It does not override an ownership, tier, or
+name-collision refusal. A missing,
 ambiguous, or unreadable directory fails closed. After a create that
 Graph confirms, register records `A365_APP_ID` in the per-agent env and
 does not copy the client secret there. The skill still composes argv,
@@ -318,10 +322,15 @@ loads it in-process when an agent has the `agent365` platform enabled).
   Microsoft host suffix, and replies through the **agentic three-stage
   user-FIC token chain** (BF S2S → agent FMI → user FIC). Outbound
   goes via `replyToActivity` against the cached inbound `serviceUrl`.
-- `update-endpoint --agent-name <n> --url <https>` — wraps
-  `a365 setup blueprint --m365 --update-endpoint <url>` so operators
-  can pin the agent's messaging endpoint to a tunnel URL. Auto-recovers
-  from [duplicate-name error #140](https://github.com/microsoft/Agent365-devTools/issues/140).
+- `update-endpoint --agent-name <n> --url <https> [--tenant-id <id>]`
+  — with `--apply`, runs `a365 setup blueprint --m365
+  --update-endpoint <url>` (not `--endpoint-only`). That can surface
+  admin-consent prompts and may mint or rotate the blueprint client
+  secret on disk. On an "already exists" CLI error
+  ([#140](https://github.com/microsoft/Agent365-devTools/issues/140)),
+  the wrapper logs a recover path, auto-confirms the GA cleanup prompt,
+  runs `a365 cleanup blueprint --endpoint-only` (deletes the existing
+  MCP messaging endpoint), then retries the update.
 
 Topology: Teams (or other M365 surface) → A365 BF → `<tunnel>/api/messages`
 → bridge → Hermes agent loop → reply via `serviceUrl`. Activity-shape
@@ -373,7 +382,7 @@ the split.
 
 | Conflict | Behaviour |
 |---|---|
-| Blueprint app already exists for the same name | Read first. No-op when per-agent `A365_APP_ID` proves ownership and both MCP and bot permission-step markers are present (Graph admin consent from `setup blueprint` does not count). A missing marker resumes only that permission step; unowned or ambiguous apps abort. `--update-permissions` re-grants on an owned blueprint only; it does not override ownership, tier, or name refusal. |
+| Blueprint app already exists for the same name | Read first. No-op when per-agent `A365_APP_ID` proves ownership and both MCP and bot permission-step markers are present (Graph admin consent from `setup blueprint` does not count). A missing marker resumes only that permission step; unowned or ambiguous apps abort. `--update-permissions` re-grants on an owned blueprint (and re-runs `setup blueprint` when the owned app has no service principal); it does not override ownership, tier, or name refusal. |
 | Permissions step fails with `AADSTS90094` | Reported as "deferred — run `hermes a365 consent`"; blueprint stays created. |
 | Instance .env exists with a previous `AA_INSTANCE_ID` | `instance create` preserves the id (cloud state is unchanged). |
 | Cleanup target has no recorded state | The corresponding kind is skipped, not errored. |
