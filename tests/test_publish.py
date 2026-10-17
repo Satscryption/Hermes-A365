@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -730,13 +731,192 @@ class TestCopilotChatAppVersion:
         path = _copilot_chat_publish_state_path(tmp_path, "my-agent")
         manifest_id = "11111111-1111-1111-1111-111111111111"
         _write_copilot_chat_publish_state(
-            path, manifest_id=manifest_id, app_version="1.1.4"
+            path,
+            manifest_id=manifest_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
         )
         assert (
-            _read_copilot_chat_publish_state(path, manifest_id=manifest_id)
+            _read_copilot_chat_publish_state(
+                path, manifest_id=manifest_id, hermes_home=tmp_path
+            )
             == "1.1.4"
         )
-        assert _read_copilot_chat_publish_state(path, manifest_id="other") is None
+        assert (
+            _read_copilot_chat_publish_state(
+                path, manifest_id="22222222-2222-2222-2222-222222222222",
+                hermes_home=tmp_path,
+            )
+            is None
+        )
+
+    def test_unparseable_template_requires_app_version_on_first_publish(self) -> None:
+        from hermes_a365.publish import _resolve_next_copilot_chat_app_version
+
+        with pytest.raises(ValueError, match="--app-version"):
+            _resolve_next_copilot_chat_app_version(
+                template_version=None,
+                last_published=None,
+                override=None,
+            )
+
+    def test_unparseable_template_still_bumps_from_last_published(self) -> None:
+        from hermes_a365.publish import _resolve_next_copilot_chat_app_version
+
+        assert (
+            _resolve_next_copilot_chat_app_version(
+                template_version=None,
+                last_published="1.1.5",
+                override=None,
+            )
+            == "1.1.6"
+        )
+
+    def test_manifest_guid_canonicalization_continues_version_sequence(
+        self, tmp_path: Path
+    ) -> None:
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            _read_copilot_chat_publish_state,
+        )
+
+        manifest_id = "11111111-1111-1111-1111-111111111111"
+        path = _copilot_chat_publish_state_path(tmp_path, "my-agent")
+        path.parent.mkdir(parents=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "manifestId": manifest_id.upper(),
+                    "lastAppVersion": "1.1.5",
+                },
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        assert (
+            _read_copilot_chat_publish_state(
+                path, manifest_id=manifest_id, hermes_home=tmp_path
+            )
+            == "1.1.5"
+        )
+
+
+class TestCopilotChatPublishStateIntegrity:
+    def _seed_zip(self, tmp_path: Path, manifest: dict) -> Path:
+        import zipfile
+
+        zp = tmp_path / "manifest.zip"
+        with zipfile.ZipFile(zp, "w") as zf:
+            zf.writestr("manifest.json", json.dumps(manifest, indent=2))
+        return zp
+
+    def test_corrupt_state_file_fails_apply_and_is_untouched(self, tmp_path: Path):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        manifest_id = "33333333-3333-3333-3333-333333333333"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        state_path.parent.mkdir(parents=True)
+        corrupt = "{broken"
+        state_path.write_text(corrupt, encoding="utf-8")
+
+        zp = self._seed_zip(
+            tmp_path,
+            {
+                "id": manifest_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        mutator = FakeMutator(
+            scripted=[
+                RunResult(
+                    argv=[],
+                    returncode=0,
+                    stdout=f"Package created: {zp}",
+                    stderr="",
+                )
+            ]
+        )
+        with pytest.raises(PublishError, match="not valid JSON"):
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert state_path.read_text(encoding="utf-8") == corrupt
+
+    def test_invalid_last_app_version_in_state_fails_apply(self, tmp_path: Path):
+        from hermes_a365.publish import _copilot_chat_publish_state_path, build_publish_plan
+
+        manifest_id = "11111111-1111-1111-1111-111111111111"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "manifestId": manifest_id,
+                    "lastAppVersion": "not-semver",
+                }
+            ),
+            encoding="utf-8",
+        )
+        zp = self._seed_zip(
+            tmp_path,
+            {
+                "id": manifest_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+            },
+        )
+        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        mutator = FakeMutator(
+            scripted=[
+                RunResult(
+                    argv=[],
+                    returncode=0,
+                    stdout=f"Package created: {zp}",
+                    stderr="",
+                )
+            ]
+        )
+        with pytest.raises(PublishError, match="invalid lastAppVersion"):
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+    def test_symlinked_agent_dir_refuses_state_write(self, tmp_path: Path):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            _write_copilot_chat_publish_state,
+        )
+
+        hermes = tmp_path / "hermes"
+        agents = hermes / "agents"
+        agents.mkdir(parents=True)
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        (agents / "agent").symlink_to(outside)
+        path = _copilot_chat_publish_state_path(hermes, "agent")
+        with pytest.raises(PublishError, match="escapes"):
+            _write_copilot_chat_publish_state(
+                path,
+                manifest_id="11111111-1111-1111-1111-111111111111",
+                app_version="1.0.0",
+                hermes_home=hermes,
+            )
+
+    def test_invalid_slug_before_a365_runs(self, tmp_path: Path):
+        from hermes_a365.publish import build_publish_plan
+
+        plan = build_publish_plan(
+            PublishInputs(agent_name="x", copilot_chat=True, slug="../escape")
+        )
+        mutator = FakeMutator()
+        with pytest.raises(PublishError, match="path separators"):
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert not any(call[:2] == ["a365", "publish"] for call in mutator.calls)
 
 
 class TestTransformManifestToCopilotChat:
@@ -1155,7 +1335,7 @@ class TestApplyPublishPlanCopilotChat:
             tmp_path,
             {
                 "manifestVersion": "devPreview",
-                "id": "catalog-app-id",
+                "id": "44444444-4444-4444-4444-444444444444",
                 "version": "1.1.4",
                 "webApplicationInfo": {"id": "the-bot"},
                 "agenticUserTemplates": [{"a": 1}],
@@ -1190,7 +1370,7 @@ class TestApplyPublishPlanCopilotChat:
 
         manifest = {
             "manifestVersion": "devPreview",
-            "id": "catalog-app-id",
+            "id": "44444444-4444-4444-4444-444444444444",
             "version": "1.1.4",
             "webApplicationInfo": {"id": "the-bot"},
             "name": {"short": "X", "full": "X"},
@@ -1258,7 +1438,8 @@ class TestApplyPublishPlanCopilotChat:
             tmp_path,
             {
                 "manifestVersion": "devPreview",
-                "id": "2e5e2dea-blueprint",
+                "id": "2e5e2dea-af3c-4707-a6f9-f2a0ee551a7a",
+                "version": "1.0.0",
                 "name": {"short": "Hermes Inbox Helper R8 Blueprint", "full": "X"},
                 "bots": [],
             },
@@ -1299,7 +1480,7 @@ class TestApplyPublishPlanCopilotChat:
             assert m["copilotAgents"]["customEngineAgents"] == [
                 {"type": "bot", "id": "1c2b61bc-fa6a-4c7b-9656-a82b662dacfe"}
             ]
-            assert m["id"] != "2e5e2dea-blueprint"  # fresh manifest-id (auto)
+            assert m["id"] != "2e5e2dea-af3c-4707-a6f9-f2a0ee551a7a"  # fresh manifest-id (auto)
             # name.short truncated 32 -> <= 30 at a word boundary.
             assert m["name"]["short"] == "Hermes Inbox Helper R8"
 
@@ -1359,7 +1540,8 @@ class TestApplyPublishPlanCopilotChat:
             tmp_path,
             {
                 "manifestVersion": "devPreview",
-                "id": "blueprint-catalog-id",
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "version": "1.0.0",
                 "webApplicationInfo": {"id": "the-bot"},
                 "agenticUserTemplates": [{"a": 1}],
                 "name": {"short": "Hermes Inbox Helper R8", "full": "X"},
@@ -1385,7 +1567,7 @@ class TestApplyPublishPlanCopilotChat:
         with zipfile.ZipFile(zp) as zf:
             m = json.loads(zf.read("manifest.json"))
             assert m["manifestVersion"] == "devPreview"
-            assert m["id"] == "blueprint-catalog-id"
+            assert m["id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             assert "agenticUserTemplates" in m
 
         # Copilot Chat sibling is in 1.27 shape.
@@ -1410,7 +1592,8 @@ class TestApplyPublishPlanCopilotChat:
         zp = self._seed_manifest_zip(
             tmp_path,
             {
-                "id": "blueprint-catalog-id",
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "version": "1.0.0",
                 "webApplicationInfo": {"id": "the-bot"},
                 "name": {"short": "X", "full": "X"},
             },
@@ -1445,7 +1628,8 @@ class TestApplyPublishPlanCopilotChat:
         zp = self._seed_manifest_zip(
             tmp_path,
             {
-                "id": "blueprint-catalog-id",
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "version": "1.0.0",
                 "webApplicationInfo": {"id": "the-bot"},
                 "name": {"short": "X", "full": "X"},
             },
@@ -1455,10 +1639,12 @@ class TestApplyPublishPlanCopilotChat:
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
         )
 
-        assert result.copilot_chat_manifest_id == "blueprint-catalog-id"
+        assert result.copilot_chat_manifest_id == (
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        )
         with zipfile.ZipFile(zp) as zf:
             m = json.loads(zf.read("manifest.json"))
-            assert m["id"] == "blueprint-catalog-id"
+            assert m["id"] == "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
             assert m["name"]["short"] == "X"
 
     def test_copilot_chat_zip_omits_ai_teammate_template_sidecar(self, tmp_path):
@@ -1470,7 +1656,8 @@ class TestApplyPublishPlanCopilotChat:
         zp = self._seed_manifest_zip(
             tmp_path,
             {
-                "id": "blueprint-catalog-id",
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "version": "1.0.0",
                 "webApplicationInfo": {"id": "the-bot"},
                 "agenticUserTemplates": [
                     {"id": "x", "file": "agenticUserTemplateManifest.json"}
@@ -1504,7 +1691,12 @@ class TestApplyPublishPlanCopilotChat:
 
         zp = self._seed_manifest_zip(
             tmp_path,
-            {"webApplicationInfo": {"id": "auto-id"}, "name": {"short": "X", "full": "X"}},
+            {
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "version": "1.0.0",
+                "webApplicationInfo": {"id": "auto-id"},
+                "name": {"short": "X", "full": "X"},
+            },
         )
         plan = build_publish_plan(
             PublishInputs(agent_name="X", copilot_chat=True, bot_id="override-id")
@@ -1527,6 +1719,8 @@ class TestApplyPublishPlanCopilotChat:
         zp = self._seed_manifest_zip(
             tmp_path,
             {
+                "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+                "version": "1.0.0",
                 "webApplicationInfo": {"id": "bid"},
                 "name": {
                     "short": "Hermes Inbox Helper R8 Blueprint",  # 32 chars
@@ -1549,7 +1743,10 @@ class TestApplyPublishPlanCopilotChat:
         from hermes_a365.publish import build_publish_plan
 
         # Manifest with no resolvable bot id and no override.
-        zp = self._seed_manifest_zip(tmp_path, {"name": {"short": "X", "full": "X"}})
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {"version": "1.0.0", "name": {"short": "X", "full": "X"}},
+        )
         plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
@@ -1565,7 +1762,10 @@ class TestApplyPublishPlanCopilotChat:
 
         from hermes_a365.publish import build_publish_plan
 
-        zp = self._seed_manifest_zip(tmp_path, {"name": {"short": "X", "full": "X"}})
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {"version": "1.0.0", "name": {"short": "X", "full": "X"}},
+        )
         plan = build_publish_plan(
             PublishInputs(agent_name="X", aiteammate=True, copilot_chat=True)
         )

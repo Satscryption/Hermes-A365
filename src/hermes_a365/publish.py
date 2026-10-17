@@ -42,6 +42,7 @@ from ._common import (
     UNPINNED_TENANT_PLAN_LINE,
     TenantResolutionError,
     active_az_tenant,
+    ensure_contained,
     resolve_expected_tenant,
     slugify,
     tenant_ids_match,
@@ -264,7 +265,7 @@ class PublishInputs:
             raise ValueError("--manifest-id is only meaningful with --copilot-chat")
         if self.manifest_id and self.manifest_id != "auto":
             try:
-                uuid.UUID(self.manifest_id)
+                self.manifest_id = _canonical_manifest_guid(self.manifest_id)
             except ValueError as e:
                 raise ValueError("--manifest-id must be 'auto' or a GUID") from e
         if self.app_version and not self.copilot_chat:
@@ -720,24 +721,29 @@ def _bump_app_version_patch(value: str) -> str:
     return _format_app_version((major, minor, patch + 1))
 
 
-def _template_app_version_from_manifest(manifest: dict) -> str:
+def _canonical_manifest_guid(value: str) -> str:
+    """Return the lowercase hyphenated Teams catalog ``manifest.id`` form."""
+    return str(uuid.UUID(value.strip()))
+
+
+def _parse_template_app_version(manifest: dict) -> str | None:
+    """Parse manifest ``version`` as ``X.Y.Z``, or ``None`` when missing/invalid."""
     raw = manifest.get("version")
-    if isinstance(raw, str) and raw.strip():
-        try:
-            return _format_app_version(_parse_app_version_triple(raw))
-        except ValueError:
-            pass
-    return "1.0.0"
+    if not isinstance(raw, str) or not raw.strip():
+        return None
+    try:
+        return _format_app_version(_parse_app_version_triple(raw))
+    except ValueError:
+        return None
 
 
 def _resolve_next_copilot_chat_app_version(
     *,
-    template_version: str,
+    template_version: str | None,
     last_published: str | None,
     override: str | None,
 ) -> str:
     """Return the manifest ``version`` to stamp on the next CEA zip."""
-    template = _format_app_version(_parse_app_version_triple(template_version))
     if override is not None:
         chosen = _format_app_version(_parse_app_version_triple(override))
         if last_published is not None and _compare_app_versions(chosen, last_published) <= 0:
@@ -747,46 +753,139 @@ def _resolve_next_copilot_chat_app_version(
             )
         return chosen
     if last_published is None:
-        return template
-    if _compare_app_versions(template, last_published) > 0:
-        return template
+        if template_version is None:
+            raise ValueError(
+                "manifest version is missing or unparseable (expected X.Y.Z); "
+                "pass --app-version to set the Teams app version explicitly"
+            )
+        return template_version
+    if (
+        template_version is not None
+        and _compare_app_versions(template_version, last_published) > 0
+    ):
+        return template_version
     return _bump_app_version_patch(last_published)
 
 
+def _agents_root(hermes_home: Path) -> Path:
+    return hermes_home / "agents"
+
+
 def _copilot_chat_publish_state_path(hermes_home: Path, slug: str) -> Path:
-    return hermes_home / "agents" / slug / _COPILOT_CHAT_PUBLISH_STATE_FILENAME
+    return _agents_root(hermes_home) / slug / _COPILOT_CHAT_PUBLISH_STATE_FILENAME
+
+
+def _guard_copilot_chat_publish_state_path(path: Path, hermes_home: Path) -> None:
+    """Refuse read/write when ``agents/<slug>/`` escapes the agents root."""
+    root = _agents_root(hermes_home)
+    try:
+        ensure_contained(path.parent, root)
+        ensure_contained(path, root)
+    except ValueError as exc:
+        raise PublishError(str(exc)) from exc
+
+
+def _require_copilot_chat_slug(inputs: PublishInputs) -> str:
+    try:
+        slug = validate_slug(inputs.slug) if inputs.slug else slugify(inputs.agent_name)
+    except ValueError as exc:
+        raise PublishError(str(exc)) from exc
+    if not slug:
+        raise PublishError(
+            "agent_name does not yield a local slug; pass --slug "
+            "to record Copilot Chat publish versions"
+        )
+    return slug
 
 
 def _read_copilot_chat_publish_state(
-    path: Path, *, manifest_id: str
+    path: Path,
+    *,
+    manifest_id: str,
+    hermes_home: Path,
 ) -> str | None:
+    """Return the last published app version for *manifest_id*, if recorded.
+
+    Returns ``None`` when the state file is absent, or when it records a
+    different (valid) catalog ``manifestId``. Raises :class:`PublishError`
+    when the file exists but is corrupt or untrusted.
+    """
     if not path.is_file():
         return None
+    _guard_copilot_chat_publish_state_path(path, hermes_home)
     try:
-        raw = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return None
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise PublishError(
+            f"could not read Copilot Chat publish state at {path}: {exc}; "
+            "fix or remove the file before re-running publish --apply"
+        ) from exc
+    try:
+        raw = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise PublishError(
+            f"Copilot Chat publish state at {path} is not valid JSON ({exc}); "
+            "fix or remove the file before re-running publish --apply"
+        ) from exc
     if not isinstance(raw, dict):
-        return None
-    if raw.get("schemaVersion") != _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
-        return None
-    if raw.get("manifestId") != manifest_id:
+        raise PublishError(
+            f"Copilot Chat publish state at {path} must be a JSON object; "
+            "fix or remove the file before re-running publish --apply"
+        )
+    schema = raw.get("schemaVersion")
+    if schema != _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
+        raise PublishError(
+            f"Copilot Chat publish state at {path} has unsupported "
+            f"schemaVersion={schema!r} (expected "
+            f"{_COPILOT_CHAT_PUBLISH_STATE_SCHEMA}); fix or remove the file "
+            "before re-running publish --apply"
+        )
+    stored_id = raw.get("manifestId")
+    if not isinstance(stored_id, str) or not stored_id.strip():
+        raise PublishError(
+            f"Copilot Chat publish state at {path} is missing a string "
+            "manifestId; fix or remove the file before re-running publish --apply"
+        )
+    try:
+        stored_canon = _canonical_manifest_guid(stored_id)
+    except ValueError:
+        raise PublishError(
+            f"Copilot Chat publish state at {path} has invalid manifestId "
+            f"{stored_id!r}; fix or remove the file before re-running publish --apply"
+        ) from None
+    try:
+        current_canon = _canonical_manifest_guid(manifest_id)
+    except ValueError as exc:
+        raise PublishError(f"invalid catalog manifest id: {exc}") from exc
+    if stored_canon != current_canon:
         return None
     last = raw.get("lastAppVersion")
     if not isinstance(last, str):
-        return None
+        raise PublishError(
+            f"Copilot Chat publish state at {path} is missing a string "
+            "lastAppVersion; fix or remove the file before re-running publish --apply"
+        )
     try:
         return _format_app_version(_parse_app_version_triple(last))
     except ValueError:
-        return None
+        raise PublishError(
+            f"Copilot Chat publish state at {path} has invalid lastAppVersion "
+            f"{last!r} (expected X.Y.Z); fix or remove the file before "
+            "re-running publish --apply"
+        ) from None
 
 
 def _write_copilot_chat_publish_state(
-    path: Path, *, manifest_id: str, app_version: str
+    path: Path,
+    *,
+    manifest_id: str,
+    app_version: str,
+    hermes_home: Path,
 ) -> None:
+    _guard_copilot_chat_publish_state_path(path, hermes_home)
     payload = {
         "schemaVersion": _COPILOT_CHAT_PUBLISH_STATE_SCHEMA,
-        "manifestId": manifest_id,
+        "manifestId": _canonical_manifest_guid(manifest_id),
         "lastAppVersion": _format_app_version(_parse_app_version_triple(app_version)),
     }
     write_owner_only_text_atomic(
@@ -879,10 +978,16 @@ def _catalog_manifest_id_for_copilot_chat(
     source_manifest: dict, requested_id: str | None
 ) -> str | None:
     if requested_id:
-        return requested_id
+        try:
+            return _canonical_manifest_guid(requested_id)
+        except ValueError:
+            return None
     top_id = source_manifest.get("id")
     if isinstance(top_id, str) and top_id.strip():
-        return top_id.strip()
+        try:
+            return _canonical_manifest_guid(top_id)
+        except ValueError:
+            return None
     return None
 
 
@@ -1039,6 +1144,8 @@ def apply_publish_plan(
         raise PublishError(str(exc)) from exc
     if not matches:
         raise PublishError("active Azure tenant does not match the publish tenant pin")
+    if plan.inputs.copilot_chat:
+        _require_copilot_chat_slug(plan.inputs)
     run = mutator.run(plan.step.argv, timeout=_PUBLISH_APPLY_TIMEOUT_SECONDS)
     package_path: str | None = None
     copilot_chat_package_path: str | None = None
@@ -1107,25 +1214,20 @@ def apply_publish_plan(
                 copilot_app_version: str | None = None
                 publish_state_path: Path | None = None
                 if plan.inputs.copilot_chat:
-                    slug = plan.inputs.resolved_slug
-                    if not slug:
-                        raise PublishError(
-                            "agent_name does not yield a local slug; pass --slug "
-                            "to record Copilot Chat publish versions"
-                        )
+                    slug = _require_copilot_chat_slug(plan.inputs)
                     publish_state_path = _copilot_chat_publish_state_path(
                         hermes_home, slug
                     )
                     last_published = (
                         _read_copilot_chat_publish_state(
-                            publish_state_path, manifest_id=catalog_manifest_id
+                            publish_state_path,
+                            manifest_id=catalog_manifest_id,
+                            hermes_home=hermes_home,
                         )
                         if catalog_manifest_id
                         else None
                     )
-                    template_version = _template_app_version_from_manifest(
-                        source_manifest
-                    )
+                    template_version = _parse_template_app_version(source_manifest)
                     try:
                         copilot_app_version = _resolve_next_copilot_chat_app_version(
                             template_version=template_version,
@@ -1168,6 +1270,7 @@ def apply_publish_plan(
                             publish_state_path,
                             manifest_id=str(summary["manifest_id"]),
                             app_version=str(summary["app_version"]),
+                            hermes_home=hermes_home,
                         )
                         messages.append(
                             f"[apply] recorded last published app version in "
@@ -1383,6 +1486,9 @@ def run(args: argparse.Namespace) -> int:
 
     try:
         result = apply_publish_plan(plan, mutator=get_mutator())
+    except ValueError as e:
+        print(f"ERROR: {e}", file=sys.stderr)
+        return 2
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
         return 2
