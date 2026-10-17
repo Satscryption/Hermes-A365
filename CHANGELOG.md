@@ -4,6 +4,26 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## Unreleased / 0.9.1
+
+- **#98: release-integrity preflight and GitHub Release finalization.**
+  A `v*` tag is published only when it is strict semver, the tagged commit
+  is reachable from `origin/main`, and that version is exactly
+  `project.version`, `hermes_a365.__version__`, and one
+  `## [X.Y.Z] — YYYY-MM-DD` section in this file. The check runs in a
+  credential-free job, before the protected `pypi` environment. The same
+  workflow runs the hermetic 3.11 and 3.14 suite, builds with the
+  hash-pinned toolchain, validates core metadata (including
+  `Requires-Python` covering 3.14), and smoke-installs the wheel. After
+  PyPI accepts those artifacts, the workflow rewrites the single GitHub
+  Release for the tag: changelog notes, title `vX.Y.Z — <theme>`, semver
+  Latest/prerelease classification, and the wheel, sdist, and checksums.
+  It does not create tags. The `Protect release tags` ruleset has no
+  bypass, so the operator mints the tag by publishing a GitHub Release.
+  See [`references/releasing.md`](references/releasing.md). A rerun edits
+  that release and skips files already on PyPI. `pyjwt[crypto]>=2.15.0`
+  is unchanged.
+
 ## [0.9.0] — 2026-10-16
 
 Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).

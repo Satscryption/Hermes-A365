@@ -370,10 +370,13 @@ v0.1 design draft is archived at
 │   ├── exposing-the-bot-endpoint.md # Tunnel/reverse-proxy options (non-prescriptive)
 │   ├── license-cost-table.md
 │   ├── live-tenant-test.md          # End-to-end runbook (operator-side)
+│   ├── releasing.md                 # PyPI + GitHub Release operator flow
 │   ├── m365-surface-coverage.md     # Surface matrix per slice 19t
 │   ├── opentelemetry-config.md
 │   ├── README.md                    # Index
 │   └── webhook-contract.md          # Bridge → responder JSON contract
+├── scripts/
+│   └── release_integrity.py         # Tag/version/changelog preflight (#98)
 ├── src/hermes_a365/         # The installed package
 │   ├── __init__.py
 │   ├── _common.py               # parse_env, slugify, safe_run, jinja_env, deep_diff
