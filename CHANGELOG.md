@@ -4,10 +4,45 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased] — 0.9.1
+## [Unreleased / 0.9.1]
 
 ### Fixed
 
+- **Copilot Chat publish auto-increments the Teams app `version`.** Each
+  successful `publish --copilot-chat --apply` now stamps a strictly higher
+  manifest `version` than the last upload for the same catalog `manifest.id`,
+  so Microsoft Admin Center accepts update packages without zip surgery. The
+  source of truth is
+  `$HERMES_HOME/agents/<slug>/copilot-chat-publish.json` (override the slug
+  with `--slug`; override the version with `--app-version`). Closes #109.
+
+- **Orphan agentic-user ownership accepts the real owner again.** When
+  `agentRegistry` no longer lists an instance for a typed orphan user id,
+  cleanup now follows `users/{id}.identityParentId` to
+  `servicePrincipals/{id}/microsoft.graph.agentIdentity` for the parent
+  blueprint proof (instead of treating the user object id as a service
+  principal). Live `az rest` Graph 403s surface the same permission hint as
+  in-body error JSON (`AgentRegistry.Read.All`, `User.Read.All`,
+  `AgentIdentity.Read.All`, or broader directory read). Wrong-blueprint and
+  unproven lookups are still refused.
+- #155: a buffered Copilot Chat turn that is still open inside the ~45s
+  idle window posts a Bot Framework streaming informative update from
+  a background task, then a `streamType=final` activity immediately
+  before the merged `send_reply`. Later updates reuse the `streamId`
+  from the opening 201. The sequence rotates when another interval
+  would leave that final outside the two-minute cap. A final that
+  fails or is skipped keeps the stream id and the buffered segments;
+  the reply is posted only after the stream is closed. An opening
+  response that does not yield an id, including an httpx read or write
+  timeout on the opening POST, does not start a second stream. A
+  connect or pool timeout does not. The id-less wait does not send
+  typing: that activity swallows the later reply, and there is no
+  stream id to continue. The reply waits out the two-minute cap.
+  A user-cancelled stream is not replaced. Uninstall sends one
+  best-effort final for a stream that already returned an id. The
+  informative text is a keep-alive, not the answer. Short turns send
+  nothing. Personal chats are unchanged. `send` does not await the
+  keep-alive POST.
 - **#158:** ``installationUpdate`` remove hard-interrupts the in-flight Hermes
   model turn (the same ``request_hard_interrupt`` path as the inactivity
   watchdog) on every matched conversation, not only the asyncio session
@@ -50,9 +85,9 @@ down afterwards).
 ### Known follow-ups (not blocking)
 
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
-- #158: fixed in 0.9.1 (see [Unreleased]).
-- #159: the orphan-cleanup Graph ownership check also refuses the real
-  owner (fails closed).
+- #158: fixed in 0.9.1 (see [Unreleased / 0.9.1]).
+- #159: the orphan-cleanup Graph ownership check also refused the real
+  owner (fixed in 0.9.1).
 - #160: the bridge allowlist is read only from the per-agent env.
 - #161: Teams 1:1 replies can stay greyed with a Stop button.
 
