@@ -4,7 +4,7 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased / 0.9.1]
+## Unreleased / 0.9.1
 
 ### Security
 
@@ -17,6 +17,18 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   disagree. If neither source sets a policy, both runtimes deny every end
   user. An empty allowlist is not allow-all. A Hermes allow does not widen
   the shared policy.
+
+### Fixed
+
+- **Orphan agentic-user ownership accepts the real owner again.** When
+  `agentRegistry` no longer lists an instance for a typed orphan user id,
+  cleanup now follows `users/{id}.identityParentId` to
+  `servicePrincipals/{id}/microsoft.graph.agentIdentity` for the parent
+  blueprint proof (instead of treating the user object id as a service
+  principal). Live `az rest` Graph 403s surface the same permission hint as
+  in-body error JSON (`AgentRegistry.Read.All`, `User.Read.All`,
+  `AgentIdentity.Read.All`, or broader directory read). Wrong-blueprint and
+  unproven lookups are still refused.
 
 ## [0.9.0] — 2026-10-16
 
@@ -46,9 +58,9 @@ down afterwards).
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
 - #158: uninstall drops the reply but does not yet cancel the in-flight
   model turn (cost only).
-- #159: the orphan-cleanup Graph ownership check also refuses the real
-  owner (fails closed).
-- #160: the bridge allowlist is read only from the per-agent env.
+- #159: the orphan-cleanup Graph ownership check also refused the real
+  owner (fixed in 0.9.1).
+- #160: the bridge allowlist was read only from the per-agent env (fixed in 0.9.1).
 - #161: Teams 1:1 replies can stay greyed with a Stop button.
 
 ### Uninstall scope (walk row 2b)
