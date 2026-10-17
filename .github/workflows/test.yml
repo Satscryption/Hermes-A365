@@ -11,6 +11,9 @@ on:
   # via REST). Allows `gh workflow run test.yml --ref <branch>` to
   # run tests on any ref regardless of push-trigger state.
   workflow_dispatch:
+  # publish.yml calls this so a release runs the same 3.11 and 3.14
+  # suite against the tagged commit before the pypi environment. #98
+  workflow_call:
 
 permissions:
   contents: read

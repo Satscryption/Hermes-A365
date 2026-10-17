@@ -67,6 +67,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   Registration Graph GETs are captured as sensitive commands so an error
   body is not streamed before redaction.
   Refs #127, #159.
+- **GitHub Release `SHA256SUMS` lists basenames.** The wheel, sdist, and
+  checksum file sit side by side, and `sha256sum --check SHA256SUMS` in
+  that folder verifies them.
+- **Prerelease distributions compare as PEP 440 versions.** Tag
+  `v1.2.3-rc.1` accepts wheel and sdist metadata, filenames, and the
+  installed version `1.2.3rc1`. The tag, changelog heading, and source
+  version strings stay SemVer, and a different version still fails.
 - **Copilot Chat publish auto-increments the Teams app `version`.** Each
   successful `publish --copilot-chat --apply` now stamps a strictly higher
   manifest `version` than the last upload for the same catalog `manifest.id`,
@@ -102,6 +109,51 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   informative text is a keep-alive, not the answer. Short turns send
   nothing. Personal chats are unchanged. `send` does not await the
   keep-alive POST.
+- **#158:** ``installationUpdate`` remove hard-interrupts the in-flight Hermes
+  model turn (the same ``request_hard_interrupt`` path as the inactivity
+  watchdog) on every matched conversation, not only the asyncio session
+  waiter. The interrupt runs on a worker thread inside a 5s bound so a
+  blocked commit fence cannot stall the gateway loop; on timeout uninstall
+  logs and continues. Sibling turns are interrupted together only after the
+  cancellable outbound phase returns, and still before personal teardown
+  waits, so one session cannot serialise the rest. The commit stays
+  shielded until every matched turn is signalled, including a second
+  cancel. A second cancel before that commit leaves the sibling turn
+  running. If a turn was already interrupted, rollback drops its deferred
+  turn-buffer retry so that retry cannot post. A retired session cannot
+  open another buffer or flush one through the reply post. A failed
+  keep-alive close does not schedule a deferred flush retry once that
+  chat is retiring. The fallback
+  interrupt calls the bound ``agent.hard_interrupt``. The session-key mapping stays until that turn has finished
+  or the interrupt succeeded with no worker left, including when
+  ``_active_sessions`` was already released, and is not dropped when cancel
+  fails or a drain task replaced the slot. Live session tasks count toward
+  the active-turn cap.
+
+### Added
+
+- **#98: release-integrity preflight and GitHub Release finalization.**
+  A `v*` tag is published only when it is strict semver, the tagged commit
+  is reachable from `origin/main`, and that version is exactly
+  `project.version`, `hermes_a365.__version__`, and one
+  `## [X.Y.Z] — YYYY-MM-DD` section in this file. The check runs in a
+  credential-free job, before the protected `pypi` environment, and the
+  worktree must be that commit. The same workflow runs the hermetic 3.11
+  and 3.14 suite, builds with the hash-pinned toolchain and
+  `SOURCE_DATE_EPOCH` taken from the commit, validates core metadata
+  (including `Requires-Python` covering 3.14), and smoke-installs the
+  wheel. After PyPI accepts those artifacts, the workflow rewrites the
+  single GitHub Release for the tag: changelog notes, title
+  `vX.Y.Z — <theme>`, semver Latest/prerelease classification, and the
+  wheel, sdist, and checksums. Assets are uploaded only when their sha256
+  matches the files PyPI has for that version, and only when the tag
+  resolves to the workflow commit. An approval-test dispatch does not
+  rewrite the release. The workflow does not create tags. The
+  `Protect release tags` ruleset has no bypass, so the operator mints the
+  tag by publishing a GitHub Release. See
+  [`references/releasing.md`](references/releasing.md). A rerun edits that
+  release and skips files already on PyPI. `pyjwt[crypto]>=2.15.0` is
+  unchanged.
 
 ## [0.9.0] — 2026-10-16
 
@@ -129,8 +181,7 @@ down afterwards).
 ### Known follow-ups (not blocking)
 
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
-- #158: uninstall drops the reply but does not yet cancel the in-flight
-  model turn (cost only).
+- #158: fixed in 0.9.1 (see [Unreleased / 0.9.1]).
 - #159: the orphan-cleanup Graph ownership check also refused the real
   owner (fixed in 0.9.1).
 - #160: the bridge allowlist was read only from the per-agent env (fixed in 0.9.1).
