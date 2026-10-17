@@ -142,10 +142,12 @@ def test_digest_verification_survives_smoke_and_gates_the_upload() -> None:
     publish_names = [step.get("name") for step in _steps(publish)]
 
     assert "SHA256SUMS must be a regular file" in script
-    assert "path.parent != dist" in script
+    assert "unsafe SHA256SUMS path" in script
+    assert '"/" in name' in script
     assert "duplicate SHA256SUMS path" in script
     assert "exactly one wheel and one sdist" in script
-    assert "sha256sum --check --strict dist/SHA256SUMS" in script
+    assert "cd dist" in script
+    assert "sha256sum --check --strict SHA256SUMS" in script
     assert "rm dist/SHA256SUMS" in script
     assert publish_names.index("Verify artefact digests") < publish_names.index("Publish to PyPI")
 
@@ -158,7 +160,11 @@ def test_digest_verification_survives_smoke_and_gates_the_upload() -> None:
 
     assert 'export SOURCE_DATE_EPOCH="$epoch"' in rebuild
     assert "git log -1 --format=%ct HEAD" in rebuild
+    assert "cd dist" in record
+    assert "-printf '%P\\0'" in record
+    assert "sha256sum --" in record
     assert "SHA256SUMS.before-smoke" in record
+    assert "cd dist" in recheck
     assert 'sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS.before-smoke"' in recheck
     assert "cmp dist/SHA256SUMS" in recheck
     assert build_names.index("Record artefact digests") < build_names.index(

@@ -476,6 +476,21 @@ def iter_dist_files(dist: Path) -> tuple[Path, Path, Path]:
     return wheels[0], sdists[0], sums
 
 
+def _basename_in_dist(dist: Path, name: str, sums_name: str) -> Path:
+    """Accept only a bare filename, so ``sha256sum --check`` works beside the assets."""
+    if (
+        not name
+        or name in {".", "..", sums_name}
+        or name != Path(name).name
+        or "/" in name
+        or "\\" in name
+        or "\n" in name
+        or "\r" in name
+    ):
+        raise ReleaseIntegrityError(f"unsafe SHA256SUMS path: {name}")
+    return dist / name
+
+
 def verify_checksums(dist: Path) -> tuple[Path, Path, Path]:
     wheel, sdist, sums = iter_dist_files(dist)
     expected: dict[Path, str] = {}
@@ -490,9 +505,7 @@ def verify_checksums(dist: Path) -> tuple[Path, Path, Path]:
         except ValueError as exc:
             raise ReleaseIntegrityError("malformed SHA256SUMS digest") from exc
         name = parts[1].lstrip("*")
-        path = Path(name)
-        if path.parent != dist or path.name == sums.name:
-            raise ReleaseIntegrityError(f"unsafe SHA256SUMS path: {name}")
+        path = _basename_in_dist(dist, name, sums.name)
         if path in expected:
             raise ReleaseIntegrityError(f"duplicate SHA256SUMS path: {name}")
         expected[path] = parts[0].lower()

@@ -97,7 +97,7 @@ def _dist(tmp_path: Path, metadata: str, version: str = "1.2.3") -> Path:
     lines = []
     for path in (wheel, sdist):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
-        lines.append(f"{digest}  {path.as_posix()}")
+        lines.append(f"{digest}  {path.name}")
     (dist / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
     return dist
 
@@ -571,6 +571,29 @@ def test_source_version_keeps_the_semver_spelling(tmp_path: Path) -> None:
     assert notes.prerelease is True
 
 
+def test_checksum_file_uses_basenames_and_checks_beside_the_assets(tmp_path: Path) -> None:
+    dist = _dist(tmp_path, _metadata("1.2.3"))
+    text = (dist / "SHA256SUMS").read_text(encoding="utf-8")
+    names = [line.split(maxsplit=1)[1] for line in text.splitlines() if line.strip()]
+
+    assert names
+    assert all("/" not in name and name == Path(name).name for name in names)
+    mod.verify_checksums(dist)
+
+    folder = tmp_path / "download"
+    folder.mkdir()
+    for path in dist.iterdir():
+        (folder / path.name).write_bytes(path.read_bytes())
+    completed = subprocess.run(
+        ["sha256sum", "--check", "--strict", "SHA256SUMS"],
+        cwd=folder,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
 def test_checksum_file_cannot_escape_dist(tmp_path: Path) -> None:
     dist = _dist(tmp_path, _metadata("1.2.3"))
     sums = dist / "SHA256SUMS"
@@ -579,6 +602,17 @@ def test_checksum_file_cannot_escape_dist(tmp_path: Path) -> None:
 
     with pytest.raises(mod.ReleaseIntegrityError, match="unsafe SHA256SUMS path"):
         mod.verify_checksums(dist)
+
+    prefixed = _dist(tmp_path / "prefixed", _metadata("1.2.3"))
+    prefixed_sums = prefixed / "SHA256SUMS"
+    rewritten = [
+        f"{line.split(maxsplit=1)[0]}  dist/{line.split(maxsplit=1)[1]}"
+        for line in prefixed_sums.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    prefixed_sums.write_text("\n".join(rewritten) + "\n", encoding="utf-8")
+    with pytest.raises(mod.ReleaseIntegrityError, match="unsafe SHA256SUMS path"):
+        mod.verify_checksums(prefixed)
 
 
 def test_smoke_accepts_the_development_install() -> None:

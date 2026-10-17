@@ -107,7 +107,9 @@ Publishing the release creates `refs/tags/vX.Y.Z` and starts
    is replaced, the wheel and sdist sha256 must match the digests the
    PyPI JSON API publishes for that version. The wheel, sdist, and
    `SHA256SUMS` are then attached, replacing any previous copies of
-   those names. A mismatch fails and leaves the release unchanged.
+   those names. The checksum file lists each asset by basename, so
+   `sha256sum --check SHA256SUMS` works in the folder the assets were
+   downloaded to. A mismatch fails and leaves the release unchanged.
 
 ## Before you approve the pypi deployment
 

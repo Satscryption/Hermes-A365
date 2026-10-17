@@ -44,6 +44,9 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **GitHub Release `SHA256SUMS` lists basenames.** The wheel, sdist, and
+  checksum file sit side by side, and `sha256sum --check SHA256SUMS` in
+  that folder verifies them.
 - **Prerelease distributions compare as PEP 440 versions.** Tag
   `v1.2.3-rc.1` accepts wheel and sdist metadata, filenames, and the
   installed version `1.2.3rc1`. The tag, changelog heading, and source

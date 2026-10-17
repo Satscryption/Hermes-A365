@@ -131,9 +131,16 @@ jobs:
             || (echo "Missing package data in wheel!" && exit 1)
 
       - name: Record artefact digests
+        # Basenames, written from inside dist/, so a download of the release
+        # assets into one folder checks with `sha256sum --check SHA256SUMS`.
         run: |
           set -euo pipefail
-          find dist -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' \
+              | sort -z \
+              | xargs -0 -r sha256sum -- > SHA256SUMS
+          )
           cp dist/SHA256SUMS "$RUNNER_TEMP/SHA256SUMS.before-smoke"
 
       - name: Check distribution metadata
@@ -173,7 +180,10 @@ jobs:
         # manifest cannot agree with each other and still be published.
         run: |
           set -euo pipefail
-          sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS.before-smoke"
+          (
+            cd dist
+            sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS.before-smoke"
+          )
           cmp dist/SHA256SUMS "$RUNNER_TEMP/SHA256SUMS.before-smoke"
 
       - name: Upload artefacts for the publish job
@@ -220,9 +230,15 @@ jobs:
               if len(parts) != 2:
                   raise SystemExit("malformed SHA256SUMS entry")
               name = parts[1].lstrip("*")
-              path = Path(name)
-              if path.parent != dist or path.name == manifest.name:
+              if (
+                  not name
+                  or name in {"", ".", "..", manifest.name}
+                  or name != Path(name).name
+                  or "/" in name
+                  or "\\" in name
+              ):
                   raise SystemExit(f"unsafe SHA256SUMS path: {name}")
+              path = dist / name
               if path in expected:
                   raise SystemExit(f"duplicate SHA256SUMS path: {name}")
               expected.add(path)
@@ -243,7 +259,10 @@ jobs:
           if len(wheels) != 1 or len(sdists) != 1 or len(actual) != 2:
               raise SystemExit("dist must contain exactly one wheel and one sdist")
           PY
-          sha256sum --check --strict dist/SHA256SUMS
+          (
+            cd dist
+            sha256sum --check --strict SHA256SUMS
+          )
           rm dist/SHA256SUMS
 
       - name: Publish to PyPI
