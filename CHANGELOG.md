@@ -4,7 +4,43 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## Unreleased / 0.9.1
+## [Unreleased / 0.9.1]
+
+### Breaking
+
+- **A sender allowlist that exists only in the process environment is refused (#160).**
+  `A365_ALLOWED_USERS` and `A365_ALLOW_ALL_USERS` are read from
+  `~/.hermes/.env`. A value set only in the process environment, with that
+  file missing or silent, no longer opens the gateway or `activity-bridge
+  serve`. To keep the previous allowlist: put `A365_ALLOWED_USERS` or
+  `A365_ALLOW_ALL_USERS` in `~/.hermes/.env`, run `chmod 600 ~/.hermes/.env`,
+  and remove the process-env value or set it to the same policy. A process
+  value that disagrees with the file is refused. A silent process adopts
+  the file.
+
+### Security
+
+- **The gateway and the activity bridge share one sender allowlist (#160).**
+  Both enforce `A365_ALLOWED_USERS` / `A365_ALLOW_ALL_USERS` from the profile
+  `~/.hermes/.env`. A silent process adopts that file. A policy that exists
+  only in the process environment is refused by both runtimes, whether the
+  profile file is missing or present and silent. Startup also refuses when
+  the file and the process disagree, when the per-agent file sets a policy
+  the profile does not, or when the two files differ. An unscoped gateway
+  (no slug) still refuses if any per-agent env states a conflicting policy,
+  including when that agent directory is a symlink. A directory name that
+  fails the slug check does not count as that path, so a sibling symlink
+  whose name contains a backslash cannot hide the real agent.
+  If neither file sets a policy, both runtimes deny every end user. An empty
+  allowlist is not allow-all. A Hermes allow does not widen the shared policy,
+  and a Hermes deny does not reject a sender the list admits. When Hermes
+  authorizes opaque `from.id` and the list names that sender's AAD object id
+  or UPN, the gateway and `serve` both admit them.
+- **`activity-bridge serve` refuses a group- or world-readable profile `.env`.**
+  Startup exits before bind when `~/.hermes/.env` is readable by group or
+  other. The error names the mode and the path and tells the operator to
+  run `chmod 600` on that file. It does not print allowlist values or any
+  other file contents. The gateway already rejected this mode.
 
 ### Fixed
 
@@ -12,19 +48,26 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   The command GETs the blueprint (and the derived identity name) before any
   `a365` call. An agent-identity blueprint whose appId is the per-agent
   `A365_APP_ID`, whose display name matches, and which already has
-  permission grants is left unchanged: no second application, no consent
-  grant, and no new client secret. A same-name application without that
-  anchor, more than one match, a tier or slug mismatch, audience drift, a
-  missing service principal, or a paged/unreadable Graph result fails
-  closed with an error that says what to fix. `--update-permissions` is
-  required to re-grant on an owned blueprint and does not override an
-  ownership, tier, or name refusal. Microsoft Graph admin consent, which
-  `a365 setup blueprint` writes, is not treated as finished MCP or bot
-  permission setup: a re-run executes only the permission step whose
-  marker is missing and does not re-run `setup blueprint`. Reads are
-  GET-only with a tight
-  `$select` (no credentials or tokens). The generated-config GUID is not
-  an ownership anchor. Refs #127, #159.
+  MCP and bot permission-step markers is left unchanged: no second
+  application, no consent grant, and no new client secret. A same-name
+  application without that anchor, more than one match, a tier or slug
+  mismatch, audience drift, a missing service principal, or a
+  paged/unreadable Graph result fails closed with an error that says what
+  to fix. `--update-permissions` is required to re-grant on an owned
+  blueprint and does not override an ownership, tier, or name refusal.
+  Microsoft Graph admin consent, which `a365 setup blueprint` writes, is
+  not treated as finished MCP or bot permission setup: a re-run executes
+  only the permission step whose marker is missing and does not re-run
+  `setup blueprint`. Reads are GET-only with a tight `$select` (no
+  credentials or tokens). The generated-config GUID is not an ownership
+  anchor. Refs #127, #159.
+- **Copilot Chat publish auto-increments the Teams app `version`.** Each
+  successful `publish --copilot-chat --apply` now stamps a strictly higher
+  manifest `version` than the last upload for the same catalog `manifest.id`,
+  so Microsoft Admin Center accepts update packages without zip surgery. The
+  source of truth is
+  `$HERMES_HOME/agents/<slug>/copilot-chat-publish.json` (override the slug
+  with `--slug`; override the version with `--app-version`). Closes #109.
 
 - **Orphan agentic-user ownership accepts the real owner again.** When
   `agentRegistry` no longer lists an instance for a typed orphan user id,
@@ -35,6 +78,24 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   in-body error JSON (`AgentRegistry.Read.All`, `User.Read.All`,
   `AgentIdentity.Read.All`, or broader directory read). Wrong-blueprint and
   unproven lookups are still refused.
+- #155: a buffered Copilot Chat turn that is still open inside the ~45s
+  idle window posts a Bot Framework streaming informative update from
+  a background task, then a `streamType=final` activity immediately
+  before the merged `send_reply`. Later updates reuse the `streamId`
+  from the opening 201. The sequence rotates when another interval
+  would leave that final outside the two-minute cap. A final that
+  fails or is skipped keeps the stream id and the buffered segments;
+  the reply is posted only after the stream is closed. An opening
+  response that does not yield an id, including an httpx read or write
+  timeout on the opening POST, does not start a second stream. A
+  connect or pool timeout does not. The id-less wait does not send
+  typing: that activity swallows the later reply, and there is no
+  stream id to continue. The reply waits out the two-minute cap.
+  A user-cancelled stream is not replaced. Uninstall sends one
+  best-effort final for a stream that already returned an id. The
+  informative text is a keep-alive, not the answer. Short turns send
+  nothing. Personal chats are unchanged. `send` does not await the
+  keep-alive POST.
 
 ## [0.9.0] — 2026-10-16
 
@@ -66,7 +127,7 @@ down afterwards).
   model turn (cost only).
 - #159: the orphan-cleanup Graph ownership check also refused the real
   owner (fixed in 0.9.1).
-- #160: the bridge allowlist is read only from the per-agent env.
+- #160: the bridge allowlist was read only from the per-agent env (fixed in 0.9.1).
 - #161: Teams 1:1 replies can stay greyed with a Stop button.
 
 ### Uninstall scope (walk row 2b)
