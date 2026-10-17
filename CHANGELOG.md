@@ -55,7 +55,9 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   cancel. A second cancel before that commit leaves the sibling turn
   running. If a turn was already interrupted, rollback drops its deferred
   turn-buffer retry so that retry cannot post. A retired session cannot
-  open another buffer or flush one through the reply post. The fallback
+  open another buffer or flush one through the reply post. A failed
+  keep-alive close does not schedule a deferred flush retry once that
+  chat is retiring. The fallback
   interrupt calls the bound ``agent.hard_interrupt``. The session-key mapping stays until that turn has finished
   or the interrupt succeeded with no worker left, including when
   ``_active_sessions`` was already released, and is not dropped when cancel

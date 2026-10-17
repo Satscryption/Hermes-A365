@@ -5790,7 +5790,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 # after a bare typing activity (#154). A final that did
                 # not close it leaves the id and the segments in place.
                 closed = await self._close_turn_buffer_keepalive_locked(chat_id)
-                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
+                    chat_id
+                ):
                     return
                 if not closed:
                     self._schedule_turn_buffer_retry(chat_id)

@@ -3736,6 +3736,57 @@ class TestLifecycleCapture:
                 await asyncio.wait_for(turn_task, timeout=1)
 
     @pytest.mark.asyncio
+    async def test_failed_keepalive_close_skips_retry_when_chat_retires(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Uninstall can arm _retiring_chats while the flush awaits the
+        # keep-alive close. A failed close must not schedule a retry.
+        a = _make_adapter(monkeypatch)
+        copilot = "19:copilot@thread.v2"
+        close_entered = asyncio.Event()
+        release_close = asyncio.Event()
+        a._turn_buffers[copilot] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": {"conversation": {"id": copilot}},
+                    "validated_path": None,
+                    "activity_id": "turn-1",
+                    "open": False,
+                }
+            ],
+            "segments": [{"id": "turnbuf:1", "text": "buffered", "turn": "1"}],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+            "retry_attempts": 0,
+        }
+
+        async def close_fails(chat_id: str) -> bool:
+            close_entered.set()
+            await release_close.wait()
+            return False
+
+        send_reply = AsyncMock()
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", close_fails)
+        monkeypatch.setattr(a, "_send_reply_activity", send_reply)
+        flush = asyncio.create_task(a._flush_turn_buffer(copilot))
+        try:
+            await asyncio.wait_for(close_entered.wait(), timeout=2)
+            a._retiring_chats.add(copilot)
+            release_close.set()
+            await asyncio.wait_for(flush, timeout=2)
+        finally:
+            release_close.set()
+            if not flush.done():
+                flush.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await flush
+        buf = a._turn_buffers[copilot]
+        assert buf.get("retry_task") is None
+        assert int(buf.get("retry_attempts") or 0) == 0
+        assert send_reply.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_failed_cancel_and_drain_task_keep_session_mapping(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
