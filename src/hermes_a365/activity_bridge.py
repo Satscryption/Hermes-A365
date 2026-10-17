@@ -1370,9 +1370,10 @@ def parse_agent_identity_ids(raw: Any) -> tuple[str, ...]:
     return tuple(parsed)
 
 
-# Profile ``~/.hermes/.env`` is the sender allowlist the Hermes gateway
-# enforces (``allowed_users_env`` / ``allow_all_env``). The per-agent env is
-# not a second policy: it may repeat the profile and must not widen it.
+# Profile ``~/.hermes/.env`` is the sender allowlist both runtimes enforce.
+# A silent process adopts that file. A process value may only repeat it.
+# The per-agent env is not a second policy: it may repeat the profile and
+# must not widen it.
 SENDER_ALLOWLIST_ENV_KEYS = ("A365_ALLOWED_USERS", "A365_ALLOW_ALL_USERS")
 _SENDER_ALLOW_TRUE = frozenset({"1", "true", "yes", "on"})
 _SENDER_ALLOW_FALSE = frozenset({"0", "false", "no", "off", ""})
@@ -1462,12 +1463,12 @@ def select_profile_sender_env(
 ) -> dict[str, str]:
     """Choose the profile policy the gateway and ``serve`` both apply.
 
-    The profile file is the only source. An absent file and a file that
-    states no sender keys are the same branch: neither is a policy. A
-    policy that exists only in the process environment is refused, a file
-    policy the process does not repeat is refused, and any disagreement
-    between the two is refused. Neither source stating a policy returns
-    an empty mapping (later deny-all), never the process environment.
+    The profile file is the source of truth. An absent file and a file
+    that states no sender keys are the same branch: neither is a policy.
+    A silent process adopts the file. A policy that exists only in the
+    process environment is refused, and a process value that disagrees
+    with the file is refused. Neither source stating a policy returns an
+    empty mapping (later deny-all), never the process environment.
     Error text does not include allowlist values.
     """
     file_policy = (
@@ -1478,13 +1479,6 @@ def select_profile_sender_env(
     scoped_policy = parse_sender_allowlist(
         scoped_env, source="the process environment"
     )
-    if file_policy is not None and scoped_policy is None:
-        raise BridgeConfigError(
-            "profile .env states a sender allowlist that the process "
-            "environment does not. Refusing to start: the gateway and "
-            "activity-bridge serve must apply the same policy. Source "
-            "~/.hermes/.env into the process."
-        )
     if file_policy is None and scoped_policy is not None:
         raise BridgeConfigError(
             "profile .env does not state the process allowlist. "

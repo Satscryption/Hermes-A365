@@ -6,12 +6,23 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## Unreleased / 0.9.1
 
+### Breaking
+
+- **A sender allowlist that exists only in the process environment is refused (#160).**
+  `A365_ALLOWED_USERS` and `A365_ALLOW_ALL_USERS` are read from
+  `~/.hermes/.env`. A value set only in the process environment, with that
+  file missing or silent, no longer opens the gateway or `activity-bridge
+  serve`. To keep the previous allowlist: put `A365_ALLOWED_USERS` or
+  `A365_ALLOW_ALL_USERS` in `~/.hermes/.env`, run `chmod 600 ~/.hermes/.env`,
+  and remove the process-env value or set it to the same policy. A process
+  value that disagrees with the file is refused. A silent process adopts
+  the file.
+
 ### Security
 
 - **The gateway and the activity bridge share one sender allowlist (#160).**
   Both enforce `A365_ALLOWED_USERS` / `A365_ALLOW_ALL_USERS` from the profile
-  `~/.hermes/.env`, which is the file the gateway already sources. The
-  process environment must state that same policy. A policy that exists
+  `~/.hermes/.env`. A silent process adopts that file. A policy that exists
   only in the process environment is refused by both runtimes, whether the
   profile file is missing or present and silent. Startup also refuses when
   the file and the process disagree, when the per-agent file sets a policy

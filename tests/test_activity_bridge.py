@@ -2527,20 +2527,38 @@ class TestSenderAllowlist:
         assert str(absent.value) == str(empty.value)
         assert "true" not in str(absent.value)
 
-    def test_file_present_and_process_absent_refuses_serve(
+    def test_file_present_and_process_absent_uses_the_file(
         self, tmp_path: Path
     ) -> None:
+        # #160 serve: the list lives in ~/.hermes/.env and the process is silent.
         _seed_agent_env(tmp_path)
-        _write_profile_env(tmp_path, A365_ALLOWED_USERS="user-a")
+        _write_profile_env(tmp_path, A365_ALLOWED_USERS="User-A")
         path = _seed_generated_config(tmp_path)
-        with pytest.raises(BridgeConfigError, match="process environment does not") as raised:
-            load_bridge_config(
-                slug="inbox-helper",
-                webhook_url="https://hook",
-                hermes_home=tmp_path,
-                generated_config_path=path,
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook",
+            hermes_home=tmp_path,
+            generated_config_path=path,
+        )
+        assert cfg.sender_allowlist_configured is True
+        assert cfg.allow_all_users is False
+        assert cfg.allowed_users == ("user-a",)
+        listed = _inbound_message_activity()
+        listed["from"] = {"id": "USER-A"}
+        outsider = _inbound_message_activity()
+        outsider["from"] = {"id": "someone-else"}
+        assert (
+            _activity_user_authorized(
+                listed, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
             )
-        assert "user-a" not in str(raised.value)
+            is True
+        )
+        assert (
+            _activity_user_authorized(
+                outsider, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+            )
+            is False
+        )
 
     def test_file_and_process_disagreement_refuses_serve(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

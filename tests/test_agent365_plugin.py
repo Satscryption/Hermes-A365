@@ -15353,7 +15353,7 @@ class TestSenderAllowlistAgreement:
                 "process": {},
                 "profile": "A365_ALLOWED_USERS=user-a\n",
                 "agent": f"A365_TENANT_ID={tenant}\n",
-                "expect": ("refuse", "process environment does not"),
+                "expect": ("allow", ("user-a",), False, True),
             },
             {
                 "name": "file absent process set",
@@ -15467,10 +15467,10 @@ class TestSenderAllowlistAgreement:
             else:
                 assert result == expect, case["name"]
 
-        # HTTP admission from the same profile file: listed sender in, outsider out.
+        # HTTP admission from the profile file with a silent process.
         home = tmp_path / "http"
         monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
-        monkeypatch.setenv("A365_ALLOWED_USERS", "user-allowed")
+        monkeypatch.delenv("A365_ALLOWED_USERS", raising=False)
         monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
         monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
         monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
