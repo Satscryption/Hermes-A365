@@ -4,6 +4,15 @@ name: Publish to PyPI
 # toolchain never runs with the OIDC publish credential in scope (M13); all
 # actions are pinned to full commit SHAs (M14); the publish job only fires
 # for v* tag refs, so `workflow_dispatch` from a branch cannot publish (M12).
+#
+# Release flow (#98): the Protect release tags ruleset on refs/tags/v* has
+# no bypass, so this workflow must not create tags. The operator mints the
+# tag by publishing a GitHub Release (see references/releasing.md). The tag
+# push runs integrity and the hermetic test suite, builds once, and only
+# then enters the protected pypi environment. After PyPI accepts those
+# artifacts, the release job rewrites that one GitHub Release. A rerun
+# skips files already on PyPI. The finalizer uploads assets only when
+# their sha256 matches the PyPI JSON API digests for that version.
 
 on:
   push:
@@ -26,11 +35,17 @@ on:
         default: false
         type: boolean
 
+# A second run for the same ref waits. Cancelling would drop a deploy that
+# is already waiting on the pypi reviewer.
+concurrency:
+  group: publish-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
-  build:
+  integrity:
     runs-on: ubuntu-latest
-    # Deliberately NO id-token permission here: the build toolchain must
-    # not execute while the PyPI OIDC credential is mintable (M13).
+    # No id-token here. A version / CHANGELOG / ancestry failure must
+    # happen before the protected pypi environment is even queued.
     permissions:
       contents: read
     steps:
@@ -38,15 +53,47 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
       - name: Verify release provenance
         if: startsWith(github.ref, 'refs/tags/v')
         env:
           RELEASE_REF: ${{ github.ref }}
           RELEASE_SHA: ${{ github.sha }}
         run: |
-          [[ "$RELEASE_REF" =~ ^refs/tags/v[0-9]+\.[0-9]+\.[0-9]+([.-][0-9A-Za-z.-]+)?$ ]]
+          set -euo pipefail
           git fetch --no-tags origin main
-          git merge-base --is-ancestor "$RELEASE_SHA" origin/main
+          python scripts/release_integrity.py check \
+            --tag-ref "$RELEASE_REF" \
+            --sha "$RELEASE_SHA" \
+            --output-dir release-metadata
+
+      - name: Upload release metadata
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-metadata
+          path: release-metadata/
+          if-no-files-found: error
+
+  test:
+    needs: integrity
+    uses: ./.github/workflows/test.yml
+    permissions:
+      contents: read
+
+  build:
+    needs: integrity
+    runs-on: ubuntu-latest
+    # Deliberately NO id-token permission here: the build toolchain must
+    # not execute while the PyPI OIDC credential is mintable (M13).
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
 
       - name: Set up Python
         uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
@@ -59,8 +106,20 @@ jobs:
       - name: Build sdist + wheel
         # --no-isolation: use the hash-pinned hatchling above instead of
         # letting `build` resolve an unpinned backend at build time.
+        # SOURCE_DATE_EPOCH is the checked-out commit's committer time so a
+        # later rerun rebuilds the same bytes. The value is a git timestamp,
+        # checked as decimal digits, and is not taken from the shell command line.
         run: |
+          set -euo pipefail
           rm -rf dist
+          epoch="$(git log -1 --format=%ct HEAD)"
+          case "$epoch" in
+            ''|*[!0-9]*)
+              echo "refusing non-numeric commit timestamp" >&2
+              exit 1
+              ;;
+          esac
+          export SOURCE_DATE_EPOCH="$epoch"
           python -m build --no-isolation
 
       - name: Sanity-check artefacts
@@ -72,7 +131,60 @@ jobs:
             || (echo "Missing package data in wheel!" && exit 1)
 
       - name: Record artefact digests
-        run: find dist -maxdepth 1 -type f ! -name SHA256SUMS -print0 | sort -z | xargs -0 sha256sum > dist/SHA256SUMS
+        # Basenames, written from inside dist/, so a download of the release
+        # assets into one folder checks with `sha256sum --check SHA256SUMS`.
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            find . -maxdepth 1 -type f ! -name SHA256SUMS -printf '%P\0' \
+              | sort -z \
+              | xargs -0 -r sha256sum -- > SHA256SUMS
+          )
+          cp dist/SHA256SUMS "$RUNNER_TEMP/SHA256SUMS.before-smoke"
+
+      - name: Check distribution metadata
+        run: |
+          set -euo pipefail
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then
+            version="$(python scripts/release_integrity.py version-from-tag --tag-ref "$GITHUB_REF")"
+          else
+            version="$(python scripts/release_integrity.py version-from-project)"
+          fi
+          printf '%s\n' "$version" > "$RUNNER_TEMP/expected-version"
+          python scripts/release_integrity.py check-dists \
+            --dist dist \
+            --expected-version "$version"
+
+      - name: Smoke-install the wheel
+        # Fresh environment, still without an OIDC credential. The wheel's
+        # dependencies come from the wheel. packaging is the hash-pinned
+        # copy, installed with --no-deps, so the smoke can compare PEP 440
+        # versions. It is not a project dependency.
+        run: |
+          set -euo pipefail
+          version="$(tr -d '\n' < "$RUNNER_TEMP/expected-version")"
+          python -m venv "$RUNNER_TEMP/wheel-smoke"
+          "$RUNNER_TEMP/wheel-smoke/bin/pip" install --disable-pip-version-check dist/*.whl
+          "$RUNNER_TEMP/wheel-smoke/bin/pip" install --disable-pip-version-check \
+            --require-hashes --no-deps \
+            "packaging==26.2" \
+            --hash "sha256:5fc45236b9446107ff2415ce77c807cee2862cb6fac22b8a73826d0693b0980e" \
+            --hash "sha256:ff452ff5a3e828ce110190feff1178bb1f2ea2281fa2075aadb987c2fb221661"
+          "$RUNNER_TEMP/wheel-smoke/bin/python" scripts/release_integrity.py smoke \
+            --expected-version "$version"
+
+      - name: Re-verify artefact digests after smoke
+        # pip install can rewrite the wheel it was given. Compare against the
+        # copy taken before smoke so a rewritten wheel and a rewritten
+        # manifest cannot agree with each other and still be published.
+        run: |
+          set -euo pipefail
+          (
+            cd dist
+            sha256sum --check --strict "$RUNNER_TEMP/SHA256SUMS.before-smoke"
+          )
+          cmp dist/SHA256SUMS "$RUNNER_TEMP/SHA256SUMS.before-smoke"
 
       - name: Upload artefacts for the publish job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
@@ -82,7 +194,7 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: build
+    needs: [build, test]
     runs-on: ubuntu-latest
     # M12: real publication still requires a v* tag ref. The only branch-ref
     # exception is the explicit approval test, which enters the same protected
@@ -118,9 +230,15 @@ jobs:
               if len(parts) != 2:
                   raise SystemExit("malformed SHA256SUMS entry")
               name = parts[1].lstrip("*")
-              path = Path(name)
-              if path.parent != dist or path.name == manifest.name:
+              if (
+                  not name
+                  or name in {"", ".", "..", manifest.name}
+                  or name != Path(name).name
+                  or "/" in name
+                  or "\\" in name
+              ):
                   raise SystemExit(f"unsafe SHA256SUMS path: {name}")
+              path = dist / name
               if path in expected:
                   raise SystemExit(f"duplicate SHA256SUMS path: {name}")
               expected.add(path)
@@ -141,13 +259,68 @@ jobs:
           if len(wheels) != 1 or len(sdists) != 1 or len(actual) != 2:
               raise SystemExit("dist must contain exactly one wheel and one sdist")
           PY
-          sha256sum --check --strict dist/SHA256SUMS
+          (
+            cd dist
+            sha256sum --check --strict SHA256SUMS
+          )
           rm dist/SHA256SUMS
 
       - name: Publish to PyPI
         if: ${{ github.event_name != 'workflow_dispatch' || inputs.approval_test != true }}
         uses: pypa/gh-action-pypi-publish@cef221092ed1bacb1cc03d23a2d87d1d172e277b # v1.14.0
+        with:
+          skip-existing: true
 
       - name: Confirm approval test completed without publishing
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.approval_test == true }}
         run: echo "pypi approval gate passed; package publication intentionally skipped"
+
+  release:
+    needs: publish
+    runs-on: ubuntu-latest
+    # Only after PyPI publication. contents: write edits the release and
+    # uploads assets. The checkout token is not stored, and the finalizer
+    # refuses to create a ref. No id-token, so this job cannot mint PyPI
+    # credentials. No environment: the reviewer gate already ran on publish.
+    # The expression is implicitly success(), so a failed publish job does
+    # not reach here. approval_test skips the PyPI action, so it must not
+    # rewrite the release either.
+    if: >-
+      startsWith(github.ref, 'refs/tags/v') &&
+      (github.event_name != 'workflow_dispatch' || inputs.approval_test != true)
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.11"
+
+      - name: Download built artefacts
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      - name: Download release metadata
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-metadata
+          path: release-metadata/
+
+      - name: Finalize the GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          GITHUB_REPOSITORY: ${{ github.repository }}
+          RELEASE_SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          python scripts/release_integrity.py publish-release \
+            --metadata release-metadata/metadata.json \
+            --notes release-metadata/notes.md \
+            --dist dist \
+            --sha "$RELEASE_SHA"
