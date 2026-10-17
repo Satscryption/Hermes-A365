@@ -8,6 +8,20 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`register` reads Entra before it provisions, and a re-run is idempotent.**
+  The command GETs the blueprint (and the derived identity name) before any
+  `a365` call. An agent-identity blueprint whose appId is the per-agent
+  `A365_APP_ID`, whose display name matches, and which already has
+  permission grants is left unchanged: no second application, no consent
+  grant, and no new client secret. A same-name application without that
+  anchor, more than one match, a tier or slug mismatch, audience drift, a
+  missing service principal, or a paged/unreadable Graph result fails
+  closed with an error that says what to fix. `--update-permissions` is
+  required to re-grant on an owned blueprint and does not override an
+  ownership, tier, or name refusal. Reads are GET-only with a tight
+  `$select` (no credentials or tokens). The generated-config GUID is not
+  an ownership anchor. Refs #127, #159.
+
 - **Orphan agentic-user ownership accepts the real owner again.** When
   `agentRegistry` no longer lists an instance for a typed orphan user id,
   cleanup now follows `users/{id}.identityParentId` to
