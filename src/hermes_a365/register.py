@@ -10,15 +10,19 @@ Agent 365 blueprint, in order:
 3. ``a365 setup permissions bot --agent-name <name>`` — configures the
    Messaging Bot API OAuth grants.
 
-The CLI itself is responsible for idempotency, JSON shape, and Azure /
-Entra round-trips. Our job is to:
+``a365 setup blueprint`` is not a safe re-run: a display-name hit adopts
+that application and can grant consent or mint a client secret. Register
+reads Entra first (:mod:`hermes_a365.entra_state`, #127) and only then
+composes argv. Our job is to:
 
-- Compose the right ``argv`` for each step from operator inputs.
+- Read the existing blueprint and refuse any state we cannot reconcile.
+- Compose the right ``argv`` for each step that is still safe to run.
 - Run them in order via the :class:`Mutator` protocol (see ``mutator.py``).
 - Surface ``AADSTS500011`` retries (license propagation) and
   ``AADSTS90094`` (admin consent required → defer to ``hermes a365 consent``).
 - Update ``a365.config.json`` if the operator wants the file form rather
-  than passing ``--agent-name`` on every call.
+  than passing ``--agent-name`` on every call. The local file is written
+  only after the Entra decision allows the run.
 
 Default mode is dry-run (prints the planned argv list without running);
 ``--apply`` executes each step.
@@ -61,6 +65,19 @@ from ._common import (
     write_owner_only_text_atomic,
 )
 from .a365_config import A365Config, merge, read, write_atomic
+from .entra_state import (
+    EntraStateError,
+    GraphGet,
+    RegistrationDecision,
+    blueprint_display_name,
+    confirmed_created_app_id,
+    decide_registration,
+    graph_get_from_mutator,
+    identity_display_name,
+    load_anchor_app_id,
+    read_registration_snapshot,
+    record_ownership_anchor,
+)
 from .mutator import (
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
@@ -161,6 +178,7 @@ class RegisterStep:
 class RegisterPlan:
     inputs: RegisterInputs
     steps: list[RegisterStep]
+    reconciliation: tuple[str, ...] = ()
 
     def render_human(self) -> str:
         lines = [f"[plan] hermes a365 register {self.inputs.agent_name}"]
@@ -174,6 +192,11 @@ class RegisterPlan:
                 "not register the messaging endpoint by itself. After the tunnel "
                 "exists, run `activity-bridge update-endpoint`."
             )
+        for line in self.reconciliation:
+            lines.append(f"  {line}")
+        if not self.steps:
+            lines.append("  steps: (none — no Entra changes)")
+            return "\n".join(lines)
         lines.append("  steps (in order):")
         for s in self.steps:
             lines.append(f"    - {s.name:<18} {s.description}")
@@ -194,8 +217,18 @@ def _common_flags(inputs: RegisterInputs, *, agent_name: bool = True) -> list[st
     return flags
 
 
-def build_register_plan(inputs: RegisterInputs) -> RegisterPlan:
-    """Compose the ordered argv list for the orchestration."""
+def build_register_plan(
+    inputs: RegisterInputs,
+    *,
+    step_names: tuple[str, ...] | None = None,
+    reconciliation: tuple[str, ...] = (),
+) -> RegisterPlan:
+    """Compose the ordered argv list for the orchestration.
+
+    ``step_names`` restricts the plan to a reconciled subset. ``None`` is
+    the create plan (all three steps), which is what a caller uses before
+    Entra has been read.
+    """
     steps: list[RegisterStep] = []
 
     blueprint_argv = ["a365", "setup", "blueprint", *_common_flags(inputs)]
@@ -231,7 +264,15 @@ def build_register_plan(inputs: RegisterInputs) -> RegisterPlan:
         )
     )
 
-    return RegisterPlan(inputs=inputs, steps=steps)
+    if step_names is not None:
+        by_name = {step.name: step for step in steps}
+        unknown = [name for name in step_names if name not in by_name]
+        if unknown:
+            raise RegisterError(
+                f"register plan has no step(s) {unknown}; refusing to invent argv."
+            )
+        steps = [by_name[name] for name in step_names]
+    return RegisterPlan(inputs=inputs, steps=steps, reconciliation=reconciliation)
 
 
 # ---------------------------------------------------------------------------
@@ -276,31 +317,19 @@ def _run_with_license_retry(
     raise last
 
 
-def apply_register_plan(
-    plan: RegisterPlan,
-    *,
-    mutator: Mutator,
-    retries: int = DEFAULT_RETRIES,
-    backoff: float = DEFAULT_BACKOFF_SECONDS,
-    sleep_fn: Callable[[float], None] = time.sleep,
-    config_path: Path | None = None,
-) -> ApplyResult:
-    """Run each step in order. Stop on a consent-required defer; propagate
-    other AADSTS errors and any non-AADSTS CLI failures.
+def _default_hermes_home() -> Path:
+    raw = os.environ.get("HERMES_HOME") or "~/.hermes"
+    return Path(os.path.expanduser(raw))
 
-    #102 M7: ``plan.inputs.tenant_id`` is the operator pin (explicit
-    ``--tenant-id``, else ``A365_TENANT_ID``). The active az session is
-    asserted to match BEFORE any provisioning step, because the a365 CLI
-    otherwise takes its tenant from that session. A missing pin is refused
-    here too: ambient ``az account show`` is not a pin."""
-    result = ApplyResult(plan=plan)
 
-    expected_tenant = (plan.inputs.tenant_id or "").strip()
-    if not expected_tenant:
-        raise RegisterError(
-            "no canonical tenant pin was resolved; pass --tenant-id or set "
-            "A365_TENANT_ID before provisioning"
-        )
+def _require_matching_tenant(mutator: Mutator, expected_tenant: str) -> str:
+    """Refuse before any Entra read or provisioning step when the pin is wrong.
+
+    #102 M7: the operator pin is explicit ``--tenant-id`` or
+    ``A365_TENANT_ID``. The active az session is only the value we compare.
+    A missing pin is refused by the caller: ambient ``az account show`` is
+    not a pin.
+    """
     active = active_az_tenant(lambda argv: mutator.run(argv))
     if active is None:
         raise RegisterError(
@@ -322,14 +351,112 @@ def apply_register_plan(
             f"{expected_tenant}; refusing to provision into the wrong "
             f"tenant. Run `az login --tenant {expected_tenant}` and re-try."
         )
-    result.messages.append(
-        f"[apply] tenant pin OK: active az tenant matches {expected_tenant}"
+    return f"[apply] tenant pin OK: active az tenant matches {expected_tenant}"
+
+
+def resolve_registration(
+    inputs: RegisterInputs,
+    *,
+    mutator: Mutator,
+    hermes_home: Path | None = None,
+    graph_get: GraphGet | None = None,
+    update_permissions: bool = False,
+) -> RegistrationDecision:
+    """Read Entra and decide create / no-op / repair / abort. No mutations."""
+    home = hermes_home if hermes_home is not None else _default_hermes_home()
+    getter = graph_get if graph_get is not None else graph_get_from_mutator(mutator)
+    try:
+        anchor = load_anchor_app_id(home, inputs.agent_name)
+        snapshot = read_registration_snapshot(
+            getter, agent_name=inputs.agent_name, anchor_app_id=anchor
+        )
+        return decide_registration(snapshot, update_permissions=update_permissions)
+    except EntraStateError as exc:
+        raise RegisterError(str(exc)) from exc
+
+
+def _bind_created_blueprint(
+    *,
+    graph_get: GraphGet,
+    hermes_home: Path,
+    agent_name: str,
+    generated_config_path: Path,
+) -> str:
+    """Record A365_APP_ID only when Graph confirms the app this run created."""
+    expected = blueprint_display_name(agent_name)
+    try:
+        app_id = confirmed_created_app_id(
+            graph_get,
+            generated_config_path,
+            expected_display_name=expected,
+        )
+        if app_id:
+            record_ownership_anchor(hermes_home, agent_name, app_id)
+    except EntraStateError as exc:
+        raise RegisterError(str(exc)) from exc
+    if not app_id:
+        return (
+            "[apply] ownership anchor was not recorded (agentBlueprintId missing "
+            "from generated config). A later register will refuse to adopt an "
+            "existing application until A365_APP_ID is set in the per-agent env."
+        )
+    return (
+        f"[apply] recorded per-agent A365_APP_ID {app_id} after Graph confirmed "
+        f"{expected!r}. The client secret was not written to the agent env."
     )
 
-    # Keep the local config mutation behind the same tenant preflight as the
-    # cloud steps. A mismatch/unverifiable session must leave existing config
-    # untouched so a failed command cannot steer a later run at the rejected
-    # tenant.
+
+def apply_register_plan(
+    plan: RegisterPlan,
+    *,
+    mutator: Mutator,
+    retries: int = DEFAULT_RETRIES,
+    backoff: float = DEFAULT_BACKOFF_SECONDS,
+    sleep_fn: Callable[[float], None] = time.sleep,
+    config_path: Path | None = None,
+    hermes_home: Path | None = None,
+    graph_get: GraphGet | None = None,
+    update_permissions: bool = False,
+    generated_config_path: Path | None = None,
+) -> ApplyResult:
+    """Run each reconciled step in order.
+
+    Stop on a consent-required defer; propagate other AADSTS errors and any
+    non-AADSTS CLI failures. Entra is read after the tenant pin matches and
+    before local config or any ``a365`` command. An abort leaves both
+    untouched.
+    """
+    expected_tenant = (plan.inputs.tenant_id or "").strip()
+    if not expected_tenant:
+        raise RegisterError(
+            "no canonical tenant pin was resolved; pass --tenant-id or set "
+            "A365_TENANT_ID before provisioning"
+        )
+    tenant_message = _require_matching_tenant(mutator, expected_tenant)
+    home = hermes_home if hermes_home is not None else _default_hermes_home()
+    getter = graph_get if graph_get is not None else graph_get_from_mutator(mutator)
+    decision = resolve_registration(
+        plan.inputs,
+        mutator=mutator,
+        hermes_home=home,
+        graph_get=getter,
+        update_permissions=update_permissions,
+    )
+    if decision.action == "abort":
+        raise RegisterError(decision.reason or "refusing to provision")
+
+    plan = build_register_plan(
+        plan.inputs,
+        step_names=decision.step_names,
+        reconciliation=decision.messages,
+    )
+    result = ApplyResult(plan=plan)
+    result.messages.append(tenant_message)
+    result.messages.extend(decision.messages)
+
+    # Keep the local config mutation behind the tenant preflight and the
+    # Entra decision. A mismatch, an unreadable directory, or an ownership
+    # refusal must leave existing config untouched.
     if config_path is not None:
         update_config_for_agent(config_path, plan.inputs)
 
@@ -356,6 +483,16 @@ def apply_register_plan(
         result.completed.append(step.name)
         result.raw_outputs[step.name] = run
         result.messages.append(f"[apply] {step.name}: {step.description} — done")
+        if step.name == "blueprint":
+            result.messages.append(
+                _bind_created_blueprint(
+                    graph_get=getter,
+                    hermes_home=home,
+                    agent_name=plan.inputs.agent_name,
+                    generated_config_path=generated_config_path
+                    or Path(GENERATED_CONFIG_FILENAME),
+                )
+            )
 
     return result
 
@@ -378,8 +515,8 @@ def update_config_for_agent(
     """
     base = read(config_path)
     updates: dict[str, Any] = {
-        "agentIdentityDisplayName": f"{inputs.agent_name} Identity",
-        "agentBlueprintDisplayName": f"{inputs.agent_name} Blueprint",
+        "agentIdentityDisplayName": identity_display_name(inputs.agent_name),
+        "agentBlueprintDisplayName": blueprint_display_name(inputs.agent_name),
     }
     if inputs.tenant_id:
         updates["tenantId"] = inputs.tenant_id
@@ -748,6 +885,17 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         help=f"backoff between retries in seconds (default {DEFAULT_BACKOFF_SECONDS:g})",
     )
     parser.add_argument(
+        "--update-permissions",
+        action="store_true",
+        help=(
+            "re-grant permissions on a blueprint this agent already owns. "
+            "When that blueprint has no service principal, also re-runs "
+            "`a365 setup blueprint`, which grants consent and may mint a "
+            "client secret. Does not override an ownership, tier, or "
+            "name-collision refusal."
+        ),
+    )
+    parser.add_argument(
         "--auto-recover-secret",
         action="store_true",
         help=(
@@ -783,8 +931,32 @@ def run(args: argparse.Namespace) -> int:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2
 
-    plan = build_register_plan(inputs)
-    sys.stdout.write(plan.render_human() + "\n")
+    home = hermes_home
+    if inputs.tenant_id:
+        try:
+            mutator = get_mutator()
+            _require_matching_tenant(mutator, inputs.tenant_id)
+            decision = resolve_registration(
+                inputs,
+                mutator=mutator,
+                hermes_home=home,
+                update_permissions=args.update_permissions,
+            )
+        except (RegisterError, CliInvocationError, AADSTSError) as e:
+            print(f"ERROR: {e}", file=sys.stderr)
+            return 2
+        plan = build_register_plan(
+            inputs,
+            step_names=decision.step_names,
+            reconciliation=decision.messages,
+        )
+        sys.stdout.write(plan.render_human() + "\n")
+        if decision.action == "abort":
+            print(f"ERROR: {decision.reason}", file=sys.stderr)
+            return 2
+    else:
+        plan = build_register_plan(inputs)
+        sys.stdout.write(plan.render_human() + "\n")
 
     if not args.apply:
         sys.stdout.write("\nNo mutations. Re-run with --apply to execute.\n")
@@ -797,6 +969,8 @@ def run(args: argparse.Namespace) -> int:
             retries=args.retries,
             backoff=args.backoff,
             config_path=args.config,
+            hermes_home=home,
+            update_permissions=args.update_permissions,
         )
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)

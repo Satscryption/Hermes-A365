@@ -163,11 +163,26 @@ needs:
 3. `a365 setup permissions bot --agent-name <name>` — configures the
    Messaging Bot API OAuth grants.
 
-The CLI itself owns idempotency, JSON shape, and Entra round-trips. The
-skill's job is to compose the right argv per step, run them in order via
-the `Mutator` protocol, persist derived display names to
-`a365.config.json` (so subsequent commands refer to consistent
-identities), and surface known auth errors:
+Register reads Entra before it composes a mutating argv. A re-run is a
+no-op when the per-agent `A365_APP_ID` (in
+`~/.hermes/agents/<slug>/.env`) is the existing agent-identity blueprint,
+the display name matches, a Graph `uniqueName` (when the blueprint
+cast returns one) matches the registration slug, and both permission-step
+markers are already present: an Observability app-role assignment, and a
+delegated grant for
+a resource other than Microsoft Graph, Messaging Bot, Observability, or
+Power Platform. Graph admin consent from `a365 setup blueprint` does not
+count, so a re-run still finishes the missing MCP or bot step. It
+does not adopt an application because the display name matches, and it
+does not re-run `a365 setup blueprint` against an application it already
+owns — that command grants consent and may mint a client secret.
+`--update-permissions` re-grants on an owned blueprint only; it does not
+override an ownership, tier, or name-collision refusal. A missing,
+ambiguous, or unreadable directory fails closed. After a create that
+Graph confirms, register records `A365_APP_ID` in the per-agent env and
+does not copy the client secret there. The skill still composes argv,
+runs the remaining steps via the `Mutator` protocol, persists derived
+display names to `a365.config.json`, and surfaces known auth errors:
 
 - `AADSTS500011` (license not propagated): retried up to `--retries`
   times with `--backoff` seconds (defaults: 3 × 30 s, mockable in tests
@@ -351,7 +366,7 @@ the split.
 
 | Conflict | Behaviour |
 |---|---|
-| Blueprint app already exists for the same name | `a365 setup blueprint` is itself idempotent; `register` re-runs are safe. |
+| Blueprint app already exists for the same name | Read first. No-op when per-agent `A365_APP_ID` proves ownership and grants already exist. Otherwise refuse; do not create a duplicate or adopt an unowned app. `--update-permissions` re-grants only on an owned blueprint. |
 | Permissions step fails with `AADSTS90094` | Reported as "deferred — run `hermes a365 consent`"; blueprint stays created. |
 | Instance .env exists with a previous `AA_INSTANCE_ID` | `instance create` preserves the id (cloud state is unchanged). |
 | Cleanup target has no recorded state | The corresponding kind is skipped, not errored. |

@@ -44,6 +44,29 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **`register` reads Entra before it provisions, and a re-run is idempotent.**
+  The command GETs the blueprint (and the derived identity name) before any
+  `a365` call. An agent-identity blueprint whose appId is the per-agent
+  `A365_APP_ID`, whose display name matches, and which already has
+  MCP and bot permission-step markers is left unchanged: no second
+  application, no consent grant, and no new client secret. A same-name
+  application without that anchor, more than one match, a tier or slug
+  mismatch, audience drift, a missing service principal, or a
+  paged/unreadable Graph result fails closed with an error that says what
+  to fix. `--update-permissions` is required to re-grant on an owned
+  blueprint and does not override an ownership, tier, or name refusal.
+  Microsoft Graph admin consent, which `a365 setup blueprint` writes, is
+  not treated as finished MCP or bot permission setup: a re-run executes
+  only the permission step whose marker is missing and does not re-run
+  `setup blueprint`. Reads are GET-only with a tight `$select` (no
+  credentials or tokens). The generated-config GUID is not an ownership
+  anchor. A dangling per-agent env symlink fails closed. When the
+  blueprint cast returns `uniqueName`, that value is the slug and a
+  different value fails closed; a missing `uniqueName` is not invented
+  from the display name (`a365 setup blueprint` does not set it).
+  Registration Graph GETs are captured as sensitive commands so an error
+  body is not streamed before redaction.
+  Refs #127, #159.
 - **GitHub Release `SHA256SUMS` lists basenames.** The wheel, sdist, and
   checksum file sit side by side, and `sha256sum --check SHA256SUMS` in
   that folder verifies them.

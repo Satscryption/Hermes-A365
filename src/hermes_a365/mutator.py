@@ -73,13 +73,24 @@ class AADSTSError(RuntimeError):
 class CliInvocationError(RuntimeError):
     """Raised on a non-zero CLI exit that doesn't surface an AADSTS code."""
 
-    def __init__(self, argv: list[str], returncode: int, output: str) -> None:
+    def __init__(
+        self,
+        argv: list[str],
+        returncode: int,
+        output: str,
+        *,
+        captured_output: str | None = None,
+    ) -> None:
         super().__init__(
             f"{argv[0]} {argv[1] if len(argv) > 1 else ''} failed (rc={returncode}): {output}"
         )
         self.argv = argv
         self.returncode = returncode
         self.output = output
+        # Sensitive failures keep the raw body off ``str(self)`` so callers
+        # that print the exception do not echo it. Parsers that redact first
+        # may read ``captured_output``.
+        self.captured_output = output if captured_output is None else captured_output
 
 
 # ---------------------------------------------------------------------------
@@ -187,7 +198,12 @@ class A365CliMutator:
             detail = _SENSITIVE_OUTPUT_SUPPRESSED if sensitive else stripped
             if match:
                 raise AADSTSError(match.group(0), detail)
-            raise CliInvocationError(argv, returncode, detail)
+            raise CliInvocationError(
+                argv,
+                returncode,
+                detail,
+                captured_output=stripped if sensitive else None,
+            )
         return RunResult(
             argv=list(argv),
             returncode=returncode,

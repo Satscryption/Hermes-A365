@@ -8,6 +8,7 @@ import shlex
 import stat
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -47,6 +48,9 @@ from hermes_a365.register import (
 )
 
 _TEST_TENANT = "aaaa1111-0000-0000-0000-000000000001"
+# Keep apply() off the real ~/.hermes so a developer anchor cannot change
+# the create-path tests. The directory is empty: no per-agent A365_APP_ID.
+_REGISTER_TEST_HOME = Path(tempfile.mkdtemp(prefix="a365-register-home-"))
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -85,6 +89,25 @@ class FakeMutator:
                 argv=list(argv),
                 returncode=0,
                 stdout=json.dumps({"tenantId": _TEST_TENANT}),
+                stderr="",
+            )
+        if argv[:4] == ["az", "rest", "--method", "GET"] or (
+            len(argv) >= 4 and argv[:2] == ["az", "rest"] and "GET" in argv
+        ):
+            # Registration state reads must not consume scripted a365 results.
+            # An empty collection is "no existing application" (the create path).
+            if self.scripted:
+                candidate = self.scripted[0]
+                candidate_argv = getattr(candidate, "argv", [])
+                if candidate_argv[:2] == ["az", "rest"]:
+                    self.scripted.pop(0)
+                    if isinstance(candidate, Exception):
+                        raise candidate
+                    return candidate
+            return RunResult(
+                argv=list(argv),
+                returncode=0,
+                stdout=json.dumps({"value": []}),
                 stderr="",
             )
         if argv[:4] == ["az", "ad", "app", "show"]:
@@ -126,6 +149,7 @@ def apply_register_plan(
     """Give mutation tests an explicit tenant unless they exercise no-pin refusal."""
     if plan.inputs.tenant_id is None:
         plan.inputs.tenant_id = _TEST_TENANT
+    kwargs.setdefault("hermes_home", _REGISTER_TEST_HOME)
     return _apply_register_plan(plan, mutator=mutator, **kwargs)  # type: ignore[arg-type]
 
 
@@ -1254,8 +1278,12 @@ class TestTenantPinnedProvisioning:
         assert mutator.calls[0] == [
             "az", "account", "show", "-o", "json", "--only-show-errors"
         ]
-        assert mutator.calls[1][0] == "a365"
-        assert result.completed  # steps actually ran after the pre-flight
+        rest = [call for call in mutator.calls if call[:2] == ["az", "rest"]]
+        a365 = [call for call in mutator.calls if call[0] == "a365"]
+        assert rest, "apply must read Entra state before provisioning"
+        assert a365
+        assert mutator.calls.index(rest[0]) < mutator.calls.index(a365[0])
+        assert result.completed == ["blueprint", "permissions-mcp", "permissions-bot"]
         assert any("tenant pin OK" in m for m in result.messages)
 
     def test_matching_preflight_updates_config_before_steps(self, tmp_path: Path) -> None:
