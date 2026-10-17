@@ -4,6 +4,17 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased / 0.9.1]
+
+- #155: a buffered Copilot Chat turn that is still open inside the ~45s
+  idle window posts a Bot Framework streaming informative update from
+  a background task, then a `streamType=final` activity immediately
+  before the merged `send_reply`. Later updates reuse the `streamId`
+  from the opening 201, and the sequence rotates before the two-minute
+  stream cap. The informative text is a keep-alive, not the answer.
+  Short turns send nothing. Personal chats are unchanged. `send` does
+  not await the keep-alive POST.
+
 ## [0.9.0] — 2026-10-16
 
 Security + reliability hardening (the first rung of the 0.9.x → 1.0 ladder).

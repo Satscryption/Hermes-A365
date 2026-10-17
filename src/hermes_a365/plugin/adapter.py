@@ -666,6 +666,28 @@ _TURN_BUFFER_DEFERRED_RETRY_LIMIT = 3
 # after the request was sent. A token-mint timeout does not use it.
 _POST_SEND_TIMEOUT_MARKER = "timeout after the request was sent"
 
+# Copilot Chat stops treating a silent turn as alive after about 45
+# seconds between activities (custom-engine async flow: an initial
+# response is expected within 15s, then a 45s gap between streaming
+# updates drops the turn). A short buffered reply already renders, and
+# a plain ``typing`` activity is accepted but then swallows the reply
+# (#154). The keep-alive is therefore a streaming informative update
+# on its own task, not a typing pulse and not the answer.
+#
+# The first update waits past the short-turn path (~16s on the 0.9.0
+# walk) and still lands inside the 45s window, with room for a token
+# mint. Later updates use the same gap, which is under 45s. A stream
+# must be completed within two minutes or Bot Framework returns 403
+# ``Content stream finished due to exceeded streaming time``;
+# informative updates do not extend that cap, so the sequence is
+# closed and a new one opened before it. Informative text is at most
+# 1000 characters.
+_TURN_BUFFER_KEEPALIVE_FIRST_SEC = 25.0
+_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC = 25.0
+_TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC = 90.0
+_TURN_BUFFER_KEEPALIVE_TEXT = "Working on it."
+_INFORMATIVE_TEXT_MAX_CHARS = 1000
+
 
 def _consume_turn_buffer_retry_result(task: asyncio.Task[Any]) -> None:
     with contextlib.suppress(asyncio.CancelledError, Exception):
@@ -1373,8 +1395,15 @@ class Agent365Adapter(BasePlatformAdapter):
         # posted once. A definite failure schedules a deferred retry only
         # when no turn is open. A timeout after the request was sent is
         # treated as delivered and is not posted again.
+        # A background keep-alive (#155) posts a BF streaming informative
+        # update only if the turn is still open inside the ~45s idle
+        # window, then a ``streamType=final`` activity immediately before
+        # the merged reply. ``send`` does not await that POST. Personal
+        # chats never open this buffer.
         # ``{"turns": [{"seq", "inbound", "validated_path", "activity_id",
-        #   "open"}], "segments": [{"id", "text", "turn"}], "depth", "lock"}``.
+        #   "open"}], "segments": [{"id", "text", "turn"}], "depth", "lock",
+        #   "keepalive": {"stream_id", "sequence", "opened_mono"},
+        #   "keepalive_task"}``.
         self._turn_buffers: dict[str, dict[str, Any]] = {}
         self._turn_buffer_seq = 0
 
@@ -4410,6 +4439,9 @@ class Agent365Adapter(BasePlatformAdapter):
         A queued follow-up calls start again before the outer complete.
         That nested start keeps the outer turn's segments and snapshots
         the follow-up's own inbound. It does not replace the buffer.
+
+        The keep-alive task is started here, on the session task, and
+        posts only after the short-turn window. ``send`` does not await it.
         """
         chat_id = self._chat_id_from_processing_event(event)
         if chat_id and chat_id in self._seen_inbounds_this_lifetime:
@@ -4447,10 +4479,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 "segments": [],
                 "depth": 1,
                 "lock": asyncio.Lock(),
+                "keepalive": {},
             }
-            return
-        buf.setdefault("turns", []).append(turn)
-        buf["depth"] = sum(1 for item in buf["turns"] if item.get("open"))
+        else:
+            buf.setdefault("turns", []).append(turn)
+            buf["depth"] = sum(1 for item in buf["turns"] if item.get("open"))
+        # One task per chat. A nested start leaves the running task in
+        # place; a task that already exited is replaced.
+        self._schedule_turn_buffer_keepalive(chat_id)
 
     def _close_innermost_turn(self, chat_id: str) -> None:
         """Mark the newest open turn finished. Leave every outer turn open."""
@@ -4467,10 +4503,12 @@ class Agent365Adapter(BasePlatformAdapter):
         buf = self._turn_buffers.pop(str(chat_id), None)
         if buf is not None:
             self._cancel_turn_buffer_retry(buf)
+            self._cancel_turn_buffer_keepalive(buf)
 
     def _cancel_turn_buffer_retries(self) -> None:
         for buf in self._turn_buffers.values():
             self._cancel_turn_buffer_retry(buf)
+            self._cancel_turn_buffer_keepalive(buf)
 
     @staticmethod
     def _cancel_turn_buffer_retry(buf: dict[str, Any]) -> None:
@@ -4518,6 +4556,387 @@ class Agent365Adapter(BasePlatformAdapter):
         buf["retry_task"] = asyncio.create_task(
             self._deferred_turn_buffer_retry(chat_id)
         )
+
+    def _schedule_turn_buffer_keepalive(self, chat_id: str) -> None:
+        """Start the informative-update task if this chat does not have one.
+
+        The task sleeps until the turn has been open long enough that a
+        short reply would already have been posted, then posts on its
+        own task. ``send`` stays free of that network await.
+        """
+        buf = self._turn_buffers.get(chat_id)
+        if buf is None or self._disconnecting or str(chat_id) in self._retiring_chats:
+            return
+        current = asyncio.current_task()
+        task = buf.get("keepalive_task")
+        if isinstance(task, asyncio.Task) and not task.done() and task is not current:
+            return
+        started = asyncio.create_task(self._turn_buffer_keepalive(chat_id))
+        started.add_done_callback(_consume_turn_buffer_retry_result)
+        buf["keepalive_task"] = started
+
+    @staticmethod
+    def _cancel_turn_buffer_keepalive(buf: dict[str, Any]) -> None:
+        task = buf.get("keepalive_task")
+        current = asyncio.current_task()
+        if (
+            isinstance(task, asyncio.Task)
+            and not task.done()
+            and task is not current
+        ):
+            task.cancel()
+
+    def _turn_buffer_keepalive_needed(self, chat_id: str) -> bool:
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return False
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return False
+        return int(buf.get("depth") or 0) > 0
+
+    async def _turn_buffer_keepalive(self, chat_id: str) -> None:
+        """Keep a long non-personal turn alive without touching ``send``.
+
+        The first post waits out short turns. Each later post stays
+        inside the 45s gap. A sequence that would pass the two-minute
+        stream cap is closed and replaced. Cancellation is the turn
+        ending or the chat being torn down; it must propagate so the
+        task does not post after the buffer is gone.
+        """
+        try:
+            await asyncio.sleep(_TURN_BUFFER_KEEPALIVE_FIRST_SEC)
+            while self._turn_buffer_keepalive_needed(chat_id):
+                await self._emit_turn_buffer_keepalive(chat_id)
+                if not self._turn_buffer_keepalive_needed(chat_id):
+                    return
+                await asyncio.sleep(_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC)
+        except asyncio.CancelledError:
+            raise
+        except RuntimeError as exc:
+            if str(exc) == "agent365 outbound operation cancelled":
+                return
+            logger.warning(
+                "agent365 turn buffer keep-alive stopped: chat_id=%s error=%s",
+                chat_id,
+                exc,
+            )
+
+    @staticmethod
+    def _turn_buffer_lock(buf: dict[str, Any]) -> asyncio.Lock:
+        lock = buf.get("lock")
+        if not isinstance(lock, asyncio.Lock):
+            lock = asyncio.Lock()
+            buf["lock"] = lock
+        return lock
+
+    @staticmethod
+    def _keepalive_turn(buf: dict[str, Any]) -> dict[str, Any] | None:
+        """The open turn whose inbound the keep-alive posts against.
+
+        A nested follow-up uses its own snapshot. When every turn is
+        already closed (the final that precedes the last reply), the
+        newest snapshot still names this conversation.
+        """
+        turns = [turn for turn in (buf.get("turns") or []) if isinstance(turn, dict)]
+        for turn in reversed(turns):
+            if turn.get("open") and isinstance(turn.get("inbound"), dict):
+                return turn
+        for turn in reversed(turns):
+            if isinstance(turn.get("inbound"), dict):
+                return turn
+        return None
+
+    async def _emit_turn_buffer_keepalive(self, chat_id: str) -> None:
+        """Post the next informative update, rotating the stream if it is old.
+
+        The pacing sleep between a closing final and the next start is
+        outside the buffer lock, so a reply that became ready during
+        that gap is not held behind it. The POST itself runs under the
+        lock so it cannot interleave with the merged reply.
+        """
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return
+        rotated = False
+        async with self._turn_buffer_lock(buf):
+            if self._turn_buffers.get(chat_id) is not buf:
+                return
+            if not self._turn_buffer_keepalive_needed(chat_id):
+                return
+            stream = buf.get("keepalive")
+            stream = stream if isinstance(stream, dict) else {}
+            stream_id = str(stream.get("stream_id") or "")
+            opened = float(stream.get("opened_mono") or 0.0)
+            if (
+                stream_id
+                and opened > 0.0
+                and time.monotonic() - opened
+                >= _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+            ):
+                await self._post_keepalive_final_locked(chat_id, buf)
+                rotated = True
+        if rotated and _STREAMING_MIN_GAP_SEC > 0:
+            await asyncio.sleep(_STREAMING_MIN_GAP_SEC)
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return
+        async with self._turn_buffer_lock(buf):
+            if self._turn_buffers.get(chat_id) is not buf:
+                return
+            if not self._turn_buffer_keepalive_needed(chat_id):
+                return
+            await self._post_informative_locked(chat_id, buf, allow_restart=True)
+
+    async def _close_turn_buffer_keepalive_locked(self, chat_id: str) -> None:
+        """Close an open informative sequence. Caller holds the buffer lock.
+
+        One attempt. The merged ``send_reply`` still runs when this
+        POST fails: the answer is that reply, not this activity.
+        """
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return
+        await self._post_keepalive_final_locked(chat_id, buf)
+
+    async def _post_informative_locked(
+        self, chat_id: str, buf: dict[str, Any], *, allow_restart: bool
+    ) -> None:
+        if self._turn_buffers.get(chat_id) is not buf:
+            return
+        if not self._turn_buffer_keepalive_needed(chat_id):
+            return
+        turn = self._keepalive_turn(buf)
+        if turn is None:
+            return
+        stream = buf.get("keepalive")
+        stream = stream if isinstance(stream, dict) else {}
+        stream_id = str(stream.get("stream_id") or "")
+        sequence = 1 if not stream_id else int(stream.get("sequence") or 0) + 1
+        status, new_id = await self._post_keepalive_activity(
+            chat_id,
+            turn,
+            stream_id=stream_id,
+            sequence=sequence,
+            final=False,
+        )
+        if self._turn_buffers.get(chat_id) is not buf:
+            return
+        if status == 201 and new_id and not stream_id:
+            buf["keepalive"] = {
+                "stream_id": new_id,
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            }
+            logger.info(
+                "agent365 turn buffer keep-alive started: chat_id=%s stream_id=%s",
+                chat_id,
+                new_id,
+            )
+            return
+        if status is not None and 200 <= status < 300 and stream_id:
+            stream["sequence"] = sequence
+            buf["keepalive"] = stream
+            logger.info(
+                "agent365 turn buffer keep-alive: chat_id=%s stream_id=%s sequence=%s",
+                chat_id,
+                stream_id,
+                sequence,
+            )
+            return
+        if status == 403 and stream_id and allow_restart:
+            # The service closed the sequence (two-minute cap, or the
+            # user stopped it). One new start, not a retry loop.
+            logger.warning(
+                "agent365 turn buffer keep-alive rejected; opening a new "
+                "sequence: chat_id=%s status=%s",
+                chat_id,
+                status,
+            )
+            buf["keepalive"] = {}
+            await self._post_informative_locked(chat_id, buf, allow_restart=False)
+            return
+        logger.warning(
+            "agent365 turn buffer keep-alive failed: chat_id=%s status=%s",
+            chat_id,
+            status,
+        )
+
+    async def _post_keepalive_final_locked(
+        self, chat_id: str, buf: dict[str, Any]
+    ) -> None:
+        if self._turn_buffers.get(chat_id) is not buf:
+            return
+        stream = buf.get("keepalive")
+        stream = stream if isinstance(stream, dict) else {}
+        stream_id = str(stream.get("stream_id") or "")
+        if not stream_id:
+            return
+        turn = self._keepalive_turn(buf)
+        if turn is None:
+            buf["keepalive"] = {}
+            return
+        status, _new_id = await self._post_keepalive_activity(
+            chat_id,
+            turn,
+            stream_id=stream_id,
+            sequence=0,
+            final=True,
+        )
+        if self._turn_buffers.get(chat_id) is not buf:
+            return
+        # Drop the id even when the final failed. A second final, or a
+        # continue against a stream the service already closed, is worse
+        # than one unanswered close. The reply is the separate send.
+        buf["keepalive"] = {}
+        if status is not None and 200 <= status < 300:
+            logger.info(
+                "agent365 turn buffer keep-alive final: chat_id=%s stream_id=%s",
+                chat_id,
+                stream_id,
+            )
+            return
+        logger.warning(
+            "agent365 turn buffer keep-alive final failed: chat_id=%s "
+            "stream_id=%s status=%s",
+            chat_id,
+            stream_id,
+            status,
+        )
+
+    async def _post_keepalive_activity(
+        self,
+        chat_id: str,
+        turn: dict[str, Any],
+        *,
+        stream_id: str,
+        sequence: int,
+        final: bool,
+    ) -> tuple[int | None, str]:
+        """POST one informative update or the final that closes it.
+
+        Returns ``(status, stream id)``. The id is set only for the
+        opening 201. The text is the keep-alive phrase, never the
+        buffered answer. Shape follows the Teams streaming REST API:
+        ``typing`` + ``streamType=informative`` + ``streamSequence``,
+        then ``message`` + ``streamType=final`` with ``streamId`` and
+        no ``streamSequence``.
+        """
+        if final and not stream_id:
+            return None, ""
+        text = _TURN_BUFFER_KEEPALIVE_TEXT.strip()
+        if not text:
+            return None, ""
+        text = text[:_INFORMATIVE_TEXT_MAX_CHARS]
+        inbound = turn.get("inbound")
+        if not isinstance(inbound, dict):
+            return None, ""
+        if (
+            self._disconnecting
+            or str(chat_id) in self._retiring_chats
+            or self._http_client is None
+            or self._bridge_cfg is None
+        ):
+            return None, ""
+        raw_conv = inbound.get("conversation")
+        conv = raw_conv if isinstance(raw_conv, dict) else {}
+        service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
+        conv_id = conv.get("id")
+        if not service_url or not conv_id:
+            return None, ""
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if (
+            not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+        ):
+            return None, ""
+        entity: dict[str, Any] = {
+            "type": "streaminfo",
+            "streamType": "final" if final else "informative",
+        }
+        if stream_id:
+            entity["streamId"] = stream_id
+        if not final:
+            entity["streamSequence"] = sequence
+        activity = {
+            "type": "message" if final else "typing",
+            "text": text,
+            "from": inbound.get("recipient") or {},
+            "recipient": inbound.get("from") or {},
+            "conversation": conv,
+            "entities": [entity],
+        }
+        bridge = _import_bridge()
+        validated = turn.get("validated_path")
+        path = validated if isinstance(validated, str) else None
+        url = _conversations_activities_url(service_url, conv_id)
+        try:
+            token, _minted = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=inbound,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=(
+                        path
+                        if path is not None
+                        else self._validated_path_for_inbound(inbound)
+                    ),
+                ),
+            )
+            if (
+                not self._lifecycle_is_current(generation, client)
+                or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+            ):
+                return None, ""
+            resp = await self._await_outbound(
+                chat_id,
+                client.post(
+                    url,
+                    json=activity,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                ),
+            )
+        except asyncio.CancelledError:
+            raise
+        except RuntimeError as exc:
+            if str(exc) == "agent365 outbound operation cancelled":
+                raise
+            logger.warning(
+                "agent365 turn buffer keep-alive POST failed: chat_id=%s error=%s",
+                chat_id,
+                exc,
+            )
+            return None, ""
+        except Exception as exc:
+            logger.warning(
+                "agent365 turn buffer keep-alive POST failed: chat_id=%s error=%s",
+                chat_id,
+                exc,
+            )
+            return None, ""
+        if (
+            not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+        ):
+            return None, ""
+        status = getattr(resp, "status_code", None)
+        if not isinstance(status, int):
+            return None, ""
+        new_id = ""
+        if status == 201:
+            try:
+                body = resp.json() if callable(getattr(resp, "json", None)) else None
+            except Exception:
+                body = None
+            if isinstance(body, dict):
+                new_id = str(body.get("id") or "")
+        return status, new_id
 
     async def _deferred_turn_buffer_retry(self, chat_id: str) -> None:
         try:
@@ -4795,6 +5214,12 @@ class Agent365Adapter(BasePlatformAdapter):
             for chunk_segments, content in chunks:
                 if not self._turn_buffers.get(chat_id) or self._disconnecting:
                     return
+                # Close the informative sequence before the visible reply.
+                # An open stream is what made a later message disappear
+                # after a bare typing activity (#154).
+                await self._close_turn_buffer_keepalive_locked(chat_id)
+                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                    return
                 result = await self._send_reply_activity(
                     inbound=inbound,
                     content=content,
@@ -4841,6 +5266,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     [str(segment.get("id") or "") for segment in chunk_segments],
                 )
             if link_alone and suffix.strip():
+                await self._close_turn_buffer_keepalive_locked(chat_id)
+                if not self._turn_buffers.get(chat_id) or self._disconnecting:
+                    return
                 link_result = await self._send_reply_activity(
                     inbound=inbound,
                     content=suffix.strip(),
@@ -4861,6 +5289,13 @@ class Agent365Adapter(BasePlatformAdapter):
         buf = self._turn_buffers.get(chat_id)
         if buf is None:
             return
+        if int(buf.get("depth") or 0) == 0:
+            # Progress-only turns never reached a send_reply. Close the
+            # sequence here so the client is not left in it.
+            await self._close_turn_buffer_keepalive_locked(chat_id)
+            buf = self._turn_buffers.get(chat_id)
+            if buf is None:
+                return
         if int(buf.get("depth") or 0) == 0 and not buf.get("segments"):
             await self._drop_turn_buffer(chat_id)
             return
