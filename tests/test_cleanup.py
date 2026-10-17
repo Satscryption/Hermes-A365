@@ -86,8 +86,10 @@ _BLUEPRINT_OBJECT_ID = "12121212-1212-1212-1212-121212121212"
 _SHARED_MANAGED_BY = "9b975845-388f-4429-889e-eab1ef63949c"
 _INSTANCE_IN_URL = re.compile(r"agentRegistry/agentInstances/([0-9a-fA-F-]{36})")
 _USER_IN_URL = re.compile(r"agentUserId eq '([0-9a-fA-F-]{36})'")
+_USER_OBJ_URL = re.compile(r"/users/([0-9a-fA-F-]{36})")
 _SP_IN_URL = re.compile(r"servicePrincipals/([0-9a-fA-F-]{36})")
-_APP_IN_URL = re.compile(r"applications\(appId='([0-9a-fA-F-]{36})'\)")
+_APP_IN_URL = re.compile(r"applications\(appId='([0-9a-fA-F-]{36})'")
+_AGENT_IDENTITY_PARENT = "2a2a2a2a-2a2a-2a2a-2a2a-2a2a2a2a2a2a"
 
 
 def _graph_owned_by(blueprint_id: str):
@@ -113,14 +115,27 @@ def _graph_owned_by(blueprint_id: str):
                     }
                 ]
             }
+        user_obj = _USER_OBJ_URL.search(url)
+        if user_obj:
+            return {
+                "id": user_obj.group(1).lower(),
+                "identityParentId": _AGENT_IDENTITY_PARENT,
+            }
         principal = _SP_IN_URL.search(url)
         if principal:
-            return {
-                "id": principal.group(1).lower(),
+            sp_id = principal.group(1).lower()
+            body: dict[str, Any] = {
+                "id": sp_id,
                 "appId": blueprint_id,
                 "agentIdentityBlueprintId": blueprint_id,
                 "managedBy": blueprint_id,
             }
+            if sp_id == _AGENT_IDENTITY_PARENT:
+                body = {
+                    "id": sp_id,
+                    "agentIdentityBlueprintId": blueprint_id,
+                }
+            return body
         instance = _INSTANCE_IN_URL.search(url)
         return {
             "id": instance.group(1).lower() if instance else "",
@@ -1756,6 +1771,50 @@ class TestOrphanOwnership:
                 additional_orphan_instance_ids=(_TEST_INSTANCE_ID,),
                 graph_get=_graph_owned_by(_FOREIGN_BLUEPRINT),
             )
+
+    def test_orphan_user_proven_via_identity_parent_when_registry_empty(
+        self, tmp_path: Path
+    ) -> None:
+        # #159: after blueprint teardown the registry filter is often empty,
+        # but the agentic user still chains to the blueprint via identityParentId.
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(url: str) -> dict[str, Any]:
+            if _APP_IN_URL.search(url):
+                return {"id": _BLUEPRINT_OBJECT_ID, "appId": _OWNERSHIP_BLUEPRINT}
+            if _USER_IN_URL.search(url):
+                return {"value": []}
+            return _graph_owned_by(_OWNERSHIP_BLUEPRINT)(url)
+
+        plan = build_cleanup_plan(
+            CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+            hermes_home=tmp_path,
+            additional_orphan_user_ids=(self._USER,),
+            graph_get=graph_get,
+        )
+        assert plan.orphan_user_ids == (self._USER,)
+
+    def test_graph_access_denied_surfaces_permission_hint(self, tmp_path: Path) -> None:
+        _seed_agent_dir(tmp_path)
+        _bind_agent_blueprint(tmp_path, "inbox-helper")
+
+        def graph_get(_url: str) -> dict[str, Any]:
+            return {
+                "error": {
+                    "code": "Authorization_RequestDenied",
+                    "message": "Insufficient privileges",
+                }
+            }
+
+        with pytest.raises(CleanupError, match="insufficient privileges") as exc:
+            build_cleanup_plan(
+                CleanupInputs(agent_name="inbox-helper", kinds=("instance",)),
+                hermes_home=tmp_path,
+                additional_orphan_user_ids=(self._USER,),
+                graph_get=graph_get,
+            )
+        assert "AgentRegistry.Read.All" in str(exc.value)
 
     def test_owned_user_is_planned_and_still_needs_double_entry(
         self, tmp_path: Path

@@ -469,8 +469,10 @@ def _collect_orphan_user_ids(
 # a copied object/identity GUID would let one agent delete another's user.
 # agentInstance.agentIdentityBlueprintId is the blueprint object id,
 # agentIdentity.agentIdentityBlueprintId is the blueprint app id, and
-# managedBy is compared to those same blueprint anchors. agentIdentityId is
-# not an ownership signal. The shared AI Teammate managing app
+# managedBy is compared to those same blueprint anchors. Orphan agentic
+# users are Entra users: when agentRegistry no longer lists an instance,
+# ``users/{id}.identityParentId`` chains to the parent agent identity SP.
+# agentIdentityId is not an ownership signal. The shared AI Teammate managing app
 # (9b975845-388f-4429-889e-eab1ef63949c) is not an anchor.
 GraphGet = Callable[[str], dict[str, Any] | None]
 _AGENT_USER_FILTER_URL = (
@@ -481,8 +483,15 @@ _AGENT_IDENTITY_URL = (
     "https://graph.microsoft.com/beta/servicePrincipals/{object_id}"
     "?$select=id,appId,servicePrincipalType,agentIdentityBlueprintId"
 )
+_AGENT_USER_URL = (
+    "https://graph.microsoft.com/beta/users/{user_id}"
+    "?$select=id,identityParentId"
+)
 _APPLICATION_BY_APP_ID_URL = (
     "https://graph.microsoft.com/beta/applications(appId='{app_id}')?$select=id,appId"
+)
+_GRAPH_ACCESS_DENIED_CODES = frozenset(
+    {"Authorization_RequestDenied", "AccessDenied", "Forbidden", "InsufficientPrivileges"}
 )
 
 
@@ -586,15 +595,39 @@ def _graph_get_from_mutator(mutator: Mutator) -> GraphGet:
     return graph_get
 
 
-def _graph_dict(graph_get: GraphGet, url: str) -> dict[str, Any] | None:
-    """Return a Graph JSON object, or None when the lookup cannot be trusted."""
+def _graph_raw(graph_get: GraphGet, url: str) -> dict[str, Any] | None:
+    """Return a Graph JSON object, including error bodies, when JSON is present."""
     try:
         payload = graph_get(url)
     except (CliInvocationError, AADSTSError, OSError):
         return None
-    if not isinstance(payload, dict) or payload.get("error"):
+    return payload if isinstance(payload, dict) else None
+
+
+def _graph_dict(graph_get: GraphGet, url: str) -> dict[str, Any] | None:
+    """Return a Graph JSON object, or None when the lookup cannot be trusted."""
+    payload = _graph_raw(graph_get, url)
+    if payload is None or payload.get("error"):
         return None
     return payload
+
+
+def _graph_access_denied_hint(payload: dict[str, Any] | None) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    error = payload.get("error")
+    if not isinstance(error, dict):
+        return None
+    code = str(error.get("code") or "")
+    if code not in _GRAPH_ACCESS_DENIED_CODES:
+        return None
+    return (
+        "Graph rejected the ownership lookup (insufficient privileges). "
+        "The az CLI session needs delegated permission to read "
+        "agentRegistry/agentInstances, users (including identityParentId), "
+        "applications, and servicePrincipals — for example "
+        "AgentRegistry.Read.All plus User.Read.All, or Directory.Read.All."
+    )
 
 
 def _require_matching_blueprint(
@@ -609,6 +642,107 @@ def _require_matching_blueprint(
     if _blueprint_association(record):
         raise CleanupError(refusal)
     raise CleanupError(unproven)
+
+
+def _verify_agentic_user_ownership(
+    user_id: str,
+    anchors: frozenset[str],
+    graph_get: GraphGet,
+) -> None:
+    """Prove an agentic-user object id belongs to this agent's blueprint."""
+    refusal_prefix = f"refusing to plan deletion of agentic user {user_id}:"
+    filter_url = _AGENT_USER_FILTER_URL.format(user_id=user_id)
+    filter_payload = _graph_raw(graph_get, filter_url)
+    denied_hint = _graph_access_denied_hint(filter_payload)
+    instances = _instances_from_graph(_graph_dict(graph_get, filter_url))
+    if instances:
+        for item in instances:
+            if _uuid_text(item.get("agentUserId")) != user_id:
+                raise CleanupError(
+                    f"{refusal_prefix} Graph agentUserId "
+                    f"{item.get('agentUserId')!r} does not match the typed id."
+                )
+            _require_matching_blueprint(
+                item,
+                anchors,
+                refusal=(
+                    f"{refusal_prefix} Graph shows this is the live agent user of "
+                    "a different agent's blueprint, not this agent's A365_APP_ID."
+                ),
+                unproven=(
+                    f"{refusal_prefix} Graph lookup did not prove the agentic user "
+                    "belongs to this agent's blueprint."
+                ),
+            )
+        return
+
+    user_url = _AGENT_USER_URL.format(user_id=user_id)
+    user_payload = _graph_raw(graph_get, user_url)
+    denied_hint = denied_hint or _graph_access_denied_hint(user_payload)
+    user_record = _graph_dict(graph_get, user_url)
+    if user_record is not None and _uuid_text(user_record.get("id")) == user_id:
+        parent_id = _uuid_text(user_record.get("identityParentId"))
+        if parent_id:
+            parent_payload = _graph_raw(
+                graph_get, _AGENT_IDENTITY_URL.format(object_id=parent_id)
+            )
+            denied_hint = denied_hint or _graph_access_denied_hint(parent_payload)
+            parent = _graph_dict(
+                graph_get, _AGENT_IDENTITY_URL.format(object_id=parent_id)
+            )
+            if parent is None:
+                if denied_hint:
+                    raise CleanupError(f"{refusal_prefix} {denied_hint}")
+                raise CleanupError(
+                    f"{refusal_prefix} Graph lookup did not prove the agentic user "
+                    "or agent identity belongs to this agent's blueprint."
+                )
+            if _uuid_text(parent.get("id")) != parent_id:
+                raise CleanupError(
+                    f"{refusal_prefix} Graph parent agent identity id "
+                    f"{parent.get('id')!r} does not match identityParentId."
+                )
+            _require_matching_blueprint(
+                parent,
+                anchors,
+                refusal=(
+                    f"{refusal_prefix} Graph shows the parent agent identity "
+                    "belongs to a different blueprint than this agent's A365_APP_ID."
+                ),
+                unproven=(
+                    f"{refusal_prefix} Graph lookup did not prove the agentic user "
+                    "or agent identity belongs to this agent's blueprint."
+                ),
+            )
+            return
+
+    identity_url = _AGENT_IDENTITY_URL.format(object_id=user_id)
+    identity_payload = _graph_raw(graph_get, identity_url)
+    denied_hint = denied_hint or _graph_access_denied_hint(identity_payload)
+    identity = _graph_dict(graph_get, identity_url)
+    if identity is None:
+        suffix = f" {denied_hint}" if denied_hint else ""
+        raise CleanupError(
+            f"{refusal_prefix} Graph lookup did not prove the agentic user or "
+            f"agent identity belongs to this agent's blueprint.{suffix}"
+        )
+    if _uuid_text(identity.get("id")) != user_id:
+        raise CleanupError(
+            f"{refusal_prefix} Graph service principal id {identity.get('id')!r} "
+            "does not match the typed id."
+        )
+    _require_matching_blueprint(
+        identity,
+        anchors,
+        refusal=(
+            f"{refusal_prefix} Graph shows this agent identity belongs to a "
+            "different blueprint than this agent's A365_APP_ID."
+        ),
+        unproven=(
+            f"{refusal_prefix} Graph lookup did not prove the agentic user or "
+            "agent identity belongs to this agent's blueprint."
+        ),
+    )
 
 
 def _require_verified_orphan_ownership(
@@ -678,58 +812,7 @@ def _require_verified_orphan_ownership(
             ),
         )
     for user_id in user_ids:
-        listed = _graph_dict(graph_get, _AGENT_USER_FILTER_URL.format(user_id=user_id))
-        instances = _instances_from_graph(listed)
-        if instances:
-            for item in instances:
-                if _uuid_text(item.get("agentUserId")) != user_id:
-                    raise CleanupError(
-                        f"refusing to plan deletion of agentic user {user_id}: "
-                        f"Graph agentUserId {item.get('agentUserId')!r} does not "
-                        "match the typed id."
-                    )
-                _require_matching_blueprint(
-                    item,
-                    anchors,
-                    refusal=(
-                        f"refusing to plan deletion of agentic user {user_id}: "
-                        "Graph shows this is the live agent user of a different "
-                        "agent's blueprint, not this agent's A365_APP_ID."
-                    ),
-                    unproven=(
-                        f"refusing to plan deletion of agentic user {user_id}: "
-                        "Graph lookup did not prove the agentic user belongs to "
-                        "this agent's blueprint."
-                    ),
-                )
-            continue
-        identity = _graph_dict(graph_get, _AGENT_IDENTITY_URL.format(object_id=user_id))
-        if identity is None:
-            raise CleanupError(
-                f"refusing to plan deletion of agentic user {user_id}: Graph "
-                "lookup did not prove the agentic user or agent identity "
-                "belongs to this agent's blueprint."
-            )
-        if _uuid_text(identity.get("id")) != user_id:
-            raise CleanupError(
-                f"refusing to plan deletion of agentic user {user_id}: Graph "
-                f"service principal id {identity.get('id')!r} does not match "
-                "the typed id."
-            )
-        _require_matching_blueprint(
-            identity,
-            anchors,
-            refusal=(
-                f"refusing to plan deletion of agentic user {user_id}: Graph "
-                "shows this agent identity belongs to a different blueprint "
-                "than this agent's A365_APP_ID."
-            ),
-            unproven=(
-                f"refusing to plan deletion of agentic user {user_id}: Graph "
-                "lookup did not prove the agentic user or agent identity "
-                "belongs to this agent's blueprint."
-            ),
-        )
+        _verify_agentic_user_ownership(user_id, anchors, graph_get)
 
 
 @dataclass
