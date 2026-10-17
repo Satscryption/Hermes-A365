@@ -84,11 +84,13 @@ whether the conversation actually renders Bot Framework streaming:
   streaming informative update from a background task — not from
   `send()`, which Hermes cancels at turn end. Later updates carry the
   `streamId` returned by the opening 201 and stay inside the 45-second
-  gap. Before the two-minute stream cap the sequence is closed and a
-  new one is opened. The merged reply is preceded by `streamType=final`
-  on that `streamId`. The informative text is a keep-alive
-  (`Working on it.`), not the answer. Short turns send none of this.
-  Personal chats still stream and do not use the buffer (#155).
+  gap. The sequence rotates when another interval would leave the
+  closing final outside the two-minute cap. The merged reply is
+  preceded by `streamType=final` on that `streamId`, and the reply is
+  not treated as delivered while that final has failed or been
+  skipped. The informative text is a keep-alive (`Working on it.`),
+  not the answer. Short turns send none of this. Personal chats still
+  stream and do not use the buffer (#155).
 
 > **`content_delivered` is not ground truth.** It has been observed both
 > false-but-delivered and true-but-not-rendered; validate Path B reply

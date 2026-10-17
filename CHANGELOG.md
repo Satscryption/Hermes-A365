@@ -21,10 +21,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   idle window posts a Bot Framework streaming informative update from
   a background task, then a `streamType=final` activity immediately
   before the merged `send_reply`. Later updates reuse the `streamId`
-  from the opening 201, and the sequence rotates before the two-minute
-  stream cap. The informative text is a keep-alive, not the answer.
-  Short turns send nothing. Personal chats are unchanged. `send` does
-  not await the keep-alive POST.
+  from the opening 201. The sequence rotates when another interval
+  would leave that final outside the two-minute cap. A final that
+  fails or is skipped keeps the stream id and the buffered segments;
+  the reply is posted only after the stream is closed. An opening
+  response that does not yield an id does not start a second stream.
+  A user-cancelled stream is not replaced. Uninstall sends one
+  best-effort final for a stream that already returned an id. The
+  informative text is a keep-alive, not the answer. Short turns send
+  nothing. Personal chats are unchanged. `send` does not await the
+  keep-alive POST.
 
 ## [0.9.0] — 2026-10-16
 
