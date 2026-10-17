@@ -8,6 +8,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Copilot Chat publish auto-increments the Teams app `version`.** Each
+  successful `publish --copilot-chat --apply` now stamps a strictly higher
+  manifest `version` than the last upload for the same catalog `manifest.id`,
+  so Microsoft Admin Center accepts update packages without zip surgery. The
+  source of truth is
+  `$HERMES_HOME/agents/<slug>/copilot-chat-publish.json` (override the slug
+  with `--slug`; override the version with `--app-version`). Closes #109.
+
 - **Orphan agentic-user ownership accepts the real owner again.** When
   `agentRegistry` no longer lists an instance for a typed orphan user id,
   cleanup now follows `users/{id}.identityParentId` to

@@ -59,6 +59,27 @@ AI-Teammate shape and is not part of the `1.21+` CEA schema. So:
   publish manifest. We do not author `agentConnectors` at all today;
   introducing it would be a new feature, not a currency fix.
 
+## App `version` (Teams package semver) vs `manifestVersion`
+
+Microsoft Admin Center rejects a **Custom Engine Agent update** upload when the
+zip's app `version` is not **strictly greater** than the version already
+installed for that catalog app (`manifest.id`). The GA `a365` CLI template
+re-stamps the same `version` on every `publish` (e.g. `1.1.4`), which blocks
+operators from uploading an updated package without hand-editing the zip (#109).
+
+Hermes records the last published app `version` per agent in:
+
+`$HERMES_HOME/agents/<slug>/copilot-chat-publish.json`
+
+(`<slug>` defaults to `slugify(--agent-name)`; override with `--slug`.)
+
+The file is keyed by Teams catalog `manifestId` and holds `lastAppVersion`.
+Each successful `hermes a365 publish --copilot-chat --apply` stamps a strictly
+higher `version` into the CEA zip (auto-bump patch when the CLI template is
+unchanged; honour a higher CLI template when Microsoft bumps it upstream).
+Operators may override with `--app-version X.Y.Z`, which must still beat the
+recorded last publish.
+
 ## Current state in the wrapper
 
 `_COPILOT_CHAT_MANIFEST_VERSION = "1.21"` has exactly **three** internal use
