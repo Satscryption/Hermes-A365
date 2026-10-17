@@ -10,11 +10,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - **Orphan agentic-user ownership accepts the real owner again.** When
   `agentRegistry` no longer lists an instance for a typed orphan user id,
-  cleanup now follows `users/{id}.identityParentId` to the parent agent
-  identity service principal instead of treating the user object id as a
-  service principal. Graph `Authorization_RequestDenied` / access-denied
-  responses name the delegated permissions needed for the ownership lookup.
-  Wrong-blueprint and unproven lookups are still refused.
+  cleanup now follows `users/{id}.identityParentId` to
+  `servicePrincipals/{id}/microsoft.graph.agentIdentity` for the parent
+  blueprint proof (instead of treating the user object id as a service
+  principal). Live `az rest` Graph 403s surface the same permission hint as
+  in-body error JSON (`AgentRegistry.Read.All`, `User.Read.All`,
+  `AgentIdentity.Read.All`, or broader directory read). Wrong-blueprint and
+  unproven lookups are still refused.
 
 ## [0.9.0] — 2026-10-16
 
