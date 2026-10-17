@@ -2004,17 +2004,19 @@ class Agent365Adapter(BasePlatformAdapter):
                         )
                 else:
                     decision = None
-                # #160: the shared profile policy is mandatory. Hermes may
-                # tighten it (a False denies) but must not widen it — an
-                # allow-all process flag or a stale gateway check cannot
-                # admit someone ``serve`` would reject.
-                hermes_decision = decision
+                # #160: the profile list is the decision ``serve`` uses.
+                # Hermes may not widen it. A Hermes deny is extra only for
+                # a sender that list also rejects — pairing often returns
+                # True for opaque ``from.id`` while the operator listed an
+                # AAD object id or UPN, and that sender is still admitted.
+                # The event identity is then the listed alias. On allow-all,
+                # the Hermes-true alias chosen above stays the event identity.
                 local_ok = bridge._activity_user_authorized(
                     activity,
                     allowed_users=self._allowed_users,
                     allow_all=self._allow_all_users,
                 )
-                if hermes_decision is False or not local_ok:
+                if not local_ok:
                     decision = False
                 else:
                     decision = True
@@ -2024,24 +2026,13 @@ class Agent365Adapter(BasePlatformAdapter):
                             for value in self._allowed_users
                             if value.strip()
                         }
-                        if hermes_decision is True:
-                            pool = [
-                                sender_id
-                                for sender_id, alias_decision in zip(
-                                    sender_ids, alias_decisions, strict=True
-                                )
-                                if alias_decision is True and sender_id in allowed
-                            ]
-                        else:
-                            pool = [
-                                sender_id
-                                for sender_id in sender_ids
-                                if sender_id in allowed
-                            ]
-                        if not pool:
-                            decision = False
-                        else:
-                            authorized_sender_id = pool[0]
+                        listed = [
+                            sender_id
+                            for sender_id in sender_ids
+                            if sender_id in allowed
+                        ]
+                        if listed:
+                            authorized_sender_id = listed[0]
                 if not decision:
                     logger.warning("inbound 403 reason=unauthorized-end-user")
                     raise HTTPException(status_code=403, detail="end user is not authorized")

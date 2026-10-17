@@ -16551,6 +16551,129 @@ class TestSenderAllowlistAgreement:
         assert admitted_response.status_code == 200
         assert adapter._handled_events
 
+    @pytest.mark.parametrize(
+        ("listed_key", "listed_value"),
+        [
+            ("aadObjectId", "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            ("userPrincipalName", "sadiq@contoso.com"),
+        ],
+    )
+    def test_hermes_from_id_and_listed_alias_admit_on_both_runtimes(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        listed_key: str,
+        listed_value: str,
+    ) -> None:
+        """Hermes pairing authorizes opaque from.id; the list names another alias."""
+        import httpx
+        from fastapi.testclient import TestClient
+
+        from hermes_a365.activity_bridge import load_bridge_config, make_app
+
+        tenant = "2699fca3-dac6-40a2-bcea-62ce05e2ee9b"
+        opaque = "29:opaque-paired"
+        intruder = "29:opaque-intruder"
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        monkeypatch.delenv("A365_ALLOWED_USERS", raising=False)
+        monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
+        monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
+        monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
+        home = tmp_path / listed_key
+        self._write(home / ".env", f"A365_ALLOWED_USERS={listed_value}\n")
+        self._write(home / "agents" / "inbox-helper" / ".env", f"A365_TENANT_ID={tenant}\n")
+        generated = home / "a365.generated.config.json"
+        self._write(
+            generated,
+            '{"agentBlueprintId":"bp","agentBlueprintClientSecret":"sek"}\n',
+        )
+        hermes_constants = types.ModuleType("hermes_constants")
+        hermes_constants.get_hermes_home = lambda bound=home: bound
+        monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
+        cfg = load_bridge_config(
+            slug="inbox-helper",
+            webhook_url="https://hook.test/responder",
+            hermes_home=home,
+            generated_config_path=generated,
+            skip_jwt_validation=True,
+        )
+
+        def activity(sender: dict[str, str], activity_id: str) -> dict[str, Any]:
+            return {
+                "type": "message",
+                "id": activity_id,
+                "channelId": "msteams",
+                "serviceUrl": "https://smba.trafficmanager.net/teams/",
+                "conversation": {"id": "conv-1", "tenantId": tenant},
+                "from": sender,
+                "recipient": {
+                    "id": "bot-1",
+                    "tenantId": tenant,
+                    "agenticAppId": "bp",
+                    "agenticUserId": "agentic-user-1",
+                },
+                "text": "hi",
+            }
+
+        listed_sender = {
+            "id": opaque,
+            "name": "Listed",
+            "aadObjectId": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+            "userPrincipalName": "other@contoso.com",
+        }
+        listed_sender[listed_key] = listed_value
+        unlisted_sender = {
+            "id": intruder,
+            "name": "Intruder",
+            "aadObjectId": "cccccccc-cccc-cccc-cccc-cccccccccccc",
+            "userPrincipalName": "intruder@contoso.com",
+        }
+        listed = activity(listed_sender, "1234")
+        outsider = activity(unlisted_sender, "1235")
+
+        def transport(req: httpx.Request) -> httpx.Response:
+            url = str(req.url)
+            if "/oauth2/v2.0/token" in url:
+                return httpx.Response(200, json={"access_token": "tok", "expires_in": 3600})
+            if "/v3/conversations/" in url:
+                return httpx.Response(200, json={})
+            return httpx.Response(200, json={"text": "ok"})
+
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(transport))
+        serve = TestClient(make_app(cfg, http_client=http_client))
+        assert serve.post("/api/messages", json=outsider).status_code == 403
+        assert serve.post("/api/messages", json=listed).status_code == 200
+
+        adapter = adapter_mod.Agent365Adapter(
+            _StubPlatformConfig(
+                extra={
+                    "slug": "inbox-helper",
+                    "conversations_path": str(home / "conversations.json"),
+                }
+            )
+        )
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+
+        def authorize(user_id: str, _chat_type: str, _chat_id: str) -> bool:
+            return user_id in {opaque, intruder}
+
+        adapter._is_sender_authorized = authorize
+        gateway = TestClient(adapter.build_app())
+        denied = gateway.post(
+            "/api/messages", json=outsider, headers={"Authorization": "Bearer a.b.c"}
+        )
+        admitted = gateway.post(
+            "/api/messages", json=listed, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert denied.status_code == 403
+        assert admitted.status_code == 200
+        assert adapter._handled_events[-1].source.user_id == listed_value.lower()
+
 
 class TestSecurityAuthorizationOrder:
     def test_unauthorized_user_is_rejected_before_media_or_state_side_effects(

@@ -78,6 +78,7 @@ from hermes_a365.activity_bridge import (
     render_human,
     render_json,
     render_reply_activity,
+    resolve_runtime_sender_allowlist,
     resolve_sender_allowlist,
     run_verify,
     select_profile_sender_env,
@@ -2483,6 +2484,34 @@ class TestSenderAllowlist:
         assert cfg.sender_allowlist_configured is True
         assert cfg.allow_all_users is False
         assert cfg.allowed_users == ()
+
+    def test_invalid_slug_symlink_does_not_hide_the_real_agent(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A sibling whose name contains ``\`` sorts first. Recording its
+        # resolved path before the slug check used to skip the real directory.
+        monkeypatch.setenv("A365_ALLOWED_USERS", "user-a")
+        _write_profile_env(tmp_path, A365_ALLOWED_USERS="user-a")
+        _seed_agent_env(tmp_path, A365_ALLOWED_USERS="user-b")
+        real = tmp_path / "agents" / "inbox-helper"
+        decoy = tmp_path / "agents" / "\\inbox-helper"
+        decoy.symlink_to(real, target_is_directory=True)
+        generated = _seed_generated_config(tmp_path)
+
+        with pytest.raises(BridgeConfigError, match="sender allowlists disagree") as unscoped:
+            resolve_runtime_sender_allowlist(
+                tmp_path, process_env=os.environ, slug=""
+            )
+        with pytest.raises(BridgeConfigError, match="sender allowlists disagree") as scoped:
+            load_bridge_config(
+                slug="inbox-helper",
+                webhook_url="https://hook",
+                hermes_home=tmp_path,
+                generated_config_path=generated,
+            )
+        assert str(unscoped.value) == str(scoped.value)
+        assert "user-a" not in str(unscoped.value)
+        assert "user-b" not in str(unscoped.value)
 
     def test_loose_profile_env_is_refused(self, tmp_path: Path) -> None:
         _seed_agent_env(tmp_path)

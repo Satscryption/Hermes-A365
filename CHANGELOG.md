@@ -28,9 +28,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   the file and the process disagree, when the per-agent file sets a policy
   the profile does not, or when the two files differ. An unscoped gateway
   (no slug) still refuses if any per-agent env states a conflicting policy,
-  including when that agent directory is a symlink.
+  including when that agent directory is a symlink. A directory name that
+  fails the slug check does not count as that path, so a sibling symlink
+  whose name contains a backslash cannot hide the real agent.
   If neither file sets a policy, both runtimes deny every end user. An empty
-  allowlist is not allow-all. A Hermes allow does not widen the shared policy.
+  allowlist is not allow-all. A Hermes allow does not widen the shared policy,
+  and a Hermes deny does not reject a sender the list admits. When Hermes
+  authorizes opaque `from.id` and the list names that sender's AAD object id
+  or UPN, the gateway and `serve` both admit them.
 - **`activity-bridge serve` refuses a group- or world-readable profile `.env`.**
   Startup exits before bind when `~/.hermes/.env` is readable by group or
   other. The error names the mode and the path and tells the operator to

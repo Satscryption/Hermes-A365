@@ -1545,7 +1545,9 @@ def _agent_envs_for_sender_policy(hermes_home: Path, slug: str) -> list[dict[str
     :func:`load_agent_env` (symlinks followed). An empty slug checks every
     agent directory the same way, so an unscoped gateway cannot ignore a
     per-agent policy behind a symlink that ``serve --slug`` would refuse.
-    Directories that resolve to the same path are checked once.
+    Directories that resolve to the same path are checked once. A name that
+    fails :func:`validate_slug` does not consume that path: a sibling symlink
+    whose name contains a backslash must not hide the real directory.
     """
     if slug:
         path = hermes_home / "agents" / slug / ".env"
@@ -1568,11 +1570,11 @@ def _agent_envs_for_sender_policy(hermes_home: Path, slug: str) -> list[dict[str
             ) from exc
         if resolved in seen:
             continue
-        seen.add(resolved)
         try:
             validate_slug(child.name)
         except ValueError:
             continue
+        seen.add(resolved)
         envs.append(load_agent_env(hermes_home, child.name))
     return envs
 
