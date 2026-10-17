@@ -88,8 +88,12 @@ whether the conversation actually renders Bot Framework streaming:
   closing final outside the two-minute cap. The merged reply is
   preceded by `streamType=final` on that `streamId`, and the reply is
   not treated as delivered while that final has failed or been
-  skipped. The informative text is a keep-alive (`Working on it.`),
-  not the answer. Short turns send none of this. Personal chats still
+  skipped. An opening read or write timeout is treated as a stream
+  that may already exist, so the next update does not start another.
+  That wait does not send a bare `typing` activity, because that
+  activity swallows the reply that follows. The informative text is a
+  keep-alive (`Working on it.`), not the answer. Short turns send
+  none of this. Personal chats still
   stream and do not use the buffer (#155).
 
 > **`content_delivered` is not ground truth.** It has been observed both

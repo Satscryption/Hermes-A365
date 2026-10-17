@@ -4865,6 +4865,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 return
             stream = self._keepalive_state(buf)
             if stream.get("stopped") or stream.get("untracked"):
+                # An id-less opening cannot be continued. A new informative
+                # start would be a second stream on this chat, and a bare
+                # typing activity is accepted and then swallows the reply
+                # that follows (#154). The turn stays quiet until the
+                # two-minute cap, which is when the service finishes the
+                # stream this process cannot name.
                 return
             stream_id = str(stream.get("stream_id") or "")
             opened = stream.get("opened_mono")
@@ -5088,8 +5094,9 @@ class Agent365Adapter(BasePlatformAdapter):
         """POST one informative update or the final that closes it.
 
         The id is taken from any 2xx body that carries one, not only 201.
-        An opening timeout after the request was sent is ``untracked``:
-        the service may already have created the stream. ``for_teardown``
+        An opening ``ReadTimeout`` or ``WriteTimeout`` from ``client.post``
+        is ``untracked``: the service may already have created the stream.
+        ``ConnectTimeout`` and ``PoolTimeout`` are not. ``for_teardown``
         still posts while the chat is retiring, so uninstall can close a
         stream that already returned an id. The text is the keep-alive
         phrase, never the buffered answer.
@@ -5145,6 +5152,8 @@ class Agent365Adapter(BasePlatformAdapter):
         validated = turn.get("validated_path")
         path = validated if isinstance(validated, str) else None
         url = _conversations_activities_url(service_url, conv_id)
+        # A timeout while minting the token is before this activity POST.
+        # Only the POST itself can have created a stream.
         try:
             token, _minted = await self._await_outbound(
                 chat_id,
@@ -5162,11 +5171,21 @@ class Agent365Adapter(BasePlatformAdapter):
                     ),
                 ),
             )
-            if not for_teardown and (
-                not self._lifecycle_is_current(generation, client)
-                or not self._chat_lifecycle_is_current(chat_id, chat_generation)
-            ):
-                return empty
+        except asyncio.CancelledError:
+            raise
+        except RuntimeError as exc:
+            if str(exc) == "agent365 outbound operation cancelled":
+                raise
+            return self._keepalive_post_exception(chat_id, exc, opening=False)
+        except Exception as exc:
+            return self._keepalive_post_exception(chat_id, exc, opening=False)
+        if not for_teardown and (
+            not self._lifecycle_is_current(generation, client)
+            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+        ):
+            return empty
+        opening = not final and not stream_id
+        try:
             resp = await self._await_outbound(
                 chat_id,
                 client.post(
@@ -5181,13 +5200,9 @@ class Agent365Adapter(BasePlatformAdapter):
         except RuntimeError as exc:
             if str(exc) == "agent365 outbound operation cancelled":
                 raise
-            return self._keepalive_post_exception(
-                chat_id, exc, opening=not final and not stream_id
-            )
+            return self._keepalive_post_exception(chat_id, exc, opening=opening)
         except Exception as exc:
-            return self._keepalive_post_exception(
-                chat_id, exc, opening=not final and not stream_id
-            )
+            return self._keepalive_post_exception(chat_id, exc, opening=opening)
         # A lifecycle change after the response must not drop an id the
         # service already issued. The caller stores it, including when
         # this buffer object is no longer the live one.
@@ -5208,11 +5223,23 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         return _KeepalivePost(status, new_id, detail, untracked)
 
+    @staticmethod
+    def _keepalive_timeout_after_send(exc: BaseException) -> bool:
+        """True for an httpx timeout that can mean the POST already left.
+
+        ``ReadTimeout`` and ``WriteTimeout`` are the types ``send_reply``
+        treats as "after the request was sent". ``ConnectTimeout`` and
+        ``PoolTimeout`` happen before that and must not mark a stream open.
+        """
+        import httpx
+
+        return isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout))
+
     def _keepalive_post_exception(
         self, chat_id: str, exc: BaseException, *, opening: bool
     ) -> _KeepalivePost:
         message = str(exc)
-        untracked = opening and _POST_SEND_TIMEOUT_MARKER in message.casefold()
+        untracked = opening and self._keepalive_timeout_after_send(exc)
         logger.warning(
             "agent365 turn buffer keep-alive POST failed: chat_id=%s error=%s",
             chat_id,

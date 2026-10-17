@@ -7617,11 +7617,111 @@ class TestEditMessage:
         await a._drop_turn_buffer("conv-G-noid")
 
     @pytest.mark.asyncio
-    async def test_opening_timeout_after_send_does_not_start_another_stream(
+    async def test_opening_httpx_timeout_marks_only_after_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # client.post raises the httpx type. ReadTimeout and WriteTimeout
+        # can mean the service already opened a stream. ConnectTimeout
+        # and PoolTimeout happen before the request is sent.
+        import httpx
+
+        cases = (
+            (httpx.ReadTimeout, True),
+            (httpx.WriteTimeout, True),
+            (httpx.ConnectTimeout, False),
+            (httpx.PoolTimeout, False),
+        )
+        for index, (exc_type, expect_untracked) in enumerate(cases):
+            chat = f"conv-G-timeout-{index}"
+            a = _make_adapter(monkeypatch)
+            inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+            inbound["conversation"]["conversationType"] = "groupChat"
+            self._wire_adapter(a, inbound=inbound)
+            self._patch_token_mint(monkeypatch)
+            monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+            posts = {"n": 0}
+
+            async def post(
+                *_args: Any,
+                timeout_type: type[BaseException] = exc_type,
+                seen: dict[str, int] = posts,
+                **_kwargs: Any,
+            ) -> MagicMock:
+                seen["n"] += 1
+                raise timeout_type("timed out")
+
+            a._http_client.post = post
+            event = _StubMessageEvent(
+                text="hi",
+                source=_StubSessionSource(platform=None, chat_id=chat),
+                message_id="act-1",
+            )
+            await a.on_processing_start(event)
+            await a._emit_turn_buffer_keepalive(chat)
+            assert posts["n"] == 1
+            stream = a._turn_buffers[chat]["keepalive"]
+            assert bool(stream.get("untracked")) is expect_untracked
+            await a._emit_turn_buffer_keepalive(chat)
+            assert posts["n"] == (1 if expect_untracked else 2)
+            await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_failed_final_retry_then_posts_one_reply(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-G-timeout", activity_id="act-1")
+        inbound = _make_inbound(conv_id="conv-G-final-retry", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            assert entity["streamType"] == "final"
+            assert entity["streamId"] == "ka-final"
+            finals["n"] += 1
+            if finals["n"] == 1:
+                raise RuntimeError("connector down")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        replies: list[str] = []
+
+        async def send_reply(**kwargs: Any) -> None:
+            replies.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-final-retry"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-final-retry", content="Keep me", reply_to=None)
+        buf = a._turn_buffers["conv-G-final-retry"]
+        buf["keepalive"] = {
+            "stream_id": "ka-final",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 2
+        assert replies == ["Keep me"]
+        assert "conv-G-final-retry" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_untracked_open_waits_out_the_cap_then_posts_one_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The id-less stream blocks the reply until 120s after it was
+        # marked open. A fake clock advances only when the deferred retry
+        # sleeps, so the wait is the cap and not a wall-clock pause.
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-untracked-wait"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
@@ -7630,21 +7730,64 @@ class TestEditMessage:
 
         async def post(*_args: Any, **_kwargs: Any) -> MagicMock:
             posts["n"] += 1
-            raise RuntimeError("timeout after the request was sent")
+            return MagicMock(
+                status_code=201,
+                text="not-json",
+                json=MagicMock(side_effect=ValueError("not json")),
+            )
 
         a._http_client.post = post
         event = _StubMessageEvent(
             text="hi",
-            source=_StubSessionSource(platform=None, chat_id="conv-G-timeout"),
+            source=_StubSessionSource(platform=None, chat_id=chat),
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        await a._emit_turn_buffer_keepalive("conv-G-timeout")
+        task = a._turn_buffers[chat]["keepalive_task"]
+        for _ in range(5):
+            await asyncio.sleep(0)
+        clock = {"t": 1_000.0}
+        gate = asyncio.Event()
+
+        def fake_monotonic() -> float:
+            return clock["t"]
+
+        async def fake_sleep(delay: float, result: Any = None) -> Any:
+            await gate.wait()
+            clock["t"] += float(delay)
+            return result
+
+        monkeypatch.setattr(adapter_mod.time, "monotonic", fake_monotonic)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+        await a._emit_turn_buffer_keepalive(chat)
         assert posts["n"] == 1
-        assert a._turn_buffers["conv-G-timeout"]["keepalive"]["untracked"] is True
-        await a._emit_turn_buffer_keepalive("conv-G-timeout")
+        opened = a._turn_buffers[chat]["keepalive"]["opened_mono"]
+        assert opened == 1_000.0
+        assert adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC == 120
+        bridge = adapter_mod._import_bridge()
+        replies: list[str] = []
+
+        async def send_reply(**kwargs: Any) -> None:
+            assert clock["t"] - opened >= 120
+            replies.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        await a.send(chat_id=chat, content="After the cap", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        live = a._turn_buffers[chat]
+        assert live["keepalive"]["untracked"] is True
+        assert [segment["text"] for segment in live["segments"]] == ["After the cap"]
+        assert replies == []
         assert posts["n"] == 1
-        await a._drop_turn_buffer("conv-G-timeout")
+        retry = live["retry_task"]
+        assert isinstance(retry, asyncio.Task)
+        gate.set()
+        await retry
+        assert replies == ["After the cap"]
+        assert posts["n"] == 1
+        assert chat not in a._turn_buffers
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_opening_id_is_kept_when_the_buffer_is_replaced(

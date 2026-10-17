@@ -25,7 +25,11 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   would leave that final outside the two-minute cap. A final that
   fails or is skipped keeps the stream id and the buffered segments;
   the reply is posted only after the stream is closed. An opening
-  response that does not yield an id does not start a second stream.
+  response that does not yield an id, including an httpx read or write
+  timeout on the opening POST, does not start a second stream. A
+  connect or pool timeout does not. The id-less wait does not send
+  typing: that activity swallows the later reply, and there is no
+  stream id to continue. The reply waits out the two-minute cap.
   A user-cancelled stream is not replaced. Uninstall sends one
   best-effort final for a stream that already returned an id. The
   informative text is a keep-alive, not the answer. Short turns send
