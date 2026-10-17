@@ -4867,9 +4867,14 @@ class Agent365Adapter(BasePlatformAdapter):
             if stream.get("stopped") or stream.get("untracked"):
                 return
             stream_id = str(stream.get("stream_id") or "")
-            opened = float(stream.get("opened_mono") or 0.0)
-            if stream_id and opened > 0.0 and _keepalive_rotation_due(
-                time.monotonic() - opened
+            opened = stream.get("opened_mono")
+            # ``time.monotonic()`` can be below the age we subtract in
+            # tests on a freshly booted runner, so the stamp may be
+            # negative. Zero is a real stamp; a missing key is not.
+            if (
+                stream_id
+                and isinstance(opened, (int, float))
+                and _keepalive_rotation_due(time.monotonic() - float(opened))
             ):
                 rotated = await self._post_keepalive_final_locked(chat_id, buf)
         if rotated and _STREAMING_MIN_GAP_SEC > 0:
