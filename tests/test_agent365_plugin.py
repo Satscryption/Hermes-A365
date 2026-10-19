@@ -11743,12 +11743,13 @@ class TestEditMessage:
         assert send_reply.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_nested_start_lets_followup_final_post_after_already_completed(
+    async def test_late_already_completed_does_not_block_followup_final(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # The already-completed guard is chat-wide until the next start.
-        # A nested follow-up start must clear it, or that short final is
-        # reported delivered and never posted.
+        # Interrupt order: nested start, then the outer 403, then the
+        # follow-up send. The guard is the landed reply anchor, so the
+        # late 403 cannot suppress a different follow-up. The same
+        # anchor stays a no-op.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-follow", activity_id="act-1")
         gateway = {"error": {"code": "BadGateway", "message": "connector reset"}}
@@ -11780,20 +11781,36 @@ class TestEditMessage:
             message_id="act-follow",
         )
         await a.on_processing_start(outer)
+        await a.on_processing_start(follow)
         await a.edit_message("conv-follow", "m1", "Pong 2.")
         landed = await a.edit_message(
             "conv-follow", "m1", "Pong 2.", finalize=True
         )
         assert landed.success is True
-        assert "conv-follow" in a._personal_final_landed
+        assert post_mock.await_count == 3
+        assert "act-1" in a._personal_final_landed["conv-follow"]
+
+        same = await a.send(
+            chat_id="conv-follow",
+            content="Pong 2.",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert same.success is True
+        assert same.message_id == ""
         assert post_mock.await_count == 3
 
-        await a.on_processing_start(follow)
-        assert "conv-follow" not in a._personal_final_landed
+        follow_in = _make_inbound(
+            conv_id="conv-follow", activity_id="act-follow", text="follow"
+        )
+        ref = adapter_mod.ConversationRef.from_activity(follow_in)
+        assert ref is not None
+        ref.validated_path = "A"
+        a._capture_coalesced_turn_target(ref)
         follow_up = await a.send(
             chat_id="conv-follow",
             content="Follow up.",
-            reply_to="act-1",
+            reply_to="act-follow",
             metadata={"notify": True},
         )
         assert follow_up.success is True

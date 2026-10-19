@@ -45,9 +45,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   `bf_error_body`. Transient failures on an already-open stream (transport
   errors, 429, and 500/502/503/504) are retried. A 403 still drops the
   stream, except a retried final whose message says the stream is already
-  completed: that edit is success, and a duplicate final send before the
-  next personal start does not open another bubble. A nested follow-up
-  start clears that guard so the follow-up's own short final is posted.
+  completed: that edit is success. The guard is that turn's reply
+  anchor, so a later final for the same anchor does not open another
+  bubble. A follow-up whose reply_to is a different activity still
+  posts, including when the 403 is accepted after the nested start.
   User cancel stays a failure. Any other intermediate
   failure keeps the stream so a later final can close the bubble. A failed
   opening edit does not keep an id-less entry; a later 201 is captured and

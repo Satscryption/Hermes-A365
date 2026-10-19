@@ -81,14 +81,15 @@ whether the conversation actually renders Bot Framework streaming:
   keeps the stream so a later final can close it. A failed opening edit
   drops the id-less entry so a later 201 can still be named and closed.
   A failed stream open that already delivered the plain final reply does
-  not let the follow-up finalize open a second stream.   A nested
+  not let the follow-up finalize open a second stream. A nested
   follow-up complete does not close the outer personal stream; the outer
   complete does. Nested previews while that stream is open are held, and
   one plain reply is posted for the follow-up final. A 403 drops the
   stream. A retried final that receives 403 "already completed" is
-  success, so a duplicate final send before the next personal start does
-  not open another bubble. A nested start clears that guard and the
-  follow-up's short final is posted. User cancel stays a failure. Personal chats do not use
+  success for that reply anchor, so a later final for the same anchor
+  does not open another bubble. A follow-up whose reply_to is a different
+  activity still posts, including when the 403 is accepted after the
+  nested start. User cancel stays a failure. Personal chats do not use
   the non-personal coalesce buffer. A **stale-stream liveness guard**
   force-drops a sequence whose
   finalization repeatedly fails or that exceeds a bounded age, so a

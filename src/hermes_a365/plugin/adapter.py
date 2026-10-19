@@ -1537,10 +1537,11 @@ class Agent365Adapter(BasePlatformAdapter):
         # finalized only when this count returns to 0 (#161).
         self._personal_processing_depth: dict[str, int] = {}
         # A retried final that learns the stream is already completed is
-        # success. A later gateway send for that same turn must not open
-        # another bubble. Cleared on the next personal start, including a
-        # nested follow-up, so that follow-up's short final is posted.
-        self._personal_final_landed: set[str] = set()
+        # success. Keyed by chat id → reply anchors for that landed turn.
+        # A later final send for the same anchor does not open another
+        # bubble. A follow-up whose reply_to is a different activity still
+        # posts, even if the 403 is accepted after the nested start.
+        self._personal_final_landed: dict[str, set[str]] = {}
         # Text for a nested personal follow-up while the outer 1:1 stream
         # is still open. Previews stay here; one plain reply is posted
         # when the follow-up final arrives.
@@ -4765,11 +4766,12 @@ class Agent365Adapter(BasePlatformAdapter):
         # expect_edits. Opening another streaming activity (or
         # suppressing the send) leaves the Stop button up.
         #
-        # A retried final that was already applied is success. The
-        # gateway's normal final send must not open a second stream.
+        # A retried final that was already applied is success. Only a
+        # later final for that same reply anchor is suppressed. A
+        # follow-up with a different reply_to still posts.
         if (
             chat_type == "personal"
-            and str(chat_id) in self._personal_final_landed
+            and self._personal_final_anchor_landed(chat_id, reply_to)
             and self._metadata_requests_stream_final(metadata)
         ):
             return SendResult(success=True, message_id="")
@@ -4863,6 +4865,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 inbound=inbound,
                 validated_path=turn_validated_path,
                 finalize=self._metadata_requests_stream_final(metadata),
+                reply_to=reply_to,
             )
             if stream_result is not None:
                 return stream_result
@@ -5023,10 +5026,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id, inbound, activity_id=activity_id
                 )
             elif inbound and chat_type == "personal":
-                # A fresh outer turn and a nested follow-up both may
-                # send. The already-completed guard is only for a
-                # duplicate final that arrives before the next start.
-                self._personal_final_landed.discard(chat_id)
+                # A new turn gets its own held follow-up. The
+                # already-completed guard stays keyed to the landed
+                # reply anchor, so a late 403 cannot block a different
+                # follow-up anchor.
                 self._nested_personal_reply.pop(chat_id, None)
                 self._personal_processing_depth[chat_id] = (
                     self._personal_processing_depth.get(chat_id, 0) + 1
@@ -7198,6 +7201,7 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound: dict[str, Any],
         validated_path: str | None = None,
         finalize: bool = False,
+        reply_to: Any | None = None,
     ) -> SendResult | None:
         """Slice 19s-bis: open a new BF stream from ``send()``.
 
@@ -7339,6 +7343,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "finalize_failures": 0,
             "lifecycle_generation": generation,
             "chat_generation": chat_generation,
+            "reply_anchor": self._personal_reply_anchor(reply_to, inbound),
             # Track last-sent content so auto-finalize-stale-stream has
             # something non-empty to POST as the close (BF rejects
             # empty-text final activities with 400 BadSyntax).
@@ -9507,6 +9512,46 @@ class Agent365Adapter(BasePlatformAdapter):
             generation, client
         ) and self._chat_lifecycle_is_current(chat_id, chat_generation)
 
+    @staticmethod
+    def _personal_reply_anchor(
+        reply_to: Any, inbound: dict[str, Any] | None
+    ) -> str:
+        """Activity id this personal stream belongs to.
+
+        A send carries ``reply_to``. An edit that opens the stream does
+        not, so the cached inbound id is the turn. Stored on the stream
+        so a later inbound upsert cannot retarget the guard.
+        """
+        if reply_to is not None and str(reply_to).strip():
+            return str(reply_to).strip()
+        if isinstance(inbound, dict):
+            raw = inbound.get("id")
+            if isinstance(raw, str) and raw.strip():
+                return raw.strip()
+        return ""
+
+    def _remember_personal_final_anchor(self, chat_id: str, anchor: str) -> None:
+        """Record that this reply anchor's final already landed."""
+        token = str(anchor or "").strip()
+        if not token:
+            return
+        key = str(chat_id)
+        anchors = self._personal_final_landed.get(key)
+        if anchors is None:
+            anchors = set()
+            self._personal_final_landed[key] = anchors
+        anchors.add(token)
+
+    def _personal_final_anchor_landed(self, chat_id: str, reply_to: Any) -> bool:
+        """True when this reply_to already has an accepted final."""
+        if reply_to is None:
+            return False
+        token = str(reply_to).strip()
+        if not token:
+            return False
+        anchors = self._personal_final_landed.get(str(chat_id))
+        return bool(anchors) and token in anchors
+
     def _nested_personal_hold(self, chat_id: str) -> dict[str, Any]:
         """Return the buffered follow-up for this chat, creating it."""
         key = str(chat_id)
@@ -9897,6 +9942,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "chat_id": str(chat_id),
                 "lifecycle_generation": generation,
                 "chat_generation": chat_generation,
+                "reply_anchor": self._personal_reply_anchor(None, inbound),
             }
             self._streams[stream_key] = state
 
@@ -10160,9 +10206,12 @@ class Agent365Adapter(BasePlatformAdapter):
                     and "cancelled by user" not in low
                 ):
                     landed_id = str(state.get("bf_stream_id") or message_id)
+                    anchor = str(state.get("reply_anchor") or "")
+                    if not anchor:
+                        anchor = self._personal_reply_anchor(None, inbound)
                     self._drop_stream_state(chat_id, message_id)
                     self._record_recently_finalized(message_id, chat_id, loop_now)
-                    self._personal_final_landed.add(str(chat_id))
+                    self._remember_personal_final_anchor(chat_id, anchor)
                     return SendResult(success=True, message_id=landed_id)
                 self._drop_stream_state(chat_id, message_id)
                 short = err_msg
@@ -11015,7 +11064,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if key[0] == chat_id:
                 self._recently_finalized.pop(key, None)
         self._personal_processing_depth.pop(chat_id, None)
-        self._personal_final_landed.discard(chat_id)
+        self._personal_final_landed.pop(chat_id, None)
         self._nested_personal_reply.pop(chat_id, None)
         for consent_id, pending in list(self._pending_file_uploads.items()):
             if str(pending.get("conversation_id") or "") == chat_id:
