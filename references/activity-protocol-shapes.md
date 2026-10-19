@@ -76,10 +76,18 @@ whether the conversation actually renders Bot Framework streaming:
   starting a second bubble; one-shot progress/fallback sends and
   separate image activities are suppressed mid-stream (#54). A failed
   edit logs `http_status`, `bf_error_code`, and `bf_error_body`.
-  Transient failures on an open stream are retried. A non-terminal
-  intermediate failure keeps the stream so a later final can close it.
-  A 403 drops it. Personal chats do not use the non-personal coalesce
-  buffer. A **stale-stream liveness guard** force-drops a sequence whose
+  Transient failures on an open stream (transport errors, 429, and
+  500/502/503/504) are retried. A non-terminal intermediate failure
+  keeps the stream so a later final can close it. A failed opening edit
+  drops the id-less entry so a later 201 can still be named and closed.
+  A failed stream open that already delivered the plain final reply does
+  not let the follow-up finalize open a second stream. A nested
+  follow-up complete does not close the outer personal stream; the outer
+  complete does. A 403 drops the stream. A retried final that receives
+  403 "already completed" is success, so the gateway does not open
+  another bubble; user cancel stays a failure. Personal chats do not use
+  the non-personal coalesce buffer. A **stale-stream liveness guard**
+  force-drops a sequence whose
   finalization repeatedly fails or that exceeds a bounded age, so a
   stuck stream can't silence the chat (#62, #83, #161).
 

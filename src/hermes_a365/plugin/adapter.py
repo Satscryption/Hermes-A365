@@ -1532,6 +1532,14 @@ class Agent365Adapter(BasePlatformAdapter):
         # start a stream or emit a non-streaming reply. Cleared on finalize
         # or terminal 403.
         self._active_stream_by_chat: dict[str, str] = {}
+        # Personal turns nest when Hermes runs an in-band follow-up before
+        # the outer stream consumer is cancelled. The outer 1:1 stream is
+        # finalized only when this count returns to 0 (#161).
+        self._personal_processing_depth: dict[str, int] = {}
+        # A retried final that learns the stream is already completed is
+        # success. A later gateway send for that same turn must not open
+        # another bubble. Cleared when the next personal turn starts.
+        self._personal_final_landed: set[str] = set()
 
         # #54 branch-walk correction: Copilot Chat arrives as
         # ``groupChat`` and renders BF streaming activities silently,
@@ -3427,6 +3435,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._record_recently_finalized(message_id, chat_id)
         self._streams.clear()
         self._active_stream_by_chat.clear()
+        self._personal_processing_depth.clear()
+        self._personal_final_landed.clear()
         for task in list(self._coalesced_status_tasks.values()):
             task.cancel()
         self._coalesced_status_tasks.clear()
@@ -4747,6 +4757,38 @@ class Agent365Adapter(BasePlatformAdapter):
         # on screen. Hermes marks that send with notify and without
         # expect_edits. Opening another streaming activity (or
         # suppressing the send) leaves the Stop button up.
+        #
+        # A retried final that was already applied is success. The
+        # gateway's normal final send must not open a second stream.
+        if (
+            chat_type == "personal"
+            and str(chat_id) in self._personal_final_landed
+            and self._metadata_requests_stream_final(metadata)
+        ):
+            return SendResult(success=True, message_id="")
+        # A nested follow-up runs before Hermes cancels the outer
+        # consumer. Do not close or rewrite that 1:1 stream. Deliver
+        # this text as its own plain reply and tombstone the id so the
+        # REQUIRES_EDIT_FINALIZE edit cannot open a stream on it.
+        if (
+            chat_type == "personal"
+            and chat_id in self._active_stream_by_chat
+            and self._personal_outer_turn_still_open(chat_id)
+            and (
+                reply_to is not None
+                or self._metadata_requests_stream_final(metadata)
+            )
+        ):
+            nested = await self._send_reply_activity(
+                inbound=inbound,
+                content=content,
+                log_context="send",
+                citations=(metadata or {}).get("citations"),
+                validated_path=turn_validated_path,
+            )
+            if nested.success and nested.message_id:
+                self._record_recently_finalized(nested.message_id, chat_id)
+            return nested
         if (
             chat_type == "personal"
             and chat_id in self._active_stream_by_chat
@@ -4805,6 +4847,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 ),
             )
 
+        plain_after_failed_personal_open = False
         if (
             chat_type == "personal"
             and reply_to is not None
@@ -4821,6 +4864,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return stream_result
             # Stream start failed (logged inside _send_stream_start);
             # fall through to non-streaming reply.
+            plain_after_failed_personal_open = True
 
         if chat_type != "personal" and reply_to is not None:
             if self._disconnecting or str(chat_id) in self._retiring_chats:
@@ -4841,7 +4885,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 validated_path=str(turn_validated_path or ""),
             )
 
-        return await self._send_reply_activity(
+        result = await self._send_reply_activity(
             inbound=inbound,
             content=content,
             log_context="send",
@@ -4850,6 +4894,18 @@ class Agent365Adapter(BasePlatformAdapter):
             citations=(metadata or {}).get("citations"),
             validated_path=turn_validated_path,
         )
+        # The plain reply is already on screen. Hermes still calls
+        # edit_message(finalize=True) because REQUIRES_EDIT_FINALIZE is
+        # set. Tombstone the id we returned so that edit cannot open a
+        # second streaming bubble (#83).
+        if (
+            plain_after_failed_personal_open
+            and result.success
+            and result.message_id
+            and self._metadata_requests_stream_final(metadata)
+        ):
+            self._record_recently_finalized(result.message_id, chat_id)
+        return result
 
     async def _send_reply_activity(
         self,
@@ -4961,6 +5017,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 activity_id = str(getattr(event, "message_id", "") or "")
                 self._open_or_nest_turn_buffer(
                     chat_id, inbound, activity_id=activity_id
+                )
+            elif inbound and chat_type == "personal":
+                # A fresh outer turn may stream again. A nested start
+                # must not clear a final that already landed.
+                if self._personal_processing_depth.get(chat_id, 0) <= 0:
+                    self._personal_final_landed.discard(chat_id)
+                self._personal_processing_depth[chat_id] = (
+                    self._personal_processing_depth.get(chat_id, 0) + 1
                 )
         parent = getattr(super(), "on_processing_start", None)
         if callable(parent):
@@ -5738,8 +5802,11 @@ class Agent365Adapter(BasePlatformAdapter):
             # Hermes cancels at turn end. A short reply often still has
             # the pacing gap left, so streamType=final never lands and
             # Teams keeps the Stop button. Close it on this session task.
-            # Non-personal chats are not in ``_active_stream_by_chat``.
-            await self._finalize_open_personal_stream(chat_id)
+            # A nested follow-up complete runs before that cancel, so it
+            # must not close the outer 1:1 stream. Non-personal chats are
+            # not in ``_active_stream_by_chat``.
+            if self._release_personal_processing(chat_id):
+                await self._finalize_open_personal_stream(chat_id)
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
             await parent(event, outcome)
@@ -9435,6 +9502,61 @@ class Agent365Adapter(BasePlatformAdapter):
             generation, client
         ) and self._chat_lifecycle_is_current(chat_id, chat_generation)
 
+    def _personal_outer_turn_still_open(self, chat_id: str) -> bool:
+        """True while a nested personal turn is inside an outer one.
+
+        Hermes runs an in-band follow-up, including its
+        ``on_processing_complete``, before it cancels the outer stream
+        consumer. Depth above 1 means that outer consumer is still live.
+        """
+        return self._personal_processing_depth.get(str(chat_id), 0) > 1
+
+    def _release_personal_processing(self, chat_id: str) -> bool:
+        """Drop one personal turn and report whether the outer one ended.
+
+        A complete with no tracked start still finalizes. That keeps a
+        turn-end close working when ``on_processing_start`` did not run.
+        A nested complete leaves the outer stream open.
+        """
+        key = str(chat_id)
+        depth = self._personal_processing_depth.get(key, 0)
+        if depth <= 0:
+            return True
+        depth -= 1
+        if depth <= 0:
+            self._personal_processing_depth.pop(key, None)
+            return True
+        self._personal_processing_depth[key] = depth
+        return False
+
+    def _drop_stream_state_if_unopened(
+        self,
+        chat_id: str,
+        message_id: str,
+        state: dict[str, Any],
+    ) -> None:
+        """Drop a stream entry that never received a connector id.
+
+        An opening POST that fails must not stay in ``_streams``. The
+        next call would see ``is_first`` false, skip the 201 capture,
+        and be unable to close the bubble Teams already opened (#161).
+        """
+        if state.get("bf_stream_id"):
+            return
+        # Disconnect and chat teardown tombstone whatever is still in
+        # ``_streams``. Dropping an in-flight open first would let the
+        # retry after reconnect post again.
+        if (
+            self._disconnecting
+            or str(chat_id) in self._retiring_chats
+            or str(chat_id) in self._registry_evicting_chats
+        ):
+            return
+        current = self._streams.get((str(chat_id), str(message_id)))
+        if current is not None and current is not state:
+            return
+        self._drop_stream_state(chat_id, message_id)
+
     async def _finalize_open_personal_stream(self, chat_id: str) -> None:
         """Post ``streamType=final`` for a personal stream still open.
 
@@ -9648,7 +9770,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 edit_message: stream lifecycle expired",
             )
-        is_first = state is None
         if state is None:
             state = {
                 "bf_stream_id": None,
@@ -9673,6 +9794,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if not self._lifecycle_is_current(
             generation, client
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            self._drop_stream_state_if_unopened(chat_id, message_id, state)
             return SendResult(
                 success=False,
                 error="agent365 edit_message: adapter lifecycle changed",
@@ -9726,6 +9848,7 @@ class Agent365Adapter(BasePlatformAdapter):
         service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
         conv_id = conv.get("id")
         if not service_url or not conv_id:
+            self._drop_stream_state_if_unopened(chat_id, message_id, state)
             return SendResult(
                 success=False,
                 error="agent365 edit_message: serviceUrl or conversation.id missing",
@@ -9750,6 +9873,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not self._lifecycle_is_current(
                     generation, client
                 ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                    self._drop_stream_state_if_unopened(
+                        chat_id, message_id, state
+                    )
                     return SendResult(
                         success=False,
                         error="agent365 edit_message: adapter lifecycle changed",
@@ -9783,11 +9909,15 @@ class Agent365Adapter(BasePlatformAdapter):
                     if not await self._pause_before_stream_retry(
                         chat_id, generation, chat_generation, client
                     ):
+                        self._drop_stream_state_if_unopened(
+                            chat_id, message_id, state
+                        )
                         return SendResult(
                             success=False,
                             error="agent365 edit_message: adapter lifecycle changed",
                         )
                     continue
+                self._drop_stream_state_if_unopened(chat_id, message_id, state)
                 return SendResult(success=False, error=last_error)
 
             if (
@@ -9795,6 +9925,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 or not self._chat_lifecycle_is_current(chat_id, chat_generation)
                 or self._streams.get(stream_key) is not state
             ):
+                self._drop_stream_state_if_unopened(chat_id, message_id, state)
                 return SendResult(
                     success=False,
                     error="agent365 edit_message: adapter lifecycle changed",
@@ -9802,9 +9933,10 @@ class Agent365Adapter(BasePlatformAdapter):
 
             state["last_emit_ts"] = loop.time()
 
-            # First request → 201 with {"id": "<streamId>"}. Capture for
-            # subsequent calls and as the message_id returned to Hermes.
-            if is_first and resp.status_code == 201:
+            # 201 with {"id": "<streamId>"} opens the stream. Capture it
+            # even when an earlier failed open left this entry without an
+            # id — otherwise the final cannot name the bubble (#161).
+            if resp.status_code == 201 and not state.get("bf_stream_id"):
                 try:
                     stream_id = (resp.json() or {}).get("id")
                 except Exception:
@@ -9851,25 +9983,29 @@ class Agent365Adapter(BasePlatformAdapter):
                         "out-of-order; server-side dedup retains the latest",
                         state["sequence"],
                     )
-                if wire_finalize:
-                    self._drop_stream_state(chat_id, message_id)
-                    self._record_recently_finalized(message_id, chat_id, loop_now)
-                elif finalize:
-                    # Accepted an opening activity and never sent final.
+                if not state.get("bf_stream_id"):
+                    # A 2xx that never named the stream cannot be closed.
+                    # Drop the id-less entry so the next 201 is captured.
                     self._log_personal_stream_edit_failure(
                         phase="edit",
                         chat_id=str(chat_id),
                         message_id=str(message_id),
-                        finalize=True,
+                        finalize=finalize,
                         http_status=resp.status_code,
                         bf_error_code="",
-                        bf_error_body="2xx without a prior streamId; final not sent",
+                        bf_error_body="2xx without a streamId; final not sent",
                         attempt=attempt,
+                    )
+                    self._drop_stream_state_if_unopened(
+                        chat_id, message_id, state
                     )
                     return SendResult(
                         success=False,
                         error="streaming start returned no id",
                     )
+                if wire_finalize:
+                    self._drop_stream_state(chat_id, message_id)
+                    self._record_recently_finalized(message_id, chat_id, loop_now)
                 return SendResult(
                     success=True, message_id=state.get("bf_stream_id") or ""
                 )
@@ -9892,12 +10028,30 @@ class Agent365Adapter(BasePlatformAdapter):
                 # error tags Hermes can surface to operators. The log line
                 # above keeps the HTTP status and BF body (#83).
                 err_msg = self._extract_error_message(resp)
+                low = err_msg.lower()
+                # A retry of the final can learn the previous attempt
+                # already closed the stream (timeout or 502, then 403
+                # "already completed"). That final landed. Returning
+                # failure makes the gateway open another stream.
+                # "canceled by user" stays a failure.
+                if (
+                    finalize
+                    and attempt > 1
+                    and state.get("bf_stream_id")
+                    and "already completed" in low
+                    and "canceled by user" not in low
+                    and "cancelled by user" not in low
+                ):
+                    landed_id = str(state.get("bf_stream_id") or message_id)
+                    self._drop_stream_state(chat_id, message_id)
+                    self._record_recently_finalized(message_id, chat_id, loop_now)
+                    self._personal_final_landed.add(str(chat_id))
+                    return SendResult(success=True, message_id=landed_id)
                 self._drop_stream_state(chat_id, message_id)
                 short = err_msg
-                low = err_msg.lower()
                 if "exceeded streaming time" in low:
                     short = "streaming timeout"
-                elif "canceled by user" in low:
+                elif "canceled by user" in low or "cancelled by user" in low:
                     short = "streaming canceled by user"
                 elif "message size too large" in low:
                     short = "streaming message too large"
@@ -9923,13 +10077,18 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not await self._pause_before_stream_retry(
                     chat_id, generation, chat_generation, client
                 ):
+                    self._drop_stream_state_if_unopened(
+                        chat_id, message_id, state
+                    )
                     return SendResult(
                         success=False,
                         error="agent365 edit_message: adapter lifecycle changed",
                     )
                 continue
+            self._drop_stream_state_if_unopened(chat_id, message_id, state)
             return SendResult(success=False, error=last_error)
 
+        self._drop_stream_state_if_unopened(chat_id, message_id, state)
         return SendResult(success=False, error=last_error)
 
     async def _auto_finalize_stale_stream(
@@ -10738,6 +10897,8 @@ class Agent365Adapter(BasePlatformAdapter):
         for key in list(self._recently_finalized):
             if key[0] == chat_id:
                 self._recently_finalized.pop(key, None)
+        self._personal_processing_depth.pop(chat_id, None)
+        self._personal_final_landed.discard(chat_id)
         for consent_id, pending in list(self._pending_file_uploads.items()):
             if str(pending.get("conversation_id") or "") == chat_id:
                 self._pending_file_uploads.pop(consent_id, None)

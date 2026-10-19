@@ -11617,6 +11617,185 @@ class TestEditMessage:
         assert ("conv-keep", "m1") not in a._streams
         assert send_reply.await_count == 0
 
+    @pytest.mark.asyncio
+    async def test_failed_opening_edit_is_dropped_and_a_later_201_finalizes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A failed open must not leave bf_stream_id=None. The next 201
+        # has to be captured, and finalize has to post streamType=final.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-reopen")
+        failure = {
+            "error": {"code": "ServiceUnavailable", "message": "upstream"}
+        }
+        responses = [
+            MagicMock(status_code=503, text="", json=lambda body=failure: body),
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-reopen"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        failed = await a.edit_message("conv-reopen", "m1", "Pong 2.", finalize=True)
+        assert failed.success is False
+        assert ("conv-reopen", "m1") not in a._streams
+        assert "conv-reopen" not in a._active_stream_by_chat
+
+        closed = await a.edit_message("conv-reopen", "m1", "Pong 2.", finalize=True)
+        assert closed.success is True
+        assert closed.message_id == "bf-reopen"
+        assert post_mock.await_count == 3
+        opened = post_mock.await_args_list[1].kwargs["json"]
+        final = post_mock.await_args_list[2].kwargs["json"]
+        assert opened["entities"][0]["streamType"] == "streaming"
+        assert "streamId" not in opened["entities"][0]
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-reopen"
+        assert ("conv-reopen", "m1") not in a._streams
+
+    @pytest.mark.asyncio
+    async def test_idless_stream_entry_still_captures_a_later_201(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Defense if an id-less entry is still present: a 201 is the open,
+        # not a later edit, and finalize must close that id.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-idless")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-idless"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        a._streams[("conv-idless", "m1")] = {
+            "bf_stream_id": None,
+            "sequence": 4,
+            "last_emit_ts": 0.0,
+            "chat_id": "conv-idless",
+        }
+
+        closed = await a.edit_message("conv-idless", "m1", "Pong 2.", finalize=True)
+        assert closed.success is True
+        assert closed.message_id == "bf-idless"
+        assert post_mock.await_count == 2
+        info = next(
+            entity
+            for entity in post_mock.await_args.kwargs["json"]["entities"]
+            if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-idless"
+        assert ("conv-idless", "m1") not in a._streams
+
+    @pytest.mark.asyncio
+    async def test_retried_final_403_already_completed_is_success(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # 502 then 403 "already completed" means the final landed.
+        # The gateway's following final send must not open another stream.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-landed", activity_id="act-1")
+        gateway = {
+            "error": {"code": "BadGateway", "message": "connector reset"}
+        }
+        completed = {
+            "error": {
+                "code": "ContentStreamNotAllowed",
+                "message": "Content stream is already completed.",
+            }
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-landed"}),
+            MagicMock(status_code=502, text="", json=lambda body=gateway: body),
+            MagicMock(status_code=403, text="", json=lambda body=completed: body),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        await a.edit_message("conv-landed", "m1", "Pong 2.")
+        result = await a.edit_message(
+            "conv-landed", "m1", "Pong 2.", finalize=True
+        )
+        assert result.success is True
+        assert result.message_id == "bf-landed"
+        assert ("conv-landed", "m1") not in a._streams
+        assert "conv-landed" not in a._active_stream_by_chat
+        assert ("conv-landed", "m1") in a._recently_finalized
+        assert post_mock.await_count == 3
+
+        again = await a.send(
+            chat_id="conv-landed",
+            content="Pong 2.",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert again.success is True
+        assert post_mock.await_count == 3
+        assert send_reply.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_first_403_already_completed_stays_a_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-once")
+        completed = {
+            "error": {
+                "code": "ContentStreamNotAllowed",
+                "message": "Content stream is already completed.",
+            }
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-once"}),
+            MagicMock(status_code=403, text="", json=lambda body=completed: body),
+        ]
+        self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-once", "m1", "A")
+        result = await a.edit_message("conv-once", "m1", "A B", finalize=True)
+        assert result.success is False
+        assert result.error == "streaming already completed"
+        assert "conv-once" not in a._personal_final_landed
+
+    @pytest.mark.asyncio
+    async def test_retried_final_403_canceled_by_user_stays_a_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cancel")
+        gateway = {"error": {"code": "BadGateway", "message": "reset"}}
+        canceled = {
+            "error": {
+                "code": "ContentStreamNotAllowed",
+                "message": "Content stream was canceled by user.",
+            }
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-cancel"}),
+            MagicMock(status_code=502, text="", json=lambda body=gateway: body),
+            MagicMock(status_code=403, text="", json=lambda body=canceled: body),
+        ]
+        self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        await a.edit_message("conv-cancel", "m1", "A")
+        result = await a.edit_message("conv-cancel", "m1", "A B", finalize=True)
+        assert result.success is False
+        assert result.error == "streaming canceled by user"
+        assert "conv-cancel" not in a._personal_final_landed
+
 
 class TestSendOrUpdateStatus:
     """#53 — gateway status/lifecycle callbacks routed through
@@ -12895,6 +13074,119 @@ class TestSendStreamStart:
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-end"
         assert "conv-end" not in a._active_stream_by_chat
+
+    @pytest.mark.asyncio
+    async def test_failed_stream_open_plain_reply_does_not_open_a_second_bubble(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # Stream open 503 falls through to one plain reply. The finalize
+        # edit Hermes sends next must not open another streaming bubble.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-plain", activity_id="act-fb")
+        failure = {"error": {"code": "ServiceUnavailable", "message": "busy"}}
+        post_mock = TestEditMessage._wire_adapter(
+            a,
+            inbound=inbound,
+            post_responses=[
+                MagicMock(status_code=503, text="", json=lambda body=failure: body)
+            ],
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        result = await a.send(
+            chat_id="conv-plain",
+            content="Pong 2.",
+            reply_to="act-fb",
+            metadata={"notify": True},
+        )
+        assert result.success is True
+        assert result.message_id == "act-fb"
+        assert send_reply.await_count == 1
+        assert post_mock.await_count == 1
+        assert "conv-plain" not in a._active_stream_by_chat
+
+        follow = await a.edit_message(
+            "conv-plain", result.message_id, "Pong 2.", finalize=True
+        )
+        assert follow.success is True
+        assert post_mock.await_count == 1
+        assert send_reply.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_nested_complete_does_not_finalize_the_outer_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The follow-up complete runs before the outer consumer is
+        # cancelled. It must not close the outer 1:1 stream, and a
+        # follow-up final send must not rewrite that bubble.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-nest", activity_id="act-1")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-nest"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=responses
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        outer = _StubMessageEvent(
+            text="ping",
+            source=_StubSessionSource(platform=None, chat_id="conv-nest"),
+            message_id="act-1",
+        )
+        follow = _StubMessageEvent(
+            text="follow",
+            source=_StubSessionSource(platform=None, chat_id="conv-nest"),
+            message_id="act-follow",
+        )
+        await a.on_processing_start(outer)
+        opened = await a.send(
+            chat_id="conv-nest", content="Hello", reply_to="act-1"
+        )
+        assert opened.success is True
+        assert post_mock.await_count == 1
+        await a.on_processing_start(follow)
+        # The follow-up send runs before its complete, while the outer
+        # consumer is still live. It must not close that stream.
+        nested = await a.send(
+            chat_id="conv-nest",
+            content="Follow up.",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert nested.success is True
+        assert send_reply.await_count == 1
+        assert post_mock.await_count == 1
+        assert a._active_stream_by_chat["conv-nest"] == "bf-nest"
+        edit = await a.edit_message(
+            "conv-nest", nested.message_id, "Follow up.", finalize=True
+        )
+        assert edit.success is True
+        assert post_mock.await_count == 1
+
+        await a.on_processing_complete(follow, outcome="success")
+        assert post_mock.await_count == 1
+        assert a._active_stream_by_chat["conv-nest"] == "bf-nest"
+
+        await a.on_processing_complete(outer, outcome="success")
+        assert post_mock.await_count == 2
+        final = post_mock.await_args.kwargs["json"]
+        assert final["text"] == "Hello"
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-nest"
+        assert "conv-nest" not in a._active_stream_by_chat
 
     @pytest.mark.asyncio
     async def test_final_send_closes_active_stream_without_a_new_one(

@@ -43,15 +43,23 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
   `bf_error_body`. Transient failures on an already-open stream (transport
-  errors, 429, and 502/503/504) are retried. A 403 still drops the stream.
-  Any other intermediate failure keeps it so a later final can close the
-  bubble. Personal chats do not fall over to the Copilot Chat coalesce
-  buffer. A final personal send (`notify`, no `expect_edits`) — the
-  short/single-chunk shape — posts `streamType=streaming` and then
-  `streamType=final`, and success requires the final activity to be
-  accepted. A personal stream still open at turn end is closed the same
-  way. `content_delivered` is not used as a success signal. A live
-  failure-rate walk is still required before calling streaming reliable.
+  errors, 429, and 500/502/503/504) are retried. A 403 still drops the
+  stream, except a retried final whose message says the stream is already
+  completed: that edit is success, and a later final send does not open
+  another bubble. User cancel stays a failure. Any other intermediate
+  failure keeps the stream so a later final can close the bubble. A failed
+  opening edit does not keep an id-less entry; a later 201 is captured and
+  a finalize posts `streamType=final`. Personal chats do not fall over to
+  the Copilot Chat coalesce buffer. A final personal send (`notify`, no
+  `expect_edits`) — the short/single-chunk shape — posts
+  `streamType=streaming` and then `streamType=final`, and success requires
+  the final activity to be accepted. If that open fails and the plain
+  reply is delivered, the returned id is tombstoned so the follow-up
+  finalize does not open a second stream. A personal stream still open at
+  the outer turn end is closed the same way. A nested follow-up complete
+  does not close the outer 1:1 stream. `content_delivered` is not used as
+  a success signal. A live failure-rate walk is still required before
+  calling streaming reliable.
 
 ## [0.9.2] — 2026-10-19
 
