@@ -44,7 +44,10 @@ cannot reach:
 Both paths share the same Path A blueprint Entra app + `/api/messages`
 handler; Path B adds its own BF identity and Bot Service registration.
 Operators with both prerequisites can run both surfaces from one
-Hermes-A365 install.
+Hermes-A365 install. User-delegated OBO on Copilot (downstream calls
+as the signed-in user on the same Path B surfaces) is out of scope
+for 1.0. See the deferred tracking issue
+([#174](../../issues/174)).
 
 **Distinct from Hermes' sibling Teams adapter** at
 `plugins/platforms/teams/adapter.py` (shipped v2026.4.30 + in-flight
