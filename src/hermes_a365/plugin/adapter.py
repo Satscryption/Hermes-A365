@@ -588,6 +588,102 @@ def _bound_feedback_map(m: dict[str, dict[str, Any]]) -> None:
         m.pop(next(iter(m)))
 
 
+# #80 — Teams messageReaction. One activity lists a handful of add/remove
+# entries; the per-message map keeps the latest action per (user, type).
+_MAX_REACTIONS_PER_ACTIVITY = 16
+_MAX_NATIVE_REACTIONS_PER_MESSAGE = 32
+_MAX_REACTION_IDENTITY_CHARS = 64
+_MAX_REACTION_USER_CHARS = 256
+
+
+def _normalize_reaction_identity(raw: Any) -> str | None:
+    """Teams ``MessageReaction.type`` as one stable token.
+
+    Case-folded and stripped. Empty, oversized, and values containing a
+    colon, slash, or whitespace are rejected so the Hermes
+    ``reaction:added:<identity>`` / ``reaction:removed:<identity>`` text
+    cannot be split into a second event.
+    """
+    if not isinstance(raw, str):
+        return None
+    text = raw.strip().casefold()
+    if not text or len(text) > _MAX_REACTION_IDENTITY_CHARS:
+        return None
+    if any(ord(ch) < 32 or ch in ":/\\ \t" for ch in text):
+        return None
+    return text
+
+
+def _message_reaction_tenant_ids(activity: dict[str, Any]) -> set[str]:
+    """Tenant ids the activity body claims, lowercased.
+
+    Teams puts the tenant on ``conversation.tenantId`` and sometimes also
+    on ``channelData.tenant.id``. Disagreeing claims are returned as a set
+    so the caller can fail closed instead of picking one.
+    """
+    found: list[str] = []
+    conv = activity.get("conversation")
+    if isinstance(conv, dict):
+        raw = conv.get("tenantId")
+        if isinstance(raw, str) and raw.strip():
+            found.append(raw.strip().lower())
+    channel = activity.get("channelData")
+    if isinstance(channel, dict):
+        raw = channel.get("tenantId")
+        if isinstance(raw, str) and raw.strip():
+            found.append(raw.strip().lower())
+        tenant = channel.get("tenant")
+        if isinstance(tenant, dict):
+            raw = tenant.get("id")
+            if isinstance(raw, str) and raw.strip():
+                found.append(raw.strip().lower())
+    return set(found)
+
+
+def _message_reaction_changes(
+    activity: dict[str, Any],
+) -> list[tuple[str, str]] | None:
+    """``(added|removed, identity)`` pairs, or None when the lists are unusable."""
+    if "reactionsAdded" not in activity and "reactionsRemoved" not in activity:
+        return None
+    added = activity.get("reactionsAdded")
+    removed = activity.get("reactionsRemoved")
+    if added is None:
+        added = []
+    if removed is None:
+        removed = []
+    if not isinstance(added, list) or not isinstance(removed, list):
+        return None
+    changes: list[tuple[str, str]] = []
+    for action, entries in (("added", added), ("removed", removed)):
+        for entry in entries:
+            if not isinstance(entry, dict):
+                return None
+            identity = _normalize_reaction_identity(entry.get("type"))
+            if identity is None:
+                return None
+            changes.append((action, identity))
+    if not changes or len(changes) > _MAX_REACTIONS_PER_ACTIVITY:
+        return None
+    return changes
+
+
+def _connector_activity_id(response: Any) -> str:
+    """Activity id from a Bot Framework connector 2xx body, or ``""``."""
+    if response is None:
+        return ""
+    try:
+        body = response.json() if callable(getattr(response, "json", None)) else None
+    except Exception:
+        return ""
+    if not isinstance(body, dict):
+        return ""
+    raw = body.get("id")
+    if isinstance(raw, str):
+        return raw.strip()
+    return ""
+
+
 def _strip_streaming_cursor(text: str) -> str:
     """Remove a trailing cursor glyph that Hermes' stream consumer
     appends to intermediate chunks. Idempotent + no-op when text
@@ -1618,7 +1714,13 @@ class Agent365Adapter(BasePlatformAdapter):
         # #73(c) — message-id -> {reaction, feedback, ...} captured from
         # ``message/submitAction`` feedback invokes. Teams stores nothing, so we
         # keep the latest reaction per replied message (in-memory, per-lifetime).
+        # #80 extends the same record with ``native_reactions`` for Teams
+        # ``messageReaction`` add/remove.
         self._feedback_by_message_id: dict[str, dict[str, Any]] = {}
+        # #80 — outbound activity id -> {conversation_id, tenant_id} for replies
+        # this process produced. A messageReaction is accepted only when
+        # ``replyToId`` hits this map. Bounded and cleared with the feedback map.
+        self._bot_reply_ids: dict[str, dict[str, str]] = {}
 
         # #82 — Copilot→Teams handoff. Maps a minted continuation token ->
         # {"conversation_id", "chat_type", ...} so a ``handoff/action`` invoke
@@ -2153,6 +2255,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 delivery_id
             ):
                 return JSONResponse({"status": "duplicate"})
+
+            # #80 — Teams messageReaction add/remove, only after the serviceUrl,
+            # JWT, end-user, and replay gates above. The body tenant is checked
+            # inside the handler (fail closed). This does not update the
+            # conversation registry: a reaction is not a reply target.
+            if str(activity.get("type") or "") == "messageReaction":
+                return await self._handle_message_reaction(
+                    activity, authorized_sender_id=authorized_sender_id
+                )
 
             # #77 — a card Action.Submit arrives as a ``message`` with ``value``
             # (our ``hermes_kind`` tag) and no user text. It is an approval/
@@ -3298,8 +3409,9 @@ class Agent365Adapter(BasePlatformAdapter):
             task.cancel()
         self._coalesced_status_tasks.clear()
         self._coalesced_status.clear()
-        # #73(c)/#82 — drop per-lifetime correlator maps on disconnect.
+        # #73(c)/#82/#80 — drop per-lifetime correlator maps on disconnect.
         self._feedback_by_message_id.clear()
+        self._bot_reply_ids.clear()
         self._handoff_tokens.clear()
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
@@ -4731,7 +4843,7 @@ class Agent365Adapter(BasePlatformAdapter):
             webhook_response["feedback"] = True
         reply = bridge.render_reply_activity(inbound, webhook_response)
         try:
-            await self._await_outbound(
+            response = await self._await_outbound(
                 chat_id,
                 bridge.send_reply(
                     inbound=inbound,
@@ -4757,6 +4869,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error=f"agent365 {log_context}: adapter lifecycle changed",
             )
+        self._remember_bot_reply(
+            _connector_activity_id(response), conversation_id=chat_id
+        )
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     @staticmethod
@@ -5280,6 +5395,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     "opened_mono": time.monotonic(),
                 },
             )
+            self._remember_bot_reply(new_id, conversation_id=str(chat_id))
             logger.info(
                 "agent365 turn buffer keep-alive started: chat_id=%s stream_id=%s",
                 chat_id,
@@ -6949,6 +7065,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # Server may return empty body — that's fine.
             pass
 
+        self._remember_bot_reply(new_id, conversation_id=str(chat_id))
         return SendResult(success=True, message_id=new_id)
 
     async def _send_stream_start(
@@ -7068,6 +7185,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return None
         bf_stream_id = str(bf_stream_id)
+        self._remember_bot_reply(bf_stream_id, conversation_id=str(chat_id))
 
         loop = asyncio.get_event_loop()
         now = loop.time()
@@ -7366,7 +7484,7 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         reply = bridge.render_reply_activity(inbound, {"text": "", "card": card})
         try:
-            await self._await_outbound(
+            response = await self._await_outbound(
                 chat_id,
                 bridge.send_reply(
                     inbound=inbound,
@@ -7388,6 +7506,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 send_image: adapter lifecycle changed",
             )
+        self._remember_bot_reply(
+            _connector_activity_id(response), conversation_id=str(chat_id)
+        )
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     # ── #76c outbound file transfer (FileConsentCard → OneDrive) ───────────
@@ -7795,7 +7916,7 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         try:
             reply = self._reply_with_attachment(activity, info_card)
-            await self._await_outbound(
+            response = await self._await_outbound(
                 pending_chat_id,
                 _import_bridge().send_reply(
                     inbound=activity,
@@ -7808,6 +7929,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     validated_path=validated_path,
                 ),
             )
+            self._remember_bot_reply(
+                _connector_activity_id(response),
+                conversation_id=str(pending_chat_id),
+            )
         except Exception as e:
             logger.warning("agent365 fileConsent info card failed: %s", e)
 
@@ -7815,6 +7940,336 @@ class Agent365Adapter(BasePlatformAdapter):
             "agent365 fileConsent uploaded %d bytes consent=%s", size, consent_id[:8]
         )
         return invoke.InvokeResponse(status=200, body={})
+
+    # ── #80 Teams messageReaction + #73(c) feedback correlation ───────────
+
+    def _remember_bot_reply(self, message_id: str, *, conversation_id: str) -> None:
+        """Record an outbound activity id this process created.
+
+        Teams delivers ``messageReaction`` with ``replyToId`` set to that
+        activity. Ids we did not create are ignored. The map shares the
+        feedback correlator's cap and is cleared on disconnect and when the
+        chat is torn down.
+        """
+        message_id = str(message_id or "").strip()
+        conversation_id = str(conversation_id or "").strip()
+        if (
+            not message_id
+            or not conversation_id
+            or len(message_id) > 2048
+            or len(conversation_id) > 2048
+        ):
+            return
+        tenant_id = self.tenant_id.strip().lower()
+        if not tenant_id:
+            return
+        self._bot_reply_ids.pop(message_id, None)
+        self._bot_reply_ids[message_id] = {
+            "conversation_id": conversation_id,
+            "tenant_id": tenant_id,
+        }
+        _bound_map(self._bot_reply_ids)
+
+    def _record_native_reaction(
+        self,
+        message_id: str,
+        *,
+        action: str,
+        identity: str,
+        conversation_id: str,
+        user_id: str,
+    ) -> bool:
+        """Merge one add/remove into the #73 feedback record for ``message_id``.
+
+        An existing thumbs-feedback record is updated in place. A record that
+        already belongs to a different conversation is left untouched.
+        Returns False when the write did not stick (cap eviction or mismatch).
+        """
+        existing = self._feedback_by_message_id.get(message_id)
+        if existing is not None:
+            existing_conv = str(existing.get("conversation_id") or "")
+            if existing_conv and existing_conv != conversation_id:
+                return False
+        rec = self._feedback_by_message_id.pop(message_id, None)
+        if rec is None:
+            rec = {
+                "reaction": None,
+                "feedback": None,
+                "conversation_id": conversation_id,
+                "user_oid": user_id,
+            }
+        elif not str(rec.get("conversation_id") or ""):
+            rec["conversation_id"] = conversation_id
+        native = rec.get("native_reactions")
+        if not isinstance(native, dict):
+            native = {}
+            rec["native_reactions"] = native
+        bucket = native.get(user_id)
+        if not isinstance(bucket, dict):
+            bucket = {}
+            native[user_id] = bucket
+        # Refresh insertion order so the latest action is the newest slot.
+        bucket.pop(identity, None)
+        bucket[identity] = {"action": action, "type": identity}
+        while self._native_reaction_slots(native) > _MAX_NATIVE_REACTIONS_PER_MESSAGE:
+            oldest_user = next(iter(native))
+            oldest_bucket = native.get(oldest_user)
+            if not isinstance(oldest_bucket, dict) or not oldest_bucket:
+                native.pop(oldest_user, None)
+                continue
+            oldest_bucket.pop(next(iter(oldest_bucket)))
+            if not oldest_bucket:
+                native.pop(oldest_user, None)
+        self._feedback_by_message_id[message_id] = rec
+        _bound_feedback_map(self._feedback_by_message_id)
+        stored = self._feedback_by_message_id.get(message_id)
+        if not isinstance(stored, dict):
+            return False
+        stored_native = stored.get("native_reactions")
+        if not isinstance(stored_native, dict):
+            return False
+        stored_bucket = stored_native.get(user_id)
+        if not isinstance(stored_bucket, dict):
+            return False
+        slot = stored_bucket.get(identity)
+        return isinstance(slot, dict) and slot.get("action") == action
+
+    @staticmethod
+    def _native_reaction_slots(native: dict[str, Any]) -> int:
+        total = 0
+        for bucket in native.values():
+            if isinstance(bucket, dict):
+                total += len(bucket)
+        return total
+
+    async def _handle_message_reaction(
+        self, activity: dict[str, Any], *, authorized_sender_id: str
+    ) -> Any:
+        """Record a Teams ``messageReaction`` and emit Hermes reaction events.
+
+        Runs only after the route's serviceUrl, JWT, end-user, and replay
+        gates. The body tenant is checked here and fails closed. A reaction
+        is stored on the #73 feedback record only when ``replyToId`` is a
+        reply this process sent in the same conversation. Hermes' reaction
+        convention (Feishu / Telegram) then delivers
+        ``reaction:added:<identity>`` / ``reaction:removed:<identity>`` as
+        the agent turn. Malformed, cross-tenant, replayed, and unrelated
+        reactions do not write a feedback record.
+
+        Edits, soft-delete, and undelete are #122 and are not handled here.
+        A live Teams round trip is still required on the #116 / #89 walks.
+        """
+        from fastapi import HTTPException
+        from fastapi.responses import JSONResponse
+
+        tenants = _message_reaction_tenant_ids(activity)
+        configured = self.tenant_id.strip().lower()
+        if tenants and tenants != {configured}:
+            logger.warning("agent365 messageReaction rejected reason=cross-tenant")
+            raise HTTPException(status_code=403, detail="cross-tenant activity")
+
+        reason = self._message_reaction_reject_reason(
+            activity, authorized_sender_id=authorized_sender_id, configured=configured
+        )
+        if reason is not None:
+            logger.info("agent365 messageReaction acked reason=%s", reason)
+            return JSONResponse({"status": "acked", "reason": reason})
+
+        conv = activity.get("conversation")
+        conv_id = str(conv.get("id") or "").strip() if isinstance(conv, dict) else ""
+        reply_to = str(activity.get("replyToId") or "").strip()
+        user_id = (authorized_sender_id or "").strip()
+        changes = _message_reaction_changes(activity) or []
+        for action, identity in changes:
+            self._record_native_reaction(
+                reply_to,
+                action=action,
+                identity=identity,
+                conversation_id=conv_id,
+                user_id=user_id,
+            )
+            logger.info(
+                "agent365 messageReaction %s type=%s msg=%s",
+                action,
+                identity,
+                reply_to[:16],
+            )
+        applied = self._stored_reaction_changes(reply_to, user_id, changes)
+        if not applied:
+            return JSONResponse({"status": "acked", "reason": "unrelated"})
+        await self._dispatch_reaction_events(
+            activity, applied, authorized_sender_id=user_id
+        )
+        return JSONResponse({"status": "acked", "reactions": len(applied)})
+
+    def _stored_reaction_changes(
+        self,
+        message_id: str,
+        user_id: str,
+        changes: list[tuple[str, str]],
+    ) -> list[tuple[str, str]]:
+        """Changes from this activity that are still the stored action.
+
+        A later add/remove of the same identity in the same activity replaces
+        the slot, and the per-message cap can drop the oldest slot. Only the
+        surviving action is emitted, so the agent turn matches the record.
+        """
+        stored = self._feedback_by_message_id.get(message_id)
+        native = stored.get("native_reactions") if isinstance(stored, dict) else None
+        bucket = native.get(user_id) if isinstance(native, dict) else None
+        if not isinstance(bucket, dict):
+            return []
+        last_index: dict[str, int] = {}
+        for index, (_action, identity) in enumerate(changes):
+            last_index[identity] = index
+        applied: list[tuple[str, str]] = []
+        for index, (action, identity) in enumerate(changes):
+            if last_index.get(identity) != index:
+                continue
+            slot = bucket.get(identity)
+            if isinstance(slot, dict) and slot.get("action") == action:
+                applied.append((action, identity))
+        return applied
+
+    def _message_reaction_reject_reason(
+        self,
+        activity: dict[str, Any],
+        *,
+        authorized_sender_id: str,
+        configured: str,
+    ) -> str | None:
+        """``malformed`` / ``ignored`` / ``unrelated``, or None when it may be stored.
+
+        Cross-tenant is decided by the caller before this runs. This method
+        does not write.
+        """
+        if str(activity.get("channelId") or "") != "msteams":
+            return "ignored"
+        if not configured or _message_reaction_tenant_ids(activity) != {configured}:
+            return "malformed"
+        conv = activity.get("conversation")
+        if not isinstance(conv, dict):
+            return "malformed"
+        conv_id = conv.get("id")
+        if not isinstance(conv_id, str) or not conv_id.strip():
+            return "malformed"
+        conv_id = conv_id.strip()
+        reply_to = activity.get("replyToId")
+        if not isinstance(reply_to, str) or not reply_to.strip():
+            return "malformed"
+        reply_to = reply_to.strip()
+        if len(reply_to) > 2048 or len(conv_id) > 2048:
+            return "malformed"
+        user_id = (authorized_sender_id or "").strip()
+        if not user_id or len(user_id) > _MAX_REACTION_USER_CHARS:
+            return "malformed"
+        if _message_reaction_changes(activity) is None:
+            return "malformed"
+        meta = self._bot_reply_ids.get(reply_to)
+        if not isinstance(meta, dict):
+            return "unrelated"
+        if (
+            meta.get("conversation_id") != conv_id
+            or meta.get("tenant_id") != configured
+        ):
+            return "unrelated"
+        existing = self._feedback_by_message_id.get(reply_to)
+        if isinstance(existing, dict):
+            existing_conv = str(existing.get("conversation_id") or "")
+            if existing_conv and existing_conv != conv_id:
+                return "unrelated"
+        if self._disconnecting or conv_id in self._retiring_chats:
+            return "unrelated"
+        return None
+
+    async def _dispatch_reaction_events(
+        self,
+        activity: dict[str, Any],
+        changes: list[tuple[str, str]],
+        *,
+        authorized_sender_id: str,
+    ) -> None:
+        """Emit one Hermes reaction event per applied add/remove.
+
+        The text is the Feishu / Telegram convention
+        (``reaction:added:<emoji>`` / ``reaction:removed:<emoji>``), which
+        is an agent turn. The event's message id is the cached user
+        activity, not the ``messageReaction`` id: ``on_processing_start``
+        copies that id onto the turn snapshot, and a personal ``send``
+        looks up the coalesced target by it. The reaction activity is not
+        a ``replyToActivity`` target, and the registry is not updated.
+        """
+        conv = activity.get("conversation")
+        conv_id = str(conv.get("id") or "").strip() if isinstance(conv, dict) else ""
+        user_activity_id = self._cached_user_activity_id(conv_id)
+        if not user_activity_id:
+            logger.warning(
+                "agent365 messageReaction recorded without a turn: "
+                "no cached user activity"
+            )
+            return
+        for action, identity in changes:
+            event = self._activity_to_event(
+                activity,
+                media=([], [], MessageType.TEXT),
+                authorized_user_id=authorized_sender_id,
+            )
+            event.text = f"reaction:{action}:{identity}"
+            event.message_id = user_activity_id
+            source = getattr(event, "source", None)
+            if source is not None:
+                source.message_id = user_activity_id
+            sk = self._session_key_for(event)
+            admission_key = sk or f"agent365:{conv_id}"
+            if not self._reserve_agent_turn_admission(admission_key):
+                logger.warning(
+                    "agent365 messageReaction recorded without a turn: "
+                    "active turns full"
+                )
+                continue
+            turn_guard = asyncio.Event()
+            if sk is not None:
+                self._session_key_to_conv[sk] = conv_id
+                turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
+            turn_token = _AGENT_TURN_LIFECYCLE.set(
+                (
+                    id(self),
+                    conv_id,
+                    self._lifecycle_generation,
+                    self._chat_generation(conv_id),
+                    turn_guard,
+                )
+            )
+            try:
+                await self.handle_message(event)
+            except Exception:
+                logger.exception(
+                    "agent365 messageReaction turn failed action=%s", action
+                )
+            finally:
+                _AGENT_TURN_LIFECYCLE.reset(turn_token)
+            if sk is None:
+                continue
+            owner = getattr(self, "_session_tasks", {}).get(sk)
+            if isinstance(owner, asyncio.Task):
+                self._note_session_task_chat(sk)
+                self._watch_agent_turn_owner(sk, turn_guard, owner)
+            elif sk not in getattr(self, "_active_sessions", {}):
+                self._agent_turn_guards.pop(sk, None)
+
+    def _cached_user_activity_id(self, chat_id: str) -> str:
+        """Activity id of the latest cached user inbound for ``chat_id``.
+
+        This is the id Hermes replies to. A ``messageReaction`` id must not
+        be substituted for it.
+        """
+        inbound = self._cached_inbound_for(chat_id)
+        if not isinstance(inbound, dict):
+            return ""
+        raw = inbound.get("id")
+        if isinstance(raw, str):
+            return raw.strip()
+        return ""
 
     # ── #73(c) feedback loop + #82 handoff (invoke children) ──────────────
 
@@ -7845,21 +8300,59 @@ class Agent365Adapter(BasePlatformAdapter):
                     "utf-8", errors="ignore"
                 )
         # The reply the reaction targets: Teams sets replyToId on the invoke.
+        # Merge into the existing #73/#80 row. Replacing the dict would drop
+        # ``native_reactions`` recorded for the same bot reply.
         msg_id = str(ctx.activity.get("replyToId") or ctx.activity.get("id") or "")
         if msg_id:
-            self._feedback_by_message_id[msg_id] = {
-                "reaction": reaction,
-                "feedback": feedback,
-                "conversation_id": str(ctx.conv.get("id") or ""),
-                "user_oid": ctx.user_oid,
-            }
-            _bound_feedback_map(self._feedback_by_message_id)
+            self._merge_thumbs_feedback(
+                msg_id,
+                reaction=reaction,
+                feedback=feedback,
+                conversation_id=str(ctx.conv.get("id") or ""),
+                user_oid=str(ctx.user_oid or ""),
+            )
         logger.info(
             "agent365 feedback reaction=%s msg=%s",
             reaction,
             msg_id[:16],
         )
         return invoke.InvokeResponse(status=200, body={})
+
+    def _merge_thumbs_feedback(
+        self,
+        message_id: str,
+        *,
+        reaction: str,
+        feedback: str | None,
+        conversation_id: str,
+        user_oid: str,
+    ) -> None:
+        """Write thumbs fields onto the feedback row for ``message_id``.
+
+        ``native_reactions`` and any other keys already on the row stay.
+        A row that already belongs to a different conversation is left
+        untouched.
+        """
+        existing = self._feedback_by_message_id.get(message_id)
+        if isinstance(existing, dict):
+            existing_conv = str(existing.get("conversation_id") or "")
+            if existing_conv and conversation_id and existing_conv != conversation_id:
+                logger.warning(
+                    "agent365 feedback ignored: conversation mismatch msg=%s",
+                    message_id[:16],
+                )
+                return
+            rec = existing
+        else:
+            rec = {}
+            self._feedback_by_message_id[message_id] = rec
+        rec["reaction"] = reaction
+        rec["feedback"] = feedback
+        if conversation_id:
+            rec["conversation_id"] = conversation_id
+        if user_oid:
+            rec["user_oid"] = user_oid
+        _bound_feedback_map(self._feedback_by_message_id)
 
     async def _handle_message_fetch_task(
         self, ctx: invoke.InvokeContext
@@ -8014,7 +8507,7 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         reply = self._reply_with_attachment(inbound, attachment)
         try:
-            await self._await_outbound(
+            response = await self._await_outbound(
                 chat_id,
                 _import_bridge().send_reply(
                     inbound=inbound,
@@ -8041,6 +8534,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error=f"agent365 {log_context}: adapter lifecycle changed",
             )
+        self._remember_bot_reply(
+            _connector_activity_id(response), conversation_id=str(chat_id)
+        )
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     async def send_exec_approval(
@@ -8645,6 +9141,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     error="streaming start returned no id",
                 )
             state["bf_stream_id"] = str(stream_id)
+            self._remember_bot_reply(str(stream_id), conversation_id=str(chat_id))
             if finalize:
                 # First + finalize is degenerate but legal — drop state.
                 self._drop_stream_state(chat_id, message_id)
@@ -9496,6 +9993,10 @@ class Agent365Adapter(BasePlatformAdapter):
         for consent_id, pending in list(self._pending_file_uploads.items()):
             if str(pending.get("conversation_id") or "") == chat_id:
                 self._pending_file_uploads.pop(consent_id, None)
+        # #80 — a retired chat must not keep accepting reactions on its replies.
+        for message_id, meta in list(self._bot_reply_ids.items()):
+            if str(meta.get("conversation_id") or "") == chat_id:
+                self._bot_reply_ids.pop(message_id, None)
         for nonce, capability in list(self._card_capabilities.items()):
             if str(capability.get("conversation_id") or "") == chat_id:
                 self._card_capabilities.pop(nonce, None)
