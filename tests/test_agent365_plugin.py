@@ -11743,6 +11743,73 @@ class TestEditMessage:
         assert send_reply.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_nested_start_lets_followup_final_post_after_already_completed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # The already-completed guard is chat-wide until the next start.
+        # A nested follow-up start must clear it, or that short final is
+        # reported delivered and never posted.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-follow", activity_id="act-1")
+        gateway = {"error": {"code": "BadGateway", "message": "connector reset"}}
+        completed = {
+            "error": {
+                "code": "ContentStreamNotAllowed",
+                "message": "Content stream is already completed.",
+            }
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-follow"}),
+            MagicMock(status_code=502, text="", json=lambda body=gateway: body),
+            MagicMock(status_code=403, text="", json=lambda body=completed: body),
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-next"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        outer = _StubMessageEvent(
+            text="ping",
+            source=_StubSessionSource(platform=None, chat_id="conv-follow"),
+            message_id="act-1",
+        )
+        follow = _StubMessageEvent(
+            text="follow",
+            source=_StubSessionSource(platform=None, chat_id="conv-follow"),
+            message_id="act-follow",
+        )
+        await a.on_processing_start(outer)
+        await a.edit_message("conv-follow", "m1", "Pong 2.")
+        landed = await a.edit_message(
+            "conv-follow", "m1", "Pong 2.", finalize=True
+        )
+        assert landed.success is True
+        assert "conv-follow" in a._personal_final_landed
+        assert post_mock.await_count == 3
+
+        await a.on_processing_start(follow)
+        assert "conv-follow" not in a._personal_final_landed
+        follow_up = await a.send(
+            chat_id="conv-follow",
+            content="Follow up.",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert follow_up.success is True
+        assert post_mock.await_count == 5
+        opened = post_mock.await_args_list[3].kwargs["json"]
+        final = post_mock.await_args_list[4].kwargs["json"]
+        assert opened["text"] == "Follow up."
+        assert opened["entities"][0]["streamType"] == "streaming"
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-next"
+        assert final["text"] == "Follow up."
+
+    @pytest.mark.asyncio
     async def test_first_403_already_completed_stays_a_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -13187,6 +13254,93 @@ class TestSendStreamStart:
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-nest"
         assert "conv-nest" not in a._active_stream_by_chat
+
+    @pytest.mark.asyncio
+    async def test_nested_preview_is_held_until_the_followup_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A preview must not be posted and tombstoned, or the later
+        # edit/final never lands. One plain reply carries the final text.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-prev", activity_id="act-1")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-prev"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=responses
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        outer = _StubMessageEvent(
+            text="ping",
+            source=_StubSessionSource(platform=None, chat_id="conv-prev"),
+            message_id="act-1",
+        )
+        follow = _StubMessageEvent(
+            text="follow",
+            source=_StubSessionSource(platform=None, chat_id="conv-prev"),
+            message_id="act-follow",
+        )
+        await a.on_processing_start(outer)
+        opened = await a.send(
+            chat_id="conv-prev", content="Hello", reply_to="act-1"
+        )
+        assert opened.success is True
+        assert post_mock.await_count == 1
+        await a.on_processing_start(follow)
+
+        preview = await a.send(
+            chat_id="conv-prev",
+            content="Hi ▉",
+            reply_to="act-1",
+            metadata={"notify": True, "expect_edits": True},
+        )
+        assert preview.success is True
+        assert str(preview.message_id).startswith("nestedbuf:")
+        assert send_reply.await_count == 0
+        assert post_mock.await_count == 1
+        assert ("conv-prev", preview.message_id) not in a._recently_finalized
+
+        edited = await a.edit_message(
+            "conv-prev", preview.message_id, "Hi there ▉", finalize=False
+        )
+        assert edited.success is True
+        assert send_reply.await_count == 0
+        assert post_mock.await_count == 1
+        assert a._active_stream_by_chat["conv-prev"] == "bf-prev"
+
+        final = await a.edit_message(
+            "conv-prev", preview.message_id, "Hi there, done.", finalize=True
+        )
+        assert final.success is True
+        assert send_reply.await_count == 1
+        assert send_reply.await_args.kwargs["reply"]["text"] == "Hi there, done."
+        assert post_mock.await_count == 1
+        assert a._active_stream_by_chat["conv-prev"] == "bf-prev"
+
+        again = await a.edit_message(
+            "conv-prev", preview.message_id, "Hi there, done.", finalize=True
+        )
+        assert again.success is True
+        assert send_reply.await_count == 1
+
+        await a.on_processing_complete(follow, outcome="success")
+        await a.on_processing_complete(outer, outcome="success")
+        assert post_mock.await_count == 2
+        outer_final = post_mock.await_args.kwargs["json"]
+        assert outer_final["text"] == "Hello"
+        info = next(
+            entity
+            for entity in outer_final["entities"]
+            if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-prev"
 
     @pytest.mark.asyncio
     async def test_final_send_closes_active_stream_without_a_new_one(

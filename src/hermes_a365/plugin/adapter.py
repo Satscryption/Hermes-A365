@@ -1538,8 +1538,14 @@ class Agent365Adapter(BasePlatformAdapter):
         self._personal_processing_depth: dict[str, int] = {}
         # A retried final that learns the stream is already completed is
         # success. A later gateway send for that same turn must not open
-        # another bubble. Cleared when the next personal turn starts.
+        # another bubble. Cleared on the next personal start, including a
+        # nested follow-up, so that follow-up's short final is posted.
         self._personal_final_landed: set[str] = set()
+        # Text for a nested personal follow-up while the outer 1:1 stream
+        # is still open. Previews stay here; one plain reply is posted
+        # when the follow-up final arrives.
+        self._nested_personal_reply: dict[str, dict[str, Any]] = {}
+        self._nested_personal_seq = 0
 
         # #54 branch-walk correction: Copilot Chat arrives as
         # ``groupChat`` and renders BF streaming activities silently,
@@ -3437,6 +3443,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._active_stream_by_chat.clear()
         self._personal_processing_depth.clear()
         self._personal_final_landed.clear()
+        self._nested_personal_reply.clear()
         for task in list(self._coalesced_status_tasks.values()):
             task.cancel()
         self._coalesced_status_tasks.clear()
@@ -4767,9 +4774,9 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             return SendResult(success=True, message_id="")
         # A nested follow-up runs before Hermes cancels the outer
-        # consumer. Do not close or rewrite that 1:1 stream. Deliver
-        # this text as its own plain reply and tombstone the id so the
-        # REQUIRES_EDIT_FINALIZE edit cannot open a stream on it.
+        # consumer. Do not close or rewrite that 1:1 stream. Hold
+        # previews and post one plain reply when the follow-up final
+        # arrives. Tombstone only after that text has been sent.
         if (
             chat_type == "personal"
             and chat_id in self._active_stream_by_chat
@@ -4779,16 +4786,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 or self._metadata_requests_stream_final(metadata)
             )
         ):
-            nested = await self._send_reply_activity(
-                inbound=inbound,
+            return await self._accept_nested_personal_send(
+                chat_id=str(chat_id),
                 content=content,
-                log_context="send",
-                citations=(metadata or {}).get("citations"),
+                metadata=metadata,
+                inbound=inbound,
                 validated_path=turn_validated_path,
             )
-            if nested.success and nested.message_id:
-                self._record_recently_finalized(nested.message_id, chat_id)
-            return nested
         if (
             chat_type == "personal"
             and chat_id in self._active_stream_by_chat
@@ -5019,10 +5023,11 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id, inbound, activity_id=activity_id
                 )
             elif inbound and chat_type == "personal":
-                # A fresh outer turn may stream again. A nested start
-                # must not clear a final that already landed.
-                if self._personal_processing_depth.get(chat_id, 0) <= 0:
-                    self._personal_final_landed.discard(chat_id)
+                # A fresh outer turn and a nested follow-up both may
+                # send. The already-completed guard is only for a
+                # duplicate final that arrives before the next start.
+                self._personal_final_landed.discard(chat_id)
+                self._nested_personal_reply.pop(chat_id, None)
                 self._personal_processing_depth[chat_id] = (
                     self._personal_processing_depth.get(chat_id, 0) + 1
                 )
@@ -9502,6 +9507,113 @@ class Agent365Adapter(BasePlatformAdapter):
             generation, client
         ) and self._chat_lifecycle_is_current(chat_id, chat_generation)
 
+    def _nested_personal_hold(self, chat_id: str) -> dict[str, Any]:
+        """Return the buffered follow-up for this chat, creating it."""
+        key = str(chat_id)
+        hold = self._nested_personal_reply.get(key)
+        if hold is None:
+            self._nested_personal_seq += 1
+            hold = {
+                "id": f"nestedbuf:{self._nested_personal_seq}",
+                "text": "",
+                "posted": False,
+            }
+            self._nested_personal_reply[key] = hold
+        return hold
+
+    async def _accept_nested_personal_send(
+        self,
+        *,
+        chat_id: str,
+        content: str,
+        metadata: dict[str, Any] | None,
+        inbound: dict[str, Any],
+        validated_path: str | None,
+    ) -> SendResult:
+        """Hold a nested preview. Post one plain reply on the final.
+
+        The outer 1:1 stream stays open. Tombstone the ids only after
+        that final text has been sent, so a later edit is not stuck on
+        the preview.
+        """
+        hold = self._nested_personal_hold(chat_id)
+        hold["text"] = _strip_streaming_cursor(content)
+        if not self._metadata_requests_stream_final(metadata):
+            return SendResult(success=True, message_id=str(hold["id"]))
+        return await self._flush_nested_personal_reply(
+            chat_id,
+            hold,
+            inbound=inbound,
+            validated_path=validated_path,
+            citations=(metadata or {}).get("citations"),
+        )
+
+    async def _edit_nested_personal_reply(
+        self,
+        chat_id: str,
+        message_id: str,
+        content: str,
+        *,
+        finalize: bool,
+    ) -> SendResult:
+        """Update the held follow-up. Finalize posts it once."""
+        hold = self._nested_personal_reply.get(str(chat_id))
+        if (
+            hold is None
+            or str(hold.get("id") or "") != str(message_id)
+            or hold.get("posted")
+        ):
+            return SendResult(success=True, message_id=str(message_id))
+        hold["text"] = _strip_streaming_cursor(content)
+        if not finalize:
+            return SendResult(success=True, message_id=str(hold["id"]))
+        inbound = self._cached_inbound_for(chat_id)
+        if not isinstance(inbound, dict):
+            return SendResult(
+                success=False,
+                error=(
+                    "agent365 edit_message: no cached inbound for "
+                    f"chat_id={chat_id!r}"
+                ),
+            )
+        return await self._flush_nested_personal_reply(
+            chat_id,
+            hold,
+            inbound=inbound,
+            validated_path=self._validated_path_for(chat_id),
+        )
+
+    async def _flush_nested_personal_reply(
+        self,
+        chat_id: str,
+        hold: dict[str, Any],
+        *,
+        inbound: dict[str, Any],
+        validated_path: str | None,
+        citations: Any = None,
+    ) -> SendResult:
+        """Post the held follow-up once, then tombstone its ids."""
+        message_id = str(hold.get("id") or "")
+        if hold.get("posted"):
+            return SendResult(success=True, message_id=message_id)
+        text = hold.get("text") if isinstance(hold.get("text"), str) else ""
+        if not text:
+            text = " "
+        result = await self._send_reply_activity(
+            inbound=inbound,
+            content=text,
+            log_context="send",
+            citations=citations,
+            validated_path=validated_path,
+        )
+        if not result.success:
+            return result
+        hold["posted"] = True
+        self._record_recently_finalized(message_id, chat_id)
+        if result.message_id:
+            self._record_recently_finalized(result.message_id, chat_id)
+        return SendResult(success=True, message_id=message_id)
+
     def _personal_outer_turn_still_open(self, chat_id: str) -> bool:
         """True while a nested personal turn is inside an outer one.
 
@@ -9645,6 +9757,11 @@ class Agent365Adapter(BasePlatformAdapter):
         if str(message_id).startswith("turnbuf:"):
             self._conversations.mark_used(chat_id)
             return self._replace_turn_buffer_segment(chat_id, message_id, content)
+        if str(message_id).startswith("nestedbuf:"):
+            self._conversations.mark_used(chat_id)
+            return await self._edit_nested_personal_reply(
+                str(chat_id), str(message_id), content, finalize=finalize
+            )
 
         # Slice 19x-d (#4): streaming edits are clear outbound traffic;
         # mark the conversation as recently used so prune respects it.
@@ -10899,6 +11016,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._recently_finalized.pop(key, None)
         self._personal_processing_depth.pop(chat_id, None)
         self._personal_final_landed.discard(chat_id)
+        self._nested_personal_reply.pop(chat_id, None)
         for consent_id, pending in list(self._pending_file_uploads.items()):
             if str(pending.get("conversation_id") or "") == chat_id:
                 self._pending_file_uploads.pop(consent_id, None)

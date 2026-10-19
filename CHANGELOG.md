@@ -45,8 +45,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   `bf_error_body`. Transient failures on an already-open stream (transport
   errors, 429, and 500/502/503/504) are retried. A 403 still drops the
   stream, except a retried final whose message says the stream is already
-  completed: that edit is success, and a later final send does not open
-  another bubble. User cancel stays a failure. Any other intermediate
+  completed: that edit is success, and a duplicate final send before the
+  next personal start does not open another bubble. A nested follow-up
+  start clears that guard so the follow-up's own short final is posted.
+  User cancel stays a failure. Any other intermediate
   failure keeps the stream so a later final can close the bubble. A failed
   opening edit does not keep an id-less entry; a later 201 is captured and
   a finalize posts `streamType=final`. Personal chats do not fall over to
@@ -57,7 +59,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   reply is delivered, the returned id is tombstoned so the follow-up
   finalize does not open a second stream. A personal stream still open at
   the outer turn end is closed the same way. A nested follow-up complete
-  does not close the outer 1:1 stream. `content_delivered` is not used as
+  does not close the outer 1:1 stream. While that outer stream is open,
+  nested previews are held and one plain reply is posted for the
+  follow-up final, so a later edit is not stuck on the first chunk.
+  `content_delivered` is not used as
   a success signal. A live failure-rate walk is still required before
   calling streaming reliable.
 
