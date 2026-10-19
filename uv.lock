@@ -216,7 +216,7 @@ wheels = [
 
 [[package]]
 name = "hermes-a365"
-version = "0.9.0"
+version = "0.9.1"
 source = { editable = "." }
 dependencies = [
     { name = "jinja2" },

@@ -4,7 +4,15 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased / 0.9.1]
+## [0.9.1] — 2026-10-19
+
+Operator walk + release integrity (#124). §1–§3 walked green on
+`main@24126496` (2026-10-19): Path A blueprint + Path B Azure Bot Service,
+three CEA manifest generations (auto patch-bump #109), MAC upload and
+"Update in store" updates, Teams + Copilot Chat smoke replies; §5 teardown
+complete. Ships merged work from #98, #109, #117, #127, #155, #158, #159,
+#160 and related PRs (#149–#170). Tag / PyPI / GitHub Release remain for a
+human after merge.
 
 ### Added
 
@@ -20,6 +28,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   spells out the MCP vs bot permission-marker resume rules, unowned-app
   abort, and the conflict-resolution table matches marker-based no-op
   (not "grants already exist").
+- **Docs: #124 operator walk runbook updates.** `references/live-tenant-test.md`
+  and `README.md` now document copying the blueprint client secret into
+  profile `.env` (or keychain) immediately after `a365 setup blueprint`
+  before `setup permissions` (D24); `gateway.standalone: true` when Hermes
+  Agent refuses a per-profile `hermes gateway run` (D28); MAC **Update in
+  store** for same-agent package updates (D34/D36); first-contact Teams
+  home-channel notice (D32); CEA zip path `<cwd>/manifest/manifest.zip`
+  (D25); manifestVersion **1.27** and Path-B publish examples without
+  `--manifest-id auto` (D8/D9); `--app-version` when MAC already holds an
+  equal or higher version (`manifest-schema-currency.md`, D7).
 
 ### Breaking
 
