@@ -56,8 +56,8 @@ app when no separate Bot Framework app is set). MCP tool tokens are
 unwired. Delegated user sign-in (OAuth cards / Teams SSO token
 exchange / chained OBO) is deferred pending operator demand. If you
 need per-user delegated data access on Copilot surfaces today, that
-is outside this package. See the deferred tracking issue:
-[Deferred: user-delegated OBO on Path B](TODO(tracking-issue)).
+is outside this package. See the deferred tracking issue
+([#174](../../issues/174)).
 
 See [`references/m365-surface-coverage.md`](references/m365-surface-coverage.md)
 for the full surface-by-surface matrix and the architectural
@@ -171,8 +171,8 @@ proactive long-running reply pattern. Outstanding gaps:
   platform limitation, not a wrapper bug.
 - **Pluggable secrets / activity-bridge library split / Work IQ V2
   amplifiers / user-delegated OBO on Path B** — tracked as deferred
-  (#19, #20, #21, and the deferred tracking issue
-  [Deferred: user-delegated OBO on Path B](TODO(tracking-issue)));
+  ([#19](../../issues/19), [#20](../../issues/20),
+  [#21](../../issues/21), [#174](../../issues/174));
   architecturally sound, picked up when concrete operator demand
   surfaces. User-delegated OBO is out of scope for 1.0 (#88).
 
@@ -821,7 +821,7 @@ invoke activities ([#18](../../issues/18)), the v0.7.3 / v0.7.4 polish
 [#65](../../issues/65) / [#53](../../issues/53)), and the
 deferred-pending-demand set ([#19](../../issues/19) /
 [#20](../../issues/20) / [#21](../../issues/21) /
-[Deferred: user-delegated OBO on Path B](TODO(tracking-issue))).
+[#174](../../issues/174)).
 
 **Active feature work:**
 
@@ -871,15 +871,14 @@ explicit triggers that would re-prioritise it.
   search-shaped invokes dominate (>40%) and the LLM-loop fallback
   cost justifies the build. Sibling of #18; depends on #18
   foundation slices (19w-a + 19w-b).
-- **[Deferred: user-delegated OBO on Path B](TODO(tracking-issue))** —
-  user-delegated On-Behalf-Of on Copilot Chat (downstream Graph/MCP
-  calls as the signed-in user via Bot OAuth, OAuth cards, Teams SSO
-  token exchange, or chained OBO). Same surfaces as Path B; differs
-  only in token subject. Decision in
+- **[#174](../../issues/174)** — User-delegated OBO on Path B.
+  Downstream Graph/MCP calls on Copilot Chat as the signed-in user
+  (Bot OAuth, OAuth cards, Teams SSO token exchange, or chained OBO).
+  Same surfaces as Path B; differs only in token subject. Decision in
   [#88](../../issues/88) (this docs change does not close it): out of
-  scope for 1.0. See the deferred tracking issue. Path A acts as the
-  agent's own agentic user; Path B messaging is Bot Service S2S, and
-  a Path B Graph token is an app-only token of the Path B app.
+  scope for 1.0. Path A acts as the agent's own agentic user; Path B
+  messaging is Bot Service S2S, and a Path B Graph token is an
+  app-only token of the Path B app.
 
 **Recent closures:**
 
