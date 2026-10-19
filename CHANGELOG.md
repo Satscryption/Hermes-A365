@@ -6,12 +6,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [0.9.1] — 2026-10-19
 
-Operator walk + release integrity (#124). §1–§3 walked green on
+Operator walk and release integrity (#124). The §1–§3 walk passed on
 `main@24126496` (2026-10-19): Path A blueprint + Path B Azure Bot Service,
 three CEA manifest generations (auto patch-bump #109), MAC upload and
 "Update in store" updates, Teams + Copilot Chat smoke replies; §5 teardown
 complete. Ships merged work from #98, #109, #117, #127, #155, #158, #159,
-#160 and related PRs (#149–#170). Tag / PyPI / GitHub Release remain for a
+#160 and related PRs (#168, #170). Tag / PyPI / GitHub Release remain for a
 human after merge.
 
 ### Added
@@ -214,7 +214,7 @@ down afterwards).
 ### Known follow-ups (not blocking)
 
 - #155: keep Copilot Chat alive for buffered turns longer than ~45s.
-- #158: fixed in 0.9.1 (see [Unreleased / 0.9.1]).
+- #158: fixed in 0.9.1 (see [0.9.1] above).
 - #159: the orphan-cleanup Graph ownership check also refused the real
   owner (fixed in 0.9.1).
 - #160: the bridge allowlist was read only from the per-agent env (fixed in 0.9.1).

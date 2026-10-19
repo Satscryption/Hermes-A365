@@ -267,9 +267,11 @@ GA CLI builds, `a365 setup permissions mcp` rewrites
 that `setup blueprint` wrote moments earlier (same family as publish
 clobbering the secret — Microsoft#408). The CLI also prints the new
 secret to stdout only once. Immediately after a successful
-`setup blueprint`, copy the value into `A365_BLUEPRINT_CLIENT_SECRET` in
-`~/.hermes/.env` (or store it in the OS keychain per README) **before**
-running `setup permissions mcp` / `bot`. Recovery without a saved copy
+`setup blueprint`, copy the value into `A365_BLUEPRINT_CLIENT_SECRET` in the
+**profile** `~/.hermes/.env` (required for the gateway plugin) **before**
+running `setup permissions mcp` / `bot`. For `activity-bridge serve` only,
+you may instead move the secret into the OS keychain per README — the
+gateway still needs the profile `.env` export. Recovery without a saved copy
 is `az ad app credential reset --append` on the blueprint app.
 
 Failure modes to watch:
@@ -849,11 +851,14 @@ hermes gateway run
 When running a **named profile** (`hermes gateway run --profile <slug>`),
 current Hermes Agent builds may refuse with "Profile does not get a gateway
 of its own" (one gateway per host). Set `gateway.standalone: true` in that
-profile's `config.yaml` (under `~/.hermes/` or the profile's Hermes home)
-as a temporary shim so the gateway binds for that profile (#124 D28). The
-multiplexed host gateway in the default profile serving the agent365
-profile is the long-term model; standalone also runs the cron scheduler for
-the `default` profile.
+**named profile's** `~/.hermes/profiles/<slug>/config.yaml` — Hermes does
+not read `gateway.standalone` from the default profile's
+`~/.hermes/config.yaml` when `--profile <slug>` is set (#124 D28). Use this
+as a temporary shim so the gateway binds for that profile. The multiplexed
+host gateway in the default profile serving the agent365 profile is the
+long-term model; while a standalone profile gateway is up it runs **that
+profile's** cron scheduler only — the default profile's scheduler stays with
+the host gateway when one is running there.
 
 The gateway should:
 

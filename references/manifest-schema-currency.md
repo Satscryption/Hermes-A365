@@ -97,7 +97,7 @@ sites and no cross-module consumers:
 - `publish.py` — the apply-summary `"manifest_version"` line (operator-facing only)
 
 So the constant is fully internal; moving it is a localized edit guarded by
-the existing tests (`test_bumps_manifest_version_to_1_21` and the
+the existing tests (`test_bumps_manifest_version_to_1_27` and the
 integration assertions that pin `manifestVersion == "1.27"`).
 
 ## Is `1.21` still accepted?

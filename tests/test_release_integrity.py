@@ -328,9 +328,10 @@ def test_live_0_9_1_section_still_parses() -> None:
     notes = mod.evaluate(_ROOT, "refs/tags/v0.9.1")
 
     assert notes.version == "0.9.1"
-    assert notes.title.startswith(
-        "v0.9.1 \u2014 Operator walk + release integrity (#124)."
+    assert notes.title == (
+        "v0.9.1 \u2014 Operator walk and release integrity (#124)."
     )
+    assert len(notes.title) <= mod.TITLE_LIMIT
     assert "main@24126496" in notes.body
 
 

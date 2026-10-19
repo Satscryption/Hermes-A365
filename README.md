@@ -206,9 +206,13 @@ this skill handles.** Where it lives + how to keep it that way:
   a fresh secret in-place. Use the flag whenever you're not on Windows.
 - **`setup permissions` clobbers the blueprint secret (D24).** After
   `a365 setup blueprint`, copy `agentBlueprintClientSecret` into
-  `A365_BLUEPRINT_CLIENT_SECRET` in `~/.hermes/.env` (or keychain) **before**
-  `setup permissions mcp` / `bot` — those steps rewrite
+  `A365_BLUEPRINT_CLIENT_SECRET` in the profile `~/.hermes/.env` **before**
+  `setup permissions mcp` / `bot` — the **gateway plugin** resolves Path A
+  from that file (not from keychain alone). Those permission steps rewrite
   `a365.generated.config.json` and drop the field the blueprint step wrote.
+  Keychain storage is an alternative for **`activity-bridge serve`** via the
+  secrets provider; it does not replace the profile `.env` for `hermes gateway
+  run`.
 
 ### Secrets at rest
 
