@@ -54,6 +54,9 @@ class _StubMessageEvent:
     timestamp: Any = None
     media_urls: list = field(default_factory=list)
     media_types: list = field(default_factory=list)
+    # #82 — Hermes pin contract. Defaults keep older positional constructors.
+    internal: bool = False
+    metadata: dict = field(default_factory=dict)
 
 
 class _StubPlatform:
@@ -16328,6 +16331,525 @@ class TestHandoff:
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         content = "x" * a.MAX_MESSAGE_LENGTH
         assert a._maybe_append_handoff_link("conv-cc-full", content) == content
+
+
+_HANDOFF_TENANT = "11111111-1111-1111-1111-111111111111"
+_HANDOFF_USER = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+_HANDOFF_OTHER_USER = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff"
+_HANDOFF_OTHER_TENANT = "22222222-2222-2222-2222-222222222222"
+
+
+class _FakeOriginDb:
+    """Just enough SessionDB for #82. ``switch_session`` / ``reopen_session``
+    raise so a pin cannot resurrect a row by calling them."""
+
+    def __init__(self, rows: dict[str, dict[str, Any]]) -> None:
+        self.rows = rows
+
+    def find_session_by_origin(
+        self,
+        *,
+        platform: str,
+        chat_id: str,
+        thread_id: str | None = None,
+        user_id: str | None = None,
+    ) -> str | None:
+        del thread_id
+        matches = [
+            row
+            for row in self.rows.values()
+            if str(row.get("source") or "").lower() == str(platform).lower()
+            and row.get("chat_id") == chat_id
+            and row.get("ended_at") is None
+            and row.get("session_key")
+        ]
+        if user_id:
+            exact = [row for row in matches if str(row.get("user_id") or "") == user_id]
+            if exact:
+                return str(exact[0]["id"])
+            if len(matches) > 1:
+                return None
+        elif len({str(row.get("user_id") or "") for row in matches if row.get("user_id")}) > 1:
+            return None
+        return str(matches[0]["id"]) if len(matches) == 1 else None
+
+    def get_session(self, session_id: str) -> dict[str, Any] | None:
+        return self.rows.get(session_id)
+
+    def switch_session(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("handoff must not call switch_session")
+
+    def reopen_session(self, *_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("handoff must not call reopen_session")
+
+
+def _live_origin_row(
+    *,
+    session_id: str = "sess-cc",
+    chat_id: str = "conv-cc",
+    user_id: str = _HANDOFF_USER,
+    ended_at: Any = None,
+    end_reason: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "id": session_id,
+        "source": "agent365",
+        "chat_id": chat_id,
+        "user_id": user_id,
+        "session_key": f"agent:main:agent365:group:{chat_id}:{user_id}",
+        "ended_at": ended_at,
+        "end_reason": end_reason,
+    }
+
+
+def _bind_origin_db(adapter: Any, db: _FakeOriginDb) -> None:
+    adapter._handoff_session_db_opener = lambda: db
+
+
+def _seed_copilot_origin(adapter: Any, conv_id: str = "conv-cc") -> None:
+    inbound = _make_inbound(conv_id=conv_id)
+    inbound["conversation"]["conversationType"] = "groupChat"
+    inbound["from"]["aadObjectId"] = _HANDOFF_USER
+    adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+
+
+def _handoff_ctx(
+    token: str,
+    *,
+    user: str = _HANDOFF_USER,
+    tenant: str = _HANDOFF_TENANT,
+    conv: str = "conv-teams",
+    claims_user: str | None = None,
+    claims_tenant: str | None = None,
+) -> Any:
+    return adapter_mod.invoke.build_invoke_context(
+        {
+            "type": "invoke",
+            "name": "handoff/action",
+            "id": "inv-1",
+            "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
+            "value": {"continuation": token},
+            "conversation": {
+                "id": conv,
+                "conversationType": "personal",
+                "tenantId": tenant,
+            },
+            "from": {"id": "29:user", "name": "Sadiq", "aadObjectId": user},
+        },
+        claims={
+            "oid": _HANDOFF_USER if claims_user is None else claims_user,
+            "tid": _HANDOFF_TENANT if claims_tenant is None else claims_tenant,
+        },
+        path_tag="B",
+    )
+
+
+async def _settle_handoff(adapter: Any) -> None:
+    tasks = list(adapter._handoff_dispatch_tasks)
+    if tasks:
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
+class TestHandoffSessionPin:
+    """#82 — resolve, pin, consume, and fail closed. No live Teams round trip."""
+
+    def _ready(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        row: dict[str, Any] | None = None,
+    ) -> Any:
+        adapter = _make_adapter(monkeypatch)
+        _seed_copilot_origin(adapter)
+        rows = {}
+        if row is not None:
+            rows[str(row["id"])] = row
+        _bind_origin_db(adapter, _FakeOriginDb(rows))
+        return adapter
+
+    def test_mint_stores_live_origin_session(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        record = adapter._handoff_tokens[token]
+        assert record["hermes_session_id"] == "sess-cc"
+        assert record["user_aad"] == _HANDOFF_USER
+        assert record["tenant_id"] == _HANDOFF_TENANT
+        assert record["conversation_id"] == "conv-cc"
+
+    def test_mint_without_live_session_stores_no_pin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = self._ready(monkeypatch, None)
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        assert adapter._handoff_tokens[token]["hermes_session_id"] == ""
+
+    def test_mint_refuses_other_users_only_row(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        # find_session_by_origin returns the sole live row even when the
+        # user id does not match. The adapter must not store that id.
+        adapter = self._ready(monkeypatch, _live_origin_row(user_id=_HANDOFF_OTHER_USER))
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        assert adapter._handoff_tokens[token]["hermes_session_id"] == ""
+
+    @pytest.mark.asyncio
+    async def test_validated_handoff_pins_after_ack(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        # The invoke ack returns before the agent turn is dispatched.
+        assert adapter._handled_events == []
+        await _settle_handoff(adapter)
+        assert len(adapter._handled_events) == 1
+        event = adapter._handled_events[0]
+        assert event.internal is True
+        assert event.metadata["gateway_session_id"] == "sess-cc"
+        assert event.source.chat_id == "conv-teams"
+        assert event.source.chat_type == "dm"
+        assert event.source.user_id == _HANDOFF_USER
+        assert event.message_id != "inv-1"
+        assert (event.raw_message or {}).get("id") != "inv-1"
+        assert "conv-teams" in adapter._conversations
+        assert "conv-teams" not in adapter._seen_inbounds_this_lifetime
+        stored = adapter._conversations.get("conv-teams")
+        assert stored.last_inbound_activity_id != "inv-1"
+        # One-time: a replay acks and does not pin again.
+        again = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert again.status == 200
+        await _settle_handoff(adapter)
+        assert len(adapter._handled_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_identity_mismatch_does_not_pin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        response = await adapter._handle_handoff_action(
+            _handoff_ctx(token, user=_HANDOFF_OTHER_USER, claims_user=_HANDOFF_OTHER_USER)
+        )
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+
+    @pytest.mark.asyncio
+    async def test_cross_tenant_does_not_pin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        response = await adapter._handle_handoff_action(
+            _handoff_ctx(
+                token,
+                tenant=_HANDOFF_OTHER_TENANT,
+                claims_tenant=_HANDOFF_OTHER_TENANT,
+            )
+        )
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+
+    @pytest.mark.asyncio
+    async def test_ended_session_is_not_resurrected(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        row = _live_origin_row()
+        adapter = self._ready(monkeypatch, row)
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        assert adapter._handoff_tokens[token]["hermes_session_id"] == "sess-cc"
+        # The user ended the Copilot session after the link was minted.
+        # The finder still returns that id (a stale origin index). get_session
+        # shows the end, and the adapter must not pin it — switch_session
+        # would reopen the row.
+        row["ended_at"] = time.time()
+        row["end_reason"] = "session_reset"
+
+        class _StaleFinder(_FakeOriginDb):
+            def find_session_by_origin(
+                self,
+                *,
+                platform: str,
+                chat_id: str,
+                thread_id: str | None = None,
+                user_id: str | None = None,
+            ) -> str | None:
+                del platform, thread_id
+                ended = self.rows.get("sess-cc")
+                if (
+                    ended
+                    and ended.get("chat_id") == chat_id
+                    and str(ended.get("user_id") or "") == user_id
+                ):
+                    return "sess-cc"
+                return None
+
+        rows = adapter._handoff_session_db_opener().rows
+        adapter._handoff_session_db_opener = lambda: _StaleFinder(rows)
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+
+    @pytest.mark.asyncio
+    async def test_explicit_end_reason_without_timestamp_refuses(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        row = _live_origin_row(end_reason="user_exit")
+        adapter = self._ready(monkeypatch, row)
+        # Mint-time lookup already refuses an explicit end reason, so plant
+        # the token as if the row was live and then marked ended.
+        adapter._handoff_tokens["tok-ended"] = {
+            "conversation_id": "conv-cc",
+            "chat_type": "groupChat",
+            "tenant_id": _HANDOFF_TENANT,
+            "user_aad": _HANDOFF_USER,
+            "hermes_session_id": "sess-cc",
+            "reason": "test",
+            "minted_at": time.time(),
+        }
+        response = await adapter._handle_handoff_action(_handoff_ctx("tok-ended"))
+        assert response.status == 200
+        assert "tok-ended" not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+
+    @pytest.mark.asyncio
+    async def test_missing_session_at_consume_does_not_pin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        row = _live_origin_row()
+        adapter = self._ready(monkeypatch, row)
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        row.clear()
+        # Drop the id so get_session misses. find also misses.
+        adapter._handoff_session_db_opener = lambda: _FakeOriginDb({})
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+
+    @pytest.mark.asyncio
+    async def test_expired_token_does_not_pin(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        adapter._handoff_tokens[token]["minted_at"] = (
+            time.time() - adapter_mod._HANDOFF_TOKEN_TTL_SEC - 1
+        )
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+
+    @pytest.mark.asyncio
+    async def test_dispatch_failure_acks_and_consumes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        calls = {"n": 0}
+
+        async def boom(_event: Any) -> None:
+            calls["n"] += 1
+            raise RuntimeError("dispatch failed")
+
+        adapter.handle_message = boom
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        assert calls["n"] == 0
+        await _settle_handoff(adapter)
+        assert calls["n"] == 1
+        # Consumed: a second click cannot retry the pin.
+        again = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert again.status == 200
+        await _settle_handoff(adapter)
+        assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_first_send_after_pin_does_not_reply_to_invoke(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "B"))
+        )
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        mock_resp = MagicMock()
+        mock_resp.status_code = 201
+        mock_resp.json = MagicMock(return_value={"id": "bot-1"})
+        adapter._http_client = MagicMock()
+        adapter._http_client.post = AsyncMock(return_value=mock_resp)
+        adapter._bridge_cfg = MagicMock()
+        adapter._fmi_cache = MagicMock()
+        adapter._user_cache = MagicMock()
+
+        async def handle_message(event: Any) -> None:
+            adapter._handled_events.append(event)
+            adapter._pin_send = await adapter.send(
+                event.source.chat_id,
+                "continued in Teams",
+                reply_to=event.message_id,
+            )
+
+        adapter.handle_message = handle_message
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        await _settle_handoff(adapter)
+        result = adapter._pin_send
+        assert result.success is True
+        assert send_reply.await_count == 0
+        body = adapter._http_client.post.await_args.kwargs["json"]
+        assert body["type"] == "message"
+        assert "replyToId" not in body
+        assert body.get("replyToId") != "inv-1"
+
+    @pytest.mark.asyncio
+    async def test_first_send_after_pin_replies_to_cached_user_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        inbound = _make_inbound(conv_id="conv-teams", activity_id="user-act")
+        inbound["from"]["aadObjectId"] = _HANDOFF_USER
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        ref.validated_path = "B"
+        adapter._conversations.upsert(ref)
+        adapter._seen_inbounds_this_lifetime.add("conv-teams")
+        adapter._capture_coalesced_turn_target(ref)
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        bridge = adapter_mod._import_bridge()
+        response = MagicMock()
+        response.json.return_value = {"id": "bot-reply-1"}
+        send_reply = AsyncMock(return_value=response)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(adapter, "_send_stream_start", AsyncMock(return_value=None))
+        adapter._http_client = MagicMock()
+        adapter._bridge_cfg = MagicMock()
+        adapter._fmi_cache = MagicMock()
+        adapter._user_cache = MagicMock()
+
+        async def handle_message(event: Any) -> None:
+            adapter._handled_events.append(event)
+            adapter._pin_send = await adapter.send(
+                event.source.chat_id,
+                "continued in Teams",
+                reply_to=event.message_id,
+            )
+
+        adapter.handle_message = handle_message
+        ack = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert ack.status == 200
+        await _settle_handoff(adapter)
+        event = adapter._handled_events[0]
+        assert event.message_id == "user-act"
+        assert event.source.message_id == "user-act"
+        assert adapter._pin_send.success is True
+        reply = send_reply.await_args.kwargs["reply"]
+        assert reply["replyToId"] == "user-act"
+        assert reply["replyToId"] != "inv-1"
+        stored = adapter._conversations.get("conv-teams")
+        assert stored.last_inbound_activity_id == "user-act"
+
+    @pytest.mark.asyncio
+    async def test_pin_turn_is_registered_and_cancelled_on_uninstall(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.2)
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        started = asyncio.Event()
+        release = asyncio.Event()
+        observed: dict[str, Any] = {}
+
+        async def session_body() -> None:
+            observed["current_while_running"] = adapter._agent_turn_lifecycle_is_current()
+            started.set()
+            await release.wait()
+
+        async def handle_message(event: Any) -> None:
+            adapter._handled_events.append(event)
+            sk = adapter._session_key_for(event)
+            observed["session_key"] = sk
+            observed["mapped"] = adapter._session_key_to_conv.get(sk)
+            observed["admitted"] = sk in adapter._agent_turn_admissions
+            observed["guard"] = sk in adapter._agent_turn_guards
+            token_value = adapter_mod._AGENT_TURN_LIFECYCLE.get()
+            observed["token_chat"] = token_value[1] if token_value else None
+            observed["token_current"] = adapter._agent_turn_lifecycle_is_current()
+            task = asyncio.create_task(session_body())
+            adapter._session_tasks[sk] = task
+            adapter._active_sessions[sk] = asyncio.Event()
+
+        adapter.handle_message = handle_message
+        try:
+            response = await adapter._handle_handoff_action(_handoff_ctx(token))
+            assert response.status == 200
+            await _settle_handoff(adapter)
+            await asyncio.wait_for(started.wait(), timeout=1)
+            sk = observed["session_key"]
+            assert sk == "agent:main:agent365:dm:conv-teams"
+            assert observed["mapped"] == "conv-teams"
+            assert observed["admitted"] is True
+            assert observed["guard"] is True
+            assert observed["token_chat"] == "conv-teams"
+            assert observed["token_current"] is True
+            assert observed["current_while_running"] is True
+            task = adapter._session_tasks[sk]
+            assert getattr(task, "_agent365_chat_id", None) == "conv-teams"
+            await adapter._evict_conversations(["conv-teams"])
+            assert task.cancelled()
+            assert sk not in adapter._session_key_to_conv
+        finally:
+            release.set()
+            pending = [
+                task
+                for task in adapter._session_tasks.values()
+                if isinstance(task, asyncio.Task) and not task.done()
+            ]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_pin_skipped_when_admission_full(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_ACTIVE_AGENT_TURNS", 0)
+        adapter = self._ready(monkeypatch, _live_origin_row())
+        link = adapter._mint_handoff_link("conv-cc", reason="test")
+        assert link is not None
+        token = link.split("continuation=")[1]
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+        assert adapter._session_key_to_conv == {}
 
 
 # ---------------------------------------------------------------------------
