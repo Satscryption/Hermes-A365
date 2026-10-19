@@ -120,6 +120,7 @@ from ._common import (
 from ._common import (
     quote_path_segment as _quote_path_segment_common,
 )
+from .invoke import empty_invoke_ack
 
 # #19: secrets-at-rest provider. Fills a MISS only — the plaintext
 # generated-config / per-agent .env values still win.
@@ -3258,6 +3259,12 @@ async def send_reply(
     return response
 
 
+def _empty_invoke_ack_response() -> Any:
+    """Serialize ``empty_invoke_ack`` (#132): HTTP 200, JSON null body."""
+    ack = empty_invoke_ack()
+    return _JSONResponse(ack.body, status_code=ack.status)
+
+
 def _reply_failed_response(error: Exception) -> Any:
     if isinstance(error, ReplyPostError):
         logger.warning("reply POST failed: HTTP %s", error.status_code)
@@ -3437,7 +3444,7 @@ def make_app(
             # ack; the original turn already produced the real response. Per-name
             # response replay is 19w-g.
             if str(activity.get("type") or "") == "invoke":
-                return _JSONResponse(None, status_code=200)
+                return _empty_invoke_ack_response()
             return _JSONResponse({"status": "duplicate"})
 
         activity_type = activity.get("type", "message")
@@ -3491,17 +3498,13 @@ def make_app(
             # the body; for an invoke WITH ids it POSTs an unsolicited error
             # card into the chat and then returns the {"status": ...} wrapper
             # marker as the invokeResponse body — the exact shape the dedupe
-            # branch above exists to avoid. Degrade to the same benign empty
-            # 200 ack that dedupe branch already returns (#96) — serve's
-            # established shape for "no real invokeResponse to give". This is
-            # NOT the plugin's shape: adapter.py answers a failed invoke with
-            # 500 + {"error": ...} (and 200 + {} for a fileConsent crash), a
-            # cross-runtime divergence left as-is here rather than widened.
-            # (Pre-dates this branch; surfaced by the #105 review because the
-            # invoke exemption above makes this path load-bearing.)
+            # branch above exists to avoid. Degrade to the canonical empty
+            # ack (#132): HTTP 200 + JSON null, the same shape the dedupe
+            # branch returns and the plugin emits for a handler crash.
+            # Teams reads a 5xx as "unable to reach app" (#97).
             if activity_type == "invoke":
                 logger.warning("invoke webhook error: %s", type(e).__name__)
-                return _JSONResponse(None, status_code=200)
+                return _empty_invoke_ack_response()
             logger.warning("operator webhook error: %s", type(e).__name__)
             error_reply = render_reply_activity(
                 activity,
@@ -3532,6 +3535,15 @@ def make_app(
         # reach app"). The operator webhook still returns {status, body}; we
         # unwrap it here.
         if activity_type == "invoke":
+            # A non-object webhook body used to raise AttributeError on
+            # ``.get`` and become an unhandled HTTP 500. That is a handler
+            # failure, not an operator invokeResponse: same empty ack as a
+            # webhook error (#132).
+            if not isinstance(webhook_resp, dict):
+                logger.warning(
+                    "invoke handler error: %s", type(webhook_resp).__name__
+                )
+                return _empty_invoke_ack_response()
             invoke_response = webhook_resp.get("invokeResponse") or {
                 "status": 200,
                 "body": webhook_resp,
@@ -3539,14 +3551,13 @@ def make_app(
             # #97 — the operator webhook response is arbitrary operator-
             # controlled JSON, so both the invokeResponse envelope AND its status
             # must be coerced defensively: a non-dict envelope, or a status that
-            # is non-numeric / Infinity / NaN / wrong-type, must degrade to a 200
-            # empty ack — never an unhandled HTTP 500 that Microsoft reads as an
-            # outage. A non-dict envelope would raise AttributeError on .get(), so
-            # guard the shape first; int() on operator data can then still raise
-            # TypeError (wrong type), ValueError (bad string / NaN) or
-            # OverflowError (Infinity).
+            # is non-numeric / Infinity / NaN / wrong-type, must degrade to the
+            # canonical empty ack — never an unhandled HTTP 500 that Microsoft
+            # reads as an outage. int() on operator data can raise TypeError
+            # (wrong type), ValueError (bad string / NaN) or OverflowError
+            # (Infinity). A non-dict envelope has no body to keep (#132).
             if not isinstance(invoke_response, dict):
-                invoke_response = {}
+                return _empty_invoke_ack_response()
             try:
                 status_code = int(invoke_response.get("status", 200) or 200)
             except (TypeError, ValueError, OverflowError):

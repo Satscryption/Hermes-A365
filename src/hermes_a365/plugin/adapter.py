@@ -2088,8 +2088,9 @@ class Agent365Adapter(BasePlatformAdapter):
             # the {status:duplicate} marker (which is not a valid invokeResponse
             # body). Invokes never enter the agent loop, so bypassing the message
             # dedupe cannot double-fire it; when a side-effectful invoke name
-            # lands, 19w-g adds per-name response replay. A handler crash still
-            # returns a graceful {status:500} invokeResponse, not an HTTP 500.
+            # lands, 19w-g adds per-name response replay. A handler crash
+            # returns the canonical empty ack (HTTP 200 + JSON null, #132),
+            # never a 5xx — Teams reads the HTTP status as the invoke status.
             if str(activity.get("type") or "") == "invoke":
                 invoke_name = str(activity.get("name") or "")
                 # #76c — fileConsent/invoke is the user's Accept/Decline on an
@@ -2106,15 +2107,16 @@ class Agent365Adapter(BasePlatformAdapter):
                         )
                     except Exception as e:
                         logger.error("agent365 fileConsent handler crashed: %s", e)
-                        resp = invoke.InvokeResponse(status=200, body={})
+                        # No real invokeResponse. Same wire as serve (#132).
+                        resp = invoke.empty_invoke_ack()
                     logger.info(
                         "inbound invoke name=%s status=%s", invoke_name, resp.status
                     )
                     return JSONResponse(resp.body, status_code=resp.status)
                 # Context assembly (_inbound_path_tag / build_invoke_context) is
                 # inside the try too: a wire-shape surprise on the live walk must
-                # degrade to a graceful {status:500} invokeResponse, never an
-                # unhandled HTTP 500 that Microsoft reads as an outage.
+                # degrade to the canonical empty ack (#132), never an unhandled
+                # HTTP 500 that Microsoft reads as an outage.
                 try:
                     path_tag = bridge._inbound_path_tag(activity)
                     ctx = invoke.build_invoke_context(
@@ -2127,9 +2129,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     logger.error(
                         "agent365 invoke handler failed: name=%s %s", invoke_name, e
                     )
-                    resp = invoke.InvokeResponse(
-                        status=500, body={"error": "invoke handler error"}
-                    )
+                    resp = invoke.empty_invoke_ack()
                 logger.info(
                     "inbound invoke name=%s status=%s", invoke_name, resp.status
                 )
@@ -7646,14 +7646,17 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.info(
                 "agent365 fileConsent action=%s consent=%s", action, consent_id[:8]
             )
-            return invoke.InvokeResponse(status=200, body={})
+            # Benign ack: nothing to render. HTTP 200 + JSON null (#132).
+            return invoke.empty_invoke_ack()
         if pending is None:
             # Consent we don't know about — restart dropped the in-memory map, a
-            # replay, or a spoofed id. Ack without uploading.
+            # replay, or a spoofed id. Ack without uploading. A Bot Framework
+            # retry lands here after the pending entry was popped; the wire is
+            # the same empty ack serve returns for a deduped invoke (#132).
             logger.warning(
                 "agent365 fileConsent accept for unknown consent=%s", consent_id[:8]
             )
-            return invoke.InvokeResponse(status=200, body={})
+            return invoke.empty_invoke_ack()
 
         pending_chat_id = str(pending.get("conversation_id") or "")
         if (

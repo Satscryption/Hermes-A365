@@ -54,6 +54,19 @@ class InvokeResponse:
     body: dict[str, Any] | None = None
 
 
+def empty_invoke_ack() -> InvokeResponse:
+    """HTTP 200 with a JSON null body — the shared no-real-response ack (#132).
+
+    Teams reads the HTTP status as the invoke status and the body as the
+    invokeResponse body. A 5xx is "unable to reach app" (#97). When either
+    runtime has nothing real to return — a handler crash, a webhook error,
+    a deduped invoke, or a benign ack — both emit this shape. ``{}`` and
+    ``{"error": ...}`` are different wires and must not be used here. This
+    is the empty ack #96 established on serve.
+    """
+    return InvokeResponse(status=200, body=None)
+
+
 @dataclass(frozen=True)
 class InvokeContext:
     """Everything a per-name invoke handler needs, assembled once per turn."""
@@ -215,7 +228,7 @@ async def dispatch_invoke(
 ) -> InvokeResponse:
     """Dispatch an ``InvokeContext`` to its registered handler, else the 501
     default. Never raises for an unknown name; a *handler's* own exception is
-    the caller's concern (the route wraps it into a graceful envelope)."""
+    the caller's concern (the route answers with ``empty_invoke_ack``)."""
     reg = INVOKE_REGISTRY if registry is None else registry
     handler = reg.get(ctx.name, default_invoke_handler)
     return await handler(ctx)

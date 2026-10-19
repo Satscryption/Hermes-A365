@@ -100,6 +100,13 @@ human after merge.
 
 ### Fixed
 
+- **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
+  A handler crash, a file-consent crash, a deduped invoke, a decline, an
+  unknown file consent, and an operator-webhook error are HTTP 200 with a
+  JSON `null` body on both runtimes. Teams reads that status as the invoke
+  status, so these paths do not return a 5xx. The plugin no longer answers
+  a handler crash with `500` and `{"error": "invoke handler error"}`.
+
 - **`register` reads Entra before it provisions, and a re-run is idempotent.**
   The command GETs the blueprint (and the derived identity name) before any
   `a365` call. An agent-identity blueprint whose appId is the per-agent

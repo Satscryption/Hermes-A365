@@ -14274,11 +14274,11 @@ class TestInvokeRoute:
         # Never dispatched to the fire-and-forget agent loop either.
         assert a._handled_events == []
 
-    def test_handler_exception_returns_graceful_500(
+    def test_handler_exception_returns_empty_ack(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # A handler crash must degrade to a {status:500} invokeResponse, never
-        # an unhandled HTTP 500.
+        # A handler crash degrades to the canonical empty ack (#132): HTTP 200
+        # + JSON null, the same wire serve uses. Never a 5xx (#97).
         a, client = self._client(monkeypatch)
 
         async def boom(ctx: Any) -> Any:
@@ -14290,10 +14290,9 @@ class TestInvokeRoute:
             json=self._invoke_body(),
             headers={"Authorization": "Bearer a.b.c"},
         )
-        # Graceful degradation: a handler crash -> HTTP 500 with the error body,
-        # never an unhandled exception.
-        assert r.status_code == 500
-        assert r.json() == {"error": "invoke handler error"}
+        assert r.status_code == 200
+        assert r.content == b"null"
+        assert r.json() is None
         assert a._handled_events == []
 
     def test_claims_wired_into_invoke_context(
