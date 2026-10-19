@@ -38,6 +38,35 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   A live Teams reaction round trip was not run here; it remains for the
   #116 / #89 walks before this is treated as production-validated.
 
+### Fixed
+
+- **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
+  A personal edit that fails now logs `http_status`, `bf_error_code`, and
+  `bf_error_body`. Transient failures on an already-open stream (transport
+  errors, 429, and 500/502/503/504) are retried. A 403 still drops the
+  stream, except a retried final whose message says the stream is already
+  completed: that edit is success. The guard is that turn's reply
+  anchor, so a later final for the same anchor does not open another
+  bubble. A follow-up whose reply_to is a different activity still
+  posts, including when the 403 is accepted after the nested start.
+  User cancel stays a failure. Any other intermediate
+  failure keeps the stream so a later final can close the bubble. A failed
+  opening edit does not keep an id-less entry; a later 201 is captured and
+  a finalize posts `streamType=final`. Personal chats do not fall over to
+  the Copilot Chat coalesce buffer. A final personal send (`notify`, no
+  `expect_edits`) — the short/single-chunk shape — posts
+  `streamType=streaming` and then `streamType=final`, and success requires
+  the final activity to be accepted. If that open fails and the plain
+  reply is delivered, the returned id is tombstoned so the follow-up
+  finalize does not open a second stream. A personal stream still open at
+  the outer turn end is closed the same way. A nested follow-up complete
+  does not close the outer 1:1 stream. While that outer stream is open,
+  nested previews are held and one plain reply is posted for the
+  follow-up final, so a later edit is not stuck on the first chunk.
+  `content_delivered` is not used as
+  a success signal. A live failure-rate walk is still required before
+  calling streaming reliable.
+
 ## [0.9.2] — 2026-10-19
 
 Publish smoke installs hash-pinned packaging from the requirements file.

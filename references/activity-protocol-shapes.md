@@ -65,12 +65,35 @@ whether the conversation actually renders Bot Framework streaming:
   streaming. The bridge opens **one** streaming sequence per user turn —
   a `typing` activity plus `streamType=streaming` / `streamSequence`
   entities, finalized with `streamType=final` (`Agent365Adapter`'s
-  `REQUIRES_EDIT_FINALIZE` path). Fresh chunk message-ids continue that
-  one sequence instead of starting a second bubble; one-shot
-  progress/fallback sends and separate image activities are suppressed
-  mid-stream (#54). A **stale-stream liveness guard** force-drops a
-  sequence whose finalization repeatedly fails or that exceeds a bounded
-  age, so a stuck stream can't silence the chat (#62).
+  `REQUIRES_EDIT_FINALIZE` path). A short or single-chunk reply is a
+  final send (`notify`, no `expect_edits`): the bridge posts the
+  streaming open and then `streamType=final` on that `streamId` before
+  `send()` returns, and the send succeeds only when the final activity
+  is accepted. A final send that arrives while a stream is already open
+  closes that stream instead of starting another. If the stream is still
+  open when the turn ends, `on_processing_complete` posts the same
+  final. Fresh chunk message-ids continue that one sequence instead of
+  starting a second bubble; one-shot progress/fallback sends and
+  separate image activities are suppressed mid-stream (#54). A failed
+  edit logs `http_status`, `bf_error_code`, and `bf_error_body`.
+  Transient failures on an open stream (transport errors, 429, and
+  500/502/503/504) are retried. A non-terminal intermediate failure
+  keeps the stream so a later final can close it. A failed opening edit
+  drops the id-less entry so a later 201 can still be named and closed.
+  A failed stream open that already delivered the plain final reply does
+  not let the follow-up finalize open a second stream. A nested
+  follow-up complete does not close the outer personal stream; the outer
+  complete does. Nested previews while that stream is open are held, and
+  one plain reply is posted for the follow-up final. A 403 drops the
+  stream. A retried final that receives 403 "already completed" is
+  success for that reply anchor, so a later final for the same anchor
+  does not open another bubble. A follow-up whose reply_to is a different
+  activity still posts, including when the 403 is accepted after the
+  nested start. User cancel stays a failure. Personal chats do not use
+  the non-personal coalesce buffer. A **stale-stream liveness guard**
+  force-drops a sequence whose
+  finalization repeatedly fails or that exceeds a bounded age, so a
+  stuck stream can't silence the chat (#62, #83, #161).
 
 - **Copilot Chat and other non-`personal` turns** do **not** render BF
   streaming (see the quirks row above): Bot Framework returns 2xx and
