@@ -8978,8 +8978,11 @@ class TestEditMessage:
     ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-P-buf", activity_id="act-1")
-        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-personal"})
-        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=first)
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-personal"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
         bridge = adapter_mod._import_bridge()
@@ -9005,10 +9008,20 @@ class TestEditMessage:
         assert post_mock.await_count == 1
         assert send_reply_mock.await_count == 0
 
+        # Still not a coalesced turn buffer. Turn end closes the personal
+        # stream with streamType=final instead of a second send_reply (#161).
         await a.on_processing_complete(event, outcome="success")
-        assert post_mock.await_count == 1
+        assert post_mock.await_count == 2
         assert send_reply_mock.await_count == 0
         assert "conv-P-buf" not in a._turn_buffers
+        final = post_mock.await_args.kwargs["json"]
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-personal"
+        assert final["text"] == "Hello"
+        assert "conv-P-buf" not in a._active_stream_by_chat
 
     @pytest.mark.asyncio
     async def test_next_turn_send_not_suppressed_by_prior_coalesced_buffer(
@@ -11307,7 +11320,7 @@ class TestEditMessage:
 
     @pytest.mark.asyncio
     async def test_403_content_stream_timeout_returns_terminal(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         # Microsoft sends 403 ContentStreamNotAllowed with
         # "exceeded streaming time" after the 2-min cap.
@@ -11327,13 +11340,23 @@ class TestEditMessage:
         self._wire_adapter(a, inbound=inbound, post_responses=[first, timeout_resp])
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
+        caplog.set_level("WARNING")
 
         await a.edit_message("conv-X", "m1", "A", finalize=False)
         r = await a.edit_message("conv-X", "m1", "A B", finalize=False)
         assert r.success is False
         assert r.error == "streaming timeout"
-        # State dropped on terminal 403.
+        # State dropped on terminal 403. The short tag stays for Hermes;
+        # the log keeps the status and the BF body (#83).
         assert ("conv-X", "m1") not in a._streams
+        assert any(
+            "http_status=403" in record.message
+            and "bf_error_code=ContentStreamNotAllowed" in record.message
+            and "exceeded streaming time" in record.message
+            and "phase=edit" in record.message
+            and "finalize=False" in record.message
+            for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_403_stop_button_returns_terminal(
@@ -11363,20 +11386,43 @@ class TestEditMessage:
 
     @pytest.mark.asyncio
     async def test_429_returns_rate_limit_error(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-R")
         first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-r"})
-        rate_resp = MagicMock(status_code=429, text="", json=lambda: {})
-        self._wire_adapter(a, inbound=inbound, post_responses=[first, rate_resp])
+        rate_body = {
+            "error": {
+                "code": "TooManyRequests",
+                "message": "Retry after 1 second.",
+            }
+        }
+        rate_responses = [
+            MagicMock(status_code=429, text="", json=lambda: rate_body)
+            for _ in range(adapter_mod._STREAM_EDIT_MAX_ATTEMPTS)
+        ]
+        post_mock = self._wire_adapter(
+            a, inbound=inbound, post_responses=[first, *rate_responses]
+        )
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
+        caplog.set_level("WARNING")
 
         await a.edit_message("conv-R", "m1", "A")
         r = await a.edit_message("conv-R", "m1", "A B")
         assert r.success is False
         assert "rate limited" in (r.error or "")
+        # Opening POST plus one attempt per retry budget. The stream stays
+        # open so a later final can still close it.
+        assert post_mock.await_count == 1 + adapter_mod._STREAM_EDIT_MAX_ATTEMPTS
+        assert ("conv-R", "m1") in a._streams
+        assert any(
+            "http_status=429" in record.message
+            and "bf_error_code=TooManyRequests" in record.message
+            and "Retry after 1 second." in record.message
+            and "bf_error_body=" in record.message
+            for record in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_202_sequence_order_failed_is_soft_success(
@@ -11446,6 +11492,130 @@ class TestEditMessage:
         body = post_mock.await_args.kwargs["json"]
         assert body["from"]["id"] == "bot-id-123"
         assert body["recipient"]["id"] == "user-id-789"
+
+    @pytest.mark.asyncio
+    async def test_single_finalize_posts_streaming_open_then_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # A one-call finalize has no streamId yet. The wire sequence is
+        # streaming open, then streamType=final. The open alone is not
+        # the close (#161).
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-one")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-one"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+
+        result = await a.edit_message(
+            "conv-one", "m1", "Pong 2.", finalize=True
+        )
+        assert result.success is True
+        assert result.message_id == "bf-one"
+        assert post_mock.await_count == 2
+        opened = post_mock.await_args_list[0].kwargs["json"]
+        final = post_mock.await_args_list[1].kwargs["json"]
+        assert opened["type"] == "typing"
+        assert opened["text"] == "Pong 2."
+        assert opened["entities"][0]["streamType"] == "streaming"
+        assert opened["entities"][0]["streamSequence"] == 1
+        assert "streamId" not in opened["entities"][0]
+        assert final["type"] == "message"
+        assert final["text"] == "Pong 2."
+        final_info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert final_info["streamType"] == "final"
+        assert final_info["streamId"] == "bf-one"
+        assert "streamSequence" not in final_info
+        assert ("conv-one", "m1") not in a._streams
+        assert "conv-one" not in a._active_stream_by_chat
+
+        duplicate = await a.edit_message(
+            "conv-one", "m1", "Pong 2.", finalize=True
+        )
+        assert duplicate.success is True
+        assert post_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_transient_edit_failure_retries_then_succeeds(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-retry")
+        failure = {
+            "error": {"code": "BadGateway", "message": "connector reset"}
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-retry"}),
+            MagicMock(status_code=502, text="", json=lambda body=failure: body),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        caplog.set_level("WARNING")
+
+        await a.edit_message("conv-retry", "m1", "A")
+        result = await a.edit_message("conv-retry", "m1", "A B")
+        assert result.success is True
+        assert post_mock.await_count == 3
+        assert any(
+            "http_status=502" in record.message
+            and "bf_error_code=BadGateway" in record.message
+            and "connector reset" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_intermediate_4xx_keeps_stream_for_a_later_final(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        # Not retried, not dropped, not coalesced into a second bubble.
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-keep")
+        failure = {
+            "error": {"code": "BadSyntax", "message": "prefix mismatch"}
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-keep"}),
+            MagicMock(status_code=400, text="", json=lambda body=failure: body),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=responses)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        caplog.set_level("WARNING")
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        await a.edit_message("conv-keep", "m1", "A")
+        failed = await a.edit_message("conv-keep", "m1", "A B")
+        assert failed.success is False
+        assert "HTTP 400" in (failed.error or "")
+        assert ("conv-keep", "m1") in a._streams
+        assert send_reply.await_count == 0
+        assert any(
+            "http_status=400" in record.message
+            and "bf_error_code=BadSyntax" in record.message
+            and "prefix mismatch" in record.message
+            for record in caplog.records
+        )
+
+        closed = await a.edit_message("conv-keep", "m1", "A B C", finalize=True)
+        assert closed.success is True
+        final = post_mock.await_args.kwargs["json"]
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-keep"
+        assert ("conv-keep", "m1") not in a._streams
+        assert send_reply.await_count == 0
 
 
 class TestSendOrUpdateStatus:
@@ -12589,6 +12759,238 @@ class TestSendStreamStart:
         assert ("c1", "m1") not in a._streams
         # Different stream wasn't cleared.
         assert a._active_stream_by_chat["c1"] == "different-stream"
+
+    @pytest.mark.asyncio
+    async def test_short_personal_reply_emits_accepted_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-short", activity_id="act-1")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-short"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=responses
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+
+        result = await a.send(
+            chat_id="conv-short",
+            content="Pong 2.",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert result.success is True
+        assert result.message_id == "bf-short"
+        assert post_mock.await_count == 2
+        opened = post_mock.await_args_list[0].kwargs["json"]
+        final = post_mock.await_args_list[1].kwargs["json"]
+        assert opened["entities"][0]["streamType"] == "streaming"
+        assert "streamId" not in opened["entities"][0]
+        assert final["type"] == "message"
+        assert final["text"] == "Pong 2."
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-short"
+        assert "streamSequence" not in info
+        assert "conv-short" not in a._active_stream_by_chat
+
+        again = await a.edit_message(
+            "conv-short", "bf-short", "Pong 2.", finalize=True
+        )
+        assert again.success is True
+        assert post_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_short_reply_final_rejection_is_not_success(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-reject", activity_id="act-1")
+        failure = {"error": {"code": "BadSyntax", "message": "final rejected"}}
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-reject"}),
+            MagicMock(status_code=400, text="", json=lambda body=failure: body),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=responses
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        caplog.set_level("WARNING")
+
+        result = await a.send(
+            chat_id="conv-reject",
+            content="Pong 3.",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert result.success is False
+        assert "conv-reject" in a._active_stream_by_chat
+        assert any(
+            "phase=edit" in record.message
+            and "http_status=400" in record.message
+            and "bf_error_code=BadSyntax" in record.message
+            and "final rejected" in record.message
+            and "finalize=True" in record.message
+            for record in caplog.records
+        )
+
+        event = _StubMessageEvent(
+            text="ping",
+            source=_StubSessionSource(platform=None, chat_id="conv-reject"),
+            message_id="act-1",
+        )
+        await a.on_processing_complete(event, outcome="success")
+        assert post_mock.await_count == 3
+        final = post_mock.await_args.kwargs["json"]
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-reject"
+        assert "conv-reject" not in a._active_stream_by_chat
+
+    @pytest.mark.asyncio
+    async def test_turn_end_finalizes_an_open_personal_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-end", activity_id="act-1")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-end"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=responses
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+
+        opened = await a.send(
+            chat_id="conv-end", content="Pong 2.", reply_to="act-1"
+        )
+        assert opened.success is True
+        assert post_mock.await_count == 1
+        assert a._active_stream_by_chat["conv-end"] == "bf-end"
+
+        event = _StubMessageEvent(
+            text="ping",
+            source=_StubSessionSource(platform=None, chat_id="conv-end"),
+            message_id="act-1",
+        )
+        await a.on_processing_complete(event, outcome="success")
+        assert post_mock.await_count == 2
+        final = post_mock.await_args.kwargs["json"]
+        assert final["type"] == "message"
+        assert final["text"] == "Pong 2."
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-end"
+        assert "conv-end" not in a._active_stream_by_chat
+
+    @pytest.mark.asyncio
+    async def test_final_send_closes_active_stream_without_a_new_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-close", activity_id="act-1")
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-close"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+        ]
+        post_mock = TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=responses
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        await a.send(chat_id="conv-close", content="partial", reply_to="act-1")
+        closed = await a.send(
+            chat_id="conv-close",
+            content="Pong 2.",
+            reply_to=None,
+            metadata={"notify": True},
+        )
+        assert closed.success is True
+        assert post_mock.await_count == 2
+        final = post_mock.await_args.kwargs["json"]
+        assert final["text"] == "Pong 2."
+        info = next(
+            entity for entity in final["entities"] if entity["type"] == "streaminfo"
+        )
+        assert info["streamType"] == "final"
+        assert info["streamId"] == "bf-close"
+        assert send_reply.await_count == 0
+        assert "conv-close" not in a._active_stream_by_chat
+
+    @pytest.mark.asyncio
+    async def test_preview_send_does_not_inline_finalize(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-preview", activity_id="act-1")
+        post_mock = TestEditMessage._wire_adapter(
+            a,
+            inbound=inbound,
+            post_responses=MagicMock(
+                status_code=201, text="", json=lambda: {"id": "bf-preview"}
+            ),
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+
+        result = await a.send(
+            chat_id="conv-preview",
+            content="Pong",
+            reply_to="act-1",
+            metadata={"notify": True, "expect_edits": True},
+        )
+        assert result.success is True
+        assert post_mock.await_count == 1
+        body = post_mock.await_args.kwargs["json"]
+        assert body["entities"][0]["streamType"] == "streaming"
+        assert a._active_stream_by_chat["conv-preview"] == "bf-preview"
+
+    @pytest.mark.asyncio
+    async def test_group_chat_final_metadata_does_not_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cc", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        result = await a.send(
+            chat_id="conv-cc",
+            content="Pong 2.",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert result.success is True
+        assert str(result.message_id).startswith("coalesced:")
+        assert post_mock.await_count == 0
+        assert "conv-cc" not in a._active_stream_by_chat
+        closed = await a.edit_message(
+            "conv-cc", str(result.message_id), "Pong 2.", finalize=True
+        )
+        assert closed.success is True
+        assert send_reply.await_count == 1
+        assert post_mock.await_count == 0
 
 
 

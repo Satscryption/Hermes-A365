@@ -38,6 +38,21 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   A live Teams reaction round trip was not run here; it remains for the
   #116 / #89 walks before this is treated as production-validated.
 
+### Fixed
+
+- **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
+  A personal edit that fails now logs `http_status`, `bf_error_code`, and
+  `bf_error_body`. Transient failures on an already-open stream (transport
+  errors, 429, and 502/503/504) are retried. A 403 still drops the stream.
+  Any other intermediate failure keeps it so a later final can close the
+  bubble. Personal chats do not fall over to the Copilot Chat coalesce
+  buffer. A final personal send (`notify`, no `expect_edits`) — the
+  short/single-chunk shape — posts `streamType=streaming` and then
+  `streamType=final`, and success requires the final activity to be
+  accepted. A personal stream still open at turn end is closed the same
+  way. `content_delivered` is not used as a success signal. A live
+  failure-rate walk is still required before calling streaming reliable.
+
 ## [0.9.2] — 2026-10-19
 
 Publish smoke installs hash-pinned packaging from the requirements file.

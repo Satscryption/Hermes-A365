@@ -951,6 +951,13 @@ def _strip_recipient_mention(text: str, entities: Any, recipient_id: str) -> str
 _STREAMING_MIN_GAP_SEC = 1.5
 _STREAMING_FORCE_DROP_AFTER_SEC = 130.0
 _STREAMING_FINALIZE_MAX_FAILURES = 2
+# #83: retry a personal-stream edit only when the connector may not have
+# applied it. 403 is terminal. Other 4xx is a payload error — keep the
+# stream (accept-and-continue) so a later final can still close it.
+# Opening POSTs are not retried: a 5xx may already have created a stream
+# we cannot name, and a second start would be a second bubble.
+_STREAM_EDIT_MAX_ATTEMPTS = 3
+_STREAM_EDIT_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
@@ -4735,6 +4742,21 @@ class Agent365Adapter(BasePlatformAdapter):
         # first-chunk (reply_to != None) may force-finalize the old
         # stream, and the next activity is allowed only if finalization
         # succeeded.
+        #
+        # #161: a completed personal reply must close the stream already
+        # on screen. Hermes marks that send with notify and without
+        # expect_edits. Opening another streaming activity (or
+        # suppressing the send) leaves the Stop button up.
+        if (
+            chat_type == "personal"
+            and chat_id in self._active_stream_by_chat
+            and self._metadata_requests_stream_final(metadata)
+        ):
+            active_id = self._active_stream_by_chat[chat_id]
+            return await self.edit_message(
+                chat_id, active_id, content, finalize=True
+            )
+
         if chat_id in self._active_stream_by_chat:
             stale_msg_id = self._active_stream_by_chat[chat_id]
             if reply_to is None:
@@ -4793,6 +4815,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 content=content,
                 inbound=inbound,
                 validated_path=turn_validated_path,
+                finalize=self._metadata_requests_stream_final(metadata),
             )
             if stream_result is not None:
                 return stream_result
@@ -5711,6 +5734,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 buf["retry_attempts"] = 0
             await self._flush_turn_buffer(chat_id)
             await self._flush_pending_coalesced_replies(chat_id)
+            # #161: the stream consumer's finalize edit runs on a task
+            # Hermes cancels at turn end. A short reply often still has
+            # the pacing gap left, so streamType=final never lands and
+            # Teams keeps the Stop button. Close it on this session task.
+            # Non-personal chats are not in ``_active_stream_by_chat``.
+            await self._finalize_open_personal_stream(chat_id)
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
             await parent(event, outcome)
@@ -7096,6 +7125,7 @@ class Agent365Adapter(BasePlatformAdapter):
         content: str,
         inbound: dict[str, Any],
         validated_path: str | None = None,
+        finalize: bool = False,
     ) -> SendResult | None:
         """Slice 19s-bis: open a new BF stream from ``send()``.
 
@@ -7106,6 +7136,12 @@ class Agent365Adapter(BasePlatformAdapter):
 
         Returns ``None`` on stream-start failure so ``send()`` can fall
         back to a non-streaming activity rather than dropping the reply.
+
+        ``finalize=True`` (#161) is a short or single-chunk reply: Hermes
+        has already marked the send final (``notify``, no ``expect_edits``).
+        After the 201, this posts ``streamType=final`` and returns success
+        only when that final activity is accepted. A streaming start alone
+        is not success — Teams keeps the Stop button until the final lands.
         """
         bridge = _import_bridge()
         conv = inbound.get("conversation") or {}
@@ -7173,10 +7209,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 ),
             )
         except Exception as e:
-            logger.warning(
-                "agent365 stream-start POST failed; falling back to "
-                "non-streaming send: %s",
-                e,
+            self._log_personal_stream_edit_failure(
+                phase="stream-start",
+                chat_id=chat_id,
+                message_id="",
+                finalize=finalize,
+                http_status="none",
+                bf_error_code="",
+                bf_error_body=str(e),
+                attempt=1,
             )
             return None
 
@@ -7189,10 +7230,16 @@ class Agent365Adapter(BasePlatformAdapter):
             )
 
         if resp.status_code != 201:
-            logger.warning(
-                "agent365 stream-start expected 201, got %s; "
-                "falling back to non-streaming send",
-                resp.status_code,
+            code, body = self._bf_error_parts(resp)
+            self._log_personal_stream_edit_failure(
+                phase="stream-start",
+                chat_id=chat_id,
+                message_id="",
+                finalize=finalize,
+                http_status=resp.status_code,
+                bf_error_code=code,
+                bf_error_body=body,
+                attempt=1,
             )
             return None
 
@@ -7226,7 +7273,17 @@ class Agent365Adapter(BasePlatformAdapter):
             "last_content": clean_content,
         }
         self._active_stream_by_chat[chat_id] = bf_stream_id
-        return SendResult(success=True, message_id=bf_stream_id)
+        if not finalize:
+            return SendResult(success=True, message_id=bf_stream_id)
+        final_result = await self.edit_message(
+            chat_id, bf_stream_id, clean_content, finalize=True
+        )
+        if final_result.success:
+            return SendResult(
+                success=True,
+                message_id=str(final_result.message_id or bf_stream_id),
+            )
+        return final_result
 
     async def _post_activity(
         self, *, inbound: dict[str, Any], activity: dict[str, Any]
@@ -9252,6 +9309,163 @@ class Agent365Adapter(BasePlatformAdapter):
 
     # ── Slice 19s — BF streaming response protocol ────────────────────────
 
+    @staticmethod
+    def _metadata_requests_stream_final(
+        metadata: dict[str, Any] | None,
+    ) -> bool:
+        """Whether this Hermes ``send`` is the completed personal reply.
+
+        The stream consumer sets ``notify`` on a final send and
+        ``expect_edits`` only when a later edit will grow the preview.
+        A short reply is often that final send and nothing else (#161).
+        Preview sends stay on the streaming-start path. Non-personal
+        chats never consult this: they coalesce instead of streaming.
+        """
+        if not isinstance(metadata, dict):
+            return False
+        if metadata.get("expect_edits"):
+            return False
+        return metadata.get("notify") is True
+
+    @staticmethod
+    def _bf_error_parts(resp: Any) -> tuple[str, str]:
+        """Return ``(error_code, error_body)`` from a connector response.
+
+        ``error_body`` is the BF ``error`` object when present, otherwise
+        a truncated response text. Empty when the response has neither.
+        This is diagnostic only — a body is never treated as success.
+        """
+        code = ""
+        body = ""
+        parsed: Any = None
+        try:
+            raw = resp.json() if callable(getattr(resp, "json", None)) else None
+        except Exception:
+            raw = None
+        if isinstance(raw, dict):
+            parsed = raw
+        if isinstance(parsed, dict):
+            err = parsed.get("error")
+            if isinstance(err, dict):
+                raw_code = err.get("code")
+                if isinstance(raw_code, str):
+                    code = raw_code
+                message = err.get("message")
+                if not isinstance(message, str):
+                    message = ""
+                body = json.dumps(
+                    {"code": code, "message": message}, ensure_ascii=False
+                )
+            else:
+                body = json.dumps(parsed, ensure_ascii=False)
+        if not body:
+            try:
+                text = resp.text
+            except Exception:
+                text = ""
+            if isinstance(text, str):
+                body = text
+        body = " ".join(body.split())[:500]
+        return code, body
+
+    def _log_personal_stream_edit_failure(
+        self,
+        *,
+        phase: str,
+        chat_id: str,
+        message_id: str,
+        finalize: bool,
+        http_status: int | str,
+        bf_error_code: str,
+        bf_error_body: str,
+        attempt: int,
+    ) -> None:
+        """Log a personal-stream failure with the connector's own detail.
+
+        Hermes flattens a failed edit to ``Edit failed`` and
+        ``content_delivered`` is not a delivery signal (#63, #83). The
+        HTTP status and BF body have to be on our log line.
+        """
+        logger.warning(
+            "agent365 personal stream edit failed: phase=%s chat_id=%s "
+            "message_id=%s finalize=%s http_status=%s bf_error_code=%s "
+            "bf_error_body=%s attempt=%s",
+            phase,
+            chat_id,
+            message_id,
+            finalize,
+            http_status,
+            bf_error_code,
+            bf_error_body,
+            attempt,
+        )
+
+    def _stream_edit_should_retry(
+        self,
+        state: dict[str, Any],
+        *,
+        http_status: int | None,
+        attempt: int,
+    ) -> bool:
+        """Retry only an open stream's transient edit (#83).
+
+        No ``bf_stream_id`` means the opening POST. Retrying it can
+        create a second stream. 403 and other 4xx are not retried:
+        403 drops the stream, and a payload 4xx keeps it so a later
+        final can still close the bubble.
+        """
+        if attempt >= _STREAM_EDIT_MAX_ATTEMPTS:
+            return False
+        if not state.get("bf_stream_id"):
+            return False
+        if http_status is None:
+            return True
+        return http_status in _STREAM_EDIT_RETRY_STATUSES
+
+    async def _pause_before_stream_retry(
+        self,
+        chat_id: str,
+        generation: int,
+        chat_generation: int,
+        client: Any,
+    ) -> bool:
+        """Wait out the streaming gap. False when the turn has moved on."""
+        await asyncio.sleep(_STREAMING_MIN_GAP_SEC)
+        return self._lifecycle_is_current(
+            generation, client
+        ) and self._chat_lifecycle_is_current(chat_id, chat_generation)
+
+    async def _finalize_open_personal_stream(self, chat_id: str) -> None:
+        """Post ``streamType=final`` for a personal stream still open.
+
+        Called from ``on_processing_complete``, which runs after Hermes
+        has cancelled the stream consumer. A missing final is what leaves
+        the Teams Stop button up (#161). Non-personal chats do not use
+        this map; their reply is the coalesced ``send_reply``.
+        """
+        message_id = self._active_stream_by_chat.get(str(chat_id))
+        if not message_id:
+            return
+        inbound = self._cached_inbound_for(chat_id)
+        conv = (inbound or {}).get("conversation") or {}
+        if str(conv.get("conversationType") or "") != "personal":
+            return
+        state = self._streams.get((str(chat_id), str(message_id))) or {}
+        content = state.get("last_content") or " "
+        if not isinstance(content, str) or not content:
+            content = " "
+        result = await self.edit_message(
+            str(chat_id), str(message_id), content, finalize=True
+        )
+        if not result.success:
+            logger.warning(
+                "agent365 personal stream turn-end finalize not accepted: "
+                "chat_id=%s message_id=%s error=%s",
+                chat_id,
+                message_id,
+                result.error,
+            )
+
     async def edit_message(
         self,
         chat_id: str,
@@ -9270,7 +9484,12 @@ class Agent365Adapter(BasePlatformAdapter):
         carries the BF-side ``streamId`` we use on every subsequent
         call. ``finalize=True`` swaps the activity ``type`` from
         ``typing`` to ``message``, sets ``streamType=final``, and
-        omits ``streamSequence`` per the Microsoft spec.
+        omits ``streamSequence`` per the Microsoft spec. A finalize
+        that does not yet have a ``streamId`` opens the stream first
+        and then posts the final; success requires that final to be
+        accepted (#161). Failures log ``http_status`` and the BF error
+        body. Transient failures on an open stream are retried; other
+        intermediate failures keep the stream (#83).
 
         Non-personal chat types are coalesced into a single normal
         ``send_reply`` on ``finalize=True`` because Copilot Chat
@@ -9459,11 +9678,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 error="agent365 edit_message: adapter lifecycle changed",
             )
 
+        # #161: streamType=final without a streamId is 400 BadSyntax and
+        # does not clear the Stop button. A first finalize opens the
+        # stream, then posts the final once the 201 returns an id.
+        wire_finalize = bool(finalize and state.get("bf_stream_id"))
         state["sequence"] += 1
         entity: dict[str, Any] = {"type": "streaminfo"}
         if state["bf_stream_id"]:
             entity["streamId"] = state["bf_stream_id"]
-        if finalize:
+        if wire_finalize:
             entity["streamType"] = "final"
             # streamSequence MUST NOT be set on the final activity per
             # Microsoft's REST API spec.
@@ -9478,7 +9701,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # Hermes never called finalize, we'll reuse this.
         state["last_content"] = clean_content
         activity: dict[str, Any] = {
-            "type": "message" if finalize else "typing",
+            "type": "message" if wire_finalize else "typing",
             # Strip the streaming cursor — Hermes appends one for visual
             # feedback, but BF's prefix-match rule rejects activities
             # whose text doesn't start with the previously streamed
@@ -9491,7 +9714,7 @@ class Agent365Adapter(BasePlatformAdapter):
         }
 
         bridge = _import_bridge()
-        if finalize:
+        if wire_finalize:
             # #73(a): the finalized, user-visible message is AI-generated
             # content — append the label alongside the streaminfo entity.
             # Intermediate (typing) chunks are NOT labelled.
@@ -9509,123 +9732,205 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         url = _conversations_activities_url(service_url, conv_id)
 
-        try:
-            token, _path = await self._await_outbound(
-                chat_id,
-                bridge.acquire_reply_token(
-                    client=client,
-                    cfg=self._bridge_cfg,
-                    activity=inbound,
-                    fmi_cache=self._fmi_cache,
-                    user_cache=self._user_cache,
-                    bf_cache=self._bf_token_cache,
-                    validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
-                ),
-            )
-            if not self._lifecycle_is_current(
-                generation, client
-            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+        last_error = "agent365 edit_message failed"
+        for attempt in range(1, _STREAM_EDIT_MAX_ATTEMPTS + 1):
+            try:
+                token, _path = await self._await_outbound(
+                    chat_id,
+                    bridge.acquire_reply_token(
+                        client=client,
+                        cfg=self._bridge_cfg,
+                        activity=inbound,
+                        fmi_cache=self._fmi_cache,
+                        user_cache=self._user_cache,
+                        bf_cache=self._bf_token_cache,
+                        validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                    ),
+                )
+                if not self._lifecycle_is_current(
+                    generation, client
+                ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                    return SendResult(
+                        success=False,
+                        error="agent365 edit_message: adapter lifecycle changed",
+                    )
+                resp = await self._await_outbound(
+                    chat_id,
+                    client.post(
+                        url,
+                        json=activity,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=15.0,
+                    ),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                last_error = str(e)
+                self._log_personal_stream_edit_failure(
+                    phase="edit",
+                    chat_id=str(chat_id),
+                    message_id=str(message_id),
+                    finalize=finalize,
+                    http_status="none",
+                    bf_error_code="",
+                    bf_error_body=last_error,
+                    attempt=attempt,
+                )
+                if self._stream_edit_should_retry(
+                    state, http_status=None, attempt=attempt
+                ):
+                    if not await self._pause_before_stream_retry(
+                        chat_id, generation, chat_generation, client
+                    ):
+                        return SendResult(
+                            success=False,
+                            error="agent365 edit_message: adapter lifecycle changed",
+                        )
+                    continue
+                return SendResult(success=False, error=last_error)
+
+            if (
+                not self._lifecycle_is_current(generation, client)
+                or not self._chat_lifecycle_is_current(chat_id, chat_generation)
+                or self._streams.get(stream_key) is not state
+            ):
                 return SendResult(
                     success=False,
                     error="agent365 edit_message: adapter lifecycle changed",
                 )
-            resp = await self._await_outbound(
-                chat_id,
-                client.post(
-                    url,
-                    json=activity,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=15.0,
-                ),
-            )
-        except Exception as e:
-            logger.warning("agent365 edit_message POST failed: %s", e)
-            return SendResult(success=False, error=str(e))
 
-        if (
-            not self._lifecycle_is_current(generation, client)
-            or not self._chat_lifecycle_is_current(chat_id, chat_generation)
-            or self._streams.get(stream_key) is not state
-        ):
-            return SendResult(
-                success=False,
-                error="agent365 edit_message: adapter lifecycle changed",
-            )
+            state["last_emit_ts"] = loop.time()
 
-        state["last_emit_ts"] = loop.time()
-
-        # First request → 201 with {"id": "<streamId>"}. Capture for
-        # subsequent calls and as the message_id returned to Hermes.
-        if is_first and resp.status_code == 201:
-            try:
-                stream_id = (resp.json() or {}).get("id")
-            except Exception:
-                stream_id = None
-            if not stream_id:
-                logger.warning(
-                    "agent365 edit_message: first streaming POST 201 "
-                    "without id: %s",
-                    resp.text[:200],
+            # First request → 201 with {"id": "<streamId>"}. Capture for
+            # subsequent calls and as the message_id returned to Hermes.
+            if is_first and resp.status_code == 201:
+                try:
+                    stream_id = (resp.json() or {}).get("id")
+                except Exception:
+                    stream_id = None
+                if not stream_id:
+                    code, body = self._bf_error_parts(resp)
+                    self._log_personal_stream_edit_failure(
+                        phase="edit",
+                        chat_id=str(chat_id),
+                        message_id=str(message_id),
+                        finalize=finalize,
+                        http_status=201,
+                        bf_error_code=code,
+                        bf_error_body=body or "201 without id",
+                        attempt=attempt,
+                    )
+                    self._drop_stream_state(chat_id, message_id)
+                    return SendResult(
+                        success=False,
+                        error="streaming start returned no id",
+                    )
+                state["bf_stream_id"] = str(stream_id)
+                self._remember_bot_reply(
+                    str(stream_id), conversation_id=str(chat_id)
                 )
-                self._drop_stream_state(chat_id, message_id)
-                return SendResult(
-                    success=False,
-                    error="streaming start returned no id",
-                )
-            state["bf_stream_id"] = str(stream_id)
-            self._remember_bot_reply(str(stream_id), conversation_id=str(chat_id))
-            if finalize:
-                # First + finalize is degenerate but legal — drop state.
-                self._drop_stream_state(chat_id, message_id)
-                self._record_recently_finalized(message_id, chat_id, loop_now)
-            else:
                 self._active_stream_by_chat[chat_id] = message_id
-            return SendResult(success=True, message_id=state["bf_stream_id"])
+                if finalize:
+                    # The activity just sent was the open, not the final.
+                    # Post streamType=final against the new id (#161).
+                    return await self.edit_message(
+                        chat_id, message_id, clean_content, finalize=True
+                    )
+                return SendResult(success=True, message_id=state["bf_stream_id"])
 
-        if 200 <= resp.status_code < 300:
-            # 202 is the happy path for subsequent calls. The body may
-            # contain a ContentStreamSequenceOrderPreConditionFailed
-            # signal (out-of-order); we log it and keep going since the
-            # most-recent sequence wins server-side anyway.
-            err_code = self._maybe_extract_error_code(resp)
-            if err_code == "ContentStreamSequenceOrderPreConditionFailed":
-                logger.debug(
-                    "agent365 edit_message: stream sequence %d arrived "
-                    "out-of-order; server-side dedup retains the latest",
-                    state["sequence"],
+            if 200 <= resp.status_code < 300:
+                # 202 is the happy path for subsequent calls. The body may
+                # contain a ContentStreamSequenceOrderPreConditionFailed
+                # signal (out-of-order); we log it and keep going since the
+                # most-recent sequence wins server-side anyway.
+                err_code = self._maybe_extract_error_code(resp)
+                if err_code == "ContentStreamSequenceOrderPreConditionFailed":
+                    logger.debug(
+                        "agent365 edit_message: stream sequence %d arrived "
+                        "out-of-order; server-side dedup retains the latest",
+                        state["sequence"],
+                    )
+                if wire_finalize:
+                    self._drop_stream_state(chat_id, message_id)
+                    self._record_recently_finalized(message_id, chat_id, loop_now)
+                elif finalize:
+                    # Accepted an opening activity and never sent final.
+                    self._log_personal_stream_edit_failure(
+                        phase="edit",
+                        chat_id=str(chat_id),
+                        message_id=str(message_id),
+                        finalize=True,
+                        http_status=resp.status_code,
+                        bf_error_code="",
+                        bf_error_body="2xx without a prior streamId; final not sent",
+                        attempt=attempt,
+                    )
+                    return SendResult(
+                        success=False,
+                        error="streaming start returned no id",
+                    )
+                return SendResult(
+                    success=True, message_id=state.get("bf_stream_id") or ""
                 )
-            if finalize:
+
+            code, body = self._bf_error_parts(resp)
+            self._log_personal_stream_edit_failure(
+                phase="edit",
+                chat_id=str(chat_id),
+                message_id=str(message_id),
+                finalize=finalize,
+                http_status=resp.status_code,
+                bf_error_code=code,
+                bf_error_body=body,
+                attempt=attempt,
+            )
+
+            if resp.status_code == 403:
+                # Terminal — fall back. Drop stream state so the next call
+                # starts cleanly. Map common Microsoft messages to short
+                # error tags Hermes can surface to operators. The log line
+                # above keeps the HTTP status and BF body (#83).
+                err_msg = self._extract_error_message(resp)
                 self._drop_stream_state(chat_id, message_id)
-                self._record_recently_finalized(message_id, chat_id, loop_now)
-            return SendResult(success=True, message_id=state.get("bf_stream_id") or "")
+                short = err_msg
+                low = err_msg.lower()
+                if "exceeded streaming time" in low:
+                    short = "streaming timeout"
+                elif "canceled by user" in low:
+                    short = "streaming canceled by user"
+                elif "message size too large" in low:
+                    short = "streaming message too large"
+                elif "already completed" in low:
+                    short = "streaming already completed"
+                return SendResult(success=False, error=short)
 
-        if resp.status_code == 403:
-            # Terminal — fall back. Drop stream state so the next call
-            # starts cleanly. Map common Microsoft messages to short
-            # error tags Hermes can surface to operators.
-            err_msg = self._extract_error_message(resp)
-            self._drop_stream_state(chat_id, message_id)
-            short = err_msg
-            low = err_msg.lower()
-            if "exceeded streaming time" in low:
-                short = "streaming timeout"
-            elif "canceled by user" in low:
-                short = "streaming canceled by user"
-            elif "message size too large" in low:
-                short = "streaming message too large"
-            elif "already completed" in low:
-                short = "streaming already completed"
-            return SendResult(success=False, error=short)
+            if resp.status_code == 429:
+                last_error = "streaming rate limited"
+            else:
+                last_error = (
+                    f"agent365 edit_message HTTP {resp.status_code}: {body}"
+                )
+            # Transient failures on an open stream are retried. Anything
+            # else keeps the stream (accept-and-continue) unless the 403
+            # branch above already dropped it. Personal chats do not fall
+            # over to the non-personal coalesce buffer: a second bubble
+            # is the pre-#64 failure mode, and a plain send while this
+            # stream is open is suppressed.
+            if self._stream_edit_should_retry(
+                state, http_status=resp.status_code, attempt=attempt
+            ):
+                if not await self._pause_before_stream_retry(
+                    chat_id, generation, chat_generation, client
+                ):
+                    return SendResult(
+                        success=False,
+                        error="agent365 edit_message: adapter lifecycle changed",
+                    )
+                continue
+            return SendResult(success=False, error=last_error)
 
-        if resp.status_code == 429:
-            return SendResult(success=False, error="streaming rate limited")
-
-        # Other non-2xx codes — surface for diagnosis.
-        return SendResult(
-            success=False,
-            error=f"agent365 edit_message HTTP {resp.status_code}: "
-                  f"{resp.text[:200] if hasattr(resp, 'text') else ''}",
-        )
+        return SendResult(success=False, error=last_error)
 
     async def _auto_finalize_stale_stream(
         self,
@@ -9719,9 +10024,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 ),
             )
         except Exception as e:
-            logger.warning(
-                "agent365 auto-finalize stale stream %s failed: %s",
-                bf_stream_id, e,
+            self._log_personal_stream_edit_failure(
+                phase="auto-finalize",
+                chat_id=chat_id,
+                message_id=message_id,
+                finalize=True,
+                http_status="none",
+                bf_error_code="",
+                bf_error_body=str(e),
+                attempt=1,
             )
             return self._record_stale_finalize_failure(
                 chat_id=chat_id,
@@ -9745,17 +10056,22 @@ class Agent365Adapter(BasePlatformAdapter):
             self._record_recently_finalized(message_id, chat_id, loop_now)
             return True
 
-        logger.warning(
-            "agent365 auto-finalize stale stream %s returned HTTP %s: %s",
-            bf_stream_id,
-            resp.status_code,
-            resp.text[:200] if hasattr(resp, "text") else "",
+        code, body = self._bf_error_parts(resp)
+        self._log_personal_stream_edit_failure(
+            phase="auto-finalize",
+            chat_id=chat_id,
+            message_id=message_id,
+            finalize=True,
+            http_status=resp.status_code,
+            bf_error_code=code,
+            bf_error_body=body,
+            attempt=1,
         )
         return self._record_stale_finalize_failure(
             chat_id=chat_id,
             message_id=message_id,
             state=state,
-            reason=f"HTTP {resp.status_code}",
+            reason=f"HTTP {resp.status_code} {code} {body}".strip(),
         )
 
     def _record_stale_finalize_failure(
