@@ -103,15 +103,20 @@ def test_bridge_and_dev_keep_security_floors() -> None:
 
 
 def test_handoff_contract_pin_names_hermes_session_apis() -> None:
-    """#82 — the documented floor is the fail-closed gateway_session_id pin."""
+    """#82 — v2026.7.20 skips the pin; acquire resolves from v2026.9.7."""
     text = NOTE.read_text()
     assert "75efd73961a88a531276d0e2e1cd30d1ec18019e" in text
     assert "00ce5f04d9cfad2e30d5e08e7a6bf135f6e53030" in text
     assert "d39c62409b5f00da6f7bd31dd3fb437d8c2daad6" in text
+    assert "db339f0051e76733923d3d8c4e4319e3e45444a3" in text
     assert "session_store.switch_session" in text
     assert 'metadata["gateway_session_id"]' in text
     assert "find_session_by_origin" in text
+    assert "hermes_state_registry.acquire" in text
     assert "v2026.7.20" in text
+    assert "v2026.9.7" in text
+    assert "**Safety floor.**" in text
+    assert "**Resolution floor.**" in text
     assert "does not call `reopen_session`" in text
 
 

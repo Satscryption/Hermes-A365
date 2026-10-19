@@ -15,9 +15,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   internal Teams `MessageEvent` with `metadata["gateway_session_id"]` after
   the invoke ack. Unknown, expired, cross-user, cross-tenant, missing, and
   ended sessions ack without rebinding. Explicitly ended conversations are
-  not reopened. Minimum Hermes commit is documented in
-  `references/hermes-runtime-compatibility.md`
-  (`75efd73961a88a531276d0e2e1cd30d1ec18019e`, release `v2026.7.20`).
+  not reopened. Hermes `v2026.7.20`
+  (`75efd73961a88a531276d0e2e1cd30d1ec18019e`) is the safety floor: a
+  missing `hermes_state_registry` fails closed and the pin is skipped.
+  Resolving the origin session through `hermes_state_registry.acquire`
+  requires `db339f0051e76733923d3d8c4e4319e3e45444a3`, first tagged in
+  `v2026.9.7` (`references/hermes-runtime-compatibility.md`).
   A live Copilot→Teams 1:1 round trip remains residual for #116 / #89.
 - **#80 — Teams `messageReaction` add/remove.** After the JWT, service URL,
   end-user, and replay gates, a reaction is stored on the #73 feedback

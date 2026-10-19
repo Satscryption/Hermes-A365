@@ -156,11 +156,15 @@ dispatch when the row is missing, has `ended_at` set, or carries an
 explicit end reason (`session_reset`, `user_exit`, `session_switch`,
 `new_session`). It does not call `reopen_session`.
 
-Minimum upstream commit that contains all three of those symbols and the
-fail-closed pin (do not inject into an ended session):
+Two Hermes floors apply.
+
+**Safety floor.** Fail closed, and skip the pin, when
+`hermes_state_registry` is absent. That is safe on the commit that
+refuses to inject `gateway_session_id` into an ended session:
 
 `75efd73961a88a531276d0e2e1cd30d1ec18019e` (2026-07-08,
-`fix(gateway): never resurrect ended sessions for delegation completions`).
+`fix(gateway): never resurrect ended sessions for delegation completions`),
+first tagged in `v2026.7.20`.
 
 That commit sits on top of:
 
@@ -170,7 +174,17 @@ That commit sits on top of:
 | `MessageEvent` `metadata["gateway_session_id"]` | `d39c62409b5f00da6f7bd31dd3fb437d8c2daad6` |
 | `SessionDB.find_session_by_origin` | present by `d39c62409` (then in `hermes_state.py`; later `hermes_state_sessions.py`) |
 
-First tagged Hermes release that contains the pin: `v2026.7.20`.
+`v2026.7.20` contains the pin symbols in that table and predates
+`hermes_state_registry`. This adapter imports
+`hermes_state_registry.acquire` and, on `ImportError`, stores no session
+id. The continuation link can still be minted. The pin stays skipped
+until the resolution floor below.
+
+**Resolution floor.** The adapter can open the shared `SessionDB` and
+resolve the origin row. `hermes_state_registry.acquire` lands in
+`db339f0051e76733923d3d8c4e4319e3e45444a3` (2026-09-01,
+`fix(state): consolidate gateway SessionDB writers via process-wide shared registry`).
+First tagged Hermes release that contains that module: `v2026.9.7`.
 Current `main` still honors `gateway_session_id` from
 `gateway/run_turn_prepare.py`. Idle-ended pins on newer Hermes can
 retarget to the destination's current row; this adapter does not dispatch
