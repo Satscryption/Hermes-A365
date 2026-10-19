@@ -4,6 +4,29 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.2] — 2026-10-19
+
+Publish smoke installs hash-pinned packaging from the requirements file.
+Tag `v0.9.1` exists (commit `680422a4`, merged PR #172, GitHub prerelease)
+but that version never published to PyPI. Publish run
+[39265071375](https://github.com/Satscryption/Hermes-A365/actions/runs/39265071375)
+failed in the build job at Smoke-install the wheel: stock venv pip rejected
+the CLI `--hash` flags (`no such option: --hash`). Integrity and the
+Python 3.11 and 3.14 tests passed; publish and release were skipped.
+PyPI latest remains 0.9.0. This 0.9.2 patch is the fix-forward. The
+`v0.9.1` tag is not moved, deleted, or retargeted.
+
+### Fixed
+
+- **The publish smoke installs hash-pinned packaging from a requirements file.**
+  pip accepts `--hash` only inside a requirements file, which is how
+  "Install pinned build toolchain" already installs
+  `.github/workflows/publish-requirements.txt`. The smoke step copies
+  that file's `packaging==26.2` pin (both sha256 lines) into a temporary
+  requirements file and installs it with `--require-hashes --no-deps -r`.
+  The fresh venv still installs the built wheel first, then runs
+  `scripts/release_integrity.py smoke`. Hash pinning stays.
+
 ## [0.9.1] — 2026-10-19
 
 Operator walk and release integrity (#124). The §1–§3 walk passed on
