@@ -8635,29 +8635,62 @@ class Agent365Adapter(BasePlatformAdapter):
         _bound_map(self._handoff_tokens)
         return self._handoff_deep_link(token)
 
-    def _remember_handoff_destination(self, ctx: invoke.InvokeContext) -> None:
-        """Cache the Teams 1:1 so the pinned turn's reply has a serviceUrl.
+    @staticmethod
+    def _conversation_message_activity_id(ref: ConversationRef | None) -> str:
+        """Activity id of a cached user ``message``, or empty.
 
-        Invoke activities return before the message path upserts the
-        registry. The cache is in-memory for this process; a restart drops
-        it the same way it drops the token.
+        A ``handoff/action`` invoke is not a conversation message. Its id
+        cannot be a ``replyToActivity`` or streaming-start target.
+        """
+        if ref is None or not isinstance(ref.raw, dict):
+            return ""
+        if str(ref.raw.get("type") or "") != "message":
+            return ""
+        activity_id = ref.raw.get("id")
+        if not isinstance(activity_id, str) or not activity_id.strip():
+            return ""
+        return activity_id.strip()
+
+    def _remember_handoff_destination(self, ctx: invoke.InvokeContext) -> str:
+        """Cache the Teams 1:1 so the pinned turn can post, and return a reply id.
+
+        The cache keeps serviceUrl, conversation, and the validated path.
+        The invoke id is not stored as ``last_inbound_activity_id`` and this
+        call does not add the chat to ``_seen_inbounds_this_lifetime``. A
+        user ``message`` already cached for the chat stays the reply target.
+        The returned id is that message when this lifetime can reply to it,
+        otherwise empty so ``send`` posts with no ``replyToId``.
         """
         ref = ConversationRef.from_activity(ctx.activity)
         if ref is None:
-            return
+            return ""
         if ctx.path_tag in {"A", "B"}:
             ref.validated_path = ctx.path_tag
+        existing = self._conversations.get(ref.conversation_id)
+        reply_id = self._conversation_message_activity_id(existing)
+        if reply_id and existing is not None:
+            ref.last_inbound_activity_id = reply_id
+            ref.raw = existing.raw
+        else:
+            raw = dict(ref.raw) if isinstance(ref.raw, dict) else {}
+            raw.pop("id", None)
+            ref.raw = raw
+            ref.last_inbound_activity_id = None
+            reply_id = ""
         self._conversations.upsert(ref)
-        seen = self._seen_inbounds_this_lifetime
-        seen.add(ref.conversation_id)
-        if len(seen) > _MAX_SEEN_INBOUNDS:
-            seen.discard(ref.conversation_id)
-            while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
-                seen.pop()
-            seen.add(ref.conversation_id)
+        if not reply_id:
+            return ""
+        turn_key = self._coalesced_reply_turn_key(ref.conversation_id, reply_id)
+        if self._coalesced_turn_target(turn_key) is None:
+            return ""
+        return reply_id
 
     def _build_handoff_message_event(
-        self, ctx: invoke.InvokeContext, record: dict[str, Any]
+        self,
+        ctx: invoke.InvokeContext,
+        record: dict[str, Any],
+        *,
+        reply_activity_id: str,
     ) -> MessageEvent:
         """Internal Teams event that pins the Copilot session onto this 1:1.
 
@@ -8665,11 +8698,25 @@ class Agent365Adapter(BasePlatformAdapter):
         later messages in that chat is the key ``switch_session`` rewrites.
         ``metadata["gateway_session_id"]`` is the only pin field: strict
         and proven keys would keep the fresh Teams row instead of switching.
+        ``message_id`` is a cached user message when one is replyable.
+        The invoke activity id is never that field: Hermes passes it to
+        ``send`` as ``reply_to``.
         """
         activity = ctx.activity
         chat_id = str(ctx.conv.get("id") or "")
         sender = activity.get("from")
         sender = sender if isinstance(sender, dict) else {}
+        message_id = reply_activity_id or None
+        if reply_activity_id:
+            cached = self._cached_inbound_for(chat_id)
+            raw_message: dict[str, Any] = (
+                cached
+                if isinstance(cached, dict) and str(cached.get("id") or "") == reply_activity_id
+                else dict(activity)
+            )
+        else:
+            raw_message = dict(activity)
+            raw_message.pop("id", None)
         source = SessionSource(
             platform=self.platform,
             chat_id=chat_id,
@@ -8677,7 +8724,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_type=_import_bridge()._activity_chat_type(activity),
             user_id=_normalized_token(record.get("user_aad")),
             user_name=str(sender.get("name") or ""),
-            message_id=str(activity.get("id") or ""),
+            message_id=reply_activity_id,
         )
         return MessageEvent(
             text=(
@@ -8686,8 +8733,8 @@ class Agent365Adapter(BasePlatformAdapter):
             ),
             message_type=MessageType.TEXT,
             source=source,
-            raw_message=activity,
-            message_id=str(activity.get("id") or "") or None,
+            raw_message=raw_message,
+            message_id=message_id,
             internal=True,
             metadata={"gateway_session_id": str(record.get("hermes_session_id") or "")},
             timestamp=datetime.now(),
@@ -8701,8 +8748,10 @@ class Agent365Adapter(BasePlatformAdapter):
         agent turn. The token is already consumed; a dispatch failure does
         not mint another pin.
         """
-        event = self._build_handoff_message_event(ctx, record)
-        self._remember_handoff_destination(ctx)
+        reply_activity_id = self._remember_handoff_destination(ctx)
+        event = self._build_handoff_message_event(
+            ctx, record, reply_activity_id=reply_activity_id
+        )
         task = asyncio.get_running_loop().create_task(self._dispatch_handoff_event(event))
         self._handoff_dispatch_tasks.add(task)
         task.add_done_callback(self._handoff_dispatch_tasks.discard)
@@ -8710,11 +8759,63 @@ class Agent365Adapter(BasePlatformAdapter):
     async def _dispatch_handoff_event(self, event: MessageEvent) -> None:
         try:
             await asyncio.sleep(0)
+            await self._run_handoff_turn(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("agent365 handoff dispatch failed", exc_info=True)
+
+    async def _run_handoff_turn(self, event: MessageEvent) -> None:
+        """Run the pin through the inbound turn lifecycle.
+
+        Admission, ``_session_key_to_conv``, and ``_AGENT_TURN_LIFECYCLE``
+        match a user message and a ``messageReaction`` turn. Uninstall
+        finds the session task from that mapping, and ``send`` sees a
+        current token so a later reinstall can refuse the old turn.
+        """
+        source = getattr(event, "source", None)
+        chat_id = str(getattr(source, "chat_id", "") or "")
+        if not chat_id or self._disconnecting or chat_id in self._retiring_chats:
+            logger.warning("agent365 handoff pin skipped: chat retiring")
+            return
+        sk = self._session_key_for(event)
+        admission_key = sk or f"agent365:{chat_id}"
+        if not self._reserve_agent_turn_admission(admission_key):
+            logger.warning("agent365 handoff pin skipped: active turns full")
+            return
+        turn_guard = asyncio.Event()
+        if sk is not None:
+            self._session_key_to_conv[sk] = chat_id
+            turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
+        turn_token = _AGENT_TURN_LIFECYCLE.set(
+            (
+                id(self),
+                chat_id,
+                self._lifecycle_generation,
+                self._chat_generation(chat_id),
+                turn_guard,
+            )
+        )
+        try:
             await self.handle_message(event)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.warning("agent365 handoff dispatch failed", exc_info=True)
+        finally:
+            _AGENT_TURN_LIFECYCLE.reset(turn_token)
+            self._finish_handoff_turn(sk, turn_guard)
+
+    def _finish_handoff_turn(self, session_key: str | None, turn_guard: asyncio.Event) -> None:
+        if session_key is None:
+            return
+        owner = getattr(self, "_session_tasks", {}).get(session_key)
+        if isinstance(owner, asyncio.Task):
+            self._note_session_task_chat(session_key)
+            self._watch_agent_turn_owner(session_key, turn_guard, owner)
+            return
+        if session_key not in getattr(self, "_active_sessions", {}):
+            self._agent_turn_guards.pop(session_key, None)
 
     async def _handle_handoff_action(self, ctx: invoke.InvokeContext) -> invoke.InvokeResponse:
         """#82: ``handoff/action`` — the user opened the continuation link.
