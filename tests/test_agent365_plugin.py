@@ -16411,10 +16411,15 @@ class TestCorrelatorBounds:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._feedback_by_message_id["m"] = {"reaction": "like"}
+        a._bot_reply_ids["reply-1"] = {
+            "conversation_id": "c",
+            "tenant_id": "11111111-1111-1111-1111-111111111111",
+        }
         a._handoff_tokens["t"] = {"conversation_id": "c"}
         a._pending_file_uploads["c1"] = {"path": "/x", "name": "x"}
         await a.disconnect()
         assert a._feedback_by_message_id == {}
+        assert a._bot_reply_ids == {}
         assert a._handoff_tokens == {}
         assert a._pending_file_uploads == {}
 
@@ -17743,3 +17748,491 @@ class TestSecurityAuthorizationOrder:
         event = a._handled_events[0]
         assert event.source.user_id == authorized_id
         assert event.source.chat_type == "group"
+
+
+# ---------------------------------------------------------------------------
+# #80 — Teams messageReaction add/remove (feedback correlation, no #122)
+# ---------------------------------------------------------------------------
+
+
+_TENANT = "11111111-1111-1111-1111-111111111111"
+
+
+def _reaction_activity(
+    *,
+    reply_to: str = "reply-1",
+    conv_id: str = "conv-1",
+    activity_id: str = "react-1",
+    tenant_id: str = _TENANT,
+    added: list[dict[str, str]] | None = None,
+    removed: list[dict[str, str]] | None = None,
+    channel_id: str = "msteams",
+    service_url: str = "https://smba.trafficmanager.net/amer/x/",
+    include_reactions: bool = True,
+) -> dict[str, Any]:
+    body = _make_inbound(
+        text="",
+        conv_id=conv_id,
+        activity_id=activity_id,
+        service_url=service_url,
+    )
+    body["type"] = "messageReaction"
+    body["channelId"] = channel_id
+    body["replyToId"] = reply_to
+    body["conversation"]["tenantId"] = tenant_id
+    body["text"] = ""
+    if include_reactions:
+        if added is not None:
+            body["reactionsAdded"] = added
+        if removed is not None:
+            body["reactionsRemoved"] = removed
+        if added is None and removed is None:
+            body["reactionsAdded"] = [{"type": "like"}]
+    return body
+
+
+class TestMessageReaction:
+    def _client(self, monkeypatch: pytest.MonkeyPatch, adapter: Any) -> Any:
+        from fastapi.testclient import TestClient
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        adapter._http_client = MagicMock()
+        return TestClient(adapter.build_app())
+
+    def _seed(self, adapter: Any) -> None:
+        adapter._remember_bot_reply("reply-1", conversation_id="conv-1")
+        adapter._feedback_by_message_id["other-msg"] = {
+            "reaction": "like",
+            "feedback": "keep",
+            "conversation_id": "conv-other",
+            "user_oid": "someone",
+        }
+        inbound = _make_inbound(conv_id="conv-1", activity_id="user-act")
+        adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+
+    def _other(self, adapter: Any) -> dict[str, Any]:
+        return dict(adapter._feedback_by_message_id["other-msg"])
+
+    def test_add_records_feedback_and_emits_synthetic_event(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(added=[{"type": "LIKE"}]),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "acked", "reactions": 1}
+        rec = a._feedback_by_message_id["reply-1"]
+        assert rec["native_reactions"]["user-1"]["like"] == {
+            "action": "added",
+            "type": "like",
+        }
+        assert rec["conversation_id"] == "conv-1"
+        assert rec["reaction"] is None
+        assert len(a._handled_events) == 1
+        assert a._handled_events[0].text == "reaction:added:like"
+        assert a._handled_events[0].raw_message["type"] == "messageReaction"
+        assert a._conversations.get("conv-1").last_inbound_activity_id == "user-act"
+        assert self._other(a)["feedback"] == "keep"
+
+    def test_remove_and_existing_thumbs_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        a._feedback_by_message_id["reply-1"] = {
+            "reaction": "dislike",
+            "feedback": "too long",
+            "conversation_id": "conv-1",
+            "user_oid": "user-1",
+        }
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(
+                activity_id="react-remove",
+                removed=[{"type": "heart"}],
+            ),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200, response.text
+        rec = a._feedback_by_message_id["reply-1"]
+        assert rec["reaction"] == "dislike"
+        assert rec["feedback"] == "too long"
+        assert rec["native_reactions"]["user-1"]["heart"]["action"] == "removed"
+        assert a._handled_events[0].text == "reaction:removed:heart"
+        assert self._other(a)["feedback"] == "keep"
+
+    def test_add_then_remove_keeps_latest_action(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(
+                added=[{"type": "like"}],
+                removed=[{"type": "like"}],
+            ),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["reactions"] == 1
+        slot = a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]["like"]
+        assert slot["action"] == "removed"
+        assert [event.text for event in a._handled_events] == ["reaction:removed:like"]
+
+    def test_distinct_add_and_remove_both_emit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(
+                added=[{"type": "like"}],
+                removed=[{"type": "heart"}],
+            ),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["reactions"] == 2
+        slots = a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]
+        assert slots["like"]["action"] == "added"
+        assert slots["heart"]["action"] == "removed"
+        assert [event.text for event in a._handled_events] == [
+            "reaction:added:like",
+            "reaction:removed:heart",
+        ]
+
+    def test_replay_does_not_apply_twice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        body = _reaction_activity()
+        headers = {"Authorization": "Bearer a.b.c"}
+        first = client.post("/api/messages", json=body, headers=headers)
+        second = client.post("/api/messages", json=body, headers=headers)
+        assert first.json()["status"] == "acked"
+        assert second.json()["status"] == "duplicate"
+        assert len(a._handled_events) == 1
+        assert list(a._feedback_by_message_id) == ["other-msg", "reply-1"]
+        assert self._other(a)["feedback"] == "keep"
+
+    @pytest.mark.parametrize(
+        "mutate",
+        [
+            "drop-reply",
+            "reply-int",
+            "added-string",
+            "empty-type",
+            "colon-type",
+            "no-lists",
+            "empty-lists",
+            "entry-not-object",
+            "missing-tenant",
+        ],
+    )
+    def test_malformed_does_not_mutate(
+        self, monkeypatch: pytest.MonkeyPatch, mutate: str
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        body = _reaction_activity()
+        if mutate == "drop-reply":
+            body.pop("replyToId")
+        elif mutate == "reply-int":
+            body["replyToId"] = 12
+        elif mutate == "added-string":
+            body["reactionsAdded"] = "like"
+        elif mutate == "empty-type":
+            body["reactionsAdded"] = [{"type": "  "}]
+        elif mutate == "colon-type":
+            body["reactionsAdded"] = [{"type": "like:extra"}]
+        elif mutate == "no-lists":
+            body.pop("reactionsAdded")
+        elif mutate == "empty-lists":
+            body["reactionsAdded"] = []
+            body["reactionsRemoved"] = []
+        elif mutate == "entry-not-object":
+            body["reactionsAdded"] = ["like"]
+        elif mutate == "missing-tenant":
+            body["conversation"].pop("tenantId")
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["reason"] == "malformed"
+        assert "reply-1" not in a._feedback_by_message_id
+        assert a._handled_events == []
+        assert self._other(a)["feedback"] == "keep"
+
+    def test_cross_tenant_does_not_mutate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        body = _reaction_activity(tenant_id="aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa")
+        first = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        second = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert first.status_code == 403
+        assert first.json()["detail"] == "cross-tenant activity"
+        assert second.json()["status"] == "duplicate"
+        assert "reply-1" not in a._feedback_by_message_id
+        assert a._handled_events == []
+        assert self._other(a)["feedback"] == "keep"
+
+    def test_disagreeing_tenant_claims_fail_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        body = _reaction_activity()
+        body["channelData"] = {"tenant": {"id": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}}
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 403
+        assert "reply-1" not in a._feedback_by_message_id
+        assert self._other(a) == {
+            "reaction": "like",
+            "feedback": "keep",
+            "conversation_id": "conv-other",
+            "user_oid": "someone",
+        }
+
+    def test_unrelated_message_does_not_mutate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(reply_to="not-our-reply", activity_id="react-x"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200
+        assert response.json()["reason"] == "unrelated"
+        assert "not-our-reply" not in a._feedback_by_message_id
+        assert "reply-1" not in a._feedback_by_message_id
+        assert a._handled_events == []
+        assert self._other(a)["feedback"] == "keep"
+
+    def test_other_conversation_does_not_mutate(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        a._feedback_by_message_id["reply-1"] = {
+            "reaction": "like",
+            "feedback": "ours",
+            "conversation_id": "conv-1",
+            "user_oid": "user-1",
+        }
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(conv_id="conv-2", activity_id="react-other-conv"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["reason"] == "unrelated"
+        assert a._feedback_by_message_id["reply-1"]["feedback"] == "ours"
+        assert "native_reactions" not in a._feedback_by_message_id["reply-1"]
+        assert a._handled_events == []
+
+    def test_non_teams_channel_is_ignored(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(channel_id="webchat", activity_id="react-web"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["reason"] == "ignored"
+        assert "reply-1" not in a._feedback_by_message_id
+        assert a._handled_events == []
+
+    def test_service_url_and_auth_gates_precede_recording(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        untrusted = client.post(
+            "/api/messages",
+            json=_reaction_activity(service_url="https://attacker.example/"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        missing = client.post("/api/messages", json=_reaction_activity(activity_id="react-2"))
+        assert untrusted.status_code == 403
+        assert "untrusted serviceUrl" in untrusted.json()["detail"]
+        assert missing.status_code == 401
+        assert "reply-1" not in a._feedback_by_message_id
+        assert a._handled_events == []
+        assert self._other(a)["feedback"] == "keep"
+
+    def test_unauthorized_sender_does_not_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        a._allow_all_users = False
+        a._allowed_users = ("someone-else",)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(activity_id="react-denied"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 403
+        assert "reply-1" not in a._feedback_by_message_id
+        assert a._handled_events == []
+
+    def test_path_b_jwt_gate_still_records(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        bridge = adapter_mod._import_bridge()
+        a365 = AsyncMock(return_value={"iss": "nope"})
+        bf = AsyncMock(return_value={"iss": bridge.BF_ISSUER})
+        monkeypatch.setattr(bridge, "validate_inbound_jwt", a365)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", bf)
+        a._http_client = MagicMock()
+        from fastapi.testclient import TestClient
+
+        token = TestMessagesRoutePathBDispatch._make_unverifiable_token(bridge.BF_ISSUER)
+        response = TestClient(a.build_app()).post(
+            "/api/messages",
+            json=_reaction_activity(activity_id="react-b"),
+            headers={"Authorization": f"Bearer {token}"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["reactions"] == 1
+        bf.assert_awaited_once()
+        a365.assert_not_awaited()
+        assert a._handled_events[0].text == "reaction:added:like"
+
+    def test_message_update_is_still_a_user_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#122 stays out of scope: edits are not reaction handling."""
+        a = _make_adapter(monkeypatch)
+        client = self._client(monkeypatch, a)
+        body = _make_inbound(text="edited")
+        body["type"] = "messageUpdate"
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["status"] == "dispatched"
+        assert a._handled_events[0].text == "edited"
+
+    def test_reply_index_is_bounded_and_evicted_ids_do_not_record(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_CORRELATOR_ENTRIES", 2)
+        a = _make_adapter(monkeypatch)
+        a._remember_bot_reply("old", conversation_id="conv-1")
+        a._remember_bot_reply("mid", conversation_id="conv-1")
+        a._remember_bot_reply("new", conversation_id="conv-1")
+        assert list(a._bot_reply_ids) == ["mid", "new"]
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(reply_to="old", activity_id="react-old"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["reason"] == "unrelated"
+        assert a._feedback_by_message_id == {}
+        assert a._handled_events == []
+
+    def test_native_reaction_slots_are_bounded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_NATIVE_REACTIONS_PER_MESSAGE", 1)
+        a = _make_adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(
+                added=[{"type": "like"}, {"type": "heart"}],
+            ),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["reactions"] == 1
+        slots = a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]
+        assert list(slots) == ["heart"]
+        assert [event.text for event in a._handled_events] == ["reaction:added:heart"]
+
+    @pytest.mark.asyncio
+    async def test_teardown_drops_chat_reply_ids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._remember_bot_reply("reply-1", conversation_id="conv-1")
+        a._remember_bot_reply("reply-2", conversation_id="conv-2")
+        await a._teardown_chat_state("conv-1")
+        assert "reply-1" not in a._bot_reply_ids
+        assert a._bot_reply_ids["reply-2"]["conversation_id"] == "conv-2"
+
+    @pytest.mark.asyncio
+    async def test_send_remembers_connector_activity_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound())
+        )
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        response = MagicMock()
+        response.json.return_value = {"id": "bot-reply-9"}
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=response))
+        result = await a.send(chat_id="conv-1", content="hi")
+        assert result.success is True
+        assert a._bot_reply_ids["bot-reply-9"]["conversation_id"] == "conv-1"
+        assert a._bot_reply_ids["bot-reply-9"]["tenant_id"] == _TENANT
+
+    def test_normalize_reaction_identity(self) -> None:
+        assert adapter_mod._normalize_reaction_identity("  Heart ") == "heart"
+        assert adapter_mod._normalize_reaction_identity("like:no") is None
+        assert adapter_mod._normalize_reaction_identity("") is None
+        assert adapter_mod._normalize_reaction_identity(None) is None
+        assert adapter_mod._normalize_reaction_identity("x" * 65) is None

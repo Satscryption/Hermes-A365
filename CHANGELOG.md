@@ -4,6 +4,23 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **#80 — Teams `messageReaction` add/remove.** After the JWT, service URL,
+  end-user, and replay gates, a reaction is stored on the #73 feedback
+  record only when `replyToId` is a reply this process sent in the same
+  conversation and tenant. The record keeps the latest add/remove and the
+  normalized reaction type. Hermes' reaction convention emits
+  `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn) for
+  each stored change. Replayed, malformed, cross-tenant, and unrelated
+  reactions do not change another feedback record. The correlation map is
+  bounded and cleared with the feedback map, and a chat teardown drops
+  that chat's reply ids. Edits and deletes stay in #122.
+  A live Teams reaction round trip was not run here; it remains for the
+  #116 / #89 walks before this is treated as production-validated.
+
 ## [0.9.2] — 2026-10-19
 
 Publish smoke installs hash-pinned packaging from the requirements file.
