@@ -26,6 +26,14 @@ PyPI latest remains 0.9.0. This 0.9.2 patch is the fix-forward. The
 
 ### Fixed
 
+- **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
+  A handler crash, a file-consent crash, a deduped invoke, a decline, an
+  unknown file consent, and an operator-webhook error are HTTP 200 with a
+  JSON `{}` body on both runtimes. Teams reads that status as the invoke
+  status, so these paths do not return a 5xx, and it rejects a JSON `null`
+  invoke payload (`Payload cannot be null`). The plugin no longer answers
+  a handler crash with `500` and `{"error": "invoke handler error"}`.
+
 - **The publish smoke installs hash-pinned packaging from a requirements file.**
   pip accepts `--hash` only inside a requirements file, which is how
   "Install pinned build toolchain" already installs
