@@ -325,14 +325,27 @@ def test_live_0_9_0_section_still_parses() -> None:
 
 
 def test_live_0_9_1_section_still_parses() -> None:
-    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.1")
+    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    heading, body = mod.changelog_section(text, "0.9.1")
 
-    assert notes.version == "0.9.1"
-    assert notes.title == (
+    assert heading.startswith("## [0.9.1] \u2014 2026-10-19")
+    assert mod.release_title("v0.9.1", body) == (
         "v0.9.1 \u2014 Operator walk and release integrity (#124)."
     )
+    assert "main@24126496" in body
+
+
+def test_live_0_9_2_section_still_parses() -> None:
+    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.2")
+
+    assert notes.version == "0.9.2"
+    assert notes.title == (
+        "v0.9.2 \u2014 Publish smoke installs hash-pinned packaging from the requirements file."
+    )
     assert len(notes.title) <= mod.TITLE_LIMIT
-    assert "main@24126496" in notes.body
+    assert "v0.9.1" in notes.body
+    assert "never published to PyPI" in notes.body
+    assert "fix-forward" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 
@@ -197,13 +198,57 @@ def test_smoke_installs_hash_pinned_packaging_for_version_compare() -> None:
     command = smoke["run"]
     assert "--require-hashes" in command
     assert "--no-deps" in command
-    assert "packaging==26.2" in command
+    assert "publish-requirements.txt" in command
+    assert "packaging-smoke-requirements.txt" in command
     assert len(hashes) >= 2
-    assert all(digest in command for digest in hashes)
+    # Hashes stay in publish-requirements.txt. pip has no CLI --hash option.
+    assert not re.search(r"(?:^|\s)--hash(?:\s|=)", command)
+    assert all(digest not in command for digest in hashes)
     wheel_install, packaging_install = command.split("bin/pip\" install", maxsplit=2)[1:]
     assert "dist/*.whl" in wheel_install
     assert "--require-hashes" not in wheel_install
-    assert "packaging==26.2" in packaging_install
+    assert "-r " in packaging_install
+    assert "packaging-smoke-requirements.txt" in packaging_install
+    assert "packaging==" not in packaging_install
+
+
+def test_smoke_requirements_fragment_reuses_the_publish_pin(tmp_path: Path) -> None:
+    workflow = _workflow()
+    smoke = next(
+        step
+        for step in _steps(workflow["jobs"]["build"])
+        if step.get("name") == "Smoke-install the wheel"
+    )
+    match = re.search(r"python - <<'PY'\n(.*)\nPY\n", smoke["run"], re.DOTALL)
+    assert match is not None
+    previous = os.environ.get("RUNNER_TEMP")
+    cwd = Path.cwd()
+    os.environ["RUNNER_TEMP"] = str(tmp_path)
+    try:
+        os.chdir(_WORKFLOW_PATH.parents[2])
+        exec(compile(match.group(1), "packaging-smoke-pin", "exec"), {})
+    finally:
+        os.chdir(cwd)
+        if previous is None:
+            os.environ.pop("RUNNER_TEMP", None)
+        else:
+            os.environ["RUNNER_TEMP"] = previous
+
+    body = (tmp_path / "packaging-smoke-requirements.txt").read_text(encoding="utf-8")
+    requirements = (_WORKFLOW_PATH.parent / "publish-requirements.txt").read_text()
+    lines = requirements.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("packaging=="))
+    hashes: list[str] = []
+    for line in lines[start:]:
+        if line[:1].isalpha() and not line.startswith("packaging=="):
+            break
+        hashes.extend(re.findall(r"sha256:[0-9a-f]{64}", line))
+
+    assert body.startswith("packaging==26.2")
+    assert len(hashes) >= 2
+    assert all(digest in body for digest in hashes)
+    assert "pathspec==" not in body
+    assert "build==" not in body
 
 
 def test_called_test_workflow_keeps_python_3_14() -> None:
