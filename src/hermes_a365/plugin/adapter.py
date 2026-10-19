@@ -2089,7 +2089,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # body). Invokes never enter the agent loop, so bypassing the message
             # dedupe cannot double-fire it; when a side-effectful invoke name
             # lands, 19w-g adds per-name response replay. A handler crash
-            # returns the canonical empty ack (HTTP 200 + JSON null, #132),
+            # returns the canonical empty ack (HTTP 200 + JSON {}, #132),
             # never a 5xx — Teams reads the HTTP status as the invoke status.
             if str(activity.get("type") or "") == "invoke":
                 invoke_name = str(activity.get("name") or "")
@@ -7646,7 +7646,8 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.info(
                 "agent365 fileConsent action=%s consent=%s", action, consent_id[:8]
             )
-            # Benign ack: nothing to render. HTTP 200 + JSON null (#132).
+            # Benign ack: nothing to render. HTTP 200 + JSON {} (#132).
+            # Null is rejected by Teams ("Payload cannot be null").
             return invoke.empty_invoke_ack()
         if pending is None:
             # Consent we don't know about — restart dropped the in-memory map, a

@@ -2,7 +2,7 @@
 
 Teams reads an invoke's HTTP status as the invoke status and its body as
 the invokeResponse body. Failed invokes and benign acks are HTTP 200 with
-a JSON null body on both the serve runtime and the plugin runtime. This
+a JSON ``{}`` body on both the serve runtime and the plugin runtime. This
 test fails if those wires diverge.
 
 A retry of an idempotent local name such as ``task/fetch`` still re-renders
@@ -25,7 +25,7 @@ from test_agent365_plugin import _make_adapter, _make_inbound, adapter_mod
 
 from hermes_a365.invoke import empty_invoke_ack
 
-_CANONICAL = (200, b"null")
+_CANONICAL = (200, b"{}")
 _AUTH = {"Authorization": "Bearer a.b.c"}
 
 
@@ -142,7 +142,7 @@ def _plugin_outcome(outcome: str, monkeypatch: pytest.MonkeyPatch) -> tuple[int,
         first = client.post("/api/messages", json=activity, headers=_AUTH)
         second = client.post("/api/messages", json=activity, headers=_AUTH)
         assert _wire(first) == _CANONICAL
-        assert first.json() is None
+        assert first.json() == {}
         return _wire(second)
     if outcome == "handler_error":
 
@@ -190,7 +190,7 @@ def test_invoke_empty_ack_matches_across_runtimes(
     outcome: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     ack = empty_invoke_ack()
-    assert (ack.status, ack.body) == (200, None)
+    assert (ack.status, ack.body) == (200, {})
     serve = _serve_outcome(outcome)
     plugin = _plugin_outcome(outcome, monkeypatch)
     assert serve == plugin == _CANONICAL

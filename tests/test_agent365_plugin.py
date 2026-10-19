@@ -14278,7 +14278,8 @@ class TestInvokeRoute:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         # A handler crash degrades to the canonical empty ack (#132): HTTP 200
-        # + JSON null, the same wire serve uses. Never a 5xx (#97).
+        # + JSON {}, the same wire serve uses. Never a 5xx (#97), and never
+        # JSON null (Teams: "Payload cannot be null").
         a, client = self._client(monkeypatch)
 
         async def boom(ctx: Any) -> Any:
@@ -14291,8 +14292,8 @@ class TestInvokeRoute:
             headers={"Authorization": "Bearer a.b.c"},
         )
         assert r.status_code == 200
-        assert r.content == b"null"
-        assert r.json() is None
+        assert r.content == b"{}"
+        assert r.json() == {}
         assert a._handled_events == []
 
     def test_claims_wired_into_invoke_context(

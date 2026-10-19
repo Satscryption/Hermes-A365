@@ -3260,7 +3260,7 @@ async def send_reply(
 
 
 def _empty_invoke_ack_response() -> Any:
-    """Serialize ``empty_invoke_ack`` (#132): HTTP 200, JSON null body."""
+    """Serialize ``empty_invoke_ack`` (#132): HTTP 200, JSON ``{}`` body."""
     ack = empty_invoke_ack()
     return _JSONResponse(ack.body, status_code=ack.status)
 
@@ -3499,7 +3499,7 @@ def make_app(
             # card into the chat and then returns the {"status": ...} wrapper
             # marker as the invokeResponse body — the exact shape the dedupe
             # branch above exists to avoid. Degrade to the canonical empty
-            # ack (#132): HTTP 200 + JSON null, the same shape the dedupe
+            # ack (#132): HTTP 200 + JSON {}, the same shape the dedupe
             # branch returns and the plugin emits for a handler crash.
             # Teams reads a 5xx as "unable to reach app" (#97).
             if activity_type == "invoke":

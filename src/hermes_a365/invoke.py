@@ -55,16 +55,23 @@ class InvokeResponse:
 
 
 def empty_invoke_ack() -> InvokeResponse:
-    """HTTP 200 with a JSON null body — the shared no-real-response ack (#132).
+    """HTTP 200 with a JSON ``{}`` body — the shared no-real-response ack (#132).
 
     Teams reads the HTTP status as the invoke status and the body as the
-    invokeResponse body. A 5xx is "unable to reach app" (#97). When either
-    runtime has nothing real to return — a handler crash, a webhook error,
-    a deduped invoke, or a benign ack — both emit this shape. ``{}`` and
-    ``{"error": ...}`` are different wires and must not be used here. This
-    is the empty ack #96 established on serve.
+    invokeResponse body. A 5xx is "unable to reach app" (#97). A JSON null
+    body is also rejected (``Payload cannot be null``, Teams error 1008);
+    the Bot Framework Python SDK sends ``body={}`` for that case
+    (microsoft/teams-sdk#1961). File-consent decline, replay, and crash
+    acks use the same object a completed upload already returns, so a
+    retry after a successful accept does not look like a failed upload.
+
+    When either runtime has nothing real to return — a handler crash, a
+    webhook error, a deduped invoke, or a benign ack — both emit this
+    shape. ``{"error": ...}`` is a different wire and must not be used
+    here. #96 only requires that a deduped invoke not return the
+    ``{"status": "duplicate"}`` marker.
     """
-    return InvokeResponse(status=200, body=None)
+    return InvokeResponse(status=200, body={})
 
 
 @dataclass(frozen=True)
