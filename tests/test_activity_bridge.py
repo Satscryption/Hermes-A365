@@ -3230,7 +3230,7 @@ class TestServeAppUnroutable:
         ) as client:
             r = client.post("/api/messages", json=activity)
         assert r.status_code == 200
-        assert r.json() is None
+        assert r.json() == {}
         # No unsolicited error card posted into the conversation.
         assert capture["reply"] == []
 
@@ -3248,7 +3248,7 @@ class TestServeAppUnroutable:
         ) as client:
             r = client.post("/api/messages", json=activity)
         assert r.status_code == 200
-        assert r.json() is None
+        assert r.json() == {}
         assert capture["reply"] == []
 
     def test_routable_activity_still_forwards(self) -> None:
@@ -3358,9 +3358,10 @@ class TestServeAppDedupe:
         # First turn: the real unwrapped invokeResponse body.
         assert r1.status_code == 200
         assert r1.json() == {"text": "ok"}
-        # Retry: benign empty ack (null body), NOT the {status:duplicate} marker.
+        # Retry: benign empty ack ({}), NOT the {status:duplicate} marker.
+        # JSON null is rejected by Teams ("Payload cannot be null").
         assert r2.status_code == 200
-        assert r2.json() is None
+        assert r2.json() == {}
         # Webhook fired once — the retry did not re-forward.
         assert len(capture["webhook"]) == 1
 

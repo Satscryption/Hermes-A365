@@ -54,6 +54,26 @@ class InvokeResponse:
     body: dict[str, Any] | None = None
 
 
+def empty_invoke_ack() -> InvokeResponse:
+    """HTTP 200 with a JSON ``{}`` body — the shared no-real-response ack (#132).
+
+    Teams reads the HTTP status as the invoke status and the body as the
+    invokeResponse body. A 5xx is "unable to reach app" (#97). A JSON null
+    body is also rejected (``Payload cannot be null``, Teams error 1008);
+    the Bot Framework Python SDK sends ``body={}`` for that case
+    (microsoft/teams-sdk#1961). File-consent decline, replay, and crash
+    acks use the same object a completed upload already returns, so a
+    retry after a successful accept does not look like a failed upload.
+
+    When either runtime has nothing real to return — a handler crash, a
+    webhook error, a deduped invoke, or a benign ack — both emit this
+    shape. ``{"error": ...}`` is a different wire and must not be used
+    here. #96 only requires that a deduped invoke not return the
+    ``{"status": "duplicate"}`` marker.
+    """
+    return InvokeResponse(status=200, body={})
+
+
 @dataclass(frozen=True)
 class InvokeContext:
     """Everything a per-name invoke handler needs, assembled once per turn."""
@@ -215,7 +235,7 @@ async def dispatch_invoke(
 ) -> InvokeResponse:
     """Dispatch an ``InvokeContext`` to its registered handler, else the 501
     default. Never raises for an unknown name; a *handler's* own exception is
-    the caller's concern (the route wraps it into a graceful envelope)."""
+    the caller's concern (the route answers with ``empty_invoke_ack``)."""
     reg = INVOKE_REGISTRY if registry is None else registry
     handler = reg.get(ctx.name, default_invoke_handler)
     return await handler(ctx)
