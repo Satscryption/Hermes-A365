@@ -261,6 +261,19 @@ names, and **`a365.generated.config.json`** (gitignored) gains the
 blueprint appId, SP id, and the **client secret in plaintext** (DPAPI
 is Windows-only). Treat that file as keychain-equivalent sensitivity.
 
+⚠️ **Copy the blueprint secret before `setup permissions`.** On current
+GA CLI builds, `a365 setup permissions mcp` rewrites
+`a365.generated.config.json` and **drops** `agentBlueprintClientSecret`
+that `setup blueprint` wrote moments earlier (same family as publish
+clobbering the secret — Microsoft#408). The CLI also prints the new
+secret to stdout only once. Immediately after a successful
+`setup blueprint`, copy the value into `A365_BLUEPRINT_CLIENT_SECRET` in the
+**profile** `~/.hermes/.env` (required for the gateway plugin) **before**
+running `setup permissions mcp` / `bot`. For `activity-bridge serve` only,
+you may instead move the secret into the OS keychain per README — the
+gateway still needs the profile `.env` export. Recovery without a saved copy
+is `az ad app credential reset --append` on the blueprint app.
+
 Failure modes to watch:
 
 - **`agentBlueprintClientSecret: null` on disk despite "Client secret
@@ -397,7 +410,7 @@ would discard.
 > **Path B note (Custom Engine Agent, GA v0.6.0):**
 > `hermes-a365 publish --copilot-chat` (optionally combined with
 > `--aiteammate`) post-processes the emitted zip into a Custom
-> Engine Agent manifest (`manifestVersion: "1.21"` + `bots[]` +
+> Engine Agent manifest (`manifestVersion: "1.27"` + `bots[]` +
 > `copilotAgents.customEngineAgents`) for Microsoft Admin Portal →
 > Agents upload + Copilot Chat surfacing. **The full Path B walk lives
 > in §11** — it additionally needs an Azure subscription + an Azure Bot
@@ -835,6 +848,18 @@ ln -s ~/a365.generated.config.json ~/.config/a365/a365.generated.config.json
 hermes gateway run
 ```
 
+When running a **named profile** (`hermes gateway run --profile <slug>`),
+current Hermes Agent builds may refuse with "Profile does not get a gateway
+of its own" (one gateway per host). Set `gateway.standalone: true` in that
+**named profile's** `~/.hermes/profiles/<slug>/config.yaml` — Hermes does
+not read `gateway.standalone` from the default profile's
+`~/.hermes/config.yaml` when `--profile <slug>` is set (#124 D28). Use this
+as a temporary shim so the gateway binds for that profile. The multiplexed
+host gateway in the default profile serving the agent365 profile is the
+long-term model; while a standalone profile gateway is up it runs **that
+profile's** cron scheduler only — the default profile's scheduler stays with
+the host gateway when one is running there.
+
 The gateway should:
 
 1. Discover the plugin via the `hermes_agent.plugins` entry-point scan.
@@ -1201,7 +1226,8 @@ MCP-platform messaging endpoint is not a classic Teams bot identity.
    reads `A365_BF_APP_ID` from `~/.hermes/.env`.)
 4. Publish and upload with the **same** BF app id (`--copilot-chat` only —
    no `--aiteammate`; the CEA zip is the in-place CLI emit, typically
-   `~/manifest/manifest.zip`):
+   `<cwd>/manifest/manifest.zip` — the GA CLI uses the current working
+   directory when `deploymentProjectPath` is unset):
 
    ```bash
    hermes-a365 publish \
@@ -1273,7 +1299,8 @@ Operator rules:
 
 - **First Hermes re-upload** of a CEA already in MAC (no local state
   yet): pass `--app-version X.Y.Z` strictly above the version MAC shows
-  for that app.
+  for that app (including when MAC already holds the **same** version as
+  the CLI template — equal versions are rejected too).
 - **Later updates** to the same MAC entry: reuse a stable
   `--manifest-id <guid>` (or omit `auto`) so state tracks
   `lastAppVersion`; then `publish --copilot-chat --apply` patch-bumps
@@ -1411,7 +1438,10 @@ Operator walk:
    per-agent `~/.hermes/agents/<slug>/.env`:
 
    ```bash
-   hermes-a365 instance create <slug> --apply
+   hermes-a365 instance create <slug> \
+       --owner <owner-email> \
+       --owner-aad-id <owner-aad-id> \
+       --apply
    ```
 
 5. **Restart the Hermes gateway** so the new `BridgeConfig` is
@@ -1642,7 +1672,7 @@ rotation.
 
 ### 11.6 — Publish the Custom Engine Agent manifest
 
-Emit the `manifestVersion: 1.21+` zip using the `--copilot-chat`
+Emit the `manifestVersion: 1.27` zip using the `--copilot-chat`
 flag (slice 19u-a, v0.4.0+), and pass `--bot-id <bf-app-id>` so the
 zip's `bots[]` block references the Path B identity (NOT the
 blueprint, which is the GA CLI's default extraction target):
@@ -1653,24 +1683,25 @@ hermes-a365 publish \
     --tenant-id <tenant-id> \
     --copilot-chat \
     --bot-id <bf-app-id> \
-    --manifest-id auto \
     --apply
 ```
 
 The wrapper post-processes the GA CLI's emitted zip: sets
-`manifestVersion: "1.21"`, populates `bots[]` referencing
+`manifestVersion: "1.27"`, populates `bots[]` referencing
 `<bf-app-id>` (when `--bot-id` is passed; otherwise extracts from the
 manifest, which defaults to the blueprint app on Path A walks), adds
 the `copilotAgents.customEngineAgents` block, strips
 `agenticUserTemplates` from `manifest.json`, omits the
 AI-Teammate template sidecar from the CEA zip, and can set
 `manifest.id` independently of `bots[0].botId` via
-`--manifest-id auto|<guid>`. The 19r-c `name.short` truncation to
+`--manifest-id <guid>` (or omit for the stable default catalog id). The
+19r-c `name.short` truncation to
 ≤30 chars runs against this zip too; in combined
 `--aiteammate --copilot-chat` mode the Copilot Chat zip also gets a
 short-name `CC` suffix so both catalog entries are distinguishable.
-Output lands at `~/manifest/manifest.copilot-chat.zip` (or
-`~/manifest/manifest.zip` when run without `--aiteammate`).
+Path-B-only output lands at `<cwd>/manifest/manifest.zip` (combined
+`--aiteammate --copilot-chat` also emits a sibling
+`manifest.copilot-chat.zip` under the same directory).
 
 ⚠️ **Make sure you're running the right `hermes-a365` binary** —
 Phase 2 walk found that `pipx install hermes-a365` lands an older
@@ -1681,12 +1712,11 @@ the pipx one first because PATH puts `~/.local/bin` before
 explicitly (`~/.hermes/hermes-agent/venv/bin/hermes-a365 publish ...`)
 or `pipx upgrade hermes-a365` before running this step.
 
-When publishing both Path A and Path B against the same tenant, use
-`--manifest-id auto` on the Copilot Chat path. This mints a fresh
-Teams App Catalog id for the CEA zip while leaving
-`bots[0].botId = <bf-app-id>`, avoiding the duplicate-id rejection
-seen during the 2026-05-12 walk. `--manifest-id <guid>` is also
-available when a stable catalog id is required for repeat uploads.
+When publishing both Path A and Path B against the same tenant, reserve
+`--manifest-id auto` for the combined `--aiteammate --copilot-chat`
+path (sibling `manifest.copilot-chat.zip`). For Path-B-only publishes
+you intend to update in place via MAC **Update in store**, omit `auto`
+and reuse the stable catalog `manifest.id` from the first upload (§11.0).
 
 The wrapper parser now handles emitted zip paths that contain spaces
 (for example the live `Hermes A365` workspace path), so the transform
@@ -1716,12 +1746,22 @@ load-bearing one for Copilot Chat surfacing.
    (MAC).
 2. Left nav: **Agents** (you may need to expand the side menu).
 3. Click **Upload custom agent**.
-4. Select the `manifest.copilot-chat.zip` from §11.6.
+4. Select the `manifest.zip` from §11.6 (`<cwd>/manifest/manifest.zip`
+   for Path-B-only publish).
 5. Step through the review screens. When asked who the agent is
    available to, pick **Just me** for the first test (assigns only
    to your account; broader scopes work but pollute the tenant if
    anything goes wrong).
 6. Click **Deploy** / **Finish**.
+
+**Updating an agent already in MAC (#109, walk-validated 2026-10-19).**
+For a newer package of the **same** custom agent (stable `manifest.id`),
+open the agent in MAC → **Update in store**, upload the new zip from
+§11.6, and finish the wizard. There is **no assignment step** on update —
+the prior scope carries over. After an update, the **Users** tab can show
+empty ("This agent needs to be installed") even when Copilot Chat / Teams
+still route to the agent for users who already had it (#124 walk gen3);
+re-check behaviour before assuming the assignment was dropped.
 
 Per-user app permission policy is auto-assigned via the **Just me** /
 **Specific users** picker — no separate Teams Admin Center step is
@@ -1752,6 +1792,10 @@ different M365 Copilot affordances, on different propagation timelines:
   Operator clicks **Add**, then the agent shows in the active agents
   picker, can be opened or @ -mentioned, and the conversation routes
   through Azure Bot Service → bot endpoint.
+
+**Teams first contact (#124 D32).** The first message in a Teams personal
+chat may show a Hermes "home channel" first-run notice before the agent's
+reply. It is expected UX, not a routing failure.
 
 Steps (assuming Copilot Chat propagation has completed):
 

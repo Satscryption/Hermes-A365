@@ -204,6 +204,15 @@ this skill handles.** Where it lives + how to keep it that way:
   disk despite reporting success). `register --apply --auto-recover-secret`
   detects this and runs `az ad app credential reset --append` to mint
   a fresh secret in-place. Use the flag whenever you're not on Windows.
+- **`setup permissions` clobbers the blueprint secret (D24).** After
+  `a365 setup blueprint`, copy `agentBlueprintClientSecret` into
+  `A365_BLUEPRINT_CLIENT_SECRET` in the profile `~/.hermes/.env` **before**
+  `setup permissions mcp` / `bot` — the **gateway plugin** resolves Path A
+  from that file (not from keychain alone). Those permission steps rewrite
+  `a365.generated.config.json` and drop the field the blueprint step wrote.
+  Keychain storage is an alternative for **`activity-bridge serve`** via the
+  secrets provider; it does not replace the profile `.env` for `hermes gateway
+  run`.
 
 ### Secrets at rest
 
@@ -581,7 +590,9 @@ public HTTPS tunnel to `/api/messages`. Full walk:
 
 ```bash
 # 1. Path B Entra app + BF secret in ~/.hermes/.env (portal or az).
-#    Re-run instance create so the per-agent .env picks up A365_BF_*.
+hermes a365 instance create <slug> \
+    --owner <email> --owner-aad-id <oid> --apply
+#    (--apply required so A365_BF_* copy into ~/.hermes/agents/<slug>/.env)
 
 # 2. Azure Bot Service bound to the BF app (not the blueprint app id).
 hermes a365 bot-service create \
@@ -603,17 +614,20 @@ hermes a365 activity-bridge update-endpoint \
 hermes a365 publish --agent-name "Inbox Helper" \
     --tenant-id "<tenant-guid>" \
     --copilot-chat --bot-id <bf-app-id> --apply
-# Upload ~/manifest/manifest.zip at MAC → Agents → Upload custom agent.
-# Re-uploads: stable manifest.id + copilot-chat-publish.json state enables
-# auto patch-bump; first update of an app already in MAC needs --app-version.
+# Upload <cwd>/manifest/manifest.zip at MAC → Agents → Upload custom agent.
+# Re-uploads: MAC → agent → Update in store (no assignment step).
+# Stable manifest.id + copilot-chat-publish.json state enables auto
+# patch-bump; first Hermes re-upload when MAC already holds equal/higher
+# version needs --app-version strictly above MAC.
 
-# 5. Same runtime as Path A
+# 5. Gateway (see §9d.3 if --profile is refused: gateway.standalone: true)
 hermes gateway run --profile inbox-helper
 ```
 
-Skipping step 2 or publishing without `--bot-id <bf-app-id>` leaves
-`bots.botId` on the blueprint and surfaces **"Invalid bot"** in Teams
-(#117).
+Skipping step 2 (`bot-service create`) while still passing
+`--bot-id <bf-app-id>` registers a BF app id that was never provisioned in
+Azure. Omitting `--bot-id` leaves `bots.botId` on the blueprint app and
+surfaces **"Invalid bot"** in Teams (#117).
 
 ## Operator setup
 

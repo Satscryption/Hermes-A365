@@ -43,7 +43,7 @@ only **one** of them carries the `1.21` pin:
 | Track | Wrapper command | Shape | `manifestVersion` | Who authors the version |
 |---|---|---|---|---|
 | **Path A — AI Teammate** | `publish --aiteammate` | `agenticUserTemplates` block | `devPreview` | the GA `a365` CLI emits it; the wrapper passes it through untouched |
-| **Path B — Custom Engine Agent** | `publish --copilot-chat` | `bots` + `copilotAgents.customEngineAgents` | **`1.21`** (`_COPILOT_CHAT_MANIFEST_VERSION`) | the wrapper, in `_transform_manifest_to_copilot_chat` |
+| **Path B — Custom Engine Agent** | `publish --copilot-chat` | `bots` + `copilotAgents.customEngineAgents` | **`1.27`** (`_COPILOT_CHAT_MANIFEST_VERSION`) | the wrapper, in `_transform_manifest_to_copilot_chat` |
 
 Crucially, the Copilot Chat transform **strips `agenticUserTemplates`**
 (`publish.py`, in `_transform_manifest_to_copilot_chat`) because it is the
@@ -83,12 +83,13 @@ reused unchanged. `--manifest-id auto` mints a new catalog id each run, so
 state never matches and no automatic bump occurs — use a stable
 `--manifest-id <guid>` for in-place MAC updates. Operators may always pass
 `--app-version X.Y.Z` (required for the first Hermes re-upload when MAC
-already holds a higher version than the CLI template); the override must
-still beat the recorded last publish when state exists.
+already holds an **equal or higher** app `version` than the CLI template —
+Microsoft rejects equal too); the override must still beat the recorded last
+publish when state exists.
 
 ## Current state in the wrapper
 
-`_COPILOT_CHAT_MANIFEST_VERSION = "1.21"` has exactly **three** internal use
+`_COPILOT_CHAT_MANIFEST_VERSION = "1.27"` has exactly **three** internal use
 sites and no cross-module consumers:
 
 - `publish.py` — the constant definition
@@ -96,8 +97,8 @@ sites and no cross-module consumers:
 - `publish.py` — the apply-summary `"manifest_version"` line (operator-facing only)
 
 So the constant is fully internal; moving it is a localized edit guarded by
-the existing tests (`test_bumps_manifest_version_to_1_21` and the
-integration assertions that pin `manifestVersion == "1.21"`).
+the existing tests (`test_bumps_manifest_version_to_1_27` and the
+integration assertions that pin `manifestVersion == "1.27"`).
 
 ## Is `1.21` still accepted?
 

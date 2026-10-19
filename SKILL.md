@@ -32,17 +32,19 @@ cannot reach:
   directory, in the "Built for your org" picker, in M365 People
   search, and in agentic-user audit trails. Teams 1:1 chat with
   M365-native identity. No Azure subscription required.
-- **Path B — Custom Engine Agent (Azure Bot Service + 1.21 manifest):**
+- **Path B — Custom Engine Agent (Azure Bot Service + 1.27 manifest):**
   the Hermes agent appears in M365 Copilot Chat's agents picker, in
   Copilot side-panels inside Word / Excel / PowerPoint / Outlook,
   and reaches the Copilot fabric's invoke surfaces (Microsoft Search,
-  Outlook compose-action). Requires an Azure subscription so the
-  blueprint Entra app can be registered as an Azure Bot Service
-  resource.
+  Outlook compose-action). Requires an Azure subscription and a
+  **separate non-agentic Entra app** registered in Azure Bot Service;
+  the CEA manifest's `bots.botId` must be that Bot Framework app id
+  (the blueprint app cannot mint BF S2S tokens — `AADSTS82001`).
 
-Both paths share the same blueprint Entra app + service principal +
-bot endpoint, and operators with both prerequisites can run both
-surfaces from one Hermes-A365 install.
+Both paths share the same Path A blueprint Entra app + `/api/messages`
+handler; Path B adds its own BF identity and Bot Service registration.
+Operators with both prerequisites can run both surfaces from one
+Hermes-A365 install.
 
 **Distinct from Hermes' sibling Teams adapter** at
 `plugins/platforms/teams/adapter.py` (shipped v2026.4.30 + in-flight
@@ -249,7 +251,7 @@ follows the M365-ecosystem path:
   per-user under Agent 365 admin centre. Surfaces in Teams 1:1
   "Built for your org".
 - **`--copilot-chat`** (Path B, slice 19u-a in v0.4.0) — emits a
-  **Custom Engine Agent** manifest (`manifestVersion: "1.21"`,
+  **Custom Engine Agent** manifest (`manifestVersion: "1.27"`,
   `bots` + `copilotAgents.customEngineAgents` blocks). Upload at
   **Teams Admin Center → Manage apps → Upload + assign per-user
   policy**. Surfaces in M365 Copilot Chat's agents picker + Copilot
@@ -272,11 +274,11 @@ auto-truncate (slice 19r-c) applies to both flavours. Channel
 deployment is **operator-side** in all cases.
 
 > **Path B additionally requires Azure Bot Service registration**
-> of the blueprint Entra app with the Microsoft Teams channel
-> enabled — otherwise Microsoft's routing layer won't forward
-> Copilot Chat activities to `/api/messages` regardless of manifest
-> shape. See `references/m365-surface-coverage.md` for the
-> prerequisite detail.
+> bound to the **separate** `A365_BF_APP_ID` Entra app (Microsoft Teams
+> channel enabled) and `publish --bot-id <bf-app-id>` — registering the
+> blueprint as the bot identity leaves **Invalid bot** in Teams. See
+> `references/m365-surface-coverage.md` and `references/live-tenant-test.md`
+> §11 for the prerequisite detail.
 
 ### `hermes a365 status [<slug>]`
 
