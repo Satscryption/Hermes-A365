@@ -102,6 +102,19 @@ def test_bridge_and_dev_keep_security_floors() -> None:
     assert "| `idna` | `>=3.15` |" in note
 
 
+def test_handoff_contract_pin_names_hermes_session_apis() -> None:
+    """#82 — the documented floor is the fail-closed gateway_session_id pin."""
+    text = NOTE.read_text()
+    assert "75efd73961a88a531276d0e2e1cd30d1ec18019e" in text
+    assert "00ce5f04d9cfad2e30d5e08e7a6bf135f6e53030" in text
+    assert "d39c62409b5f00da6f7bd31dd3fb437d8c2daad6" in text
+    assert "session_store.switch_session" in text
+    assert 'metadata["gateway_session_id"]' in text
+    assert "find_session_by_origin" in text
+    assert "v2026.7.20" in text
+    assert "does not call `reopen_session`" in text
+
+
 def test_docs_show_the_override_install_and_upstream_issue() -> None:
     for path in (NOTE, README, CHANGELOG):
         text = path.read_text()

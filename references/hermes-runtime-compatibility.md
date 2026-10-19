@@ -142,3 +142,39 @@ This repository's CI runs ruff and the full pytest suite on Python 3.11
 and Python 3.14. That proves this package on the Hermes runtime. It does
 not, by itself, prove the combined Hermes resolve; the override above is
 what makes that resolve succeed while the upstream pins remain.
+
+## Copilot→Teams session pin (#82)
+
+Continuation tokens rebind a Teams 1:1 onto the Copilot Hermes session by
+emitting an internal `MessageEvent` whose `metadata["gateway_session_id"]`
+is that session id. Hermes then calls `session_store.switch_session`. The
+adapter resolves the id with `SessionDB.find_session_by_origin` and
+refuses the pin unless `get_session` still shows that same live row.
+
+`switch_session` reopens its target. This package therefore does not
+dispatch when the row is missing, has `ended_at` set, or carries an
+explicit end reason (`session_reset`, `user_exit`, `session_switch`,
+`new_session`). It does not call `reopen_session`.
+
+Minimum upstream commit that contains all three of those symbols and the
+fail-closed pin (do not inject into an ended session):
+
+`75efd73961a88a531276d0e2e1cd30d1ec18019e` (2026-07-08,
+`fix(gateway): never resurrect ended sessions for delegation completions`).
+
+That commit sits on top of:
+
+| Piece | Commit |
+|---|---|
+| `session_store.switch_session` | `00ce5f04d9cfad2e30d5e08e7a6bf135f6e53030` |
+| `MessageEvent` `metadata["gateway_session_id"]` | `d39c62409b5f00da6f7bd31dd3fb437d8c2daad6` |
+| `SessionDB.find_session_by_origin` | present by `d39c62409` (then in `hermes_state.py`; later `hermes_state_sessions.py`) |
+
+First tagged Hermes release that contains the pin: `v2026.7.20`.
+Current `main` still honors `gateway_session_id` from
+`gateway/run_turn_prepare.py`. Idle-ended pins on newer Hermes can
+retarget to the destination's current row; this adapter does not dispatch
+those, so the retarget does not run.
+
+The upstream surface is not a stable third-party adapter API. A live
+Copilot Chat → Teams 1:1 round trip is residual for #116 / #89.

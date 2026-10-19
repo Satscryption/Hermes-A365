@@ -526,6 +526,19 @@ _MAX_FEEDBACK_TEXT_BYTES = 2048
 _MAX_FEEDBACK_CACHE_BYTES = 256 * 1024
 _CARD_CAPABILITY_TTL_SEC = 900.0
 
+# #82 — one-time Copilot→Teams continuation. Same window as a card capability:
+# an unclicked link cannot rebind a session after it expires.
+_HANDOFF_TOKEN_TTL_SEC = 900.0
+# Hermes refuses to pin a row the user explicitly ended, because
+# ``switch_session`` reopens its target. These are the user-boundary reasons
+# in ``gateway/run.py`` (``_USER_BOUNDARY_END_REASONS``) at the contract pin.
+# Any ``ended_at`` is also refused — idle and compression ends included — so
+# this adapter never asks the gateway to resurrect a closed row.
+_HANDOFF_EXPLICIT_END_REASONS = frozenset(
+    {"session_reset", "user_exit", "session_switch", "new_session"}
+)
+
+
 # L2 (#105): cap the per-lifetime "seen this chat" set so a long-running
 # gateway can't grow it without limit. Generous — it only holds chat-id
 # strings and drives first-message detection; over-cap eviction just re-treats
@@ -1723,11 +1736,13 @@ class Agent365Adapter(BasePlatformAdapter):
         self._bot_reply_ids: dict[str, dict[str, str]] = {}
 
         # #82 — Copilot→Teams handoff. Maps a minted continuation token ->
-        # {"conversation_id", "chat_type", ...} so a ``handoff/action`` invoke
-        # (fired when the user clicks the "continue in Teams" deep link) can
-        # resolve the originating CC session. In-memory + per-lifetime — a
-        # restart drops tokens and the deep link simply lands in a fresh 1:1.
+        # the origin conversation, tenant, Entra object id, and live Hermes
+        # session id. In-memory + per-lifetime — a restart drops tokens and
+        # the deep link acks without rebinding. ``_handoff_dispatch_tasks``
+        # are the post-ack pins; disconnect cancels anything still queued.
         self._handoff_tokens: dict[str, dict[str, Any]] = {}
+        self._handoff_dispatch_tasks: set[asyncio.Task[Any]] = set()
+
 
         # #73(c)/#82 — per-instance invoke registry: the shared #18 table plus
         # adapter-bound children that need adapter state (feedback map / handoff
@@ -3410,6 +3425,12 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_status_tasks.clear()
         self._coalesced_status.clear()
         # #73(c)/#82/#80 — drop per-lifetime correlator maps on disconnect.
+        # Cancel a pin that has not entered ``handle_message`` yet so a
+        # token consumed during shutdown cannot rebind after the adapter
+        # has dropped its conversation cache.
+        for task in list(self._handoff_dispatch_tasks):
+            task.cancel()
+        self._handoff_dispatch_tasks.clear()
         self._feedback_by_message_id.clear()
         self._bot_reply_ids.clear()
         self._handoff_tokens.clear()
@@ -8398,48 +8419,358 @@ class Agent365Adapter(BasePlatformAdapter):
         with_link = f"{content}\n\n[Continue in Teams]({link})"
         return with_link if len(with_link) <= self.MAX_MESSAGE_LENGTH else content
 
+    def _handoff_user_aad(self, ref: ConversationRef) -> str:
+        """Entra object id for the Copilot sender, or empty.
+
+        ``from.id`` is a channel account and differs between Copilot
+        (``19:…``) and a Teams 1:1 (``a:…`` / ``29:…``). Only
+        ``aadObjectId`` can prove the click is the same person.
+        """
+        raw = ref.raw if isinstance(ref.raw, dict) else {}
+        sender = raw.get("from") if isinstance(raw.get("from"), dict) else {}
+        return _normalized_token(sender.get("aadObjectId"))
+
+    def _handoff_tenant(self, ref: ConversationRef) -> str:
+        """Origin tenant, or empty when it is missing or not this adapter's."""
+        tenant = _normalized_token(ref.tenant_id)
+        adapter_tenant = _normalized_token(self.tenant_id)
+        if not tenant or not adapter_tenant or tenant != adapter_tenant:
+            return ""
+        return tenant
+
+    def _open_handoff_session_db(self) -> Any | None:
+        """SessionDB for origin resolution, or None when Hermes isn't there.
+
+        Tests inject ``_handoff_session_db_opener``. Production uses
+        ``hermes_state_registry.acquire`` — the same handle
+        ``SessionDB.find_session_by_origin`` is called with. Import and
+        acquire failures fail closed (no session id) rather than minting a
+        pin we cannot re-check.
+        """
+        opener = getattr(self, "_handoff_session_db_opener", None)
+        if opener is not None:
+            try:
+                return opener()
+            except Exception:
+                logger.warning("agent365 handoff session lookup failed", exc_info=True)
+                return None
+        try:
+            from hermes_state_registry import acquire
+        except ImportError:
+            return None
+        try:
+            return acquire()
+        except Exception:
+            logger.warning("agent365 handoff session lookup failed", exc_info=True)
+            return None
+
+    def _close_handoff_session_db(self, db: Any) -> None:
+        if db is None:
+            return
+        # An injected opener owns its handle. Do not pass that object to
+        # Hermes' registry release.
+        if getattr(self, "_handoff_session_db_opener", None) is not None:
+            closer = getattr(self, "_handoff_session_db_closer", None)
+            if closer is not None:
+                try:
+                    closer(db)
+                except Exception:
+                    logger.debug("agent365 handoff session db close failed", exc_info=True)
+            return
+        try:
+            from hermes_state_registry import release_or_close
+        except ImportError:
+            return
+        try:
+            release_or_close(db)
+        except Exception:
+            logger.debug("agent365 handoff session db close failed", exc_info=True)
+
+    def _origin_session_row_is_live(
+        self,
+        row: Any,
+        *,
+        conversation_id: str,
+        user_id: str,
+    ) -> bool:
+        """True only for a live origin row this adapter may pin.
+
+        ``ended_at`` or an explicit end reason refuses the row.
+        ``switch_session`` would reopen it. The row's chat, platform, and
+        user must be the Copilot origin — ``find_session_by_origin`` can
+        return the only live row even when the user id does not match, and
+        that fallthrough must not bind another person's session.
+        """
+        if not isinstance(row, dict):
+            return False
+        if row.get("ended_at") is not None:
+            return False
+        if str(row.get("end_reason") or "") in _HANDOFF_EXPLICIT_END_REASONS:
+            return False
+        if str(row.get("chat_id") or "") != conversation_id:
+            return False
+        platform = str(getattr(self.platform, "value", "") or "")
+        source = str(row.get("source") or "")
+        if not platform or source.lower() != platform.lower():
+            return False
+        if str(row.get("user_id") or "") != user_id:
+            return False
+        if not str(row.get("session_key") or ""):
+            return False
+        return bool(str(row.get("id") or ""))
+
+    def _lookup_live_origin_session(
+        self,
+        *,
+        conversation_id: str,
+        user_id: str,
+        expected_session_id: str | None = None,
+    ) -> str | None:
+        """Live Hermes session id for this Copilot origin, or None.
+
+        ``expected_session_id`` must be that same row. A missing db, a
+        missing method, a different id, or a row that is not live fails
+        closed. This method never calls ``switch_session`` or
+        ``reopen_session``.
+        """
+        if not conversation_id or not user_id:
+            return None
+        platform = str(getattr(self.platform, "value", "") or "")
+        if not platform:
+            return None
+        db = self._open_handoff_session_db()
+        if db is None:
+            return None
+        try:
+            finder = getattr(db, "find_session_by_origin", None)
+            getter = getattr(db, "get_session", None)
+            if not callable(finder) or not callable(getter):
+                return None
+            try:
+                found = finder(platform=platform, chat_id=conversation_id, user_id=user_id)
+            except Exception:
+                logger.warning("agent365 handoff origin lookup failed", exc_info=True)
+                return None
+            if not found:
+                return None
+            found = str(found)
+            if expected_session_id is not None and found != expected_session_id:
+                return None
+            try:
+                row = getter(found)
+            except Exception:
+                logger.warning("agent365 handoff session read failed", exc_info=True)
+                return None
+            if not self._origin_session_row_is_live(
+                row, conversation_id=conversation_id, user_id=user_id
+            ):
+                return None
+            return found
+        finally:
+            self._close_handoff_session_db(db)
+
+    def _handoff_token_expired(self, record: dict[str, Any]) -> bool:
+        minted = record.get("minted_at")
+        if isinstance(minted, bool) or not isinstance(minted, (int, float)):
+            return True
+        return (time.time() - float(minted)) > _HANDOFF_TOKEN_TTL_SEC
+
+    def _handoff_identity_matches(self, record: dict[str, Any], ctx: invoke.InvokeContext) -> bool:
+        """Same tenant and same Entra user as the token, or refuse.
+
+        Empty identity on either side fails closed. A claim and an activity
+        field that name different tenants or users also fails closed — the
+        activity body is not a second factor, but it must not contradict
+        the identity the token was minted for.
+        """
+        token_tenant = _normalized_token(record.get("tenant_id"))
+        invoke_tenant = _normalized_token(ctx.tenant_id)
+        adapter_tenant = _normalized_token(self.tenant_id)
+        token_user = _normalized_token(record.get("user_aad"))
+        invoke_user = _normalized_token(ctx.user_oid)
+        if not (token_tenant and invoke_tenant and adapter_tenant and token_user and invoke_user):
+            return False
+        if token_tenant != invoke_tenant or token_tenant != adapter_tenant:
+            return False
+        if token_user != invoke_user:
+            return False
+        sender = ctx.activity.get("from")
+        sender = sender if isinstance(sender, dict) else {}
+        activity_user = _normalized_token(sender.get("aadObjectId"))
+        if activity_user and activity_user != token_user:
+            return False
+        activity_tenant = _normalized_token(ctx.conv.get("tenantId"))
+        return not activity_tenant or activity_tenant == token_tenant
+
     def _mint_handoff_link(self, chat_id: str, *, reason: str) -> str | None:
         """#82: mint a continuation token bound to ``chat_id`` and return the
         deep link, or None if we can't resolve the conversation. Used to append
-        a "continue in Teams" affordance to a degraded Copilot Chat reply."""
+        a "continue in Teams" affordance to a degraded Copilot Chat reply.
+
+        The token stores the live Hermes session id for that Copilot origin
+        when ``SessionDB.find_session_by_origin`` returns one that is still
+        open for this tenant and Entra user. A miss still mints the link —
+        the click acks and does not rebind.
+        """
         ref = self._conversations.get(chat_id)
         if ref is None:
             return None
+        tenant_id = self._handoff_tenant(ref)
+        user_aad = self._handoff_user_aad(ref)
+        session_id = ""
+        if tenant_id and user_aad:
+            session_id = (
+                self._lookup_live_origin_session(conversation_id=chat_id, user_id=user_aad) or ""
+            )
         token = uuid.uuid4().hex
         self._handoff_tokens[token] = {
             "conversation_id": chat_id,
             "chat_type": ref.chat_type,
-            "tenant_id": ref.tenant_id,
+            "tenant_id": tenant_id,
+            "user_aad": user_aad,
+            "hermes_session_id": session_id,
             "reason": reason,
+            "minted_at": time.time(),
         }
         _bound_map(self._handoff_tokens)
         return self._handoff_deep_link(token)
 
-    async def _handle_handoff_action(
-        self, ctx: invoke.InvokeContext
-    ) -> invoke.InvokeResponse:
-        """#82 (foundation only): ``handoff/action`` — the user clicked a
-        continuation deep link, so Teams opened a 1:1 and handed us the token.
+    def _remember_handoff_destination(self, ctx: invoke.InvokeContext) -> None:
+        """Cache the Teams 1:1 so the pinned turn's reply has a serviceUrl.
 
-        Scope of THIS handler: validate + consume the continuation token (reject
-        unknown/spoofed) and ack so Teams completes the handoff. It does **not**
-        yet bridge the Copilot session into the Teams conversation — the agent
-        lands in a fresh Teams turn. Actual session-context import needs a
-        Hermes-core conversation-import hook that does not exist yet; #82 stays
-        open, tracking that dependency, until it does. Always 200 (Teams reads a
-        non-200 as a failed handoff)."""
+        Invoke activities return before the message path upserts the
+        registry. The cache is in-memory for this process; a restart drops
+        it the same way it drops the token.
+        """
+        ref = ConversationRef.from_activity(ctx.activity)
+        if ref is None:
+            return
+        if ctx.path_tag in {"A", "B"}:
+            ref.validated_path = ctx.path_tag
+        self._conversations.upsert(ref)
+        seen = self._seen_inbounds_this_lifetime
+        seen.add(ref.conversation_id)
+        if len(seen) > _MAX_SEEN_INBOUNDS:
+            seen.discard(ref.conversation_id)
+            while len(seen) >= _MAX_SEEN_INBOUNDS and seen:
+                seen.pop()
+            seen.add(ref.conversation_id)
+
+    def _build_handoff_message_event(
+        self, ctx: invoke.InvokeContext, record: dict[str, Any]
+    ) -> MessageEvent:
+        """Internal Teams event that pins the Copilot session onto this 1:1.
+
+        The source is the Teams conversation, so Hermes' routing key for
+        later messages in that chat is the key ``switch_session`` rewrites.
+        ``metadata["gateway_session_id"]`` is the only pin field: strict
+        and proven keys would keep the fresh Teams row instead of switching.
+        """
+        activity = ctx.activity
+        chat_id = str(ctx.conv.get("id") or "")
+        sender = activity.get("from")
+        sender = sender if isinstance(sender, dict) else {}
+        source = SessionSource(
+            platform=self.platform,
+            chat_id=chat_id,
+            chat_name=chat_id,
+            chat_type=_import_bridge()._activity_chat_type(activity),
+            user_id=_normalized_token(record.get("user_aad")),
+            user_name=str(sender.get("name") or ""),
+            message_id=str(activity.get("id") or ""),
+        )
+        return MessageEvent(
+            text=(
+                "The user continued this Copilot conversation in Teams. "
+                "The prior transcript is this session; continue from it."
+            ),
+            message_type=MessageType.TEXT,
+            source=source,
+            raw_message=activity,
+            message_id=str(activity.get("id") or "") or None,
+            internal=True,
+            metadata={"gateway_session_id": str(record.get("hermes_session_id") or "")},
+            timestamp=datetime.now(),
+        )
+
+    def _schedule_handoff_dispatch(self, ctx: invoke.InvokeContext, record: dict[str, Any]) -> None:
+        """Queue the pin to run after this invoke returns its 200.
+
+        ``asyncio.sleep(0)`` inside the task yields once, so the HTTP
+        acknowledgement is produced before ``handle_message`` starts the
+        agent turn. The token is already consumed; a dispatch failure does
+        not mint another pin.
+        """
+        event = self._build_handoff_message_event(ctx, record)
+        self._remember_handoff_destination(ctx)
+        task = asyncio.get_running_loop().create_task(self._dispatch_handoff_event(event))
+        self._handoff_dispatch_tasks.add(task)
+        task.add_done_callback(self._handoff_dispatch_tasks.discard)
+
+    async def _dispatch_handoff_event(self, event: MessageEvent) -> None:
+        try:
+            await asyncio.sleep(0)
+            await self.handle_message(event)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.warning("agent365 handoff dispatch failed", exc_info=True)
+
+    async def _handle_handoff_action(self, ctx: invoke.InvokeContext) -> invoke.InvokeResponse:
+        """#82: ``handoff/action`` — the user opened the continuation link.
+
+        A recognized token is consumed once. The Teams turn is pinned to the
+        Copilot Hermes session only when the token is unexpired, the tenant
+        and Entra user match, and that session is still the live origin.
+        Unknown, expired, cross-user, cross-tenant, missing, and ended
+        sessions ack 200 and do not dispatch. Teams treats a non-200 as a
+        failed handoff, so refusal stays on the 200 ack.
+        """
         token = str(ctx.value.get("continuation") or "")
-        origin = self._handoff_tokens.pop(token, None) if token else None
-        if origin is None:
+        record = self._handoff_tokens.pop(token, None) if token else None
+        if record is None:
             logger.warning("agent365 handoff/action unknown token=%s", token[:8])
             return invoke.InvokeResponse(status=200, body={})
-        # Record the CC-origin → Teams-conversation linkage so a later
-        # Hermes-core session-import hook can bridge them.
-        origin["resumed_conversation_id"] = str(ctx.conv.get("id") or "")
+        teams_chat = str(ctx.conv.get("id") or "")
+        origin_chat = str(record.get("conversation_id") or "")
+        session_id = str(record.get("hermes_session_id") or "")
+        if self._handoff_token_expired(record):
+            logger.warning("agent365 handoff/action expired token=%s", token[:8])
+            return invoke.InvokeResponse(status=200, body={})
+        if not self._handoff_identity_matches(record, ctx):
+            logger.warning("agent365 handoff/action identity mismatch token=%s", token[:8])
+            return invoke.InvokeResponse(status=200, body={})
+        if not teams_chat or teams_chat == origin_chat or not session_id:
+            logger.warning(
+                "agent365 handoff/action refused token=%s reason=unbound",
+                token[:8],
+            )
+            return invoke.InvokeResponse(status=200, body={})
+        live = self._lookup_live_origin_session(
+            conversation_id=origin_chat,
+            user_id=_normalized_token(record.get("user_aad")),
+            expected_session_id=session_id,
+        )
+        if live != session_id:
+            logger.warning(
+                "agent365 handoff/action source session not live token=%s",
+                token[:8],
+            )
+            return invoke.InvokeResponse(status=200, body={})
+        try:
+            self._schedule_handoff_dispatch(ctx, record)
+        except Exception:
+            logger.warning(
+                "agent365 handoff/action dispatch schedule failed token=%s",
+                token[:8],
+                exc_info=True,
+            )
+            return invoke.InvokeResponse(status=200, body={})
         logger.info(
-            "agent365 handoff resumed: origin=%s teams=%s",
-            origin.get("conversation_id"),
-            origin["resumed_conversation_id"],
+            "agent365 handoff pinned: origin=%s teams=%s session=%s",
+            origin_chat,
+            teams_chat,
+            session_id[:8],
         )
         return invoke.InvokeResponse(status=200, body={})
 
