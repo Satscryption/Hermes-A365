@@ -874,11 +874,10 @@ explicit triggers that would re-prioritise it.
 - **[#174](../../issues/174)** — User-delegated OBO on Path B.
   Downstream Graph/MCP calls on Copilot Chat as the signed-in user
   (Bot OAuth, OAuth cards, Teams SSO token exchange, or chained OBO).
-  Same surfaces as Path B; differs only in token subject. Decision in
-  [#88](../../issues/88) (this docs change does not close it): out of
-  scope for 1.0. Path A acts as the agent's own agentic user; Path B
-  messaging is Bot Service S2S, and a Path B Graph token is an
-  app-only token of the Path B app.
+  Same surfaces as Path B; differs only in token subject. Out of
+  scope for 1.0 (decision [#88](../../issues/88)). Path A acts as the
+  agent's own agentic user; Path B messaging is Bot Service S2S, and
+  a Path B Graph token is an app-only token of the Path B app.
 
 **Recent closures:**
 
