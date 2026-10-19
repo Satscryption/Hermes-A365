@@ -18236,3 +18236,198 @@ class TestMessageReaction:
         assert adapter_mod._normalize_reaction_identity("") is None
         assert adapter_mod._normalize_reaction_identity(None) is None
         assert adapter_mod._normalize_reaction_identity("x" * 65) is None
+
+    def _wire_turn(self, monkeypatch: pytest.MonkeyPatch, adapter: Any) -> Any:
+        """Let ``handle_message`` run the real start/send/complete path."""
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        adapter._http_client = MagicMock()
+        adapter._bridge_cfg = MagicMock()
+        adapter._fmi_cache = MagicMock()
+        adapter._user_cache = MagicMock()
+
+        async def handle_message(event: Any) -> None:
+            adapter._handled_events.append(event)
+            await adapter.on_processing_start(event)
+            result = await adapter.send(
+                event.source.chat_id,
+                "noted the reaction",
+                reply_to=event.message_id,
+            )
+            adapter._reaction_send_result = result
+            await adapter.on_processing_complete(event)
+
+        adapter.handle_message = handle_message
+        return send_reply
+
+    @pytest.mark.asyncio
+    async def test_group_flush_replies_to_cached_user_activity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-g", activity_id="user-act")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        ref.validated_path = "A"
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add("conv-g")
+        a._remember_bot_reply("reply-1", conversation_id="conv-g")
+        send_reply = self._wire_turn(monkeypatch, a)
+        client = self._client(monkeypatch, a)
+        body = _reaction_activity(
+            conv_id="conv-g",
+            reply_to="reply-1",
+            activity_id="react-1",
+        )
+        body["conversation"]["conversationType"] = "groupChat"
+
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 200, response.text
+        event = a._handled_events[0]
+        assert event.message_id == "user-act"
+        assert event.source.message_id == "user-act"
+        assert event.raw_message["id"] == "react-1"
+        assert a._conversations.get("conv-g").last_inbound_activity_id == "user-act"
+        reply = send_reply.await_args.kwargs["reply"]
+        assert reply["replyToId"] == "user-act"
+        assert "react-1" not in str(reply.get("replyToId"))
+
+    @pytest.mark.asyncio
+    async def test_personal_reaction_turn_uses_cached_user_activity(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-1", activity_id="user-act")
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        ref.validated_path = "A"
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        a._capture_coalesced_turn_target(ref)
+        a._remember_bot_reply("reply-1", conversation_id="conv-1")
+        send_reply = self._wire_turn(monkeypatch, a)
+        monkeypatch.setattr(a, "_send_stream_start", AsyncMock(return_value=None))
+        client = self._client(monkeypatch, a)
+
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(activity_id="react-1"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert a._handled_events[0].message_id == "user-act"
+        result = a._reaction_send_result
+        assert result.success is True
+        assert "no cached inbound for exact turn" not in str(result.error or "")
+        reply = send_reply.await_args.kwargs["reply"]
+        assert reply["replyToId"] == "user-act"
+        assert a._conversations.get("conv-1").last_inbound_activity_id == "user-act"
+
+    def test_reaction_without_user_activity_does_not_start_a_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._remember_bot_reply("reply-1", conversation_id="conv-1")
+        client = self._client(monkeypatch, a)
+
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(activity_id="react-1"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["reactions"] == 1
+        assert a._handled_events == []
+        assert (
+            a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]["like"][
+                "action"
+            ]
+            == "added"
+        )
+
+    @pytest.mark.asyncio
+    async def test_thumbs_submit_keeps_native_reactions(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        native = {"user-1": {"heart": {"action": "added", "type": "heart"}}}
+        a._feedback_by_message_id["reply-1"] = {
+            "reaction": None,
+            "feedback": None,
+            "conversation_id": "conv-1",
+            "user_oid": "user-1",
+            "native_reactions": native,
+        }
+        ctx = adapter_mod.invoke.build_invoke_context(
+            {
+                "type": "invoke",
+                "name": "message/submitAction",
+                "replyToId": "reply-1",
+                "conversation": {"id": "conv-1"},
+                "from": {"id": "user-1"},
+                "value": {
+                    "actionName": "feedback",
+                    "actionValue": {"reaction": "dislike", "feedback": "too long"},
+                },
+            },
+            claims={"oid": "o1", "tid": "t1"},
+            path_tag="A",
+        )
+
+        resp = await a._handle_feedback_submit(ctx)
+
+        assert resp.status == 200
+        rec = a._feedback_by_message_id["reply-1"]
+        assert rec["reaction"] == "dislike"
+        assert rec["feedback"] == "too long"
+        assert rec["native_reactions"] == native
+        assert rec["conversation_id"] == "conv-1"
+
+    @pytest.mark.asyncio
+    async def test_thumbs_submit_does_not_retarget_another_conversation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        original = {
+            "reaction": None,
+            "feedback": None,
+            "conversation_id": "conv-1",
+            "user_oid": "user-1",
+            "native_reactions": {
+                "user-1": {"like": {"action": "added", "type": "like"}}
+            },
+        }
+        a._feedback_by_message_id["reply-1"] = dict(original)
+        a._feedback_by_message_id["reply-1"]["native_reactions"] = original[
+            "native_reactions"
+        ]
+        ctx = adapter_mod.invoke.build_invoke_context(
+            {
+                "type": "invoke",
+                "name": "message/submitAction",
+                "replyToId": "reply-1",
+                "conversation": {"id": "conv-other"},
+                "value": {
+                    "actionName": "feedback",
+                    "actionValue": {"reaction": "like", "feedback": "nope"},
+                },
+            },
+            claims=None,
+            path_tag="A",
+        )
+
+        resp = await a._handle_feedback_submit(ctx)
+
+        assert resp.status == 200
+        rec = a._feedback_by_message_id["reply-1"]
+        assert rec["reaction"] is None
+        assert rec["feedback"] is None
+        assert rec["conversation_id"] == "conv-1"
+        assert rec["native_reactions"]["user-1"]["like"]["action"] == "added"

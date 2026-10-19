@@ -14,10 +14,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   conversation and tenant. The record keeps the latest add/remove and the
   normalized reaction type. Hermes' reaction convention emits
   `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn) for
-  each stored change. Replayed, malformed, cross-tenant, and unrelated
-  reactions do not change another feedback record. The correlation map is
-  bounded and cleared with the feedback map, and a chat teardown drops
-  that chat's reply ids. Edits and deletes stay in #122.
+  each stored change. That turn's message id is the cached user activity,
+  so the reply is not aimed at the reaction activity. A later thumbs
+  submit merges into the same row and keeps `native_reactions`. Replayed,
+  malformed, cross-tenant, and unrelated reactions do not change another
+  feedback record. The correlation map is bounded and cleared with the
+  feedback map, and a chat teardown drops that chat's reply ids. Edits
+  and deletes stay in #122.
   A live Teams reaction round trip was not run here; it remains for the
   #116 / #89 walks before this is treated as production-validated.
 

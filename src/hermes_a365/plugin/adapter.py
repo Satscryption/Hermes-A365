@@ -8189,11 +8189,21 @@ class Agent365Adapter(BasePlatformAdapter):
 
         The text is the Feishu / Telegram convention
         (``reaction:added:<emoji>`` / ``reaction:removed:<emoji>``), which
-        is an agent turn. The conversation registry is not updated: the
-        reaction activity is not a ``replyToActivity`` target.
+        is an agent turn. The event's message id is the cached user
+        activity, not the ``messageReaction`` id: ``on_processing_start``
+        copies that id onto the turn snapshot, and a personal ``send``
+        looks up the coalesced target by it. The reaction activity is not
+        a ``replyToActivity`` target, and the registry is not updated.
         """
         conv = activity.get("conversation")
         conv_id = str(conv.get("id") or "").strip() if isinstance(conv, dict) else ""
+        user_activity_id = self._cached_user_activity_id(conv_id)
+        if not user_activity_id:
+            logger.warning(
+                "agent365 messageReaction recorded without a turn: "
+                "no cached user activity"
+            )
+            return
         for action, identity in changes:
             event = self._activity_to_event(
                 activity,
@@ -8201,6 +8211,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 authorized_user_id=authorized_sender_id,
             )
             event.text = f"reaction:{action}:{identity}"
+            event.message_id = user_activity_id
+            source = getattr(event, "source", None)
+            if source is not None:
+                source.message_id = user_activity_id
             sk = self._session_key_for(event)
             admission_key = sk or f"agent365:{conv_id}"
             if not self._reserve_agent_turn_admission(admission_key):
@@ -8239,6 +8253,20 @@ class Agent365Adapter(BasePlatformAdapter):
             elif sk not in getattr(self, "_active_sessions", {}):
                 self._agent_turn_guards.pop(sk, None)
 
+    def _cached_user_activity_id(self, chat_id: str) -> str:
+        """Activity id of the latest cached user inbound for ``chat_id``.
+
+        This is the id Hermes replies to. A ``messageReaction`` id must not
+        be substituted for it.
+        """
+        inbound = self._cached_inbound_for(chat_id)
+        if not isinstance(inbound, dict):
+            return ""
+        raw = inbound.get("id")
+        if isinstance(raw, str):
+            return raw.strip()
+        return ""
+
     # ── #73(c) feedback loop + #82 handoff (invoke children) ──────────────
 
     async def _handle_feedback_submit(
@@ -8268,21 +8296,59 @@ class Agent365Adapter(BasePlatformAdapter):
                     "utf-8", errors="ignore"
                 )
         # The reply the reaction targets: Teams sets replyToId on the invoke.
+        # Merge into the existing #73/#80 row. Replacing the dict would drop
+        # ``native_reactions`` recorded for the same bot reply.
         msg_id = str(ctx.activity.get("replyToId") or ctx.activity.get("id") or "")
         if msg_id:
-            self._feedback_by_message_id[msg_id] = {
-                "reaction": reaction,
-                "feedback": feedback,
-                "conversation_id": str(ctx.conv.get("id") or ""),
-                "user_oid": ctx.user_oid,
-            }
-            _bound_feedback_map(self._feedback_by_message_id)
+            self._merge_thumbs_feedback(
+                msg_id,
+                reaction=reaction,
+                feedback=feedback,
+                conversation_id=str(ctx.conv.get("id") or ""),
+                user_oid=str(ctx.user_oid or ""),
+            )
         logger.info(
             "agent365 feedback reaction=%s msg=%s",
             reaction,
             msg_id[:16],
         )
         return invoke.InvokeResponse(status=200, body={})
+
+    def _merge_thumbs_feedback(
+        self,
+        message_id: str,
+        *,
+        reaction: str,
+        feedback: str | None,
+        conversation_id: str,
+        user_oid: str,
+    ) -> None:
+        """Write thumbs fields onto the feedback row for ``message_id``.
+
+        ``native_reactions`` and any other keys already on the row stay.
+        A row that already belongs to a different conversation is left
+        untouched.
+        """
+        existing = self._feedback_by_message_id.get(message_id)
+        if isinstance(existing, dict):
+            existing_conv = str(existing.get("conversation_id") or "")
+            if existing_conv and conversation_id and existing_conv != conversation_id:
+                logger.warning(
+                    "agent365 feedback ignored: conversation mismatch msg=%s",
+                    message_id[:16],
+                )
+                return
+            rec = existing
+        else:
+            rec = {}
+            self._feedback_by_message_id[message_id] = rec
+        rec["reaction"] = reaction
+        rec["feedback"] = feedback
+        if conversation_id:
+            rec["conversation_id"] = conversation_id
+        if user_oid:
+            rec["user_oid"] = user_oid
+        _bound_feedback_map(self._feedback_by_message_id)
 
     async def _handle_message_fetch_task(
         self, ctx: invoke.InvokeContext
