@@ -41,6 +41,24 @@ adapter.
 - *"All of the above"* → install both the sibling Teams adapter
   AND Hermes-A365; configure each for its lane.
 
+**Not a third path: user-delegated OBO on Copilot.** Microsoft also
+documents an *On-Behalf-Of (OBO)* execution mode, where an agent
+reached through Copilot Chat (via Azure Bot Service and a Bot OAuth
+connection) calls downstream APIs and MCP tools **as the signed-in
+user** instead of as its own agentic identity. This is sometimes
+described as an "agentic path to Copilot" gateway. It reaches the
+same surfaces as Path B, so it isn't a separate surface. It changes
+only **whose identity downstream calls carry**. Hermes-A365 1.0 does
+**not** support it: Path A acts as the agent's own agentic user, and
+Path B uses Bot Service S2S for messaging. A Graph token minted for a
+Path B activity is an app-only token of the Path B app (the blueprint
+app when no separate Bot Framework app is set). MCP tool tokens are
+unwired. Delegated user sign-in (OAuth cards / Teams SSO token
+exchange / chained OBO) is deferred pending operator demand. If you
+need per-user delegated data access on Copilot surfaces today, that
+is outside this package. See the deferred tracking issue
+([#174](../../issues/174)).
+
 See [`references/m365-surface-coverage.md`](references/m365-surface-coverage.md)
 for the full surface-by-surface matrix and the architectural
 reasoning behind the split.
@@ -152,8 +170,11 @@ proactive long-running reply pattern. Outstanding gaps:
   operators** (only "blocked" via the M365 Admin Centre). Microsoft
   platform limitation, not a wrapper bug.
 - **Pluggable secrets / activity-bridge library split / Work IQ V2
-  amplifiers** — tracked as deferred (#19, #20, #21); architecturally
-  sound, picked up when concrete operator demand surfaces.
+  amplifiers / user-delegated OBO on Path B** — tracked as deferred
+  ([#19](../../issues/19), [#20](../../issues/20),
+  [#21](../../issues/21), [#174](../../issues/174));
+  architecturally sound, picked up when concrete operator demand
+  surfaces. User-delegated OBO is out of scope for 1.0 (#88).
 
 Three issues filed upstream during the validation walkthroughs:
 [microsoft/Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402)
@@ -799,7 +820,8 @@ invoke activities ([#18](../../issues/18)), the v0.7.3 / v0.7.4 polish
 + Hermes-core slices ([#48](../../issues/48) /
 [#65](../../issues/65) / [#53](../../issues/53)), and the
 deferred-pending-demand set ([#19](../../issues/19) /
-[#20](../../issues/20) / [#21](../../issues/21)).
+[#20](../../issues/20) / [#21](../../issues/21) /
+[#174](../../issues/174)).
 
 **Active feature work:**
 
@@ -849,6 +871,13 @@ explicit triggers that would re-prioritise it.
   search-shaped invokes dominate (>40%) and the LLM-loop fallback
   cost justifies the build. Sibling of #18; depends on #18
   foundation slices (19w-a + 19w-b).
+- **[#174](../../issues/174)** — User-delegated OBO on Path B.
+  Downstream Graph/MCP calls on Copilot Chat as the signed-in user
+  (Bot OAuth, OAuth cards, Teams SSO token exchange, or chained OBO).
+  Same surfaces as Path B; differs only in token subject. Out of
+  scope for 1.0 (decision [#88](../../issues/88)). Path A acts as the
+  agent's own agentic user; Path B messaging is Bot Service S2S, and
+  a Path B Graph token is an app-only token of the Path B app.
 
 **Recent closures:**
 

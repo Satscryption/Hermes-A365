@@ -16,6 +16,14 @@ Python 3.11 and 3.14 tests passed; publish and release were skipped.
 PyPI latest remains 0.9.0. This 0.9.2 patch is the fix-forward. The
 `v0.9.1` tag is not moved, deleted, or retargeted.
 
+### Added
+
+- **Docs: user-delegated OBO on Path B is out of scope for 1.0 (#88, #174).**
+  README, `SKILL.md`, and `references/m365-surface-coverage.md` state
+  that Copilot Chat with downstream calls as the signed-in user reaches
+  the same surfaces as Path B. That auth mode is deferred
+  ([#174](https://github.com/satscryption/Hermes-A365/issues/174)).
+
 ### Fixed
 
 - **The publish smoke installs hash-pinned packaging from a requirements file.**
