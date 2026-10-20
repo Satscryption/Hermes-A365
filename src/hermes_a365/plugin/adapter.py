@@ -855,9 +855,36 @@ def _parse_retry_after_seconds(resp: Any) -> float:
     if raw is None:
         return 0.0
     try:
-        return max(0.0, float(raw))
+        parsed = max(0.0, float(raw))
     except (TypeError, ValueError):
         return 0.0
+    return min(parsed, _ANSWER_FINAL_RETRY_AFTER_CAP_SEC)
+
+
+def _keepalive_stream_age_sec(stream: dict[str, Any]) -> float:
+    opened = stream.get("opened_mono")
+    if not isinstance(opened, (int, float)):
+        return 0.0
+    return time.monotonic() - float(opened)
+
+
+def _answer_final_cap_remaining_sec(stream: dict[str, Any]) -> float:
+    """Seconds left before the Copilot two-minute stream cap (with margin)."""
+    return max(
+        0.0,
+        _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        - _ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        - _keepalive_stream_age_sec(stream),
+    )
+
+
+def _cap_answer_final_retry_delay(
+    stream: dict[str, Any], delay: float
+) -> float:
+    remaining = _answer_final_cap_remaining_sec(stream)
+    if remaining <= 0.0:
+        return 0.0
+    return min(delay, _ANSWER_FINAL_RETRY_AFTER_CAP_SEC, remaining)
 
 
 def _keepalive_final_closed(result: _KeepalivePost) -> bool:
@@ -979,6 +1006,8 @@ _STREAM_EDIT_MAX_ATTEMPTS = 3
 _STREAM_EDIT_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
 _ANSWER_FINAL_MAX_ATTEMPTS = 5
 _ANSWER_FINAL_RETRY_STATUSES = _STREAM_EDIT_RETRY_STATUSES
+_ANSWER_FINAL_RETRY_AFTER_CAP_SEC = 60.0
+_ANSWER_FINAL_STREAM_CAP_MARGIN_SEC = 5.0
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
@@ -5286,6 +5315,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
                 attempts,
             )
+            if buf.get("segments"):
+                buf["force_plain_answer"] = True
+                buf["retry_task"] = asyncio.create_task(
+                    self._deferred_turn_buffer_retry(chat_id)
+                )
             return
         buf["retry_attempts"] = attempts + 1
         buf["retry_task"] = asyncio.create_task(
@@ -5949,6 +5983,14 @@ class Agent365Adapter(BasePlatformAdapter):
         if not isinstance(buf, dict):
             return ("retry", None)
         stream = self._keepalive_state(buf)
+        if buf.pop("force_plain_answer", None):
+            buf["keepalive"] = {}
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "reason=stream retry exhausted",
+                chat_id,
+            )
+            return ("fallback", "stream retry exhausted")
         if stream.get("stopped"):
             buf["keepalive"] = {}
             logger.warning(
@@ -6044,9 +6086,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 result.status in _ANSWER_FINAL_RETRY_STATUSES
                 and attempt < _ANSWER_FINAL_MAX_ATTEMPTS
             ):
+                stream = self._keepalive_state(buf)
+                if _answer_final_cap_remaining_sec(stream) <= 0.0:
+                    break
                 delay = result.retry_after_sec
                 if delay <= 0.0:
-                    delay = min(2.0 ** attempt, 60.0)
+                    delay = min(2.0 ** attempt, _ANSWER_FINAL_RETRY_AFTER_CAP_SEC)
+                delay = _cap_answer_final_retry_delay(stream, delay)
+                if delay <= 0.0:
+                    break
                 attempt += 1
                 await self._sleep_turn_buffer_locked(chat_id, buf, delay)
                 if self._turn_buffers.get(chat_id) is not buf:
@@ -6127,6 +6175,19 @@ class Agent365Adapter(BasePlatformAdapter):
                 reason,
             )
             return ("fallback", reason)
+        stream = self._keepalive_state(buf)
+        cap_left = _answer_final_cap_remaining_sec(stream)
+        if stream_id and (
+            attempt >= _ANSWER_FINAL_MAX_ATTEMPTS or cap_left <= 0.0
+        ):
+            buf["keepalive"] = {}
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "status=%s reason=stream retry exhausted",
+                chat_id,
+                status,
+            )
+            return ("fallback", "stream retry exhausted")
         logger.warning(
             "agent365 turn buffer answer final failed: chat_id=%s "
             "stream_id=%s status=%s",

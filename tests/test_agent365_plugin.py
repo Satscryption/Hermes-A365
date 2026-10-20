@@ -9246,6 +9246,167 @@ class TestEditMessage:
         assert "conv-G-503" not in a._turn_buffers
 
     @pytest.mark.asyncio
+    async def test_answer_final_persistent_503_falls_back_to_plain_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-503-all", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                return MagicMock(
+                    status_code=503,
+                    text="",
+                    headers={"Retry-After": "0"},
+                    json=lambda: {},
+                )
+            return self._http_result(201, "ka-503-all")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-503-all"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-503-all", content="Plain once", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain once"
+        assert "conv-G-503-all" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_answer_final_huge_retry_after_respects_stream_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-ra-cap", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        finals = {"n": 0}
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        real_sleep = asyncio.sleep
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                return MagicMock(
+                    status_code=503,
+                    text="",
+                    headers={"Retry-After": "9999"},
+                    json=lambda: {},
+                )
+            return self._http_result(201, "ka-ra")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        sleep_delays: list[float] = []
+
+        async def cap_advancing_sleep(delay: float) -> None:
+            sleep_delays.append(delay)
+            live = a._turn_buffers.get("conv-G-ra-cap")
+            if isinstance(live, dict):
+                stream = live.get("keepalive")
+                if isinstance(stream, dict):
+                    opened = stream.get("opened_mono")
+                    if isinstance(opened, (int, float)):
+                        stream["opened_mono"] = float(opened) - delay
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", cap_advancing_sleep)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-ra-cap"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-ra-cap"]
+        buf["keepalive"] = {
+            "stream_id": "ka-ra",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (cap - margin - 0.5),
+        }
+        await a.send(chat_id="conv-G-ra-cap", content="Before cap", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Before cap"
+        assert finals["n"] <= 2
+        retry_sleeps = [
+            delay
+            for delay in sleep_delays
+            if delay <= adapter_mod._ANSWER_FINAL_RETRY_AFTER_CAP_SEC
+        ]
+        assert retry_sleeps
+        assert max(retry_sleeps) <= 1.0
+        assert "conv-G-ra-cap" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_answer_final_stream_cap_stops_mid_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-cap-mid", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                return MagicMock(
+                    status_code=503,
+                    text="",
+                    headers={"Retry-After": "30"},
+                    json=lambda: {},
+                )
+            return self._http_result(201, "ka-cap")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-cap-mid"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-cap-mid"]
+        buf["keepalive"] = {
+            "stream_id": "ka-cap",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (cap - margin + 1.0),
+        }
+        await a.send(chat_id="conv-G-cap-mid", content="Cap fallback", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 1
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Cap fallback"
+        assert "conv-G-cap-mid" not in a._turn_buffers
+
+    @pytest.mark.asyncio
     async def test_answer_final_retry_already_completed_is_delivered(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
