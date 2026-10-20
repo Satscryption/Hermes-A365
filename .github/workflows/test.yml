@@ -35,11 +35,7 @@ jobs:
             python-version: "3.14"
           - os: macos-latest
             python-version: "3.14"
-          - os: windows-latest
-            python-version: "3.14"
     name: test (${{ matrix.os }}, Python ${{ matrix.python-version }})
-    env:
-      HERMES_A365_LIVE_KEYCHAIN: ${{ matrix.os == 'macos-latest' && '1' || '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -56,6 +52,29 @@ jobs:
 
       - name: pytest
         run: uv run --python ${{ matrix.python-version }} pytest
+
+  windows-negative:
+    runs-on: windows-latest
+    name: windows (unsupported host probes)
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Install deps
+        run: uv sync --all-extras --frozen --python 3.14
+
+      - name: Unsupported-platform contract tests
+        run: >
+          uv run --python 3.14 pytest
+          tests/test_compatibility.py
+          tests/test_keychain.py::TestGetBackend::test_windows_unsupported
+          tests/test_doctor.py::TestProbeKeychain::test_unsupported_platform_errors
+          tests/test_compatibility.py::test_probe_host_platform_windows_errors
+          -q
 
   keychain-linux:
     runs-on: ubuntu-latest

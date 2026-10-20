@@ -78,7 +78,7 @@ def test_ci_matrix_covers_supported_python_versions() -> None:
     for version in ("3.11", "3.12", "3.13", "3.14"):
         assert f'python-version: "{version}"' in text
     assert "macos-latest" in text
-    assert "windows-latest" in text
+    assert "windows-negative" in text
     assert "keychain-linux" in text
     assert "wheel-smoke" in text
     assert "hermes-source-smoke" in text

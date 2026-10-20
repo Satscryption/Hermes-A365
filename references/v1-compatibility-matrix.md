@@ -24,8 +24,8 @@ security floors; see [`hermes-runtime-compatibility.md`](hermes-runtime-compatib
 
 | OS | v1 support | Secret store | Notes |
 | --- | --- | --- | --- |
-| **macOS** (13+) | Supported | `security` CLI (login keychain) | macOS keychain **writes** require `HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1` (secret in argv). Reads/deletes work by default. |
-| **Linux** (glibc distros, e.g. Ubuntu 22.04+) | Supported | `secret-tool` (libsecret / Secret Service) | CI exercises libsecret when a disposable Secret Service is available. |
+| **macOS** (13+) | Supported | `security` CLI (login keychain) | macOS keychain **writes** require `HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1` (secret in argv). Reads/deletes work by default. CI runs the full pytest suite on macOS; **live keychain round-trips** need an unlocked login keychain (operator Mac) — GitHub-hosted macOS cannot complete headless writes. |
+| **Linux** (glibc distros, e.g. Ubuntu 22.04+) | Supported | `secret-tool` (libsecret / Secret Service) | CI `keychain-linux` job exercises libsecret with a disposable Secret Service. |
 | **Windows** | **Not supported** | *None in this package* | The GA `a365` CLI may write blueprint secrets with DPAPI; Hermes-A365 does not implement Credential Manager and does not integrate DPAPI persistence. End-to-end v1 flows require macOS or Linux. |
 
 `doctor` reports **error** on Windows and on missing keychain backends.
@@ -82,7 +82,7 @@ Record exact CLI builds used on the #90 walk in the closing report.
 | --- | --- | --- |
 | Python 3.11–3.14 unit + lint | Yes | — |
 | macOS / Linux / Windows pytest | Yes (Windows = unsupported **host**; tests run on runner) | — |
-| macOS keychain round-trip | Yes (synthetic credential, deleted after) | — |
+| macOS keychain round-trip | Full suite on macOS runner; live store/get/delete on operator Mac with unlocked keychain | GitHub macOS blocks headless `security` writes |
 | Linux libsecret round-trip | Yes when Secret Service available | — |
 | Wheel/sdist build + fresh install smoke | Yes | — |
 | Hermes source tags + plugin import path | Yes (pinned refs) | Full gateway multiplex traffic |

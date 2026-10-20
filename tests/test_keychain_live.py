@@ -14,9 +14,21 @@ import pytest
 
 from hermes_a365.keychain import delete_secret, get_secret, store_secret
 
+
+def _live_keychain_enabled() -> bool:
+    if os.environ.get("HERMES_A365_LIVE_KEYCHAIN") != "1":
+        return False
+    # GitHub-hosted macOS runners cannot complete headless `security` writes
+    # (the login keychain blocks until an interactive unlock). Linux libsecret
+    # coverage runs in the dedicated keychain-linux CI job.
+    if os.environ.get("GITHUB_ACTIONS") == "true" and sys.platform == "darwin":
+        return False
+    return True
+
+
 pytestmark = pytest.mark.skipif(
-    os.environ.get("HERMES_A365_LIVE_KEYCHAIN") != "1",
-    reason="set HERMES_A365_LIVE_KEYCHAIN=1 to exercise the real keychain",
+    not _live_keychain_enabled(),
+    reason="set HERMES_A365_LIVE_KEYCHAIN=1 on a host with an unlocked keychain",
 )
 
 
