@@ -9,7 +9,6 @@ contract files exist.
 from __future__ import annotations
 
 import argparse
-import os
 import subprocess
 import sys
 import tempfile
@@ -67,10 +66,18 @@ def _check_ref(ref: str, work: Path) -> list[str]:
             [
                 sys.executable,
                 "-c",
-                "from gateway.platforms.base import BasePlatformAdapter",
+                (
+                    "import importlib.util, sys; from pathlib import Path; "
+                    "root = Path.cwd(); sys.path.insert(0, str(root)); "
+                    "path = root / 'gateway' / 'platforms' / 'base.py'; "
+                    "spec = importlib.util.spec_from_file_location("
+                    "'hermes_gateway_base', path); "
+                    "mod = importlib.util.module_from_spec(spec); "
+                    "spec.loader.exec_module(mod); "
+                    "assert hasattr(mod, 'BasePlatformAdapter')"
+                ),
             ],
             cwd=checkout,
-            env={**os.environ, "PYTHONPATH": str(checkout)},
             capture_output=True,
             text=True,
         )
