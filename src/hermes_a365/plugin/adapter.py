@@ -81,6 +81,7 @@ import stat
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
@@ -696,6 +697,13 @@ def _connector_activity_id(response: Any) -> str:
     if isinstance(raw, str):
         return raw.strip()
     return ""
+
+
+def _teams_utf16_len(text: str) -> int:
+    """Length in UTF-16 code units (Teams activity size accounting)."""
+    if not text:
+        return 0
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _strip_streaming_cursor(text: str) -> str:
@@ -1330,9 +1338,10 @@ class Agent365Adapter(BasePlatformAdapter):
     # Teams agent messages allow much larger payloads than the interactive
     # send cap above (Microsoft documents ~100 KB per activity, ~80 KB
     # recommended for text). Hermes' stream consumer uses
-    # ``streaming_overflow_limit()`` so replies that fit one streamed final
-    # are not split at 4k (#184); matches the sibling Hermes Teams adapter.
-    _STREAMING_OVERFLOW_MESSAGE_LENGTH = 28000
+    # ``streaming_overflow_limit()`` for personal BF streaming only (#184).
+    # Teams documents ~80 KB of message text in UTF-16; keep headroom for
+    # stream entities, AI label, and feedback channelData.
+    _TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT = 32768
 
     # Slice 19s — Microsoft's BF streaming requires an explicit
     # ``endStream()`` (i.e. a final activity with
@@ -1342,9 +1351,21 @@ class Agent365Adapter(BasePlatformAdapter):
     # through even when content is unchanged.
     REQUIRES_EDIT_FINALIZE: bool = True
 
+    @property
+    def message_len_fn(self) -> Callable[[str], int]:
+        """Teams measures activity text in UTF-16 code units."""
+        return _teams_utf16_len
+
     def streaming_overflow_limit(self) -> int | None:
-        """Raise the stream-consumer split budget for Teams 1:1 streaming."""
-        return self._STREAMING_OVERFLOW_MESSAGE_LENGTH
+        """Raise the stream-consumer split budget for Teams 1:1 streaming only."""
+        chat_id = self._stream_overflow_scope_chat_id
+        if not chat_id:
+            return None
+        inbound = self._cached_inbound_for(chat_id)
+        conv = (inbound or {}).get("conversation") or {}
+        if str(conv.get("conversationType") or "") != "personal":
+            return None
+        return self._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
 
     def __init__(self, config: PlatformConfig, **_kwargs: Any) -> None:
         super().__init__(config=config, platform=Platform("agent365"))
@@ -1711,6 +1732,11 @@ class Agent365Adapter(BasePlatformAdapter):
         # ``_active_stream_by_chat``) — a gateway restart drops pending offers,
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
+        # Decline notices are sent once per consentId (BF invoke retries).
+        self._file_consent_decline_notified: set[str] = set()
+        # Hermes stream consumer calls ``streaming_overflow_limit()`` without
+        # chat_id; scope it to the personal turn in flight (#184).
+        self._stream_overflow_scope_chat_id: str | None = None
         self._card_capabilities: dict[str, dict[str, Any]] = {}
         # #130: a typed-answer wait has no live card capability. Open-ended
         # clarify never mints one. "Something else" consumes the choice card
@@ -3478,6 +3504,8 @@ class Agent365Adapter(BasePlatformAdapter):
         self._handoff_tokens.clear()
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
+        self._file_consent_decline_notified.clear()
+        self._stream_overflow_scope_chat_id = None
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
         self._agent_turn_guards.clear()
@@ -5048,9 +5076,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 # reply anchor, so a late 403 cannot block a different
                 # follow-up anchor.
                 self._nested_personal_reply.pop(chat_id, None)
-                self._personal_processing_depth[chat_id] = (
-                    self._personal_processing_depth.get(chat_id, 0) + 1
-                )
+                prev_depth = self._personal_processing_depth.get(chat_id, 0)
+                self._personal_processing_depth[chat_id] = prev_depth + 1
+                if prev_depth == 0:
+                    self._clear_personal_typing_suppression(chat_id)
+                self._set_stream_overflow_scope(chat_id)
         parent = getattr(super(), "on_processing_start", None)
         if callable(parent):
             await parent(event)
@@ -5830,8 +5860,14 @@ class Agent365Adapter(BasePlatformAdapter):
             # A nested follow-up complete runs before that cancel, so it
             # must not close the outer 1:1 stream. Non-personal chats are
             # not in ``_active_stream_by_chat``.
-            if self._release_personal_processing(chat_id):
+            outer_personal_ended = self._release_personal_processing(chat_id)
+            if outer_personal_ended:
                 await self._finalize_open_personal_stream(chat_id)
+                # #185: Hermes' typing task outlives this hook; drop suppression
+                # only after turn-end finalize so late pulses are skipped, then
+                # leave the next turn free to show pre-stream dots.
+                self._clear_personal_typing_suppression(chat_id)
+                self._clear_stream_overflow_scope(chat_id)
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
             await parent(event, outcome)
@@ -8038,18 +8074,24 @@ class Agent365Adapter(BasePlatformAdapter):
         context = context if isinstance(context, dict) else {}
         consent_id = str(context.get("consentId") or "")
         pending = self._pending_file_uploads.pop(consent_id, None)
+        consent_chat_id = str((activity.get("conversation") or {}).get("id") or "")
+
+        async def _remove_consent_card() -> None:
+            await self._remove_file_consent_card(
+                activity, chat_id=consent_chat_id
+            )
 
         if action != "accept":
             logger.info(
                 "agent365 fileConsent action=%s consent=%s", action, consent_id[:8]
             )
-            consent_chat_id = str(
-                (activity.get("conversation") or {}).get("id") or ""
-            )
-            await self._remove_file_consent_card(
-                activity, chat_id=consent_chat_id
-            )
-            if action == "decline":
+            await _remove_consent_card()
+            if (
+                action == "decline"
+                and consent_id
+                and consent_id not in self._file_consent_decline_notified
+            ):
+                self._file_consent_decline_notified.add(consent_id)
                 await self._send_file_consent_decline_notice(
                     activity, validated_path=validated_path
                 )
@@ -8064,6 +8106,7 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning(
                 "agent365 fileConsent accept for unknown consent=%s", consent_id[:8]
             )
+            await _remove_consent_card()
             return invoke.empty_invoke_ack()
 
         pending_chat_id = str(pending.get("conversation_id") or "")
@@ -8077,6 +8120,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent accept for expired lifecycle consent=%s",
                 consent_id[:8],
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F2 / R2-P1 — capability model, not authenticated-user check.
@@ -8100,11 +8144,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent accept context mismatch consent=%s",
                 consent_id[:8],
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F3: a consent the user answers long after the offer is stale.
         if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
             logger.warning("agent365 fileConsent accept expired consent=%s", consent_id[:8])
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         upload_info = value.get("uploadInfo")
@@ -8122,6 +8168,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         ):
             logger.warning("agent365 fileConsent accept missing uploadUrl/client")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         # R2-P1: only POST bytes to an EXACT configured tenant SharePoint/OneDrive
         # host — a `*.sharepoint.com` suffix would accept an attacker-owned tenant's
@@ -8131,12 +8178,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent uploadUrl not on the configured tenant host "
                 "allowlist; refused (%.60s)", upload_url
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         # Re-validate the path (may have been removed since the offer).
         safe_path = self.validate_media_delivery_path(str(pending.get("path") or ""))
         if safe_path is None:
             logger.warning("agent365 fileConsent accept: file no longer available")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         # R2-P2: read the current bytes ONCE through a bounded descriptor, then
         # verify size + SHA-256 against the offer. A file that grew past the cap,
@@ -8146,13 +8195,16 @@ class Agent365Adapter(BasePlatformAdapter):
         data = _read_file_bounded(safe_path, _MAX_OUTBOUND_FILE_BYTES)
         if data is None:
             logger.warning("agent365 fileConsent: file unreadable or over-cap at accept")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         size = len(data)
         if size <= 0 or size != int(pending.get("size") or -1):
             logger.warning("agent365 fileConsent: size changed since offer")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         if hashlib.sha256(data).hexdigest() != pending.get("sha256"):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         try:
             put_resp = await self._await_outbound(
@@ -8171,9 +8223,11 @@ class Agent365Adapter(BasePlatformAdapter):
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
             if status_code < 200 or status_code >= 300:
                 logger.error("agent365 fileConsent upload HTTP %s", status_code)
+                await _remove_consent_card()
                 return invoke.InvokeResponse(status=200, body={})
         except Exception as e:
             logger.error("agent365 fileConsent upload failed: %s", e)
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         if not self._lifecycle_is_current(
@@ -8186,11 +8240,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 "consent=%s",
                 consent_id[:8],
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
-        await self._remove_file_consent_card(
-            activity, chat_id=str(pending_chat_id)
-        )
+        await _remove_consent_card()
 
         # Confirm with a FileInfoCard so the file renders inline in the chat.
         # Best-effort — the upload already succeeded, so a failed card is logged,
@@ -9817,10 +9870,25 @@ class Agent365Adapter(BasePlatformAdapter):
         depth -= 1
         if depth <= 0:
             self._personal_processing_depth.pop(key, None)
-            self._personal_stream_final_posted.discard(key)
             return True
         self._personal_processing_depth[key] = depth
         return False
+
+    def _clear_personal_typing_suppression(self, chat_id: str) -> None:
+        self._personal_stream_final_posted.discard(str(chat_id))
+
+    def _personal_conversation_type_for_chat(self, chat_id: str) -> str:
+        inbound = self._cached_inbound_for(chat_id)
+        conv = (inbound or {}).get("conversation") or {}
+        return str(conv.get("conversationType") or "")
+
+    def _set_stream_overflow_scope(self, chat_id: str) -> None:
+        if self._personal_conversation_type_for_chat(chat_id) == "personal":
+            self._stream_overflow_scope_chat_id = str(chat_id)
+
+    def _clear_stream_overflow_scope(self, chat_id: str) -> None:
+        if self._stream_overflow_scope_chat_id == str(chat_id):
+            self._stream_overflow_scope_chat_id = None
 
     def _mark_personal_stream_final_posted(self, chat_id: str) -> None:
         """Record that a personal stream final landed for this turn (#185)."""
@@ -9878,9 +9946,7 @@ class Agent365Adapter(BasePlatformAdapter):
         result = await self.edit_message(
             str(chat_id), str(message_id), content, finalize=True
         )
-        if result.success:
-            self._mark_personal_stream_final_posted(chat_id)
-        else:
+        if not result.success:
             logger.warning(
                 "agent365 personal stream turn-end finalize not accepted: "
                 "chat_id=%s message_id=%s error=%s",
@@ -10014,6 +10080,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 inbound=inbound,
                 loop_now=loop_now,
             )
+
+        self._set_stream_overflow_scope(chat_id)
 
         if self._http_client is None or self._bridge_cfg is None:
             return SendResult(

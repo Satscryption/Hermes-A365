@@ -44,20 +44,24 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   ``fileConsent/invoke``, the adapter best-effort deletes the consent
   card activity (``replyToId``) via the Bot Framework DELETE endpoint,
   then posts the FileInfoCard on accept or a short decline confirmation
-  on decline. Delete failures are logged and do not block the invoke ack.
+  on decline (once per ``consentId``, including BF invoke retries).
+  Failed accepts remove the card too. Delete failures are logged and do
+  not block the invoke ack.
 
-- **Teams 1:1 stream overflow split at ~4k (#184).** Override
-  ``streaming_overflow_limit()`` to 28 000 characters so Hermes' stream
-  consumer does not seal long personal replies at the conservative
-  ``MAX_MESSAGE_LENGTH`` (4000) interactive cap. Plain sends and turn
-  buffers still use 4000; Teams accepts much larger activity payloads.
+- **Teams 1:1 stream overflow split at ~4k (#184).** Raise
+  ``streaming_overflow_limit()`` only for scoped Teams **personal**
+  streaming turns (32 768 UTF-16 code units, under Microsoft's ~80 KB
+  text guidance with headroom). Copilot Chat, group/channel, and
+  turn/coalesced buffers stay at ``MAX_MESSAGE_LENGTH`` (4000). Length
+  accounting uses UTF-16 code units via ``message_len_fn``.
 
 - **Teams 1:1 typing indicator after a streamed final (#185).** On personal
   chats, ``send_typing`` is a no-op while a BF stream is open and for the
   rest of the turn after ``streamType=final`` lands, so Hermes'
   ``_keep_typing`` loop does not post late pulses once the answer bubble
-  is complete. Cleared when the outer personal turn ends on
-  ``on_processing_complete``.
+  is complete. Suppression clears when the next personal turn starts and
+  after ``on_processing_complete`` finishes the turn-end finalize (including
+  failed finalize).
 
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and

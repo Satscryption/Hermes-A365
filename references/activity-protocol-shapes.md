@@ -91,16 +91,18 @@ whether the conversation actually renders Bot Framework streaming:
   does not open another bubble. A follow-up whose reply_to is a different
   activity still posts, including when the 403 is accepted after the
   nested start. User cancel stays a failure. Personal chats do not use
-  the non-personal coalesce buffer.   A **stale-stream liveness guard**
+  the non-personal coalesce buffer. A **stale-stream liveness guard**
   force-drops a sequence whose
   finalization repeatedly fails or that exceeds a bounded age, so a
   stuck stream can't silence the chat (#62, #83, #161). While a stream
   is open, and for the rest of the turn after ``streamType=final``,
   ``send_typing`` is suppressed on personal chats so late gateway
-  typing pulses do not keep the dots alive (#185). Long streamed replies
-  use ``streaming_overflow_limit()`` (28 000 characters) so the Hermes
+  typing pulses do not keep the dots alive (#185); suppression clears
+  after turn-end finalize in ``on_processing_complete`` and when the next
+  personal turn starts. Long **personal** streamed replies use a scoped
+  ``streaming_overflow_limit()`` (32 768 UTF-16 code units) so the Hermes
   stream consumer does not split a single final near the 4 000-character
-  interactive send cap (#184).
+  interactive send cap; non-personal chats keep the 4 000 limit (#184).
 
 - **Copilot Chat and other non-`personal` turns** do **not** render BF
   streaming (see the quirks row above): Bot Framework returns 2xx and
