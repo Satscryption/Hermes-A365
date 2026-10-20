@@ -74,11 +74,13 @@ Hermes records the last published app `version` per agent in:
 (`<slug>` defaults to `slugify(--agent-name)`; override with `--slug`.)
 
 Schema v2 keys state by **tenant** (`tenantId` from the publish pin),
-**Hermes profile** (`HERMES_PROFILE` / `HERMES_GATEWAY_PROFILE`, default
-`default`), and catalog `manifestId`, and records `lastAppVersion` plus
-`ceaCatalogIdMinted` (whether the catalog id was auto-minted for Copilot
-Chat). Schema v1 files migrate to v2 on read with `ceaCatalogIdMinted:
-false`.
+**Hermes profile** (`publish --profile`, or `HERMES_PROFILE` /
+`HERMES_GATEWAY_PROFILE`, default `default` — match the name passed to
+`hermes gateway run --profile`), and catalog `manifestId`, and records
+`lastAppVersion` plus `ceaCatalogIdMinted` (whether the catalog id was
+auto-minted for Copilot Chat). Legacy schema v1 files are **unscoped** (no
+tenant/profile); apply refuses auto bump or reuse from v1 unless you pass
+`--app-version` to seed scoped v2 state (`ceaCatalogIdMinted: false`).
 
 When state already records `lastAppVersion` for the **same** tenant,
 profile, and `manifestId` as this zip, `hermes a365 publish --copilot-chat
@@ -87,8 +89,10 @@ template is unchanged; honour a higher CLI template when Microsoft bumps
 it upstream). With **no** matching record, apply **fails** unless the
 operator passes `--app-version` strictly above the version in Microsoft
 Admin Center — except the first upload of a **new** auto-minted catalog id,
-which may use the CLI template `version`. Apply refuses when the state file
-records a different `manifestId` than this publish targets.
+which may use the CLI template `version`. Apply refuses when the state file records a different `manifestId` than
+this publish targets, unless you pass a new `--manifest-id` **and**
+`--app-version` (or `--manifest-id auto` mints a new CEA id) to start or
+replace a catalog entry.
 
 `--manifest-id auto` (and the combined `--aiteammate --copilot-chat`
 default) mints a distinct CEA catalog id and, on later runs for the same

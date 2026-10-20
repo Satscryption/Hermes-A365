@@ -637,7 +637,8 @@ hermes a365 publish --agent-name "Inbox Helper" \
     --copilot-chat --bot-id <bf-app-id> --apply
 # Upload <cwd>/manifest/manifest.zip at MAC → Agents → Upload custom agent.
 # Re-uploads: MAC → agent → Update in store (no assignment step).
-# copilot-chat-publish.json (per tenant + profile) tracks manifest.id +
+# copilot-chat-publish.json (per tenant + profile via publish --profile or
+# HERMES_PROFILE, matching gateway --profile) tracks manifest.id +
 # lastAppVersion. No matching record → pass --app-version above MAC.
 # Reserve --manifest-id auto for combined A+B; Path-B updates omit auto.
 

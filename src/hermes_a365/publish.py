@@ -250,6 +250,8 @@ class PublishInputs:
     app_version: str | None = None
     # local ``~/.hermes/agents/<slug>/`` dir; defaults to slugify(agent_name).
     slug: str | None = None
+    # Hermes gateway profile for publish-state partitioning (``--profile``).
+    profile: str | None = None
     verbose: bool = False
 
     def __post_init__(self) -> None:
@@ -330,6 +332,8 @@ class PublishPlan:
             lines.append(f"  bot-id:  {self.inputs.bot_id} (override)")
         if self.inputs.app_version:
             lines.append(f"  app-version: {self.inputs.app_version} (override)")
+        if self.inputs.profile:
+            lines.append(f"  profile: {self.inputs.profile} (publish state scope)")
         if self.inputs.manifest_id:
             lines.append(f"  manifest-id: {self.inputs.manifest_id}")
         elif self.inputs.aiteammate and self.inputs.copilot_chat:
@@ -786,13 +790,25 @@ def _guard_copilot_chat_publish_state_path(path: Path, hermes_home: Path) -> Non
         raise PublishError(str(exc)) from exc
 
 
-def _resolve_hermes_profile_name() -> str:
-    """Hermes gateway profile name for publish-state partitioning."""
+def _resolve_hermes_profile_name(cli_profile: str | None = None) -> str:
+    """Hermes gateway profile name for publish-state partitioning.
+
+    ``publish --profile`` wins, then ``HERMES_PROFILE`` /
+    ``HERMES_GATEWAY_PROFILE``, then ``default``. The gateway's
+    ``hermes gateway run --profile`` does not set those env vars — pass the
+    same name here (or export ``HERMES_PROFILE``) so publish state matches the
+    profile's ``HERMES_HOME``.
+    """
+    if cli_profile and cli_profile.strip():
+        return cli_profile.strip()
     for key in ("HERMES_PROFILE", "HERMES_GATEWAY_PROFILE"):
         value = os.environ.get(key, "").strip()
         if value:
             return value
     return "default"
+
+
+_COPILOT_CHAT_PUBLISH_STATE_UNSCOPED_V1 = "_unscopedV1"
 
 
 def _normalize_publish_state_tenant_id(tenant_id: str) -> str:
@@ -825,21 +841,53 @@ def _require_copilot_chat_slug(inputs: PublishInputs) -> str:
     return slug
 
 
-def _migrate_publish_state_v1_to_v2(
+def _normalize_publish_state_v1_fields(
     raw: dict[str, object],
-    *,
-    tenant_id: str,
-    profile: str,
 ) -> dict[str, object]:
-    """Upgrade schema v1 on read; v1 never tracked auto-minted CEA ids."""
+    """Parse legacy schema v1 without claiming tenant/profile scope."""
     return {
-        "schemaVersion": _COPILOT_CHAT_PUBLISH_STATE_SCHEMA,
-        "tenantId": tenant_id,
-        "profile": profile,
+        "schemaVersion": _COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1,
         "manifestId": raw["manifestId"],
         "lastAppVersion": raw["lastAppVersion"],
         "ceaCatalogIdMinted": False,
+        _COPILOT_CHAT_PUBLISH_STATE_UNSCOPED_V1: True,
     }
+
+
+def _refuse_unscoped_v1_publish_state(
+    record: dict[str, object],
+    *,
+    path: Path,
+    app_version_override: str | None,
+) -> None:
+    if not record.get(_COPILOT_CHAT_PUBLISH_STATE_UNSCOPED_V1):
+        return
+    if app_version_override is not None:
+        return
+    raise PublishError(
+        f"Copilot Chat publish state at {path} is legacy schema v1 (no tenant "
+        "or profile scope); pass --app-version strictly above the version shown "
+        "in Microsoft Admin Center to seed scoped schema v2 state, or remove "
+        "the file before re-running publish --apply"
+    )
+
+
+def _publish_state_allows_manifest_id_change(
+    inputs: PublishInputs,
+    resolution: _CopilotChatManifestIdResolution | None,
+) -> bool:
+    """Whether apply may replace on-disk state keyed by a different manifestId."""
+    if (
+        inputs.manifest_id
+        and inputs.manifest_id != "auto"
+        and inputs.app_version is not None
+    ):
+        return True
+    return bool(
+        resolution
+        and inputs.manifest_id == "auto"
+        and resolution.freshly_minted
+    )
 
 
 def _validate_publish_state_scope(
@@ -917,15 +965,13 @@ def _load_copilot_chat_publish_state_record(
                 "fix or remove the file before re-running publish --apply"
             )
         try:
-            raw = _migrate_publish_state_v1_to_v2(
+            raw = _normalize_publish_state_v1_fields(
                 {
                     "manifestId": _canonical_manifest_guid(stored_id),
                     "lastAppVersion": _format_app_version(
                         _parse_app_version_triple(last)
                     ),
-                },
-                tenant_id=tenant_id,
-                profile=profile,
+                }
             )
         except ValueError as exc:
             raise PublishError(
@@ -978,10 +1024,10 @@ def _load_copilot_chat_publish_state_record(
             )
         if minted is None:
             raw["ceaCatalogIdMinted"] = False
+        _validate_publish_state_scope(
+            raw, path=path, tenant_id=tenant_id, profile=profile
+        )
 
-    _validate_publish_state_scope(
-        raw, path=path, tenant_id=tenant_id, profile=profile
-    )
     return raw
 
 
@@ -992,8 +1038,12 @@ def _assert_publish_state_matches_catalog_id(
     hermes_home: Path,
     tenant_id: str,
     profile: str,
+    inputs: PublishInputs,
+    manifest_id_resolution: _CopilotChatManifestIdResolution | None,
 ) -> None:
     """Refuse apply when on-disk state targets a different catalog ``manifest.id``."""
+    if _publish_state_allows_manifest_id_change(inputs, manifest_id_resolution):
+        return
     record = _load_copilot_chat_publish_state_record(
         path, hermes_home=hermes_home, tenant_id=tenant_id, profile=profile
     )
@@ -1390,7 +1440,7 @@ def apply_publish_plan(
     if plan.inputs.copilot_chat:
         _require_copilot_chat_slug(plan.inputs)
     publish_tenant_id = _normalize_publish_state_tenant_id(expected_tenant)
-    publish_profile = _resolve_hermes_profile_name()
+    publish_profile = _resolve_hermes_profile_name(plan.inputs.profile)
     run = mutator.run(plan.step.argv, timeout=_PUBLISH_APPLY_TIMEOUT_SECONDS)
     package_path: str | None = None
     copilot_chat_package_path: str | None = None
@@ -1463,6 +1513,18 @@ def apply_publish_plan(
                     publish_state_path = _copilot_chat_publish_state_path(
                         hermes_home, slug
                     )
+                    publish_state_record = _load_copilot_chat_publish_state_record(
+                        publish_state_path,
+                        hermes_home=hermes_home,
+                        tenant_id=publish_tenant_id,
+                        profile=publish_profile,
+                    )
+                    if publish_state_record is not None:
+                        _refuse_unscoped_v1_publish_state(
+                            publish_state_record,
+                            path=publish_state_path,
+                            app_version_override=plan.inputs.app_version,
+                        )
                     if catalog_manifest_id:
                         _assert_publish_state_matches_catalog_id(
                             publish_state_path,
@@ -1470,6 +1532,8 @@ def apply_publish_plan(
                             hermes_home=hermes_home,
                             tenant_id=publish_tenant_id,
                             profile=publish_profile,
+                            inputs=plan.inputs,
+                            manifest_id_resolution=manifest_id_resolution,
                         )
                     last_published = (
                         _read_copilot_chat_publish_state(
@@ -1546,10 +1610,18 @@ def apply_publish_plan(
                         and summary.get("manifest_id")
                         and summary.get("app_version")
                     ):
-                        cea_minted = bool(
+                        if manifest_id_resolution and manifest_id_resolution.freshly_minted:
+                            cea_minted = True
+                        elif (
                             manifest_id_resolution
-                            and manifest_id_resolution.freshly_minted
-                        )
+                            and manifest_id_resolution.reused_from_state
+                            and publish_state_record is not None
+                        ):
+                            cea_minted = bool(
+                                publish_state_record.get("ceaCatalogIdMinted")
+                            )
+                        else:
+                            cea_minted = False
                         _write_copilot_chat_publish_state(
                             publish_state_path,
                             manifest_id=str(summary["manifest_id"]),
@@ -1708,6 +1780,16 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         ),
     )
     parser.add_argument(
+        "--profile",
+        metavar="NAME",
+        help=(
+            "Hermes gateway profile name for copilot-chat-publish.json "
+            "partitioning (must match the profile used with "
+            "'hermes gateway run --profile NAME', or set HERMES_PROFILE / "
+            "HERMES_GATEWAY_PROFILE); defaults to 'default'"
+        ),
+    )
+    parser.add_argument(
         "--use-blueprint",
         action="store_true",
         help="use blueprint-based non-DW flow (only with --aiteammate false)",
@@ -1759,6 +1841,7 @@ def run(args: argparse.Namespace) -> int:
             manifest_id=args.manifest_id,
             app_version=args.app_version,
             slug=args.slug,
+            profile=getattr(args, "profile", None),
             use_blueprint=args.use_blueprint,
             prompt_starters=(
                 tuple(_parse_prompt_starter(s) for s in args.prompt_starter)

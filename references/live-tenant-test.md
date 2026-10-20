@@ -1289,12 +1289,16 @@ greater than the package already installed for the same catalog
 
 `publish --copilot-chat --apply` patch-bumps `version` when
 `~/.hermes/agents/<slug>/copilot-chat-publish.json` (schema v2: same
-`tenantId`, Hermes profile, and catalog `manifestId`) records
-`lastAppVersion`. With **no** matching record, apply **fails** unless you
-pass `--app-version` strictly above the version MAC shows — except the
-first upload of a newly auto-minted CEA catalog id, which may use the CLI
-template version. Apply refuses when the state file's `manifestId` does not
-match this publish.
+`tenantId`, Hermes profile — use `publish --profile` or `HERMES_PROFILE` to
+match `hermes gateway run --profile` — and catalog `manifestId`) records
+`lastAppVersion`. Legacy schema v1 files have no tenant/profile scope; pass
+`--app-version` once to seed v2 state before auto bumping. With **no**
+matching record, apply **fails** unless you pass `--app-version` strictly
+above the version MAC shows — except the first upload of a newly
+auto-minted CEA catalog id, which may use the CLI template version. Apply
+refuses when the state file's `manifestId` does not match this publish,
+unless you pass a new `--manifest-id` and `--app-version` (or `--manifest-id
+auto` for a new minted id).
 
 Operator rules:
 
