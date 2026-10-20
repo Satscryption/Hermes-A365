@@ -772,6 +772,56 @@ class TestCopilotChatAppVersion:
             == "1.1.6"
         )
 
+    def test_stored_manifest_id_from_publish_state(self, tmp_path: Path) -> None:
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            _stored_manifest_id_from_publish_state,
+            _write_copilot_chat_publish_state,
+        )
+
+        manifest_id = "11111111-1111-1111-1111-111111111111"
+        path = _copilot_chat_publish_state_path(tmp_path, "my-agent")
+        assert (
+            _stored_manifest_id_from_publish_state(path, hermes_home=tmp_path) is None
+        )
+        _write_copilot_chat_publish_state(
+            path,
+            manifest_id=manifest_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+        )
+        assert (
+            _stored_manifest_id_from_publish_state(path, hermes_home=tmp_path)
+            == manifest_id
+        )
+
+    def test_resolve_copilot_chat_manifest_id_reuses_auto_from_state(
+        self, tmp_path: Path
+    ) -> None:
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            _resolve_copilot_chat_manifest_id_for_apply,
+            _write_copilot_chat_publish_state,
+        )
+
+        manifest_id = "22222222-2222-2222-2222-222222222222"
+        path = _copilot_chat_publish_state_path(tmp_path, "my-agent")
+        _write_copilot_chat_publish_state(
+            path,
+            manifest_id=manifest_id,
+            app_version="1.0.0",
+            hermes_home=tmp_path,
+        )
+        inputs = PublishInputs(
+            agent_name="My Agent", copilot_chat=True, manifest_id="auto"
+        )
+        assert (
+            _resolve_copilot_chat_manifest_id_for_apply(
+                inputs, hermes_home=tmp_path
+            )
+            == manifest_id
+        )
+
     def test_manifest_guid_canonicalization_continues_version_sequence(
         self, tmp_path: Path
     ) -> None:
@@ -1361,6 +1411,82 @@ class TestApplyPublishPlanCopilotChat:
         # Operator-facing message points at the MAC Agents upload path.
         assert any("Microsoft Admin Portal" in msg for msg in result.messages)
         assert not any("AI Teammate package" in msg for msg in result.messages)
+
+    def test_no_publish_record_stamps_template_and_writes_state(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        manifest = {
+            "manifestVersion": "devPreview",
+            "id": "44444444-4444-4444-4444-444444444444",
+            "version": "1.1.4",
+            "webApplicationInfo": {"id": "the-bot"},
+            "name": {"short": "X", "full": "X"},
+        }
+        zp = self._seed_manifest_zip(tmp_path, manifest)
+        hermes = tmp_path / "hermes"
+        state_path = _copilot_chat_publish_state_path(hermes, "x")
+        assert not state_path.is_file()
+
+        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        result = apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp), hermes_home=hermes
+        )
+
+        with zipfile.ZipFile(zp) as zf:
+            assert json.loads(zf.read("manifest.json"))["version"] == "1.1.4"
+        assert state_path.is_file()
+        assert any("no Copilot Chat publish record" in m for m in result.messages)
+
+    def test_manifest_id_auto_reuses_catalog_id_and_bumps_version(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import build_publish_plan
+
+        manifest = {
+            "manifestVersion": "devPreview",
+            "id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "version": "1.1.4",
+            "webApplicationInfo": {"id": "the-bot"},
+            "name": {"short": "X", "full": "X"},
+        }
+        hermes = tmp_path / "hermes"
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, manifest_id="auto")
+        )
+        round1 = tmp_path / "r1"
+        round1.mkdir()
+        zp1 = self._seed_manifest_zip(round1, manifest)
+        first = apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp1), hermes_home=hermes
+        )
+        first_id = first.copilot_chat_manifest_id
+        assert first_id is not None
+        with zipfile.ZipFile(zp1) as zf:
+            m = json.loads(zf.read("manifest.json"))
+            assert m["id"] == first_id
+            assert m["version"] == "1.1.4"
+
+        round2 = tmp_path / "r2"
+        round2.mkdir()
+        zp2 = self._seed_manifest_zip(round2, manifest)
+        second = apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp2), hermes_home=hermes
+        )
+        assert second.copilot_chat_manifest_id == first_id
+        with zipfile.ZipFile(zp2) as zf:
+            m = json.loads(zf.read("manifest.json"))
+            assert m["id"] == first_id
+            assert m["version"] == "1.1.5"
+        assert any(
+            "reusing catalog manifest.id" in m for m in second.messages
+        )
 
     def test_copilot_chat_republish_bumps_app_version(self, tmp_path):
         import json

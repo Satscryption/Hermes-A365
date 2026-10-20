@@ -78,14 +78,19 @@ When that file already records `lastAppVersion` for the **same**
 `manifestId` as the zip being built, `hermes a365 publish --copilot-chat
 --apply` stamps a strictly higher `version` (patch-bump when the CLI
 template is unchanged; honour a higher CLI template when Microsoft bumps
-it upstream). With no matching state entry, the CLI template version is
-reused unchanged. `--manifest-id auto` mints a new catalog id each run, so
-state never matches and no automatic bump occurs — use a stable
-`--manifest-id <guid>` for in-place MAC updates. Operators may always pass
-`--app-version X.Y.Z` (required for the first Hermes re-upload when MAC
-already holds an **equal or higher** app `version` than the CLI template —
-Microsoft rejects equal too); the override must still beat the recorded last
-publish when state exists.
+it upstream). With **no** local publish record yet, the CLI template
+`version` is stamped (suitable for a first MAC upload); a MAC **update**
+when the package was installed outside Hermes still needs `--app-version`
+strictly above the version shown in Microsoft Admin Center. `--manifest-id
+auto` (and the combined `--aiteammate --copilot-chat` default) **reuses**
+the `manifestId` already recorded in `copilot-chat-publish.json` on later
+runs so `lastAppVersion` continues to patch-bump across MAC updates. For
+Path-B-only in-place updates without `auto`, omit `--manifest-id` so the
+zip keeps the stable catalog `manifest.id` from the first upload. Operators
+may always pass `--app-version X.Y.Z` (required for the first Hermes
+re-upload when MAC already holds an **equal or higher** app `version` than
+the CLI template — Microsoft rejects equal too); the override must still
+beat the recorded last publish when state exists.
 
 ## Current state in the wrapper
 

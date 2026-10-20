@@ -1287,13 +1287,13 @@ rejects a CEA re-upload when the zip's app `version` is not strictly
 greater than the package already installed for the same catalog
 `manifest.id`.
 
-`publish --copilot-chat --apply` bumps `version` only when
-`~/.hermes/agents/<slug>/copilot-chat-publish.json` already records a
-`lastAppVersion` for the **same** `manifestId` as this zip. If there is
-no state entry (first publish from Hermes, or a new catalog id), the CLI
-template version is reused as-is (often `1.1.4` → `1.1.4`). Passing
-`--manifest-id auto` mints a fresh catalog id every run, so the state
-lookup never matches and **no automatic bump happens**.
+`publish --copilot-chat --apply` patch-bumps `version` when
+`~/.hermes/agents/<slug>/copilot-chat-publish.json` records
+`lastAppVersion` for the **same** catalog `manifestId` as this zip
+(including when `--manifest-id auto` reuses the id from that file on later
+runs). With **no** local publish record yet, the CLI template version is
+stamped as-is (often `1.1.4` → `1.1.4`) — fine for a first MAC upload,
+not for a MAC **update** when the app was installed outside Hermes.
 
 Operator rules:
 
@@ -1301,11 +1301,11 @@ Operator rules:
   yet): pass `--app-version X.Y.Z` strictly above the version MAC shows
   for that app (including when MAC already holds the **same** version as
   the CLI template — equal versions are rejected too).
-- **Later updates** to the same MAC entry: reuse a stable
-  `--manifest-id <guid>` (or omit `auto`) so state tracks
-  `lastAppVersion`; then `publish --copilot-chat --apply` patch-bumps
-  when the CLI template is unchanged. See
-  [`manifest-schema-currency.md`](manifest-schema-currency.md).
+- **Later updates** to the same MAC entry: reuse a stable catalog
+  `manifest.id` (omit `--manifest-id auto` on Path-B-only publishes, or
+  let `auto` reuse the id from `copilot-chat-publish.json`); then
+  `publish --copilot-chat --apply` patch-bumps when the CLI template is
+  unchanged. See [`manifest-schema-currency.md`](manifest-schema-currency.md).
 
 Path B layers Azure Bot Service registration on top of Path A's
 blueprint work. The blueprint Entra app from §3 + its client secret

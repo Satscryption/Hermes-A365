@@ -40,6 +40,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Copilot Chat publish bumps app version without a prior state match (#171).**
+  `publish --copilot-chat --apply` now reuses the catalog `manifest.id`
+  recorded in `copilot-chat-publish.json` when `--manifest-id auto` (or the
+  combined `--aiteammate --copilot-chat` default) runs again, so
+  `lastAppVersion` patch-bumps on MAC updates instead of re-stamping the CLI
+  template. With no local publish record yet, the CLI template version is
+  still used and apply warns that MAC updates of packages installed outside
+  Hermes need `--app-version` strictly above Microsoft Admin Center.
+
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
   `bf_error_body`. Transient failures on an already-open stream (transport

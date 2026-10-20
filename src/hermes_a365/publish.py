@@ -798,18 +798,12 @@ def _require_copilot_chat_slug(inputs: PublishInputs) -> str:
     return slug
 
 
-def _read_copilot_chat_publish_state(
+def _load_copilot_chat_publish_state_record(
     path: Path,
     *,
-    manifest_id: str,
     hermes_home: Path,
-) -> str | None:
-    """Return the last published app version for *manifest_id*, if recorded.
-
-    Returns ``None`` when the state file is absent, or when it records a
-    different (valid) catalog ``manifestId``. Raises :class:`PublishError`
-    when the file exists but is corrupt or untrusted.
-    """
+) -> dict[str, object] | None:
+    """Return a validated publish-state object, or ``None`` when absent."""
     if not path.is_file():
         return None
     _guard_copilot_chat_publish_state_path(path, hermes_home)
@@ -847,18 +841,12 @@ def _read_copilot_chat_publish_state(
             "manifestId; fix or remove the file before re-running publish --apply"
         )
     try:
-        stored_canon = _canonical_manifest_guid(stored_id)
+        raw["manifestId"] = _canonical_manifest_guid(stored_id)
     except ValueError:
         raise PublishError(
             f"Copilot Chat publish state at {path} has invalid manifestId "
             f"{stored_id!r}; fix or remove the file before re-running publish --apply"
         ) from None
-    try:
-        current_canon = _canonical_manifest_guid(manifest_id)
-    except ValueError as exc:
-        raise PublishError(f"invalid catalog manifest id: {exc}") from exc
-    if stored_canon != current_canon:
-        return None
     last = raw.get("lastAppVersion")
     if not isinstance(last, str):
         raise PublishError(
@@ -866,13 +854,78 @@ def _read_copilot_chat_publish_state(
             "lastAppVersion; fix or remove the file before re-running publish --apply"
         )
     try:
-        return _format_app_version(_parse_app_version_triple(last))
+        raw["lastAppVersion"] = _format_app_version(_parse_app_version_triple(last))
     except ValueError:
         raise PublishError(
             f"Copilot Chat publish state at {path} has invalid lastAppVersion "
             f"{last!r} (expected X.Y.Z); fix or remove the file before "
             "re-running publish --apply"
         ) from None
+    return raw
+
+
+def _stored_manifest_id_from_publish_state(
+    path: Path,
+    *,
+    hermes_home: Path,
+) -> str | None:
+    """Return the catalog ``manifestId`` from publish state, if recorded."""
+    record = _load_copilot_chat_publish_state_record(path, hermes_home=hermes_home)
+    if record is None:
+        return None
+    manifest_id = record.get("manifestId")
+    return manifest_id if isinstance(manifest_id, str) else None
+
+
+def _copilot_chat_mints_catalog_id(inputs: PublishInputs) -> bool:
+    """Whether this run assigns (or reuses) a generated catalog ``manifest.id``."""
+    return inputs.manifest_id == "auto" or (
+        inputs.manifest_id is None
+        and inputs.aiteammate
+        and inputs.copilot_chat
+    )
+
+
+def _resolve_copilot_chat_manifest_id_for_apply(
+    inputs: PublishInputs,
+    *,
+    hermes_home: Path,
+) -> str | None:
+    """Catalog ``manifest.id`` to stamp on the Copilot Chat zip for this apply."""
+    if _copilot_chat_mints_catalog_id(inputs):
+        slug = _require_copilot_chat_slug(inputs)
+        state_path = _copilot_chat_publish_state_path(hermes_home, slug)
+        stored = _stored_manifest_id_from_publish_state(
+            state_path, hermes_home=hermes_home
+        )
+        return stored or str(uuid.uuid4())
+    return inputs.manifest_id
+
+
+def _read_copilot_chat_publish_state(
+    path: Path,
+    *,
+    manifest_id: str,
+    hermes_home: Path,
+) -> str | None:
+    """Return the last published app version for *manifest_id*, if recorded.
+
+    Returns ``None`` when the state file is absent, or when it records a
+    different (valid) catalog ``manifestId``. Raises :class:`PublishError`
+    when the file exists but is corrupt or untrusted.
+    """
+    record = _load_copilot_chat_publish_state_record(path, hermes_home=hermes_home)
+    if record is None:
+        return None
+    try:
+        current_canon = _canonical_manifest_guid(manifest_id)
+    except ValueError as exc:
+        raise PublishError(f"invalid catalog manifest id: {exc}") from exc
+    stored_canon = record.get("manifestId")
+    if not isinstance(stored_canon, str) or stored_canon != current_canon:
+        return None
+    last = record.get("lastAppVersion")
+    return last if isinstance(last, str) else None
 
 
 def _write_copilot_chat_publish_state(
@@ -1175,14 +1228,20 @@ def apply_publish_plan(
                     f"{emitted_zip} (CLI no longer emits a zip directly)"
                 )
         if emitted_zip:
-            if plan.inputs.manifest_id == "auto" or (
-                plan.inputs.manifest_id is None
-                and plan.inputs.aiteammate
-                and plan.inputs.copilot_chat
-            ):
-                copilot_chat_manifest_id = str(uuid.uuid4())
-            else:
-                copilot_chat_manifest_id = plan.inputs.manifest_id
+            copilot_chat_manifest_id = _resolve_copilot_chat_manifest_id_for_apply(
+                plan.inputs, hermes_home=hermes_home
+            )
+            reused_catalog_id = False
+            if _copilot_chat_mints_catalog_id(plan.inputs):
+                slug = _require_copilot_chat_slug(plan.inputs)
+                state_path = _copilot_chat_publish_state_path(hermes_home, slug)
+                stored = _stored_manifest_id_from_publish_state(
+                    state_path, hermes_home=hermes_home
+                )
+                reused_catalog_id = (
+                    stored is not None
+                    and copilot_chat_manifest_id == stored
+                )
 
             # Decide which file we end up calling the Copilot Chat zip.
             # - Both surfaces requested → copy the CLI-emitted zip aside
@@ -1228,6 +1287,25 @@ def apply_publish_plan(
                         else None
                     )
                     template_version = _parse_template_app_version(source_manifest)
+                    if (
+                        last_published is None
+                        and plan.inputs.app_version is None
+                        and publish_state_path is not None
+                        and not publish_state_path.is_file()
+                        and catalog_manifest_id is not None
+                    ):
+                        # #171 — no local publish record for this catalog id yet.
+                        # The CLI template version is correct for a first MAC
+                        # upload, but a MAC *update* when the app was installed
+                        # outside Hermes needs --app-version above MAC's version.
+                        messages.append(
+                            "[apply] no Copilot Chat publish record for this "
+                            f"catalog manifest.id ({catalog_manifest_id}); "
+                            "stamping the CLI template app version. For a MAC "
+                            "update when a package is already installed, pass "
+                            "--app-version strictly above the version shown in "
+                            "Microsoft Admin Center."
+                        )
                     try:
                         copilot_app_version = _resolve_next_copilot_chat_app_version(
                             template_version=template_version,
@@ -1261,6 +1339,11 @@ def apply_publish_plan(
                         f"manifestId={summary['manifest_id']}, "
                         f"scopes={summary['scopes']}" + dropped
                     )
+                    if reused_catalog_id:
+                        messages.append(
+                            "[apply] reusing catalog manifest.id from "
+                            f"{publish_state_path} (--manifest-id auto)"
+                        )
                     if (
                         publish_state_path is not None
                         and summary.get("manifest_id")
@@ -1394,8 +1477,9 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         "--manifest-id",
         help=(
             "override the Teams App Catalog manifest.id used in the Copilot "
-            "Chat zip; pass 'auto' to generate a fresh GUID. Defaults to "
-            "auto when --aiteammate and --copilot-chat are combined"
+            "Chat zip; pass 'auto' to generate a fresh GUID (reuses the id "
+            "recorded in copilot-chat-publish.json on later runs). Defaults "
+            "to auto when --aiteammate and --copilot-chat are combined"
         ),
     )
     parser.add_argument(
