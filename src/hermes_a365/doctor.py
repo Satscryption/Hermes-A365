@@ -49,10 +49,14 @@ from . import bot_service, bot_service_diagnostics
 from ._common import parse_env, safe_run, tcp_reachable
 from .activity_bridge import parse_agent_identity_ids
 from .compatibility import (
+    A365_CLI_LIVE_VERIFIED,
+    AZURE_CLI_MIN,
     HERMES_GATEWAY_PYTHON,
     HERMES_MULTIPLEX_MIN_CALENDAR,
     HERMES_PLUGIN_MIN_CALENDAR,
     HERMES_SESSION_PIN_RESOLUTION_MIN_CALENDAR,
+    POWERSHELL_MIN_MAJOR,
+    PYTHON_VERSIONS_CI,
     REQUIRES_PYTHON,
     format_calendar_tag,
     hermes_meets_multiplex_floor,
@@ -60,6 +64,7 @@ from .compatibility import (
     hermes_meets_session_pin_resolution_floor,
     host_platform_supported,
     parse_hermes_version_text,
+    python_in_ci_matrix,
     python_in_supported_range,
     python_version_tuple,
 )
@@ -94,8 +99,10 @@ FRONTIER_PROGRAM_URL = "https://adoption.microsoft.com/copilot/frontier-program/
 # fixed upstream, but a 2026-05-15 live R9 walkthrough still reproduced
 # the persistence gap on 1.1.181. Keep this probe conservative until a
 # later CLI build is live-verified.
-A365_CLI_SECRET_LATEST_AFFECTED_VERSION = (1, 1, 181)
-A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT = "1.1.181"
+A365_CLI_SECRET_LATEST_AFFECTED_VERSION = A365_CLI_LIVE_VERIFIED
+A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT = ".".join(
+    str(part) for part in A365_CLI_LIVE_VERIFIED
+)
 A365_CLI_NUGET_URL = "https://www.nuget.org/packages/Microsoft.Agents.A365.DevTools.Cli"
 
 
@@ -197,11 +204,12 @@ def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
 
 def probe_az_cli() -> ProbeResult:
     binary = shutil.which("az")
+    min_label = ".".join(str(part) for part in AZURE_CLI_MIN)
     if not binary:
         return ProbeResult(
             "az_cli",
             _ERROR,
-            "az not found on PATH (install Azure CLI ≥ 2.55.0)",
+            f"az not found on PATH (install Azure CLI ≥ {min_label})",
         )
     signed_in = safe_run([binary, "account", "show", "--query", "user.name", "-o", "tsv"])
     if not signed_in:
@@ -231,11 +239,15 @@ def probe_powershell() -> ProbeResult:
         )
     version_raw = safe_run([binary, "-Command", "$PSVersionTable.PSVersion.ToString()"]) or ""
     version = version_raw.strip() or "unknown"
-    if version != "unknown" and not version.startswith(("7.", "8.", "9.")):
+    major = version.split(".", 1)[0] if version != "unknown" else ""
+    if version != "unknown" and (
+        not major.isdigit() or int(major) < POWERSHELL_MIN_MAJOR
+    ):
         return ProbeResult(
             "powershell",
             _WARN,
-            f"present at {binary}; version {version} (CLI requires 7+)",
+            f"present at {binary}; version {version} (CLI requires "
+            f"{POWERSHELL_MIN_MAJOR}+)",
             {"path": binary, "version": version},
         )
     return ProbeResult(
@@ -330,19 +342,19 @@ def probe_python_runtime() -> ProbeResult:
     ver = python_version_tuple()
     label = f"{ver[0]}.{ver[1]}.{ver[2]}"
     if not python_in_supported_range(ver):
-        if ver[:2] < (3, 11):
-            return ProbeResult(
-                "python",
-                _ERROR,
-                f"Python {label} is below the v1 minimum (3.11); "
-                f"supported range is {REQUIRES_PYTHON}",
-                {"version": label},
-            )
         return ProbeResult(
             "python",
             _ERROR,
-            f"Python {label} is outside the supported range ({REQUIRES_PYTHON}); "
-            "not continuously tested in CI",
+            f"Python {label} is below the v1 minimum (3.11); "
+            f"supported range is {REQUIRES_PYTHON}",
+            {"version": label},
+        )
+    if not python_in_ci_matrix(ver):
+        return ProbeResult(
+            "python",
+            _WARN,
+            f"Python {label} meets {REQUIRES_PYTHON} but is outside the CI matrix "
+            f"({', '.join(PYTHON_VERSIONS_CI)}); not continuously tested",
             {"version": label},
         )
     detail = f"Python {label} is within {REQUIRES_PYTHON}"
@@ -459,6 +471,35 @@ def probe_local_config() -> ProbeResult:
             ),
         },
     )
+
+
+def _hermes_agent365_plugin_in_use() -> bool:
+    """True when the Hermes gateway is configured to load the agent365 plugin."""
+    home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
+    cfg = home / "config.yaml"
+    if not cfg.is_file():
+        return False
+    try:
+        import yaml
+
+        data = yaml.safe_load(cfg.read_text()) or {}
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    plugins = data.get("plugins")
+    if isinstance(plugins, dict):
+        enabled = plugins.get("enabled")
+        if isinstance(enabled, (list, tuple, set)) and "agent365" in enabled:
+            return True
+    gw = data.get("gateway")
+    if isinstance(gw, dict):
+        platforms = gw.get("platforms")
+        if isinstance(platforms, dict):
+            agent365 = platforms.get("agent365")
+            if isinstance(agent365, dict) and agent365.get("enabled"):
+                return True
+    return False
 
 
 def _agent365_file_hosts_from_config() -> tuple[str, list[str], bool]:
@@ -879,15 +920,27 @@ def probe_hermes_harness() -> ProbeResult:
     multiplex_ok = hermes_meets_multiplex_floor(parsed)
     pin_ok = hermes_meets_session_pin_resolution_floor(parsed)
     _, _, multiplex_cfg = _agent365_file_hosts_from_config()
+    plugin_in_use = _hermes_agent365_plugin_in_use()
 
     if plugin_ok is False:
+        floor = (
+            f"{format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR)} / "
+            "Hermes Agent 0.12.0+"
+        )
+        if plugin_in_use or multiplex_cfg:
+            return ProbeResult(
+                "hermes_harness",
+                _ERROR,
+                f"{first} ({binary}) is below the v1 plugin floor ({floor})",
+                data,
+            )
         return ProbeResult(
             "hermes_harness",
-            _ERROR,
+            _WARN,
             (
-                f"{first} ({binary}) is below the v1 plugin floor "
-                f"({format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR)} / "
-                "Hermes Agent 0.12.0+)"
+                f"{first} ({binary}) is below the v1 plugin floor ({floor}); "
+                "standalone CLI use is fine — upgrade Hermes before enabling "
+                "the agent365 gateway plugin"
             ),
             data,
         )

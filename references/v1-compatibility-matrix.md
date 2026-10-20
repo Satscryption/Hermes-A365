@@ -13,20 +13,21 @@ probes the host against this matrix (Python, OS, Hermes floors, keychain).
 
 | Role | Supported range | CI evidence |
 | --- | --- | --- |
-| **Standalone CLI / wheel** (`hermes-a365`, `pipx install`) | `>=3.11,<3.15` (3.11–3.14 tested) | Ubuntu + macOS + Windows: pytest + ruff per version |
-| **Hermes gateway plugin** | **Python 3.14** in the Hermes venv | Same CI on 3.14; combined install uses `overrides.txt` ([#148](https://github.com/Satscryption/Hermes-A365/issues/148)) |
+| **Standalone CLI / wheel** (`hermes-a365`, `pipx install`) | `>=3.11` (3.11–3.14 tested in CI; 3.15+ untested) | **Ubuntu:** ruff + full pytest on 3.11–3.14 |
+| **Hermes gateway plugin** | **Python 3.14** in the Hermes venv | **Ubuntu 3.14** + **macOS 3.14** (same pytest suite; combined install uses `overrides.txt` ([#148](https://github.com/Satscryption/Hermes-A365/issues/148))) |
 
-Hermes Agent declares `requires-python = ">=3.11,<3.15"` and documents **3.14**
-as the supported gateway runtime. This package does not lower the bridge
-security floors; see [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md).
+Hermes Agent upstream still declares `requires-python = ">=3.11,<3.15"` and
+documents **3.14** as the supported gateway runtime. This package does not
+lower the bridge security floors; see
+[`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md).
 
 ## Host operating systems
 
 | OS | v1 support | Secret store | Notes |
 | --- | --- | --- | --- |
-| **macOS** (13+) | Supported | `security` CLI (login keychain) | macOS keychain **writes** require `HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1` (secret in argv). Reads/deletes work by default. CI runs the full pytest suite on macOS; **live keychain round-trips** need an unlocked login keychain (operator Mac) — GitHub-hosted macOS cannot complete headless writes. |
-| **Linux** (glibc distros, e.g. Ubuntu 22.04+) | Supported | `secret-tool` (libsecret / Secret Service) | CI `keychain-linux` job exercises libsecret with a disposable Secret Service. |
-| **Windows** | **Not supported** | *None in this package* | The GA `a365` CLI may write blueprint secrets with DPAPI; Hermes-A365 does not implement Credential Manager and does not integrate DPAPI persistence. End-to-end v1 flows require macOS or Linux. |
+| **macOS** | Supported | `security` CLI (login keychain) | macOS keychain **writes** require `HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI=1` (secret in argv). Reads/deletes work by default. CI runs the full pytest suite on **macOS 3.14 only**; live keychain round-trips are **operator-verified** on an unlocked login keychain — GitHub-hosted macOS skips headless `security` writes. |
+| **Linux** (glibc distros) | Supported | `secret-tool` (libsecret / Secret Service) | CI `keychain-linux` job exercises libsecret with a disposable Secret Service. Distros such as Ubuntu 22.04+ are **operator-verified**, not separate CI lanes. |
+| **Windows** | **Not supported** | *None in this package* | The GA `a365` CLI may write blueprint secrets with DPAPI; Hermes-A365 does not implement Credential Manager and does not integrate DPAPI persistence. CI runs **negative probe tests only** on `windows-latest` (unsupported-host contract). End-to-end v1 flows require macOS or Linux. |
 
 `doctor` reports **error** on Windows and on missing keychain backends.
 
@@ -39,7 +40,7 @@ Two install contracts:
 
 | Mode | Minimum Hermes (calendar tag) | Minimum Hermes Agent (semver) | Evidence |
 | --- | --- | --- | --- |
-| Plugin (single-profile or multiplex off) | `v2026.4.30` | `0.12.0` | Source smoke in CI; plugin unit tests |
+| Plugin (single-profile or multiplex off) | `v2026.4.30` (Teams adapter ship tag; pairs with **0.12.0**) | `0.12.0` | CI Hermes source smoke (import + contract files); plugin unit tests |
 | `gateway.multiplex_profiles: true` | `v2026.6.19` | `0.17.0` | Source smoke; multiplex config guard in `doctor` |
 | Copilot→Teams session pin (resolution) | `v2026.9.7` | `0.21.1` | Documented in [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md); `doctor` **warns** below floor |
 
@@ -80,12 +81,13 @@ Record exact CLI builds used on the #90 walk in the closing report.
 
 | Claim | Automated | Live (#90 / operator) |
 | --- | --- | --- |
-| Python 3.11–3.14 unit + lint | Yes | — |
-| macOS / Linux / Windows pytest | Yes (Windows = unsupported **host**; tests run on runner) | — |
-| macOS keychain round-trip | Full suite on macOS runner; live store/get/delete on operator Mac with unlocked keychain | GitHub macOS blocks headless `security` writes |
-| Linux libsecret round-trip | Yes when Secret Service available | — |
+| Python 3.11–3.14 unit + lint (Ubuntu) | Yes | — |
+| Python 3.14 unit + lint (macOS) | Yes | — |
+| Windows unsupported-host probes | Yes (`windows-negative` job only) | — |
+| macOS keychain round-trip | No (skipped on GitHub macOS runners) | Operator Mac with unlocked keychain |
+| Linux libsecret round-trip | Yes when Secret Service available (`keychain-linux`) | — |
 | Wheel/sdist build + fresh install smoke | Yes | — |
-| Hermes source tags + plugin import path | Yes (pinned refs) | Full gateway multiplex traffic |
+| Hermes source tags (import + adapter contract) | Yes (pinned refs) | Full gateway multiplex traffic |
 | Teams / Copilot UI round-trips | — | #90 feature matrix |
 
 ## Related references

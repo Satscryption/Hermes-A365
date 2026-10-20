@@ -32,17 +32,22 @@ def test_requires_python_matches_compatibility_module() -> None:
 def test_python_range() -> None:
     assert python_in_supported_range((3, 11, 0))
     assert python_in_supported_range((3, 14, 9))
+    assert python_in_supported_range((3, 15, 0))
     assert not python_in_supported_range((3, 10, 0))
-    assert not python_in_supported_range((3, 15, 0))
 
 
 def test_parse_hermes_versions() -> None:
     assert parse_hermes_version_text("v2026.4.30") == ("calendar", (2026, 4, 30))
     assert parse_hermes_version_text("Hermes Agent v0.22.2 (v2026.9.24)") == (
-        "calendar",
-        (2026, 9, 24),
+        "semver",
+        (0, 22, 2),
+    )
+    assert parse_hermes_version_text("Hermes Agent v0.22.2 (2026.9.24)") == (
+        "semver",
+        (0, 22, 2),
     )
     assert parse_hermes_version_text("Hermes Agent v0.12.0") == ("semver", (0, 12, 0))
+    assert parse_hermes_version_text("(2026.9.24)") == ("calendar", (2026, 9, 24))
     assert parse_hermes_version_text("unknown") is None
 
 
@@ -77,10 +82,11 @@ def test_probe_host_platform_windows_errors() -> None:
     assert "Windows" in result.detail
 
 
-def test_probe_hermes_below_plugin_floor_errors() -> None:
+def test_probe_hermes_below_plugin_floor_errors_when_plugin_in_use() -> None:
     with (
         patch("hermes_a365.doctor.shutil.which", return_value="/bin/hermes"),
         patch("hermes_a365.doctor.safe_run", return_value="Hermes Agent v0.11.0\n"),
+        patch("hermes_a365.doctor._hermes_agent365_plugin_in_use", return_value=True),
         patch(
             "hermes_a365.doctor._agent365_file_hosts_from_config",
             return_value=("unreadable", [], False),
@@ -89,6 +95,21 @@ def test_probe_hermes_below_plugin_floor_errors() -> None:
         result = probe_hermes_harness()
     assert result.state == "error"
     assert format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR) in result.detail
+
+
+def test_probe_hermes_below_plugin_floor_warns_for_standalone_cli() -> None:
+    with (
+        patch("hermes_a365.doctor.shutil.which", return_value="/bin/hermes"),
+        patch("hermes_a365.doctor.safe_run", return_value="Hermes Agent v0.11.0\n"),
+        patch("hermes_a365.doctor._hermes_agent365_plugin_in_use", return_value=False),
+        patch(
+            "hermes_a365.doctor._agent365_file_hosts_from_config",
+            return_value=("unreadable", [], False),
+        ),
+    ):
+        result = probe_hermes_harness()
+    assert result.state == "warn"
+    assert "standalone CLI" in result.detail
 
 
 def test_probe_hermes_multiplex_floor_when_config_on() -> None:

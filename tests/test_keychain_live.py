@@ -1,6 +1,8 @@
 """Optional live OS-keychain round-trips (#126).
 
-Enabled only when ``HERMES_A365_LIVE_KEYCHAIN=1`` (CI macOS / Linux jobs).
+Enabled only when ``HERMES_A365_LIVE_KEYCHAIN=1``. CI runs this on Linux
+(``keychain-linux`` job). GitHub-hosted macOS runners skip headless login
+keychain writes; use an operator Mac for macOS live coverage.
 Uses synthetic credentials and always deletes them.
 """
 

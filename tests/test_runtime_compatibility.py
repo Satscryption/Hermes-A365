@@ -65,7 +65,7 @@ def test_requires_python_matches_v1_matrix() -> None:
     assert Version("3.11") in spec
     assert Version("3.14") in spec
     assert Version("3.10") not in spec
-    assert Version("3.15") not in spec
+    assert Version("3.15") in spec
     classifiers = _project()["classifiers"]
     for minor in (11, 12, 13, 14):
         assert f"Programming Language :: Python :: 3.{minor}" in classifiers

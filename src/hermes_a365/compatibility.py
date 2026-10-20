@@ -14,9 +14,8 @@ from typing import Final
 # --- Python (standalone CLI / wheel) -----------------------------------------
 
 PYTHON_VERSION_MIN: Final[tuple[int, int]] = (3, 11)
-PYTHON_VERSION_MAX_EXCLUSIVE: Final[tuple[int, int]] = (3, 15)
 PYTHON_VERSIONS_CI: Final[tuple[str, ...]] = ("3.11", "3.12", "3.13", "3.14")
-REQUIRES_PYTHON: Final[str] = ">=3.11,<3.15"
+REQUIRES_PYTHON: Final[str] = ">=3.11"
 
 # Hermes gateway venv (NousResearch/hermes-agent documents 3.14 as runtime).
 HERMES_GATEWAY_PYTHON: Final[str] = "3.14"
@@ -28,7 +27,9 @@ WINDOWS_KEYCHAIN_SUPPORTED: Final[bool] = False
 
 # --- Hermes Agent (gateway plugin) -------------------------------------------
 
-# Calendar-tag floors (``v2026.M.D``) documented in references.
+# Calendar-tag floors (``vYYYY.M.D``) documented in references.
+# Plugin baseline aligns with Hermes Agent 0.12.0+ / the Teams adapter ship tag
+# ``v2026.4.30`` (not a separate agent365 import break).
 HERMES_PLUGIN_MIN_CALENDAR: Final[tuple[int, int, int]] = (2026, 4, 30)
 HERMES_MULTIPLEX_MIN_CALENDAR: Final[tuple[int, int, int]] = (2026, 6, 19)
 HERMES_SESSION_PIN_RESOLUTION_MIN_CALENDAR: Final[tuple[int, int, int]] = (2026, 9, 7)
@@ -45,7 +46,6 @@ HERMES_INTEGRATION_SMOKE_REFS: Final[tuple[str, ...]] = ("v2026.6.19", "v0.22.2"
 
 AZURE_CLI_MIN: Final[tuple[int, int, int]] = (2, 55, 0)
 POWERSHELL_MIN_MAJOR: Final[int] = 7
-DOTNET_RUNTIME_MIN: Final[tuple[int, int, int]] = (10, 0, 0)
 A365_CLI_LIVE_VERIFIED: Final[tuple[int, int, int]] = (1, 1, 181)
 
 # --- M365 manifest / program -------------------------------------------------
@@ -53,8 +53,9 @@ A365_CLI_LIVE_VERIFIED: Final[tuple[int, int, int]] = (1, 1, 181)
 CEA_MANIFEST_VERSION: Final[str] = "1.27"
 FRONTIER_PREVIEW_REQUIRED: Final[bool] = True
 
-_CALENDAR_RE = re.compile(r"(?:\bv)?(2026)\.(\d+)\.(\d+)")
 _SEMVER_RE = re.compile(r"(?:\bv)?(0)\.(\d+)\.(\d+)")
+_PAREN_CALENDAR_RE = re.compile(r"\((\d{4})\.(\d+)\.(\d+)\)")
+_YEAR_CALENDAR_RE = re.compile(r"(?:\bv)?(\d{4})\.(\d+)\.(\d+)")
 
 
 def python_version_tuple() -> tuple[int, int, int]:
@@ -63,9 +64,13 @@ def python_version_tuple() -> tuple[int, int, int]:
 
 def python_in_supported_range(version: tuple[int, int, int] | None = None) -> bool:
     ver = version or python_version_tuple()
-    if ver[:2] < PYTHON_VERSION_MIN:
-        return False
-    return ver[:2] < PYTHON_VERSION_MAX_EXCLUSIVE
+    return ver[:2] >= PYTHON_VERSION_MIN
+
+
+def python_in_ci_matrix(version: tuple[int, int, int] | None = None) -> bool:
+    ver = version or python_version_tuple()
+    label = f"{ver[0]}.{ver[1]}"
+    return label in PYTHON_VERSIONS_CI
 
 
 def host_platform_supported(platform: str | None = None) -> bool:
@@ -74,20 +79,37 @@ def host_platform_supported(platform: str | None = None) -> bool:
 
 
 def parse_hermes_version_text(text: str) -> tuple[str, tuple[int, ...]] | None:
-    """Return ``('calendar', (2026, M, D))`` or ``('semver', (0, M, D))``."""
+    """Return ``('calendar', (Y, M, D))`` or ``('semver', (0, M, D))``.
 
-    calendar = _CALENDAR_RE.search(text)
-    if calendar:
-        return (
-            "calendar",
-            (int(calendar.group(1)), int(calendar.group(2)), int(calendar.group(3))),
-        )
+    Prefer the semantic ``v0.M.D`` token from ``hermes --version`` (for example
+    ``Hermes Agent v0.22.2 (2026.9.24)``). Use a parenthetical or bare calendar
+    tag only when no semver token is present.
+    """
+
     semver = _SEMVER_RE.search(text)
     if semver:
         return (
             "semver",
             (int(semver.group(1)), int(semver.group(2)), int(semver.group(3))),
         )
+    paren = _PAREN_CALENDAR_RE.search(text)
+    if paren:
+        return (
+            "calendar",
+            (int(paren.group(1)), int(paren.group(2)), int(paren.group(3))),
+        )
+    calendar = _YEAR_CALENDAR_RE.search(text)
+    if calendar:
+        year = int(calendar.group(1))
+        if year >= 2020:
+            return (
+                "calendar",
+                (
+                    year,
+                    int(calendar.group(2)),
+                    int(calendar.group(3)),
+                ),
+            )
     return None
 
 

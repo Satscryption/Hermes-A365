@@ -2,12 +2,14 @@
 """Verify pinned Hermes git refs against the v1 plugin/multiplex floors (#126).
 
 This is source-level integration evidence (not a live gateway walk). It clones
-each ref shallowly and checks the adapter contract files exist.
+each ref shallowly, imports ``gateway.platforms.base``, and checks adapter
+contract files exist.
 """
 
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 import sys
 import tempfile
@@ -61,6 +63,20 @@ def _check_ref(ref: str, work: Path) -> list[str]:
         text = base_py.read_text(encoding="utf-8", errors="replace")
         if "BasePlatformAdapter" not in text:
             errors.append(f"{ref}: BasePlatformAdapter not found in base.py")
+        import_check = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from gateway.platforms.base import BasePlatformAdapter",
+            ],
+            cwd=checkout,
+            env={**os.environ, "PYTHONPATH": str(checkout)},
+            capture_output=True,
+            text=True,
+        )
+        if import_check.returncode != 0:
+            detail = (import_check.stderr or import_check.stdout or "").strip()
+            errors.append(f"{ref}: gateway.platforms.base import failed ({detail})")
 
     calendar = _calendar_from_ref(ref)
     if calendar is not None and calendar < HERMES_PLUGIN_MIN_CALENDAR:

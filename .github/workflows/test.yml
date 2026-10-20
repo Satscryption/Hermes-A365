@@ -123,10 +123,12 @@ jobs:
 
       - name: Smoke-install wheel in a clean venv
         run: |
+          set -euo pipefail
           uv venv /tmp/wheel-smoke-venv --python 3.14
           uv pip install --python /tmp/wheel-smoke-venv/bin/python dist/*.whl
           /tmp/wheel-smoke-venv/bin/python -c "import hermes_a365; import hermes_a365.plugin"
-          /tmp/wheel-smoke-venv/bin/hermes-a365 doctor --no-network | head -n 5
+          /tmp/wheel-smoke-venv/bin/hermes-a365 doctor --no-network | tee /tmp/doctor-smoke.json
+          /tmp/wheel-smoke-venv/bin/python -c "import json,sys; o=json.load(open('/tmp/doctor-smoke.json'))['overall']; sys.exit(2 if o=='error' else 0)"
 
   hermes-source-smoke:
     runs-on: ubuntu-latest

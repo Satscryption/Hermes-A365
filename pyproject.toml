@@ -11,9 +11,9 @@ license = {text = "MIT"}
 authors = [
   {name = "Sadiq Jaffer", email = "sadiq.jaffer@satscryption.io"},
 ]
-# v1 matrix (#126): 3.11 minimum standalone CLI; 3.14 Hermes gateway runtime;
-# upper bound matches NousResearch/hermes-agent (<3.15). CI tests 3.11–3.14.
-requires-python = ">=3.11,<3.15"
+# v1 matrix (#126): 3.11 minimum standalone CLI; 3.14 Hermes gateway runtime.
+# CI tests 3.11–3.14; 3.15+ is not capped (untested in CI).
+requires-python = ">=3.11"
 classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
