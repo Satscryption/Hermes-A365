@@ -8,6 +8,20 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **#126 — v1 compatibility matrix.** Published
+  [`references/v1-compatibility-matrix.md`](references/v1-compatibility-matrix.md)
+  (Python `>=3.11` with 3.11–3.14 in CI; 3.15+ untested, macOS/Linux
+  supported hosts, Hermes plugin/multiplex floors, Microsoft tooling
+  snapshots, CEA manifest 1.27). `hermes_a365.compatibility` centralizes the
+  constants; `doctor` probes Python, host OS, and Hermes version floors
+  (including multiplex when `gateway.multiplex_profiles` is enabled). CI runs
+  ruff and pytest on Ubuntu for Python 3.11–3.14, macOS for 3.14 only (live
+  macOS keychain tests skipped on GitHub runners), Linux libsecret live
+  keychain, wheel fresh-install smoke, Hermes source smoke for `v2026.6.19`
+  and `v0.22.2`, and Windows as an unsupported-host negative probe only.
+  Windows remains unsupported for the OS keychain layer (no Credential Manager
+  backend). Refs [#126](https://github.com/Satscryption/Hermes-A365/issues/126).
+
 - **`gateway.platforms.agent365.extra.reactions_dispatch_agent_turn`** (default
   `false`). When enabled, a stored Teams `messageReaction` on a bot reply also
   dispatches Hermes' `reaction:added:<type>` / `reaction:removed:<type>` agent
@@ -15,6 +29,25 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   feedback map and logged without invoking the agent.
 
 ### Fixed
+
+- **Copilot Chat publish version and catalog id handling (#171).**
+  `publish --copilot-chat --apply` fails closed when there is no matching
+  `copilot-chat-publish.json` record for the target catalog `manifest.id` and
+  no `--app-version` (first upload of a new auto-minted catalog id still
+  stamps the CLI template). Apply refuses to overwrite state when the on-disk
+  `manifestId` differs, except when you pass a new `--manifest-id` with
+  `--app-version` or `--manifest-id auto` mints a fresh CEA id. Reuse writes
+  preserve `ceaCatalogIdMinted` across consecutive auto applies. `--manifest-id
+  auto` (and the combined `--aiteammate --copilot-chat` default) reuses only a
+  prior **auto-minted** CEA id recorded for the same tenant and Hermes
+  profile, never the AI Teammate / Path-B template catalog id (#26). Publish
+  state schema v2 adds `tenantId`, `profile` (`publish --profile` or
+  `HERMES_PROFILE` / `HERMES_GATEWAY_PROFILE`), and `ceaCatalogIdMinted`.
+  Legacy schema v1 is unscoped: apply requires `--app-version` to seed v2
+  state instead of implicitly claiming the current tenant/profile on read.
+  Fresh-mint state replacement follows resolver `freshly_minted` (including
+  combined `--aiteammate --copilot-chat` default). Mismatch hints never steer
+  operators toward reusing the AI Teammate catalog id on the CEA zip.
 
 - **#180 — Teams reactions no longer start an agent turn by default.** Recording
   and #80 logging still run; only `reactions_dispatch_agent_turn` restores the
@@ -25,6 +58,26 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   (invoke, `messageReaction`, card submit, and lifecycle handlers are unchanged);
   `activity-bridge serve` still forwards only `message` and `invoke`, matching
   `references/webhook-contract.md`.
+- **FileConsentCard removed after Allow/Decline (#183).** On
+  ``fileConsent/invoke``, the adapter best-effort deletes the consent
+  card activity (``replyToId``) via the Bot Framework DELETE endpoint,
+  then posts the FileInfoCard on accept or a short decline confirmation
+  on decline (once per ``consentId``, including BF invoke retries).
+  Failed accepts remove the card too. Delete failures are logged and do
+  not block the invoke ack.
+- **Teams 1:1 stream overflow split at ~4k (#184).** Raise
+  ``streaming_overflow_limit()`` only for Teams **personal** streaming
+  session tasks via a ContextVar (32 768 UTF-16 code units, under
+  Microsoft's ~80 KB text guidance with headroom). Copilot Chat,
+  group/channel, and turn/coalesced buffers stay at ``MAX_MESSAGE_LENGTH``
+  (4000). Length accounting uses UTF-16 code units via ``message_len_fn``.
+- **Teams 1:1 typing indicator after a streamed final (#185).** On personal
+  chats, ``send_typing`` is a no-op while a BF stream is open and for the
+  rest of the turn after ``streamType=final`` lands, so Hermes'
+  ``_keep_typing`` loop does not post late pulses once the answer bubble
+  is complete. Suppression clears when the next personal turn starts and
+  after ``on_processing_complete`` finishes the turn-end finalize (including
+  failed finalize).
 
 ## [0.9.2] — 2026-10-19
 
@@ -84,7 +137,7 @@ in v0.9.2 (`f4d85bcd`) but had been listed under `[Unreleased]`.
 
 - **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
   A handler crash, a file-consent crash, a deduped invoke, a decline, an
-  unknown file consent, and an operator-webhook error are HTTP 200 with a
+  unknown file consent, and operator-webhook error are HTTP 200 with a
   JSON `{}` body on both runtimes. Teams reads that status as the invoke
   status, so these paths do not return a 5xx, and it rejects a JSON `null`
   invoke payload (`Payload cannot be null`). The plugin no longer answers

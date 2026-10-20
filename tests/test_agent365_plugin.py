@@ -21,6 +21,7 @@ import types
 from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
@@ -6798,6 +6799,135 @@ class TestSendTyping:
         assert body["conversation"]["conversationType"] == "personal"
 
     @pytest.mark.asyncio
+    async def test_send_typing_suppressed_during_personal_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-stream-typing")
+            )
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-xyz"),
+        )
+        post_mock = AsyncMock(return_value=MagicMock(status_code=200, text=""))
+        a._http_client.post = post_mock
+        a._active_stream_by_chat["conv-stream-typing"] = "stream-msg-1"
+
+        await a.send_typing("conv-stream-typing")
+        assert post_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_send_typing_suppressed_after_personal_stream_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-after-final")
+            )
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-xyz"),
+        )
+        post_mock = AsyncMock(return_value=MagicMock(status_code=200, text=""))
+        a._http_client.post = post_mock
+        a._personal_stream_final_posted.add("conv-after-final")
+
+        await a.send_typing("conv-after-final")
+        assert post_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_personal_stream_final_sets_and_complete_clears_typing_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-flag-lifecycle"
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id=chat_id)
+            )
+        )
+        a._personal_processing_depth[chat_id] = 1
+        a._mark_personal_stream_final_posted(chat_id)
+        assert chat_id in a._personal_stream_final_posted
+
+        event = SimpleNamespace(
+            raw_message={"conversation": {"id": chat_id}},
+        )
+        finalize = AsyncMock(return_value=adapter_mod.SendResult(success=True))
+        monkeypatch.setattr(a, "_finalize_open_personal_stream", finalize)
+
+        await a.on_processing_complete(event)
+        assert chat_id not in a._personal_stream_final_posted
+
+    @pytest.mark.asyncio
+    async def test_new_personal_turn_allows_typing_after_prior_final_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-next-turn"
+        inbound = _make_inbound(conv_id=chat_id)
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        a._seen_inbounds_this_lifetime.add(chat_id)
+        a._personal_stream_final_posted.add(chat_id)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-xyz"),
+        )
+        post_mock = AsyncMock(return_value=MagicMock(status_code=200, text=""))
+        a._http_client.post = post_mock
+
+        event = SimpleNamespace(
+            message_id="act-new",
+            raw_message={"conversation": {"id": chat_id}},
+        )
+        await a.on_processing_start(event)
+        assert chat_id not in a._personal_stream_final_posted
+
+        await a.send_typing(chat_id)
+        assert post_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_turn_end_finalize_clears_typing_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-fail-final"
+        a._personal_processing_depth[chat_id] = 1
+        a._mark_personal_stream_final_posted(chat_id)
+        event = SimpleNamespace(
+            raw_message={"conversation": {"id": chat_id}},
+        )
+        async def fail_finalize(_chat: str) -> None:
+            return None
+
+        monkeypatch.setattr(a, "_finalize_open_personal_stream", fail_finalize)
+        await a.on_processing_complete(event)
+        assert chat_id not in a._personal_stream_final_posted
+
+    @pytest.mark.asyncio
     async def test_typing_failure_swallowed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -13019,6 +13149,167 @@ class TestSendOrUpdateStatus:
         assert a._coalesced_status_tasks == {}
 
 
+class TestStreamingOverflowLimit:
+    def test_streaming_overflow_limit_only_for_personal_session_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        assert a.streaming_overflow_limit() is None
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-p"))
+        )
+        token = a._enter_stream_overflow_limit("conv-p")
+        adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
+        cap = a.streaming_overflow_limit()
+        assert (
+            cap
+            == adapter_mod.Agent365Adapter._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
+        )
+        assert cap > a.MAX_MESSAGE_LENGTH
+        a._reset_stream_overflow_limit_for_task()
+        assert a.streaming_overflow_limit() is None
+
+    def test_streaming_overflow_limit_none_for_group_session_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-grp")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        token = a._enter_stream_overflow_limit("conv-grp")
+        adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
+        assert a.streaming_overflow_limit() is None
+        a._reset_stream_overflow_limit_for_task()
+
+    @pytest.mark.asyncio
+    async def test_group_consumer_during_personal_turn_does_not_inherit_overflow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        personal = _make_inbound(conv_id="conv-personal")
+        group = _make_inbound(conv_id="conv-group")
+        group["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(personal))
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(group))
+        results: dict[str, int | None] = {}
+        gate = asyncio.Event()
+
+        async def personal_turn() -> None:
+            token = a._enter_stream_overflow_limit("conv-personal")
+            adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
+            gate.set()
+            await asyncio.sleep(0.05)
+            results["personal"] = a.streaming_overflow_limit()
+            a._reset_stream_overflow_limit_for_task()
+
+        async def group_turn() -> None:
+            await gate.wait()
+            token = a._enter_stream_overflow_limit("conv-group")
+            adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
+            results["group"] = a.streaming_overflow_limit()
+            oversized = "z" * (a.MAX_MESSAGE_LENGTH + 1)
+            append = a._append_turn_buffer_segment(
+                "conv-group",
+                oversized,
+                reply_to=None,
+            )
+            results["group_append"] = append.success
+            a._reset_stream_overflow_limit_for_task()
+
+        await asyncio.gather(personal_turn(), group_turn())
+        assert (
+            results["personal"]
+            == adapter_mod.Agent365Adapter._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
+        )
+        assert results["group"] is None
+        assert results["group_append"] is False
+
+    def test_turn_buffer_still_rejects_over_max_message_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._turn_buffers["conv-buf"] = {
+            "turns": [{"seq": "1", "open": True}],
+            "segments": [],
+            "depth": 1,
+            "lock": asyncio.Lock(),
+            "keepalive": {},
+        }
+        oversized = "x" * (a.MAX_MESSAGE_LENGTH + 1)
+        result = a._append_turn_buffer_segment("conv-buf", oversized)
+        assert result.success is False
+
+    def test_teams_utf16_len_counts_non_bmp_heavier_than_code_points(
+        self,
+    ) -> None:
+        emoji = "😀" * 3000
+        assert len(emoji) == 3000
+        assert adapter_mod._teams_utf16_len(emoji) == 6000
+
+    def test_walk092_sized_personal_reply_fits_overflow_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-walk")
+            )
+        )
+        token = a._enter_stream_overflow_limit("conv-walk")
+        adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
+        cap = a.streaming_overflow_limit()
+        assert cap is not None
+        body = "\n".join(f"{i}. A short line about a star." for i in range(1, 151))
+        assert 3500 < len(body) < 8000
+        assert adapter_mod._teams_utf16_len(body) < cap - 200
+        a._reset_stream_overflow_limit_for_task()
+
+    @pytest.mark.asyncio
+    async def test_cancelled_finalize_resets_overflow_scope(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-cancel-overflow"
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id=chat_id)
+            )
+        )
+        a._seen_inbounds_this_lifetime.add(chat_id)
+        a._personal_processing_depth[chat_id] = 1
+        token = a._enter_stream_overflow_limit(chat_id)
+        adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
+        event = SimpleNamespace(
+            raw_message={"conversation": {"id": chat_id}},
+        )
+
+        async def cancelled_finalize(_chat: str) -> None:
+            raise asyncio.CancelledError
+
+        monkeypatch.setattr(a, "_finalize_open_personal_stream", cancelled_finalize)
+        with pytest.raises(asyncio.CancelledError):
+            await a.on_processing_complete(event)
+        assert a.streaming_overflow_limit() is None
+
+    @pytest.mark.asyncio
+    async def test_coalesced_reply_buffer_rejects_over_max_message_length(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cc")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        oversized = "y" * (a.MAX_MESSAGE_LENGTH + 1)
+        result = a._buffer_coalesced_reply(
+            chat_id="conv-cc",
+            content=oversized,
+            message_id="coalesced:test",
+            inbound=inbound,
+            turn_key=("conv-cc", "act-1"),
+            validated_path="B",
+        )
+        assert result.success is False
+
+
 class TestSendStreamStart:
     """Slice 19s-bis: send() participates in the same BF stream as
     edit_message when in a streaming context (personal chat, no active
@@ -16422,6 +16713,7 @@ class TestOutboundFiles:
         conv_id: str = "conv-1",
     ) -> dict[str, Any]:
         act = _make_inbound(conv_id=conv_id, activity_id="fc-act-1")
+        act["replyToId"] = "consent-card-activity-1"
         act["type"] = "invoke"
         act["name"] = adapter_mod._FILE_CONSENT_INVOKE
         val: dict[str, Any] = {"action": action, "context": {"consentId": consent_id}}
@@ -16656,9 +16948,15 @@ class TestOutboundFiles:
         f.write_bytes(payload)
         self._seed_pending(a, f)
         a._http_client.put = AsyncMock(return_value=MagicMock(status_code=201))
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("token", "B")),
+        )
 
         upload_info = {
             "uploadUrl": self._GOOD_UPLOAD,
@@ -16681,6 +16979,9 @@ class TestOutboundFiles:
             a._http_client.put.await_args.kwargs["headers"]["Content-Range"]
             == f"bytes 0-{n - 1}/{n}"
         )
+        assert a._http_client.delete.await_count == 1
+        delete_url = a._http_client.delete.await_args.args[0]
+        assert "consent-card-activity-1" in delete_url
         # FileInfoCard confirmation sent, pointing at the uploaded content.
         assert send_reply.await_count == 1
         info_att = send_reply.await_args.kwargs["reply"]["attachments"][0]
@@ -16744,18 +17045,104 @@ class TestOutboundFiles:
         f.write_bytes(b"x")
         a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
         a._http_client.put = AsyncMock()
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("token", "B")),
+        )
 
         resp = await a._handle_file_consent(
             self._consent_activity(action="decline"), validated_path="A"
         )
         assert resp.status == 200
         assert a._http_client.put.await_count == 0
-        assert send_reply.await_count == 0
+        assert a._http_client.delete.await_count == 1
+        assert send_reply.await_count == 1
+        assert (
+            send_reply.await_args.kwargs["reply"]["text"]
+            == adapter_mod._FILE_CONSENT_DECLINED_NOTICE
+        )
         # Pending dropped even on decline (the offer is spent).
         assert "c1" not in a._pending_file_uploads
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_decline_retry_sends_notice_once(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "x.pdf"
+        f.write_bytes(b"x")
+        self._seed_pending(a, f, consent_id="c-retry")
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("token", "B")),
+        )
+        activity = self._consent_activity(action="decline", consent_id="c-retry")
+        for _ in range(2):
+            resp = await a._handle_file_consent(activity, validated_path="A")
+            assert resp.status == 200
+        assert send_reply.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_delete_failure_still_acks_decline(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "x.pdf"
+        f.write_bytes(b"x")
+        self._seed_pending(a, f)
+        a._http_client.delete = AsyncMock(side_effect=RuntimeError("delete failed"))
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("token", "B")),
+        )
+        resp = await a._handle_file_consent(
+            self._consent_activity(action="decline"), validated_path="A"
+        )
+        assert resp.status == 200
+        assert send_reply.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_handle_consent_failed_upload_removes_card(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        f = tmp_path / "x.pdf"
+        f.write_bytes(b"data")
+        self._seed_pending(a, f)
+        a._http_client.put = AsyncMock(return_value=MagicMock(status_code=500))
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("token", "B")),
+        )
+        resp = await a._handle_file_consent(
+            self._consent_activity(
+                upload_info={"uploadUrl": self._GOOD_UPLOAD}
+            ),
+            validated_path="A",
+        )
+        assert resp.status == 200
+        assert a._http_client.delete.await_count == 1
 
     @pytest.mark.asyncio
     async def test_handle_consent_unknown_consent_acks(

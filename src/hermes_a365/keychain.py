@@ -17,7 +17,8 @@ Backends
 - macOS: ``security`` command fallback; reads/deletes work by default, while
   writes require opt-in because ``add-generic-password`` carries the secret in argv
 - Linux: ``secret-tool`` (libsecret)
-- Windows: not supported in v0.1 (per SPEC §10 Q3)
+- Windows: not supported for v1 (no Credential Manager backend; see
+  references/v1-compatibility-matrix.md)
 
 Trade-off note
 --------------
@@ -329,7 +330,9 @@ def get_backend() -> KeychainBackend:
         if not binary:
             raise KeychainError("`secret-tool` not found (install libsecret-tools / libsecret-1-0)")
         return LinuxBackend(binary)
-    raise KeychainError(f"unsupported platform: {sys.platform} (v0.1 supports macOS + Linux)")
+    raise KeychainError(
+        f"unsupported platform: {sys.platform} (v1 supports macOS + Linux only)"
+    )
 
 
 # ---------------------------------------------------------------------------
