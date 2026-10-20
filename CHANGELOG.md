@@ -22,6 +22,24 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   Windows remains unsupported for the OS keychain layer (no Credential Manager
   backend). Refs [#126](https://github.com/Satscryption/Hermes-A365/issues/126).
 
+- **`gateway.platforms.agent365.extra.reactions_dispatch_agent_turn`** (default
+  `false`). When enabled, a stored Teams `messageReaction` on a bot reply also
+  dispatches Hermes' `reaction:added:<type>` / `reaction:removed:<type>` agent
+  turn (#80). When disabled (the default), reactions are recorded on the #73
+  feedback map and logged without invoking the agent.
+
+### Fixed
+
+- **#180 — Teams reactions no longer start an agent turn by default.** Recording
+  and #80 logging still run; only `reactions_dispatch_agent_turn` restores the
+  synthetic turn. Empty-text `message` activities with no attachments are acked
+  without dispatch so connector follow-ons cannot produce unprompted replies.
+- **#188 — Non-message inbound types no longer open agent turns or hit the
+  operator webhook.** The gateway allowlists user turns to `type=message` only
+  (invoke, `messageReaction`, card submit, and lifecycle handlers are unchanged);
+  `activity-bridge serve` still forwards only `message` and `invoke`, matching
+  `references/webhook-contract.md`.
+
 ## [0.9.2] — 2026-10-19
 
 Publish smoke installs hash-pinned packaging from the requirements file.

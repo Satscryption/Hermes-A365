@@ -1141,6 +1141,17 @@ def _activity_chat_type(activity: dict[str, Any]) -> str:
     }.get(raw, "group")
 
 
+# Activity types ``activity-bridge serve`` forwards to the operator webhook.
+# Must stay aligned with ``references/webhook-contract.md``.
+WEBHOOK_FORWARD_ACTIVITY_TYPES: frozenset[str] = frozenset({"message", "invoke"})
+
+
+def activity_forwards_to_webhook(activity: dict[str, Any]) -> bool:
+    """Return whether ``serve`` should POST this activity to the operator webhook."""
+    activity_type = str(activity.get("type") or "message")
+    return activity_type in WEBHOOK_FORWARD_ACTIVITY_TYPES
+
+
 def _activity_requires_end_user_auth(activity: dict[str, Any]) -> bool:
     """Return whether processing the activity represents an end-user action."""
     activity_type = str(activity.get("type") or "message")
@@ -3447,11 +3458,24 @@ def make_app(
                 return _empty_invoke_ack_response()
             return _JSONResponse({"status": "duplicate"})
 
-        activity_type = activity.get("type", "message")
+        activity_type = str(activity.get("type") or "message")
 
         # Channel-control activities — ack and bail.
         if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
             return _JSONResponse({"status": "acked"})
+
+        if not activity_forwards_to_webhook(activity):
+            channel_data = activity.get("channelData")
+            event_type = ""
+            if isinstance(channel_data, dict):
+                event_type = str(channel_data.get("eventType") or "")
+            logger.debug(
+                "inbound acked without forwarding: unhandled activity "
+                "type=%s eventType=%s",
+                _safe_log_field(activity_type),
+                _safe_log_field(event_type),
+            )
+            return _JSONResponse({"status": "acked", "reason": "unhandled_type"})
 
         # #105 review: a *forwarded-and-replied-to* activity we could not build
         # a delivery key for (missing / non-string conversation or activity id)

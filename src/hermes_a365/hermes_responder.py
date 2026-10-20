@@ -298,13 +298,15 @@ def make_app(cfg: ResponderConfig, *, store: ConversationStore | None = None) ->
     async def respond(envelope: dict[str, Any] = _Body(...)) -> Any:  # noqa: B008
         activity = envelope.get("activity", {}) or {}
         conv_id = (activity.get("conversation") or {}).get("id") or ""
-        activity_type = activity.get("type", "message")
+        activity_type = str(activity.get("type") or "message")
 
         first_in_conv = conv_id not in store.by_conv
 
-        # Channel-control activities — bridge already filters most of these,
+        # Channel-control and non-forwarded types — bridge filters these,
         # but be defensive: if one arrives, ack with empty.
-        if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
+        from hermes_a365.activity_bridge import WEBHOOK_FORWARD_ACTIVITY_TYPES
+
+        if activity_type not in WEBHOOK_FORWARD_ACTIVITY_TYPES:
             store.append(conv_id, {"in": activity, "out": None})
             return _JSONResponse({"text": ""})
 

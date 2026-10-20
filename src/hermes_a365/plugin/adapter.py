@@ -43,6 +43,7 @@ Configuration in ``config.yaml``::
             blueprint_client_secret: ""           # or via env
             generated_config_path: ""             # default cwd/a365.generated.config.json
             notice_delivery: private              # withhold ops notices off 1:1
+            reactions_dispatch_agent_turn: false # #180 — record reactions only
 
 Or via environment variables:
 
@@ -1038,6 +1039,31 @@ _CHANNEL_CONTROL_TYPES: frozenset[str] = frozenset(
     {"conversationUpdate", "typing", "endOfConversation"}
 )
 
+# User turns: only plain ``message`` activities reach ``handle_message``.
+# Invoke, ``messageReaction``, card Action.Submit, and lifecycle events
+# are handled on dedicated branches before this allowlist runs.
+_DISPATCHABLE_ACTIVITY_TYPES: frozenset[str] = frozenset({"message"})
+
+
+def _extra_bool(extra: dict[str, Any], key: str, default: bool = False) -> bool:
+    raw = extra.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    if raw is None:
+        return default
+    return bool(raw)
+
+
+def _inbound_message_has_agent_content(activity: dict[str, Any]) -> bool:
+    """True when a ``message`` activity carries text or attachments for the agent."""
+    text = activity.get("text")
+    if isinstance(text, str) and text.strip():
+        return True
+    attachments = activity.get("attachments")
+    return isinstance(attachments, list) and bool(attachments)
+
 
 def _lifecycle_registry_action(activity: dict[str, Any]) -> str | None:
     """Classify a BF lifecycle activity into a registry action (#79).
@@ -1261,9 +1287,10 @@ def _parties_from_ref(ref: ConversationRef) -> _ConversationParties:
 def _should_dispatch(activity: dict[str, Any]) -> bool:
     """Return ``True`` for activities the agent loop should reason about.
 
-    ``False`` for BF channel-control + synthetic ``agents``-channel
-    probes. Pure-function so the route stays small and tests can
-    exercise the matrix without spinning up a TestClient.
+    Allowlist: only ``type=message`` may become a user turn. ``False`` for
+    BF channel-control, non-message types (edits/deletes/reactions/events),
+    and synthetic ``agents``-channel probes. Pure-function so the route
+    stays small and tests can exercise the matrix without a TestClient.
 
     The ``agents``-channel synthetic-sender filter was extended after
     the §9d round-5 walkthrough caught the email-template render
@@ -1271,6 +1298,8 @@ def _should_dispatch(activity: dict[str, Any]) -> bool:
     (real ``from.id`` is ``no-reply@teams.mail.microsoft``).
     """
     activity_type = str(activity.get("type") or "message")
+    if activity_type not in _DISPATCHABLE_ACTIVITY_TYPES:
+        return False
     if activity_type in _CHANNEL_CONTROL_TYPES:
         return False
     channel_id = str(activity.get("channelId") or "")
@@ -1423,6 +1452,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
         self._allow_all_users = sender_policy.allow_all_users
         self._sender_allowlist_configured = sender_policy.configured
+        self._reactions_dispatch_agent_turn = _extra_bool(
+            extra, "reactions_dispatch_agent_turn", default=False
+        )
         if not sender_policy.configured:
             logger.warning(
                 "agent365 sender allowlist is not configured; denying every "
@@ -2297,7 +2329,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # JWT, end-user, and replay gates above. The body tenant is checked
             # inside the handler (fail closed). This does not update the
             # conversation registry: a reaction is not a reply target.
-            if str(activity.get("type") or "") == "messageReaction":
+            if str(activity.get("type") or "").casefold() == "messagereaction":
                 return await self._handle_message_reaction(
                     activity, authorized_sender_id=authorized_sender_id
                 )
@@ -2424,7 +2456,17 @@ class Agent365Adapter(BasePlatformAdapter):
             # transient or aren't user messages, so persisting them in
             # the registry would just churn ``last_inbound_activity_id``.
             if not _should_dispatch(activity):
-                return JSONResponse({"status": "acked"})
+                channel_data = activity.get("channelData")
+                event_type = ""
+                if isinstance(channel_data, dict):
+                    event_type = str(channel_data.get("eventType") or "")
+                logger.debug(
+                    "inbound acked without dispatch: unhandled activity "
+                    "type=%s eventType=%s",
+                    bridge._safe_log_field(activity.get("type")),
+                    bridge._safe_log_field(event_type),
+                )
+                return JSONResponse({"status": "acked", "reason": "unhandled_type"})
 
             if not self._inbound_lifecycle_is_current(
                 chat_id,
@@ -2442,6 +2484,15 @@ class Agent365Adapter(BasePlatformAdapter):
                     "inbound acked without dispatch: missing or invalid activity id"
                 )
                 return JSONResponse({"status": "acked", "reason": "unroutable"})
+
+            if not _inbound_message_has_agent_content(activity):
+                logger.debug(
+                    "inbound acked without dispatch: empty message "
+                    "type=%s id=%s",
+                    bridge._safe_log_field(activity.get("type")),
+                    bridge._safe_log_field(activity_id),
+                )
+                return JSONResponse({"status": "acked", "reason": "empty_message"})
 
             admission_event = self._activity_to_event(
                 activity,
@@ -8205,10 +8256,12 @@ class Agent365Adapter(BasePlatformAdapter):
         Runs only after the route's serviceUrl, JWT, end-user, and replay
         gates. The body tenant is checked here and fails closed. A reaction
         is stored on the #73 feedback record only when ``replyToId`` is a
-        reply this process sent in the same conversation. Hermes' reaction
-        convention (Feishu / Telegram) then delivers
+        reply this process sent in the same conversation. When
+        ``extra.reactions_dispatch_agent_turn`` is true (default false),
+        Hermes' reaction convention (Feishu / Telegram) delivers
         ``reaction:added:<identity>`` / ``reaction:removed:<identity>`` as
-        the agent turn. Malformed, cross-tenant, replayed, and unrelated
+        an agent turn; otherwise reactions are recorded only. Malformed,
+        cross-tenant, replayed, and unrelated
         reactions do not write a feedback record.
 
         Edits, soft-delete, and undelete are #122 and are not handled here.
@@ -8252,9 +8305,10 @@ class Agent365Adapter(BasePlatformAdapter):
         applied = self._stored_reaction_changes(reply_to, user_id, changes)
         if not applied:
             return JSONResponse({"status": "acked", "reason": "unrelated"})
-        await self._dispatch_reaction_events(
-            activity, applied, authorized_sender_id=user_id
-        )
+        if self._reactions_dispatch_agent_turn:
+            await self._dispatch_reaction_events(
+                activity, applied, authorized_sender_id=user_id
+            )
         return JSONResponse({"status": "acked", "reactions": len(applied)})
 
     def _stored_reaction_changes(
