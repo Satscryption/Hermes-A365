@@ -435,6 +435,7 @@ _MEDIA_ACTIVITY_DEADLINE_SEC = 60.0
 _FILE_CONSENT_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.consent"
 _FILE_INFO_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.info"
 _FILE_CONSENT_INVOKE = "fileConsent/invoke"
+_FILE_CONSENT_DECLINED_NOTICE = "Declined — nothing uploaded."
 # Single-PUT upload cap (the OneDrive session accepts one range for the whole
 # file well above this); chunked upload for larger files is a follow-up.
 _MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024
@@ -7434,6 +7435,102 @@ class Agent365Adapter(BasePlatformAdapter):
                 f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}"
             )
 
+    async def _delete_activity(
+        self,
+        *,
+        inbound: dict[str, Any],
+        activity_id: str,
+        chat_id: str,
+    ) -> bool:
+        """Best-effort DELETE for a conversation activity (#183 FileConsentCard)."""
+        activity_id = str(activity_id or "").strip()
+        if not activity_id:
+            return False
+        if self._http_client is None or self._bridge_cfg is None:
+            return False
+        service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
+        conv = inbound.get("conversation") if isinstance(inbound.get("conversation"), dict) else {}
+        conv_id = conv.get("id")
+        if not service_url or not conv_id:
+            return False
+        chat_id = str(chat_id or conv_id)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return False
+        url = (
+            f"{service_url}/v3/conversations/{quote_path_segment(str(conv_id))}"
+            f"/activities/{quote_path_segment(activity_id)}"
+        )
+        bridge = _import_bridge()
+        try:
+            token, _path = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=inbound,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=self._validated_path_for_inbound(inbound),
+                ),
+            )
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return False
+            resp = await self._await_outbound(
+                chat_id,
+                client.delete(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                ),
+            )
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return False
+            if 200 <= int(getattr(resp, "status_code", 0) or 0) < 300:
+                return True
+            logger.warning(
+                "agent365 delete_activity HTTP %s activity=%s",
+                resp.status_code,
+                activity_id[:12],
+            )
+        except Exception as e:
+            logger.warning(
+                "agent365 delete_activity failed activity=%s: %s",
+                activity_id[:12],
+                e,
+            )
+        return False
+
+    async def _remove_file_consent_card(
+        self, activity: dict[str, Any], *, chat_id: str
+    ) -> None:
+        """Remove the FileConsentCard the user answered (#183)."""
+        reply_to = str(activity.get("replyToId") or "").strip()
+        if reply_to:
+            await self._delete_activity(
+                inbound=activity, activity_id=reply_to, chat_id=chat_id
+            )
+
+    async def _send_file_consent_decline_notice(
+        self, activity: dict[str, Any], *, validated_path: str | None
+    ) -> None:
+        try:
+            await self._send_reply_activity(
+                inbound=activity,
+                content=_FILE_CONSENT_DECLINED_NOTICE,
+                log_context="fileConsent decline",
+                validated_path=validated_path,
+            )
+        except Exception as e:
+            logger.warning("agent365 fileConsent decline notice failed: %s", e)
+
     async def send_or_update_status(
         self,
         chat_id: str,
@@ -7946,6 +8043,16 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.info(
                 "agent365 fileConsent action=%s consent=%s", action, consent_id[:8]
             )
+            consent_chat_id = str(
+                (activity.get("conversation") or {}).get("id") or ""
+            )
+            await self._remove_file_consent_card(
+                activity, chat_id=consent_chat_id
+            )
+            if action == "decline":
+                await self._send_file_consent_decline_notice(
+                    activity, validated_path=validated_path
+                )
             # Benign ack: nothing to render. HTTP 200 + JSON {} (#132).
             # Null is rejected by Teams ("Payload cannot be null").
             return invoke.empty_invoke_ack()
@@ -8080,6 +8187,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 consent_id[:8],
             )
             return invoke.InvokeResponse(status=200, body={})
+
+        await self._remove_file_consent_card(
+            activity, chat_id=str(pending_chat_id)
+        )
 
         # Confirm with a FileInfoCard so the file renders inline in the chat.
         # Best-effort — the upload already succeeded, so a failed card is logged,

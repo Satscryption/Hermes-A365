@@ -40,6 +40,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **FileConsentCard removed after Allow/Decline (#183).** On
+  ``fileConsent/invoke``, the adapter best-effort deletes the consent
+  card activity (``replyToId``) via the Bot Framework DELETE endpoint,
+  then posts the FileInfoCard on accept or a short decline confirmation
+  on decline. Delete failures are logged and do not block the invoke ack.
+
 - **Teams 1:1 stream overflow split at ~4k (#184).** Override
   ``streaming_overflow_limit()`` to 28 000 characters so Hermes' stream
   consumer does not seal long personal replies at the conservative

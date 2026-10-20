@@ -43,7 +43,8 @@ poll. Long-poll TTL is 60 s; the bridge re-subscribes on disconnect.
 |---|---|---|
 | `message` | `agent.responded` | Plain text or Adaptive Card. |
 | `invokeResponse` | Inbound `invoke` | Card refresh JSON; uses `templates/adaptive-cards/`. |
-| `typing` | Long-running tool calls | Optional; emit at most every 1 s. |
+| `typing` | Long-running tool calls | Optional; emit at most every 1 s. On personal chats, suppressed while a BF stream is open and after ``streamType=final`` until turn end (#185). |
+| `message` (file consent) | Outbound ``MEDIA:`` / ``send_document`` (#76c) | FileConsentCard; on Accept/Decline the card activity is deleted and accept posts a FileInfoCard (#183). |
 
 ## Channel-specific quirks
 

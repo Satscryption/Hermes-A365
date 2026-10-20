@@ -15973,6 +15973,7 @@ class TestOutboundFiles:
         conv_id: str = "conv-1",
     ) -> dict[str, Any]:
         act = _make_inbound(conv_id=conv_id, activity_id="fc-act-1")
+        act["replyToId"] = "consent-card-activity-1"
         act["type"] = "invoke"
         act["name"] = adapter_mod._FILE_CONSENT_INVOKE
         val: dict[str, Any] = {"action": action, "context": {"consentId": consent_id}}
@@ -16207,9 +16208,15 @@ class TestOutboundFiles:
         f.write_bytes(payload)
         self._seed_pending(a, f)
         a._http_client.put = AsyncMock(return_value=MagicMock(status_code=201))
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("token", "B")),
+        )
 
         upload_info = {
             "uploadUrl": self._GOOD_UPLOAD,
@@ -16232,6 +16239,9 @@ class TestOutboundFiles:
             a._http_client.put.await_args.kwargs["headers"]["Content-Range"]
             == f"bytes 0-{n - 1}/{n}"
         )
+        assert a._http_client.delete.await_count == 1
+        delete_url = a._http_client.delete.await_args.args[0]
+        assert "consent-card-activity-1" in delete_url
         # FileInfoCard confirmation sent, pointing at the uploaded content.
         assert send_reply.await_count == 1
         info_att = send_reply.await_args.kwargs["reply"]["attachments"][0]
@@ -16295,16 +16305,27 @@ class TestOutboundFiles:
         f.write_bytes(b"x")
         a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
         a._http_client.put = AsyncMock()
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("token", "B")),
+        )
 
         resp = await a._handle_file_consent(
             self._consent_activity(action="decline"), validated_path="A"
         )
         assert resp.status == 200
         assert a._http_client.put.await_count == 0
-        assert send_reply.await_count == 0
+        assert a._http_client.delete.await_count == 1
+        assert send_reply.await_count == 1
+        assert (
+            send_reply.await_args.kwargs["reply"]["text"]
+            == adapter_mod._FILE_CONSENT_DECLINED_NOTICE
+        )
         # Pending dropped even on decline (the offer is spent).
         assert "c1" not in a._pending_file_uploads
 
