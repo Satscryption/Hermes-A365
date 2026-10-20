@@ -9795,6 +9795,194 @@ class TestEditMessage:
         assert "conv-G-dup-final" not in a._turn_buffers
 
     @pytest.mark.asyncio
+    async def test_answer_final_mint_failure_then_already_completed_plain_posts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-mint-403", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        mint_calls = {"n": 0}
+        finals = {"n": 0}
+
+        async def acquire_reply_token(**_kwargs: Any) -> tuple[str, str]:
+            mint_calls["n"] += 1
+            if mint_calls["n"] == 1:
+                raise RuntimeError("token mint failed")
+            return "bearer-test", "A"
+
+        monkeypatch.setattr(bridge, "acquire_reply_token", acquire_reply_token)
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") != "final":
+                return self._http_result(201, "ka-mint-403")
+            finals["n"] += 1
+            return MagicMock(
+                status_code=403,
+                text="already completed",
+                json=lambda: {"error": {"message": "already completed"}},
+            )
+
+        a._http_client.post = post
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-mint-403"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-mint-403"]
+        buf["keepalive"] = {
+            "stream_id": "ka-mint-403",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(
+            chat_id="conv-G-mint-403", content="Plain once", reply_to=None
+        )
+        await a.on_processing_complete(event, outcome="success")
+        assert mint_calls["n"] == 2
+        assert finals["n"] == 1
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain once"
+        assert "conv-G-mint-403" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_connect_timeout_remote_error_then_503_uncertain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-ct-rpe-503", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") != "final":
+                return self._http_result(201, "ka-ct")
+            finals["n"] += 1
+            if finals["n"] == 1:
+                raise httpx.ConnectTimeout("connect timed out")
+            if finals["n"] == 2:
+                raise httpx.RemoteProtocolError("connection dropped")
+            return MagicMock(
+                status_code=503,
+                text="",
+                headers={"Retry-After": "0"},
+                json=lambda: {},
+            )
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-ct-rpe-503"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-ct-rpe-503"]
+        buf["keepalive"] = {
+            "stream_id": "ka-ct",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(
+            chat_id="conv-G-ct-rpe-503", content="Uncertain path", reply_to=None
+        )
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] >= adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
+        assert send_reply_mock.await_count == 0
+        assert "conv-G-ct-rpe-503" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_second_turn_plain_budget_after_first_uncertain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-two-turn", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        turn_one_finals = {"n": 0}
+        turn_two_finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") != "final":
+                return self._http_result(201, "ka-two")
+            text = kwargs["json"].get("text") or ""
+            if text == "Turn one":
+                turn_one_finals["n"] += 1
+                if turn_one_finals["n"] == 1:
+                    raise httpx.RemoteProtocolError("dropped")
+                return MagicMock(
+                    status_code=503,
+                    text="",
+                    headers={"Retry-After": "0"},
+                    json=lambda: {},
+                )
+            turn_two_finals["n"] += 1
+            return MagicMock(
+                status_code=503,
+                text="",
+                headers={"Retry-After": "0"},
+                json=lambda: {},
+            )
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event1 = _StubMessageEvent(
+            text="first",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-two-turn"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event1)
+        buf = a._turn_buffers["conv-G-two-turn"]
+        buf["keepalive"] = {
+            "stream_id": "ka-two",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id="conv-G-two-turn", content="Turn one", reply_to=None)
+        await a.on_processing_complete(event1, outcome="success")
+        assert send_reply_mock.await_count == 0
+        assert "conv-G-two-turn" not in a._turn_buffers
+
+        inbound["id"] = "act-2"
+        event2 = _StubMessageEvent(
+            text="second",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-two-turn"),
+            message_id="act-2",
+        )
+        await a.on_processing_start(event2)
+        buf = a._turn_buffers["conv-G-two-turn"]
+        buf["keepalive"] = {
+            "stream_id": "ka-two",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id="conv-G-two-turn", content="Turn two", reply_to=None)
+        await a.on_processing_complete(event2, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Turn two"
+        assert "conv-G-two-turn" not in a._turn_buffers
+
+    @pytest.mark.asyncio
     async def test_token_timeout_on_open_stream_retries_mint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

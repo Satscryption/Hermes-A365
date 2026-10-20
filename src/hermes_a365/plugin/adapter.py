@@ -844,6 +844,7 @@ class _KeepalivePost(NamedTuple):
     timeout_after_send: bool = False
     retry_after_sec: float = 0.0
     connect_before_send: bool = False
+    during_mint: bool = False
 
 
 def _keepalive_rotation_due(age: float) -> bool:
@@ -905,6 +906,32 @@ def _cap_answer_final_retry_delay(
     if remaining <= 0.0:
         return 0.0
     return min(delay, _ANSWER_FINAL_RETRY_AFTER_CAP_SEC, remaining)
+
+
+def _classify_answer_final_post(result: _KeepalivePost) -> str:
+    """Classify one answer-final POST for delivery policy."""
+    if result.during_mint:
+        return _ANSWER_FINAL_NOT_SENT
+    status = result.status
+    if status is not None and 200 <= status < 300:
+        return _ANSWER_FINAL_DELIVERED
+    if status == 403 and _keepalive_final_closed(result):
+        if "already completed" in result.detail.casefold():
+            return _ANSWER_FINAL_ALREADY_COMPLETED
+        return _ANSWER_FINAL_REJECTED_TERMINAL
+    if status in _ANSWER_FINAL_RETRY_STATUSES:
+        return _ANSWER_FINAL_RETRYABLE
+    if status is None:
+        if result.timeout_after_send:
+            return _ANSWER_FINAL_MAY_HAVE_LANDED
+        if result.connect_before_send:
+            return _ANSWER_FINAL_NOT_SENT
+        if not result.detail and not result.untracked:
+            return _ANSWER_FINAL_NOT_SENT
+        return _ANSWER_FINAL_MAY_HAVE_LANDED
+    if status is not None and status >= 400:
+        return _ANSWER_FINAL_REJECTED_TERMINAL
+    return _ANSWER_FINAL_NOT_SENT
 
 
 def _keepalive_final_closed(result: _KeepalivePost) -> bool:
@@ -1028,6 +1055,13 @@ _ANSWER_FINAL_MAX_ATTEMPTS = 5
 _ANSWER_FINAL_RETRY_STATUSES = _STREAM_EDIT_RETRY_STATUSES
 _ANSWER_FINAL_RETRY_AFTER_CAP_SEC = 60.0
 _ANSWER_FINAL_STREAM_CAP_MARGIN_SEC = 5.0
+# One answer-final POST attempt is classified into exactly one bucket.
+_ANSWER_FINAL_NOT_SENT = "NOT_SENT"
+_ANSWER_FINAL_MAY_HAVE_LANDED = "MAY_HAVE_LANDED"
+_ANSWER_FINAL_DELIVERED = "DELIVERED"
+_ANSWER_FINAL_REJECTED_TERMINAL = "REJECTED_TERMINAL"
+_ANSWER_FINAL_ALREADY_COMPLETED = "ALREADY_COMPLETED"
+_ANSWER_FINAL_RETRYABLE = "RETRYABLE"
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
@@ -5217,6 +5251,9 @@ class Agent365Adapter(BasePlatformAdapter):
         else:
             buf.setdefault("turns", []).append(turn)
             buf["depth"] = sum(1 for item in buf["turns"] if item.get("open"))
+        live = self._turn_buffers.get(chat_id)
+        if isinstance(live, dict):
+            self._reset_turn_answer_delivery_state(live)
         # One task per chat. A nested start leaves the running task in
         # place; a task that already exited is replaced.
         self._schedule_turn_buffer_keepalive(chat_id)
@@ -5994,20 +6031,14 @@ class Agent365Adapter(BasePlatformAdapter):
         )
 
     @staticmethod
-    def _answer_final_timeout_delivered(result: _KeepalivePost) -> bool:
-        return result.timeout_after_send
-
-    @staticmethod
-    def _answer_final_requires_plain_reply(result: _KeepalivePost) -> bool:
-        if result.status is not None and 200 <= result.status < 300:
-            return False
-        if result.untracked:
-            return False
-        if Agent365Adapter._answer_final_timeout_delivered(result):
-            return False
-        return bool(
-            result.status == 403 and _keepalive_final_closed(result)
-        )
+    def _reset_turn_answer_delivery_state(buf: dict[str, Any]) -> None:
+        """Fresh answer-final / plain-fallback state for one turn."""
+        buf.pop("final_may_have_landed", None)
+        buf.pop("force_plain_latched", None)
+        buf.pop("force_plain_exhausted", None)
+        buf.pop("plain_fallback_attempts", None)
+        buf.pop("force_plain_answer", None)
+        buf["retry_attempts"] = 0
 
     async def _sleep_turn_buffer_stream_gap_locked(
         self, chat_id: str, buf: dict[str, Any]
@@ -6142,8 +6173,8 @@ class Agent365Adapter(BasePlatformAdapter):
             turn = self._keepalive_turn(buf)
             if turn is None:
                 return ("retry", None)
-            ambiguous_retry = False
-            first_final_connect_before_send = False
+            turn_had_landed = False
+            not_sent_probe = True
             result = await self._post_keepalive_activity(
                 chat_id,
                 turn,
@@ -6155,21 +6186,12 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             attempt = 1
             while self._turn_buffers.get(chat_id) is buf:
-                if result.status is not None and 200 <= result.status < 300:
-                    break
-                if self._answer_final_timeout_delivered(result):
-                    break
-                if self._answer_final_requires_plain_reply(result):
-                    break
-                if (
-                    not ambiguous_retry
-                    and result.status is None
-                    and not result.timeout_after_send
-                ):
-                    first_final_connect_before_send = result.connect_before_send
-                    ambiguous_retry = True
-                    if not result.connect_before_send:
-                        buf["final_may_have_landed"] = True
+                classified = _classify_answer_final_post(result)
+                if classified == _ANSWER_FINAL_MAY_HAVE_LANDED:
+                    buf["final_may_have_landed"] = True
+                    turn_had_landed = True
+                    if result.timeout_after_send:
+                        break
                     result = await self._post_keepalive_activity(
                         chat_id,
                         turn,
@@ -6180,10 +6202,66 @@ class Agent365Adapter(BasePlatformAdapter):
                         message_chrome=True,
                     )
                     continue
-                if (
-                    result.status in _ANSWER_FINAL_RETRY_STATUSES
-                    and attempt < _ANSWER_FINAL_MAX_ATTEMPTS
-                ):
+                if classified == _ANSWER_FINAL_DELIVERED:
+                    turn_had_landed = True
+                    self._touch_keepalive_emit(chat_id, buf)
+                    activity_id = result.stream_id or stream_id
+                    if activity_id:
+                        self._remember_bot_reply(
+                            activity_id, conversation_id=str(chat_id)
+                        )
+                    buf["keepalive"] = {}
+                    logger.info(
+                        "agent365 turn buffer answer final: chat_id=%s stream_id=%s "
+                        "chars=%s",
+                        chat_id,
+                        stream_id,
+                        len(content),
+                    )
+                    return ("delivered", activity_id or None)
+                elif classified == _ANSWER_FINAL_ALREADY_COMPLETED:
+                    if turn_had_landed:
+                        self._touch_keepalive_emit(chat_id, buf)
+                        buf["keepalive"] = {}
+                        logger.info(
+                            "agent365 turn buffer answer final: chat_id=%s "
+                            "stream_id=%s chars=%s (already completed)",
+                            chat_id,
+                            stream_id,
+                            len(content),
+                        )
+                        return ("delivered", None)
+                    buf["keepalive"] = {}
+                    logger.warning(
+                        "agent365 turn buffer answer plain fallback: chat_id=%s "
+                        "status=403 reason=stream already closed",
+                        chat_id,
+                    )
+                    return ("fallback", "stream already closed")
+                elif classified == _ANSWER_FINAL_REJECTED_TERMINAL:
+                    if self._plain_answer_blocked(buf):
+                        return self._answer_uncertain_delivery(
+                            chat_id,
+                            buf,
+                            stream_id=stream_id,
+                            context="terminal stream response",
+                        )
+                    buf["keepalive"] = {}
+                    status = result.status
+                    reason = "stream already closed"
+                    if status is not None and status >= 400 and status != 403:
+                        reason = "open rejected"
+                    logger.warning(
+                        "agent365 turn buffer answer plain fallback: chat_id=%s "
+                        "status=%s reason=%s",
+                        chat_id,
+                        status,
+                        reason,
+                    )
+                    return ("fallback", reason)
+                elif classified == _ANSWER_FINAL_RETRYABLE:
+                    if attempt >= _ANSWER_FINAL_MAX_ATTEMPTS:
+                        break
                     stream = self._keepalive_state(buf)
                     if _answer_final_cap_remaining_sec(stream) <= 0.0:
                         break
@@ -6216,92 +6294,42 @@ class Agent365Adapter(BasePlatformAdapter):
                         message_chrome=True,
                     )
                     continue
-                break
+                elif classified == _ANSWER_FINAL_NOT_SENT:
+                    if not_sent_probe and result.status is None:
+                        not_sent_probe = False
+                        result = await self._post_keepalive_activity(
+                            chat_id,
+                            turn,
+                            stream_id=stream_id,
+                            sequence=0,
+                            final=True,
+                            text=content,
+                            message_chrome=True,
+                        )
+                        continue
+                    break
+                else:
+                    break
             if self._turn_buffers.get(chat_id) is not buf:
                 return ("retry", None)
             self._touch_keepalive_emit(chat_id, buf)
             status = result.status
-            if (
-                ambiguous_retry
-                and status == 403
-                and "already completed" in result.detail.casefold()
-                and not _keepalive_user_cancelled(result.detail)
-            ):
-                if first_final_connect_before_send:
-                    if self._plain_answer_blocked(buf):
-                        return self._answer_uncertain_delivery(
-                            chat_id,
-                            buf,
-                            stream_id=stream_id,
-                            context="already completed after connect failure",
-                        )
-                    buf["keepalive"] = {}
-                    logger.warning(
-                        "agent365 turn buffer answer plain fallback: chat_id=%s "
-                        "status=403 reason=stream already closed",
-                        chat_id,
-                    )
-                    return ("fallback", "stream already closed")
-                buf["keepalive"] = {}
-                logger.info(
-                    "agent365 turn buffer answer final: chat_id=%s stream_id=%s "
-                    "chars=%s (retry saw already completed)",
-                    chat_id,
-                    stream_id,
-                    len(content),
-                )
-                return ("delivered", None)
-            if status is not None and 200 <= status < 300:
-                activity_id = result.stream_id or stream_id
-                if activity_id:
-                    self._remember_bot_reply(
-                        activity_id, conversation_id=str(chat_id)
-                    )
-                buf["keepalive"] = {}
-                logger.info(
-                    "agent365 turn buffer answer final: chat_id=%s stream_id=%s "
-                    "chars=%s",
-                    chat_id,
-                    stream_id,
-                    len(content),
-                )
-                return ("delivered", activity_id or None)
-            if self._answer_final_timeout_delivered(result):
-                buf["final_may_have_landed"] = True
+            classified = _classify_answer_final_post(result)
+            if classified == _ANSWER_FINAL_MAY_HAVE_LANDED:
                 buf["keepalive"] = {}
                 logger.warning(
-                    "agent365 turn buffer treating timed-out answer final as "
+                    "agent365 turn buffer treating ambiguous answer final as "
                     "delivered: chat_id=%s stream_id=%s",
                     chat_id,
                     stream_id,
                 )
                 return ("delivered", None)
-            if self._answer_final_requires_plain_reply(result):
-                if self._plain_answer_blocked(buf):
-                    return self._answer_uncertain_delivery(
-                        chat_id,
-                        buf,
-                        stream_id=stream_id,
-                        context="terminal stream response",
-                    )
-                buf["keepalive"] = {}
-                reason = "stream already closed"
-                if status == 403:
-                    reason = "stream already closed"
-                elif status is not None and status >= 400:
-                    reason = "open rejected"
-                logger.warning(
-                    "agent365 turn buffer answer plain fallback: chat_id=%s "
-                    "status=%s reason=%s",
-                    chat_id,
-                    status,
-                    reason,
-                )
-                return ("fallback", reason)
             stream = self._keepalive_state(buf)
             cap_left = _answer_final_cap_remaining_sec(stream)
             if stream_id and (
-                attempt >= _ANSWER_FINAL_MAX_ATTEMPTS or cap_left <= 0.0
+                attempt >= _ANSWER_FINAL_MAX_ATTEMPTS
+                or cap_left <= 0.0
+                or classified == _ANSWER_FINAL_RETRYABLE
             ):
                 if self._plain_answer_blocked(buf):
                     return self._answer_uncertain_delivery(
@@ -6365,7 +6393,10 @@ class Agent365Adapter(BasePlatformAdapter):
 
         connect_before_send = (
             not during_mint
-            and isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout))
+            and isinstance(
+                exc,
+                (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError),
+            )
         )
         return _KeepalivePost(
             None,
@@ -6375,6 +6406,7 @@ class Agent365Adapter(BasePlatformAdapter):
             timeout_after_send,
             0.0,
             connect_before_send,
+            during_mint,
         )
 
     @staticmethod
@@ -6441,9 +6473,8 @@ class Agent365Adapter(BasePlatformAdapter):
             if chat_id:
                 self._close_innermost_turn(chat_id)
                 buf = self._turn_buffers.get(chat_id)
-                if buf is not None:
-                    # A later user turn may try again after the deferred cap.
-                    buf["retry_attempts"] = 0
+                if isinstance(buf, dict):
+                    self._reset_turn_answer_delivery_state(buf)
                 await self._flush_turn_buffer(chat_id)
                 await self._flush_pending_coalesced_replies(chat_id)
                 # #161: the stream consumer's finalize edit runs on a task
