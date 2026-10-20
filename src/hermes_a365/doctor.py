@@ -48,6 +48,21 @@ from uuid import UUID
 from . import bot_service, bot_service_diagnostics
 from ._common import parse_env, safe_run, tcp_reachable
 from .activity_bridge import parse_agent_identity_ids
+from .compatibility import (
+    HERMES_GATEWAY_PYTHON,
+    HERMES_MULTIPLEX_MIN_CALENDAR,
+    HERMES_PLUGIN_MIN_CALENDAR,
+    HERMES_SESSION_PIN_RESOLUTION_MIN_CALENDAR,
+    REQUIRES_PYTHON,
+    format_calendar_tag,
+    hermes_meets_multiplex_floor,
+    hermes_meets_plugin_floor,
+    hermes_meets_session_pin_resolution_floor,
+    host_platform_supported,
+    parse_hermes_version_text,
+    python_in_supported_range,
+    python_version_tuple,
+)
 
 ProbeState = Literal["ok", "warn", "error"]
 
@@ -311,6 +326,62 @@ def probe_network(hosts: tuple[str, ...] = _DEFAULT_NETWORK_HOSTS) -> ProbeResul
     )
 
 
+def probe_python_runtime() -> ProbeResult:
+    ver = python_version_tuple()
+    label = f"{ver[0]}.{ver[1]}.{ver[2]}"
+    if not python_in_supported_range(ver):
+        if ver[:2] < (3, 11):
+            return ProbeResult(
+                "python",
+                _ERROR,
+                f"Python {label} is below the v1 minimum (3.11); "
+                f"supported range is {REQUIRES_PYTHON}",
+                {"version": label},
+            )
+        return ProbeResult(
+            "python",
+            _ERROR,
+            f"Python {label} is outside the supported range ({REQUIRES_PYTHON}); "
+            "not continuously tested in CI",
+            {"version": label},
+        )
+    detail = f"Python {label} is within {REQUIRES_PYTHON}"
+    state: ProbeState = _OK
+    if ver[:2] != (3, 14):
+        detail += (
+            f"; Hermes gateway plugin runtime targets Python {HERMES_GATEWAY_PYTHON} "
+            f"(this interpreter is fine for the standalone CLI)"
+        )
+    return ProbeResult("python", state, detail, {"version": label})
+
+
+def probe_host_platform() -> ProbeResult:
+    if sys.platform == "win32":
+        return ProbeResult(
+            "host_platform",
+            _ERROR,
+            "Windows is unsupported for v1: Hermes-A365 has no OS secret-store "
+            "backend (macOS Keychain / Linux libsecret only). The GA A365 CLI "
+            "can persist blueprint secrets via DPAPI on Windows, but this package "
+            "does not read them — use macOS or Linux for end-to-end operator flows",
+            {"platform": sys.platform},
+        )
+    if not host_platform_supported():
+        return ProbeResult(
+            "host_platform",
+            _ERROR,
+            f"unsupported platform: {sys.platform} (v1 supports macOS + Linux)",
+            {"platform": sys.platform},
+        )
+    name = "macOS" if sys.platform == "darwin" else "Linux"
+    return ProbeResult(
+        "host_platform",
+        _OK,
+        f"{name} ({sys.platform}) is a supported v1 host",
+        {"platform": sys.platform},
+    )
+
+
 def probe_keychain() -> ProbeResult:
     if sys.platform == "darwin":
         binary = shutil.which("security")
@@ -338,7 +409,7 @@ def probe_keychain() -> ProbeResult:
     return ProbeResult(
         "keychain",
         _ERROR,
-        f"unsupported platform: {sys.platform} (v0.1 supports macOS + Linux)",
+        f"unsupported platform: {sys.platform} (v1 supports macOS + Linux)",
     )
 
 
@@ -793,15 +864,61 @@ def probe_hermes_harness() -> ProbeResult:
         return ProbeResult(
             "hermes_harness",
             _WARN,
-            "hermes not on PATH (skill loads, but harness CLI unavailable)",
+            "hermes not on PATH (standalone CLI works; gateway plugin needs the "
+            f"Hermes harness on Python {HERMES_GATEWAY_PYTHON})",
         )
     out = safe_run([binary, "--version"], timeout=10.0) or ""
-    return ProbeResult(
-        "hermes_harness",
-        _OK,
-        f"{out.splitlines()[0] if out else 'version unknown'} ({binary})",
-        {"path": binary, "version_raw": out},
-    )
+    first = out.splitlines()[0] if out else "version unknown"
+    parsed = parse_hermes_version_text(out)
+    data: dict[str, Any] = {"path": binary, "version_raw": out}
+    if parsed is not None:
+        data["parsed_kind"] = parsed[0]
+        data["parsed_version"] = list(parsed[1])
+
+    plugin_ok = hermes_meets_plugin_floor(parsed)
+    multiplex_ok = hermes_meets_multiplex_floor(parsed)
+    pin_ok = hermes_meets_session_pin_resolution_floor(parsed)
+    _, _, multiplex_cfg = _agent365_file_hosts_from_config()
+
+    if plugin_ok is False:
+        return ProbeResult(
+            "hermes_harness",
+            _ERROR,
+            (
+                f"{first} ({binary}) is below the v1 plugin floor "
+                f"({format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR)} / "
+                "Hermes Agent 0.12.0+)"
+            ),
+            data,
+        )
+    if multiplex_cfg and multiplex_ok is False:
+        return ProbeResult(
+            "hermes_harness",
+            _ERROR,
+            (
+                f"{first} ({binary}) is below the multiplex floor "
+                f"({format_calendar_tag(HERMES_MULTIPLEX_MIN_CALENDAR)}); "
+                "set gateway.multiplex_profiles: false or upgrade Hermes"
+            ),
+            {**data, "multiplex_profiles": True},
+        )
+
+    state: ProbeState = _OK
+    detail = f"{first} ({binary})"
+    if parsed is None:
+        state = _WARN
+        detail += "; could not parse version against the v1 Hermes matrix"
+    elif pin_ok is False:
+        state = _WARN
+        detail += (
+            "; below the Copilot→Teams session-pin resolution floor "
+            f"({format_calendar_tag(HERMES_SESSION_PIN_RESOLUTION_MIN_CALENDAR)}); "
+            "handoff pins may be skipped"
+        )
+    elif plugin_ok is None or multiplex_ok is None:
+        state = _WARN
+        detail += "; Hermes version unverified against the v1 matrix"
+    return ProbeResult("hermes_harness", state, detail, data)
 
 
 # ---------------------------------------------------------------------------
@@ -841,6 +958,8 @@ def run_all_probes(
     bot_service_runtime_auth_probe: bot_service_diagnostics.RuntimeAuthProbe | None = None,
 ) -> DoctorReport:
     probes: list[ProbeResult] = []
+    probes.append(probe_python_runtime())
+    probes.append(probe_host_platform())
     probes.append(probe_a365_cli())
     probes.append(probe_az_cli())
     probes.append(probe_powershell())

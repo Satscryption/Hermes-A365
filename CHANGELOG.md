@@ -8,6 +8,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **#126 — v1 compatibility matrix.** Published
+  [`references/v1-compatibility-matrix.md`](references/v1-compatibility-matrix.md)
+  (Python `>=3.11,<3.15`, macOS/Linux hosts, Hermes plugin/multiplex floors,
+  Microsoft tooling snapshots, CEA manifest 1.27). `hermes_a365.compatibility`
+  centralizes the constants; `doctor` now probes Python, host OS, and Hermes
+  version floors (including multiplex when
+  `gateway.multiplex_profiles` is enabled). CI expands to Python 3.11–3.14 on
+  Ubuntu, macOS, and Windows, adds Linux libsecret and macOS live keychain
+  round-trips, wheel fresh-install smoke, and Hermes source smoke for
+  `v2026.6.19` and `v0.22.2`. Windows remains unsupported for the OS keychain
+  layer (no Credential Manager backend).
 - **#82 — Copilot→Teams session pin.** A continuation token stores the live
   Hermes session for the Copilot origin (`SessionDB.find_session_by_origin`).
   `handoff/action` consumes the token once, requires the same tenant and

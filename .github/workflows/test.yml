@@ -11,8 +11,8 @@ on:
   # via REST). Allows `gh workflow run test.yml --ref <branch>` to
   # run tests on any ref regardless of push-trigger state.
   workflow_dispatch:
-  # publish.yml calls this so a release runs the same 3.11 and 3.14
-  # suite against the tagged commit before the pypi environment. #98
+  # publish.yml calls this so a release runs the same matrix against
+  # the tagged commit before the pypi environment. #98
   workflow_call:
 
 permissions:
@@ -20,14 +20,26 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
-        # 3.11 is the package minimum. 3.14 is the Hermes gateway runtime
-        # (NousResearch/hermes-agent; #148).
-        python-version: ["3.11", "3.14"]
-    name: test (Python ${{ matrix.python-version }})
+        include:
+          - os: ubuntu-latest
+            python-version: "3.11"
+          - os: ubuntu-latest
+            python-version: "3.12"
+          - os: ubuntu-latest
+            python-version: "3.13"
+          - os: ubuntu-latest
+            python-version: "3.14"
+          - os: macos-latest
+            python-version: "3.14"
+          - os: windows-latest
+            python-version: "3.14"
+    name: test (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    env:
+      HERMES_A365_LIVE_KEYCHAIN: ${{ matrix.os == 'macos-latest' && '1' || '' }}
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
@@ -44,3 +56,75 @@ jobs:
 
       - name: pytest
         run: uv run --python ${{ matrix.python-version }} pytest
+
+  keychain-linux:
+    runs-on: ubuntu-latest
+    name: keychain (Linux libsecret)
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install Secret Service stack
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y dbus-x11 gnome-keyring libsecret-tools
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Install deps
+        run: uv sync --all-extras --frozen --python 3.14
+
+      - name: Live libsecret round-trip
+        env:
+          HERMES_A365_LIVE_KEYCHAIN: "1"
+        run: |
+          eval "$(dbus-launch --sh-syntax)"
+          echo '' | gnome-keyring-daemon --unlock
+          export $(gnome-keyring-daemon --start)
+          export GNOME_KEYRING_CONTROL
+          uv run --python 3.14 pytest tests/test_keychain_live.py -q
+
+  wheel-smoke:
+    runs-on: ubuntu-latest
+    name: wheel smoke (fresh install)
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@08807647e7069bb48b6ef5acd8ec9567f424441b # v8.1.0
+        with:
+          python-version: "3.14"
+
+      - name: Build wheel and sdist
+        run: |
+          uv build
+          ls -la dist/
+
+      - name: Smoke-install wheel in a clean venv
+        run: |
+          uv venv /tmp/wheel-smoke-venv --python 3.14
+          uv pip install --python /tmp/wheel-smoke-venv/bin/python dist/*.whl
+          /tmp/wheel-smoke-venv/bin/python -c "import hermes_a365; import hermes_a365.plugin"
+          /tmp/wheel-smoke-venv/bin/hermes-a365 doctor --no-network | head -n 5
+
+  hermes-source-smoke:
+    runs-on: ubuntu-latest
+    name: hermes source (${{ matrix.hermes-ref }})
+    strategy:
+      fail-fast: false
+      matrix:
+        hermes-ref:
+          - v2026.6.19
+          - v0.22.2
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.14"
+
+      - name: Verify Hermes ref against plugin floors
+        run: python scripts/hermes_compat_smoke.py --ref ${{ matrix.hermes-ref }}

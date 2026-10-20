@@ -449,6 +449,11 @@ v0.1 design draft is archived at
 
 ## Install
 
+**v1 support matrix:** supported Python versions, host OSes (macOS and
+Linux; Windows is explicitly unsupported for end-to-end flows), Hermes
+gateway floors, and Microsoft tooling pins are documented in
+[`references/v1-compatibility-matrix.md`](references/v1-compatibility-matrix.md).
+
 `hermes-a365` ships as a PyPI package. There are two install paths,
 depending on what you want:
 

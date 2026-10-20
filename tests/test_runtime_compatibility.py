@@ -16,6 +16,7 @@ from packaging.version import Version
 ROOT = Path(__file__).resolve().parents[1]
 PYPROJECT = ROOT / "pyproject.toml"
 NOTE = ROOT / "references" / "hermes-runtime-compatibility.md"
+MATRIX = ROOT / "references" / "v1-compatibility-matrix.md"
 README = ROOT / "README.md"
 CHANGELOG = ROOT / "CHANGELOG.md"
 OVERRIDES = ROOT / "overrides.txt"
@@ -56,19 +57,39 @@ def _specifier_for(requirements: list[str], name: str) -> SpecifierSet:
     raise AssertionError(f"{name} floor missing from {requirements}")
 
 
-def test_requires_python_includes_hermes_3_14_runtime() -> None:
-    spec = SpecifierSet(_project()["requires-python"])
+def test_requires_python_matches_v1_matrix() -> None:
+    from hermes_a365.compatibility import REQUIRES_PYTHON
+
+    assert _project()["requires-python"] == REQUIRES_PYTHON
+    spec = SpecifierSet(REQUIRES_PYTHON)
     assert Version("3.11") in spec
     assert Version("3.14") in spec
     assert Version("3.10") not in spec
+    assert Version("3.15") not in spec
     classifiers = _project()["classifiers"]
-    assert "Programming Language :: Python :: 3.11" in classifiers
-    assert "Programming Language :: Python :: 3.14" in classifiers
+    for minor in (11, 12, 13, 14):
+        assert f"Programming Language :: Python :: 3.{minor}" in classifiers
+    assert "Operating System :: MacOS" in classifiers
+    assert "Operating System :: POSIX :: Linux" in classifiers
 
 
-def test_ci_matrix_runs_3_11_and_3_14() -> None:
+def test_ci_matrix_covers_supported_python_versions() -> None:
     text = TEST_WORKFLOW.read_text()
-    assert 'python-version: ["3.11", "3.14"]' in text
+    for version in ("3.11", "3.12", "3.13", "3.14"):
+        assert f'python-version: "{version}"' in text
+    assert "macos-latest" in text
+    assert "windows-latest" in text
+    assert "keychain-linux" in text
+    assert "wheel-smoke" in text
+    assert "hermes-source-smoke" in text
+
+
+def test_v1_compatibility_matrix_is_linked_from_readme() -> None:
+    readme = README.read_text()
+    assert "references/v1-compatibility-matrix.md" in readme
+    matrix = MATRIX.read_text()
+    assert "Snapshot date: 2026-10-20" in matrix
+    assert "Windows" in matrix and "Not supported" in matrix
 
 
 def test_override_file_keeps_the_security_floors() -> None:
