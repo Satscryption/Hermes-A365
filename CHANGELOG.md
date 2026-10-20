@@ -44,6 +44,26 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   (invoke, `messageReaction`, card submit, and lifecycle handlers are unchanged);
   `activity-bridge serve` still forwards only `message` and `invoke`, matching
   `references/webhook-contract.md`.
+- **FileConsentCard removed after Allow/Decline (#183).** On
+  ``fileConsent/invoke``, the adapter best-effort deletes the consent
+  card activity (``replyToId``) via the Bot Framework DELETE endpoint,
+  then posts the FileInfoCard on accept or a short decline confirmation
+  on decline (once per ``consentId``, including BF invoke retries).
+  Failed accepts remove the card too. Delete failures are logged and do
+  not block the invoke ack.
+- **Teams 1:1 stream overflow split at ~4k (#184).** Raise
+  ``streaming_overflow_limit()`` only for Teams **personal** streaming
+  session tasks via a ContextVar (32 768 UTF-16 code units, under
+  Microsoft's ~80 KB text guidance with headroom). Copilot Chat,
+  group/channel, and turn/coalesced buffers stay at ``MAX_MESSAGE_LENGTH``
+  (4000). Length accounting uses UTF-16 code units via ``message_len_fn``.
+- **Teams 1:1 typing indicator after a streamed final (#185).** On personal
+  chats, ``send_typing`` is a no-op while a BF stream is open and for the
+  rest of the turn after ``streamType=final`` lands, so Hermes'
+  ``_keep_typing`` loop does not post late pulses once the answer bubble
+  is complete. Suppression clears when the next personal turn starts and
+  after ``on_processing_complete`` finishes the turn-end finalize (including
+  failed finalize).
 
 ## [0.9.2] — 2026-10-19
 
@@ -103,7 +123,7 @@ in v0.9.2 (`f4d85bcd`) but had been listed under `[Unreleased]`.
 
 - **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
   A handler crash, a file-consent crash, a deduped invoke, a decline, an
-  unknown file consent, and an operator-webhook error are HTTP 200 with a
+  unknown file consent, and operator-webhook error are HTTP 200 with a
   JSON `{}` body on both runtimes. Teams reads that status as the invoke
   status, so these paths do not return a 5xx, and it rejects a JSON `null`
   invoke payload (`Payload cannot be null`). The plugin no longer answers

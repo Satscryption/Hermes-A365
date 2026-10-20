@@ -82,7 +82,8 @@ import stat
 import threading
 import time
 import uuid
-from contextvars import ContextVar
+from collections.abc import Callable
+from contextvars import ContextVar, Token
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -194,6 +195,15 @@ def _validate_profile_env_permissions(hermes_home: Path) -> None:
 
 _AGENT_TURN_LIFECYCLE: ContextVar[tuple[int, str, int, int, asyncio.Event] | None] = ContextVar(
     "agent365_agent_turn_lifecycle", default=None
+)
+# Hermes snapshots ``streaming_overflow_limit()`` per stream-consumer task.
+# Scope the raised cap with a ContextVar so concurrent non-personal turns
+# never inherit a personal chat's budget (#184).
+_STREAM_OVERFLOW_LIMIT: ContextVar[int | None] = ContextVar(
+    "agent365_stream_overflow_limit", default=None
+)
+_STREAM_OVERFLOW_RESET_TOKEN: ContextVar[Token | None] = ContextVar(
+    "agent365_stream_overflow_reset_token", default=None
 )
 _PERSIST_STATE_GUARD = threading.Lock()
 _PERSIST_STATES: dict[str, dict[str, Any]] = {}
@@ -436,6 +446,7 @@ _MEDIA_ACTIVITY_DEADLINE_SEC = 60.0
 _FILE_CONSENT_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.consent"
 _FILE_INFO_CONTENT_TYPE = "application/vnd.microsoft.teams.card.file.info"
 _FILE_CONSENT_INVOKE = "fileConsent/invoke"
+_FILE_CONSENT_DECLINED_NOTICE = "Declined — nothing uploaded."
 # Single-PUT upload cap (the OneDrive session accepts one range for the whole
 # file well above this); chunked upload for larger files is a follow-up.
 _MAX_OUTBOUND_FILE_BYTES = 25 * 1024 * 1024
@@ -696,6 +707,13 @@ def _connector_activity_id(response: Any) -> str:
     if isinstance(raw, str):
         return raw.strip()
     return ""
+
+
+def _teams_utf16_len(text: str) -> int:
+    """Length in UTF-16 code units (Teams activity size accounting)."""
+    if not text:
+        return 0
+    return len(text.encode("utf-16-le")) // 2
 
 
 def _strip_streaming_cursor(text: str) -> str:
@@ -1355,6 +1373,13 @@ class Agent365Adapter(BasePlatformAdapter):
     # that for interactive turns; #4 covers the proactive pattern for
     # longer reasoning.
     MAX_MESSAGE_LENGTH = 4000
+    # Teams agent messages allow much larger payloads than the interactive
+    # send cap above (Microsoft documents ~100 KB per activity, ~80 KB
+    # recommended for text). Hermes' stream consumer uses
+    # ``streaming_overflow_limit()`` for personal BF streaming only (#184).
+    # Teams documents ~80 KB of message text in UTF-16; keep headroom for
+    # stream entities, AI label, and feedback channelData.
+    _TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT = 32768
 
     # Slice 19s — Microsoft's BF streaming requires an explicit
     # ``endStream()`` (i.e. a final activity with
@@ -1363,6 +1388,15 @@ class Agent365Adapter(BasePlatformAdapter):
     # consumer to route the final ``edit_message(finalize=True)``
     # through even when content is unchanged.
     REQUIRES_EDIT_FINALIZE: bool = True
+
+    @property
+    def message_len_fn(self) -> Callable[[str], int]:
+        """Teams measures activity text in UTF-16 code units."""
+        return _teams_utf16_len
+
+    def streaming_overflow_limit(self) -> int | None:
+        """Per-task stream-consumer split budget (personal 1:1 only, #184)."""
+        return _STREAM_OVERFLOW_LIMIT.get()
 
     def __init__(self, config: PlatformConfig, **_kwargs: Any) -> None:
         super().__init__(config=config, platform=Platform("agent365"))
@@ -1564,6 +1598,11 @@ class Agent365Adapter(BasePlatformAdapter):
         # start a stream or emit a non-streaming reply. Cleared on finalize
         # or terminal 403.
         self._active_stream_by_chat: dict[str, str] = {}
+        # Personal chats: after ``streamType=final`` the BF stream slot is
+        # cleared but Hermes' ``_keep_typing`` loop may still pulse until
+        # ``on_processing_complete`` (#185). Suppress ``send_typing`` for
+        # the rest of that turn once a final has landed.
+        self._personal_stream_final_posted: set[str] = set()
         # Personal turns nest when Hermes runs an in-band follow-up before
         # the outer stream consumer is cancelled. The outer 1:1 stream is
         # finalized only when this count returns to 0 (#161).
@@ -1727,6 +1766,8 @@ class Agent365Adapter(BasePlatformAdapter):
         # ``_active_stream_by_chat``) — a gateway restart drops pending offers,
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
+        # Decline notices are sent once per consentId (BF invoke retries).
+        self._file_consent_decline_notified: set[str] = set()
         self._card_capabilities: dict[str, dict[str, Any]] = {}
         # #130: a typed-answer wait has no live card capability. Open-ended
         # clarify never mints one. "Something else" consumes the choice card
@@ -3493,6 +3534,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._record_recently_finalized(message_id, chat_id)
         self._streams.clear()
         self._active_stream_by_chat.clear()
+        self._personal_stream_final_posted.clear()
         self._personal_processing_depth.clear()
         self._personal_final_landed.clear()
         self._nested_personal_reply.clear()
@@ -3512,6 +3554,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._handoff_tokens.clear()
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
+        self._file_consent_decline_notified.clear()
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
         self._agent_turn_guards.clear()
@@ -5063,6 +5106,8 @@ class Agent365Adapter(BasePlatformAdapter):
         posts only after the short-turn window. ``send`` does not await it.
         """
         chat_id = self._chat_id_from_processing_event(event)
+        if chat_id:
+            _STREAM_OVERFLOW_RESET_TOKEN.set(self._enter_stream_overflow_limit(chat_id))
         if (
             chat_id
             and chat_id in self._seen_inbounds_this_lifetime
@@ -5082,9 +5127,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 # reply anchor, so a late 403 cannot block a different
                 # follow-up anchor.
                 self._nested_personal_reply.pop(chat_id, None)
-                self._personal_processing_depth[chat_id] = (
-                    self._personal_processing_depth.get(chat_id, 0) + 1
-                )
+                prev_depth = self._personal_processing_depth.get(chat_id, 0)
+                self._personal_processing_depth[chat_id] = prev_depth + 1
+                if prev_depth == 0:
+                    self._clear_personal_typing_suppression(chat_id)
         parent = getattr(super(), "on_processing_start", None)
         if callable(parent):
             await parent(event)
@@ -5849,23 +5895,35 @@ class Agent365Adapter(BasePlatformAdapter):
         open is flushed afterwards.
         """
         chat_id = self._chat_id_from_processing_event(event)
-        if chat_id:
-            self._close_innermost_turn(chat_id)
-            buf = self._turn_buffers.get(chat_id)
-            if buf is not None:
-                # A later user turn may try again after the deferred cap.
-                buf["retry_attempts"] = 0
-            await self._flush_turn_buffer(chat_id)
-            await self._flush_pending_coalesced_replies(chat_id)
-            # #161: the stream consumer's finalize edit runs on a task
-            # Hermes cancels at turn end. A short reply often still has
-            # the pacing gap left, so streamType=final never lands and
-            # Teams keeps the Stop button. Close it on this session task.
-            # A nested follow-up complete runs before that cancel, so it
-            # must not close the outer 1:1 stream. Non-personal chats are
-            # not in ``_active_stream_by_chat``.
-            if self._release_personal_processing(chat_id):
-                await self._finalize_open_personal_stream(chat_id)
+        try:
+            if chat_id:
+                self._close_innermost_turn(chat_id)
+                buf = self._turn_buffers.get(chat_id)
+                if buf is not None:
+                    # A later user turn may try again after the deferred cap.
+                    buf["retry_attempts"] = 0
+                await self._flush_turn_buffer(chat_id)
+                await self._flush_pending_coalesced_replies(chat_id)
+                # #161: the stream consumer's finalize edit runs on a task
+                # Hermes cancels at turn end. A short reply often still has
+                # the pacing gap left, so streamType=final never lands and
+                # Teams keeps the Stop button. Close it on this session task.
+                # A nested follow-up complete runs before that cancel, so it
+                # must not close the outer 1:1 stream. Non-personal chats are
+                # not in ``_active_stream_by_chat``.
+                outer_personal_ended = self._release_personal_processing(chat_id)
+                try:
+                    if outer_personal_ended:
+                        await self._finalize_open_personal_stream(chat_id)
+                        # #185: Hermes' typing task outlives this hook; drop
+                        # suppression only after turn-end finalize.
+                        self._clear_personal_typing_suppression(chat_id)
+                except asyncio.CancelledError:
+                    self._clear_personal_typing_suppression(chat_id)
+                    raise
+        finally:
+            if chat_id:
+                self._reset_stream_overflow_limit_for_task()
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
             await parent(event, outcome)
@@ -7469,6 +7527,102 @@ class Agent365Adapter(BasePlatformAdapter):
                 f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}"
             )
 
+    async def _delete_activity(
+        self,
+        *,
+        inbound: dict[str, Any],
+        activity_id: str,
+        chat_id: str,
+    ) -> bool:
+        """Best-effort DELETE for a conversation activity (#183 FileConsentCard)."""
+        activity_id = str(activity_id or "").strip()
+        if not activity_id:
+            return False
+        if self._http_client is None or self._bridge_cfg is None:
+            return False
+        service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
+        conv = inbound.get("conversation") if isinstance(inbound.get("conversation"), dict) else {}
+        conv_id = conv.get("id")
+        if not service_url or not conv_id:
+            return False
+        chat_id = str(chat_id or conv_id)
+        generation = self._lifecycle_generation
+        chat_generation = self._chat_generation(chat_id)
+        client = self._http_client
+        if not self._chat_lifecycle_is_current(chat_id, chat_generation):
+            return False
+        url = (
+            f"{service_url}/v3/conversations/{quote_path_segment(str(conv_id))}"
+            f"/activities/{quote_path_segment(activity_id)}"
+        )
+        bridge = _import_bridge()
+        try:
+            token, _path = await self._await_outbound(
+                chat_id,
+                bridge.acquire_reply_token(
+                    client=client,
+                    cfg=self._bridge_cfg,
+                    activity=inbound,
+                    fmi_cache=self._fmi_cache,
+                    user_cache=self._user_cache,
+                    bf_cache=self._bf_token_cache,
+                    validated_path=self._validated_path_for_inbound(inbound),
+                ),
+            )
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return False
+            resp = await self._await_outbound(
+                chat_id,
+                client.delete(
+                    url,
+                    headers={"Authorization": f"Bearer {token}"},
+                    timeout=15.0,
+                ),
+            )
+            if not self._lifecycle_is_current(
+                generation, client
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
+                return False
+            if 200 <= int(getattr(resp, "status_code", 0) or 0) < 300:
+                return True
+            logger.warning(
+                "agent365 delete_activity HTTP %s activity=%s",
+                resp.status_code,
+                activity_id[:12],
+            )
+        except Exception as e:
+            logger.warning(
+                "agent365 delete_activity failed activity=%s: %s",
+                activity_id[:12],
+                e,
+            )
+        return False
+
+    async def _remove_file_consent_card(
+        self, activity: dict[str, Any], *, chat_id: str
+    ) -> None:
+        """Remove the FileConsentCard the user answered (#183)."""
+        reply_to = str(activity.get("replyToId") or "").strip()
+        if reply_to:
+            await self._delete_activity(
+                inbound=activity, activity_id=reply_to, chat_id=chat_id
+            )
+
+    async def _send_file_consent_decline_notice(
+        self, activity: dict[str, Any], *, validated_path: str | None
+    ) -> None:
+        try:
+            await self._send_reply_activity(
+                inbound=activity,
+                content=_FILE_CONSENT_DECLINED_NOTICE,
+                log_context="fileConsent decline",
+                validated_path=validated_path,
+            )
+        except Exception as e:
+            logger.warning("agent365 fileConsent decline notice failed: %s", e)
+
     async def send_or_update_status(
         self,
         chat_id: str,
@@ -7604,6 +7758,14 @@ class Agent365Adapter(BasePlatformAdapter):
             return None
         conv = inbound.get("conversation") if isinstance(inbound.get("conversation"), dict) else {}
         if str(conv.get("conversationType") or "") != "personal":
+            return None
+        # #185: BF has no "stop typing" activity. While a personal stream is
+        # open, typing is redundant; after ``streamType=final`` Hermes may still
+        # pulse until ``on_processing_complete`` — skip those late ticks.
+        if (
+            chat_id in self._active_stream_by_chat
+            or chat_id in self._personal_stream_final_posted
+        ):
             return None
         # Slice 19x-d (#4): bump last_used_at on typing too.
         self._conversations.mark_used(chat_id)
@@ -7968,11 +8130,27 @@ class Agent365Adapter(BasePlatformAdapter):
         context = context if isinstance(context, dict) else {}
         consent_id = str(context.get("consentId") or "")
         pending = self._pending_file_uploads.pop(consent_id, None)
+        consent_chat_id = str((activity.get("conversation") or {}).get("id") or "")
+
+        async def _remove_consent_card() -> None:
+            await self._remove_file_consent_card(
+                activity, chat_id=consent_chat_id
+            )
 
         if action != "accept":
             logger.info(
                 "agent365 fileConsent action=%s consent=%s", action, consent_id[:8]
             )
+            await _remove_consent_card()
+            if (
+                action == "decline"
+                and consent_id
+                and consent_id not in self._file_consent_decline_notified
+            ):
+                self._file_consent_decline_notified.add(consent_id)
+                await self._send_file_consent_decline_notice(
+                    activity, validated_path=validated_path
+                )
             # Benign ack: nothing to render. HTTP 200 + JSON {} (#132).
             # Null is rejected by Teams ("Payload cannot be null").
             return invoke.empty_invoke_ack()
@@ -7984,6 +8162,7 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning(
                 "agent365 fileConsent accept for unknown consent=%s", consent_id[:8]
             )
+            await _remove_consent_card()
             return invoke.empty_invoke_ack()
 
         pending_chat_id = str(pending.get("conversation_id") or "")
@@ -7997,6 +8176,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent accept for expired lifecycle consent=%s",
                 consent_id[:8],
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F2 / R2-P1 — capability model, not authenticated-user check.
@@ -8020,11 +8200,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent accept context mismatch consent=%s",
                 consent_id[:8],
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F3: a consent the user answers long after the offer is stale.
         if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
             logger.warning("agent365 fileConsent accept expired consent=%s", consent_id[:8])
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         upload_info = value.get("uploadInfo")
@@ -8042,6 +8224,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         ):
             logger.warning("agent365 fileConsent accept missing uploadUrl/client")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         # R2-P1: only POST bytes to an EXACT configured tenant SharePoint/OneDrive
         # host — a `*.sharepoint.com` suffix would accept an attacker-owned tenant's
@@ -8051,12 +8234,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent uploadUrl not on the configured tenant host "
                 "allowlist; refused (%.60s)", upload_url
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         # Re-validate the path (may have been removed since the offer).
         safe_path = self.validate_media_delivery_path(str(pending.get("path") or ""))
         if safe_path is None:
             logger.warning("agent365 fileConsent accept: file no longer available")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         # R2-P2: read the current bytes ONCE through a bounded descriptor, then
         # verify size + SHA-256 against the offer. A file that grew past the cap,
@@ -8066,13 +8251,16 @@ class Agent365Adapter(BasePlatformAdapter):
         data = _read_file_bounded(safe_path, _MAX_OUTBOUND_FILE_BYTES)
         if data is None:
             logger.warning("agent365 fileConsent: file unreadable or over-cap at accept")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         size = len(data)
         if size <= 0 or size != int(pending.get("size") or -1):
             logger.warning("agent365 fileConsent: size changed since offer")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         if hashlib.sha256(data).hexdigest() != pending.get("sha256"):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
         try:
             put_resp = await self._await_outbound(
@@ -8091,9 +8279,11 @@ class Agent365Adapter(BasePlatformAdapter):
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
             if status_code < 200 or status_code >= 300:
                 logger.error("agent365 fileConsent upload HTTP %s", status_code)
+                await _remove_consent_card()
                 return invoke.InvokeResponse(status=200, body={})
         except Exception as e:
             logger.error("agent365 fileConsent upload failed: %s", e)
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
 
         if not self._lifecycle_is_current(
@@ -8106,7 +8296,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 "consent=%s",
                 consent_id[:8],
             )
+            await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
+
+        await _remove_consent_card()
 
         # Confirm with a FileInfoCard so the file renders inline in the chat.
         # Best-effort — the upload already succeeded, so a failed card is logged,
@@ -9740,6 +9933,38 @@ class Agent365Adapter(BasePlatformAdapter):
         self._personal_processing_depth[key] = depth
         return False
 
+    def _clear_personal_typing_suppression(self, chat_id: str) -> None:
+        self._personal_stream_final_posted.discard(str(chat_id))
+
+    def _personal_conversation_type_for_chat(self, chat_id: str) -> str:
+        inbound = self._cached_inbound_for(chat_id)
+        conv = (inbound or {}).get("conversation") or {}
+        return str(conv.get("conversationType") or "")
+
+    def _enter_stream_overflow_limit(self, chat_id: str) -> Token:
+        """Bind the stream-consumer overflow cap for this session task."""
+        if self._personal_conversation_type_for_chat(chat_id) == "personal":
+            limit: int | None = self._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
+        else:
+            limit = None
+        return _STREAM_OVERFLOW_LIMIT.set(limit)
+
+    def _reset_stream_overflow_limit_for_task(self) -> None:
+        token = _STREAM_OVERFLOW_RESET_TOKEN.get()
+        if token is not None:
+            try:
+                _STREAM_OVERFLOW_LIMIT.reset(token)
+            except ValueError:
+                # Token was bound on another task (tests); clear this task's view.
+                _STREAM_OVERFLOW_LIMIT.set(None)
+            _STREAM_OVERFLOW_RESET_TOKEN.set(None)
+
+    def _mark_personal_stream_final_posted(self, chat_id: str) -> None:
+        """Record that a personal stream final landed for this turn (#185)."""
+        key = str(chat_id)
+        if key:
+            self._personal_stream_final_posted.add(key)
+
     def _drop_stream_state_if_unopened(
         self,
         chat_id: str,
@@ -10223,6 +10448,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if wire_finalize:
                     self._drop_stream_state(chat_id, message_id)
                     self._record_recently_finalized(message_id, chat_id, loop_now)
+                    self._mark_personal_stream_final_posted(chat_id)
                 return SendResult(
                     success=True, message_id=state.get("bf_stream_id") or ""
                 )
@@ -10266,6 +10492,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._drop_stream_state(chat_id, message_id)
                     self._record_recently_finalized(message_id, chat_id, loop_now)
                     self._remember_personal_final_anchor(chat_id, anchor)
+                    self._mark_personal_stream_final_posted(chat_id)
                     return SendResult(success=True, message_id=landed_id)
                 self._drop_stream_state(chat_id, message_id)
                 short = err_msg
@@ -10433,6 +10660,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._drop_stream_state(chat_id, message_id)
             loop_now = asyncio.get_event_loop().time()
             self._record_recently_finalized(message_id, chat_id, loop_now)
+            self._mark_personal_stream_final_posted(chat_id)
             return True
 
         code, body = self._bf_error_parts(resp)
@@ -11118,6 +11346,8 @@ class Agent365Adapter(BasePlatformAdapter):
             if key[0] == chat_id:
                 self._recently_finalized.pop(key, None)
         self._personal_processing_depth.pop(chat_id, None)
+        self._personal_stream_final_posted.discard(chat_id)
+        self._reset_stream_overflow_limit_for_task()
         self._personal_final_landed.pop(chat_id, None)
         self._nested_personal_reply.pop(chat_id, None)
         for consent_id, pending in list(self._pending_file_uploads.items()):

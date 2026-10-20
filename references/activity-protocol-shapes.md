@@ -44,14 +44,15 @@ poll. Long-poll TTL is 60 s; the bridge re-subscribes on disconnect.
 |---|---|---|
 | `message` | `agent.responded` | Plain text or Adaptive Card. |
 | `invokeResponse` | Inbound `invoke` | Card refresh JSON; uses `templates/adaptive-cards/`. |
-| `typing` | Long-running tool calls | Optional; emit at most every 1 s. |
+| `typing` | Long-running tool calls | Optional; emit at most every 1 s. On personal chats, suppressed while a BF stream is open and after ``streamType=final`` until turn end (#185). |
+| `message` (file consent) | Outbound ``MEDIA:`` / ``send_document`` (#76c) | FileConsentCard; on Accept/Decline the card activity is deleted and accept posts a FileInfoCard (#183). |
 
 ## Channel-specific quirks
 
 | Channel | Quirk | Handling |
 |---|---|---|
 | Teams | Conversation TTL of ~24 h after last activity | Bridge re-resolves `conversation.id` on `NotFound`. |
-| Teams | `text` field has 28 KB cap | Long replies are split or rendered as Adaptive Card. |
+| Teams | Agent message payload ~100 KB (~80 KB text recommended); interactive sends still capped at 4 000 in the adapter | Long non-stream replies are split or rendered as Adaptive Card; personal BF streaming uses a higher ``streaming_overflow_limit`` (#184). |
 | Outlook | `attachments` may include voice transcripts (preview) | Treat unknown attachment kinds as opaque; do not block reply. |
 | M365 Copilot | `replyToId` semantics differ — Copilot expects threaded replies | Bridge sets `replyToId` from the inbound activity. |
 | M365 Copilot Chat (Custom Engine Agent, Path B) | Arrives as `conversationType=groupChat` with `channelId=msteams` and a `19:…@thread.v2` id — **shape-indistinguishable from a real Teams group chat**. Accepts BF streaming activities (HTTP 2xx) but does **not visibly render** them. A plain `typing` activity is accepted and then the following reply is not rendered. A silent turn is dropped after about 45 seconds between activities. A stream must be finished within two minutes (`Content stream finished due to exceeded streaming time`); informative updates do not extend that cap. | Do not stream the answer. Buffer the turn and emit one `send_reply`. If the turn is still open inside the ~45s window, a background task posts a streaming informative keep-alive (`streamType=informative`, then `streamId`) and closes it with `streamType=final` immediately before that reply. The informative text is not the answer. See *Streaming and reply delivery* below. |
@@ -94,7 +95,16 @@ whether the conversation actually renders Bot Framework streaming:
   the non-personal coalesce buffer. A **stale-stream liveness guard**
   force-drops a sequence whose
   finalization repeatedly fails or that exceeds a bounded age, so a
-  stuck stream can't silence the chat (#62, #83, #161).
+  stuck stream can't silence the chat (#62, #83, #161). While a stream
+  is open, and for the rest of the turn after ``streamType=final``,
+  ``send_typing`` is suppressed on personal chats so late gateway
+  typing pulses do not keep the dots alive (#185); suppression clears
+  after turn-end finalize in ``on_processing_complete`` and when the next
+  personal turn starts.   Long **personal** streamed replies bind a per-task
+  ``streaming_overflow_limit()`` (32 768 UTF-16 code units) so the Hermes
+  stream consumer does not split a single final near the 4 000-character
+  interactive send cap; concurrent non-personal session tasks keep the
+  4 000 limit (#184).
 
 - **Copilot Chat and other non-`personal` turns** do **not** render BF
   streaming (see the quirks row above): Bot Framework returns 2xx and
