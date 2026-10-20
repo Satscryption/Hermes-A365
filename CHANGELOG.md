@@ -8,6 +8,11 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **`gateway.platforms.agent365.extra.reactions_dispatch_agent_turn`** (default
+  `false`). When enabled, a stored Teams `messageReaction` on a bot reply also
+  dispatches Hermes' `reaction:added:<type>` / `reaction:removed:<type>` agent
+  turn (#80). When disabled (the default), reactions are recorded on the #73
+  feedback map and logged without invoking the agent.
 - **#82 — Copilot→Teams session pin.** A continuation token stores the live
   Hermes session for the Copilot origin (`SessionDB.find_session_by_origin`).
   `handoff/action` consumes the token once, requires the same tenant and
@@ -26,9 +31,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   end-user, and replay gates, a reaction is stored on the #73 feedback
   record only when `replyToId` is a reply this process sent in the same
   conversation and tenant. The record keeps the latest add/remove and the
-  normalized reaction type. Hermes' reaction convention emits
-  `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn) for
-  each stored change. That turn's message id is the cached user activity,
+  normalized reaction type. When
+  `reactions_dispatch_agent_turn` is enabled, Hermes' reaction convention
+  emits `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn)
+  for each stored change; that turn's message id is the cached user activity,
   so the reply is not aimed at the reaction activity. A later thumbs
   submit merges into the same row and keeps `native_reactions`. Replayed,
   malformed, cross-tenant, and unrelated reactions do not change another
@@ -40,6 +46,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **#180 — Teams reactions no longer start an agent turn by default.** Recording
+  and #80 logging still run; only `reactions_dispatch_agent_turn` restores the
+  synthetic turn. Empty-text `message` activities are acked without dispatch so
+  connector follow-ons cannot produce unprompted replies.
+- **#188 — Non-message inbound activities no longer reach the agent loop or the
+  operator webhook.** The gateway allowlists user turns to `type=message` only;
+  `activity-bridge serve` forwards only `message` and `invoke`, matching
+  `references/webhook-contract.md`.
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
   `bf_error_body`. Transient failures on an already-open stream (transport

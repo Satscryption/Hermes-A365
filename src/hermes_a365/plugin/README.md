@@ -94,6 +94,10 @@ gateway:
         file_host_allowlist:
           - contoso.sharepoint.com
           - contoso-my.sharepoint.com
+        # #80 / #180 — record Teams native reactions on the #73 feedback map
+        # without invoking the agent (default). Set true only when you want
+        # reaction:added:/reaction:removed: synthetic agent turns.
+        reactions_dispatch_agent_turn: false
 ```
 
 Required env vars (already populated by the wrapper's

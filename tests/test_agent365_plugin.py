@@ -1848,6 +1848,18 @@ class TestShouldDispatch:
     def test_real_msteams_message_dispatches(self) -> None:
         assert adapter_mod._should_dispatch(_make_inbound()) is True
 
+    def test_message_update_does_not_dispatch(self) -> None:
+        body = {**_make_inbound(), "type": "messageUpdate"}
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_message_delete_does_not_dispatch(self) -> None:
+        body = {**_make_inbound(text=""), "type": "messageDelete"}
+        assert adapter_mod._should_dispatch(body) is False
+
+    def test_unknown_type_does_not_dispatch(self) -> None:
+        body = {**_make_inbound(), "type": "fooBar"}
+        assert adapter_mod._should_dispatch(body) is False
+
     def test_conversation_update_acks(self) -> None:
         body = {**_make_inbound(), "type": "conversationUpdate"}
         assert adapter_mod._should_dispatch(body) is False
@@ -19137,6 +19149,82 @@ class TestSecurityAuthorizationOrder:
         assert event.source.chat_type == "group"
 
 
+class TestUnhandledInboundActivityTypes:
+    """Non-message BF types are acked without an agent turn (#188)."""
+
+    def _client(self, monkeypatch: pytest.MonkeyPatch, adapter: Any) -> Any:
+        from fastapi.testclient import TestClient
+
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        adapter._http_client = MagicMock()
+        return TestClient(adapter.build_app())
+
+    @pytest.mark.parametrize(
+        ("activity_type", "extra_fields"),
+        [
+            ("messageUpdate", {"text": "edited"}),
+            (
+                "messageUpdate",
+                {"text": "restored", "channelData": {"eventType": "undeleteMessage"}},
+            ),
+            ("messageDelete", {"text": ""}),
+            ("event", {"name": "customEvent"}),
+            ("fooBar", {"text": "surprise"}),
+        ],
+    )
+    def test_non_message_types_are_acked_not_dispatched(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        activity_type: str,
+        extra_fields: dict[str, Any],
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(monkeypatch, a)
+        body = _make_inbound(text=extra_fields.pop("text", "hello"))
+        body["type"] = activity_type
+        body.update(extra_fields)
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "acked", "reason": "unhandled_type"}
+        assert a._handled_events == []
+
+    def test_empty_message_is_acked_not_dispatched(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(monkeypatch, a)
+        body = _make_inbound(text="")
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json() == {"status": "acked", "reason": "empty_message"}
+        assert a._handled_events == []
+
+    def test_real_message_still_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_make_inbound(text="hello"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["status"] == "dispatched"
+        assert a._handled_events[0].text == "hello"
+
+
 # ---------------------------------------------------------------------------
 # #80 — Teams messageReaction add/remove (feedback correlation, no #122)
 # ---------------------------------------------------------------------------
@@ -19179,6 +19267,13 @@ def _reaction_activity(
 
 
 class TestMessageReaction:
+    def _adapter(
+        self, monkeypatch: pytest.MonkeyPatch, *, dispatch_turn: bool = False, **extra: Any
+    ) -> Any:
+        if dispatch_turn:
+            extra = {**extra, "reactions_dispatch_agent_turn": True}
+        return _make_adapter(monkeypatch, **extra)
+
     def _client(self, monkeypatch: pytest.MonkeyPatch, adapter: Any) -> Any:
         from fastapi.testclient import TestClient
 
@@ -19205,10 +19300,31 @@ class TestMessageReaction:
     def _other(self, adapter: Any) -> dict[str, Any]:
         return dict(adapter._feedback_by_message_id["other-msg"])
 
-    def test_add_records_feedback_and_emits_synthetic_event(
+    def test_add_records_feedback_without_agent_turn_by_default(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(added=[{"type": "LIKE"}]),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "acked", "reactions": 1}
+        rec = a._feedback_by_message_id["reply-1"]
+        assert rec["native_reactions"]["user-1"]["like"] == {
+            "action": "added",
+            "type": "like",
+        }
+        assert a._handled_events == []
+        assert self._other(a)["feedback"] == "keep"
+
+    def test_add_records_feedback_and_emits_synthetic_event_when_opted_in(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         client = self._client(monkeypatch, a)
         response = client.post(
@@ -19234,7 +19350,7 @@ class TestMessageReaction:
     def test_remove_and_existing_thumbs_record(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         a._feedback_by_message_id["reply-1"] = {
             "reaction": "dislike",
@@ -19262,7 +19378,7 @@ class TestMessageReaction:
     def test_add_then_remove_keeps_latest_action(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         client = self._client(monkeypatch, a)
         response = client.post(
@@ -19281,7 +19397,7 @@ class TestMessageReaction:
     def test_distinct_add_and_remove_both_emit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         client = self._client(monkeypatch, a)
         response = client.post(
@@ -19304,7 +19420,7 @@ class TestMessageReaction:
     def test_replay_does_not_apply_twice(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         client = self._client(monkeypatch, a)
         body = _reaction_activity()
@@ -19508,7 +19624,7 @@ class TestMessageReaction:
     def test_path_b_jwt_gate_still_records(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         bridge = adapter_mod._import_bridge()
         a365 = AsyncMock(return_value={"iss": "nope"})
@@ -19529,22 +19645,6 @@ class TestMessageReaction:
         bf.assert_awaited_once()
         a365.assert_not_awaited()
         assert a._handled_events[0].text == "reaction:added:like"
-
-    def test_message_update_is_still_a_user_turn(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        """#122 stays out of scope: edits are not reaction handling."""
-        a = _make_adapter(monkeypatch)
-        client = self._client(monkeypatch, a)
-        body = _make_inbound(text="edited")
-        body["type"] = "messageUpdate"
-        response = client.post(
-            "/api/messages",
-            json=body,
-            headers={"Authorization": "Bearer a.b.c"},
-        )
-        assert response.json()["status"] == "dispatched"
-        assert a._handled_events[0].text == "edited"
 
     def test_reply_index_is_bounded_and_evicted_ids_do_not_record(
         self, monkeypatch: pytest.MonkeyPatch
@@ -19582,7 +19682,7 @@ class TestMessageReaction:
         assert response.json()["reactions"] == 1
         slots = a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]
         assert list(slots) == ["heart"]
-        assert [event.text for event in a._handled_events] == ["reaction:added:heart"]
+        assert a._handled_events == []
 
     @pytest.mark.asyncio
     async def test_teardown_drops_chat_reply_ids(
@@ -19652,7 +19752,7 @@ class TestMessageReaction:
     async def test_group_flush_replies_to_cached_user_activity(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = _make_adapter(monkeypatch, reactions_dispatch_agent_turn=True)
         inbound = _make_inbound(conv_id="conv-g", activity_id="user-act")
         inbound["conversation"]["conversationType"] = "groupChat"
         ref = adapter_mod.ConversationRef.from_activity(inbound)
@@ -19689,7 +19789,7 @@ class TestMessageReaction:
     async def test_personal_reaction_turn_uses_cached_user_activity(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = _make_adapter(monkeypatch, reactions_dispatch_agent_turn=True)
         inbound = _make_inbound(conv_id="conv-1", activity_id="user-act")
         ref = adapter_mod.ConversationRef.from_activity(inbound)
         ref.validated_path = "A"

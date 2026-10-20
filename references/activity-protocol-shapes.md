@@ -34,8 +34,9 @@ poll. Long-poll TTL is 60 s; the bridge re-subscribes on disconnect.
 | `message` | Teams / Outlook | Local Hermes agent (request/response) | Reply MUST be posted as `message` with the same `conversation.id`. |
 | `invoke` (`adaptiveCard/action`) | Teams (Adaptive Card actions) | Card builder (`emit_card.py`) | Reply is an Adaptive Card refresh; SPEC §6.7 example. |
 | `conversationUpdate` | Teams (members added/removed) | Bridge bookkeeping only | No agent invocation. |
-| `messageReaction` | Teams | #73 feedback record + Hermes reaction event | Add/remove only, after JWT, serviceUrl, tenant, and replay gates. Stored when `replyToId` is a reply this bot sent. Emits `reaction:added:<type>` / `reaction:removed:<type>`. Edits and deletes are #122. Live round trip still open on the #116 / #89 walks. |
-| `event` | M365 Copilot agent picker | Local Hermes agent | Same routing as `message`. |
+| `messageReaction` | Teams | #73 feedback record (optional agent turn) | Add/remove only, after JWT, serviceUrl, tenant, and replay gates. Stored when `replyToId` is a reply this bot sent. With `reactions_dispatch_agent_turn` (default off), no agent turn. When enabled, emits `reaction:added:<type>` / `reaction:removed:<type>`. Edits and deletes are #122. |
+| `messageUpdate` / `messageDelete` | Teams | Acknowledged only | Not user turns; edit/delete semantics remain #122. |
+| `event` | M365 Copilot agent picker | Acknowledged unless `type=message` | Non-`message` events are not dispatched to the agent loop. |
 
 ## Outbound activity types (emitted by bridge)
 
