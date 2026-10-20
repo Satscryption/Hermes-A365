@@ -883,10 +883,60 @@ def _publish_state_allows_manifest_id_change(
         and inputs.app_version is not None
     ):
         return True
-    return bool(
-        resolution
-        and inputs.manifest_id == "auto"
-        and resolution.freshly_minted
+    return bool(resolution and resolution.freshly_minted)
+
+
+def _refuse_copilot_chat_manifest_id_colliding_with_aiteammate(
+    inputs: PublishInputs,
+    *,
+    aiteammate_catalog_id: str | None,
+) -> None:
+    """Combined emits must not stamp the AI Teammate catalog id on the CEA zip."""
+    if not (inputs.aiteammate and inputs.copilot_chat):
+        return
+    if not aiteammate_catalog_id or inputs.manifest_id in (None, "auto"):
+        return
+    try:
+        chosen = _canonical_manifest_guid(inputs.manifest_id)
+        template = _canonical_manifest_guid(aiteammate_catalog_id)
+    except ValueError:
+        return
+    if chosen != template:
+        return
+    raise PublishError(
+        f"--manifest-id {chosen} matches the AI Teammate catalog id; combined "
+        "--aiteammate --copilot-chat publishes need a distinct CEA catalog id. "
+        "Omit --manifest-id for auto mint or pass a new GUID with --app-version."
+    )
+
+
+def _publish_state_manifest_id_mismatch_message(
+    path: Path,
+    *,
+    stored_id: str,
+    catalog_manifest_id: str,
+    aiteammate_catalog_id: str | None,
+) -> str:
+    base = (
+        f"Copilot Chat publish state at {path} records manifestId {stored_id}, "
+        f"but this publish targets {catalog_manifest_id}. "
+    )
+    if (
+        aiteammate_catalog_id
+        and stored_id == _canonical_manifest_guid(aiteammate_catalog_id)
+    ):
+        return (
+            base
+            + "The stored id is the AI Teammate catalog id — do not pass "
+            "--manifest-id with that value on combined publishes. Omit "
+            "--manifest-id to mint a distinct CEA catalog id, remove or rename "
+            "the state file, or pass a new --manifest-id with --app-version."
+        )
+    return (
+        base
+        + f"Pass --manifest-id {stored_id} to match the stored id, remove or "
+        "rename the state file, or pass a new --manifest-id with --app-version "
+        "for a separate catalog entry."
     )
 
 
@@ -1040,6 +1090,7 @@ def _assert_publish_state_matches_catalog_id(
     profile: str,
     inputs: PublishInputs,
     manifest_id_resolution: _CopilotChatManifestIdResolution | None,
+    aiteammate_catalog_id: str | None,
 ) -> None:
     """Refuse apply when on-disk state targets a different catalog ``manifest.id``."""
     if _publish_state_allows_manifest_id_change(inputs, manifest_id_resolution):
@@ -1055,10 +1106,12 @@ def _assert_publish_state_matches_catalog_id(
     if stored_id == _canonical_manifest_guid(catalog_manifest_id):
         return
     raise PublishError(
-        f"Copilot Chat publish state at {path} records manifestId {stored_id}, "
-        f"but this publish targets {catalog_manifest_id}. Pass --manifest-id to "
-        "match the stored id, remove or rename the state file, or pass a new "
-        "--manifest-id with --app-version for a separate catalog entry."
+        _publish_state_manifest_id_mismatch_message(
+            path,
+            stored_id=stored_id,
+            catalog_manifest_id=catalog_manifest_id,
+            aiteammate_catalog_id=aiteammate_catalog_id,
+        )
     )
 
 
@@ -1098,6 +1151,9 @@ def _resolve_copilot_chat_manifest_id_for_apply(
 ) -> _CopilotChatManifestIdResolution:
     """Catalog ``manifest.id`` to stamp on the Copilot Chat zip for this apply."""
     aiteammate_catalog_id = _catalog_manifest_id_for_copilot_chat(source_manifest, None)
+    _refuse_copilot_chat_manifest_id_colliding_with_aiteammate(
+        inputs, aiteammate_catalog_id=aiteammate_catalog_id
+    )
     if not _copilot_chat_mints_catalog_id(inputs):
         return _CopilotChatManifestIdResolution(
             manifest_id=inputs.manifest_id,
@@ -1495,6 +1551,9 @@ def apply_publish_plan(
             manifest_id_resolution: _CopilotChatManifestIdResolution | None = None
             if copilot_chat_target is not None:
                 source_manifest = _read_manifest_json_from_zip(copilot_chat_target) or {}
+                aiteammate_catalog_id = _catalog_manifest_id_for_copilot_chat(
+                    source_manifest, None
+                )
                 manifest_id_resolution = _resolve_copilot_chat_manifest_id_for_apply(
                     plan.inputs,
                     hermes_home=hermes_home,
@@ -1534,6 +1593,7 @@ def apply_publish_plan(
                             profile=publish_profile,
                             inputs=plan.inputs,
                             manifest_id_resolution=manifest_id_resolution,
+                            aiteammate_catalog_id=aiteammate_catalog_id,
                         )
                     last_published = (
                         _read_copilot_chat_publish_state(

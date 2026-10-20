@@ -2,7 +2,10 @@ name: Tests
 
 on:
   push:
-    branches: [main]
+    # ``main`` plus agent/feature branches: PR ``pull_request`` events alone
+    # did not re-run this workflow after synchronize pushes (only org CodeQL
+    # ran on updated PR heads in Oct 2026).
+    branches: [main, "cursor/**"]
   pull_request:
     branches: [main]
   # Manual trigger — used to unblock CI when the push-trigger

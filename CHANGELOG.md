@@ -55,6 +55,9 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   `HERMES_PROFILE` / `HERMES_GATEWAY_PROFILE`), and `ceaCatalogIdMinted`.
   Legacy schema v1 is unscoped: apply requires `--app-version` to seed v2
   state instead of implicitly claiming the current tenant/profile on read.
+  Fresh-mint state replacement follows resolver `freshly_minted` (including
+  combined `--aiteammate --copilot-chat` default). Mismatch hints never steer
+  operators toward reusing the AI Teammate catalog id on the CEA zip.
 
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
