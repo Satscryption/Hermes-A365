@@ -53,7 +53,7 @@ poll. Long-poll TTL is 60 s; the bridge re-subscribes on disconnect.
 | Teams | `text` field has 28 KB cap | Long replies are split or rendered as Adaptive Card. |
 | Outlook | `attachments` may include voice transcripts (preview) | Treat unknown attachment kinds as opaque; do not block reply. |
 | M365 Copilot | `replyToId` semantics differ — Copilot expects threaded replies | Bridge sets `replyToId` from the inbound activity. |
-| M365 Copilot Chat (Custom Engine Agent, Path B) | Arrives as `conversationType=groupChat` with `channelId=msteams` and a `19:…@thread.v2` id — **shape-indistinguishable from a real Teams group chat**. Accepts BF streaming activities (HTTP 2xx) but does **not visibly render** them. A plain `typing` activity is accepted and then the following reply is not rendered. A silent turn is dropped after about 45 seconds between activities. A stream must be finished within two minutes (`Content stream finished due to exceeded streaming time`); informative updates do not extend that cap. | Do not stream the answer. Buffer the turn and emit one `send_reply`. If the turn is still open inside the ~45s window, a background task posts a streaming informative keep-alive (`streamType=informative`, then `streamId`) and closes it with `streamType=final` immediately before that reply. The informative text is not the answer. See *Streaming and reply delivery* below. |
+| M365 Copilot Chat (Custom Engine Agent, Path B) | Arrives as `conversationType=groupChat` with `channelId=msteams` and a `19:…@thread.v2` id — **shape-indistinguishable from a real Teams group chat**. Accepts informative streaming activities (HTTP 2xx). `streamType=streaming` chunk edits are accepted but not rendered (#54). A bare `typing` activity (no `streaminfo`) swallows the following reply. A silent turn is dropped after about 45 seconds between activities. A stream must be finished within two minutes (`Content stream finished due to exceeded streaming time`); informative updates do not extend that cap. | Buffer chunks locally; deliver the merged body as `streamType=final` on one informative stream (`typing` + `streamType=informative`, then `message` + `streamType=final` on the same `streamId`). Plain `send_reply` only when the stream is rejected, user-cancelled, past the two-minute cap, or for overflow after the final. Long turns may get informative keep-alive updates from a background task (#155); the answer is still the stream final, not a separate plain message. See *Streaming and reply delivery* below. |
 
 ## Streaming and reply delivery (Path B)
 
@@ -96,28 +96,25 @@ whether the conversation actually renders Bot Framework streaming:
   stuck stream can't silence the chat (#62, #83, #161).
 
 - **Copilot Chat and other non-`personal` turns** do **not** render BF
-  streaming (see the quirks row above): Bot Framework returns 2xx and
-  the gateway may even log `content_delivered=True`, yet nothing appears
-  in the client. The bridge buffers the stream-consumer's chunks for
-  that turn and emits **one** ordinary `send_reply` from
-  `on_processing_complete` (#54, #157). That single send also removed
-  the duplicated agent-name lines the old multi-activity fallback
-  produced (#55). Copilot drops a turn that stays silent for about 45
-  seconds, so a buffer that is still open at 25 seconds posts a
-  streaming informative update from a background task — not from
-  `send()`, which Hermes cancels at turn end. Later updates carry the
-  `streamId` returned by the opening 201 and stay inside the 45-second
-  gap. The sequence rotates when another interval would leave the
-  closing final outside the two-minute cap. The merged reply is
-  preceded by `streamType=final` on that `streamId`, and the reply is
-  not treated as delivered while that final has failed or been
-  skipped. An opening read or write timeout is treated as a stream
-  that may already exist, so the next update does not start another.
-  That wait does not send a bare `typing` activity, because that
-  activity swallows the reply that follows. The informative text is a
-  keep-alive (`Working on it.`), not the answer. Short turns send
-  none of this. Personal chats still
-  stream and do not use the buffer (#155).
+  `streamType=streaming` chunk edits (#54): Bot Framework returns 2xx and
+  the client stays blank. The bridge buffers the stream-consumer's chunks
+  for that turn and delivers the merged body as **`streamType=final` on
+  one informative stream** from `on_processing_complete` (#182). That path
+  uses the same `streamId` as the optional keep-alive (#155): informative
+  `typing` activities (keep-alive text, not the answer), then a final
+  `message` whose `text` is the merged reply. Plain `send_reply` is used
+  only for rejected opens, user-cancelled streams, cap expiry, and overflow
+  chunks after the final. Copilot drops a turn that stays silent for about
+  45 seconds, so a buffer that is still open at 25 seconds may post
+  informative updates from a background task — not from `send()`, which
+  Hermes cancels at turn end. Short turns open the informative sequence at
+  flush when no `streamId` exists yet. The sequence rotates when another
+  interval would leave a closing final outside the two-minute cap. An
+  opening read or write timeout is treated as a stream that may already
+  exist, so the process does not start another until the cap elapses.
+  That wait does not send a bare `typing` activity, because that activity
+  swallows the reply that follows. Personal chats still stream with
+  `streamType=streaming` and do not use the buffer (#155).
 
 > **`content_delivered` is not ground truth.** It has been observed both
 > false-but-delivered and true-but-not-rendered; validate Path B reply

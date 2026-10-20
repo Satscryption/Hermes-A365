@@ -3791,13 +3791,15 @@ class TestLifecycleCapture:
             "retry_attempts": 0,
         }
 
-        async def close_fails(chat_id: str) -> bool:
+        async def deliver_waits(
+            chat_id: str, inbound: dict[str, Any], content: str, **kwargs: Any
+        ) -> tuple[str, str | None]:
             close_entered.set()
             await release_close.wait()
-            return False
+            return ("retry", None)
 
         send_reply = AsyncMock()
-        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", close_fails)
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", deliver_waits)
         monkeypatch.setattr(a, "_send_reply_activity", send_reply)
         flush = asyncio.create_task(a._flush_turn_buffer(copilot))
         try:
@@ -7113,11 +7115,30 @@ class TestEditMessage:
         a._bf_token_cache = MagicMock()  # #33: dispatcher needs a cache to pass through
 
         if post_responses is None:
-            post_responses = MagicMock(status_code=202, text="", json=lambda: {})
-        if not isinstance(post_responses, list):
-            post_responses = [post_responses]
 
-        post_mock = AsyncMock(side_effect=post_responses)
+            async def _default_turn_buffer_post(
+                *_args: Any, **kwargs: Any
+            ) -> MagicMock:
+                activity = kwargs.get("json") or {}
+                entities = activity.get("entities") or []
+                entity = entities[0] if entities else {}
+                if (
+                    activity.get("type") == "typing"
+                    and entity.get("streamType") == "informative"
+                    and "streamId" not in entity
+                ):
+                    return MagicMock(
+                        status_code=201,
+                        text="",
+                        json=lambda: {"id": "stream-default"},
+                    )
+                return MagicMock(status_code=202, text="", json=lambda: {})
+
+            post_mock = AsyncMock(side_effect=_default_turn_buffer_post)
+        else:
+            if not isinstance(post_responses, list):
+                post_responses = [post_responses]
+            post_mock = AsyncMock(side_effect=post_responses)
         a._http_client.post = post_mock
         return post_mock
 
@@ -7920,7 +7941,17 @@ class TestEditMessage:
             "acquire_reply_token",
             AsyncMock(return_value=("bearer-test", "A")),
         )
-        post_mock.side_effect = httpx.ReadTimeout("The read operation timed out")
+        async def read_timeout_post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs.get("json") or {}
+            if activity.get("type") == "message":
+                raise httpx.ReadTimeout("The read operation timed out")
+            return MagicMock(
+                status_code=201,
+                text="",
+                json=lambda: {"id": "stream-read"},
+            )
+
+        post_mock.side_effect = read_timeout_post
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0)
         event = _StubMessageEvent(
             text="hi",
@@ -7932,7 +7963,7 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         await asyncio.sleep(0)
         await a.on_processing_complete(event, outcome="success")
-        assert post_mock.await_count == 1
+        assert post_mock.await_count == 2
         assert "conv-G-read" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -8099,9 +8130,21 @@ class TestEditMessage:
         assert post_mock.await_count == 0
         await a.on_processing_complete(event, outcome="success")
         await asyncio.sleep(0)
-        assert send_reply_mock.await_count == 1
-        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Short answer"
-        assert post_mock.await_count == 0
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["text"] == "Working on it."
+        assert opener["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "informative",
+            "streamSequence": 1,
+        }
+        assert final["type"] == "message"
+        assert final["text"] == "Short answer"
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][0]["streamId"] == "stream-default"
+        assert "streamSequence" not in final["entities"][0]
         assert task.cancelled()
         assert "conv-G-short" not in a._turn_buffers
 
@@ -8194,15 +8237,17 @@ class TestEditMessage:
         assert again.success is True
         assert len(bodies) == before
         await a.on_processing_complete(event, outcome="success")
-        assert order == ["informative", "informative", "final", "reply"]
+        assert order == ["informative", "informative", "final"]
         final = bodies[-1]
         assert final["type"] == "message"
-        assert final["text"] == "Working on it."
-        assert final["entities"] == [
-            {"type": "streaminfo", "streamId": "ka-1", "streamType": "final"}
-        ]
+        assert final["text"] == "The date is Thursday."
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamId": "ka-1",
+            "streamType": "final",
+        }
         assert "streamSequence" not in final["entities"][0]
-        assert replies == ["The date is Thursday."]
+        assert replies == []
         assert "conv-G-long" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -8373,14 +8418,13 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
         order: list[str] = []
+        stream_ids = iter(["ka-nest", "ka-outer"])
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
             order.append(str(entity["streamType"]))
-            if "streamId" not in entity:
-                return self._http_result(201, "ka-nest")
-            assert entity["streamId"] == "ka-nest"
-            assert entity["streamType"] == "final"
+            if entity["streamType"] == "informative" and "streamId" not in entity:
+                return self._http_result(201, next(stream_ids))
             return self._http_result(202)
 
         a._http_client.post = post
@@ -8411,16 +8455,16 @@ class TestEditMessage:
             chat_id="conv-G-ka-nest", content="Follow-up answer", reply_to="act-followup"
         )
         await a.on_processing_complete(follow_event, outcome="success")
-        assert order == ["informative", "final", "reply"]
-        assert replies == [("act-followup", "Follow-up answer")]
+        assert order == ["informative", "final"]
+        assert replies == []
         assert a._turn_buffers["conv-G-ka-nest"]["depth"] == 1
         assert a._turn_buffers["conv-G-ka-nest"]["keepalive"] == {}
         assert [
             segment["text"] for segment in a._turn_buffers["conv-G-ka-nest"]["segments"]
         ] == ["Outer answer"]
         await a.on_processing_complete(outer_event, outcome="success")
-        assert order == ["informative", "final", "reply", "reply"]
-        assert replies[1] == ("act-outer", "Outer answer")
+        assert order == ["informative", "final", "informative", "final"]
+        assert replies == []
         assert "conv-G-ka-nest" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -8665,9 +8709,11 @@ class TestEditMessage:
             "sequence": 1,
             "opened_mono": time.monotonic(),
         }
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0)
         await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
         assert finals["n"] == 2
-        assert replies == ["Keep me"]
+        assert replies == []
         assert "conv-G-final-retry" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -8971,6 +9017,128 @@ class TestEditMessage:
             timeout=2,
         )
         assert "conv-G-teardown-bound" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_answer_final_includes_ai_label_and_feedback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-chrome", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        a._feedback_enabled = True
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-chrome"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-chrome", content="Hello", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 0
+        opener, final = [c.kwargs["json"] for c in post_mock.await_args_list]
+        assert opener["entities"] == [
+            {"type": "streaminfo", "streamType": "informative", "streamSequence": 1}
+        ]
+        assert "channelData" not in opener
+        assert len(final["entities"]) == 2
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][1] == dict(bridge.AI_GENERATED_CONTENT_ENTITY)
+        assert final["channelData"] == dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_open_403_falls_back_to_plain_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-open-403", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+
+        async def post(*_args: Any, **_kwargs: Any) -> MagicMock:
+            return self._http_result(403, "")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-open-403"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-open-403", content="Plain please", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain please"
+        assert "conv-G-open-403" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_stopped_stream_uses_plain_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-stopped", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = AsyncMock(side_effect=AssertionError("unexpected HTTP post"))
+        self._wire_adapter(a, inbound=inbound)
+        a._http_client.post = post_mock
+        self._patch_token_mint(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-stopped"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-stopped", content="After cancel", reply_to=None)
+        a._turn_buffers["conv-G-stopped"]["keepalive"] = {
+            "stream_id": "ka-stop",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+            "stopped": True,
+        }
+        await a.on_processing_complete(event, outcome="success")
+        assert post_mock.await_count == 0
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "After cancel"
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_opener_final_respects_streaming_gap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-gap", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        gap_calls = {"n": 0}
+
+        async def gap_spy(_self: Any, chat_id: str, buf: dict[str, Any]) -> None:
+            gap_calls["n"] += 1
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_sleep_turn_buffer_stream_gap_locked",
+            gap_spy,
+        )
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-gap"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-gap", content="Gap answer", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert gap_calls["n"] == 1
 
     @pytest.mark.asyncio
     async def test_personal_chat_is_not_turn_buffered(

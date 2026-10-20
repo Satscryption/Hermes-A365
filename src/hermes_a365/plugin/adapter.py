@@ -812,12 +812,15 @@ class _KeepalivePost(NamedTuple):
     ``untracked`` is an opening request the service may already have
     turned into a stream whose id this process does not have: a 2xx
     body with no id, or a timeout after the request was sent.
+    ``timeout_after_send`` is set when a ``ReadTimeout`` or
+    ``WriteTimeout`` may mean the activity was already stored.
     """
 
     status: int | None
     stream_id: str
     detail: str
     untracked: bool
+    timeout_after_send: bool = False
 
 
 def _keepalive_rotation_due(age: float) -> bool:
@@ -1598,13 +1601,16 @@ class Agent365Adapter(BasePlatformAdapter):
         # treated as delivered and is not posted again.
         # A background keep-alive (#155) posts a BF streaming informative
         # update only if the turn is still open inside the ~45s idle
-        # window, then a ``streamType=final`` activity immediately before
-        # the merged reply. ``send`` does not await that POST. Personal
-        # chats never open this buffer.
+        # window. ``on_processing_complete`` delivers the merged reply as
+        # ``streamType=final`` on that stream (or opens one informative
+        # sequence at flush when none exists). Plain ``send_reply`` is
+        # only for rejected opens, user-cancelled streams, cap expiry,
+        # and overflow chunks after the final. ``send`` does not await
+        # those POSTs. Personal chats never open this buffer.
         # ``{"turns": [{"seq", "inbound", "validated_path", "activity_id",
         #   "open"}], "segments": [{"id", "text", "turn"}], "depth", "lock",
         #   "keepalive": {"stream_id", "sequence", "opened_mono",
-        #   "untracked", "stopped"}, "keepalive_task"}``.
+        #   "last_emit_mono", "untracked", "stopped"}, "keepalive_task"}``.
         # The id is cleared only after a final the service accepted, or a
         # 403 that says the stream is already finished or cancelled. An
         # id that could not be stored (the buffer was replaced while the
@@ -4642,17 +4648,16 @@ class Agent365Adapter(BasePlatformAdapter):
         turn" rule (custom-engine-agents doc) and gives a single
         growing bubble per Hermes segment.
 
-        #54 branch-walk correction: Copilot Chat arrives as
-        ``groupChat`` and does not visibly render BF streaming
-        activities. When ``on_processing_start`` has opened a per-turn
-        buffer for this non-personal chat, ``send`` appends a local
-        segment and returns without a network await. The merged reply
-        is posted once from ``on_processing_complete``, after Hermes
-        has cancelled the stream-consumer task. Chats with no open
-        turn buffer keep the coalesced path: a stream-consumer first
-        chunk (``reply_to`` present) buffers locally, and
-        ``edit_message(finalize=True)`` or the turn-end coalesced
-        flush emits one normal ``send_reply``.
+        #54 / #182: Copilot Chat arrives as ``groupChat``. Chunk edits
+        with ``streamType=streaming`` are not rendered there; this path
+        buffers locally and delivers the merged body as one informative
+        stream's ``streamType=final`` from ``on_processing_complete``.
+        When ``on_processing_start`` has opened a per-turn buffer,
+        ``send`` appends a local segment and returns without a network
+        await. Chats with no open turn buffer keep the coalesced path:
+        a stream-consumer first chunk (``reply_to`` present) buffers
+        locally, and ``edit_message(finalize=True)`` or the turn-end
+        coalesced flush emits one normal ``send_reply``.
 
         Suppress one-shot non-streaming sends while a stream is active;
         Copilot Chat renders interleaved progress/fallback activities
@@ -5458,14 +5463,20 @@ class Agent365Adapter(BasePlatformAdapter):
         stream = self._keepalive_state(buf)
         if stream.get("untracked") and not self._keepalive_blocks_reply(stream):
             buf["keepalive"] = {}
+            buf["skip_stream_open"] = True
 
     async def _post_informative_locked(
-        self, chat_id: str, buf: dict[str, Any], *, allow_restart: bool
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        *,
+        allow_restart: bool,
+        for_answer: bool = False,
     ) -> bool:
         """Return True when a 403 should be followed by one new sequence."""
         if self._turn_buffers.get(chat_id) is not buf:
             return False
-        if not self._turn_buffer_keepalive_needed(chat_id):
+        if not for_answer and not self._turn_buffer_keepalive_needed(chat_id):
             return False
         stream = self._keepalive_state(buf)
         if stream.get("stopped") or stream.get("untracked"):
@@ -5502,15 +5513,13 @@ class Agent365Adapter(BasePlatformAdapter):
             and new_id
             and not stream_id
         ):
-            self._remember_keepalive(
-                chat_id,
-                buf,
-                {
-                    "stream_id": new_id,
-                    "sequence": 1,
-                    "opened_mono": time.monotonic(),
-                },
-            )
+            opened_state = {
+                "stream_id": new_id,
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            }
+            self._remember_keepalive(chat_id, buf, opened_state)
+            self._touch_keepalive_emit(chat_id, buf)
             self._remember_bot_reply(new_id, conversation_id=str(chat_id))
             logger.info(
                 "agent365 turn buffer keep-alive started: chat_id=%s stream_id=%s",
@@ -5521,6 +5530,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if status is not None and 200 <= status < 300 and stream_id:
             stream["sequence"] = sequence
             self._remember_keepalive(chat_id, buf, stream)
+            self._touch_keepalive_emit(chat_id, buf)
             logger.info(
                 "agent365 turn buffer keep-alive: chat_id=%s stream_id=%s sequence=%s",
                 chat_id,
@@ -5549,6 +5559,14 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_id,
             status,
         )
+        if (
+            not stream_id
+            and not result.untracked
+            and (for_answer or status is None)
+        ):
+            failed = dict(self._keepalive_state(buf))
+            failed["open_failed"] = True
+            self._remember_keepalive(chat_id, buf, failed)
         return False
 
     async def _post_keepalive_final_locked(
@@ -5588,6 +5606,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if _keepalive_final_closed(result):
             buf["keepalive"] = {}
+            self._touch_keepalive_emit(chat_id, buf)
             logger.info(
                 "agent365 turn buffer keep-alive final: chat_id=%s stream_id=%s",
                 chat_id,
@@ -5603,6 +5622,13 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         return False
 
+    def _touch_keepalive_emit(self, chat_id: str, buf: dict[str, Any]) -> None:
+        stream = self._keepalive_state(buf)
+        if not stream:
+            return
+        stream["last_emit_mono"] = time.monotonic()
+        self._remember_keepalive(chat_id, buf, stream)
+
     async def _post_keepalive_activity(
         self,
         chat_id: str,
@@ -5612,24 +5638,32 @@ class Agent365Adapter(BasePlatformAdapter):
         sequence: int,
         final: bool,
         for_teardown: bool = False,
+        text: str | None = None,
+        message_chrome: bool = False,
     ) -> _KeepalivePost:
-        """POST one informative update or the final that closes it.
+        """POST one informative update or a stream final.
 
         The id is taken from any 2xx body that carries one, not only 201.
         An opening ``ReadTimeout`` or ``WriteTimeout`` from ``client.post``
         is ``untracked``: the service may already have created the stream.
         ``ConnectTimeout`` and ``PoolTimeout`` are not. ``for_teardown``
         still posts while the chat is retiring, so uninstall can close a
-        stream that already returned an id. The text is the keep-alive
-        phrase, never the buffered answer.
+        stream that already returned an id. Informative text defaults to
+        the keep-alive phrase. Answer finals pass the merged body and may
+        request AI-label and feedback chrome on the final only.
         """
         empty = _KeepalivePost(None, "", "", False)
         if final and not stream_id:
             return empty
-        text = _TURN_BUFFER_KEEPALIVE_TEXT.strip()
-        if not text:
+        body_text = (
+            text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT
+        ).strip()
+        if not body_text:
             return empty
-        text = text[:_INFORMATIVE_TEXT_MAX_CHARS]
+        if final and text is not None:
+            payload_text = body_text[: self.MAX_MESSAGE_LENGTH]
+        else:
+            payload_text = body_text[:_INFORMATIVE_TEXT_MAX_CHARS]
         inbound = turn.get("inbound")
         if not isinstance(inbound, dict):
             return empty
@@ -5662,15 +5696,19 @@ class Agent365Adapter(BasePlatformAdapter):
             entity["streamId"] = stream_id
         if not final:
             entity["streamSequence"] = sequence
-        activity = {
+        activity: dict[str, Any] = {
             "type": "message" if final else "typing",
-            "text": text,
+            "text": payload_text,
             "from": inbound.get("recipient") or {},
             "recipient": inbound.get("from") or {},
             "conversation": conv,
             "entities": [entity],
         }
         bridge = _import_bridge()
+        if final and message_chrome:
+            activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
+            if self._feedback_enabled:
+                activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
         validated = turn.get("validated_path")
         path = validated if isinstance(validated, str) else None
         url = _conversations_activities_url(service_url, conv_id)
@@ -5743,7 +5781,204 @@ class Agent365Adapter(BasePlatformAdapter):
         untracked = (
             not final and not stream_id and 200 <= status < 300 and not new_id
         )
-        return _KeepalivePost(status, new_id, detail, untracked)
+        return _KeepalivePost(status, new_id, detail, untracked, False)
+
+    @staticmethod
+    def _answer_final_timeout_delivered(result: _KeepalivePost) -> bool:
+        return result.timeout_after_send
+
+    @staticmethod
+    def _answer_final_requires_plain_reply(result: _KeepalivePost) -> bool:
+        if result.status is not None and 200 <= result.status < 300:
+            return False
+        if result.untracked:
+            return False
+        if Agent365Adapter._answer_final_timeout_delivered(result):
+            return False
+        if result.status == 403 and _keepalive_final_closed(result):
+            return True
+        if result.status is not None and result.status >= 400:
+            return True
+        return False
+
+    async def _sleep_turn_buffer_stream_gap_locked(
+        self, chat_id: str, buf: dict[str, Any]
+    ) -> None:
+        """Pace informative→final pairs without blocking the keep-alive task."""
+        stream = self._keepalive_state(buf)
+        last = float(stream.get("last_emit_mono") or 0.0)
+        if last <= 0.0:
+            return
+        gap = _STREAMING_MIN_GAP_SEC - (time.monotonic() - last)
+        if gap <= 0.0:
+            return
+        lock = self._turn_buffer_lock(buf)
+        if not lock.locked():
+            await asyncio.sleep(gap)
+            return
+        lock.release()
+        try:
+            await asyncio.sleep(gap)
+        finally:
+            await lock.acquire()
+
+    async def _deliver_turn_answer_locked(
+        self,
+        chat_id: str,
+        inbound: dict[str, Any],
+        content: str,
+        *,
+        validated_path: str | None,
+    ) -> tuple[str, str | None]:
+        """Deliver one merged chunk on the turn-buffer stream.
+
+        Caller holds the buffer lock. Returns ``("delivered", None)``,
+        ``("retry", None)`` when the stream id and segments should stay,
+        ``("fallback", reason)`` when the caller should plain-post, or
+        ``("blocked", None)`` while an untracked opening still blocks.
+        """
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return ("retry", None)
+        self._clear_expired_untracked(chat_id)
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return ("retry", None)
+        stream = self._keepalive_state(buf)
+        if stream.get("stopped"):
+            buf["keepalive"] = {}
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "reason=user cancelled",
+                chat_id,
+            )
+            return ("fallback", "user cancelled")
+        if stream.get("untracked") and self._keepalive_blocks_reply(stream):
+            return ("blocked", None)
+        stream_id = str(stream.get("stream_id") or "")
+        if not stream_id:
+            if stream.get("open_failed") or buf.get("skip_stream_open"):
+                buf.pop("skip_stream_open", None)
+                logger.warning(
+                    "agent365 turn buffer answer plain fallback: chat_id=%s "
+                    "reason=open rejected",
+                    chat_id,
+                )
+                return ("fallback", "open rejected")
+            await self._post_informative_locked(
+                chat_id, buf, allow_restart=False, for_answer=True
+            )
+            if self._turn_buffers.get(chat_id) is not buf:
+                return ("retry", None)
+            stream = self._keepalive_state(buf)
+            if stream.get("untracked"):
+                return ("blocked", None)
+            stream_id = str(stream.get("stream_id") or "")
+            if not stream_id:
+                logger.warning(
+                    "agent365 turn buffer answer plain fallback: chat_id=%s "
+                    "reason=open rejected",
+                    chat_id,
+                )
+                return ("fallback", "open rejected")
+        await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return ("retry", None)
+        stream = self._keepalive_state(buf)
+        if stream.get("stopped"):
+            buf["keepalive"] = {}
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "reason=user cancelled",
+                chat_id,
+            )
+            return ("fallback", "user cancelled")
+        stream_id = str(stream.get("stream_id") or "")
+        if not stream_id:
+            if stream.get("untracked") and self._keepalive_blocks_reply(stream):
+                return ("blocked", None)
+            return ("retry", None)
+        turn = self._keepalive_turn(buf)
+        if turn is None:
+            return ("retry", None)
+        result = await self._post_keepalive_activity(
+            chat_id,
+            turn,
+            stream_id=stream_id,
+            sequence=0,
+            final=True,
+            text=content,
+            message_chrome=True,
+        )
+        if (
+            self._turn_buffers.get(chat_id) is buf
+            and not self._answer_final_timeout_delivered(result)
+            and not (
+                result.status is not None and 200 <= result.status < 300
+            )
+            and not self._answer_final_requires_plain_reply(result)
+        ):
+            result = await self._post_keepalive_activity(
+                chat_id,
+                turn,
+                stream_id=stream_id,
+                sequence=0,
+                final=True,
+                text=content,
+                message_chrome=True,
+            )
+        if self._turn_buffers.get(chat_id) is not buf:
+            return ("retry", None)
+        self._touch_keepalive_emit(chat_id, buf)
+        status = result.status
+        if status is not None and 200 <= status < 300:
+            activity_id = result.stream_id or stream_id
+            if activity_id:
+                self._remember_bot_reply(
+                    activity_id, conversation_id=str(chat_id)
+                )
+            buf["keepalive"] = {}
+            logger.info(
+                "agent365 turn buffer answer final: chat_id=%s stream_id=%s "
+                "chars=%s",
+                chat_id,
+                stream_id,
+                len(content),
+            )
+            return ("delivered", activity_id or None)
+        if self._answer_final_timeout_delivered(result):
+            buf["keepalive"] = {}
+            logger.warning(
+                "agent365 turn buffer treating timed-out answer final as "
+                "delivered: chat_id=%s stream_id=%s",
+                chat_id,
+                stream_id,
+            )
+            return ("delivered", None)
+        if self._answer_final_requires_plain_reply(result):
+            buf["keepalive"] = {}
+            reason = "stream already closed"
+            if status == 403:
+                reason = "stream already closed"
+            elif status is not None and status >= 400:
+                reason = "open rejected"
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "status=%s reason=%s",
+                chat_id,
+                status,
+                reason,
+            )
+            return ("fallback", reason)
+        logger.warning(
+            "agent365 turn buffer answer final failed: chat_id=%s "
+            "stream_id=%s status=%s",
+            chat_id,
+            stream_id,
+            status,
+        )
+        return ("retry", None)
 
     @staticmethod
     def _keepalive_timeout_after_send(exc: BaseException) -> bool:
@@ -5761,13 +5996,14 @@ class Agent365Adapter(BasePlatformAdapter):
         self, chat_id: str, exc: BaseException, *, opening: bool
     ) -> _KeepalivePost:
         message = str(exc)
-        untracked = opening and self._keepalive_timeout_after_send(exc)
+        timeout_after_send = self._keepalive_timeout_after_send(exc)
+        untracked = opening and timeout_after_send
         logger.warning(
             "agent365 turn buffer keep-alive POST failed: chat_id=%s error=%s",
             chat_id,
             exc,
         )
-        return _KeepalivePost(None, "", message, untracked)
+        return _KeepalivePost(None, "", message, untracked, timeout_after_send)
 
     async def _deferred_turn_buffer_retry(self, chat_id: str) -> None:
         try:
@@ -6055,23 +6291,76 @@ class Agent365Adapter(BasePlatformAdapter):
                     link_alone = True
             validated_path = turn.get("validated_path")
             path = validated_path if isinstance(validated_path, str) else None
+            first_chunk_on_stream = True
+            stream_final_activity_id: str | None = None
             for chunk_segments, content in chunks:
                 if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
                     chat_id
                 ):
                     return
-                # Close the informative sequence before the visible reply.
-                # An open stream is what made a later message disappear
-                # after a bare typing activity (#154). A final that did
-                # not close it leaves the id and the segments in place.
-                closed = await self._close_turn_buffer_keepalive_locked(chat_id)
-                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
-                    chat_id
-                ):
-                    return
-                if not closed:
-                    self._schedule_turn_buffer_retry(chat_id)
-                    return
+                if first_chunk_on_stream:
+                    outcome, stream_final_activity_id = (
+                        await self._deliver_turn_answer_locked(
+                            chat_id,
+                            inbound,
+                            content,
+                            validated_path=path,
+                        )
+                    )
+                    if outcome == "blocked":
+                        if not self._turn_reply_blocked(chat_id):
+                            self._schedule_turn_buffer_retry(chat_id)
+                        return
+                    if outcome == "retry":
+                        if not self._turn_reply_blocked(chat_id):
+                            self._schedule_turn_buffer_retry(chat_id)
+                        return
+                    if outcome == "fallback":
+                        result = await self._send_reply_activity(
+                            inbound=inbound,
+                            content=content,
+                            log_context="turn buffer",
+                            validated_path=path,
+                        )
+                        if not result.success:
+                            error = str(result.error or "")
+                            live = self._turn_buffers.get(chat_id)
+                            if live is None:
+                                return
+                            buf = live
+                            if _POST_SEND_TIMEOUT_MARKER in error.casefold():
+                                logger.warning(
+                                    "agent365 turn buffer treating timed-out post as "
+                                    "delivered: chat_id=%s error=%s",
+                                    chat_id,
+                                    error,
+                                )
+                                self._remove_turn_segments(
+                                    buf,
+                                    [
+                                        str(segment.get("id") or "")
+                                        for segment in chunk_segments
+                                    ],
+                                )
+                                first_chunk_on_stream = False
+                                continue
+                            logger.warning(
+                                "agent365 turn buffer flush failed: chat_id=%s error=%s",
+                                chat_id,
+                                error,
+                            )
+                            self._schedule_turn_buffer_retry(chat_id)
+                            return
+                    live = self._turn_buffers.get(chat_id)
+                    if live is None:
+                        return
+                    buf = live
+                    self._remove_turn_segments(
+                        buf,
+                        [str(segment.get("id") or "") for segment in chunk_segments],
+                    )
+                    first_chunk_on_stream = False
+                    continue
                 result = await self._send_reply_activity(
                     inbound=inbound,
                     content=content,
@@ -6085,9 +6374,6 @@ class Agent365Adapter(BasePlatformAdapter):
                         return
                     buf = live
                     if _POST_SEND_TIMEOUT_MARKER in error.casefold():
-                        # The request may already be stored. Drop the chunk
-                        # so a deferred retry or the next complete cannot
-                        # post a second bubble.
                         logger.warning(
                             "agent365 turn buffer treating timed-out post as "
                             "delivered: chat_id=%s error=%s",
