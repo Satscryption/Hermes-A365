@@ -5384,18 +5384,33 @@ class Agent365Adapter(BasePlatformAdapter):
             task.cancel()
             task.add_done_callback(_consume_turn_buffer_retry_result)
 
-    def _schedule_turn_buffer_retry(self, chat_id: str) -> None:
-        """Retry a finished turn later, once, while nothing else is open.
+    def _delivery_record_for_key(
+        self, buf: dict[str, Any], turn_key: str
+    ) -> dict[str, Any] | None:
+        from hermes_a365.plugin.turn_buffer_answer_delivery import delivery_map
 
-        The flush that just failed has already returned the segment ids to
-        the buffer. Scheduling here is not another attempt inside that
-        flush. An open outer turn must keep its ``turnbuf:`` ids, so a
-        nested complete that fails does not start this task.
-        """
+        record = delivery_map(buf).get(turn_key)
+        return record if isinstance(record, dict) else None
+
+    def _schedule_turn_buffer_retry(
+        self, chat_id: str, turn_key: str | None = None
+    ) -> None:
+        """Schedule a deferred flush for one turn's delivery record."""
         buf = self._turn_buffers.get(chat_id)
         if buf is None or self._disconnecting:
             return
+        if int(buf.get("depth") or 0) != 0:
+            return
         if not self._turn_buffer_retry_pending(buf):
+            return
+        if turn_key is None:
+            turn_key = str(buf.get("retry_turn_key") or "")
+        if not turn_key:
+            return
+        record = self._delivery_record_for_key(buf, turn_key)
+        if record is None:
+            return
+        if record.get("force_plain_exhausted"):
             return
         current = asyncio.current_task()
         task = buf.get("retry_task")
@@ -5405,12 +5420,10 @@ class Agent365Adapter(BasePlatformAdapter):
             and task is not current
         ):
             return
-        attempts = int(buf.get("retry_attempts") or 0)
-        if attempts >= _TURN_BUFFER_DEFERRED_RETRY_LIMIT:
-            if buf.get("force_plain_exhausted"):
-                return
-            plain_attempts = int(buf.get("plain_fallback_attempts") or 0)
-            if buf.get("force_plain_latched") and (
+        deferrals = int(record.get("deferral_count") or 0)
+        if deferrals >= _TURN_BUFFER_DEFERRED_RETRY_LIMIT:
+            plain_attempts = int(record.get("plain_attempts") or 0)
+            if record.get("force_plain") and (
                 plain_attempts >= _TURN_BUFFER_FORCE_PLAIN_MAX_ATTEMPTS
             ):
                 logger.error(
@@ -5419,36 +5432,31 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id,
                     plain_attempts,
                 )
-                buf["force_plain_exhausted"] = True
-                buf.pop("force_plain_answer", None)
-                buf["keepalive"] = {}
-                if int(buf.get("depth") or 0) == 0 and not buf.get("segments"):
-                    drop_task = asyncio.create_task(self._drop_turn_buffer(chat_id))
-                    drop_task.add_done_callback(_consume_turn_buffer_retry_result)
+                record["force_plain_exhausted"] = True
+                record["plain_due"] = False
                 return
-            if not buf.get("force_plain_latched"):
+            if not record.get("force_plain"):
                 logger.warning(
                     "agent365 turn buffer deferred retry stopped: "
-                    "chat_id=%s attempts=%s",
+                    "chat_id=%s deferrals=%s turn=%s",
                     chat_id,
-                    attempts,
+                    deferrals,
+                    turn_key,
                 )
-                buf["force_plain_latched"] = True
-                buf["plain_fallback_attempts"] = 0
+                record["force_plain"] = True
+                record["state"] = "FORCED_PLAIN"
+                record["plain_attempts"] = 0
             if not buf.get("segments"):
                 return
-            buf["force_plain_answer"] = True
-            if (
-                isinstance(task, asyncio.Task)
-                and not task.done()
-                and task is not current
-            ):
-                return
+            record["plain_due"] = True
+            buf["retry_turn_key"] = turn_key
             buf["retry_task"] = asyncio.create_task(
                 self._deferred_turn_buffer_retry(chat_id)
             )
             return
-        buf["retry_attempts"] = attempts + 1
+        record["deferral_count"] = deferrals + 1
+        record["state"] = "DEFERRED"
+        buf["retry_turn_key"] = turn_key
         buf["retry_task"] = asyncio.create_task(
             self._deferred_turn_buffer_retry(chat_id)
         )
@@ -5638,6 +5646,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 stream_id
                 and isinstance(opened, (int, float))
                 and _keepalive_rotation_due(time.monotonic() - float(opened))
+                and not self._buffer_has_kept_answer_segments(buf)
             ):
                 rotated = await self._post_keepalive_final_locked(chat_id, buf)
         if rotated and _STREAMING_MIN_GAP_SEC > 0:
@@ -5842,7 +5851,10 @@ class Agent365Adapter(BasePlatformAdapter):
             self._remember_keepalive(chat_id, buf, stream)
             return False
         if _keepalive_final_closed(result):
-            buf["keepalive"] = {}
+            stream = self._keepalive_state(buf)
+            stream["closed_by"] = "keepalive"
+            stream["stream_id"] = ""
+            buf["keepalive"] = stream
             self._touch_keepalive_emit(chat_id, buf)
             logger.info(
                 "agent365 turn buffer keep-alive final: chat_id=%s stream_id=%s",
@@ -6043,45 +6055,532 @@ class Agent365Adapter(BasePlatformAdapter):
             status, new_id, detail, untracked, False, retry_after_sec
         )
 
-    @staticmethod
-    def _answer_delivery_state(buf: dict[str, Any]) -> dict[str, bool]:
-        state = buf.get("answer_delivery")
-        if not isinstance(state, dict):
-            state = {"may_have_landed": False, "had_landed": False}
-            buf["answer_delivery"] = state
-        return state
-
-    @classmethod
-    def _record_answer_may_have_landed(cls, buf: dict[str, Any]) -> None:
-        delivery = cls._answer_delivery_state(buf)
-        delivery["may_have_landed"] = True
-        buf["final_may_have_landed"] = True
-
-    @classmethod
-    def _record_answer_had_landed(cls, buf: dict[str, Any]) -> None:
-        delivery = cls._answer_delivery_state(buf)
-        delivery["had_landed"] = True
-
-    @classmethod
-    def _answer_had_landed_before(cls, buf: dict[str, Any]) -> bool:
-        delivery = cls._answer_delivery_state(buf)
-        return bool(delivery.get("had_landed") or delivery.get("may_have_landed"))
 
     @staticmethod
-    def _reset_turn_answer_delivery_state(buf: dict[str, Any]) -> None:
-        """Fresh delivery state when a new answer starts with no segments."""
-        buf.pop("answer_delivery", None)
-        buf.pop("final_may_have_landed", None)
-        buf.pop("force_plain_latched", None)
-        buf.pop("force_plain_exhausted", None)
-        buf.pop("plain_fallback_attempts", None)
-        buf.pop("force_plain_answer", None)
-        buf["retry_attempts"] = 0
+    def _turn_delivery_key(turn: dict[str, Any]) -> str:
+        from hermes_a365.plugin.turn_buffer_answer_delivery import turn_delivery_key
 
-    @classmethod
-    def _clear_answer_delivery_if_unpending(cls, buf: dict[str, Any]) -> None:
-        if not buf.get("segments"):
-            cls._reset_turn_answer_delivery_state(buf)
+        return turn_delivery_key(turn)
+
+    def _delivery_record(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> dict[str, Any]:
+        from hermes_a365.plugin.turn_buffer_answer_delivery import (
+            get_delivery_record,
+            refresh_segment_ids,
+        )
+
+        record = get_delivery_record(buf, turn)
+        refresh_segment_ids(record, buf)
+        return record
+
+    @staticmethod
+    def _purge_turn_delivery_records(buf: dict[str, Any]) -> None:
+        from hermes_a365.plugin.turn_buffer_answer_delivery import purge_done_records
+
+        purge_done_records(buf)
+
+    @staticmethod
+    def _buffer_has_kept_answer_segments(buf: dict[str, Any]) -> bool:
+        for segment in buf.get("segments") or []:
+            text = str(segment.get("text") or "")
+            if text and not _is_hermes_tool_progress_segment(text):
+                return True
+        return False
+
+    def _keepalive_stream(self, buf: dict[str, Any]) -> dict[str, Any]:
+        stream = self._keepalive_state(buf)
+        stream.setdefault("closed_by", "")
+        return stream
+
+    def _answer_uncertain_for_turn(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        record: dict[str, Any],
+        *,
+        stream_id: str,
+        context: str,
+        chunk_segment_ids: list[str],
+    ) -> tuple[str, str | None]:
+        stream = self._keepalive_stream(buf)
+        logger.warning(
+            "agent365 turn buffer answer delivery uncertain: chat_id=%s "
+            "stream_id=%s context=%s; not plain-posting a duplicate",
+            chat_id,
+            stream_id,
+            context,
+        )
+        record["state"] = "DONE"
+        record["plain_due"] = False
+        if not stream.get("closed_by"):
+            stream["closed_by"] = f"turn:{record['turn_key']}"
+        stream["stream_id"] = ""
+        buf["keepalive"] = stream
+        self._remove_turn_segments(buf, chunk_segment_ids)
+        self._purge_turn_delivery_records(buf)
+        return ("uncertain", None)
+
+    def _apply_user_cancel(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        record: dict[str, Any],
+        *,
+        chunk_segment_ids: list[str],
+    ) -> tuple[str, str | None]:
+        stream = self._keepalive_stream(buf)
+        stream_id = str(stream.get("stream_id") or "")
+        if record.get("may_have_landed"):
+            return self._answer_uncertain_for_turn(
+                chat_id,
+                buf,
+                turn,
+                record,
+                stream_id=stream_id,
+                context="user cancelled",
+                chunk_segment_ids=chunk_segment_ids,
+            )
+        if record.get("had_landed"):
+            record["state"] = "DONE"
+            self._purge_turn_delivery_records(buf)
+            return ("delivered", None)
+        stream["stream_id"] = ""
+        if not stream.get("closed_by"):
+            stream["closed_by"] = "turn:other"
+        buf["keepalive"] = stream
+        logger.warning(
+            "agent365 turn buffer answer plain fallback: chat_id=%s "
+            "reason=user cancelled",
+            chat_id,
+        )
+        return ("fallback", "user cancelled")
+
+    def _answer_deliver_pre_post(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        record: dict[str, Any],
+        *,
+        chunk_segment_ids: list[str],
+    ) -> tuple[str, str | None] | None:
+        from hermes_a365.plugin.turn_buffer_answer_delivery import (
+            closed_by_turn_key,
+        )
+
+        stream = self._keepalive_stream(buf)
+        stream_id = str(stream.get("stream_id") or "")
+        closed_by = str(stream.get("closed_by") or "")
+        turn_key = str(record.get("turn_key") or "")
+
+        if record.get("force_plain_exhausted"):
+            return ("retry", None)
+        if record.get("plain_due"):
+            if record.get("may_have_landed"):
+                return self._answer_uncertain_for_turn(
+                    chat_id,
+                    buf,
+                    turn,
+                    record,
+                    stream_id=stream_id,
+                    context="forced plain after stream retries",
+                    chunk_segment_ids=chunk_segment_ids,
+                )
+            if stream_id and (
+                stream_id == record.get("bound_stream_id")
+                or closed_by == f"turn:{turn_key}"
+            ):
+                stream["stream_id"] = ""
+            buf["keepalive"] = stream
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "reason=stream retry exhausted",
+                chat_id,
+            )
+            return ("fallback", "stream retry exhausted")
+        if stream.get("stopped"):
+            return self._apply_user_cancel(
+                chat_id, buf, turn, record, chunk_segment_ids=chunk_segment_ids
+            )
+        other_key = closed_by_turn_key(closed_by)
+        if other_key and other_key != turn_key:
+            stream["stream_id"] = ""
+            buf["keepalive"] = stream
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "status=403 reason=stream already closed",
+                chat_id,
+            )
+            return ("fallback", "stream already closed")
+        if closed_by == "turn:other":
+            stream["stream_id"] = ""
+            buf["keepalive"] = stream
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "status=403 reason=stream already closed",
+                chat_id,
+            )
+            return ("fallback", "stream already closed")
+        if stream.get("untracked") and self._keepalive_blocks_reply(stream):
+            return ("blocked", None)
+        if not stream_id and (
+            stream.get("open_failed") or buf.get("skip_stream_open")
+        ):
+            buf.pop("skip_stream_open", None)
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "reason=open rejected",
+                chat_id,
+            )
+            return ("fallback", "open rejected")
+        return None
+
+    async def _post_answer_final(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        record: dict[str, Any],
+        *,
+        stream_id: str,
+        content: str,
+        count_attempt: bool,
+    ) -> _KeepalivePost:
+        if count_attempt:
+            record["answer_final_attempts"] = int(
+                record.get("answer_final_attempts") or 0
+            ) + 1
+            record["state"] = "POSTING"
+            record["bound_stream_id"] = stream_id
+        return await self._post_keepalive_activity(
+            chat_id,
+            turn,
+            stream_id=stream_id,
+            sequence=0,
+            final=True,
+            text=content,
+            message_chrome=True,
+        )
+
+    def _finish_delivered(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        record: dict[str, Any],
+        *,
+        stream_id: str,
+        content: str,
+        activity_id: str | None,
+        chunk_segment_ids: list[str],
+        log_suffix: str = "",
+    ) -> tuple[str, str | None]:
+        stream = self._keepalive_stream(buf)
+        stream["closed_by"] = f"turn:{record['turn_key']}"
+        stream["stream_id"] = ""
+        buf["keepalive"] = stream
+        self._touch_keepalive_emit(chat_id, buf)
+        if activity_id:
+            self._remember_bot_reply(activity_id, conversation_id=str(chat_id))
+        record["state"] = "DONE"
+        self._remove_turn_segments(buf, chunk_segment_ids)
+        self._purge_turn_delivery_records(buf)
+        msg = (
+            f"agent365 turn buffer answer final: chat_id={chat_id} "
+            f"stream_id={stream_id} chars={len(content)}"
+        )
+        if log_suffix:
+            msg += f" ({log_suffix})"
+        logger.info(msg)
+        return ("delivered", activity_id)
+
+    async def _deliver_turn_answer_locked(
+        self,
+        chat_id: str,
+        turn: dict[str, Any],
+        content: str,
+        chunk_segment_ids: list[str],
+    ) -> tuple[str, str | None]:
+        from hermes_a365.plugin.turn_buffer_answer_delivery import (
+            landing_bits,
+            set_had_landed,
+            set_may_have_landed,
+            user_cancel_phrase,
+        )
+
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return ("retry", None)
+        self._clear_expired_untracked(chat_id)
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return ("retry", None)
+        record = self._delivery_record(buf, turn)
+        record["answer_final_attempts"] = 0
+        record["not_sent_probes_left"] = 1
+        record["may_have_landed_probes_left"] = 1
+
+        early = self._answer_deliver_pre_post(
+            chat_id,
+            buf,
+            turn,
+            record,
+            chunk_segment_ids=chunk_segment_ids,
+        )
+        if early is not None:
+            return early
+
+        stream = self._keepalive_stream(buf)
+        stream_id = str(stream.get("stream_id") or "")
+        if not stream_id:
+            await self._post_informative_locked(
+                chat_id, buf, allow_restart=False, for_answer=True
+            )
+            if self._turn_buffers.get(chat_id) is not buf:
+                return ("retry", None)
+            stream = self._keepalive_stream(buf)
+            if stream.get("untracked"):
+                return ("blocked", None)
+            stream_id = str(stream.get("stream_id") or "")
+            if not stream_id:
+                logger.warning(
+                    "agent365 turn buffer answer plain fallback: chat_id=%s "
+                    "reason=open rejected",
+                    chat_id,
+                )
+                return ("fallback", "open rejected")
+            early = self._answer_deliver_pre_post(
+                chat_id,
+                buf,
+                turn,
+                record,
+                chunk_segment_ids=chunk_segment_ids,
+            )
+            if early is not None:
+                return early
+            stream_id = str(stream.get("stream_id") or "")
+
+        buf["answer_final_in_progress"] = True
+        try:
+            await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
+            buf = self._turn_buffers.get(chat_id)
+            if not isinstance(buf, dict):
+                return ("retry", None)
+            record = self._delivery_record(buf, turn)
+            stream = self._keepalive_stream(buf)
+            stream_id = str(stream.get("stream_id") or "")
+            early = self._answer_deliver_pre_post(
+                chat_id,
+                buf,
+                turn,
+                record,
+                chunk_segment_ids=chunk_segment_ids,
+            )
+            if early is not None:
+                return early
+            if not stream_id:
+                if stream.get("untracked") and self._keepalive_blocks_reply(
+                    stream
+                ):
+                    return ("blocked", None)
+                return ("retry", None)
+
+            result = await self._post_answer_final(
+                chat_id,
+                buf,
+                turn,
+                record,
+                stream_id=stream_id,
+                content=content,
+                count_attempt=True,
+            )
+            while self._turn_buffers.get(chat_id) is buf:
+                classified = _classify_answer_final_post(result)
+                if classified == _ANSWER_FINAL_NOT_SENT:
+                    if (
+                        result.status is None
+                        and int(record.get("not_sent_probes_left") or 0) > 0
+                    ):
+                        record["not_sent_probes_left"] = (
+                            int(record["not_sent_probes_left"]) - 1
+                        )
+                        result = await self._post_answer_final(
+                            chat_id,
+                            buf,
+                            turn,
+                            record,
+                            stream_id=stream_id,
+                            content=content,
+                            count_attempt=False,
+                        )
+                        continue
+                    record["state"] = "DEFERRED"
+                    return ("retry", None)
+                if classified == _ANSWER_FINAL_MAY_HAVE_LANDED:
+                    set_may_have_landed(record)
+                    if result.timeout_after_send:
+                        return self._finish_delivered(
+                            chat_id,
+                            buf,
+                            turn,
+                            record,
+                            stream_id=stream_id,
+                            content=content,
+                            activity_id=None,
+                            chunk_segment_ids=chunk_segment_ids,
+                            log_suffix="timeout",
+                        )
+                    if int(record.get("may_have_landed_probes_left") or 0) > 0:
+                        record["may_have_landed_probes_left"] = (
+                            int(record["may_have_landed_probes_left"]) - 1
+                        )
+                        record["state"] = "MAY_HAVE_LANDED"
+                        result = await self._post_answer_final(
+                            chat_id,
+                            buf,
+                            turn,
+                            record,
+                            stream_id=stream_id,
+                            content=content,
+                            count_attempt=False,
+                        )
+                        continue
+                    record["state"] = "DEFERRED"
+                    return ("retry", None)
+                if classified == _ANSWER_FINAL_DELIVERED:
+                    set_had_landed(record)
+                    self._touch_keepalive_emit(chat_id, buf)
+                    activity_id = result.stream_id or stream_id
+                    return self._finish_delivered(
+                        chat_id,
+                        buf,
+                        turn,
+                        record,
+                        stream_id=stream_id,
+                        content=content,
+                        activity_id=activity_id or None,
+                        chunk_segment_ids=chunk_segment_ids,
+                    )
+                if classified == _ANSWER_FINAL_ALREADY_COMPLETED:
+                    if landing_bits(record):
+                        return self._finish_delivered(
+                            chat_id,
+                            buf,
+                            turn,
+                            record,
+                            stream_id=stream_id,
+                            content=content,
+                            activity_id=None,
+                            chunk_segment_ids=chunk_segment_ids,
+                            log_suffix="already completed",
+                        )
+                    stream = self._keepalive_stream(buf)
+                    stream["stream_id"] = ""
+                    if not stream.get("closed_by"):
+                        stream["closed_by"] = "turn:other"
+                    buf["keepalive"] = stream
+                    logger.warning(
+                        "agent365 turn buffer answer plain fallback: chat_id=%s "
+                        "status=403 reason=stream already closed",
+                        chat_id,
+                    )
+                    return ("fallback", "stream already closed")
+                if classified == _ANSWER_FINAL_REJECTED_TERMINAL:
+                    if record.get("may_have_landed"):
+                        return self._answer_uncertain_for_turn(
+                            chat_id,
+                            buf,
+                            turn,
+                            record,
+                            stream_id=stream_id,
+                            context="terminal stream response",
+                            chunk_segment_ids=chunk_segment_ids,
+                        )
+                    stream = self._keepalive_stream(buf)
+                    stream["stream_id"] = ""
+                    if not stream.get("closed_by"):
+                        stream["closed_by"] = "turn:other"
+                    buf["keepalive"] = stream
+                    reason = (
+                        "user cancelled"
+                        if user_cancel_phrase(result.detail)
+                        else "stream already closed"
+                    )
+                    logger.warning(
+                        "agent365 turn buffer answer plain fallback: chat_id=%s "
+                        "status=%s reason=%s",
+                        chat_id,
+                        result.status,
+                        reason,
+                    )
+                    return ("fallback", reason)
+                if classified == _ANSWER_FINAL_DEFER:
+                    record["state"] = "DEFERRED"
+                    return ("retry", None)
+                if classified == _ANSWER_FINAL_RETRYABLE:
+                    attempts = int(record.get("answer_final_attempts") or 0)
+                    cap_left = _answer_final_cap_remaining_sec(stream)
+                    delay = result.retry_after_sec
+                    if delay <= 0.0:
+                        delay = min(
+                            2.0 ** attempts,
+                            _ANSWER_FINAL_RETRY_AFTER_CAP_SEC,
+                        )
+                    delay = _cap_answer_final_retry_delay(stream, delay)
+                    if (
+                        attempts < _ANSWER_FINAL_MAX_ATTEMPTS
+                        and cap_left > 0.0
+                        and delay > 0.0
+                    ):
+                        await self._sleep_turn_buffer_locked(
+                            chat_id, buf, delay
+                        )
+                        if self._turn_buffers.get(chat_id) is not buf:
+                            return ("retry", None)
+                        stream = self._keepalive_stream(buf)
+                        stream_id = str(stream.get("stream_id") or "")
+                        if not stream_id:
+                            return ("retry", None)
+                        result = await self._post_answer_final(
+                            chat_id,
+                            buf,
+                            turn,
+                            record,
+                            stream_id=stream_id,
+                            content=content,
+                            count_attempt=True,
+                        )
+                        continue
+                    if record.get("may_have_landed"):
+                        return self._answer_uncertain_for_turn(
+                            chat_id,
+                            buf,
+                            turn,
+                            record,
+                            stream_id=stream_id,
+                            context="stream retry exhausted",
+                            chunk_segment_ids=chunk_segment_ids,
+                        )
+                    stream = self._keepalive_stream(buf)
+                    stream["stream_id"] = ""
+                    buf["keepalive"] = stream
+                    logger.warning(
+                        "agent365 turn buffer answer plain fallback: chat_id=%s "
+                        "status=%s reason=stream retry exhausted",
+                        chat_id,
+                        result.status,
+                    )
+                    return ("fallback", "stream retry exhausted")
+                record["state"] = "DEFERRED"
+                return ("retry", None)
+            return ("retry", None)
+        finally:
+            buf = self._turn_buffers.get(chat_id)
+            if isinstance(buf, dict):
+                buf.pop("answer_final_in_progress", None)
 
     async def _sleep_turn_buffer_stream_gap_locked(
         self, chat_id: str, buf: dict[str, Any]
@@ -6119,299 +6618,6 @@ class Agent365Adapter(BasePlatformAdapter):
             await asyncio.sleep(delay)
         finally:
             await lock.acquire()
-
-    async def _deliver_turn_answer_locked(
-        self,
-        chat_id: str,
-        content: str,
-    ) -> tuple[str, str | None]:
-        """Deliver one merged chunk on the turn-buffer stream.
-
-        Caller holds the buffer lock. Returns ``("delivered", None)``,
-        ``("retry", None)`` when the stream id and segments should stay,
-        ``("fallback", reason)`` when the caller should plain-post, or
-        ``("blocked", None)`` while an untracked opening still blocks.
-        """
-        buf = self._turn_buffers.get(chat_id)
-        if not isinstance(buf, dict):
-            return ("retry", None)
-        self._clear_expired_untracked(chat_id)
-        buf = self._turn_buffers.get(chat_id)
-        if not isinstance(buf, dict):
-            return ("retry", None)
-        stream = self._keepalive_state(buf)
-        stream_id = str(stream.get("stream_id") or "")
-        if buf.pop("force_plain_answer", None):
-            if self._plain_answer_blocked(buf):
-                return self._answer_uncertain_delivery(
-                    chat_id,
-                    buf,
-                    stream_id=stream_id,
-                    context="forced plain after stream retries",
-                )
-            buf["keepalive"] = {}
-            logger.warning(
-                "agent365 turn buffer answer plain fallback: chat_id=%s "
-                "reason=stream retry exhausted",
-                chat_id,
-            )
-            return ("fallback", "stream retry exhausted")
-        if stream.get("stopped"):
-            buf["keepalive"] = {}
-            logger.warning(
-                "agent365 turn buffer answer plain fallback: chat_id=%s "
-                "reason=user cancelled",
-                chat_id,
-            )
-            return ("fallback", "user cancelled")
-        if stream.get("untracked") and self._keepalive_blocks_reply(stream):
-            return ("blocked", None)
-        if not stream_id:
-            if stream.get("open_failed") or buf.get("skip_stream_open"):
-                buf.pop("skip_stream_open", None)
-                logger.warning(
-                    "agent365 turn buffer answer plain fallback: chat_id=%s "
-                    "reason=open rejected",
-                    chat_id,
-                )
-                return ("fallback", "open rejected")
-            await self._post_informative_locked(
-                chat_id, buf, allow_restart=False, for_answer=True
-            )
-            if self._turn_buffers.get(chat_id) is not buf:
-                return ("retry", None)
-            stream = self._keepalive_state(buf)
-            if stream.get("untracked"):
-                return ("blocked", None)
-            stream_id = str(stream.get("stream_id") or "")
-            if not stream_id:
-                logger.warning(
-                    "agent365 turn buffer answer plain fallback: chat_id=%s "
-                    "reason=open rejected",
-                    chat_id,
-                )
-                return ("fallback", "open rejected")
-        buf["answer_final_in_progress"] = True
-        try:
-            await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
-            buf = self._turn_buffers.get(chat_id)
-            if not isinstance(buf, dict):
-                return ("retry", None)
-            stream = self._keepalive_state(buf)
-            if stream.get("stopped"):
-                buf["keepalive"] = {}
-                logger.warning(
-                    "agent365 turn buffer answer plain fallback: chat_id=%s "
-                    "reason=user cancelled",
-                    chat_id,
-                )
-                return ("fallback", "user cancelled")
-            stream_id = str(stream.get("stream_id") or "")
-            if not stream_id:
-                if stream.get("untracked") and self._keepalive_blocks_reply(
-                    stream
-                ):
-                    return ("blocked", None)
-                return ("retry", None)
-            turn = self._keepalive_turn(buf)
-            if turn is None:
-                return ("retry", None)
-            turn_had_landed = self._answer_had_landed_before(buf)
-            not_sent_probe = True
-            may_have_landed_immediate_probe = True
-            result = await self._post_keepalive_activity(
-                chat_id,
-                turn,
-                stream_id=stream_id,
-                sequence=0,
-                final=True,
-                text=content,
-                message_chrome=True,
-            )
-            attempt = 1
-            while self._turn_buffers.get(chat_id) is buf:
-                classified = _classify_answer_final_post(result)
-                if classified == _ANSWER_FINAL_MAY_HAVE_LANDED:
-                    self._record_answer_may_have_landed(buf)
-                    self._record_answer_had_landed(buf)
-                    turn_had_landed = True
-                    if result.timeout_after_send:
-                        break
-                    if may_have_landed_immediate_probe:
-                        may_have_landed_immediate_probe = False
-                        result = await self._post_keepalive_activity(
-                            chat_id,
-                            turn,
-                            stream_id=stream_id,
-                            sequence=0,
-                            final=True,
-                            text=content,
-                            message_chrome=True,
-                        )
-                        continue
-                    break
-                if classified == _ANSWER_FINAL_DELIVERED:
-                    self._record_answer_had_landed(buf)
-                    turn_had_landed = True
-                    self._touch_keepalive_emit(chat_id, buf)
-                    activity_id = result.stream_id or stream_id
-                    if activity_id:
-                        self._remember_bot_reply(
-                            activity_id, conversation_id=str(chat_id)
-                        )
-                    buf["keepalive"] = {}
-                    logger.info(
-                        "agent365 turn buffer answer final: chat_id=%s stream_id=%s "
-                        "chars=%s",
-                        chat_id,
-                        stream_id,
-                        len(content),
-                    )
-                    return ("delivered", activity_id or None)
-                elif classified == _ANSWER_FINAL_ALREADY_COMPLETED:
-                    if turn_had_landed or self._answer_had_landed_before(buf):
-                        self._touch_keepalive_emit(chat_id, buf)
-                        buf["keepalive"] = {}
-                        logger.info(
-                            "agent365 turn buffer answer final: chat_id=%s "
-                            "stream_id=%s chars=%s (already completed)",
-                            chat_id,
-                            stream_id,
-                            len(content),
-                        )
-                        return ("delivered", None)
-                    buf["keepalive"] = {}
-                    logger.warning(
-                        "agent365 turn buffer answer plain fallback: chat_id=%s "
-                        "status=403 reason=stream already closed",
-                        chat_id,
-                    )
-                    return ("fallback", "stream already closed")
-                elif classified == _ANSWER_FINAL_REJECTED_TERMINAL:
-                    if self._plain_answer_blocked(buf):
-                        return self._answer_uncertain_delivery(
-                            chat_id,
-                            buf,
-                            stream_id=stream_id,
-                            context="terminal stream response",
-                        )
-                    buf["keepalive"] = {}
-                    status = result.status
-                    reason = "stream already closed"
-                    if status is not None and status >= 400 and status != 403:
-                        reason = "open rejected"
-                    logger.warning(
-                        "agent365 turn buffer answer plain fallback: chat_id=%s "
-                        "status=%s reason=%s",
-                        chat_id,
-                        status,
-                        reason,
-                    )
-                    return ("fallback", reason)
-                elif classified == _ANSWER_FINAL_DEFER:
-                    break
-                elif classified == _ANSWER_FINAL_RETRYABLE:
-                    if attempt >= _ANSWER_FINAL_MAX_ATTEMPTS:
-                        break
-                    stream = self._keepalive_state(buf)
-                    if _answer_final_cap_remaining_sec(stream) <= 0.0:
-                        break
-                    delay = result.retry_after_sec
-                    if delay <= 0.0:
-                        delay = min(
-                            2.0 ** attempt, _ANSWER_FINAL_RETRY_AFTER_CAP_SEC
-                        )
-                    delay = _cap_answer_final_retry_delay(stream, delay)
-                    if delay <= 0.0:
-                        break
-                    attempt += 1
-                    await self._sleep_turn_buffer_locked(chat_id, buf, delay)
-                    if self._turn_buffers.get(chat_id) is not buf:
-                        return ("retry", None)
-                    stream = self._keepalive_state(buf)
-                    stream_id = str(stream.get("stream_id") or "")
-                    if not stream_id:
-                        return ("retry", None)
-                    turn = self._keepalive_turn(buf)
-                    if turn is None:
-                        return ("retry", None)
-                    result = await self._post_keepalive_activity(
-                        chat_id,
-                        turn,
-                        stream_id=stream_id,
-                        sequence=0,
-                        final=True,
-                        text=content,
-                        message_chrome=True,
-                    )
-                    continue
-                elif classified == _ANSWER_FINAL_NOT_SENT:
-                    if not_sent_probe and result.status is None:
-                        not_sent_probe = False
-                        result = await self._post_keepalive_activity(
-                            chat_id,
-                            turn,
-                            stream_id=stream_id,
-                            sequence=0,
-                            final=True,
-                            text=content,
-                            message_chrome=True,
-                        )
-                        continue
-                    break
-                else:
-                    break
-            if self._turn_buffers.get(chat_id) is not buf:
-                return ("retry", None)
-            self._touch_keepalive_emit(chat_id, buf)
-            status = result.status
-            classified = _classify_answer_final_post(result)
-            if (
-                classified == _ANSWER_FINAL_MAY_HAVE_LANDED
-                and result.timeout_after_send
-            ):
-                buf["keepalive"] = {}
-                logger.warning(
-                    "agent365 turn buffer treating timed-out answer final as "
-                    "delivered: chat_id=%s stream_id=%s",
-                    chat_id,
-                    stream_id,
-                )
-                return ("delivered", None)
-            stream = self._keepalive_state(buf)
-            cap_left = _answer_final_cap_remaining_sec(stream)
-            if stream_id and (
-                attempt >= _ANSWER_FINAL_MAX_ATTEMPTS
-                or cap_left <= 0.0
-                or classified == _ANSWER_FINAL_RETRYABLE
-            ):
-                if self._plain_answer_blocked(buf):
-                    return self._answer_uncertain_delivery(
-                        chat_id,
-                        buf,
-                        stream_id=stream_id,
-                        context="stream retry exhausted",
-                    )
-                buf["keepalive"] = {}
-                logger.warning(
-                    "agent365 turn buffer answer plain fallback: chat_id=%s "
-                    "status=%s reason=stream retry exhausted",
-                    chat_id,
-                    status,
-                )
-                return ("fallback", "stream retry exhausted")
-            logger.warning(
-                "agent365 turn buffer answer final failed: chat_id=%s "
-                "stream_id=%s status=%s",
-                chat_id,
-                stream_id,
-                status,
-            )
-            return ("retry", None)
-        finally:
-            buf = self._turn_buffers.get(chat_id)
-            if isinstance(buf, dict):
-                buf.pop("answer_final_in_progress", None)
 
     @staticmethod
     def _keepalive_timeout_after_send(exc: BaseException) -> bool:
@@ -6463,42 +6669,19 @@ class Agent365Adapter(BasePlatformAdapter):
             during_mint,
         )
 
-    @classmethod
-    def _plain_answer_blocked(cls, buf: dict[str, Any]) -> bool:
-        delivery = buf.get("answer_delivery")
-        if isinstance(delivery, dict) and delivery.get("may_have_landed"):
-            return True
-        return bool(buf.get("final_may_have_landed"))
-
-    def _answer_uncertain_delivery(
-        self,
-        chat_id: str,
-        buf: dict[str, Any],
-        *,
-        stream_id: str,
-        context: str,
-    ) -> tuple[str, str | None]:
-        buf["keepalive"] = {}
-        buf.pop("force_plain_answer", None)
-        logger.warning(
-            "agent365 turn buffer answer delivery uncertain: chat_id=%s "
-            "stream_id=%s context=%s; not plain-posting a duplicate",
-            chat_id,
-            stream_id,
-            context,
-        )
-        return ("uncertain", None)
-
     async def _deferred_turn_buffer_retry(self, chat_id: str) -> None:
         try:
             buf = self._turn_buffers.get(chat_id)
             delay = _TURN_BUFFER_RETRY_DELAY_SEC
-            if isinstance(buf, dict) and buf.get("force_plain_latched"):
-                plain_attempts = int(buf.get("plain_fallback_attempts") or 0)
-                delay = min(
-                    2.0 ** plain_attempts * _TURN_BUFFER_RETRY_DELAY_SEC,
-                    5.0,
-                )
+            if isinstance(buf, dict):
+                turn_key = str(buf.get("retry_turn_key") or "")
+                record = self._delivery_record_for_key(buf, turn_key)
+                if isinstance(record, dict) and record.get("force_plain"):
+                    plain_attempts = int(record.get("plain_attempts") or 0)
+                    delay = min(
+                        2.0 ** plain_attempts * _TURN_BUFFER_RETRY_DELAY_SEC,
+                        5.0,
+                    )
             await asyncio.sleep(delay)
             buf = self._turn_buffers.get(chat_id)
             if buf is None or self._disconnecting:
@@ -6581,8 +6764,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 ),
             )
         segments: list[dict[str, str]] = buf["segments"]
-        if not segments:
-            self._reset_turn_answer_delivery_state(buf)
+        self._delivery_record(buf, turn)
         turn_seq = str(turn.get("seq") or "")
         own = [segment for segment in segments if str(segment.get("turn") or "") == turn_seq]
         if own and own[-1]["text"] == text:
@@ -6800,30 +6982,37 @@ class Agent365Adapter(BasePlatformAdapter):
                 ):
                     return
                 if first_chunk_on_stream:
+                    chunk_ids = [
+                        str(segment.get("id") or "")
+                        for segment in chunk_segments
+                    ]
+                    record = self._delivery_record(buf, turn)
                     outcome, _final_id = await self._deliver_turn_answer_locked(
                         chat_id,
+                        turn,
                         content,
+                        chunk_ids,
                     )
                     if outcome == "blocked":
                         if not self._turn_reply_blocked(chat_id):
-                            self._schedule_turn_buffer_retry(chat_id)
+                            buf["retry_turn_key"] = record["turn_key"]
+                            self._schedule_turn_buffer_retry(
+                                chat_id, record["turn_key"]
+                            )
                         return
                     if outcome == "retry":
                         if not self._turn_reply_blocked(chat_id):
-                            self._schedule_turn_buffer_retry(chat_id)
+                            record = self._delivery_record(buf, turn)
+                            if not record.get("force_plain_exhausted"):
+                                buf["retry_turn_key"] = record["turn_key"]
+                                self._schedule_turn_buffer_retry(
+                                    chat_id, record["turn_key"]
+                                )
                         return
                     if outcome == "uncertain":
-                        live = self._turn_buffers.get(chat_id)
-                        if live is None:
-                            return
-                        buf = live
-                        self._remove_turn_segments(
-                            buf,
-                            [
-                                str(segment.get("id") or "")
-                                for segment in chunk_segments
-                            ],
-                        )
+                        first_chunk_on_stream = False
+                        continue
+                    if outcome == "delivered":
                         first_chunk_on_stream = False
                         continue
                     if outcome == "fallback":
@@ -6846,6 +7035,9 @@ class Agent365Adapter(BasePlatformAdapter):
                                     chat_id,
                                     error,
                                 )
+                                record = self._delivery_record(buf, turn)
+                                record["state"] = "DONE"
+                                record["plain_due"] = False
                                 self._remove_turn_segments(
                                     buf,
                                     [
@@ -6853,6 +7045,7 @@ class Agent365Adapter(BasePlatformAdapter):
                                         for segment in chunk_segments
                                     ],
                                 )
+                                self._purge_turn_delivery_records(buf)
                                 first_chunk_on_stream = False
                                 continue
                             logger.warning(
@@ -6860,25 +7053,35 @@ class Agent365Adapter(BasePlatformAdapter):
                                 chat_id,
                                 error,
                             )
-                            if buf.get("force_plain_latched"):
-                                buf["plain_fallback_attempts"] = (
-                                    int(buf.get("plain_fallback_attempts") or 0)
-                                    + 1
+                            record = self._delivery_record(buf, turn)
+                            if record.get("force_plain"):
+                                record["plain_attempts"] = (
+                                    int(record.get("plain_attempts") or 0) + 1
                                 )
-                            self._schedule_turn_buffer_retry(chat_id)
+                            else:
+                                record["deferral_count"] = (
+                                    int(record.get("deferral_count") or 0) + 1
+                                )
+                                record["state"] = "DEFERRED"
+                            buf["retry_turn_key"] = record["turn_key"]
+                            self._schedule_turn_buffer_retry(
+                                chat_id, record["turn_key"]
+                            )
                             return
-                    live = self._turn_buffers.get(chat_id)
-                    if live is None:
-                        return
-                    buf = live
-                    if buf.get("force_plain_latched"):
-                        buf.pop("force_plain_answer", None)
-                    self._remove_turn_segments(
-                        buf,
-                        [str(segment.get("id") or "") for segment in chunk_segments],
-                    )
-                    first_chunk_on_stream = False
-                    continue
+                        live = self._turn_buffers.get(chat_id)
+                        if live is None:
+                            return
+                        buf = live
+                        record = self._delivery_record(buf, turn)
+                        record["state"] = "DONE"
+                        record["plain_due"] = False
+                        self._remove_turn_segments(
+                            buf,
+                            [str(segment.get("id") or "") for segment in chunk_segments],
+                        )
+                        self._purge_turn_delivery_records(buf)
+                        first_chunk_on_stream = False
+                        continue
                 result = await self._send_reply_activity(
                     inbound=inbound,
                     content=content,
@@ -6979,7 +7182,7 @@ class Agent365Adapter(BasePlatformAdapter):
             for segment in buf.get("segments") or []
             if str(segment.get("id") or "") not in drop
         ]
-        Agent365Adapter._clear_answer_delivery_if_unpending(buf)
+        Agent365Adapter._purge_turn_delivery_records(buf)
 
     async def send_private_notice(
         self,

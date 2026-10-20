@@ -3809,7 +3809,11 @@ class TestLifecycleCapture:
         }
 
         async def deliver_waits(
-            chat_id: str, content: str, **kwargs: Any
+            chat_id: str,
+            turn: dict[str, Any],
+            content: str,
+            chunk_segment_ids: list[str],
+            **kwargs: Any,
         ) -> tuple[str, str | None]:
             close_entered.set()
             await release_close.wait()
@@ -7831,16 +7835,17 @@ class TestEditMessage:
         )
         assert edited.success is True
         await a.on_processing_complete(outer_event, outcome="success")
-        assert send_reply_mock.await_count == 0
+        assert send_reply_mock.await_count == 1
+        assert (
+            send_reply_mock.await_args.kwargs["reply"]["text"]
+            == "Outer final\n\nOuter still streaming"
+        )
         finals = [
             call.kwargs["json"]["text"]
             for call in post_mock.await_args_list
             if call.kwargs["json"]["type"] == "message"
         ]
-        assert finals == [
-            "Follow-up reply\n\nFollow-up note",
-            "Outer final\n\nOuter still streaming",
-        ]
+        assert finals == ["Follow-up reply\n\nFollow-up note"]
         assert "conv-G-nest" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -8629,13 +8634,15 @@ class TestEditMessage:
         assert order == ["informative", "final"]
         assert replies == []
         assert a._turn_buffers["conv-G-ka-nest"]["depth"] == 1
-        assert a._turn_buffers["conv-G-ka-nest"]["keepalive"] == {}
+        ka = a._turn_buffers["conv-G-ka-nest"]["keepalive"]
+        assert ka.get("stream_id") == ""
+        assert ka.get("closed_by") == "turn:2:act-followup"
         assert [
             segment["text"] for segment in a._turn_buffers["conv-G-ka-nest"]["segments"]
         ] == ["Outer answer"]
         await a.on_processing_complete(outer_event, outcome="success")
-        assert order == ["informative", "final", "informative", "final"]
-        assert replies == []
+        assert order == ["informative", "final", "reply"]
+        assert replies == [("act-outer", "Outer answer")]
         assert "conv-G-ka-nest" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -9672,14 +9679,20 @@ class TestEditMessage:
             }
         ]
         buf["depth"] = 0
-        a._schedule_turn_buffer_retry("conv-G-plain-cap")
+        turn = buf["turns"][0]
+        record = a._delivery_record(buf, turn)
+        record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+        record["force_plain"] = True
+        record["plain_due"] = True
+        buf["retry_turn_key"] = record["turn_key"]
+        a._schedule_turn_buffer_retry("conv-G-plain-cap", record["turn_key"])
         for _ in range(adapter_mod._TURN_BUFFER_FORCE_PLAIN_MAX_ATTEMPTS + 2):
             await asyncio.sleep(0)
             task = buf.get("retry_task")
             if isinstance(task, asyncio.Task) and not task.done():
                 await task
         assert calls["n"] <= adapter_mod._TURN_BUFFER_FORCE_PLAIN_MAX_ATTEMPTS
-        assert buf.get("force_plain_exhausted") is True
+        assert record.get("force_plain_exhausted") is True
 
     @pytest.mark.asyncio
     async def test_keepalive_skips_rotation_during_answer_final_sleep(
@@ -9983,7 +9996,7 @@ class TestEditMessage:
         assert "conv-G-two-turn" not in a._turn_buffers
 
     @pytest.mark.asyncio
-    async def test_nested_turn_does_not_clear_outer_answer_delivery_latch(
+    async def test_nested_start_does_not_reset_outer_delivery_record(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import httpx
@@ -10033,7 +10046,10 @@ class TestEditMessage:
             chat_id="conv-G-nest-latch", content="Outer body", reply_to=None
         )
         await a.on_processing_complete(outer_event, outcome="success")
-        assert adapter_mod.Agent365Adapter._plain_answer_blocked(buf)
+        outer_turn = buf["turns"][0]
+        outer_key = a._turn_delivery_key(outer_turn)
+        outer_rec = buf["delivery_by_turn"][outer_key]
+        assert outer_rec["may_have_landed"] is True
         assert [s["text"] for s in buf["segments"]] == ["Outer body"]
 
         inbound["id"] = "act-inner"
@@ -10043,11 +10059,81 @@ class TestEditMessage:
             message_id="act-inner",
         )
         await a.on_processing_start(inner_event)
-        assert adapter_mod.Agent365Adapter._plain_answer_blocked(buf)
+        assert buf["delivery_by_turn"][outer_key]["may_have_landed"] is True
+        before = dict(buf["delivery_by_turn"][outer_key])
+        await a.send(
+            chat_id="conv-G-nest-latch", content="Inner body", reply_to="act-inner"
+        )
+        after = buf["delivery_by_turn"][outer_key]
+        assert after["may_have_landed"] == before["may_have_landed"]
+        assert after["deferral_count"] == before["deferral_count"]
+
+    @pytest.mark.asyncio
+    async def test_inner_lands_outer_pending_plain_posts_outer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-inner-land", activity_id="act-outer")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        informative_posts = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                informative_posts["n"] += 1
+                return self._http_result(201, "ka-share")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        outer_event = _StubMessageEvent(
+            text="outer",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-inner-land"),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(outer_event)
+        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _c: False)
+        await a.send(
+            chat_id="conv-G-inner-land", content="Outer pending", reply_to="act-outer"
+        )
+        buf = a._turn_buffers["conv-G-inner-land"]
+        buf["keepalive"] = {
+            "stream_id": "ka-share",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        inbound["id"] = "act-inner"
+        inner_event = _StubMessageEvent(
+            text="inner",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-inner-land"),
+            message_id="act-inner",
+        )
+        await a.on_processing_start(inner_event)
+        await a.send(
+            chat_id="conv-G-inner-land", content="Inner lands", reply_to="act-inner"
+        )
         await a.on_processing_complete(inner_event, outcome="success")
-        assert outer_finals["n"] == 3
-        assert send_reply_mock.await_count == 0
-        assert "conv-G-nest-latch" not in a._turn_buffers
+        buf = a._turn_buffers["conv-G-inner-land"]
+        outer_turn = next(t for t in buf["turns"] if t["seq"] == "1")
+        inner_turn = next(t for t in buf["turns"] if t["seq"] == "2")
+        outer_key = a._turn_delivery_key(outer_turn)
+        inner_key = a._turn_delivery_key(inner_turn)
+        assert buf["keepalive"]["closed_by"] == f"turn:{inner_key}"
+        outer_rec = buf["delivery_by_turn"].get(outer_key)
+        assert outer_rec is not None
+        assert outer_rec.get("had_landed") is False
+        assert outer_rec.get("may_have_landed") is False
+        await a.on_processing_complete(outer_event, outcome="success")
+        assert informative_posts["n"] == 0
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Outer pending"
+        assert "conv-G-inner-land" not in a._turn_buffers
 
     @pytest.mark.asyncio
     async def test_token_timeout_on_open_stream_retries_mint(
