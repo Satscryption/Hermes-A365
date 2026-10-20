@@ -6780,6 +6780,60 @@ class TestSendTyping:
         assert body["conversation"]["conversationType"] == "personal"
 
     @pytest.mark.asyncio
+    async def test_send_typing_suppressed_during_personal_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-stream-typing")
+            )
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-xyz"),
+        )
+        post_mock = AsyncMock(return_value=MagicMock(status_code=200, text=""))
+        a._http_client.post = post_mock
+        a._active_stream_by_chat["conv-stream-typing"] = "stream-msg-1"
+
+        await a.send_typing("conv-stream-typing")
+        assert post_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_send_typing_suppressed_after_personal_stream_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        a._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(
+                _make_inbound(conv_id="conv-after-final")
+            )
+        )
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_outbound_token",
+            AsyncMock(return_value="bearer-xyz"),
+        )
+        post_mock = AsyncMock(return_value=MagicMock(status_code=200, text=""))
+        a._http_client.post = post_mock
+        a._personal_stream_final_posted.add("conv-after-final")
+
+        await a.send_typing("conv-after-final")
+        assert post_mock.await_count == 0
+
+    @pytest.mark.asyncio
     async def test_typing_failure_swallowed(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

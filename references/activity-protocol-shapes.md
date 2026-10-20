@@ -90,10 +90,13 @@ whether the conversation actually renders Bot Framework streaming:
   does not open another bubble. A follow-up whose reply_to is a different
   activity still posts, including when the 403 is accepted after the
   nested start. User cancel stays a failure. Personal chats do not use
-  the non-personal coalesce buffer. A **stale-stream liveness guard**
+  the non-personal coalesce buffer.   A **stale-stream liveness guard**
   force-drops a sequence whose
   finalization repeatedly fails or that exceeds a bounded age, so a
-  stuck stream can't silence the chat (#62, #83, #161).
+  stuck stream can't silence the chat (#62, #83, #161). While a stream
+  is open, and for the rest of the turn after ``streamType=final``,
+  ``send_typing`` is suppressed on personal chats so late gateway
+  typing pulses do not keep the dots alive (#185).
 
 - **Copilot Chat and other non-`personal` turns** do **not** render BF
   streaming (see the quirks row above): Bot Framework returns 2xx and

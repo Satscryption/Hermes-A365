@@ -1532,6 +1532,11 @@ class Agent365Adapter(BasePlatformAdapter):
         # start a stream or emit a non-streaming reply. Cleared on finalize
         # or terminal 403.
         self._active_stream_by_chat: dict[str, str] = {}
+        # Personal chats: after ``streamType=final`` the BF stream slot is
+        # cleared but Hermes' ``_keep_typing`` loop may still pulse until
+        # ``on_processing_complete`` (#185). Suppress ``send_typing`` for
+        # the rest of that turn once a final has landed.
+        self._personal_stream_final_posted: set[str] = set()
         # Personal turns nest when Hermes runs an in-band follow-up before
         # the outer stream consumer is cancelled. The outer 1:1 stream is
         # finalized only when this count returns to 0 (#161).
@@ -3442,6 +3447,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._record_recently_finalized(message_id, chat_id)
         self._streams.clear()
         self._active_stream_by_chat.clear()
+        self._personal_stream_final_posted.clear()
         self._personal_processing_depth.clear()
         self._personal_final_landed.clear()
         self._nested_personal_reply.clear()
@@ -7554,6 +7560,14 @@ class Agent365Adapter(BasePlatformAdapter):
         conv = inbound.get("conversation") if isinstance(inbound.get("conversation"), dict) else {}
         if str(conv.get("conversationType") or "") != "personal":
             return None
+        # #185: BF has no "stop typing" activity. While a personal stream is
+        # open, typing is redundant; after ``streamType=final`` Hermes may still
+        # pulse until ``on_processing_complete`` — skip those late ticks.
+        if (
+            chat_id in self._active_stream_by_chat
+            or chat_id in self._personal_stream_final_posted
+        ):
+            return None
         # Slice 19x-d (#4): bump last_used_at on typing too.
         self._conversations.mark_used(chat_id)
         typing_activity = {
@@ -9682,9 +9696,16 @@ class Agent365Adapter(BasePlatformAdapter):
         depth -= 1
         if depth <= 0:
             self._personal_processing_depth.pop(key, None)
+            self._personal_stream_final_posted.discard(key)
             return True
         self._personal_processing_depth[key] = depth
         return False
+
+    def _mark_personal_stream_final_posted(self, chat_id: str) -> None:
+        """Record that a personal stream final landed for this turn (#185)."""
+        key = str(chat_id)
+        if key:
+            self._personal_stream_final_posted.add(key)
 
     def _drop_stream_state_if_unopened(
         self,
@@ -9736,7 +9757,9 @@ class Agent365Adapter(BasePlatformAdapter):
         result = await self.edit_message(
             str(chat_id), str(message_id), content, finalize=True
         )
-        if not result.success:
+        if result.success:
+            self._mark_personal_stream_final_posted(chat_id)
+        else:
             logger.warning(
                 "agent365 personal stream turn-end finalize not accepted: "
                 "chat_id=%s message_id=%s error=%s",
@@ -10169,6 +10192,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if wire_finalize:
                     self._drop_stream_state(chat_id, message_id)
                     self._record_recently_finalized(message_id, chat_id, loop_now)
+                    self._mark_personal_stream_final_posted(chat_id)
                 return SendResult(
                     success=True, message_id=state.get("bf_stream_id") or ""
                 )
@@ -10212,6 +10236,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._drop_stream_state(chat_id, message_id)
                     self._record_recently_finalized(message_id, chat_id, loop_now)
                     self._remember_personal_final_anchor(chat_id, anchor)
+                    self._mark_personal_stream_final_posted(chat_id)
                     return SendResult(success=True, message_id=landed_id)
                 self._drop_stream_state(chat_id, message_id)
                 short = err_msg
@@ -10379,6 +10404,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._drop_stream_state(chat_id, message_id)
             loop_now = asyncio.get_event_loop().time()
             self._record_recently_finalized(message_id, chat_id, loop_now)
+            self._mark_personal_stream_final_posted(chat_id)
             return True
 
         code, body = self._bf_error_parts(resp)
@@ -11064,6 +11090,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if key[0] == chat_id:
                 self._recently_finalized.pop(key, None)
         self._personal_processing_depth.pop(chat_id, None)
+        self._personal_stream_final_posted.discard(chat_id)
         self._personal_final_landed.pop(chat_id, None)
         self._nested_personal_reply.pop(chat_id, None)
         for consent_id, pending in list(self._pending_file_uploads.items()):

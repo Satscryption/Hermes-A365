@@ -40,6 +40,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Teams 1:1 typing indicator after a streamed final (#185).** On personal
+  chats, ``send_typing`` is a no-op while a BF stream is open and for the
+  rest of the turn after ``streamType=final`` lands, so Hermes'
+  ``_keep_typing`` loop does not post late pulses once the answer bubble
+  is complete. Cleared when the outer personal turn ends on
+  ``on_processing_complete``.
+
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
   `bf_error_body`. Transient failures on an already-open stream (transport
