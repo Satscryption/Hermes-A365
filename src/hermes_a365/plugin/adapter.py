@@ -1326,6 +1326,12 @@ class Agent365Adapter(BasePlatformAdapter):
     # that for interactive turns; #4 covers the proactive pattern for
     # longer reasoning.
     MAX_MESSAGE_LENGTH = 4000
+    # Teams agent messages allow much larger payloads than the interactive
+    # send cap above (Microsoft documents ~100 KB per activity, ~80 KB
+    # recommended for text). Hermes' stream consumer uses
+    # ``streaming_overflow_limit()`` so replies that fit one streamed final
+    # are not split at 4k (#184); matches the sibling Hermes Teams adapter.
+    _STREAMING_OVERFLOW_MESSAGE_LENGTH = 28000
 
     # Slice 19s — Microsoft's BF streaming requires an explicit
     # ``endStream()`` (i.e. a final activity with
@@ -1334,6 +1340,10 @@ class Agent365Adapter(BasePlatformAdapter):
     # consumer to route the final ``edit_message(finalize=True)``
     # through even when content is unchanged.
     REQUIRES_EDIT_FINALIZE: bool = True
+
+    def streaming_overflow_limit(self) -> int | None:
+        """Raise the stream-consumer split budget for Teams 1:1 streaming."""
+        return self._STREAMING_OVERFLOW_MESSAGE_LENGTH
 
     def __init__(self, config: PlatformConfig, **_kwargs: Any) -> None:
         super().__init__(config=config, platform=Platform("agent365"))

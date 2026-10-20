@@ -40,6 +40,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Teams 1:1 stream overflow split at ~4k (#184).** Override
+  ``streaming_overflow_limit()`` to 28 000 characters so Hermes' stream
+  consumer does not seal long personal replies at the conservative
+  ``MAX_MESSAGE_LENGTH`` (4000) interactive cap. Plain sends and turn
+  buffers still use 4000; Teams accepts much larger activity payloads.
+
 - **Teams 1:1 typing indicator after a streamed final (#185).** On personal
   chats, ``send_typing`` is a no-op while a BF stream is open and for the
   rest of the turn after ``streamType=final`` lands, so Hermes'

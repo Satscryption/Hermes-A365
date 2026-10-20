@@ -12560,6 +12560,16 @@ class TestSendOrUpdateStatus:
         assert a._coalesced_status_tasks == {}
 
 
+class TestStreamingOverflowLimit:
+    def test_streaming_overflow_limit_for_teams_personal(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        cap = a.streaming_overflow_limit()
+        assert cap == adapter_mod.Agent365Adapter._STREAMING_OVERFLOW_MESSAGE_LENGTH
+        assert cap is not None and cap > a.MAX_MESSAGE_LENGTH
+
+
 class TestSendStreamStart:
     """Slice 19s-bis: send() participates in the same BF stream as
     edit_message when in a streaming context (personal chat, no active
