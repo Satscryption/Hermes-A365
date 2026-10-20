@@ -490,7 +490,11 @@ class TestProbeHermesHarness:
     def test_present_ok(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/local/bin/hermes"),
-            patch("hermes_a365.doctor.safe_run", return_value="Hermes Agent v0.12.0\n"),
+            patch("hermes_a365.doctor.safe_run", return_value="Hermes Agent v0.22.2\n"),
+            patch(
+                "hermes_a365.doctor._agent365_file_hosts_from_config",
+                return_value=("unreadable", [], False),
+            ),
         ):
             r = probe_hermes_harness()
         assert r.state == "ok"
@@ -667,6 +671,8 @@ class TestRunAllProbes:
         report = run_all_probes()
         names = [p.name for p in report.probes]
         for required in (
+            "python",
+            "host_platform",
             "a365_cli",
             "az_cli",
             "powershell",

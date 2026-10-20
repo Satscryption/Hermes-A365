@@ -255,5 +255,6 @@ def test_called_test_workflow_keeps_python_3_14() -> None:
     text = _TEST_WORKFLOW_PATH.read_text()
 
     assert "workflow_call:" in text
-    assert 'python-version: ["3.11", "3.14"]' in text
+    for version in ("3.11", "3.12", "3.13", "3.14"):
+        assert f'python-version: "{version}"' in text
     assert "permissions:\n  contents: read\n" in text

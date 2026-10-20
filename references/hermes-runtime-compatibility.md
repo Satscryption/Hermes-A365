@@ -138,9 +138,13 @@ uv pip install --python ~/.hermes/hermes-agent/venv/bin/python --override overri
 install, read back `pyjwt`, `cryptography`, `fastapi`, `starlette`, and
 `anyio` before the #123 gateway rows.
 
-This repository's CI runs ruff and the full pytest suite on Python 3.11
-and Python 3.14. That proves this package on the Hermes runtime. It does
-not, by itself, prove the combined Hermes resolve; the override above is
+This repository's CI runs ruff and the full pytest suite on **Ubuntu** for
+Python 3.11 through 3.14, on **macOS** for Python 3.14 only (live macOS
+keychain tests are skipped on GitHub-hosted runners), plus dedicated jobs for
+Linux libsecret live keychain, wheel fresh-install smoke, Hermes source tag
+checks, and **Windows** as an unsupported-host negative probe only. That
+proves this package across the declared Python matrix and supported hosts. It
+does not, by itself, prove the combined Hermes resolve; the override above is
 what makes that resolve succeed while the upstream pins remain.
 
 ## Copilot→Teams session pin (#82)

@@ -8,6 +8,20 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **#126 — v1 compatibility matrix.** Published
+  [`references/v1-compatibility-matrix.md`](references/v1-compatibility-matrix.md)
+  (Python `>=3.11` with 3.11–3.14 in CI; 3.15+ untested, macOS/Linux
+  supported hosts, Hermes plugin/multiplex floors, Microsoft tooling
+  snapshots, CEA manifest 1.27). `hermes_a365.compatibility` centralizes the
+  constants; `doctor` probes Python, host OS, and Hermes version floors
+  (including multiplex when `gateway.multiplex_profiles` is enabled). CI runs
+  ruff and pytest on Ubuntu for Python 3.11–3.14, macOS for 3.14 only (live
+  macOS keychain tests skipped on GitHub runners), Linux libsecret live
+  keychain, wheel fresh-install smoke, Hermes source smoke for `v2026.6.19`
+  and `v0.22.2`, and Windows as an unsupported-host negative probe only.
+  Windows remains unsupported for the OS keychain layer (no Credential Manager
+  backend). Refs [#126](https://github.com/Satscryption/Hermes-A365/issues/126).
+
 - **`gateway.platforms.agent365.extra.reactions_dispatch_agent_turn`** (default
   `false`). When enabled, a stored Teams `messageReaction` on a bot reply also
   dispatches Hermes' `reaction:added:<type>` / `reaction:removed:<type>` agent
