@@ -2329,7 +2329,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # JWT, end-user, and replay gates above. The body tenant is checked
             # inside the handler (fail closed). This does not update the
             # conversation registry: a reaction is not a reply target.
-            if str(activity.get("type") or "") == "messageReaction":
+            if str(activity.get("type") or "").casefold() == "messagereaction":
                 return await self._handle_message_reaction(
                     activity, authorized_sender_id=authorized_sender_id
                 )

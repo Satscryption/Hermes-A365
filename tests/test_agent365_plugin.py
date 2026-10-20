@@ -1860,6 +1860,10 @@ class TestShouldDispatch:
         body = {**_make_inbound(), "type": "fooBar"}
         assert adapter_mod._should_dispatch(body) is False
 
+    def test_message_reaction_does_not_dispatch(self) -> None:
+        body = {**_make_inbound(text=""), "type": "messageReaction"}
+        assert adapter_mod._should_dispatch(body) is False
+
     def test_conversation_update_acks(self) -> None:
         body = {**_make_inbound(), "type": "conversationUpdate"}
         assert adapter_mod._should_dispatch(body) is False
@@ -19224,6 +19228,26 @@ class TestUnhandledInboundActivityTypes:
         assert response.json()["status"] == "dispatched"
         assert a._handled_events[0].text == "hello"
 
+    def test_attachment_only_message_still_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        client = self._client(monkeypatch, a)
+        body = _make_inbound(text="")
+        body["attachments"] = [
+            {
+                "contentType": "application/vnd.microsoft.teams.file.download.info",
+                "content": {"downloadUrl": "https://example.test/file"},
+            }
+        ]
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["status"] == "dispatched"
+        assert a._handled_events[0].text == ""
+
 
 # ---------------------------------------------------------------------------
 # #80 — Teams messageReaction add/remove (feedback correlation, no #122)
@@ -19669,7 +19693,7 @@ class TestMessageReaction:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_NATIVE_REACTIONS_PER_MESSAGE", 1)
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch)
         self._seed(a)
         client = self._client(monkeypatch, a)
         response = client.post(
@@ -19683,6 +19707,25 @@ class TestMessageReaction:
         slots = a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]
         assert list(slots) == ["heart"]
         assert a._handled_events == []
+
+    def test_native_reaction_slots_opt_in_emits_only_survivor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(adapter_mod, "_MAX_NATIVE_REACTIONS_PER_MESSAGE", 1)
+        a = self._adapter(monkeypatch, dispatch_turn=True)
+        self._seed(a)
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(
+                added=[{"type": "like"}, {"type": "heart"}],
+            ),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["reactions"] == 1
+        slots = a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]
+        assert list(slots) == ["heart"]
+        assert [event.text for event in a._handled_events] == ["reaction:added:heart"]
 
     @pytest.mark.asyncio
     async def test_teardown_drops_chat_reply_ids(
@@ -19819,7 +19862,7 @@ class TestMessageReaction:
     def test_reaction_without_user_activity_does_not_start_a_turn(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        a = self._adapter(monkeypatch)
         a._remember_bot_reply("reply-1", conversation_id="conv-1")
         client = self._client(monkeypatch, a)
 
@@ -19838,6 +19881,64 @@ class TestMessageReaction:
             ]
             == "added"
         )
+
+    def test_reaction_without_user_activity_opt_in_does_not_call_handle_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch, dispatch_turn=True)
+        a._remember_bot_reply("reply-1", conversation_id="conv-1")
+        client = self._client(monkeypatch, a)
+
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(activity_id="react-1"),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+
+        assert response.status_code == 200, response.text
+        assert response.json()["reactions"] == 1
+        assert a._handled_events == []
+
+    def test_walk092_reaction_shape_does_not_open_empty_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Replay #180 walk092: reaction logged, no #80 handler lines in the
+        report, empty user row with platform_message_id = reacted bot reply.
+
+        Empty text rules out ``_dispatch_reaction_events`` (synthetic
+        ``reaction:added:`` text). The matching generic-dispatch shape is an
+        empty ``MessageEvent`` whose ``message_id`` is the activity id; Teams
+        can set that id to the reacted bot reply (same as ``replyToId``).
+        """
+        bot_reply_id = "1792434320876"
+        a = self._adapter(monkeypatch)
+        self._seed(a)
+        a._remember_bot_reply(bot_reply_id, conversation_id="conv-1")
+        event = a._activity_to_event(
+            _reaction_activity(
+                reply_to=bot_reply_id,
+                activity_id=bot_reply_id,
+                added=[{"type": "heart"}],
+            ),
+            media=([], [], adapter_mod.MessageType.TEXT),
+            authorized_user_id="user-1",
+        )
+        assert event.text == ""
+        assert event.message_id == bot_reply_id
+
+        client = self._client(monkeypatch, a)
+        response = client.post(
+            "/api/messages",
+            json=_reaction_activity(
+                reply_to=bot_reply_id,
+                activity_id=bot_reply_id,
+                added=[{"type": "heart"}],
+            ),
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["reactions"] == 1
+        assert a._handled_events == []
 
     @pytest.mark.asyncio
     async def test_thumbs_submit_keeps_native_reactions(

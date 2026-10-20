@@ -48,11 +48,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - **#180 — Teams reactions no longer start an agent turn by default.** Recording
   and #80 logging still run; only `reactions_dispatch_agent_turn` restores the
-  synthetic turn. Empty-text `message` activities are acked without dispatch so
-  connector follow-ons cannot produce unprompted replies.
-- **#188 — Non-message inbound activities no longer reach the agent loop or the
-  operator webhook.** The gateway allowlists user turns to `type=message` only;
-  `activity-bridge serve` forwards only `message` and `invoke`, matching
+  synthetic turn. Empty-text `message` activities with no attachments are acked
+  without dispatch so connector follow-ons cannot produce unprompted replies.
+- **#188 — Non-message inbound types no longer open agent turns or hit the
+  operator webhook.** The gateway allowlists user turns to `type=message` only
+  (invoke, `messageReaction`, card submit, and lifecycle handlers are unchanged);
+  `activity-bridge serve` still forwards only `message` and `invoke`, matching
   `references/webhook-contract.md`.
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
