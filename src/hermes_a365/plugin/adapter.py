@@ -43,6 +43,7 @@ Configuration in ``config.yaml``::
             blueprint_client_secret: ""           # or via env
             generated_config_path: ""             # default cwd/a365.generated.config.json
             notice_delivery: private              # withhold ops notices off 1:1
+            reactions_dispatch_agent_turn: false # #180 — record reactions only
 
 Or via environment variables:
 
@@ -82,7 +83,7 @@ import threading
 import time
 import uuid
 from collections.abc import Callable
-from contextvars import ContextVar
+from contextvars import ContextVar, Token
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -194,6 +195,15 @@ def _validate_profile_env_permissions(hermes_home: Path) -> None:
 
 _AGENT_TURN_LIFECYCLE: ContextVar[tuple[int, str, int, int, asyncio.Event] | None] = ContextVar(
     "agent365_agent_turn_lifecycle", default=None
+)
+# Hermes snapshots ``streaming_overflow_limit()`` per stream-consumer task.
+# Scope the raised cap with a ContextVar so concurrent non-personal turns
+# never inherit a personal chat's budget (#184).
+_STREAM_OVERFLOW_LIMIT: ContextVar[int | None] = ContextVar(
+    "agent365_stream_overflow_limit", default=None
+)
+_STREAM_OVERFLOW_RESET_TOKEN: ContextVar[Token | None] = ContextVar(
+    "agent365_stream_overflow_reset_token", default=None
 )
 _PERSIST_STATE_GUARD = threading.Lock()
 _PERSIST_STATES: dict[str, dict[str, Any]] = {}
@@ -1047,6 +1057,31 @@ _CHANNEL_CONTROL_TYPES: frozenset[str] = frozenset(
     {"conversationUpdate", "typing", "endOfConversation"}
 )
 
+# User turns: only plain ``message`` activities reach ``handle_message``.
+# Invoke, ``messageReaction``, card Action.Submit, and lifecycle events
+# are handled on dedicated branches before this allowlist runs.
+_DISPATCHABLE_ACTIVITY_TYPES: frozenset[str] = frozenset({"message"})
+
+
+def _extra_bool(extra: dict[str, Any], key: str, default: bool = False) -> bool:
+    raw = extra.get(key, default)
+    if isinstance(raw, bool):
+        return raw
+    if isinstance(raw, str):
+        return raw.strip().lower() in {"1", "true", "yes", "on"}
+    if raw is None:
+        return default
+    return bool(raw)
+
+
+def _inbound_message_has_agent_content(activity: dict[str, Any]) -> bool:
+    """True when a ``message`` activity carries text or attachments for the agent."""
+    text = activity.get("text")
+    if isinstance(text, str) and text.strip():
+        return True
+    attachments = activity.get("attachments")
+    return isinstance(attachments, list) and bool(attachments)
+
 
 def _lifecycle_registry_action(activity: dict[str, Any]) -> str | None:
     """Classify a BF lifecycle activity into a registry action (#79).
@@ -1270,9 +1305,10 @@ def _parties_from_ref(ref: ConversationRef) -> _ConversationParties:
 def _should_dispatch(activity: dict[str, Any]) -> bool:
     """Return ``True`` for activities the agent loop should reason about.
 
-    ``False`` for BF channel-control + synthetic ``agents``-channel
-    probes. Pure-function so the route stays small and tests can
-    exercise the matrix without spinning up a TestClient.
+    Allowlist: only ``type=message`` may become a user turn. ``False`` for
+    BF channel-control, non-message types (edits/deletes/reactions/events),
+    and synthetic ``agents``-channel probes. Pure-function so the route
+    stays small and tests can exercise the matrix without a TestClient.
 
     The ``agents``-channel synthetic-sender filter was extended after
     the §9d round-5 walkthrough caught the email-template render
@@ -1280,6 +1316,8 @@ def _should_dispatch(activity: dict[str, Any]) -> bool:
     (real ``from.id`` is ``no-reply@teams.mail.microsoft``).
     """
     activity_type = str(activity.get("type") or "message")
+    if activity_type not in _DISPATCHABLE_ACTIVITY_TYPES:
+        return False
     if activity_type in _CHANNEL_CONTROL_TYPES:
         return False
     channel_id = str(activity.get("channelId") or "")
@@ -1357,15 +1395,8 @@ class Agent365Adapter(BasePlatformAdapter):
         return _teams_utf16_len
 
     def streaming_overflow_limit(self) -> int | None:
-        """Raise the stream-consumer split budget for Teams 1:1 streaming only."""
-        chat_id = self._stream_overflow_scope_chat_id
-        if not chat_id:
-            return None
-        inbound = self._cached_inbound_for(chat_id)
-        conv = (inbound or {}).get("conversation") or {}
-        if str(conv.get("conversationType") or "") != "personal":
-            return None
-        return self._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
+        """Per-task stream-consumer split budget (personal 1:1 only, #184)."""
+        return _STREAM_OVERFLOW_LIMIT.get()
 
     def __init__(self, config: PlatformConfig, **_kwargs: Any) -> None:
         super().__init__(config=config, platform=Platform("agent365"))
@@ -1455,6 +1486,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
         self._allow_all_users = sender_policy.allow_all_users
         self._sender_allowlist_configured = sender_policy.configured
+        self._reactions_dispatch_agent_turn = _extra_bool(
+            extra, "reactions_dispatch_agent_turn", default=False
+        )
         if not sender_policy.configured:
             logger.warning(
                 "agent365 sender allowlist is not configured; denying every "
@@ -1734,9 +1768,6 @@ class Agent365Adapter(BasePlatformAdapter):
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
         # Decline notices are sent once per consentId (BF invoke retries).
         self._file_consent_decline_notified: set[str] = set()
-        # Hermes stream consumer calls ``streaming_overflow_limit()`` without
-        # chat_id; scope it to the personal turn in flight (#184).
-        self._stream_overflow_scope_chat_id: str | None = None
         self._card_capabilities: dict[str, dict[str, Any]] = {}
         # #130: a typed-answer wait has no live card capability. Open-ended
         # clarify never mints one. "Something else" consumes the choice card
@@ -2339,7 +2370,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # JWT, end-user, and replay gates above. The body tenant is checked
             # inside the handler (fail closed). This does not update the
             # conversation registry: a reaction is not a reply target.
-            if str(activity.get("type") or "") == "messageReaction":
+            if str(activity.get("type") or "").casefold() == "messagereaction":
                 return await self._handle_message_reaction(
                     activity, authorized_sender_id=authorized_sender_id
                 )
@@ -2466,7 +2497,17 @@ class Agent365Adapter(BasePlatformAdapter):
             # transient or aren't user messages, so persisting them in
             # the registry would just churn ``last_inbound_activity_id``.
             if not _should_dispatch(activity):
-                return JSONResponse({"status": "acked"})
+                channel_data = activity.get("channelData")
+                event_type = ""
+                if isinstance(channel_data, dict):
+                    event_type = str(channel_data.get("eventType") or "")
+                logger.debug(
+                    "inbound acked without dispatch: unhandled activity "
+                    "type=%s eventType=%s",
+                    bridge._safe_log_field(activity.get("type")),
+                    bridge._safe_log_field(event_type),
+                )
+                return JSONResponse({"status": "acked", "reason": "unhandled_type"})
 
             if not self._inbound_lifecycle_is_current(
                 chat_id,
@@ -2484,6 +2525,15 @@ class Agent365Adapter(BasePlatformAdapter):
                     "inbound acked without dispatch: missing or invalid activity id"
                 )
                 return JSONResponse({"status": "acked", "reason": "unroutable"})
+
+            if not _inbound_message_has_agent_content(activity):
+                logger.debug(
+                    "inbound acked without dispatch: empty message "
+                    "type=%s id=%s",
+                    bridge._safe_log_field(activity.get("type")),
+                    bridge._safe_log_field(activity_id),
+                )
+                return JSONResponse({"status": "acked", "reason": "empty_message"})
 
             admission_event = self._activity_to_event(
                 activity,
@@ -3505,7 +3555,6 @@ class Agent365Adapter(BasePlatformAdapter):
         # Review-F3 — drop pending file-consent offers on disconnect too.
         self._pending_file_uploads.clear()
         self._file_consent_decline_notified.clear()
-        self._stream_overflow_scope_chat_id = None
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
         self._agent_turn_guards.clear()
@@ -5057,6 +5106,8 @@ class Agent365Adapter(BasePlatformAdapter):
         posts only after the short-turn window. ``send`` does not await it.
         """
         chat_id = self._chat_id_from_processing_event(event)
+        if chat_id:
+            _STREAM_OVERFLOW_RESET_TOKEN.set(self._enter_stream_overflow_limit(chat_id))
         if (
             chat_id
             and chat_id in self._seen_inbounds_this_lifetime
@@ -5080,7 +5131,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._personal_processing_depth[chat_id] = prev_depth + 1
                 if prev_depth == 0:
                     self._clear_personal_typing_suppression(chat_id)
-                self._set_stream_overflow_scope(chat_id)
         parent = getattr(super(), "on_processing_start", None)
         if callable(parent):
             await parent(event)
@@ -5845,29 +5895,35 @@ class Agent365Adapter(BasePlatformAdapter):
         open is flushed afterwards.
         """
         chat_id = self._chat_id_from_processing_event(event)
-        if chat_id:
-            self._close_innermost_turn(chat_id)
-            buf = self._turn_buffers.get(chat_id)
-            if buf is not None:
-                # A later user turn may try again after the deferred cap.
-                buf["retry_attempts"] = 0
-            await self._flush_turn_buffer(chat_id)
-            await self._flush_pending_coalesced_replies(chat_id)
-            # #161: the stream consumer's finalize edit runs on a task
-            # Hermes cancels at turn end. A short reply often still has
-            # the pacing gap left, so streamType=final never lands and
-            # Teams keeps the Stop button. Close it on this session task.
-            # A nested follow-up complete runs before that cancel, so it
-            # must not close the outer 1:1 stream. Non-personal chats are
-            # not in ``_active_stream_by_chat``.
-            outer_personal_ended = self._release_personal_processing(chat_id)
-            if outer_personal_ended:
-                await self._finalize_open_personal_stream(chat_id)
-                # #185: Hermes' typing task outlives this hook; drop suppression
-                # only after turn-end finalize so late pulses are skipped, then
-                # leave the next turn free to show pre-stream dots.
-                self._clear_personal_typing_suppression(chat_id)
-                self._clear_stream_overflow_scope(chat_id)
+        try:
+            if chat_id:
+                self._close_innermost_turn(chat_id)
+                buf = self._turn_buffers.get(chat_id)
+                if buf is not None:
+                    # A later user turn may try again after the deferred cap.
+                    buf["retry_attempts"] = 0
+                await self._flush_turn_buffer(chat_id)
+                await self._flush_pending_coalesced_replies(chat_id)
+                # #161: the stream consumer's finalize edit runs on a task
+                # Hermes cancels at turn end. A short reply often still has
+                # the pacing gap left, so streamType=final never lands and
+                # Teams keeps the Stop button. Close it on this session task.
+                # A nested follow-up complete runs before that cancel, so it
+                # must not close the outer 1:1 stream. Non-personal chats are
+                # not in ``_active_stream_by_chat``.
+                outer_personal_ended = self._release_personal_processing(chat_id)
+                try:
+                    if outer_personal_ended:
+                        await self._finalize_open_personal_stream(chat_id)
+                        # #185: Hermes' typing task outlives this hook; drop
+                        # suppression only after turn-end finalize.
+                        self._clear_personal_typing_suppression(chat_id)
+                except asyncio.CancelledError:
+                    self._clear_personal_typing_suppression(chat_id)
+                    raise
+        finally:
+            if chat_id:
+                self._reset_stream_overflow_limit_for_task()
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
             await parent(event, outcome)
@@ -8393,10 +8449,12 @@ class Agent365Adapter(BasePlatformAdapter):
         Runs only after the route's serviceUrl, JWT, end-user, and replay
         gates. The body tenant is checked here and fails closed. A reaction
         is stored on the #73 feedback record only when ``replyToId`` is a
-        reply this process sent in the same conversation. Hermes' reaction
-        convention (Feishu / Telegram) then delivers
+        reply this process sent in the same conversation. When
+        ``extra.reactions_dispatch_agent_turn`` is true (default false),
+        Hermes' reaction convention (Feishu / Telegram) delivers
         ``reaction:added:<identity>`` / ``reaction:removed:<identity>`` as
-        the agent turn. Malformed, cross-tenant, replayed, and unrelated
+        an agent turn; otherwise reactions are recorded only. Malformed,
+        cross-tenant, replayed, and unrelated
         reactions do not write a feedback record.
 
         Edits, soft-delete, and undelete are #122 and are not handled here.
@@ -8440,9 +8498,10 @@ class Agent365Adapter(BasePlatformAdapter):
         applied = self._stored_reaction_changes(reply_to, user_id, changes)
         if not applied:
             return JSONResponse({"status": "acked", "reason": "unrelated"})
-        await self._dispatch_reaction_events(
-            activity, applied, authorized_sender_id=user_id
-        )
+        if self._reactions_dispatch_agent_turn:
+            await self._dispatch_reaction_events(
+                activity, applied, authorized_sender_id=user_id
+            )
         return JSONResponse({"status": "acked", "reactions": len(applied)})
 
     def _stored_reaction_changes(
@@ -9882,13 +9941,23 @@ class Agent365Adapter(BasePlatformAdapter):
         conv = (inbound or {}).get("conversation") or {}
         return str(conv.get("conversationType") or "")
 
-    def _set_stream_overflow_scope(self, chat_id: str) -> None:
+    def _enter_stream_overflow_limit(self, chat_id: str) -> Token:
+        """Bind the stream-consumer overflow cap for this session task."""
         if self._personal_conversation_type_for_chat(chat_id) == "personal":
-            self._stream_overflow_scope_chat_id = str(chat_id)
+            limit: int | None = self._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
+        else:
+            limit = None
+        return _STREAM_OVERFLOW_LIMIT.set(limit)
 
-    def _clear_stream_overflow_scope(self, chat_id: str) -> None:
-        if self._stream_overflow_scope_chat_id == str(chat_id):
-            self._stream_overflow_scope_chat_id = None
+    def _reset_stream_overflow_limit_for_task(self) -> None:
+        token = _STREAM_OVERFLOW_RESET_TOKEN.get()
+        if token is not None:
+            try:
+                _STREAM_OVERFLOW_LIMIT.reset(token)
+            except ValueError:
+                # Token was bound on another task (tests); clear this task's view.
+                _STREAM_OVERFLOW_LIMIT.set(None)
+            _STREAM_OVERFLOW_RESET_TOKEN.set(None)
 
     def _mark_personal_stream_final_posted(self, chat_id: str) -> None:
         """Record that a personal stream final landed for this turn (#185)."""
@@ -10080,8 +10149,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 inbound=inbound,
                 loop_now=loop_now,
             )
-
-        self._set_stream_overflow_scope(chat_id)
 
         if self._http_client is None or self._bridge_cfg is None:
             return SendResult(
@@ -11280,6 +11347,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._recently_finalized.pop(key, None)
         self._personal_processing_depth.pop(chat_id, None)
         self._personal_stream_final_posted.discard(chat_id)
+        self._reset_stream_overflow_limit_for_task()
         self._personal_final_landed.pop(chat_id, None)
         self._nested_personal_reply.pop(chat_id, None)
         for consent_id, pending in list(self._pending_file_uploads.items()):

@@ -34,8 +34,9 @@ poll. Long-poll TTL is 60 s; the bridge re-subscribes on disconnect.
 | `message` | Teams / Outlook | Local Hermes agent (request/response) | Reply MUST be posted as `message` with the same `conversation.id`. |
 | `invoke` (`adaptiveCard/action`) | Teams (Adaptive Card actions) | Card builder (`emit_card.py`) | Reply is an Adaptive Card refresh; SPEC §6.7 example. |
 | `conversationUpdate` | Teams (members added/removed) | Bridge bookkeeping only | No agent invocation. |
-| `messageReaction` | Teams | #73 feedback record + Hermes reaction event | Add/remove only, after JWT, serviceUrl, tenant, and replay gates. Stored when `replyToId` is a reply this bot sent. Emits `reaction:added:<type>` / `reaction:removed:<type>`. Edits and deletes are #122. Live round trip still open on the #116 / #89 walks. |
-| `event` | M365 Copilot agent picker | Local Hermes agent | Same routing as `message`. |
+| `messageReaction` | Teams | #73 feedback record (optional agent turn) | Add/remove only, after JWT, serviceUrl, tenant, and replay gates. Stored when `replyToId` is a reply this bot sent. With `reactions_dispatch_agent_turn` (default off), no agent turn. When enabled, emits `reaction:added:<type>` / `reaction:removed:<type>`. Edits and deletes are #122. |
+| `messageUpdate` / `messageDelete` | Teams | Acknowledged only | Not user turns; edit/delete semantics remain #122. |
+| `event` | M365 Copilot agent picker | Acknowledged unless `type=message` | Non-`message` events are not dispatched to the agent loop. |
 
 ## Outbound activity types (emitted by bridge)
 
@@ -99,10 +100,11 @@ whether the conversation actually renders Bot Framework streaming:
   ``send_typing`` is suppressed on personal chats so late gateway
   typing pulses do not keep the dots alive (#185); suppression clears
   after turn-end finalize in ``on_processing_complete`` and when the next
-  personal turn starts. Long **personal** streamed replies use a scoped
+  personal turn starts.   Long **personal** streamed replies bind a per-task
   ``streaming_overflow_limit()`` (32 768 UTF-16 code units) so the Hermes
   stream consumer does not split a single final near the 4 000-character
-  interactive send cap; non-personal chats keep the 4 000 limit (#184).
+  interactive send cap; concurrent non-personal session tasks keep the
+  4 000 limit (#184).
 
 - **Copilot Chat and other non-`personal` turns** do **not** render BF
   streaming (see the quirks row above): Bot Framework returns 2xx and
