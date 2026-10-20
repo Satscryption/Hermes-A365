@@ -908,6 +908,18 @@ def _cap_answer_final_retry_delay(
     return min(delay, _ANSWER_FINAL_RETRY_AFTER_CAP_SEC, remaining)
 
 
+def _answer_final_terminal_403(detail: str) -> bool:
+    """403 cases that end the stream and allow a plain fallback (#182)."""
+    low = detail.casefold()
+    if "already completed" in low:
+        return False
+    return (
+        "exceeded streaming time" in low
+        or _keepalive_user_cancelled(detail)
+        or "content stream is not allowed" in low
+    )
+
+
 def _classify_answer_final_post(result: _KeepalivePost) -> str:
     """Classify one answer-final POST for delivery policy."""
     if result.during_mint:
@@ -915,10 +927,13 @@ def _classify_answer_final_post(result: _KeepalivePost) -> str:
     status = result.status
     if status is not None and 200 <= status < 300:
         return _ANSWER_FINAL_DELIVERED
-    if status == 403 and _keepalive_final_closed(result):
-        if "already completed" in result.detail.casefold():
+    if status == 403:
+        low = result.detail.casefold()
+        if "already completed" in low:
             return _ANSWER_FINAL_ALREADY_COMPLETED
-        return _ANSWER_FINAL_REJECTED_TERMINAL
+        if _answer_final_terminal_403(result.detail):
+            return _ANSWER_FINAL_REJECTED_TERMINAL
+        return _ANSWER_FINAL_DEFER
     if status in _ANSWER_FINAL_RETRY_STATUSES:
         return _ANSWER_FINAL_RETRYABLE
     if status is None:
@@ -930,7 +945,7 @@ def _classify_answer_final_post(result: _KeepalivePost) -> str:
             return _ANSWER_FINAL_NOT_SENT
         return _ANSWER_FINAL_MAY_HAVE_LANDED
     if status is not None and status >= 400:
-        return _ANSWER_FINAL_REJECTED_TERMINAL
+        return _ANSWER_FINAL_DEFER
     return _ANSWER_FINAL_NOT_SENT
 
 
@@ -1062,6 +1077,7 @@ _ANSWER_FINAL_DELIVERED = "DELIVERED"
 _ANSWER_FINAL_REJECTED_TERMINAL = "REJECTED_TERMINAL"
 _ANSWER_FINAL_ALREADY_COMPLETED = "ALREADY_COMPLETED"
 _ANSWER_FINAL_RETRYABLE = "RETRYABLE"
+_ANSWER_FINAL_DEFER = "DEFER"
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
@@ -5251,9 +5267,6 @@ class Agent365Adapter(BasePlatformAdapter):
         else:
             buf.setdefault("turns", []).append(turn)
             buf["depth"] = sum(1 for item in buf["turns"] if item.get("open"))
-        live = self._turn_buffers.get(chat_id)
-        if isinstance(live, dict):
-            self._reset_turn_answer_delivery_state(live)
         # One task per chat. A nested start leaves the running task in
         # place; a task that already exited is replaced.
         self._schedule_turn_buffer_keepalive(chat_id)
@@ -6031,14 +6044,44 @@ class Agent365Adapter(BasePlatformAdapter):
         )
 
     @staticmethod
+    def _answer_delivery_state(buf: dict[str, Any]) -> dict[str, bool]:
+        state = buf.get("answer_delivery")
+        if not isinstance(state, dict):
+            state = {"may_have_landed": False, "had_landed": False}
+            buf["answer_delivery"] = state
+        return state
+
+    @classmethod
+    def _record_answer_may_have_landed(cls, buf: dict[str, Any]) -> None:
+        delivery = cls._answer_delivery_state(buf)
+        delivery["may_have_landed"] = True
+        buf["final_may_have_landed"] = True
+
+    @classmethod
+    def _record_answer_had_landed(cls, buf: dict[str, Any]) -> None:
+        delivery = cls._answer_delivery_state(buf)
+        delivery["had_landed"] = True
+
+    @classmethod
+    def _answer_had_landed_before(cls, buf: dict[str, Any]) -> bool:
+        delivery = cls._answer_delivery_state(buf)
+        return bool(delivery.get("had_landed") or delivery.get("may_have_landed"))
+
+    @staticmethod
     def _reset_turn_answer_delivery_state(buf: dict[str, Any]) -> None:
-        """Fresh answer-final / plain-fallback state for one turn."""
+        """Fresh delivery state when a new answer starts with no segments."""
+        buf.pop("answer_delivery", None)
         buf.pop("final_may_have_landed", None)
         buf.pop("force_plain_latched", None)
         buf.pop("force_plain_exhausted", None)
         buf.pop("plain_fallback_attempts", None)
         buf.pop("force_plain_answer", None)
         buf["retry_attempts"] = 0
+
+    @classmethod
+    def _clear_answer_delivery_if_unpending(cls, buf: dict[str, Any]) -> None:
+        if not buf.get("segments"):
+            cls._reset_turn_answer_delivery_state(buf)
 
     async def _sleep_turn_buffer_stream_gap_locked(
         self, chat_id: str, buf: dict[str, Any]
@@ -6173,8 +6216,9 @@ class Agent365Adapter(BasePlatformAdapter):
             turn = self._keepalive_turn(buf)
             if turn is None:
                 return ("retry", None)
-            turn_had_landed = False
+            turn_had_landed = self._answer_had_landed_before(buf)
             not_sent_probe = True
+            may_have_landed_immediate_probe = True
             result = await self._post_keepalive_activity(
                 chat_id,
                 turn,
@@ -6188,21 +6232,26 @@ class Agent365Adapter(BasePlatformAdapter):
             while self._turn_buffers.get(chat_id) is buf:
                 classified = _classify_answer_final_post(result)
                 if classified == _ANSWER_FINAL_MAY_HAVE_LANDED:
-                    buf["final_may_have_landed"] = True
+                    self._record_answer_may_have_landed(buf)
+                    self._record_answer_had_landed(buf)
                     turn_had_landed = True
                     if result.timeout_after_send:
                         break
-                    result = await self._post_keepalive_activity(
-                        chat_id,
-                        turn,
-                        stream_id=stream_id,
-                        sequence=0,
-                        final=True,
-                        text=content,
-                        message_chrome=True,
-                    )
-                    continue
+                    if may_have_landed_immediate_probe:
+                        may_have_landed_immediate_probe = False
+                        result = await self._post_keepalive_activity(
+                            chat_id,
+                            turn,
+                            stream_id=stream_id,
+                            sequence=0,
+                            final=True,
+                            text=content,
+                            message_chrome=True,
+                        )
+                        continue
+                    break
                 if classified == _ANSWER_FINAL_DELIVERED:
+                    self._record_answer_had_landed(buf)
                     turn_had_landed = True
                     self._touch_keepalive_emit(chat_id, buf)
                     activity_id = result.stream_id or stream_id
@@ -6220,7 +6269,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     return ("delivered", activity_id or None)
                 elif classified == _ANSWER_FINAL_ALREADY_COMPLETED:
-                    if turn_had_landed:
+                    if turn_had_landed or self._answer_had_landed_before(buf):
                         self._touch_keepalive_emit(chat_id, buf)
                         buf["keepalive"] = {}
                         logger.info(
@@ -6259,6 +6308,8 @@ class Agent365Adapter(BasePlatformAdapter):
                         reason,
                     )
                     return ("fallback", reason)
+                elif classified == _ANSWER_FINAL_DEFER:
+                    break
                 elif classified == _ANSWER_FINAL_RETRYABLE:
                     if attempt >= _ANSWER_FINAL_MAX_ATTEMPTS:
                         break
@@ -6315,10 +6366,13 @@ class Agent365Adapter(BasePlatformAdapter):
             self._touch_keepalive_emit(chat_id, buf)
             status = result.status
             classified = _classify_answer_final_post(result)
-            if classified == _ANSWER_FINAL_MAY_HAVE_LANDED:
+            if (
+                classified == _ANSWER_FINAL_MAY_HAVE_LANDED
+                and result.timeout_after_send
+            ):
                 buf["keepalive"] = {}
                 logger.warning(
-                    "agent365 turn buffer treating ambiguous answer final as "
+                    "agent365 turn buffer treating timed-out answer final as "
                     "delivered: chat_id=%s stream_id=%s",
                     chat_id,
                     stream_id,
@@ -6409,8 +6463,11 @@ class Agent365Adapter(BasePlatformAdapter):
             during_mint,
         )
 
-    @staticmethod
-    def _plain_answer_blocked(buf: dict[str, Any]) -> bool:
+    @classmethod
+    def _plain_answer_blocked(cls, buf: dict[str, Any]) -> bool:
+        delivery = buf.get("answer_delivery")
+        if isinstance(delivery, dict) and delivery.get("may_have_landed"):
+            return True
         return bool(buf.get("final_may_have_landed"))
 
     def _answer_uncertain_delivery(
@@ -6472,9 +6529,6 @@ class Agent365Adapter(BasePlatformAdapter):
         try:
             if chat_id:
                 self._close_innermost_turn(chat_id)
-                buf = self._turn_buffers.get(chat_id)
-                if isinstance(buf, dict):
-                    self._reset_turn_answer_delivery_state(buf)
                 await self._flush_turn_buffer(chat_id)
                 await self._flush_pending_coalesced_replies(chat_id)
                 # #161: the stream consumer's finalize edit runs on a task
@@ -6527,6 +6581,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 ),
             )
         segments: list[dict[str, str]] = buf["segments"]
+        if not segments:
+            self._reset_turn_answer_delivery_state(buf)
         turn_seq = str(turn.get("seq") or "")
         own = [segment for segment in segments if str(segment.get("turn") or "") == turn_seq]
         if own and own[-1]["text"] == text:
@@ -6923,6 +6979,7 @@ class Agent365Adapter(BasePlatformAdapter):
             for segment in buf.get("segments") or []
             if str(segment.get("id") or "") not in drop
         ]
+        Agent365Adapter._clear_answer_delivery_if_unpending(buf)
 
     async def send_private_notice(
         self,

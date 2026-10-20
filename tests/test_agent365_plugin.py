@@ -9983,6 +9983,73 @@ class TestEditMessage:
         assert "conv-G-two-turn" not in a._turn_buffers
 
     @pytest.mark.asyncio
+    async def test_nested_turn_does_not_clear_outer_answer_delivery_latch(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-nest-latch", activity_id="act-outer")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        outer_finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") != "final":
+                return self._http_result(201, "ka-nest")
+            text = kwargs["json"].get("text") or ""
+            if text == "Outer body":
+                outer_finals["n"] += 1
+                if outer_finals["n"] <= 2:
+                    raise httpx.RemoteProtocolError("dropped")
+                return MagicMock(
+                    status_code=403,
+                    text="already completed",
+                    json=lambda: {"error": {"message": "already completed"}},
+                )
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        outer_event = _StubMessageEvent(
+            text="outer",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-nest-latch"),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(outer_event)
+        buf = a._turn_buffers["conv-G-nest-latch"]
+        buf["keepalive"] = {
+            "stream_id": "ka-nest",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(
+            chat_id="conv-G-nest-latch", content="Outer body", reply_to=None
+        )
+        await a.on_processing_complete(outer_event, outcome="success")
+        assert adapter_mod.Agent365Adapter._plain_answer_blocked(buf)
+        assert [s["text"] for s in buf["segments"]] == ["Outer body"]
+
+        inbound["id"] = "act-inner"
+        inner_event = _StubMessageEvent(
+            text="inner",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-nest-latch"),
+            message_id="act-inner",
+        )
+        await a.on_processing_start(inner_event)
+        assert adapter_mod.Agent365Adapter._plain_answer_blocked(buf)
+        await a.on_processing_complete(inner_event, outcome="success")
+        assert outer_finals["n"] == 3
+        assert send_reply_mock.await_count == 0
+        assert "conv-G-nest-latch" not in a._turn_buffers
+
+    @pytest.mark.asyncio
     async def test_token_timeout_on_open_stream_retries_mint(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
