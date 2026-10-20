@@ -32,8 +32,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   Legacy schema v1 is unscoped: apply requires `--app-version` to seed v2
   state instead of implicitly claiming the current tenant/profile on read.
   Fresh-mint state replacement follows resolver `freshly_minted` (including
-  combined `--aiteammate --copilot-chat` default). Mismatch hints never steer
+  combined `--aiteammate --copilot-chat` default).   Mismatch hints never steer
   operators toward reusing the AI Teammate catalog id on the CEA zip.
+
+- **Copilot Chat publish state follow-up (#171, #196).** Schema v2
+  `tenantId` scope now canonicalises GUID spelling (case, braces,
+  hyphenation) on write and compare so it matches `tenant_ids_match`.
+  Path-B-only `--manifest-id` mismatch hints keep the “pass the stored
+  id” recovery instead of the combined-publish AI Teammate collision
+  wording.
 
 - **#180 — Teams reactions no longer start an agent turn by default.** Recording
   and #80 logging still run; only `reactions_dispatch_agent_turn` restores the

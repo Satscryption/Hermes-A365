@@ -812,13 +812,17 @@ _COPILOT_CHAT_PUBLISH_STATE_UNSCOPED_V1 = "_unscopedV1"
 
 
 def _normalize_publish_state_tenant_id(tenant_id: str) -> str:
+    """Canonical tenant GUID for publish-state scope (matches ``tenant_ids_match``)."""
     tenant = tenant_id.strip()
     if not tenant:
         raise PublishError(
             "no canonical tenant pin was resolved; pass --tenant-id or set "
             "A365_TENANT_ID before publishing"
         )
-    return tenant
+    try:
+        return str(uuid.UUID(tenant))
+    except ValueError:
+        return tenant
 
 
 @dataclass(frozen=True)
@@ -916,13 +920,19 @@ def _publish_state_manifest_id_mismatch_message(
     stored_id: str,
     catalog_manifest_id: str,
     aiteammate_catalog_id: str | None,
+    inputs: PublishInputs,
+    state_cea_catalog_id_minted: bool,
 ) -> str:
     base = (
         f"Copilot Chat publish state at {path} records manifestId {stored_id}, "
         f"but this publish targets {catalog_manifest_id}. "
     )
+    combined_or_auto_state = (
+        (inputs.aiteammate and inputs.copilot_chat) or state_cea_catalog_id_minted
+    )
     if (
-        aiteammate_catalog_id
+        combined_or_auto_state
+        and aiteammate_catalog_id
         and stored_id == _canonical_manifest_guid(aiteammate_catalog_id)
     ):
         return (
@@ -959,7 +969,9 @@ def _validate_publish_state_scope(
             f"Copilot Chat publish state at {path} is missing profile; "
             "fix or remove the file before re-running publish --apply"
         )
-    if stored_tenant != tenant_id:
+    if _normalize_publish_state_tenant_id(
+        stored_tenant
+    ) != _normalize_publish_state_tenant_id(tenant_id):
         raise PublishError(
             f"Copilot Chat publish state at {path} belongs to tenant "
             f"{stored_tenant!r}, not the current publish pin {tenant_id!r}. "
@@ -1105,12 +1117,16 @@ def _assert_publish_state_matches_catalog_id(
         return
     if stored_id == _canonical_manifest_guid(catalog_manifest_id):
         return
+    minted = record.get("ceaCatalogIdMinted")
+    state_cea_catalog_id_minted = bool(minted) if isinstance(minted, bool) else False
     raise PublishError(
         _publish_state_manifest_id_mismatch_message(
             path,
             stored_id=stored_id,
             catalog_manifest_id=catalog_manifest_id,
             aiteammate_catalog_id=aiteammate_catalog_id,
+            inputs=inputs,
+            state_cea_catalog_id_minted=state_cea_catalog_id_minted,
         )
     )
 
@@ -1231,7 +1247,7 @@ def _write_copilot_chat_publish_state(
     _guard_copilot_chat_publish_state_path(path, hermes_home)
     payload = {
         "schemaVersion": _COPILOT_CHAT_PUBLISH_STATE_SCHEMA,
-        "tenantId": tenant_id,
+        "tenantId": _normalize_publish_state_tenant_id(tenant_id),
         "profile": profile,
         "manifestId": _canonical_manifest_guid(manifest_id),
         "lastAppVersion": _format_app_version(_parse_app_version_triple(app_version)),

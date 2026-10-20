@@ -2267,6 +2267,47 @@ class TestApplyPublishPlanCopilotChat:
                 plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
             )
 
+    def test_path_b_manifest_id_mismatch_suggests_pass_stored_id(
+        self, tmp_path
+    ):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        template_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        other_id = "22222222-2222-2222-2222-222222222222"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            state_path,
+            manifest_id=template_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+            cea_catalog_id_minted=False,
+        )
+        manifest = {
+            "id": template_id,
+            "version": "1.1.4",
+            "webApplicationInfo": {"id": "the-bot"},
+            "name": {"short": "X", "full": "X"},
+        }
+        zp = self._seed_manifest_zip(tmp_path, manifest)
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                manifest_id=other_id,
+            )
+        )
+        with pytest.raises(PublishError) as exc:
+            apply_publish_plan(
+                plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
+            )
+        message = str(exc.value)
+        assert f"Pass --manifest-id {template_id}" in message
+        assert "do not pass --manifest-id" not in message
+        assert "mint a distinct CEA catalog id" not in message
+
     def test_mismatch_hint_never_suggests_aiteammate_catalog_id(
         self, tmp_path
     ):
@@ -2494,6 +2535,86 @@ class TestApplyPublishPlanCopilotChat:
         )
         with pytest.raises(PublishError, match="belongs to tenant"):
             apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+    def test_publish_state_tenant_guid_spelling_variants_accepted(
+        self, tmp_path
+    ):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        manifest_id = "44444444-4444-4444-4444-444444444444"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            state_path,
+            manifest_id=manifest_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+        )
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        record["tenantId"] = "{AAAAAAAA-0000-0000-0000-000000000001}"
+        state_path.write_text(json.dumps(record, indent=2) + "\n", encoding="utf-8")
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": manifest_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        braced_pin = "{aaaaaaaa-0000-0000-0000-000000000001}"
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                tenant_id=braced_pin,
+                app_version="1.1.5",
+            )
+        )
+        apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
+        )
+        updated = json.loads(state_path.read_text(encoding="utf-8"))
+        assert updated["tenantId"] == _TEST_TENANT
+        assert updated["lastAppVersion"] == "1.1.5"
+
+    def test_publish_state_tenant_guid_hyphenless_pin_accepted(self, tmp_path):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        manifest_id = "44444444-4444-4444-4444-444444444444"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            state_path,
+            manifest_id=manifest_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+        )
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": manifest_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        hyphenless = "aaaaaaaa000000000000000000000001"
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                tenant_id=hyphenless,
+                app_version="1.1.5",
+            )
+        )
+        apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
+        )
 
     def test_publish_state_profile_isolation(self, tmp_path, monkeypatch):
         from hermes_a365.publish import (
