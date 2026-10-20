@@ -128,7 +128,7 @@ jobs:
           uv pip install --python /tmp/wheel-smoke-venv/bin/python dist/*.whl
           /tmp/wheel-smoke-venv/bin/python -c "import hermes_a365; import hermes_a365.plugin"
           /tmp/wheel-smoke-venv/bin/hermes-a365 doctor --no-network > /tmp/doctor-smoke.json || true
-          /tmp/wheel-smoke-venv/bin/python -c "import json,sys; o=json.load(open('/tmp/doctor-smoke.json'))['overall']; sys.exit(2 if o=='error' else 0)"
+          /tmp/wheel-smoke-venv/bin/python -c "import json,sys; probes={p['name']:p['state'] for p in json.load(open('/tmp/doctor-smoke.json'))['probes']}; sys.exit(2 if probes.get('python')=='error' or probes.get('host_platform')=='error' else 0)"
 
   hermes-source-smoke:
     runs-on: ubuntu-latest

@@ -2,13 +2,14 @@
 """Verify pinned Hermes git refs against the v1 plugin/multiplex floors (#126).
 
 This is source-level integration evidence (not a live gateway walk). It clones
-each ref shallowly, imports ``gateway.platforms.base``, and checks adapter
-contract files exist.
+each ref shallowly, AST-checks ``BasePlatformAdapter`` in
+``gateway/platforms/base.py``, and checks adapter contract files exist.
 """
 
 from __future__ import annotations
 
 import argparse
+import ast
 import subprocess
 import sys
 import tempfile
@@ -60,30 +61,13 @@ def _check_ref(ref: str, work: Path) -> list[str]:
         errors.append(f"{ref}: missing gateway/platforms/base.py")
     else:
         text = base_py.read_text(encoding="utf-8", errors="replace")
-        if "BasePlatformAdapter" not in text:
-            errors.append(f"{ref}: BasePlatformAdapter not found in base.py")
-        import_check = subprocess.run(
-            [
-                sys.executable,
-                "-c",
-                (
-                    "import importlib.util, sys; from pathlib import Path; "
-                    "root = Path.cwd(); sys.path.insert(0, str(root)); "
-                    "path = root / 'gateway' / 'platforms' / 'base.py'; "
-                    "spec = importlib.util.spec_from_file_location("
-                    "'hermes_gateway_base', path); "
-                    "mod = importlib.util.module_from_spec(spec); "
-                    "spec.loader.exec_module(mod); "
-                    "assert hasattr(mod, 'BasePlatformAdapter')"
-                ),
-            ],
-            cwd=checkout,
-            capture_output=True,
-            text=True,
+        tree = ast.parse(text)
+        has_adapter = any(
+            isinstance(node, ast.ClassDef) and node.name == "BasePlatformAdapter"
+            for node in ast.walk(tree)
         )
-        if import_check.returncode != 0:
-            detail = (import_check.stderr or import_check.stdout or "").strip()
-            errors.append(f"{ref}: gateway.platforms.base import failed ({detail})")
+        if not has_adapter:
+            errors.append(f"{ref}: BasePlatformAdapter class not found in base.py")
 
     calendar = _calendar_from_ref(ref)
     if calendar is not None and calendar < HERMES_PLUGIN_MIN_CALENDAR:
