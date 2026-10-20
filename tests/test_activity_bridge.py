@@ -37,6 +37,7 @@ from hermes_a365.activity_bridge import (
     MAX_JWT_BYTES,
     OBSERVABILITY_RESOURCE_APPID,
     TENANT_TOKEN_URL_TEMPLATE,
+    WEBHOOK_FORWARD_ACTIVITY_TYPES,
     BridgeConfig,
     BridgeConfigError,
     JwtValidationError,
@@ -60,6 +61,7 @@ from hermes_a365.activity_bridge import (
     acquire_t2_token,
     acquire_token,
     acquire_user_fic_token,
+    activity_forwards_to_webhook,
     build_ai_message_entity,
     build_webhook_envelope,
     load_agent_env,
@@ -4092,6 +4094,42 @@ class TestSecurityRequestBoundary:
         assert response.status_code == 200
         assert response.json() == {"status": "acked"}
         assert capture["webhook"] == []
+
+    @pytest.mark.parametrize(
+        "activity_type",
+        [
+            "messageReaction",
+            "messageUpdate",
+            "messageDelete",
+            "event",
+            "fooBar",
+        ],
+    )
+    def test_serve_does_not_forward_non_webhook_contract_types(
+        self, activity_type: str
+    ) -> None:
+        capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        activity = _inbound_message_activity()
+        activity["type"] = activity_type
+        if activity_type == "messageUpdate":
+            activity["channelData"] = {"eventType": "undeleteMessage"}
+        client = _client_for(cfg, capture=capture)
+
+        response = client.post("/api/messages", json=activity)
+
+        assert response.status_code == 200
+        assert response.json() == {"status": "acked", "reason": "unhandled_type"}
+        assert capture["webhook"] == []
+
+    @pytest.mark.parametrize("activity_type", sorted(WEBHOOK_FORWARD_ACTIVITY_TYPES))
+    def test_webhook_contract_forwarded_types(self, activity_type: str) -> None:
+        activity = _inbound_message_activity()
+        activity["type"] = activity_type
+        if activity_type == "invoke":
+            activity["name"] = "task/fetch"
+        assert activity_forwards_to_webhook(activity) is True
 
     def test_authorization_accepts_any_normalized_activity_user_alias(self) -> None:
         capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
