@@ -813,7 +813,8 @@ class _KeepalivePost(NamedTuple):
     turned into a stream whose id this process does not have: a 2xx
     body with no id, or a timeout after the request was sent.
     ``timeout_after_send`` is set when a ``ReadTimeout`` or
-    ``WriteTimeout`` may mean the activity was already stored.
+    ``WriteTimeout`` on the activity POST may mean it was already stored.
+    ``retry_after_sec`` is honoured for throttling and transient 5xx.
     """
 
     status: int | None
@@ -821,6 +822,7 @@ class _KeepalivePost(NamedTuple):
     detail: str
     untracked: bool
     timeout_after_send: bool = False
+    retry_after_sec: float = 0.0
 
 
 def _keepalive_rotation_due(age: float) -> bool:
@@ -842,6 +844,19 @@ def _keepalive_rotation_due(age: float) -> bool:
 def _keepalive_user_cancelled(detail: str) -> bool:
     low = detail.casefold()
     return "canceled by user" in low or "cancelled by user" in low
+
+
+def _parse_retry_after_seconds(resp: Any) -> float:
+    headers = getattr(resp, "headers", None)
+    if headers is None:
+        return 0.0
+    raw = headers.get("Retry-After") or headers.get("retry-after")
+    if raw is None:
+        return 0.0
+    try:
+        return max(0.0, float(raw))
+    except (TypeError, ValueError):
+        return 0.0
 
 
 def _keepalive_final_closed(result: _KeepalivePost) -> bool:
@@ -961,6 +976,8 @@ _STREAMING_FINALIZE_MAX_FAILURES = 2
 # we cannot name, and a second start would be a second bubble.
 _STREAM_EDIT_MAX_ATTEMPTS = 3
 _STREAM_EDIT_RETRY_STATUSES = frozenset({429, 500, 502, 503, 504})
+_ANSWER_FINAL_MAX_ATTEMPTS = 5
+_ANSWER_FINAL_RETRY_STATUSES = _STREAM_EDIT_RETRY_STATUSES
 _COALESCED_REPLY_FLUSH_AFTER_SEC = _STREAMING_FORCE_DROP_AFTER_SEC
 _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
@@ -5562,7 +5579,9 @@ class Agent365Adapter(BasePlatformAdapter):
         if (
             not stream_id
             and not result.untracked
-            and (for_answer or status is None)
+            and for_answer
+            and status is not None
+            and not (200 <= status < 300 and new_id)
         ):
             failed = dict(self._keepalive_state(buf))
             failed["open_failed"] = True
@@ -5712,39 +5731,55 @@ class Agent365Adapter(BasePlatformAdapter):
         validated = turn.get("validated_path")
         path = validated if isinstance(validated, str) else None
         url = _conversations_activities_url(service_url, conv_id)
+        opening = not final and not stream_id
         # A timeout while minting the token is before this activity POST.
         # Only the POST itself can have created a stream.
-        try:
-            token, _minted = await self._await_outbound(
-                chat_id,
-                bridge.acquire_reply_token(
-                    client=client,
-                    cfg=self._bridge_cfg,
-                    activity=inbound,
-                    fmi_cache=self._fmi_cache,
-                    user_cache=self._user_cache,
-                    bf_cache=self._bf_token_cache,
-                    validated_path=(
-                        path
-                        if path is not None
-                        else self._validated_path_for_inbound(inbound)
+        token: str | None = None
+        mint_path = (
+            path
+            if path is not None
+            else self._validated_path_for_inbound(inbound)
+        )
+        # Retry mint timeouts only when a stream id is already held; an
+        # opener mint failure is retried by the deferred flush retry.
+        for mint_attempt in range(2 if stream_id else 1):
+            try:
+                token, _minted = await self._await_outbound(
+                    chat_id,
+                    bridge.acquire_reply_token(
+                        client=client,
+                        cfg=self._bridge_cfg,
+                        activity=inbound,
+                        fmi_cache=self._fmi_cache,
+                        user_cache=self._user_cache,
+                        bf_cache=self._bf_token_cache,
+                        validated_path=mint_path,
                     ),
-                ),
-            )
-        except asyncio.CancelledError:
-            raise
-        except RuntimeError as exc:
-            if str(exc) == "agent365 outbound operation cancelled":
+                )
+                break
+            except asyncio.CancelledError:
                 raise
-            return self._keepalive_post_exception(chat_id, exc, opening=False)
-        except Exception as exc:
-            return self._keepalive_post_exception(chat_id, exc, opening=False)
+            except RuntimeError as exc:
+                if str(exc) == "agent365 outbound operation cancelled":
+                    raise
+                if mint_attempt == 0 and self._keepalive_timeout_after_send(exc):
+                    continue
+                return self._keepalive_post_exception(
+                    chat_id, exc, opening=opening, during_mint=True
+                )
+            except Exception as exc:
+                if mint_attempt == 0 and self._keepalive_timeout_after_send(exc):
+                    continue
+                return self._keepalive_post_exception(
+                    chat_id, exc, opening=opening, during_mint=True
+                )
+        if token is None:
+            return empty
         if not for_teardown and (
             not self._lifecycle_is_current(generation, client)
             or not self._chat_lifecycle_is_current(chat_id, chat_generation)
         ):
             return empty
-        opening = not final and not stream_id
         try:
             resp = await self._await_outbound(
                 chat_id,
@@ -5781,7 +5816,14 @@ class Agent365Adapter(BasePlatformAdapter):
         untracked = (
             not final and not stream_id and 200 <= status < 300 and not new_id
         )
-        return _KeepalivePost(status, new_id, detail, untracked, False)
+        retry_after_sec = (
+            _parse_retry_after_seconds(resp)
+            if status in _ANSWER_FINAL_RETRY_STATUSES
+            else 0.0
+        )
+        return _KeepalivePost(
+            status, new_id, detail, untracked, False, retry_after_sec
+        )
 
     @staticmethod
     def _answer_final_timeout_delivered(result: _KeepalivePost) -> bool:
@@ -5795,11 +5837,9 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if Agent365Adapter._answer_final_timeout_delivered(result):
             return False
-        if result.status == 403 and _keepalive_final_closed(result):
-            return True
-        if result.status is not None and result.status >= 400:
-            return True
-        return False
+        return bool(
+            result.status == 403 and _keepalive_final_closed(result)
+        )
 
     async def _sleep_turn_buffer_stream_gap_locked(
         self, chat_id: str, buf: dict[str, Any]
@@ -5822,13 +5862,26 @@ class Agent365Adapter(BasePlatformAdapter):
         finally:
             await lock.acquire()
 
+    async def _sleep_turn_buffer_locked(
+        self, chat_id: str, buf: dict[str, Any], delay: float
+    ) -> None:
+        """Sleep without blocking other keep-alive work on this buffer."""
+        if delay <= 0:
+            return
+        lock = self._turn_buffer_lock(buf)
+        if not lock.locked():
+            await asyncio.sleep(delay)
+            return
+        lock.release()
+        try:
+            await asyncio.sleep(delay)
+        finally:
+            await lock.acquire()
+
     async def _deliver_turn_answer_locked(
         self,
         chat_id: str,
-        inbound: dict[str, Any],
         content: str,
-        *,
-        validated_path: str | None,
     ) -> tuple[str, str | None]:
         """Deliver one merged chunk on the turn-buffer stream.
 
@@ -5902,6 +5955,7 @@ class Agent365Adapter(BasePlatformAdapter):
         turn = self._keepalive_turn(buf)
         if turn is None:
             return ("retry", None)
+        ambiguous_retry = False
         result = await self._post_keepalive_activity(
             chat_id,
             turn,
@@ -5911,27 +5965,78 @@ class Agent365Adapter(BasePlatformAdapter):
             text=content,
             message_chrome=True,
         )
-        if (
-            self._turn_buffers.get(chat_id) is buf
-            and not self._answer_final_timeout_delivered(result)
-            and not (
-                result.status is not None and 200 <= result.status < 300
-            )
-            and not self._answer_final_requires_plain_reply(result)
-        ):
-            result = await self._post_keepalive_activity(
-                chat_id,
-                turn,
-                stream_id=stream_id,
-                sequence=0,
-                final=True,
-                text=content,
-                message_chrome=True,
-            )
+        attempt = 1
+        while self._turn_buffers.get(chat_id) is buf:
+            if result.status is not None and 200 <= result.status < 300:
+                break
+            if self._answer_final_timeout_delivered(result):
+                break
+            if self._answer_final_requires_plain_reply(result):
+                break
+            if (
+                not ambiguous_retry
+                and result.status is None
+                and not result.timeout_after_send
+            ):
+                ambiguous_retry = True
+                result = await self._post_keepalive_activity(
+                    chat_id,
+                    turn,
+                    stream_id=stream_id,
+                    sequence=0,
+                    final=True,
+                    text=content,
+                    message_chrome=True,
+                )
+                continue
+            if (
+                result.status in _ANSWER_FINAL_RETRY_STATUSES
+                and attempt < _ANSWER_FINAL_MAX_ATTEMPTS
+            ):
+                delay = result.retry_after_sec
+                if delay <= 0.0:
+                    delay = min(2.0 ** attempt, 60.0)
+                attempt += 1
+                await self._sleep_turn_buffer_locked(chat_id, buf, delay)
+                if self._turn_buffers.get(chat_id) is not buf:
+                    return ("retry", None)
+                stream = self._keepalive_state(buf)
+                stream_id = str(stream.get("stream_id") or "")
+                if not stream_id:
+                    return ("retry", None)
+                turn = self._keepalive_turn(buf)
+                if turn is None:
+                    return ("retry", None)
+                result = await self._post_keepalive_activity(
+                    chat_id,
+                    turn,
+                    stream_id=stream_id,
+                    sequence=0,
+                    final=True,
+                    text=content,
+                    message_chrome=True,
+                )
+                continue
+            break
         if self._turn_buffers.get(chat_id) is not buf:
             return ("retry", None)
         self._touch_keepalive_emit(chat_id, buf)
         status = result.status
+        if (
+            ambiguous_retry
+            and status == 403
+            and "already completed" in result.detail.casefold()
+            and not _keepalive_user_cancelled(result.detail)
+        ):
+            buf["keepalive"] = {}
+            logger.info(
+                "agent365 turn buffer answer final: chat_id=%s stream_id=%s "
+                "chars=%s (retry saw already completed)",
+                chat_id,
+                stream_id,
+                len(content),
+            )
+            return ("delivered", None)
         if status is not None and 200 <= status < 300:
             activity_id = result.stream_id or stream_id
             if activity_id:
@@ -5993,10 +6098,17 @@ class Agent365Adapter(BasePlatformAdapter):
         return isinstance(exc, (httpx.ReadTimeout, httpx.WriteTimeout))
 
     def _keepalive_post_exception(
-        self, chat_id: str, exc: BaseException, *, opening: bool
+        self,
+        chat_id: str,
+        exc: BaseException,
+        *,
+        opening: bool,
+        during_mint: bool = False,
     ) -> _KeepalivePost:
         message = str(exc)
-        timeout_after_send = self._keepalive_timeout_after_send(exc)
+        timeout_after_send = (
+            not during_mint and self._keepalive_timeout_after_send(exc)
+        )
         untracked = opening and timeout_after_send
         logger.warning(
             "agent365 turn buffer keep-alive POST failed: chat_id=%s error=%s",
@@ -6292,20 +6404,15 @@ class Agent365Adapter(BasePlatformAdapter):
             validated_path = turn.get("validated_path")
             path = validated_path if isinstance(validated_path, str) else None
             first_chunk_on_stream = True
-            stream_final_activity_id: str | None = None
             for chunk_segments, content in chunks:
                 if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
                     chat_id
                 ):
                     return
                 if first_chunk_on_stream:
-                    outcome, stream_final_activity_id = (
-                        await self._deliver_turn_answer_locked(
-                            chat_id,
-                            inbound,
-                            content,
-                            validated_path=path,
-                        )
+                    outcome, _final_id = await self._deliver_turn_answer_locked(
+                        chat_id,
+                        content,
                     )
                     if outcome == "blocked":
                         if not self._turn_reply_blocked(chat_id):
@@ -10005,8 +10112,9 @@ class Agent365Adapter(BasePlatformAdapter):
 
         Called from ``on_processing_complete``, which runs after Hermes
         has cancelled the stream consumer. A missing final is what leaves
-        the Teams Stop button up (#161). Non-personal chats do not use
-        this map; their reply is the coalesced ``send_reply``.
+        the Teams Stop button up (#161). Non-personal chats deliver the
+        merged turn-buffer body as ``streamType=final`` on one informative
+        stream (#182).
         """
         message_id = self._active_stream_by_chat.get(str(chat_id))
         if not message_id:
@@ -10056,9 +10164,9 @@ class Agent365Adapter(BasePlatformAdapter):
         body. Transient failures on an open stream are retried; other
         intermediate failures keep the stream (#83).
 
-        Non-personal chat types are coalesced into a single normal
-        ``send_reply`` on ``finalize=True`` because Copilot Chat
-        accepts but does not visibly render BF streaming activities.
+        Non-personal chats buffer locally and post one
+        ``streamType=final`` on turn end (#182). Personal chats keep
+        the ``streamType=streaming`` sequence above.
 
         Returns ``SendResult(success=False, ...)`` and falls back to
         ``send()`` on:

@@ -3792,7 +3792,7 @@ class TestLifecycleCapture:
         }
 
         async def deliver_waits(
-            chat_id: str, inbound: dict[str, Any], content: str, **kwargs: Any
+            chat_id: str, content: str, **kwargs: Any
         ) -> tuple[str, str | None]:
             close_entered.set()
             await release_close.wait()
@@ -7371,6 +7371,7 @@ class TestEditMessage:
         inbound = _make_inbound(conv_id="conv-G-buf", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         a._handoff_link_enabled = True
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
@@ -7443,14 +7444,15 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         await a.on_processing_complete(event, outcome="success")
 
-        assert send_reply_mock.await_count == 1
-        kwargs = send_reply_mock.await_args.kwargs
-        assert kwargs["inbound"]["id"] == "act-1"
-        assert kwargs["validated_path"] == "A"
-        text = kwargs["reply"]["text"]
-        assert text.startswith("Using the tool.\n\nFinal answer\n\n[Continue in Teams](")
+        assert send_reply_mock.await_count == 0
         assert "conv-G-buf" not in a._turn_buffers
-        assert post_mock.await_count == 0
+        assert post_mock.await_count == 2
+        final = post_mock.await_args_list[-1].kwargs["json"]
+        assert final["type"] == "message"
+        text = final["text"]
+        assert text.startswith("Using the tool.\n\nFinal answer\n\n[Continue in Teams](")
+        assert final["entities"][0]["streamType"] == "final"
+        assert "streamSequence" not in final["entities"][0]
 
         await a.on_processing_start(event)
         assert "conv-G-buf" in a._turn_buffers
@@ -7473,7 +7475,8 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-progress", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -7511,10 +7514,10 @@ class TestEditMessage:
         assert answer.success is True
 
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == 1
-        assert (
-            send_reply_mock.await_args.kwargs["reply"]["text"]
-            == "Thursday, 16 October."
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_count == 2
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
+            "Thursday, 16 October."
         )
 
         await a.on_processing_start(event)
@@ -7525,7 +7528,8 @@ class TestEditMessage:
         )
         assert only_progress.success is True
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_count == 2
 
         await a.on_processing_start(event)
         edited = await a.send(
@@ -7553,8 +7557,8 @@ class TestEditMessage:
         assert mixed.success is True
         assert prose.success is True
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == 2
-        assert send_reply_mock.await_args.kwargs["reply"]["text"] == (
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
             "Replaced with the answer.\n\n"
             "The command was date.\n💻 Running date is not the whole reply.\n\n"
             "Running date locally is fine."
@@ -7569,7 +7573,8 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-answer", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -7590,8 +7595,8 @@ class TestEditMessage:
             )
             assert result.success is True
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == 1
-        assert send_reply_mock.await_args.kwargs["reply"]["text"] == (
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
             "📝 Writing the patch is done.\n\n"
             "💬 Running through it: the date is Thursday.\n\n"
             "\u270d\ufe0f Writing the patch is done."
@@ -7609,7 +7614,8 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-nest", activity_id="act-outer")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -7661,11 +7667,9 @@ class TestEditMessage:
             "2": ["Follow-up reply", "Follow-up note"],
         }
         await a.on_processing_complete(follow_event, outcome="success")
-        texts = [
-            call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list
-        ]
-        assert texts == ["Follow-up reply\n\nFollow-up note"]
-        assert send_reply_mock.await_args.kwargs["inbound"]["id"] == "act-followup"
+        assert send_reply_mock.await_count == 0
+        follow_final = post_mock.await_args_list[-1].kwargs["json"]
+        assert follow_final["text"] == "Follow-up reply\n\nFollow-up note"
         assert a._turn_buffers["conv-G-nest"]["depth"] == 1
         outer_segments = [
             segment
@@ -7681,15 +7685,16 @@ class TestEditMessage:
         )
         assert edited.success is True
         await a.on_processing_complete(outer_event, outcome="success")
-        texts = [
-            call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list
+        assert send_reply_mock.await_count == 0
+        finals = [
+            call.kwargs["json"]["text"]
+            for call in post_mock.await_args_list
+            if call.kwargs["json"]["type"] == "message"
         ]
-        assert texts == [
+        assert finals == [
             "Follow-up reply\n\nFollow-up note",
             "Outer final\n\nOuter still streaming",
         ]
-        assert send_reply_mock.await_args_list[1].kwargs["inbound"]["id"] == "act-outer"
-        assert send_reply_mock.await_count == 2
         assert "conv-G-nest" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -7774,7 +7779,8 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-split", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -7789,12 +7795,16 @@ class TestEditMessage:
             result = await a.send(chat_id="conv-G-split", content=part, reply_to=None)
             assert result.success is True
         await a.on_processing_complete(event, outcome="success")
-        texts = [
-            call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == parts[2]
+        finals = [
+            call.kwargs["json"]
+            for call in post_mock.await_args_list
+            if call.kwargs["json"]["type"] == "message"
         ]
-        # 1500 + blank line + 1500 fits; the third segment does not.
-        assert texts == [f"{parts[0]}\n\n{parts[1]}", parts[2]]
-        assert all(len(text) <= a.MAX_MESSAGE_LENGTH for text in texts)
+        assert len(finals) == 1
+        assert finals[0]["text"] == f"{parts[0]}\n\n{parts[1]}"
+        assert finals[0]["entities"][0]["streamType"] == "final"
         assert "conv-G-split" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -7806,7 +7816,8 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-live", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -7832,10 +7843,9 @@ class TestEditMessage:
         )
         assert edited.success is True
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == 1
-        assert (
-            send_reply_mock.await_args.kwargs["reply"]["text"]
-            == "Still streaming, edited"
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
+            "Still streaming, edited"
         )
         assert "conv-G-live" not in a._turn_buffers
 
@@ -7851,15 +7861,28 @@ class TestEditMessage:
         inbound = _make_inbound(conv_id="conv-G-once", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         parts = [char * 1500 for char in ("A", "B", "C")]
         first = f"{parts[0]}\n\n{parts[1]}"
-        posted: list[str] = []
+        final_posts: list[str] = []
+        overflow_posts: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            if activity["type"] == "message":
+                final_posts.append(activity["text"])
+                return MagicMock(status_code=202, text="", json=lambda: {})
+            return MagicMock(
+                status_code=201, text="", json=lambda: {"id": "stream-once"}
+            )
+
+        a._http_client.post = post
 
         async def send_reply(**kwargs: Any) -> None:
             text = kwargs["reply"]["text"]
-            posted.append(text)
-            if text == parts[2] and posted.count(parts[2]) == 1:
+            overflow_posts.append(text)
+            if text == parts[2] and overflow_posts.count(parts[2]) == 1:
                 raise RuntimeError("timeout after the request was sent")
 
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -7874,11 +7897,13 @@ class TestEditMessage:
             assert result.success is True
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0)
         await a.on_processing_complete(event, outcome="success")
-        assert posted == [first, parts[2]]
+        assert final_posts == [first]
+        assert overflow_posts == [parts[2]]
         assert "conv-G-once" not in a._turn_buffers
         await asyncio.sleep(0)
         await a.on_processing_complete(event, outcome="success")
-        assert posted == [first, parts[2]]
+        assert final_posts == [first]
+        assert overflow_posts == [parts[2]]
 
     @pytest.mark.asyncio
     async def test_deferred_retry_waits_until_no_turn_is_open(
@@ -8024,7 +8049,8 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-live-turn", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -8054,11 +8080,10 @@ class TestEditMessage:
         assert final.success is True
         assert send_reply_mock.await_count == 0
         await a.on_processing_complete(event, outcome="success")
-        assert send_reply_mock.await_count == 1
-        assert send_reply_mock.await_args.kwargs["reply"]["text"] == (
+        assert send_reply_mock.await_count == 0
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
             "Checking the current time now.\n\nThe current time is 16:37 UTC."
         )
-        assert send_reply_mock.await_args.kwargs["inbound"]["id"] == "act-1"
         assert "conv-G-live-turn" not in a._turn_buffers
 
     def test_keepalive_windows_fit_copilot_limits(self) -> None:
@@ -8381,7 +8406,7 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Keep me"
-        assert posts["n"] == 1
+        assert posts["n"] == 2
         assert "conv-G-ka-fail" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -9120,16 +9145,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        gap_calls = {"n": 0}
-
-        async def gap_spy(_self: Any, chat_id: str, buf: dict[str, Any]) -> None:
-            gap_calls["n"] += 1
-
-        monkeypatch.setattr(
-            adapter_mod.Agent365Adapter,
-            "_sleep_turn_buffer_stream_gap_locked",
-            gap_spy,
-        )
+        sleep_mock = self._no_sleep(monkeypatch)
         event = _StubMessageEvent(
             text="hi",
             source=_StubSessionSource(platform=None, chat_id="conv-G-gap"),
@@ -9138,7 +9154,159 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await a.send(chat_id="conv-G-gap", content="Gap answer", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
-        assert gap_calls["n"] == 1
+        assert sleep_mock.await_count == 1
+        delay = sleep_mock.await_args.args[0]
+        assert 0 < delay <= adapter_mod._STREAMING_MIN_GAP_SEC
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_gap_skipped_after_stale_keepalive_emit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-gap-skip", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        sleep_mock = self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 1.5)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-gap-skip"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-gap-skip"]
+        buf["keepalive"] = {
+            "stream_id": "ka-gap",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+            "last_emit_mono": time.monotonic() - 2.0,
+        }
+        await a.send(chat_id="conv-G-gap-skip", content="No extra gap", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert sleep_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_answer_final_503_retries_without_plain_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-503", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                if finals["n"] == 1:
+                    return MagicMock(
+                        status_code=503,
+                        text="",
+                        headers={"Retry-After": "0"},
+                        json=lambda: {},
+                    )
+                return self._http_result(202)
+            return self._http_result(201, "ka-503")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        sleep_mock = self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-503"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-503", content="Recovered", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 2
+        assert send_reply_mock.await_count == 0
+        assert sleep_mock.await_count >= 1
+        assert "conv-G-503" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_answer_final_retry_already_completed_is_delivered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-dup-final", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") != "final":
+                return self._http_result(201, "ka-dup")
+            finals["n"] += 1
+            if finals["n"] == 1:
+                raise httpx.RemoteProtocolError("connection dropped")
+            return MagicMock(
+                status_code=403,
+                text="already completed",
+                json=lambda: {"error": {"message": "already completed"}},
+            )
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-dup-final"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-dup-final", content="Once only", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 2
+        assert send_reply_mock.await_count == 0
+        assert "conv-G-dup-final" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_token_timeout_on_open_stream_retries_mint(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-mint-open", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        mint_calls = {"n": 0}
+
+        async def acquire_reply_token(**_kwargs: Any) -> tuple[str, str]:
+            mint_calls["n"] += 1
+            if mint_calls["n"] == 1:
+                raise httpx.ReadTimeout("The read operation timed out")
+            return "bearer-test", "A"
+
+        monkeypatch.setattr(bridge, "acquire_reply_token", acquire_reply_token)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-mint-open"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-mint-open"]
+        buf["keepalive"] = {
+            "stream_id": "ka-open",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id="conv-G-mint-open", content="Delivered", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert mint_calls["n"] == 2
+        assert "conv-G-mint-open" not in a._turn_buffers
 
     @pytest.mark.asyncio
     async def test_personal_chat_is_not_turn_buffered(
