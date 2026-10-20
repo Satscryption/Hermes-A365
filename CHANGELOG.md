@@ -13,6 +13,42 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   dispatches Hermes' `reaction:added:<type>` / `reaction:removed:<type>` agent
   turn (#80). When disabled (the default), reactions are recorded on the #73
   feedback map and logged without invoking the agent.
+
+### Fixed
+
+- **#180 — Teams reactions no longer start an agent turn by default.** Recording
+  and #80 logging still run; only `reactions_dispatch_agent_turn` restores the
+  synthetic turn. Empty-text `message` activities with no attachments are acked
+  without dispatch so connector follow-ons cannot produce unprompted replies.
+- **#188 — Non-message inbound types no longer open agent turns or hit the
+  operator webhook.** The gateway allowlists user turns to `type=message` only
+  (invoke, `messageReaction`, card submit, and lifecycle handlers are unchanged);
+  `activity-bridge serve` still forwards only `message` and `invoke`, matching
+  `references/webhook-contract.md`.
+
+## [0.9.2] — 2026-10-19
+
+Publish smoke installs hash-pinned packaging from the requirements file.
+Tag `v0.9.1` exists (commit `680422a4`, merged PR #172, GitHub prerelease)
+but that version never published to PyPI. Publish run
+[39265071375](https://github.com/Satscryption/Hermes-A365/actions/runs/39265071375)
+failed in the build job at Smoke-install the wheel: stock venv pip rejected
+the CLI `--hash` flags (`no such option: --hash`). Integrity and the
+Python 3.11 and 3.14 tests passed; publish and release were skipped.
+PyPI latest remains 0.9.0. This 0.9.2 patch is the fix-forward. The
+`v0.9.1` tag is not moved, deleted, or retargeted.
+
+Entries for #80, #82, and #83/#161 were added after the fact: they shipped
+in v0.9.2 (`f4d85bcd`) but had been listed under `[Unreleased]`.
+
+### Added
+
+- **Docs: user-delegated OBO on Path B is out of scope for 1.0 (#88, #174).**
+  README, `SKILL.md`, and `references/m365-surface-coverage.md` state
+  that Copilot Chat with downstream calls as the signed-in user reaches
+  the same surfaces as Path B. That auth mode is deferred
+  ([#174](https://github.com/satscryption/Hermes-A365/issues/174)).
+
 - **#82 — Copilot→Teams session pin.** A continuation token stores the live
   Hermes session for the Copilot origin (`SessionDB.find_session_by_origin`).
   `handoff/action` consumes the token once, requires the same tenant and
@@ -27,14 +63,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   requires `db339f0051e76733923d3d8c4e4319e3e45444a3`, first tagged in
   `v2026.9.7` (`references/hermes-runtime-compatibility.md`).
   A live Copilot→Teams 1:1 round trip remains residual for #116 / #89.
+
 - **#80 — Teams `messageReaction` add/remove.** After the JWT, service URL,
   end-user, and replay gates, a reaction is stored on the #73 feedback
   record only when `replyToId` is a reply this process sent in the same
   conversation and tenant. The record keeps the latest add/remove and the
-  normalized reaction type. When
-  `reactions_dispatch_agent_turn` is enabled, Hermes' reaction convention
-  emits `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn)
-  for each stored change; that turn's message id is the cached user activity,
+  normalized reaction type. Hermes' reaction convention emits
+  `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn) for
+  each stored change. That turn's message id is the cached user activity,
   so the reply is not aimed at the reaction activity. A later thumbs
   submit merges into the same row and keeps `native_reactions`. Replayed,
   malformed, cross-tenant, and unrelated reactions do not change another
@@ -46,15 +82,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **#180 — Teams reactions no longer start an agent turn by default.** Recording
-  and #80 logging still run; only `reactions_dispatch_agent_turn` restores the
-  synthetic turn. Empty-text `message` activities with no attachments are acked
-  without dispatch so connector follow-ons cannot produce unprompted replies.
-- **#188 — Non-message inbound types no longer open agent turns or hit the
-  operator webhook.** The gateway allowlists user turns to `type=message` only
-  (invoke, `messageReaction`, card submit, and lifecycle handlers are unchanged);
-  `activity-bridge serve` still forwards only `message` and `invoke`, matching
-  `references/webhook-contract.md`.
+- **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
+  A handler crash, a file-consent crash, a deduped invoke, a decline, an
+  unknown file consent, and an operator-webhook error are HTTP 200 with a
+  JSON `{}` body on both runtimes. Teams reads that status as the invoke
+  status, so these paths do not return a 5xx, and it rejects a JSON `null`
+  invoke payload (`Payload cannot be null`). The plugin no longer answers
+  a handler crash with `500` and `{"error": "invoke handler error"}`.
+
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
   `bf_error_body`. Transient failures on an already-open stream (transport
@@ -81,36 +116,6 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   `content_delivered` is not used as
   a success signal. A live failure-rate walk is still required before
   calling streaming reliable.
-
-## [0.9.2] — 2026-10-19
-
-Publish smoke installs hash-pinned packaging from the requirements file.
-Tag `v0.9.1` exists (commit `680422a4`, merged PR #172, GitHub prerelease)
-but that version never published to PyPI. Publish run
-[39265071375](https://github.com/Satscryption/Hermes-A365/actions/runs/39265071375)
-failed in the build job at Smoke-install the wheel: stock venv pip rejected
-the CLI `--hash` flags (`no such option: --hash`). Integrity and the
-Python 3.11 and 3.14 tests passed; publish and release were skipped.
-PyPI latest remains 0.9.0. This 0.9.2 patch is the fix-forward. The
-`v0.9.1` tag is not moved, deleted, or retargeted.
-
-### Added
-
-- **Docs: user-delegated OBO on Path B is out of scope for 1.0 (#88, #174).**
-  README, `SKILL.md`, and `references/m365-surface-coverage.md` state
-  that Copilot Chat with downstream calls as the signed-in user reaches
-  the same surfaces as Path B. That auth mode is deferred
-  ([#174](https://github.com/satscryption/Hermes-A365/issues/174)).
-
-### Fixed
-
-- **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
-  A handler crash, a file-consent crash, a deduped invoke, a decline, an
-  unknown file consent, and an operator-webhook error are HTTP 200 with a
-  JSON `{}` body on both runtimes. Teams reads that status as the invoke
-  status, so these paths do not return a 5xx, and it rejects a JSON `null`
-  invoke payload (`Payload cannot be null`). The plugin no longer answers
-  a handler crash with `500` and `{"error": "invoke handler error"}`.
 
 - **The publish smoke installs hash-pinned packaging from a requirements file.**
   pip accepts `--hash` only inside a requirements file, which is how
