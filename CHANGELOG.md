@@ -6,38 +6,6 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Added
-
-- **#82 — Copilot→Teams session pin.** A continuation token stores the live
-  Hermes session for the Copilot origin (`SessionDB.find_session_by_origin`).
-  `handoff/action` consumes the token once, requires the same tenant and
-  Entra user, and — only while that session is still live — dispatches an
-  internal Teams `MessageEvent` with `metadata["gateway_session_id"]` after
-  the invoke ack. Unknown, expired, cross-user, cross-tenant, missing, and
-  ended sessions ack without rebinding. Explicitly ended conversations are
-  not reopened. Hermes `v2026.7.20`
-  (`75efd73961a88a531276d0e2e1cd30d1ec18019e`) is the safety floor: a
-  missing `hermes_state_registry` fails closed and the pin is skipped.
-  Resolving the origin session through `hermes_state_registry.acquire`
-  requires `db339f0051e76733923d3d8c4e4319e3e45444a3`, first tagged in
-  `v2026.9.7` (`references/hermes-runtime-compatibility.md`).
-  A live Copilot→Teams 1:1 round trip remains residual for #116 / #89.
-- **#80 — Teams `messageReaction` add/remove.** After the JWT, service URL,
-  end-user, and replay gates, a reaction is stored on the #73 feedback
-  record only when `replyToId` is a reply this process sent in the same
-  conversation and tenant. The record keeps the latest add/remove and the
-  normalized reaction type. Hermes' reaction convention emits
-  `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn) for
-  each stored change. That turn's message id is the cached user activity,
-  so the reply is not aimed at the reaction activity. A later thumbs
-  submit merges into the same row and keeps `native_reactions`. Replayed,
-  malformed, cross-tenant, and unrelated reactions do not change another
-  feedback record. The correlation map is bounded and cleared with the
-  feedback map, and a chat teardown drops that chat's reply ids. Edits
-  and deletes stay in #122.
-  A live Teams reaction round trip was not run here; it remains for the
-  #116 / #89 walks before this is treated as production-validated.
-
 ### Fixed
 
 - **Copilot Chat publish version and catalog id handling (#171).**
@@ -58,6 +26,70 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   Fresh-mint state replacement follows resolver `freshly_minted` (including
   combined `--aiteammate --copilot-chat` default). Mismatch hints never steer
   operators toward reusing the AI Teammate catalog id on the CEA zip.
+
+## [0.9.2] — 2026-10-19
+
+Publish smoke installs hash-pinned packaging from the requirements file.
+Tag `v0.9.1` exists (commit `680422a4`, merged PR #172, GitHub prerelease)
+but that version never published to PyPI. Publish run
+[39265071375](https://github.com/Satscryption/Hermes-A365/actions/runs/39265071375)
+failed in the build job at Smoke-install the wheel: stock venv pip rejected
+the CLI `--hash` flags (`no such option: --hash`). Integrity and the
+Python 3.11 and 3.14 tests passed; publish and release were skipped.
+PyPI latest remains 0.9.0. This 0.9.2 patch is the fix-forward. The
+`v0.9.1` tag is not moved, deleted, or retargeted.
+
+Entries for #80, #82, and #83/#161 were added after the fact: they shipped
+in v0.9.2 (`f4d85bcd`) but had been listed under `[Unreleased]`.
+
+### Added
+
+- **Docs: user-delegated OBO on Path B is out of scope for 1.0 (#88, #174).**
+  README, `SKILL.md`, and `references/m365-surface-coverage.md` state
+  that Copilot Chat with downstream calls as the signed-in user reaches
+  the same surfaces as Path B. That auth mode is deferred
+  ([#174](https://github.com/satscryption/Hermes-A365/issues/174)).
+
+- **#82 — Copilot→Teams session pin.** A continuation token stores the live
+  Hermes session for the Copilot origin (`SessionDB.find_session_by_origin`).
+  `handoff/action` consumes the token once, requires the same tenant and
+  Entra user, and — only while that session is still live — dispatches an
+  internal Teams `MessageEvent` with `metadata["gateway_session_id"]` after
+  the invoke ack. Unknown, expired, cross-user, cross-tenant, missing, and
+  ended sessions ack without rebinding. Explicitly ended conversations are
+  not reopened. Hermes `v2026.7.20`
+  (`75efd73961a88a531276d0e2e1cd30d1ec18019e`) is the safety floor: a
+  missing `hermes_state_registry` fails closed and the pin is skipped.
+  Resolving the origin session through `hermes_state_registry.acquire`
+  requires `db339f0051e76733923d3d8c4e4319e3e45444a3`, first tagged in
+  `v2026.9.7` (`references/hermes-runtime-compatibility.md`).
+  A live Copilot→Teams 1:1 round trip remains residual for #116 / #89.
+
+- **#80 — Teams `messageReaction` add/remove.** After the JWT, service URL,
+  end-user, and replay gates, a reaction is stored on the #73 feedback
+  record only when `replyToId` is a reply this process sent in the same
+  conversation and tenant. The record keeps the latest add/remove and the
+  normalized reaction type. Hermes' reaction convention emits
+  `reaction:added:<type>` / `reaction:removed:<type>` (an agent turn) for
+  each stored change. That turn's message id is the cached user activity,
+  so the reply is not aimed at the reaction activity. A later thumbs
+  submit merges into the same row and keeps `native_reactions`. Replayed,
+  malformed, cross-tenant, and unrelated reactions do not change another
+  feedback record. The correlation map is bounded and cleared with the
+  feedback map, and a chat teardown drops that chat's reply ids. Edits
+  and deletes stay in #122.
+  A live Teams reaction round trip was not run here; it remains for the
+  #116 / #89 walks before this is treated as production-validated.
+
+### Fixed
+
+- **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
+  A handler crash, a file-consent crash, a deduped invoke, a decline, an
+  unknown file consent, and an operator-webhook error are HTTP 200 with a
+  JSON `{}` body on both runtimes. Teams reads that status as the invoke
+  status, so these paths do not return a 5xx, and it rejects a JSON `null`
+  invoke payload (`Payload cannot be null`). The plugin no longer answers
+  a handler crash with `500` and `{"error": "invoke handler error"}`.
 
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
@@ -85,36 +117,6 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   `content_delivered` is not used as
   a success signal. A live failure-rate walk is still required before
   calling streaming reliable.
-
-## [0.9.2] — 2026-10-19
-
-Publish smoke installs hash-pinned packaging from the requirements file.
-Tag `v0.9.1` exists (commit `680422a4`, merged PR #172, GitHub prerelease)
-but that version never published to PyPI. Publish run
-[39265071375](https://github.com/Satscryption/Hermes-A365/actions/runs/39265071375)
-failed in the build job at Smoke-install the wheel: stock venv pip rejected
-the CLI `--hash` flags (`no such option: --hash`). Integrity and the
-Python 3.11 and 3.14 tests passed; publish and release were skipped.
-PyPI latest remains 0.9.0. This 0.9.2 patch is the fix-forward. The
-`v0.9.1` tag is not moved, deleted, or retargeted.
-
-### Added
-
-- **Docs: user-delegated OBO on Path B is out of scope for 1.0 (#88, #174).**
-  README, `SKILL.md`, and `references/m365-surface-coverage.md` state
-  that Copilot Chat with downstream calls as the signed-in user reaches
-  the same surfaces as Path B. That auth mode is deferred
-  ([#174](https://github.com/satscryption/Hermes-A365/issues/174)).
-
-### Fixed
-
-- **Plugin and serve emit one invoke ack for failure and benign outcomes (#132).**
-  A handler crash, a file-consent crash, a deduped invoke, a decline, an
-  unknown file consent, and an operator-webhook error are HTTP 200 with a
-  JSON `{}` body on both runtimes. Teams reads that status as the invoke
-  status, so these paths do not return a 5xx, and it rejects a JSON `null`
-  invoke payload (`Payload cannot be null`). The plugin no longer answers
-  a handler crash with `500` and `{"error": "invoke handler error"}`.
 
 - **The publish smoke installs hash-pinned packaging from a requirements file.**
   pip accepts `--hash` only inside a requirements file, which is how
