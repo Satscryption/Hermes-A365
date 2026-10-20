@@ -16,6 +16,25 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Copilot Chat publish version and catalog id handling (#171).**
+  `publish --copilot-chat --apply` fails closed when there is no matching
+  `copilot-chat-publish.json` record for the target catalog `manifest.id` and
+  no `--app-version` (first upload of a new auto-minted catalog id still
+  stamps the CLI template). Apply refuses to overwrite state when the on-disk
+  `manifestId` differs, except when you pass a new `--manifest-id` with
+  `--app-version` or `--manifest-id auto` mints a fresh CEA id. Reuse writes
+  preserve `ceaCatalogIdMinted` across consecutive auto applies. `--manifest-id
+  auto` (and the combined `--aiteammate --copilot-chat` default) reuses only a
+  prior **auto-minted** CEA id recorded for the same tenant and Hermes
+  profile, never the AI Teammate / Path-B template catalog id (#26). Publish
+  state schema v2 adds `tenantId`, `profile` (`publish --profile` or
+  `HERMES_PROFILE` / `HERMES_GATEWAY_PROFILE`), and `ceaCatalogIdMinted`.
+  Legacy schema v1 is unscoped: apply requires `--app-version` to seed v2
+  state instead of implicitly claiming the current tenant/profile on read.
+  Fresh-mint state replacement follows resolver `freshly_minted` (including
+  combined `--aiteammate --copilot-chat` default). Mismatch hints never steer
+  operators toward reusing the AI Teammate catalog id on the CEA zip.
+
 - **#180 — Teams reactions no longer start an agent turn by default.** Recording
   and #80 logging still run; only `reactions_dispatch_agent_turn` restores the
   synthetic turn. Empty-text `message` activities with no attachments are acked

@@ -248,9 +248,14 @@ their state under the reframed positioning:
 - **#26 (`--manifest-id` flag)** — **closed (v0.7.2).** Path B-specific;
   `--manifest-id auto|<guid>` lets operators run A + B simultaneously
   with distinct Teams App Catalog ids while keeping `bots[0].botId` on
-  the Bot Framework app id. The same slice also hardens emitted zip
-  path parsing for workspaces containing spaces and keeps the CEA bot
-  scope/command shape aligned with the 2026-05-18 live walk.
+  the Bot Framework app id. On later runs, `auto` (and the combined
+  `--aiteammate --copilot-chat` default) reuses only a prior
+  auto-minted CEA id from `copilot-chat-publish.json` for the same tenant
+  and Hermes profile — not the AI Teammate template catalog id. Path-B-only
+  in-place MAC updates omit `auto` and keep the stable zip `manifest.id`.
+  The same slice also hardens emitted zip path parsing for workspaces
+  containing spaces and keeps the CEA bot scope/command shape aligned with
+  the 2026-05-18 live walk.
 
 ## Sources
 
