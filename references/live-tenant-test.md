@@ -1288,24 +1288,28 @@ greater than the package already installed for the same catalog
 `manifest.id`.
 
 `publish --copilot-chat --apply` patch-bumps `version` when
-`~/.hermes/agents/<slug>/copilot-chat-publish.json` records
-`lastAppVersion` for the **same** catalog `manifestId` as this zip
-(including when `--manifest-id auto` reuses the id from that file on later
-runs). With **no** local publish record yet, the CLI template version is
-stamped as-is (often `1.1.4` → `1.1.4`) — fine for a first MAC upload,
-not for a MAC **update** when the app was installed outside Hermes.
+`~/.hermes/agents/<slug>/copilot-chat-publish.json` (schema v2: same
+`tenantId`, Hermes profile, and catalog `manifestId`) records
+`lastAppVersion`. With **no** matching record, apply **fails** unless you
+pass `--app-version` strictly above the version MAC shows — except the
+first upload of a newly auto-minted CEA catalog id, which may use the CLI
+template version. Apply refuses when the state file's `manifestId` does not
+match this publish.
 
 Operator rules:
 
-- **First Hermes re-upload** of a CEA already in MAC (no local state
-  yet): pass `--app-version X.Y.Z` strictly above the version MAC shows
-  for that app (including when MAC already holds the **same** version as
-  the CLI template — equal versions are rejected too).
-- **Later updates** to the same MAC entry: reuse a stable catalog
-  `manifest.id` (omit `--manifest-id auto` on Path-B-only publishes, or
-  let `auto` reuse the id from `copilot-chat-publish.json`); then
-  `publish --copilot-chat --apply` patch-bumps when the CLI template is
-  unchanged. See [`manifest-schema-currency.md`](manifest-schema-currency.md).
+- **CEA already in MAC but no Hermes state** (fresh machine, or installed
+  outside Hermes): pass `--app-version X.Y.Z` strictly above MAC's version
+  (Microsoft rejects equal too).
+- **Path-B-only in-place MAC updates:** omit `--manifest-id auto`; keep
+  the stable catalog `manifest.id` from the zip. After the first successful
+  apply (with `--app-version` when required), later runs patch-bump from
+  state.
+- **Combined `--aiteammate --copilot-chat` (or explicit `--manifest-id
+  auto`):** mints a distinct CEA catalog id (#26). Later combined/auto runs
+  for the **same tenant and Hermes profile** reuse only that auto-minted id
+  (`ceaCatalogIdMinted` in state), never the AI Teammate template id. See
+  [`manifest-schema-currency.md`](manifest-schema-currency.md).
 
 Path B layers Azure Bot Service registration on top of Path A's
 blueprint work. The blueprint Entra app from §3 + its client secret

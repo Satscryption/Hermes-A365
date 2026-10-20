@@ -24,6 +24,42 @@ from hermes_a365.publish import (
 )
 
 _TEST_TENANT = "aaaaaaaa-0000-0000-0000-000000000001"
+_PUBLISH_STATE_PROFILE = "default"
+
+
+def _write_publish_state(
+    path: Path,
+    *,
+    manifest_id: str,
+    app_version: str,
+    hermes_home: Path,
+    cea_catalog_id_minted: bool = False,
+) -> None:
+    from hermes_a365.publish import _write_copilot_chat_publish_state
+
+    _write_copilot_chat_publish_state(
+        path,
+        manifest_id=manifest_id,
+        app_version=app_version,
+        hermes_home=hermes_home,
+        tenant_id=_TEST_TENANT,
+        profile=_PUBLISH_STATE_PROFILE,
+        cea_catalog_id_minted=cea_catalog_id_minted,
+    )
+
+
+def _read_publish_state(
+    path: Path, *, manifest_id: str, hermes_home: Path
+) -> str | None:
+    from hermes_a365.publish import _read_copilot_chat_publish_state
+
+    return _read_copilot_chat_publish_state(
+        path,
+        manifest_id=manifest_id,
+        hermes_home=hermes_home,
+        tenant_id=_TEST_TENANT,
+        profile=_PUBLISH_STATE_PROFILE,
+    )
 
 # ---------------------------------------------------------------------------
 # FakeMutator
@@ -730,21 +766,20 @@ class TestCopilotChatAppVersion:
 
         path = _copilot_chat_publish_state_path(tmp_path, "my-agent")
         manifest_id = "11111111-1111-1111-1111-111111111111"
-        _write_copilot_chat_publish_state(
+        _write_publish_state(
             path,
             manifest_id=manifest_id,
             app_version="1.1.4",
             hermes_home=tmp_path,
         )
         assert (
-            _read_copilot_chat_publish_state(
-                path, manifest_id=manifest_id, hermes_home=tmp_path
-            )
+            _read_publish_state(path, manifest_id=manifest_id, hermes_home=tmp_path)
             == "1.1.4"
         )
         assert (
-            _read_copilot_chat_publish_state(
-                path, manifest_id="22222222-2222-2222-2222-222222222222",
+            _read_publish_state(
+                path,
+                manifest_id="22222222-2222-2222-2222-222222222222",
                 hermes_home=tmp_path,
             )
             is None
@@ -772,26 +807,46 @@ class TestCopilotChatAppVersion:
             == "1.1.6"
         )
 
-    def test_stored_manifest_id_from_publish_state(self, tmp_path: Path) -> None:
+    def test_cea_manifest_id_for_auto_reuse_requires_minted_flag(
+        self, tmp_path: Path
+    ) -> None:
         from hermes_a365.publish import (
+            _cea_manifest_id_for_auto_reuse,
             _copilot_chat_publish_state_path,
-            _stored_manifest_id_from_publish_state,
-            _write_copilot_chat_publish_state,
+            _load_copilot_chat_publish_state_record,
         )
 
         manifest_id = "11111111-1111-1111-1111-111111111111"
         path = _copilot_chat_publish_state_path(tmp_path, "my-agent")
-        assert (
-            _stored_manifest_id_from_publish_state(path, hermes_home=tmp_path) is None
-        )
-        _write_copilot_chat_publish_state(
+        _write_publish_state(
             path,
             manifest_id=manifest_id,
             app_version="1.1.4",
             hermes_home=tmp_path,
+            cea_catalog_id_minted=False,
+        )
+        record = _load_copilot_chat_publish_state_record(
+            path,
+            hermes_home=tmp_path,
+            tenant_id=_TEST_TENANT,
+            profile=_PUBLISH_STATE_PROFILE,
+        )
+        assert _cea_manifest_id_for_auto_reuse(record, aiteammate_catalog_id=None) is None
+        _write_publish_state(
+            path,
+            manifest_id=manifest_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+            cea_catalog_id_minted=True,
+        )
+        record = _load_copilot_chat_publish_state_record(
+            path,
+            hermes_home=tmp_path,
+            tenant_id=_TEST_TENANT,
+            profile=_PUBLISH_STATE_PROFILE,
         )
         assert (
-            _stored_manifest_id_from_publish_state(path, hermes_home=tmp_path)
+            _cea_manifest_id_for_auto_reuse(record, aiteammate_catalog_id=None)
             == manifest_id
         )
 
@@ -801,26 +856,29 @@ class TestCopilotChatAppVersion:
         from hermes_a365.publish import (
             _copilot_chat_publish_state_path,
             _resolve_copilot_chat_manifest_id_for_apply,
-            _write_copilot_chat_publish_state,
         )
 
         manifest_id = "22222222-2222-2222-2222-222222222222"
         path = _copilot_chat_publish_state_path(tmp_path, "my-agent")
-        _write_copilot_chat_publish_state(
+        _write_publish_state(
             path,
             manifest_id=manifest_id,
             app_version="1.0.0",
             hermes_home=tmp_path,
+            cea_catalog_id_minted=True,
         )
         inputs = PublishInputs(
             agent_name="My Agent", copilot_chat=True, manifest_id="auto"
         )
-        assert (
-            _resolve_copilot_chat_manifest_id_for_apply(
-                inputs, hermes_home=tmp_path
-            )
-            == manifest_id
+        resolved = _resolve_copilot_chat_manifest_id_for_apply(
+            inputs,
+            hermes_home=tmp_path,
+            tenant_id=_TEST_TENANT,
+            profile=_PUBLISH_STATE_PROFILE,
+            source_manifest={"id": "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"},
         )
+        assert resolved.manifest_id == manifest_id
+        assert resolved.reused_from_state is True
 
     def test_manifest_guid_canonicalization_continues_version_sequence(
         self, tmp_path: Path
@@ -846,9 +904,7 @@ class TestCopilotChatAppVersion:
             encoding="utf-8",
         )
         assert (
-            _read_copilot_chat_publish_state(
-                path, manifest_id=manifest_id, hermes_home=tmp_path
-            )
+            _read_publish_state(path, manifest_id=manifest_id, hermes_home=tmp_path)
             == "1.1.5"
         )
 
@@ -933,7 +989,7 @@ class TestCopilotChatPublishStateIntegrity:
                 )
             ]
         )
-        with pytest.raises(PublishError, match="invalid lastAppVersion"):
+        with pytest.raises(PublishError, match="invalid v1 fields"):
             apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
 
     def test_symlinked_agent_dir_refuses_state_write(self, tmp_path: Path):
@@ -950,7 +1006,7 @@ class TestCopilotChatPublishStateIntegrity:
         (agents / "agent").symlink_to(outside)
         path = _copilot_chat_publish_state_path(hermes, "agent")
         with pytest.raises(PublishError, match="escapes"):
-            _write_copilot_chat_publish_state(
+            _write_publish_state(
                 path,
                 manifest_id="11111111-1111-1111-1111-111111111111",
                 app_version="1.0.0",
@@ -1392,7 +1448,9 @@ class TestApplyPublishPlanCopilotChat:
                 "name": {"short": "X", "full": "X"},
             },
         )
-        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.1.4")
+        )
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
         )
@@ -1412,10 +1470,7 @@ class TestApplyPublishPlanCopilotChat:
         assert any("Microsoft Admin Portal" in msg for msg in result.messages)
         assert not any("AI Teammate package" in msg for msg in result.messages)
 
-    def test_no_publish_record_stamps_template_and_writes_state(self, tmp_path):
-        import json
-        import zipfile
-
+    def test_no_publish_record_fails_without_app_version(self, tmp_path):
         from hermes_a365.publish import (
             _copilot_chat_publish_state_path,
             build_publish_plan,
@@ -1434,14 +1489,11 @@ class TestApplyPublishPlanCopilotChat:
         assert not state_path.is_file()
 
         plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
-        result = apply_publish_plan(
-            plan, mutator=self._scripted_zip_emit(zp), hermes_home=hermes
-        )
-
-        with zipfile.ZipFile(zp) as zf:
-            assert json.loads(zf.read("manifest.json"))["version"] == "1.1.4"
-        assert state_path.is_file()
-        assert any("no Copilot Chat publish record" in m for m in result.messages)
+        with pytest.raises(PublishError, match="no Copilot Chat publish record"):
+            apply_publish_plan(
+                plan, mutator=self._scripted_zip_emit(zp), hermes_home=hermes
+            )
+        assert not state_path.is_file()
 
     def test_manifest_id_auto_reuses_catalog_id_and_bumps_version(self, tmp_path):
         import json
@@ -1502,7 +1554,9 @@ class TestApplyPublishPlanCopilotChat:
             "name": {"short": "X", "full": "X"},
         }
         zp = self._seed_manifest_zip(tmp_path, manifest)
-        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.1.4")
+        )
         first = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
         )
@@ -1513,8 +1567,11 @@ class TestApplyPublishPlanCopilotChat:
         round2 = tmp_path / "round2"
         round2.mkdir()
         zp2 = self._seed_manifest_zip(round2, manifest)
+        plan_second = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True)
+        )
         second = apply_publish_plan(
-            plan, mutator=self._scripted_zip_emit(zp2), hermes_home=tmp_path
+            plan_second, mutator=self._scripted_zip_emit(zp2), hermes_home=tmp_path
         )
         with zipfile.ZipFile(zp2) as zf:
             assert json.loads(zf.read("manifest.json"))["version"] == "1.1.5"
@@ -1729,6 +1786,7 @@ class TestApplyPublishPlanCopilotChat:
                 agent_name="X",
                 copilot_chat=True,
                 manifest_id="11111111-1111-1111-1111-111111111111",
+                app_version="1.0.0",
             )
         )
         result = apply_publish_plan(
@@ -1760,7 +1818,9 @@ class TestApplyPublishPlanCopilotChat:
                 "name": {"short": "X", "full": "X"},
             },
         )
-        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.0.0")
+        )
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
         )
@@ -1798,7 +1858,9 @@ class TestApplyPublishPlanCopilotChat:
                 "color.png": b"icon",
             },
         )
-        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.0.0")
+        )
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
         )
@@ -1825,7 +1887,12 @@ class TestApplyPublishPlanCopilotChat:
             },
         )
         plan = build_publish_plan(
-            PublishInputs(agent_name="X", copilot_chat=True, bot_id="override-id")
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                bot_id="override-id",
+                app_version="1.0.0",
+            )
         )
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
@@ -1854,7 +1921,9 @@ class TestApplyPublishPlanCopilotChat:
                 },
             },
         )
-        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.0.0")
+        )
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
         )
@@ -1905,6 +1974,193 @@ class TestApplyPublishPlanCopilotChat:
         # Sibling was rolled back.
         sibling = Path(zp).with_name(Path(zp).stem + ".copilot-chat.zip")
         assert not sibling.exists()
+
+    def test_combined_default_reuses_distinct_cea_id(self, tmp_path):
+        import json
+        import zipfile
+
+        from hermes_a365.publish import build_publish_plan
+
+        aiteammate_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        manifest = {
+            "id": aiteammate_id,
+            "version": "1.0.0",
+            "webApplicationInfo": {"id": "the-bot"},
+            "name": {"short": "Hermes Inbox Helper R8", "full": "X"},
+        }
+        hermes = tmp_path / "hermes"
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", aiteammate=True, copilot_chat=True)
+        )
+        round1 = tmp_path / "r1"
+        round1.mkdir()
+        zp1 = self._seed_manifest_zip(round1, manifest)
+        first = apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp1), hermes_home=hermes
+        )
+        assert first.copilot_chat_manifest_id != aiteammate_id
+        round2 = tmp_path / "r2"
+        round2.mkdir()
+        zp2 = self._seed_manifest_zip(round2, manifest)
+        second = apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp2), hermes_home=hermes
+        )
+        assert second.copilot_chat_manifest_id == first.copilot_chat_manifest_id
+        with zipfile.ZipFile(zp2.with_name(zp2.stem + ".copilot-chat.zip")) as zf:
+            m = json.loads(zf.read("manifest.json"))
+            assert m["id"] == first.copilot_chat_manifest_id
+            assert m["version"] == "1.0.1"
+
+    def test_auto_does_not_reuse_path_b_template_catalog_id(self, tmp_path):
+        import uuid
+
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            _resolve_copilot_chat_manifest_id_for_apply,
+        )
+
+        template_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            path,
+            manifest_id=template_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+            cea_catalog_id_minted=False,
+        )
+        resolved = _resolve_copilot_chat_manifest_id_for_apply(
+            PublishInputs(agent_name="X", copilot_chat=True, manifest_id="auto"),
+            hermes_home=tmp_path,
+            tenant_id=_TEST_TENANT,
+            profile=_PUBLISH_STATE_PROFILE,
+            source_manifest={"id": template_id},
+        )
+        assert resolved.manifest_id != template_id
+        uuid.UUID(resolved.manifest_id)
+        assert resolved.freshly_minted is True
+
+    def test_mismatched_manifest_id_in_state_fails_apply(self, tmp_path):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        stored_id = "11111111-1111-1111-1111-111111111111"
+        zip_id = "22222222-2222-2222-2222-222222222222"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            state_path,
+            manifest_id=stored_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+        )
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": zip_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.1.5")
+        )
+        with pytest.raises(PublishError, match="records manifestId"):
+            apply_publish_plan(
+                plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
+            )
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        assert record["manifestId"] == stored_id
+        assert record["lastAppVersion"] == "1.1.4"
+
+    def test_publish_state_tenant_isolation(self, tmp_path):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        manifest_id = "44444444-4444-4444-4444-444444444444"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            state_path,
+            manifest_id=manifest_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+            cea_catalog_id_minted=True,
+        )
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": manifest_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        other_tenant = "bbbbbbbb-0000-0000-0000-000000000002"
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                tenant_id=other_tenant,
+                manifest_id="auto",
+            )
+        )
+        mutator = FakeMutator(
+            scripted=[
+                RunResult(
+                    argv=["az", "account", "show"],
+                    returncode=0,
+                    stdout=json.dumps({"tenantId": other_tenant}),
+                    stderr="",
+                ),
+                RunResult(
+                    argv=[],
+                    returncode=0,
+                    stdout=f"Package created: {zp}",
+                    stderr="",
+                ),
+            ]
+        )
+        with pytest.raises(PublishError, match="belongs to tenant"):
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+
+    def test_publish_state_profile_isolation(self, tmp_path, monkeypatch):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            _write_copilot_chat_publish_state,
+            build_publish_plan,
+        )
+
+        manifest_id = "44444444-4444-4444-4444-444444444444"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_copilot_chat_publish_state(
+            state_path,
+            manifest_id=manifest_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+            tenant_id=_TEST_TENANT,
+            profile="profile-a",
+            cea_catalog_id_minted=True,
+        )
+        monkeypatch.setenv("HERMES_PROFILE", "profile-b")
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": manifest_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, manifest_id="auto")
+        )
+        with pytest.raises(PublishError, match="belongs to Hermes profile"):
+            apply_publish_plan(
+                plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
+            )
 
 
 class TestSecurityManifestArchives:

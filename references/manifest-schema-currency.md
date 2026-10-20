@@ -73,24 +73,29 @@ Hermes records the last published app `version` per agent in:
 
 (`<slug>` defaults to `slugify(--agent-name)`; override with `--slug`.)
 
-The file is keyed by Teams catalog `manifestId` and holds `lastAppVersion`.
-When that file already records `lastAppVersion` for the **same**
-`manifestId` as the zip being built, `hermes a365 publish --copilot-chat
+Schema v2 keys state by **tenant** (`tenantId` from the publish pin),
+**Hermes profile** (`HERMES_PROFILE` / `HERMES_GATEWAY_PROFILE`, default
+`default`), and catalog `manifestId`, and records `lastAppVersion` plus
+`ceaCatalogIdMinted` (whether the catalog id was auto-minted for Copilot
+Chat). Schema v1 files migrate to v2 on read with `ceaCatalogIdMinted:
+false`.
+
+When state already records `lastAppVersion` for the **same** tenant,
+profile, and `manifestId` as this zip, `hermes a365 publish --copilot-chat
 --apply` stamps a strictly higher `version` (patch-bump when the CLI
 template is unchanged; honour a higher CLI template when Microsoft bumps
-it upstream). With **no** local publish record yet, the CLI template
-`version` is stamped (suitable for a first MAC upload); a MAC **update**
-when the package was installed outside Hermes still needs `--app-version`
-strictly above the version shown in Microsoft Admin Center. `--manifest-id
-auto` (and the combined `--aiteammate --copilot-chat` default) **reuses**
-the `manifestId` already recorded in `copilot-chat-publish.json` on later
-runs so `lastAppVersion` continues to patch-bump across MAC updates. For
-Path-B-only in-place updates without `auto`, omit `--manifest-id` so the
-zip keeps the stable catalog `manifest.id` from the first upload. Operators
-may always pass `--app-version X.Y.Z` (required for the first Hermes
-re-upload when MAC already holds an **equal or higher** app `version` than
-the CLI template — Microsoft rejects equal too); the override must still
-beat the recorded last publish when state exists.
+it upstream). With **no** matching record, apply **fails** unless the
+operator passes `--app-version` strictly above the version in Microsoft
+Admin Center — except the first upload of a **new** auto-minted catalog id,
+which may use the CLI template `version`. Apply refuses when the state file
+records a different `manifestId` than this publish targets.
+
+`--manifest-id auto` (and the combined `--aiteammate --copilot-chat`
+default) mints a distinct CEA catalog id and, on later runs for the same
+tenant and profile, reuses only a prior id with `ceaCatalogIdMinted: true`
+that is **not** the AI Teammate / CLI template catalog id (#26). Path-B-only
+in-place MAC updates: omit `--manifest-id` and keep the stable
+`manifest.id` from the zip; do not use `auto`.
 
 ## Current state in the wrapper
 
