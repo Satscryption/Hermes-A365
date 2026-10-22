@@ -5270,6 +5270,18 @@ class Agent365Adapter(BasePlatformAdapter):
                 record["state"] = "FORCED_PLAIN"
                 record["plain_attempts"] = 0
             if not buf.get("segments"):
+                stream = self._keepalive_stream(buf)
+                stream_id = str(stream.get("stream_id") or "")
+                if stream_id:
+                    stream["stream_id"] = ""
+                    buf["keepalive"] = stream
+                    logger.warning(
+                        "agent365 turn buffer clearing lingering keep-alive stream: "
+                        "chat_id=%s stream_id=%s deferrals=%s",
+                        chat_id,
+                        stream_id,
+                        deferrals,
+                    )
                 return
             record["plain_due"] = True
             buf["retry_turn_key"] = turn_key
@@ -5890,6 +5902,7 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         record["state"] = "DONE"
         record["plain_due"] = False
+        record["answer_final_settled"] = True
         if not stream.get("closed_by"):
             stream["closed_by"] = f"turn:{record['turn_key']}"
         stream["stream_id"] = ""
@@ -6792,6 +6805,7 @@ class Agent365Adapter(BasePlatformAdapter):
                                 record = self._delivery_record(buf, turn)
                                 record["state"] = "DONE"
                                 record["plain_due"] = False
+                                record["answer_final_settled"] = True
                                 self._remove_turn_segments(
                                     buf,
                                     [str(segment.get("id") or "") for segment in chunk_segments],
@@ -6848,10 +6862,15 @@ class Agent365Adapter(BasePlatformAdapter):
                             chat_id,
                             error,
                         )
+                        record = self._delivery_record(buf, turn)
+                        record["state"] = "DONE"
+                        record["plain_due"] = False
+                        record["answer_final_settled"] = True
                         self._remove_turn_segments(
                             buf,
                             [str(segment.get("id") or "") for segment in chunk_segments],
                         )
+                        self._purge_turn_delivery_records(buf)
                         continue
                     logger.warning(
                         "agent365 turn buffer flush failed: chat_id=%s error=%s",

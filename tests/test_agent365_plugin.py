@@ -8031,6 +8031,18 @@ class TestEditMessage:
             json=lambda payload=payload: payload,
         )
 
+    @staticmethod
+    def _observe_stream_wire_activity(
+        activity: dict[str, Any], counts: dict[str, int]
+    ) -> None:
+        entities = activity.get("entities") or [{}]
+        entity = entities[0] if entities else {}
+        stream_type = entity.get("streamType")
+        if stream_type == "informative" and "streamId" not in entity:
+            counts["informative_open"] = int(counts.get("informative_open") or 0) + 1
+        if activity.get("type") == "message" and stream_type == "final":
+            counts["final"] = int(counts.get("final") or 0) + 1
+
     @pytest.mark.asyncio
     async def test_short_buffered_turn_does_not_send_keepalive(
         self, monkeypatch: pytest.MonkeyPatch
@@ -10975,14 +10987,12 @@ class TestEditMessage:
         self._no_sleep(monkeypatch)
         parts = [char * 1500 for char in ("A", "B", "C")]
         calls = {"n": 0}
-        informative_posts = {"n": 0}
+        wire = {"informative_open": 0, "final": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             activity = kwargs["json"]
+            self._observe_stream_wire_activity(activity, wire)
             if activity.get("type") == "message":
-                entity = activity["entities"][0]
-                if entity.get("streamType") == "informative" and "streamId" not in entity:
-                    informative_posts["n"] += 1
                 return MagicMock(status_code=202, text="", json=lambda: {})
             return MagicMock(status_code=201, text="", json=lambda: {"id": "stream-ovr"})
 
@@ -11011,7 +11021,6 @@ class TestEditMessage:
         turn_key = a._delivery_record(buf, buf["turns"][0])["turn_key"]
         record = a._delivery_record(buf, buf["turns"][0])
         assert record.get("answer_final_settled") is True
-        assert informative_posts["n"] == 0
         task = buf.get("retry_task")
         assert isinstance(task, asyncio.Task)
         assert not task.done()
@@ -11019,11 +11028,177 @@ class TestEditMessage:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         buf["retry_task"] = None
-        informative_posts["n"] = 0
-        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        wire["informative_open"] = 0
+        wire["final"] = 0
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
         await a._flush_turn_buffer("conv-G-ov-retry")
-        assert informative_posts["n"] == 0
+        assert wire["informative_open"] == 0
+        assert wire["final"] == 0
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == parts[2]
         assert "conv-G-ov-retry" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_overflow_after_uncertain_first_chunk_plain_on_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-ov-unc", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        parts = [char * 1500 for char in ("A", "B", "C")]
+        finals = {"n": 0}
+        wire = {"informative_open": 0, "final": 0}
+        overflow_calls = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            self._observe_stream_wire_activity(activity, wire)
+            entity = activity["entities"][0]
+            if entity.get("streamType") != "final":
+                return self._http_result(201, "ka-ovu")
+            finals["n"] += 1
+            if finals["n"] == 1:
+                raise httpx.RemoteProtocolError("dropped")
+            return MagicMock(
+                status_code=403,
+                text="exceeded streaming time",
+                json=lambda: {"error": {"message": "exceeded streaming time"}},
+            )
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            text = kwargs["reply"]["text"]
+            if text == parts[2]:
+                overflow_calls["n"] += 1
+                if overflow_calls["n"] == 1:
+                    raise RuntimeError("overflow failed")
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-ov-unc"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        for part in parts:
+            await a.send(chat_id="conv-G-ov-unc", content=part, reply_to=None)
+        buf = a._turn_buffers["conv-G-ov-unc"]
+        buf["keepalive"] = {
+            "stream_id": "ka-ovu",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.on_processing_complete(event, outcome="success")
+        record = a._delivery_record(buf, buf["turns"][0])
+        assert record.get("answer_final_settled") is True
+        assert finals["n"] == 2
+        assert overflow_calls["n"] == 1
+        task = buf.get("retry_task")
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        buf["retry_task"] = None
+        wire["informative_open"] = 0
+        wire["final"] = 0
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        await a._flush_turn_buffer("conv-G-ov-unc")
+        assert wire["informative_open"] == 0
+        assert wire["final"] == 0
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = bridge.send_reply
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == parts[2]
+        assert "conv-G-ov-unc" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_overflow_after_plain_timeout_first_chunk_plain_on_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-ov-pto", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        parts = [char * 1500 for char in ("A", "B", "C")]
+        merged = f"{parts[0]}\n\n{parts[1]}"
+        wire = {"informative_open": 0, "final": 0}
+        plain_calls: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            self._observe_stream_wire_activity(activity, wire)
+            entity = activity["entities"][0]
+            if entity.get("streamType") == "final":
+                return MagicMock(
+                    status_code=403,
+                    text="already completed",
+                    json=lambda: {
+                        "error": {
+                            "message": (
+                                "Content stream is not allowed on an already "
+                                "completed streamed message"
+                            )
+                        }
+                    },
+                )
+            return self._http_result(201, "ka-pto")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            text = kwargs["reply"]["text"]
+            plain_calls.append(text)
+            if text == merged:
+                raise RuntimeError("timeout after the request was sent")
+            if text == parts[2]:
+                raise RuntimeError("overflow failed")
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-ov-pto"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        for part in parts:
+            await a.send(chat_id="conv-G-ov-pto", content=part, reply_to=None)
+        buf = a._turn_buffers["conv-G-ov-pto"]
+        buf["keepalive"] = {
+            "stream_id": "ka-pto",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.on_processing_complete(event, outcome="success")
+        record = a._delivery_record(buf, buf["turns"][0])
+        assert record.get("answer_final_settled") is True
+        assert plain_calls == [merged, parts[2]]
+        task = buf.get("retry_task")
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        buf["retry_task"] = None
+        wire["informative_open"] = 0
+        wire["final"] = 0
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        await a._flush_turn_buffer("conv-G-ov-pto")
+        assert wire["informative_open"] == 0
+        assert wire["final"] == 0
+        send_reply_mock = bridge.send_reply
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == parts[2]
+        assert "conv-G-ov-pto" not in a._turn_buffers
 
     @pytest.mark.asyncio
     async def test_invalid_inbound_flush_schedules_retry_with_turn_key(
@@ -11085,19 +11260,62 @@ class TestEditMessage:
             },
         }
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
+        close_mock = AsyncMock(side_effect=[False, True])
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", close_mock)
+        await a._flush_turn_buffer(chat)
+        buf = a._turn_buffers[chat]
+        turn_key = a._delivery_record(buf, buf["turns"][0])["turn_key"]
+        assert buf.get("retry_turn_key") == turn_key
+        assert close_mock.await_count == 1
+        task = buf.get("retry_task")
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        buf["retry_task"] = None
+        await a._flush_turn_buffer(chat)
+        assert close_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_progress_only_keepalive_close_clears_stream_after_deferral_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-prog-cap"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "validated_path": "A",
+                    "activity_id": "act-1",
+                    "open": False,
+                }
+            ],
+            "segments": [],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+            "keepalive": {
+                "stream_id": "ka-linger",
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            },
+        }
+        buf = a._turn_buffers[chat]
+        turn = buf["turns"][0]
+        record = a._delivery_record(buf, turn)
+        record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+        record["state"] = "DEFERRED"
+        buf["retry_turn_key"] = record["turn_key"]
         monkeypatch.setattr(
             a,
             "_close_turn_buffer_keepalive_locked",
             AsyncMock(return_value=False),
         )
-        await a._flush_turn_buffer(chat)
-        buf = a._turn_buffers[chat]
-        turn_key = a._delivery_record(buf, buf["turns"][0])["turn_key"]
-        assert buf.get("retry_turn_key") == turn_key
-        task = buf.get("retry_task")
-        assert isinstance(task, asyncio.Task)
-        task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        a._schedule_turn_buffer_retry(chat, record["turn_key"])
+        assert str(buf["keepalive"].get("stream_id") or "") == ""
+        assert not buf.get("retry_task")
 
     @pytest.mark.asyncio
     async def test_keepalive_close_failure_schedules_retry_with_turn_key(
