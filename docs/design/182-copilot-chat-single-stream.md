@@ -206,7 +206,7 @@ Walk092 C2: inbound 19:29:57, `sleep 40`, turn end 19:30:42, reply 19:30:43. The
 
 Walk092 C2 final included the tool-progress line and interim commentary (`segments=3`, 58 characters). The intended split is progress in the informative text and only the answer in the final.
 
-Today `_flush_closed_turns` already drops a segment when `_is_hermes_tool_progress_segment` is true (exact Hermes `{emoji} {verb}{connector}{preview}` lines, including `💻 Running …`). A segment that mixes progress with other text is kept whole. Commentary (`reply_to is None`, not a progress line) is joined into the final. `test_turn_buffer_merges_commentary_edited_segment_and_duplicate_final` locks that join. #182 keeps it.
+Today `_flush_closed_turns` classifies segments by `kind` at append time (see [Segment classification](#segment-classification-186-shipped)): progress and commentary stay out of the final body; only `kind=answer` is joined. Hermes does not yet set `metadata.informative_update` on interim commentary (`gateway/stream_consumer.py` sends commentary via plain `adapter.send` with thread metadata only), so unscoped interim lines still default to `answer` until Hermes adds a signal.
 
 #186, after this lands:
 

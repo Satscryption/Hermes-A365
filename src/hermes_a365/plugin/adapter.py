@@ -795,7 +795,7 @@ def _refresh_turn_buffer_segment_kind_after_edit(segment: dict[str, str]) -> Non
     text = str(segment.get("text") or "")
     if _is_hermes_tool_progress_segment(text):
         segment["kind"] = "progress"
-    elif segment.get("kind") == "progress":
+    elif segment.get("kind") in ("progress", "commentary"):
         segment["kind"] = "answer"
 
 
@@ -3537,6 +3537,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_target_count_by_chat.clear()
         self._cancel_turn_buffer_retries()
         for chat_id, buf in list(self._turn_buffers.items()):
+            self._cancel_segment_informative_task(buf)
             await self._cancel_keepalive_and_close(str(chat_id), buf)
         self._turn_buffers.clear()
         self._orphan_keepalive.clear()
@@ -5137,6 +5138,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 break
         buf["depth"] = sum(1 for turn in buf.get("turns") or [] if turn.get("open"))
 
+    @staticmethod
+    def _cancel_segment_informative_task(buf: dict[str, Any]) -> None:
+        task = buf.get("segment_informative_task")
+        current = asyncio.current_task()
+        if isinstance(task, asyncio.Task) and not task.done() and task is not current:
+            task.cancel()
+
     async def _drop_turn_buffer(self, chat_id: str) -> None:
         """Drop the buffer, cancel its retry, and close a keep-alive stream.
 
@@ -5147,6 +5155,7 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id = str(chat_id)
         buf = self._turn_buffers.pop(chat_id, None)
         if buf is not None:
+            self._cancel_segment_informative_task(buf)
             self._cancel_turn_buffer_retry(buf)
             await self._cancel_keepalive_and_close(chat_id, buf)
         self._orphan_keepalive.pop(chat_id, None)
@@ -5338,12 +5347,32 @@ class Agent365Adapter(BasePlatformAdapter):
         if isinstance(task, asyncio.Task) and not task.done() and task is not current:
             return
         started = asyncio.create_task(self._turn_buffer_keepalive(chat_id))
-        started.add_done_callback(_consume_turn_buffer_retry_result)
+        started.add_done_callback(
+            lambda task, bound_chat_id=chat_id: self._turn_buffer_keepalive_task_done(
+                bound_chat_id, task
+            )
+        )
         buf["keepalive_task"] = started
         logger.debug(
             "agent365 turn buffer keep-alive scheduled: chat_id=%s",
             chat_id,
         )
+
+    def _turn_buffer_keepalive_task_done(self, chat_id: str, task: asyncio.Task[Any]) -> None:
+        """Reschedule keep-alive when a live turn loses its sleeper to cancel."""
+        _consume_turn_buffer_retry_result(task)
+        if not task.cancelled():
+            return
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return
+        if buf.get("keepalive_task") is task:
+            buf["keepalive_task"] = None
+        if not self._turn_buffer_keepalive_needed(chat_id):
+            return
+        self._schedule_turn_buffer_keepalive(chat_id)
 
     @staticmethod
     def _cancel_turn_buffer_keepalive(buf: dict[str, Any]) -> None:
@@ -5544,6 +5573,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id,
                     "swallowed RuntimeError",
                 )
+                if self._turn_buffer_keepalive_needed(chat_id):
+                    self._schedule_turn_buffer_keepalive(chat_id)
                 return
             logger.warning(
                 "agent365 turn buffer keep-alive stopped: chat_id=%s error=%s",
@@ -5842,6 +5873,10 @@ class Agent365Adapter(BasePlatformAdapter):
             return True
         turn = self._keepalive_turn(buf)
         if turn is None:
+            logger.debug(
+                "agent365 turn buffer keep-alive exit: chat_id=%s reason=_keepalive_turn None",
+                chat_id,
+            )
             return False
         result = await self._post_keepalive_activity(
             chat_id,
@@ -6021,6 +6056,11 @@ class Agent365Adapter(BasePlatformAdapter):
             not self._lifecycle_is_current(generation, client)
             or not self._chat_lifecycle_is_current(chat_id, chat_generation)
         ):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: "
+                "chat_id=%s reason=stale lifecycle after mint",
+                chat_id,
+            )
             return empty
         try:
             resp = await self._await_outbound(
@@ -6718,9 +6758,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._close_innermost_turn(chat_id)
                 await self._flush_turn_buffer(chat_id)
                 await self._flush_pending_coalesced_replies(chat_id)
-                buf = self._turn_buffers.get(chat_id)
-                if isinstance(buf, dict) and int(buf.get("depth") or 0) == 0:
-                    buf["processing_active"] = False
                 # #161: the stream consumer's finalize edit runs on a task
                 # Hermes cancels at turn end. A short reply often still has
                 # the pacing gap left, so streamType=final never lands and
@@ -6740,6 +6777,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     raise
         finally:
             if chat_id:
+                buf = self._turn_buffers.get(chat_id)
+                if isinstance(buf, dict) and int(buf.get("depth") or 0) == 0:
+                    buf["processing_active"] = False
                 self._reset_stream_overflow_limit_for_task()
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):

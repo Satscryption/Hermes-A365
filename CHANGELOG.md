@@ -30,12 +30,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Copilot Chat turn-buffer keep-alive (#181).** `_turn_buffer_keepalive_needed`
-  stays true while `processing_active` or `depth > 0` (not while deferred
-  delivery segments alone remain). DEBUG logs name every
-  silent keep-alive exit (scheduled, needed=false, stopped/untracked,
-  `_keepalive_turn` missing, HTTP/lifecycle skip, cancel, swallowed outbound
-  cancel).
+- **Copilot Chat turn-buffer keep-alive (#181).** Reschedule the sleeper when
+  cancellation hits during the first-interval wait while the turn is still
+  live; DEBUG logs cover stale lifecycle after mint and `_keepalive_turn`
+  missing on keep-alive final. `processing_active` clears in a `finally` on
+  `on_processing_complete`. Block opening a second informative stream while an
+  abandoned `stream_id` still blocks replies (#199).
 
 - **Copilot Chat informative vs answer text (#186).** Tool-progress lines and
   `send` metadata `informative_update: true` update informative stream text;

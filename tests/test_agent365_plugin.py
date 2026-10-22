@@ -8239,6 +8239,172 @@ class TestEditMessage:
         assert "conv-G-ka-task" not in a._turn_buffers
 
     @pytest.mark.asyncio
+    async def test_keepalive_posts_on_first_interval_with_live_depth(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # #181 walk092: depth stays 1 for ~45s but the first-interval POST
+        # never ran when the sleeper task was cancelled during its wait.
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-ka-live-25"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        inbound["from"] = {
+            "id": "29:copilot-channel",
+            "aadObjectId": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+            "name": "User",
+        }
+        inbound["recipient"] = {
+            "id": "28:app",
+            "applicationId": "copilot",
+            "name": "Bot",
+        }
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        first_sec = adapter_mod._TURN_BUFFER_KEEPALIVE_FIRST_SEC
+        assert first_sec > 0
+        posts: list[dict[str, Any]] = []
+        real_sleep = asyncio.sleep
+        first_sleep_gate = asyncio.Event()
+
+        async def controlled_sleep(delay: float) -> None:
+            if delay == first_sec:
+                if not first_sleep_gate.is_set():
+                    await first_sleep_gate.wait()
+                return
+            await real_sleep(0)
+
+        monkeypatch.setattr(asyncio, "sleep", controlled_sleep)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-live-25")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="cc-long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        assert a._turn_buffers[chat]["depth"] == 1
+        buf = a._turn_buffers[chat]
+        first_task = buf.get("keepalive_task")
+        assert isinstance(first_task, asyncio.Task)
+        first_task.cancel()
+        first_sleep_gate.set()
+        await asyncio.gather(first_task, return_exceptions=True)
+        await self._spin_until(lambda: posts)
+        assert posts[0]["type"] == "typing"
+        assert posts[0]["text"] == "Working on it."
+        await a.on_processing_complete(event, outcome="success")
+
+    @pytest.mark.asyncio
+    async def test_drop_turn_buffer_cancels_segment_informative_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-seg-inform-cancel"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        task = asyncio.create_task(asyncio.sleep(3600))
+        buf["segment_informative_task"] = task
+        await a._drop_turn_buffer(chat)
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_progress_only_turn_does_not_open_second_informative_after_failed_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-no-second-ka"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        wire = {"informative_open": 0, "informative_cont": 0, "final": 0}
+        opened_mono = time.monotonic() - adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC + 5
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            entity = activity["entities"][0]
+            if entity.get("streamType") == "final":
+                wire["final"] += 1
+                return MagicMock(status_code=500, text="fail", json=lambda: {})
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                wire["informative_open"] += 1
+                return self._http_result(201, "should-not-open")
+            if entity.get("streamId") == "ka-one":
+                wire["informative_cont"] += 1
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        keepalive_task = buf.get("keepalive_task")
+        if isinstance(keepalive_task, asyncio.Task):
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        buf["keepalive"] = {
+            "stream_id": "ka-one",
+            "sequence": 1,
+            "opened_mono": opened_mono,
+        }
+        progress = "💻 Running terminal_command in the sandbox..."
+        await a.send(chat_id=chat, content=progress, reply_to=None)
+        for turn in buf["turns"]:
+            turn["open"] = False
+        buf["depth"] = 0
+        await a._emit_turn_buffer_keepalive(chat)
+        assert wire["final"] >= 1
+        assert wire["informative_open"] == 0
+        assert wire["informative_cont"] == 1
+
+    @pytest.mark.asyncio
+    async def test_edit_message_reclassifies_commentary_to_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-commentary-edit"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        sent = await a.send(
+            chat_id=chat,
+            content="Checking now.",
+            metadata={"informative_update": True},
+        )
+        assert sent.success is True
+        segment_id = sent.message_id
+        result = await a.edit_message(chat, segment_id, "The answer is 42.")
+        assert result.success is True
+        segment = next(s for s in a._turn_buffers[chat]["segments"] if s["id"] == segment_id)
+        assert segment["kind"] == "answer"
+
+    @pytest.mark.asyncio
     async def test_keepalive_needed_while_segments_wait_after_complete(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -8273,6 +8439,7 @@ class TestEditMessage:
         await a.send(chat_id="conv-G-ka-depth", content="Answer", reply_to="act-1")
         a._close_innermost_turn("conv-G-ka-depth")
         assert a._turn_buffers["conv-G-ka-depth"]["depth"] == 0
+        assert a._turn_buffer_keepalive_needed("conv-G-ka-depth")
         assert len(posts) >= 1
         await a._flush_turn_buffer("conv-G-ka-depth")
         assert any(body.get("text") == "Answer" for body in posts if body.get("type") == "message")
