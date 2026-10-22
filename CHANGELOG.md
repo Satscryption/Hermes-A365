@@ -30,22 +30,20 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Copilot Chat turn-buffer keep-alive (#181).** Reschedule the sleeper when
-  cancellation hits during the first-interval wait while the turn is still
-  live; DEBUG logs cover stale lifecycle after mint and `_keepalive_turn`
-  missing on keep-alive final. `processing_active` clears in a `finally` on
-<<<<<<< HEAD
-  `on_processing_complete`. Block opening a second informative stream while an
-  abandoned `stream_id` still blocks replies (#199).
-=======
-  `on_processing_complete`. Cancel in-flight `segment_informative_task` on buffer
-  drop and disconnect.
->>>>>>> 4765bd5 (Fix #181 keep-alive reschedule and Grok review follow-ups)
+- **Copilot Chat turn-buffer keep-alive (#181).** DEBUG at `on_processing_complete`
+  records whether the keep-alive task is still pending and elapsed time since
+  scheduling; at most one keep-alive revival per turn while `depth > 0` or
+  `processing_active`. Stale lifecycle after mint and missing `_keepalive_turn`
+  on keep-alive final are logged. `processing_active` clears in a `finally` on
+  `on_processing_complete`. Progress-only flush sets `skip_stream_open` so a
+  closed informative stream is not reopened. Cancel in-flight
+  `segment_informative_task` on buffer drop and disconnect.
 
-- **Copilot Chat informative vs answer text (#186).** Tool-progress lines and
-  `send` metadata `informative_update: true` update informative stream text;
-  all other buffered segments stay on the `streamType=final` body. Personal 1:1
-  streaming is unchanged.
+- **Copilot Chat informative vs answer text (#186).** Flush-time segment roles:
+  tool-progress shape → informative only; `reply_to` / `notify` / `expect_edits`
+  → answer; unscoped sends are commentary only when the same turn also has a
+  marked answer (else they stay the answer). `informative_update` metadata
+  remains an extra commentary hook. Personal 1:1 streaming is unchanged.
 
 - **Copilot Chat publish version and catalog id handling (#171).**
   `publish --copilot-chat --apply` fails closed when there is no matching

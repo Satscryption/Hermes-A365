@@ -774,6 +774,48 @@ def _metadata_marks_informative_segment(metadata: Any | None) -> bool:
     return isinstance(metadata, dict) and bool(metadata.get("informative_update"))
 
 
+def _segment_is_marked_answer_from_send(
+    reply_to: Any | None, metadata: Any | None
+) -> bool:
+    if reply_to is not None and str(reply_to):
+        return True
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("notify"):
+        return True
+    return bool(metadata.get("expect_edits"))
+
+
+def _segment_is_marked_answer(segment: dict[str, Any]) -> bool:
+    if str(segment.get("reply_to") or ""):
+        return True
+    if segment.get("notify"):
+        return True
+    return bool(segment.get("expect_edits"))
+
+
+def _reconcile_turn_buffer_kinds_for_flush(segments: list[dict[str, Any]], seq: str) -> None:
+    """Apply #186 flush rules using the send shape Hermes actually uses."""
+    turn_segments = [
+        segment
+        for segment in segments
+        if str(segment.get("turn") or "") == seq and isinstance(segment, dict)
+    ]
+    has_marked_answer = any(_segment_is_marked_answer(segment) for segment in turn_segments)
+    for segment in turn_segments:
+        text = str(segment.get("text") or "")
+        if _is_hermes_tool_progress_segment(text):
+            segment["kind"] = "progress"
+            continue
+        if segment.get("informative_update"):
+            segment["kind"] = "commentary"
+            continue
+        if _segment_is_marked_answer(segment):
+            segment["kind"] = "answer"
+            continue
+        segment["kind"] = "commentary" if has_marked_answer else "answer"
+
+
 def _classify_turn_buffer_segment_kind(
     text: str,
     *,
@@ -5353,26 +5395,37 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         )
         buf["keepalive_task"] = started
+        buf["keepalive_scheduled_mono"] = time.monotonic()
         logger.debug(
             "agent365 turn buffer keep-alive scheduled: chat_id=%s",
             chat_id,
         )
 
+    @staticmethod
+    def _turn_buffer_live_for_keepalive(buf: dict[str, Any]) -> bool:
+        return int(buf.get("depth") or 0) > 0 or bool(buf.get("processing_active"))
+
+    def _maybe_revive_turn_buffer_keepalive(self, chat_id: str, buf: dict[str, Any]) -> None:
+        if self._disconnecting or str(chat_id) in self._retiring_chats:
+            return
+        if not self._turn_buffer_live_for_keepalive(buf):
+            return
+        if buf.get("keepalive_revive_used"):
+            return
+        buf["keepalive_revive_used"] = True
+        self._schedule_turn_buffer_keepalive(chat_id)
+
     def _turn_buffer_keepalive_task_done(self, chat_id: str, task: asyncio.Task[Any]) -> None:
-        """Reschedule keep-alive when a live turn loses its sleeper to cancel."""
+        """Reschedule keep-alive once when a live turn loses its sleeper to cancel."""
         _consume_turn_buffer_retry_result(task)
         if not task.cancelled():
-            return
-        if self._disconnecting or str(chat_id) in self._retiring_chats:
             return
         buf = self._turn_buffers.get(chat_id)
         if not isinstance(buf, dict):
             return
         if buf.get("keepalive_task") is task:
             buf["keepalive_task"] = None
-        if not self._turn_buffer_keepalive_needed(chat_id):
-            return
-        self._schedule_turn_buffer_keepalive(chat_id)
+        self._maybe_revive_turn_buffer_keepalive(chat_id, buf)
 
     @staticmethod
     def _cancel_turn_buffer_keepalive(buf: dict[str, Any]) -> None:
@@ -5573,8 +5626,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id,
                     "swallowed RuntimeError",
                 )
-                if self._turn_buffer_keepalive_needed(chat_id):
-                    self._schedule_turn_buffer_keepalive(chat_id)
+                buf = self._turn_buffers.get(chat_id)
+                if isinstance(buf, dict):
+                    self._maybe_revive_turn_buffer_keepalive(chat_id, buf)
                 return
             logger.warning(
                 "agent365 turn buffer keep-alive stopped: chat_id=%s error=%s",
@@ -5755,8 +5809,21 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if not for_answer and not self._turn_buffer_keepalive_needed(chat_id):
             return False
+        if not for_answer and not self._turn_buffer_live_for_keepalive(buf):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s reason=turn ended",
+                chat_id,
+            )
+            return False
         stream = self._keepalive_state(buf)
         if stream.get("stopped") or stream.get("untracked"):
+            return False
+        stream_id = str(stream.get("stream_id") or "")
+        if not stream_id and buf.get("skip_stream_open"):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s reason=skip_stream_open",
+                chat_id,
+            )
             return False
         turn = self._keepalive_turn(buf)
         if turn is None:
@@ -5765,7 +5832,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return False
-        stream_id = str(stream.get("stream_id") or "")
         sequence = 1 if not stream_id else int(stream.get("sequence") or 0) + 1
         informative_text = self._informative_text_for_turn(buf, turn)
         result = await self._post_keepalive_activity(
@@ -6778,8 +6844,26 @@ class Agent365Adapter(BasePlatformAdapter):
         finally:
             if chat_id:
                 buf = self._turn_buffers.get(chat_id)
-                if isinstance(buf, dict) and int(buf.get("depth") or 0) == 0:
-                    buf["processing_active"] = False
+                if isinstance(buf, dict):
+                    task = buf.get("keepalive_task")
+                    scheduled = buf.get("keepalive_scheduled_mono")
+                    elapsed: float | None = None
+                    if isinstance(scheduled, (int, float)):
+                        elapsed = time.monotonic() - float(scheduled)
+                    pending = isinstance(task, asyncio.Task) and not task.done()
+                    logger.debug(
+                        "agent365 turn buffer keep-alive at processing complete: "
+                        "chat_id=%s task_pending=%s scheduled_elapsed_sec=%s depth=%s "
+                        "processing_active=%s stream_id=%s",
+                        chat_id,
+                        pending,
+                        f"{elapsed:.3f}" if elapsed is not None else "n/a",
+                        int(buf.get("depth") or 0),
+                        bool(buf.get("processing_active")),
+                        str(self._keepalive_state(buf).get("stream_id") or ""),
+                    )
+                    if int(buf.get("depth") or 0) == 0:
+                        buf["processing_active"] = False
                 self._reset_stream_overflow_limit_for_task()
         parent = getattr(super(), "on_processing_complete", None)
         if callable(parent):
@@ -6828,7 +6912,18 @@ class Agent365Adapter(BasePlatformAdapter):
             reply_to=reply_to,
             metadata=metadata,
         )
-        segments.append({"id": segment_id, "text": text, "turn": turn_seq, "kind": kind})
+        segments.append(
+            {
+                "id": segment_id,
+                "text": text,
+                "turn": turn_seq,
+                "kind": kind,
+                "reply_to": str(reply_to) if reply_to is not None else "",
+                "notify": bool((metadata or {}).get("notify")),
+                "expect_edits": bool((metadata or {}).get("expect_edits")),
+                "informative_update": _metadata_marks_informative_segment(metadata),
+            }
+        )
         if kind in ("progress", "commentary"):
             self._schedule_informative_segment_refresh(str(chat_id))
         return SendResult(success=True, message_id=segment_id)
@@ -6931,6 +7026,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self, segments: list[dict[str, str]], seq: str, *, chat_id: str = ""
     ) -> tuple[list[dict[str, str]], list[str]]:
         """Split one turn's segments into answer bodies vs informative-only drops."""
+        _reconcile_turn_buffer_kinds_for_flush(segments, seq)
         turn_segments = [
             segment
             for segment in segments
@@ -7226,6 +7322,9 @@ class Agent365Adapter(BasePlatformAdapter):
             buf = self._turn_buffers.get(chat_id)
             if buf is None:
                 return
+            if closed:
+                buf["skip_stream_open"] = True
+                self._cancel_turn_buffer_keepalive(buf)
             if not closed:
                 turn_key = self._retry_turn_key_for_buffer(buf)
                 if turn_key:
