@@ -7464,7 +7464,11 @@ class TestEditMessage:
         assert prose.success is True
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 0
-        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == "Replaced with the answer."
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
+            "Replaced with the answer.\n\n"
+            "The command was date.\n💻 Running date is not the whole reply.\n\n"
+            "Running date locally is fine."
+        )
 
     @pytest.mark.asyncio
     async def test_turn_buffer_keeps_one_line_answers_sharing_progress_shape(
