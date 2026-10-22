@@ -769,6 +769,26 @@ def _is_hermes_tool_progress_segment(text: str) -> bool:
     return all(_is_hermes_tool_progress_line(line) for line in lines)
 
 
+def _classify_turn_buffer_segment_kind(text: str, *, reply_to: Any | None) -> str:
+    """Classify a buffered segment for informative vs answer delivery (#186)."""
+    if reply_to is not None:
+        return "answer"
+    if _is_hermes_tool_progress_segment(text):
+        return "progress"
+    return "commentary"
+
+
+def _refresh_turn_buffer_segment_kind_after_edit(segment: dict[str, str]) -> None:
+    """Reconcile kind after ``edit_message`` replaces segment text."""
+    if segment.get("kind") == "answer":
+        return
+    text = str(segment.get("text") or "")
+    if _is_hermes_tool_progress_segment(text):
+        segment["kind"] = "progress"
+    elif segment.get("kind") == "progress":
+        segment["kind"] = "answer"
+
+
 def _hermes_progress_target_is_sentence(target: str) -> bool:
     """A finished sentence is an answer, not a tool preview.
 
@@ -5303,6 +5323,10 @@ class Agent365Adapter(BasePlatformAdapter):
         started = asyncio.create_task(self._turn_buffer_keepalive(chat_id))
         started.add_done_callback(_consume_turn_buffer_retry_result)
         buf["keepalive_task"] = started
+        logger.debug(
+            "agent365 turn buffer keep-alive scheduled: chat_id=%s",
+            chat_id,
+        )
 
     @staticmethod
     def _cancel_turn_buffer_keepalive(buf: dict[str, Any]) -> None:
@@ -5365,7 +5389,91 @@ class Agent365Adapter(BasePlatformAdapter):
         buf = self._turn_buffers.get(chat_id)
         if not isinstance(buf, dict):
             return False
-        return int(buf.get("depth") or 0) > 0
+        if int(buf.get("depth") or 0) > 0:
+            return True
+        # Hermes can close processing while segments are still buffered (#181).
+        if buf.get("segments"):
+            return True
+        return bool(self._keepalive_blocks_reply(self._keepalive_state(buf)))
+
+    def _turn_buffer_keepalive_skip_reason(self, chat_id: str) -> str:
+        if self._disconnecting:
+            return "disconnecting"
+        if str(chat_id) in self._retiring_chats:
+            return "retiring"
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return "needed=false (depth 0 or buffer gone)"
+        depth = int(buf.get("depth") or 0)
+        if (
+            depth <= 0
+            and not buf.get("segments")
+            and not self._keepalive_blocks_reply(self._keepalive_state(buf))
+        ):
+            return "needed=false (depth 0 or buffer gone)"
+        return "needed=false"
+
+    @staticmethod
+    def _turn_buffer_segment_kind(segment: dict[str, str]) -> str:
+        kind = segment.get("kind")
+        if isinstance(kind, str) and kind:
+            return kind
+        text = str(segment.get("text") or "")
+        if _is_hermes_tool_progress_segment(text):
+            return "progress"
+        return "answer"
+
+    def _informative_text_for_turn(
+        self, buf: dict[str, Any], turn: dict[str, Any] | None
+    ) -> str:
+        if not isinstance(turn, dict):
+            return _TURN_BUFFER_KEEPALIVE_TEXT
+        seq = str(turn.get("seq") or "")
+        latest = ""
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            kind = self._turn_buffer_segment_kind(segment)
+            if kind not in ("progress", "commentary"):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if text:
+                latest = text
+        if latest:
+            return latest[:_INFORMATIVE_TEXT_MAX_CHARS]
+        return _TURN_BUFFER_KEEPALIVE_TEXT
+
+    def _schedule_informative_segment_refresh(self, chat_id: str) -> None:
+        """Push progress/commentary into an open informative stream when possible."""
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict) or buf.get("answer_final_in_progress"):
+            return
+        stream = self._keepalive_state(buf)
+        if stream.get("stopped") or stream.get("untracked"):
+            return
+        if not str(stream.get("stream_id") or ""):
+            return
+        task = buf.get("segment_informative_task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            return
+        started = asyncio.create_task(self._push_informative_segment_text(chat_id))
+        started.add_done_callback(_consume_turn_buffer_retry_result)
+        buf["segment_informative_task"] = started
+
+    async def _push_informative_segment_text(self, chat_id: str) -> None:
+        try:
+            await self._post_informative_under_lock(chat_id, allow_restart=False)
+        except asyncio.CancelledError:
+            raise
+        except RuntimeError as exc:
+            if str(exc) == "agent365 outbound operation cancelled":
+                logger.debug(
+                    "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                    chat_id,
+                    "swallowed RuntimeError",
+                )
+                return
+            raise
 
     async def _turn_buffer_keepalive(self, chat_id: str) -> None:
         """Keep a long non-personal turn alive without touching ``send``.
@@ -5379,16 +5487,47 @@ class Agent365Adapter(BasePlatformAdapter):
         try:
             await asyncio.sleep(_TURN_BUFFER_KEEPALIVE_FIRST_SEC)
             while self._turn_buffer_keepalive_needed(chat_id):
-                if self._keepalive_state(self._turn_buffers.get(chat_id)).get("stopped"):
+                buf = self._turn_buffers.get(chat_id)
+                stream = self._keepalive_state(buf)
+                if stream.get("stopped"):
+                    logger.debug(
+                        "agent365 turn buffer keep-alive exit: chat_id=%s reason=stopped",
+                        chat_id,
+                    )
+                    return
+                if stream.get("untracked"):
+                    logger.debug(
+                        "agent365 turn buffer keep-alive exit: chat_id=%s reason=untracked",
+                        chat_id,
+                    )
                     return
                 await self._emit_turn_buffer_keepalive(chat_id)
                 if not self._turn_buffer_keepalive_needed(chat_id):
+                    logger.debug(
+                        "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                        chat_id,
+                        self._turn_buffer_keepalive_skip_reason(chat_id),
+                    )
                     return
                 await asyncio.sleep(_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC)
+            logger.debug(
+                "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                chat_id,
+                self._turn_buffer_keepalive_skip_reason(chat_id),
+            )
         except asyncio.CancelledError:
+            logger.debug(
+                "agent365 turn buffer keep-alive exit: chat_id=%s reason=cancelled",
+                chat_id,
+            )
             raise
         except RuntimeError as exc:
             if str(exc) == "agent365 outbound operation cancelled":
+                logger.debug(
+                    "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                    chat_id,
+                    "swallowed RuntimeError",
+                )
                 return
             logger.warning(
                 "agent365 turn buffer keep-alive stopped: chat_id=%s error=%s",
@@ -5432,14 +5571,34 @@ class Agent365Adapter(BasePlatformAdapter):
         """
         buf = self._turn_buffers.get(chat_id)
         if not isinstance(buf, dict):
+            logger.debug(
+                "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                chat_id,
+                "needed=false (depth 0 or buffer gone)",
+            )
             return
         rotated = False
         async with self._turn_buffer_lock(buf):
             if self._turn_buffers.get(chat_id) is not buf:
+                logger.debug(
+                    "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                    chat_id,
+                    "needed=false (depth 0 or buffer gone)",
+                )
                 return
             if buf.get("answer_final_in_progress"):
+                logger.debug(
+                    "agent365 turn buffer keep-alive skip emit: "
+                    "chat_id=%s reason=answer_final_in_progress",
+                    chat_id,
+                )
                 return
             if not self._turn_buffer_keepalive_needed(chat_id):
+                logger.debug(
+                    "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                    chat_id,
+                    self._turn_buffer_keepalive_skip_reason(chat_id),
+                )
                 return
             stream = self._keepalive_state(buf)
             if stream.get("stopped") or stream.get("untracked"):
@@ -5449,6 +5608,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 # that follows (#154). The turn stays quiet until the
                 # two-minute cap, which is when the service finishes the
                 # stream this process cannot name.
+                reason = "stopped" if stream.get("stopped") else "untracked"
+                logger.debug(
+                    "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                    chat_id,
+                    reason,
+                )
                 return
             stream_id = str(stream.get("stream_id") or "")
             opened = stream.get("opened_mono")
@@ -5548,15 +5713,21 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         turn = self._keepalive_turn(buf)
         if turn is None:
+            logger.debug(
+                "agent365 turn buffer keep-alive exit: chat_id=%s reason=_keepalive_turn None",
+                chat_id,
+            )
             return False
         stream_id = str(stream.get("stream_id") or "")
         sequence = 1 if not stream_id else int(stream.get("sequence") or 0) + 1
+        informative_text = self._informative_text_for_turn(buf, turn)
         result = await self._post_keepalive_activity(
             chat_id,
             turn,
             stream_id=stream_id,
             sequence=sequence,
             final=False,
+            text=informative_text,
         )
         if result.untracked and not stream_id:
             self._remember_keepalive(
@@ -5721,6 +5892,10 @@ class Agent365Adapter(BasePlatformAdapter):
             return empty
         body_text = (text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT).strip()
         if not body_text:
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s reason=empty text",
+                chat_id,
+            )
             return empty
         if final and text is not None:
             payload_text = body_text[: self.MAX_MESSAGE_LENGTH]
@@ -5728,9 +5903,18 @@ class Agent365Adapter(BasePlatformAdapter):
             payload_text = body_text[:_INFORMATIVE_TEXT_MAX_CHARS]
         inbound = turn.get("inbound")
         if not isinstance(inbound, dict):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s reason=_keepalive_turn None",
+                chat_id,
+            )
             return empty
         retiring = self._disconnecting or str(chat_id) in self._retiring_chats
         if self._http_client is None or self._bridge_cfg is None:
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: "
+                "chat_id=%s reason=http client or bridge config missing",
+                chat_id,
+            )
             return empty
         if retiring and not for_teardown:
             return empty
@@ -5747,6 +5931,11 @@ class Agent365Adapter(BasePlatformAdapter):
             not self._lifecycle_is_current(generation, client)
             or not self._chat_lifecycle_is_current(chat_id, chat_generation)
         ):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: "
+                "chat_id=%s reason=lifecycle not current",
+                chat_id,
+            )
             return empty
         entity: dict[str, Any] = {
             "type": "streaminfo",
@@ -5882,7 +6071,14 @@ class Agent365Adapter(BasePlatformAdapter):
     def _buffer_has_kept_answer_segments(buf: dict[str, Any]) -> bool:
         for segment in buf.get("segments") or []:
             text = str(segment.get("text") or "")
-            if text and not _is_hermes_tool_progress_segment(text):
+            if not text:
+                continue
+            kind = segment.get("kind")
+            if kind:
+                if kind == "answer":
+                    return True
+                continue
+            if not _is_hermes_tool_progress_segment(text):
                 return True
         return False
 
@@ -6563,7 +6759,10 @@ class Agent365Adapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=own[-1]["id"])
         self._turn_buffer_seq += 1
         segment_id = f"turnbuf:{self._turn_buffer_seq}"
-        segments.append({"id": segment_id, "text": text, "turn": turn_seq})
+        kind = _classify_turn_buffer_segment_kind(text, reply_to=reply_to)
+        segments.append({"id": segment_id, "text": text, "turn": turn_seq, "kind": kind})
+        if kind in ("progress", "commentary"):
+            self._schedule_informative_segment_refresh(str(chat_id))
         return SendResult(success=True, message_id=segment_id)
 
     @staticmethod
@@ -6618,6 +6817,10 @@ class Agent365Adapter(BasePlatformAdapter):
             for segment in own["segments"]:
                 if segment["id"] == message_id:
                     segment["text"] = text
+                    _refresh_turn_buffer_segment_kind_after_edit(segment)
+                    kind = str(segment.get("kind") or "")
+                    if kind in ("progress", "commentary"):
+                        self._schedule_informative_segment_refresh(chat_id)
                     return SendResult(success=True, message_id=message_id)
         for other_id, buf in self._turn_buffers.items():
             if other_id == chat_id:
@@ -6655,6 +6858,49 @@ class Agent365Adapter(BasePlatformAdapter):
         if current:
             chunks.append(current)
         return chunks
+
+    def _partition_turn_flush_segments(
+        self, segments: list[dict[str, str]], seq: str, *, chat_id: str = ""
+    ) -> tuple[list[dict[str, str]], list[str]]:
+        """Split one turn's segments into answer bodies vs informative-only drops."""
+        turn_segments = [
+            segment
+            for segment in segments
+            if str(segment.get("turn") or "") == seq
+        ]
+        kept: list[dict[str, str]] = []
+        drop_ids: list[str] = []
+        for segment in turn_segments:
+            text = str(segment.get("text") or "")
+            kind = self._turn_buffer_segment_kind(segment)
+            if not text or kind in ("progress", "commentary"):
+                if text and kind == "progress" and chat_id:
+                    logger.debug(
+                        "agent365 turn buffer omitting tool-progress segment: chat_id=%s",
+                        chat_id,
+                    )
+                drop_ids.append(str(segment.get("id") or ""))
+                continue
+            if _is_hermes_tool_progress_segment(text):
+                drop_ids.append(str(segment.get("id") or ""))
+                continue
+            kept.append(segment)
+        if not kept:
+            nonempty = [
+                segment
+                for segment in turn_segments
+                if str(segment.get("text") or "")
+                and self._turn_buffer_segment_kind(segment) != "progress"
+                and not _is_hermes_tool_progress_segment(str(segment.get("text") or ""))
+            ]
+            if len(nonempty) == 1:
+                kept = nonempty
+                drop_ids = [
+                    str(segment.get("id") or "")
+                    for segment in turn_segments
+                    if segment not in kept
+                ]
+        return kept, drop_ids
 
     def _turn_buffer_handoff_suffix(self, chat_id: str) -> str:
         """The opt-in handoff line, minted once, or empty when it does not apply."""
@@ -6704,22 +6950,12 @@ class Agent365Adapter(BasePlatformAdapter):
         for turn in turns:
             if turn.get("open"):
                 continue
-            kept: list[dict[str, str]] = []
-            drop_ids: list[str] = []
             seq = str(turn.get("seq") or "")
-            for segment in buf.get("segments") or []:
-                if str(segment.get("turn") or "") != seq:
-                    continue
-                text = str(segment.get("text") or "")
-                if not text or _is_hermes_tool_progress_segment(text):
-                    if text and _is_hermes_tool_progress_segment(text):
-                        logger.debug(
-                            "agent365 turn buffer omitting tool-progress segment: chat_id=%s",
-                            chat_id,
-                        )
-                    drop_ids.append(str(segment.get("id") or ""))
-                    continue
-                kept.append(segment)
+            kept, drop_ids = self._partition_turn_flush_segments(
+                list(buf.get("segments") or []),
+                seq,
+                chat_id=chat_id,
+            )
             plan.append((turn, kept, drop_ids))
         last_postable = -1
         for index, (_turn, kept, _drop_ids) in enumerate(plan):

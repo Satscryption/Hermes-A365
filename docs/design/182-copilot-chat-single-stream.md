@@ -78,7 +78,7 @@ Hermes cancels the stream-consumer task at turn end. A POST inside `send` dies a
 
 The keep-alive task (#155) still waits `_TURN_BUFFER_KEEPALIVE_FIRST_SEC` (25s) and still posts informative updates on `buf["keepalive"]`. This design does not make it fire, and does not move its first post. That is #181.
 
-Tool-progress lines that match `_is_hermes_tool_progress_segment` are still dropped from the final body. Commentary is still joined into the answer with `\n\n`. Changing that split is #186.
+Tool-progress and interim commentary are routed to informative stream text (#186); only `kind=answer` segments are joined into the `streamType=final` body.
 
 Personal chats never open `_turn_buffers`.
 
@@ -215,6 +215,18 @@ Today `_flush_closed_turns` already drops a segment when `_is_hermes_tool_progre
 - Do not put progress on the final activity, and do not put the answer on an informative activity. After the first `streamType=streaming` chunk, informative updates stop rendering; stay on `informative` for progress.
 - The pure-progress filter can stay as a backstop, but #186 should classify by segment role (`reply_to` scoped stream chunk vs unscoped progress/commentary), not only by emoji shape. The walk line may already match the emoji filter and still have been merged because it shared a segment with commentary, or the quoted log may be counting buffer segments before the filter. Check the walk log before changing the filter.
 - Per-platform `display.tool_progress: off` remains the workaround that does not need this delivery path.
+
+### Segment classification (#186 shipped)
+
+Each turn-buffer segment carries a `kind` set at append time (and refreshed on `edit_message` when a progress line becomes answer text):
+
+| `kind` | How it is assigned | Informative stream | Answer `streamType=final` |
+|---|---|---|---|
+| `answer` | `send` / `edit_message` with `reply_to` set to the turn activity id (stream chunks and finalized edits) | never | yes — only these segments are joined into the final body |
+| `progress` | unscoped `send` whose text matches `_is_hermes_tool_progress_segment` | latest progress/commentary text on keep-alive and on flush opener | never (emoji filter remains a backstop) |
+| `commentary` | unscoped `send` that is not tool-progress (interim assistant lines) | same as progress | never |
+
+When an informative stream is already open (`keepalive.stream_id` set), new progress or commentary segments schedule a continuation POST with the latest informative text. If no stream is open yet, that text is included on the first informative opener at flush (or on the keep-alive opener once #181 fires). Personal Teams 1:1 does not use the turn buffer; this split applies only to Copilot Chat / non-personal buffered turns.
 
 ## Test plan
 

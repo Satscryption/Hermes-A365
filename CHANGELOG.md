@@ -30,6 +30,18 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Copilot Chat turn-buffer keep-alive (#181).** `_turn_buffer_keepalive_needed`
+  now stays true while segments or an open informative stream remain after
+  `on_processing_complete` closes the turn (`depth` 0). DEBUG logs name every
+  silent keep-alive exit (scheduled, needed=false, stopped/untracked,
+  `_keepalive_turn` missing, HTTP/lifecycle skip, cancel, swallowed outbound
+  cancel).
+
+- **Copilot Chat informative vs answer text (#186).** Tool-progress and interim
+  commentary update informative stream text; only `reply_to`-scoped answer
+  segments are joined into the `streamType=final` body. Personal 1:1 streaming
+  is unchanged.
+
 - **Copilot Chat publish version and catalog id handling (#171).**
   `publish --copilot-chat --apply` fails closed when there is no matching
   `copilot-chat-publish.json` record for the target catalog `manifest.id` and

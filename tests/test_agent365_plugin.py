@@ -7352,10 +7352,12 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 0
         assert "conv-G-buf" not in a._turn_buffers
         assert post_mock.await_count == 2
-        final = post_mock.await_args_list[-1].kwargs["json"]
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["text"] == "Using the tool."
         assert final["type"] == "message"
         text = final["text"]
-        assert text.startswith("Using the tool.\n\nFinal answer\n\n[Continue in Teams](")
+        assert text.startswith("Final answer\n\n[Continue in Teams](")
         assert final["entities"][0]["streamType"] == "final"
         assert "streamSequence" not in final["entities"][0]
 
@@ -7461,11 +7463,7 @@ class TestEditMessage:
         assert prose.success is True
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 0
-        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
-            "Replaced with the answer.\n\n"
-            "The command was date.\n💻 Running date is not the whole reply.\n\n"
-            "Running date locally is fine."
-        )
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == "Replaced with the answer."
 
     @pytest.mark.asyncio
     async def test_turn_buffer_keeps_one_line_answers_sharing_progress_shape(
@@ -7978,7 +7976,7 @@ class TestEditMessage:
         final = await a.send(
             chat_id="conv-G-live-turn",
             content="The current time is 16:37 UTC.",
-            reply_to=None,
+            reply_to="act-1",
         )
         assert interim.success is True
         assert tool.success is True
@@ -7986,9 +7984,10 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 0
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 0
-        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
-            "Checking the current time now.\n\nThe current time is 16:37 UTC."
-        )
+        opener, answer_final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["text"] == "💻 Running date"
+        assert answer_final["text"] == "The current time is 16:37 UTC."
         assert "conv-G-live-turn" not in a._turn_buffers
 
     def test_keepalive_windows_fit_copilot_limits(self) -> None:
@@ -8190,6 +8189,192 @@ class TestEditMessage:
         assert "streamSequence" not in final["entities"][0]
         assert replies == []
         assert "conv-G-long" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_keepalive_task_posts_after_first_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-ka-task", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-task")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-ka-task"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-ka-task", content="Still running", reply_to="act-1")
+        await self._spin_until(
+            lambda: (
+                a._turn_buffers.get("conv-G-ka-task", {}).get("keepalive", {}).get("stream_id")
+                == "ka-task"
+            )
+        )
+        assert posts[0]["type"] == "typing"
+        assert posts[0]["text"] == "Working on it."
+        await a.on_processing_complete(event, outcome="success")
+        assert "conv-G-ka-task" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_keepalive_needed_while_segments_wait_after_complete(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-ka-depth", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-depth")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-ka-depth"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await self._spin_until(
+            lambda: (
+                a._turn_buffers.get("conv-G-ka-depth", {}).get("keepalive", {}).get("stream_id")
+                == "ka-depth"
+            )
+        )
+        await a.send(chat_id="conv-G-ka-depth", content="Answer", reply_to="act-1")
+        a._close_innermost_turn("conv-G-ka-depth")
+        assert a._turn_buffers["conv-G-ka-depth"]["depth"] == 0
+        assert len(posts) >= 1
+        await a._flush_turn_buffer("conv-G-ka-depth")
+        assert any(body.get("text") == "Answer" for body in posts if body.get("type") == "message")
+
+    @pytest.mark.asyncio
+    async def test_keepalive_skip_reason_logs(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-ka-log", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        a._http_client = None
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-ka-log"),
+            message_id="act-1",
+        )
+        with caplog.at_level("DEBUG"):
+            await a.on_processing_start(event)
+            await a._emit_turn_buffer_keepalive("conv-G-ka-log")
+        assert any(
+            "skip post" in record.message
+            and "http client or bridge config missing" in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_progress_updates_informative_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-prog-info", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        bodies: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            bodies.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "prog-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-prog-info"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await self._spin_until(lambda: len(bodies) >= 1)
+        await a.send(
+            chat_id="conv-G-prog-info",
+            content="💻 Running sleep 40",
+            reply_to=None,
+        )
+        await self._spin_until(lambda: len(bodies) >= 2)
+        assert bodies[-1]["text"] == "💻 Running sleep 40"
+        answer = await a.send(
+            chat_id="conv-G-prog-info",
+            content="slept",
+            reply_to="act-1",
+        )
+        assert answer.success is True
+        await a.on_processing_complete(event, outcome="success")
+        final = bodies[-1]
+        assert final["type"] == "message"
+        assert final["text"] == "slept"
+
+    @pytest.mark.asyncio
+    async def test_progress_only_turn_closes_informative_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-prog-only", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        kinds: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            kinds.append(str(entity.get("streamType")))
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "prog-only")
+            if entity.get("streamType") == "final":
+                return self._http_result(202)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-prog-only"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await self._spin_until(lambda: "informative" in kinds)
+        await a.send(
+            chat_id="conv-G-prog-only",
+            content="💻 Running noop",
+            reply_to=None,
+        )
+        await a.on_processing_complete(event, outcome="success")
+        assert kinds[-1] == "final"
+        assert "conv-G-prog-only" not in a._turn_buffers
 
     @pytest.mark.asyncio
     async def test_keepalive_rotates_before_two_minute_cap(
