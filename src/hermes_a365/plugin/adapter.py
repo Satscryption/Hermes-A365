@@ -193,6 +193,7 @@ def _validate_profile_env_permissions(hermes_home: Path) -> None:
             f"profile .env is group/world-readable (mode 0{mode:o}); chmod 600 {path}"
         )
 
+
 _AGENT_TURN_LIFECYCLE: ContextVar[tuple[int, str, int, int, asyncio.Event] | None] = ContextVar(
     "agent365_agent_turn_lifecycle", default=None
 )
@@ -255,9 +256,7 @@ def _claim_persist_owner(
         )
 
 
-def _reserve_persist_sequence(
-    path: Path, owner: int
-) -> tuple[dict[str, Any], int | None]:
+def _reserve_persist_sequence(path: Path, owner: int) -> tuple[dict[str, Any], int | None]:
     with _PERSIST_STATE_GUARD:
         state = _persist_state(path)
         current_owner = int(state["current_owner"])
@@ -272,9 +271,7 @@ def _reserve_persist_sequence(
         return state, sequence
 
 
-def _reserve_persist_mutation(
-    path: Path, owner: int
-) -> tuple[dict[str, Any], int | None]:
+def _reserve_persist_mutation(path: Path, owner: int) -> tuple[dict[str, Any], int | None]:
     with _PERSIST_STATE_GUARD:
         state = _persist_state(path)
         if owner != int(state["current_owner"]):
@@ -285,9 +282,7 @@ def _reserve_persist_mutation(
         return state, mutation
 
 
-def _promote_persist_mutation(
-    state: dict[str, Any], mutation: int, owner: int
-) -> int | None:
+def _promote_persist_mutation(state: dict[str, Any], mutation: int, owner: int) -> int | None:
     """Atomically turn a mutation lease into its post-mutation write order."""
     with _PERSIST_STATE_GUARD:
         state["mutations"].discard(mutation)
@@ -306,13 +301,9 @@ def _complete_persist_mutation(state: dict[str, Any], mutation: int) -> None:
         state["mutations"].discard(mutation)
 
 
-def _persist_write_is_admitted(
-    state: dict[str, Any], owner: int, sequence: int
-) -> bool:
+def _persist_write_is_admitted(state: dict[str, Any], owner: int, sequence: int) -> bool:
     with _PERSIST_STATE_GUARD:
-        return owner == int(state["current_owner"]) or sequence <= int(
-            state["handoff_cutoff"]
-        )
+        return owner == int(state["current_owner"]) or sequence <= int(state["handoff_cutoff"])
 
 
 def _complete_persist_sequence(state: dict[str, Any], sequence: int) -> None:
@@ -391,9 +382,7 @@ class _PreAuthAdmissionMiddleware:
                 message = await asyncio.wait_for(receive(), timeout=max(0, remaining))
             except TimeoutError as exc:
                 raise _PreAuthBodyTimeout from exc
-            if message.get("type") == "http.disconnect" or not message.get(
-                "more_body", False
-            ):
+            if message.get("type") == "http.disconnect" or not message.get("more_body", False):
                 body_complete = True
             return message
 
@@ -416,6 +405,7 @@ class _PreAuthAdmissionMiddleware:
             if task is not None:
                 self.owner._pre_auth_tasks.discard(task)
             self.semaphore.release()
+
 
 # Bridge helpers are imported lazily inside methods so missing optional
 # extras (e.g. fastapi for `activity-bridge serve`) produce a clear runtime
@@ -606,10 +596,14 @@ def _bound_map(m: dict[str, Any], cap: int | None = None) -> None:
 
 def _bound_feedback_map(m: dict[str, dict[str, Any]]) -> None:
     _bound_map(m)
-    while m and sum(
-        len(json.dumps(value, ensure_ascii=True, default=str).encode("utf-8"))
-        for value in m.values()
-    ) > _MAX_FEEDBACK_CACHE_BYTES:
+    while (
+        m
+        and sum(
+            len(json.dumps(value, ensure_ascii=True, default=str).encode("utf-8"))
+            for value in m.values()
+        )
+        > _MAX_FEEDBACK_CACHE_BYTES
+    ):
         m.pop(next(iter(m)))
 
 
@@ -899,9 +893,7 @@ def _answer_final_cap_remaining_sec(stream: dict[str, Any]) -> float:
     )
 
 
-def _cap_answer_final_retry_delay(
-    stream: dict[str, Any], delay: float
-) -> float:
+def _cap_answer_final_retry_delay(stream: dict[str, Any], delay: float) -> float:
     remaining = _answer_final_cap_remaining_sec(stream)
     if remaining <= 0.0:
         return 0.0
@@ -1288,9 +1280,7 @@ def _lifecycle_registry_action(activity: dict[str, Any]) -> str | None:
 # - Absorbing the named conversation's cached ref copies a strong id only
 #   when this side has none. Disagreeing strong ids are not unioned; that
 #   conflict retires only the named conversation.
-_APP_GUID_RE = re.compile(
-    r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
-)
+_APP_GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _BOT_APP_ID_KEYS = ("agenticAppId", "appId", "applicationId")
 
 
@@ -1364,9 +1354,7 @@ class _ConversationParties:
         return True
 
 
-def _same_uninstall_parties(
-    anchor: _ConversationParties, other: _ConversationParties
-) -> bool:
+def _same_uninstall_parties(anchor: _ConversationParties, other: _ConversationParties) -> bool:
     """True when ``other`` is the same Entra user and the same bot app."""
     return bool(
         anchor.user.strong
@@ -1449,10 +1437,7 @@ def _conversations_activities_url(service_url: str, conv_id: str) -> str:
     stays attached. BF accepts encoded segments (Teams ids like
     ``19:abc@thread.tacv2`` become ``19%3Aabc%40thread.tacv2``).
     """
-    return (
-        f"{service_url}/v3/conversations/"
-        f"{quote_path_segment(str(conv_id))}/activities"
-    )
+    return f"{service_url}/v3/conversations/{quote_path_segment(str(conv_id))}/activities"
 
 
 def _import_bridge() -> Any:
@@ -1528,9 +1513,7 @@ class Agent365Adapter(BasePlatformAdapter):
             try:
                 self.slug: str = validate_slug(_slug_raw)
             except ValueError:
-                raise ValueError(
-                    "agent365 configured slug is not path-safe"
-                ) from None
+                raise ValueError("agent365 configured slug is not path-safe") from None
         else:
             self.slug = ""
         self.host: str = str(extra.get("host") or "127.0.0.1")
@@ -1541,23 +1524,17 @@ class Agent365Adapter(BasePlatformAdapter):
         # Tenant + blueprint identity (also pulled by load_bridge_config when
         # available, but env-first lookup keeps the plugin loadable when
         # generated config isn't on disk in the gateway's cwd).
-        self.tenant_id: str = _profile_env("A365_TENANT_ID") or str(
-            extra.get("tenant_id") or ""
+        self.tenant_id: str = _profile_env("A365_TENANT_ID") or str(extra.get("tenant_id") or "")
+        self.blueprint_app_id: str = _profile_env("A365_APP_ID") or str(extra.get("app_id") or "")
+        self.blueprint_client_secret: str = _profile_env("A365_BLUEPRINT_CLIENT_SECRET") or str(
+            extra.get("blueprint_client_secret") or ""
         )
-        self.blueprint_app_id: str = _profile_env("A365_APP_ID") or str(
-            extra.get("app_id") or ""
-        )
-        self.blueprint_client_secret: str = _profile_env(
-            "A365_BLUEPRINT_CLIENT_SECRET"
-        ) or str(extra.get("blueprint_client_secret") or "")
 
         # #36: optional separate non-agentic Path B identity. Empty
         # defaults to the blueprint app (which fails AADSTS82001 on
         # outbound for #36's reasons). Operators following the #36
         # walk register a second Entra app + set these env vars.
-        self.bf_app_id: str = _profile_env("A365_BF_APP_ID") or str(
-            extra.get("bf_app_id") or ""
-        )
+        self.bf_app_id: str = _profile_env("A365_BF_APP_ID") or str(extra.get("bf_app_id") or "")
         self.bf_client_secret: str = _profile_env("A365_BF_CLIENT_SECRET") or str(
             extra.get("bf_client_secret") or ""
         )
@@ -1604,12 +1581,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._conversations_path: Path = Path(
             extra.get("conversations_path")
             or _profile_env("A365_CONVERSATIONS_PATH")
-            or (
-                self._hermes_home
-                / "agents"
-                / (self.slug or "default")
-                / "conversations.json"
-            )
+            or (self._hermes_home / "agents" / (self.slug or "default") / "conversations.json")
         )
         with _PERSIST_STATE_GUARD:
             initial_persist_state = _persist_state(self._conversations_path)
@@ -1618,9 +1590,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._conversations_path
             )
             self._persist_loaded_sequence = int(initial_persist_state["written"])
-            self._persist_loaded_fingerprint = _registry_fingerprint(
-                self._conversations
-            )
+            self._persist_loaded_fingerprint = _registry_fingerprint(self._conversations)
 
         # Slice 19x-d (#4): conversations registry prune threshold.
         # Default 30 days matches Hermes' SessionStore reset policy.
@@ -1736,20 +1706,12 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_reply_survivor_count_by_chat: dict[str, int] = {}
         self._lifecycle_owner_survivors: dict[asyncio.Task[Any], str] = {}
         self._lifecycle_owner_survivor_count_by_chat: dict[str, int] = {}
-        self._coalesced_delivery_tail_by_turn: dict[
-            tuple[str, str], asyncio.Event
-        ] = {}
+        self._coalesced_delivery_tail_by_turn: dict[tuple[str, str], asyncio.Event] = {}
         self._coalesced_generation_count_by_chat: dict[str, int] = {}
         self._coalesced_generation_count_by_turn: dict[tuple[str, str], int] = {}
-        self._coalesced_turn_owners: dict[
-            tuple[str, str], tuple[dict[str, Any], str]
-        ] = {}
-        self._coalesced_turn_targets: dict[
-            tuple[str, str], tuple[dict[str, Any], str, float]
-        ] = {}
-        self._coalesced_turn_target_order_by_chat: dict[
-            str, dict[tuple[str, str], None]
-        ] = {}
+        self._coalesced_turn_owners: dict[tuple[str, str], tuple[dict[str, Any], str]] = {}
+        self._coalesced_turn_targets: dict[tuple[str, str], tuple[dict[str, Any], str, float]] = {}
+        self._coalesced_turn_target_order_by_chat: dict[str, dict[tuple[str, str], None]] = {}
         self._coalesced_turn_target_count_by_chat: dict[str, int] = {}
 
         # #123 live retest: Hermes cancels the stream-consumer task at turn
@@ -1942,7 +1904,6 @@ class Agent365Adapter(BasePlatformAdapter):
         self._handoff_tokens: dict[str, dict[str, Any]] = {}
         self._handoff_dispatch_tasks: set[asyncio.Task[Any]] = set()
 
-
         # #73(c)/#82 — per-instance invoke registry: the shared #18 table plus
         # adapter-bound children that need adapter state (feedback map / handoff
         # tokens / ConversationRegistry). Passed to ``dispatch_invoke`` so the
@@ -1967,9 +1928,7 @@ class Agent365Adapter(BasePlatformAdapter):
         except FileNotFoundError:
             return
         except OSError as e:
-            raise RuntimeError(
-                f"cannot verify generated-config permissions: {e}"
-            ) from e
+            raise RuntimeError(f"cannot verify generated-config permissions: {e}") from e
         if mode & 0o077:
             raise RuntimeError(
                 "generated config is group/world-readable "
@@ -2024,9 +1983,7 @@ class Agent365Adapter(BasePlatformAdapter):
         cached = self._provider_secret
         if cached:
             return cached
-        found = _resolve_secret_at_rest(
-            self.tenant_id, self.blueprint_app_id, existing=""
-        )
+        found = _resolve_secret_at_rest(self.tenant_id, self.blueprint_app_id, existing="")
         self._provider_secret = found
         return found
 
@@ -2036,9 +1993,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return self.bf_client_secret
         if self._provider_bf_secret:
             return self._provider_bf_secret
-        found = _resolve_secret_at_rest(
-            self.tenant_id, self.bf_app_id, existing=""
-        )
+        found = _resolve_secret_at_rest(self.tenant_id, self.bf_app_id, existing="")
         self._provider_bf_secret = found
         return found
 
@@ -2187,9 +2142,7 @@ class Agent365Adapter(BasePlatformAdapter):
             service_url = activity.get("serviceUrl") or ""
             trusted_suffixes = bridge.DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
             if not trusted_suffixes:
-                logger.warning(
-                    "inbound 403 reason=config-bug detail=empty-trusted-suffixes"
-                )
+                logger.warning("inbound 403 reason=config-bug detail=empty-trusted-suffixes")
                 raise HTTPException(
                     status_code=403,
                     detail="trusted_service_url_suffixes is empty — refusing to "
@@ -2262,9 +2215,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         cache=self._bf_jwks_cache,
                     )
                 except bridge.JwtValidationError as e:
-                    logger.warning(
-                        "inbound 403 path=B reason=%s", bridge._safe_log_field(e)
-                    )
+                    logger.warning("inbound 403 path=B reason=%s", bridge._safe_log_field(e))
                     raise HTTPException(status_code=403, detail="invalid bearer token") from e
 
             else:
@@ -2279,9 +2230,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         cache=self._jwks_cache,
                     )
                 except bridge.JwtValidationError as e:
-                    logger.warning(
-                        "inbound 403 path=A reason=%s", bridge._safe_log_field(e)
-                    )
+                    logger.warning("inbound 403 path=A reason=%s", bridge._safe_log_field(e))
                     raise HTTPException(status_code=403, detail="invalid bearer token") from e
 
             if self._disconnecting:
@@ -2291,9 +2240,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             if not self._lifecycle_is_current(
                 request_generation, request_client
-            ) or not self._chat_lifecycle_is_current(
-                chat_id, request_chat_generation
-            ):
+            ) or not self._chat_lifecycle_is_current(chat_id, request_chat_generation):
                 return JSONResponse(
                     {"status": "unavailable", "reason": "lifecycle_changed"},
                     status_code=503,
@@ -2307,8 +2254,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 alias_decisions: list[Any] = []
                 if callable(auth_check):
                     alias_decisions = [
-                        auth_check(sender_id, chat_type, chat_id)
-                        for sender_id in sender_ids
+                        auth_check(sender_id, chat_type, chat_id) for sender_id in sender_ids
                     ]
                     decision = (
                         True
@@ -2345,15 +2291,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     decision = True
                     if not self._allow_all_users:
                         allowed = {
-                            value.strip().lower()
-                            for value in self._allowed_users
-                            if value.strip()
+                            value.strip().lower() for value in self._allowed_users if value.strip()
                         }
-                        listed = [
-                            sender_id
-                            for sender_id in sender_ids
-                            if sender_id in allowed
-                        ]
+                        listed = [sender_id for sender_id in sender_ids if sender_id in allowed]
                         if listed:
                             authorized_sender_id = listed[0]
                 if not decision:
@@ -2425,9 +2365,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         logger.error("agent365 fileConsent handler crashed: %s", e)
                         # No real invokeResponse. Same wire as serve (#132).
                         resp = invoke.empty_invoke_ack()
-                    logger.info(
-                        "inbound invoke name=%s status=%s", invoke_name, resp.status
-                    )
+                    logger.info("inbound invoke name=%s status=%s", invoke_name, resp.status)
                     return JSONResponse(resp.body, status_code=resp.status)
                 # Context assembly (_inbound_path_tag / build_invoke_context) is
                 # inside the try too: a wire-shape surprise on the live walk must
@@ -2435,20 +2373,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 # HTTP 500 that Microsoft reads as an outage.
                 try:
                     path_tag = bridge._inbound_path_tag(activity)
-                    ctx = invoke.build_invoke_context(
-                        activity, claims=claims, path_tag=path_tag
-                    )
-                    resp = await invoke.dispatch_invoke(
-                        ctx, registry=self._invoke_registry
-                    )
+                    ctx = invoke.build_invoke_context(activity, claims=claims, path_tag=path_tag)
+                    resp = await invoke.dispatch_invoke(ctx, registry=self._invoke_registry)
                 except Exception as e:
-                    logger.error(
-                        "agent365 invoke handler failed: name=%s %s", invoke_name, e
-                    )
+                    logger.error("agent365 invoke handler failed: name=%s %s", invoke_name, e)
                     resp = invoke.empty_invoke_ack()
-                logger.info(
-                    "inbound invoke name=%s status=%s", invoke_name, resp.status
-                )
+                logger.info("inbound invoke name=%s status=%s", invoke_name, resp.status)
                 # BF wire: the HTTP body is the invokeResponse *body*, and the
                 # HTTP status is its status — NOT a {status, body} wrapper (an
                 # SDK abstraction the transport unwraps). v0.8.0 walk: Teams
@@ -2465,9 +2395,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 validated_path=validated_path or "",
                 tenant_id=self.tenant_id,
             )
-            if delivery_id is not None and self._idempotency_cache.is_duplicate(
-                delivery_id
-            ):
+            if delivery_id is not None and self._idempotency_cache.is_duplicate(delivery_id):
                 return JSONResponse({"status": "duplicate"})
 
             # #80 — Teams messageReaction add/remove, only after the serviceUrl,
@@ -2529,12 +2457,8 @@ class Agent365Adapter(BasePlatformAdapter):
                         # widen uninstall to another app's conversations.
                         target_ids = self._uninstall_conversation_ids(activity)
                     else:
-                        target_ids = (
-                            [lifecycle_conv_id] if lifecycle_conv_id else []
-                        )
-                    if target_ids and not await self._evict_conversations(
-                        target_ids
-                    ):
+                        target_ids = [lifecycle_conv_id] if lifecycle_conv_id else []
+                    if target_ids and not await self._evict_conversations(target_ids):
                         if delivery_id is not None:
                             self._idempotency_cache.forget(delivery_id)
                         return JSONResponse(
@@ -2550,9 +2474,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         request_generation,
                         request_chat_generation,
                     ):
-                        return JSONResponse(
-                            {"status": "acked", "reason": "lifecycle_changed"}
-                        )
+                        return JSONResponse({"status": "acked", "reason": "lifecycle_changed"})
                     ref = ConversationRef.from_activity(activity)
                 if ref is not None:
                     # L4 (#100, #106 review follow-up): stamp the JWT-validated
@@ -2583,9 +2505,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             # M11 (#105): lifecycle capture is a growth path too.
                             self._enforce_registry_cap(ref.conversation_id)
                         except BaseException:
-                            _complete_persist_mutation(
-                                reservation[0], reservation[1]
-                            )
+                            _complete_persist_mutation(reservation[0], reservation[1])
                             raise
                         await self._persist_conversations(reservation)
                 logger.info(
@@ -2606,8 +2526,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if isinstance(channel_data, dict):
                     event_type = str(channel_data.get("eventType") or "")
                 logger.debug(
-                    "inbound acked without dispatch: unhandled activity "
-                    "type=%s eventType=%s",
+                    "inbound acked without dispatch: unhandled activity type=%s eventType=%s",
                     bridge._safe_log_field(activity.get("type")),
                     bridge._safe_log_field(event_type),
                 )
@@ -2625,15 +2544,12 @@ class Agent365Adapter(BasePlatformAdapter):
             # may legitimately omit it, but they have already acked above.
             activity_id = activity.get("id")
             if not isinstance(activity_id, str) or not activity_id:
-                logger.warning(
-                    "inbound acked without dispatch: missing or invalid activity id"
-                )
+                logger.warning("inbound acked without dispatch: missing or invalid activity id")
                 return JSONResponse({"status": "acked", "reason": "unroutable"})
 
             if not _inbound_message_has_agent_content(activity):
                 logger.debug(
-                    "inbound acked without dispatch: empty message "
-                    "type=%s id=%s",
+                    "inbound acked without dispatch: empty message type=%s id=%s",
                     bridge._safe_log_field(activity.get("type")),
                     bridge._safe_log_field(activity_id),
                 )
@@ -2665,8 +2581,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 # would either leave a new chat with no outbound target or let
                 # an existing chat reply against its previously cached activity.
                 logger.warning(
-                    "inbound acked without dispatch: unroutable conversation "
-                    "reference type=%s",
+                    "inbound acked without dispatch: unroutable conversation reference type=%s",
                     str(activity.get("type") or ""),
                 )
                 return JSONResponse({"status": "acked", "reason": "unroutable"})
@@ -2719,9 +2634,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 request_generation,
                 request_chat_generation,
             ):
-                return JSONResponse(
-                    {"status": "acked", "reason": "lifecycle_changed"}
-                )
+                return JSONResponse({"status": "acked", "reason": "lifecycle_changed"})
 
             # Build event + dispatch through Hermes' loop.
             # #76 — download any inbound attachments (images/files) into the
@@ -2742,9 +2655,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 request_chat_generation,
             ):
                 self._release_media_paths(request_media_leases)
-                return JSONResponse(
-                    {"status": "acked", "reason": "lifecycle_changed"}
-                )
+                return JSONResponse({"status": "acked", "reason": "lifecycle_changed"})
             try:
                 event = self._activity_to_event(
                     activity,
@@ -2771,9 +2682,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
-                self._media_leases_by_session.setdefault(sk, set()).update(
-                    request_media_leases
-                )
+                self._media_leases_by_session.setdefault(sk, set()).update(request_media_leases)
             turn_token = _AGENT_TURN_LIFECYCLE.set(
                 (
                     id(self),
@@ -2832,9 +2741,7 @@ class Agent365Adapter(BasePlatformAdapter):
         paths = self._media_leases_by_session.pop(session_key, set())
         self._release_media_paths(paths)
 
-    def _release_request_media_leases(
-        self, session_key: str, request_paths: set[Path]
-    ) -> None:
+    def _release_request_media_leases(self, session_key: str, request_paths: set[Path]) -> None:
         session_paths = self._media_leases_by_session.get(session_key)
         if session_paths is not None:
             session_paths.difference_update(request_paths)
@@ -2842,9 +2749,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._media_leases_by_session.pop(session_key, None)
         self._release_media_paths(request_paths)
 
-    def _prepare_media_cache(
-        self, *, protected_paths: set[Path] | None = None
-    ) -> Path:
+    def _prepare_media_cache(self, *, protected_paths: set[Path] | None = None) -> Path:
         cache_dir = self._media_cache_dir()
         cache_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
         os.chmod(cache_dir, 0o700)
@@ -2999,9 +2904,7 @@ class Agent365Adapter(BasePlatformAdapter):
         except RuntimeError as e:
             logger.warning("agent365 inbound media download rejected: %s", e)
             with media_state["lock"]:
-                media_state["reserved"] = max(
-                    0, int(media_state["reserved"]) - cap
-                )
+                media_state["reserved"] = max(0, int(media_state["reserved"]) - cap)
                 media_state["inflight"].discard(out)
             return None
         try:
@@ -3027,8 +2930,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     try:
                         if int(clen) > cap:
                             logger.warning(
-                                "agent365 inbound media Content-Length %s over cap; "
-                                "dropped", clen
+                                "agent365 inbound media Content-Length %s over cap; dropped", clen
                             )
                             return None
                     except ValueError:
@@ -3038,8 +2940,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     written += len(chunk)
                     if written > cap:
                         logger.warning(
-                            "agent365 inbound media over %d-byte cap while streaming; "
-                            "aborted", cap
+                            "agent365 inbound media over %d-byte cap while streaming; aborted", cap
                         )
                         return None
                     view = memoryview(chunk)
@@ -3050,9 +2951,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 os.fsync(fd)
             if not self._lifecycle_is_current(
                 generation, client
-            ) or not self._chat_lifecycle_is_current(
-                chat_id, chat_generation
-            ):
+            ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
                 return None
             completed = True
         except asyncio.CancelledError:
@@ -3071,13 +2970,9 @@ class Agent365Adapter(BasePlatformAdapter):
             if not completed:
                 with contextlib.suppress(OSError):
                     out.unlink()
-            self._unregister_outbound_task(
-                chat_id, outbound_task, outbound_added
-            )
+            self._unregister_outbound_task(chat_id, outbound_task, outbound_added)
             with media_state["lock"]:
-                media_state["reserved"] = max(
-                    0, int(media_state["reserved"]) - cap
-                )
+                media_state["reserved"] = max(0, int(media_state["reserved"]) - cap)
                 media_state["inflight"].discard(out)
                 if completed and lease_paths is not None:
                     media_state["leased"].add(out)
@@ -3134,7 +3029,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not _is_safe_fetch_url(url, connector_suffixes):
                     logger.warning(
                         "agent365 inbound image contentUrl off connector allowlist; "
-                        "skipped host=%s", bridge._safe_url_host(url)
+                        "skipped host=%s",
+                        bridge._safe_url_host(url),
                     )
                     continue
                 if image_bearer is None:
@@ -3207,9 +3103,7 @@ class Agent365Adapter(BasePlatformAdapter):
         conv = activity.get("conversation") or {}
         sender = activity.get("from") or {}
         recipient = activity.get("recipient")
-        recipient_id = (
-            str(recipient.get("id") or "") if isinstance(recipient, dict) else ""
-        )
+        recipient_id = str(recipient.get("id") or "") if isinstance(recipient, dict) else ""
         text = _strip_recipient_mention(
             str(activity.get("text") or ""),
             activity.get("entities"),
@@ -3361,9 +3255,7 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.error("agent365 persistence activation failed: %s", e)
             if await self._run_failed_connect_cleanup():
                 raise asyncio.CancelledError() from e
-            self._set_fatal_error(
-                "persistence_activation_failed", str(e), retryable=True
-            )
+            self._set_fatal_error("persistence_activation_failed", str(e), retryable=True)
             return False
         self._commit_persist_owner()
         self._mark_connected()
@@ -3474,14 +3366,8 @@ class Agent365Adapter(BasePlatformAdapter):
             for task in pending:
                 self._track_lifecycle_owner_survivor(task, task_chats[task])
 
-    async def _drain_pre_auth_tasks(
-        self, current: asyncio.Task[Any] | None
-    ) -> None:
-        tasks = {
-            task
-            for task in self._pre_auth_tasks
-            if task is not current and not task.done()
-        }
+    async def _drain_pre_auth_tasks(self, current: asyncio.Task[Any] | None) -> None:
+        tasks = {task for task in self._pre_auth_tasks if task is not current and not task.done()}
         for task in tasks:
             task.cancel()
         if not tasks:
@@ -3510,10 +3396,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
     async def _drain_persist_tasks(self) -> None:
         tasks = {task for task in self._persist_tasks if not task.done()}
-        if (
-            self._persist_activation_task is not None
-            and not self._persist_activation_task.done()
-        ):
+        if self._persist_activation_task is not None and not self._persist_activation_task.done():
             tasks.add(self._persist_activation_task)
         if not tasks:
             return
@@ -3531,9 +3414,7 @@ class Agent365Adapter(BasePlatformAdapter):
             for task in pending:
                 self._track_lifecycle_owner_survivor(task, "")
 
-    async def _drain_coalesced_reply_tasks(
-        self, current: asyncio.Task[Any] | None
-    ) -> None:
+    async def _drain_coalesced_reply_tasks(self, current: asyncio.Task[Any] | None) -> None:
         existing_survivors = set(self._coalesced_reply_survivors)
         task_chats = dict(self._coalesced_reply_survivors)
         for message_id, task in self._coalesced_reply_tasks.items():
@@ -3584,9 +3465,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 for task in pending:
                     if task not in existing_survivors:
                         task.cancel()
-                    self._track_coalesced_reply_survivor(
-                        task, task_chats.get(task, "")
-                    )
+                    self._track_coalesced_reply_survivor(task, task_chats.get(task, ""))
 
     async def _finish_disconnect(
         self,
@@ -3679,8 +3558,7 @@ class Agent365Adapter(BasePlatformAdapter):
         finally:
             self._disconnect_cleanup_active = False
             self._disconnecting = bool(
-                self._coalesced_reply_survivors
-                or self._lifecycle_owner_survivors
+                self._coalesced_reply_survivors or self._lifecycle_owner_survivors
             )
 
     @staticmethod
@@ -3688,9 +3566,7 @@ class Agent365Adapter(BasePlatformAdapter):
         with contextlib.suppress(asyncio.CancelledError, Exception):
             task.result()
 
-    def _track_coalesced_reply_survivor(
-        self, task: asyncio.Task[Any], chat_id: str
-    ) -> None:
+    def _track_coalesced_reply_survivor(self, task: asyncio.Task[Any], chat_id: str) -> None:
         if task in self._coalesced_reply_survivors:
             return
         if len(self._coalesced_reply_survivors) >= _MAX_COALESCED_REPLY_SURVIVORS:
@@ -3725,15 +3601,10 @@ class Agent365Adapter(BasePlatformAdapter):
             self._disconnecting = False
         self._consume_coalesced_reply_task_result(task)
 
-    def _track_lifecycle_owner_survivor(
-        self, task: asyncio.Task[Any], chat_id: str
-    ) -> None:
+    def _track_lifecycle_owner_survivor(self, task: asyncio.Task[Any], chat_id: str) -> None:
         if task in self._lifecycle_owner_survivors:
             return
-        if (
-            len(self._lifecycle_owner_survivors)
-            >= _MAX_LIFECYCLE_OWNER_SURVIVORS
-        ):
+        if len(self._lifecycle_owner_survivors) >= _MAX_LIFECYCLE_OWNER_SURVIVORS:
             logger.error("agent365 lifecycle owner survivor registry full")
             task.add_done_callback(self._consume_coalesced_reply_task_result)
             return
@@ -3766,9 +3637,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._disconnecting = False
         self._consume_coalesced_reply_task_result(task)
 
-    def _register_outbound_task(
-        self, chat_id: str
-    ) -> tuple[asyncio.Task[Any] | None, bool]:
+    def _register_outbound_task(self, chat_id: str) -> tuple[asyncio.Task[Any] | None, bool]:
         if not self._agent_turn_lifecycle_is_current():
             raise RuntimeError("agent365 agent turn lifecycle changed")
         owner = str(chat_id)
@@ -3784,8 +3653,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 for live_task in owners
             }
             if (
-                len(tasks)
-                + self._coalesced_reply_survivor_count_by_chat.get(owner, 0)
+                len(tasks) + self._coalesced_reply_survivor_count_by_chat.get(owner, 0)
                 >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT
                 or len(live_tasks) + len(self._coalesced_reply_survivors)
                 >= _MAX_COALESCED_REPLY_GENERATIONS
@@ -3855,9 +3723,7 @@ class Agent365Adapter(BasePlatformAdapter):
         finally:
             self._unregister_outbound_task(chat_id, task, added)
 
-    def _lifecycle_is_current(
-        self, generation: int, client: Any | None = None
-    ) -> bool:
+    def _lifecycle_is_current(self, generation: int, client: Any | None = None) -> bool:
         return (
             not self._disconnecting
             and generation == self._lifecycle_generation
@@ -3893,14 +3759,10 @@ class Agent365Adapter(BasePlatformAdapter):
             return
         tasks.add(task)
         task.add_done_callback(
-            lambda completed, owner=owner: self._pre_auth_chat_task_done(
-                owner, completed
-            )
+            lambda completed, owner=owner: self._pre_auth_chat_task_done(owner, completed)
         )
 
-    def _pre_auth_chat_task_done(
-        self, chat_id: str, task: asyncio.Task[Any]
-    ) -> None:
+    def _pre_auth_chat_task_done(self, chat_id: str, task: asyncio.Task[Any]) -> None:
         tasks = self._pre_auth_tasks_by_chat.get(chat_id)
         if tasks is None:
             return
@@ -3932,9 +3794,8 @@ class Agent365Adapter(BasePlatformAdapter):
         return self._chat_lifecycle_generation.get(str(chat_id), 0)
 
     def _chat_lifecycle_is_current(self, chat_id: str, generation: int) -> bool:
-        return (
-            str(chat_id) not in self._retiring_chats
-            and generation == self._chat_generation(chat_id)
+        return str(chat_id) not in self._retiring_chats and generation == self._chat_generation(
+            chat_id
         )
 
     def _chat_has_live_lifecycle_state(
@@ -3977,14 +3838,11 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id = str(chat_id)
         if (
             chat_id not in self._chat_lifecycle_generation
-            and len(self._chat_lifecycle_generation)
-            >= _MAX_CHAT_LIFECYCLE_GENERATIONS
+            and len(self._chat_lifecycle_generation) >= _MAX_CHAT_LIFECYCLE_GENERATIONS
         ):
             active_conversation_ids = self._active_conversation_ids()
             for candidate in list(self._chat_lifecycle_generation):
-                if not self._chat_has_live_lifecycle_state(
-                    candidate, active_conversation_ids
-                ):
+                if not self._chat_has_live_lifecycle_state(candidate, active_conversation_ids):
                     self._chat_lifecycle_generation.pop(candidate, None)
                     break
             if len(self._chat_lifecycle_generation) >= _MAX_CHAT_LIFECYCLE_GENERATIONS:
@@ -4051,9 +3909,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return build_session_key(
                 event.source,
                 group_sessions_per_user=extra.get("group_sessions_per_user", True),
-                thread_sessions_per_user=extra.get(
-                    "thread_sessions_per_user", False
-                ),
+                thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
             )
         except Exception:
             return None
@@ -4236,11 +4092,7 @@ class Agent365Adapter(BasePlatformAdapter):
             from agent.interrupt_compat import request_hard_interrupt
         except Exception:
             request_hard_interrupt = None
-        interrupt = (
-            None
-            if request_hard_interrupt is not None
-            else self._interrupt_callable(agent)
-        )
+        interrupt = None if request_hard_interrupt is not None else self._interrupt_callable(agent)
         if request_hard_interrupt is None and interrupt is None:
             return False
 
@@ -4253,11 +4105,7 @@ class Agent365Adapter(BasePlatformAdapter):
         def _call() -> bool:
             try:
                 if request_hard_interrupt is not None:
-                    return bool(
-                        request_hard_interrupt(
-                            agent, message, tool_reason=tool_reason
-                        )
-                    )
+                    return bool(request_hard_interrupt(agent, message, tool_reason=tool_reason))
                 if interrupt is None:
                     return False
                 interrupt(message)
@@ -4284,8 +4132,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         except TimeoutError:
             logger.warning(
-                "agent365 hard interrupt timed out for session %s; "
-                "continuing uninstall",
+                "agent365 hard interrupt timed out for session %s; continuing uninstall",
                 session_key,
             )
             return False
@@ -4312,11 +4159,7 @@ class Agent365Adapter(BasePlatformAdapter):
         no worker remains.
         """
         current = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
-        if (
-            isinstance(current, asyncio.Task)
-            and not current.done()
-            and current is not prior
-        ):
+        if isinstance(current, asyncio.Task) and not current.done() and current is not prior:
             return False
         if self._running_agent(session_key) is not None:
             return False
@@ -4389,8 +4232,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._conversations.enforce_cap(
             _MAX_REGISTRY_ENTRIES,
             active_conversation_ids=(
-                self._registry_protected_conversation_ids()
-                | {current_conversation_id}
+                self._registry_protected_conversation_ids() | {current_conversation_id}
             ),
         )
 
@@ -4399,9 +4241,7 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> tuple[dict[str, Any], int, int] | None:
         """Reserve a handoff-visible lease before mutating the registry."""
         owner = await self._activate_persist_owner()
-        state, mutation = _reserve_persist_mutation(
-            self._conversations_path, owner
-        )
+        state, mutation = _reserve_persist_mutation(self._conversations_path, owner)
         if mutation is None:
             return None
         return state, mutation, owner
@@ -4519,9 +4359,9 @@ class Agent365Adapter(BasePlatformAdapter):
         while True:
             with _PERSIST_STATE_GUARD:
                 cutoff = int(state["handoff_cutoff"])
-                pending = any(
-                    sequence <= cutoff for sequence in state["pending"]
-                ) or bool(state["mutations"])
+                pending = any(sequence <= cutoff for sequence in state["pending"]) or bool(
+                    state["mutations"]
+                )
                 if not pending:
                     # Flip ownership under the same guard used to reserve a
                     # sequence. The previous owner can no longer admit work,
@@ -4539,21 +4379,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 await asyncio.sleep(0.01)
             acquired = True
             if int(state["written"]) > self._persist_loaded_sequence:
-                if (
-                    _registry_fingerprint(self._conversations)
-                    != self._persist_loaded_fingerprint
-                ):
+                if _registry_fingerprint(self._conversations) != self._persist_loaded_fingerprint:
                     raise RuntimeError(
-                        "conversation registry mutated before persistence "
-                        "ownership activation"
+                        "conversation registry mutated before persistence ownership activation"
                     )
-                self._conversations = type(self._conversations).load(
-                    self._conversations_path
-                )
+                self._conversations = type(self._conversations).load(self._conversations_path)
                 self._persist_loaded_sequence = int(state["written"])
-                self._persist_loaded_fingerprint = _registry_fingerprint(
-                    self._conversations
-                )
+                self._persist_loaded_fingerprint = _registry_fingerprint(self._conversations)
         finally:
             if acquired:
                 state["lock"].release()
@@ -4685,8 +4517,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if dropped > 0:
             await self._persist_conversations(reservation)
             logger.info(
-                "agent365 prune_conversations: dropped %d stale entry(ies); "
-                "%d remain.",
+                "agent365 prune_conversations: dropped %d stale entry(ies); %d remain.",
                 dropped,
                 len(self._conversations),
             )
@@ -4876,9 +4707,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # is what Hermes cancels when it stops the stream consumer.
         if str(chat_id) in self._turn_buffers:
             self._conversations.mark_used(chat_id)
-            return self._append_turn_buffer_segment(
-                str(chat_id), content, reply_to=reply_to
-            )
+            return self._append_turn_buffer_segment(str(chat_id), content, reply_to=reply_to)
 
         turn_key: tuple[str, str] | None = None
         turn_validated_path: str | None = None
@@ -4888,10 +4717,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if target is None:
                 return SendResult(
                     success=False,
-                    error=(
-                        "agent365 send: no cached inbound for exact "
-                        f"turn chat_id={chat_id!r}"
-                    ),
+                    error=(f"agent365 send: no cached inbound for exact turn chat_id={chat_id!r}"),
                 )
             inbound, turn_validated_path = target
         else:
@@ -4980,10 +4806,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_type == "personal"
             and chat_id in self._active_stream_by_chat
             and self._personal_outer_turn_still_open(chat_id)
-            and (
-                reply_to is not None
-                or self._metadata_requests_stream_final(metadata)
-            )
+            and (reply_to is not None or self._metadata_requests_stream_final(metadata))
         ):
             return await self._accept_nested_personal_send(
                 chat_id=str(chat_id),
@@ -4998,22 +4821,21 @@ class Agent365Adapter(BasePlatformAdapter):
             and self._metadata_requests_stream_final(metadata)
         ):
             active_id = self._active_stream_by_chat[chat_id]
-            return await self.edit_message(
-                chat_id, active_id, content, finalize=True
-            )
+            return await self.edit_message(chat_id, active_id, content, finalize=True)
 
         if chat_id in self._active_stream_by_chat:
             stale_msg_id = self._active_stream_by_chat[chat_id]
             if reply_to is None:
                 logger.info(
-                    "agent365 send suppressed while stream active: "
-                    "chat_id=%s active_message_id=%s",
+                    "agent365 send suppressed while stream active: chat_id=%s active_message_id=%s",
                     chat_id,
                     stale_msg_id,
                 )
                 return SendResult(success=True, message_id=str(stale_msg_id))
             finalized = await self._auto_finalize_stale_stream(
-                chat_id=chat_id, message_id=stale_msg_id, inbound=inbound,
+                chat_id=chat_id,
+                message_id=stale_msg_id,
+                inbound=inbound,
             )
             if not self._lifecycle_is_current(
                 generation, client
@@ -5173,9 +4995,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error=f"agent365 {log_context}: adapter lifecycle changed",
             )
-        self._remember_bot_reply(
-            _connector_activity_id(response), conversation_id=chat_id
-        )
+        self._remember_bot_reply(_connector_activity_id(response), conversation_id=chat_id)
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     @staticmethod
@@ -5221,9 +5041,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_type = str(conv.get("conversationType") or "")
             if inbound and chat_type and chat_type != "personal":
                 activity_id = str(getattr(event, "message_id", "") or "")
-                self._open_or_nest_turn_buffer(
-                    chat_id, inbound, activity_id=activity_id
-                )
+                self._open_or_nest_turn_buffer(chat_id, inbound, activity_id=activity_id)
             elif inbound and chat_type == "personal":
                 # A new turn gets its own held follow-up. The
                 # already-completed guard stays keyed to the landed
@@ -5316,9 +5134,7 @@ class Agent365Adapter(BasePlatformAdapter):
             opened = float(stream.get("opened_mono") or 0.0)
             if opened <= 0.0:
                 return True
-            return (
-                time.monotonic() - opened < _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-            )
+            return time.monotonic() - opened < _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         return bool(str(stream.get("stream_id") or ""))
 
     def _turn_buffer_retry_pending(self, buf: dict[str, Any]) -> bool:
@@ -5344,9 +5160,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if remaining > 0.0:
             await asyncio.sleep(remaining)
 
-    def _remember_keepalive(
-        self, chat_id: str, buf: dict[str, Any], state: dict[str, Any]
-    ) -> None:
+    def _remember_keepalive(self, chat_id: str, buf: dict[str, Any], state: dict[str, Any]) -> None:
         """Store stream state on the live buffer, or as an orphan.
 
         The opening POST can outlive the buffer object that started it.
@@ -5359,9 +5173,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return
         if isinstance(live, dict):
             current = self._keepalive_state(live)
-            if not self._keepalive_blocks_reply(current) and not current.get(
-                "stopped"
-            ):
+            if not self._keepalive_blocks_reply(current) and not current.get("stopped"):
                 live["keepalive"] = state
                 return
         if state.get("stream_id") or state.get("untracked") or state.get("stopped"):
@@ -5376,11 +5188,7 @@ class Agent365Adapter(BasePlatformAdapter):
     def _cancel_turn_buffer_retry(buf: dict[str, Any]) -> None:
         task = buf.get("retry_task")
         current = asyncio.current_task()
-        if (
-            isinstance(task, asyncio.Task)
-            and not task.done()
-            and task is not current
-        ):
+        if isinstance(task, asyncio.Task) and not task.done() and task is not current:
             task.cancel()
             task.add_done_callback(_consume_turn_buffer_retry_result)
 
@@ -5400,17 +5208,22 @@ class Agent365Adapter(BasePlatformAdapter):
             return str(retry)
         return None
 
-    def _delivery_record_for_key(
-        self, buf: dict[str, Any], turn_key: str
-    ) -> dict[str, Any] | None:
+    def _retry_turn_key_for_buffer(self, buf: dict[str, Any]) -> str | None:
+        key = self._first_buffered_turn_key(buf)
+        if key:
+            return key
+        turn = self._keepalive_turn(buf)
+        if turn is None:
+            return None
+        return self._delivery_record(buf, turn)["turn_key"]
+
+    def _delivery_record_for_key(self, buf: dict[str, Any], turn_key: str) -> dict[str, Any] | None:
         from hermes_a365.plugin.turn_buffer_answer_delivery import delivery_map
 
         record = delivery_map(buf).get(turn_key)
         return record if isinstance(record, dict) else None
 
-    def _schedule_turn_buffer_retry(
-        self, chat_id: str, turn_key: str | None = None
-    ) -> None:
+    def _schedule_turn_buffer_retry(self, chat_id: str, turn_key: str | None = None) -> None:
         """Schedule a deferred flush for one turn's delivery record."""
         buf = self._turn_buffers.get(chat_id)
         if buf is None or self._disconnecting:
@@ -5430,11 +5243,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return
         current = asyncio.current_task()
         task = buf.get("retry_task")
-        if (
-            isinstance(task, asyncio.Task)
-            and not task.done()
-            and task is not current
-        ):
+        if isinstance(task, asyncio.Task) and not task.done() and task is not current:
             return
         deferrals = int(record.get("deferral_count") or 0)
         if deferrals >= _TURN_BUFFER_DEFERRED_RETRY_LIMIT:
@@ -5443,8 +5252,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 plain_attempts >= _TURN_BUFFER_FORCE_PLAIN_MAX_ATTEMPTS
             ):
                 logger.error(
-                    "agent365 turn buffer plain fallback exhausted: "
-                    "chat_id=%s attempts=%s",
+                    "agent365 turn buffer plain fallback exhausted: chat_id=%s attempts=%s",
                     chat_id,
                     plain_attempts,
                 )
@@ -5453,8 +5261,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return
             if not record.get("force_plain"):
                 logger.warning(
-                    "agent365 turn buffer deferred retry stopped: "
-                    "chat_id=%s deferrals=%s turn=%s",
+                    "agent365 turn buffer deferred retry stopped: chat_id=%s deferrals=%s turn=%s",
                     chat_id,
                     deferrals,
                     turn_key,
@@ -5466,16 +5273,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 return
             record["plain_due"] = True
             buf["retry_turn_key"] = turn_key
-            buf["retry_task"] = asyncio.create_task(
-                self._deferred_turn_buffer_retry(chat_id)
-            )
+            buf["retry_task"] = asyncio.create_task(self._deferred_turn_buffer_retry(chat_id))
             return
         record["deferral_count"] = deferrals + 1
         record["state"] = "DEFERRED"
         buf["retry_turn_key"] = turn_key
-        buf["retry_task"] = asyncio.create_task(
-            self._deferred_turn_buffer_retry(chat_id)
-        )
+        buf["retry_task"] = asyncio.create_task(self._deferred_turn_buffer_retry(chat_id))
 
     def _schedule_turn_buffer_keepalive(self, chat_id: str) -> None:
         """Start the informative-update task if this chat does not have one.
@@ -5499,16 +5302,10 @@ class Agent365Adapter(BasePlatformAdapter):
     def _cancel_turn_buffer_keepalive(buf: dict[str, Any]) -> None:
         task = buf.get("keepalive_task")
         current = asyncio.current_task()
-        if (
-            isinstance(task, asyncio.Task)
-            and not task.done()
-            and task is not current
-        ):
+        if isinstance(task, asyncio.Task) and not task.done() and task is not current:
             task.cancel()
 
-    async def _cancel_keepalive_and_close(
-        self, chat_id: str, buf: dict[str, Any]
-    ) -> None:
+    async def _cancel_keepalive_and_close(self, chat_id: str, buf: dict[str, Any]) -> None:
         """Stop the sleeper, then final a stream that already has an id.
 
         Best effort. The wait and the final each give up after
@@ -5523,14 +5320,10 @@ class Agent365Adapter(BasePlatformAdapter):
             and task is not asyncio.current_task()
         ):
             with contextlib.suppress(Exception):
-                await asyncio.wait(
-                    {task}, timeout=_TURN_BUFFER_KEEPALIVE_TEARDOWN_FINAL_SEC
-                )
+                await asyncio.wait({task}, timeout=_TURN_BUFFER_KEEPALIVE_TEARDOWN_FINAL_SEC)
         await self._best_effort_keepalive_final(chat_id, buf)
 
-    async def _best_effort_keepalive_final(
-        self, chat_id: str, buf: dict[str, Any]
-    ) -> None:
+    async def _best_effort_keepalive_final(self, chat_id: str, buf: dict[str, Any]) -> None:
         stream_id = str(self._keepalive_state(buf).get("stream_id") or "")
         if not stream_id:
             return
@@ -5580,9 +5373,7 @@ class Agent365Adapter(BasePlatformAdapter):
         try:
             await asyncio.sleep(_TURN_BUFFER_KEEPALIVE_FIRST_SEC)
             while self._turn_buffer_keepalive_needed(chat_id):
-                if self._keepalive_state(
-                    self._turn_buffers.get(chat_id)
-                ).get("stopped"):
+                if self._keepalive_state(self._turn_buffers.get(chat_id)).get("stopped"):
                     return
                 await self._emit_turn_buffer_keepalive(chat_id)
                 if not self._turn_buffer_keepalive_needed(chat_id):
@@ -5674,9 +5465,7 @@ class Agent365Adapter(BasePlatformAdapter):
             await asyncio.sleep(_STREAMING_MIN_GAP_SEC)
         await self._post_informative_under_lock(chat_id, allow_restart=False)
 
-    async def _post_informative_under_lock(
-        self, chat_id: str, *, allow_restart: bool
-    ) -> bool:
+    async def _post_informative_under_lock(self, chat_id: str, *, allow_restart: bool) -> bool:
         """POST one informative update. True when the caller should restart.
 
         The restart itself is the caller's job, after the pacing gap and
@@ -5690,9 +5479,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return False
             if not self._turn_buffer_keepalive_needed(chat_id):
                 return False
-            return await self._post_informative_locked(
-                chat_id, buf, allow_restart=allow_restart
-            )
+            return await self._post_informative_locked(chat_id, buf, allow_restart=allow_restart)
 
     async def _close_turn_buffer_keepalive_locked(self, chat_id: str) -> bool:
         """Close an open informative sequence. Caller holds the buffer lock.
@@ -5702,9 +5489,7 @@ class Agent365Adapter(BasePlatformAdapter):
         stays until a final is accepted or the service says the stream is
         already finished, and the merged reply is not posted until then.
         """
-        if not self._keepalive_blocks_reply(
-            self._keepalive_state(self._turn_buffers.get(chat_id))
-        ):
+        if not self._keepalive_blocks_reply(self._keepalive_state(self._turn_buffers.get(chat_id))):
             self._clear_expired_untracked(chat_id)
             return True
         closed = await self._post_keepalive_final_locked(chat_id, buf=None)
@@ -5765,12 +5550,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         status = result.status
         new_id = result.stream_id
-        if (
-            status is not None
-            and 200 <= status < 300
-            and new_id
-            and not stream_id
-        ):
+        if status is not None and 200 <= status < 300 and new_id and not stream_id:
             opened_state = {
                 "stream_id": new_id,
                 "sequence": 1,
@@ -5829,9 +5609,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._remember_keepalive(chat_id, buf, failed)
         return False
 
-    async def _post_keepalive_final_locked(
-        self, chat_id: str, buf: dict[str, Any] | None
-    ) -> bool:
+    async def _post_keepalive_final_locked(self, chat_id: str, buf: dict[str, Any] | None) -> bool:
         """POST ``streamType=final``. True only when the stream is closed.
 
         The id is removed after a 2xx final, or a 403 whose body says the
@@ -5879,8 +5657,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return True
         logger.warning(
-            "agent365 turn buffer keep-alive final failed: chat_id=%s "
-            "stream_id=%s status=%s",
+            "agent365 turn buffer keep-alive final failed: chat_id=%s stream_id=%s status=%s",
             chat_id,
             stream_id,
             result.status,
@@ -5920,9 +5697,7 @@ class Agent365Adapter(BasePlatformAdapter):
         empty = _KeepalivePost(None, "", "", False)
         if final and not stream_id:
             return empty
-        body_text = (
-            text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT
-        ).strip()
+        body_text = (text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT).strip()
         if not body_text:
             return empty
         if final and text is not None:
@@ -5932,9 +5707,7 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound = turn.get("inbound")
         if not isinstance(inbound, dict):
             return empty
-        retiring = (
-            self._disconnecting or str(chat_id) in self._retiring_chats
-        )
+        retiring = self._disconnecting or str(chat_id) in self._retiring_chats
         if self._http_client is None or self._bridge_cfg is None:
             return empty
         if retiring and not for_teardown:
@@ -5981,11 +5754,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # A timeout while minting the token is before this activity POST.
         # Only the POST itself can have created a stream.
         token: str | None = None
-        mint_path = (
-            path
-            if path is not None
-            else self._validated_path_for_inbound(inbound)
-        )
+        mint_path = path if path is not None else self._validated_path_for_inbound(inbound)
         # Retry mint timeouts only when a stream id is already held; an
         # opener mint failure is retried by the deferred flush retry.
         for mint_attempt in range(2 if stream_id else 1):
@@ -6059,18 +5828,11 @@ class Agent365Adapter(BasePlatformAdapter):
             if isinstance(body, dict):
                 new_id = str(body.get("id") or "")
         detail = self._extract_error_message(resp) if status == 403 else ""
-        untracked = (
-            not final and not stream_id and 200 <= status < 300 and not new_id
-        )
+        untracked = not final and not stream_id and 200 <= status < 300 and not new_id
         retry_after_sec = (
-            _parse_retry_after_seconds(resp)
-            if status in _ANSWER_FINAL_RETRY_STATUSES
-            else 0.0
+            _parse_retry_after_seconds(resp) if status in _ANSWER_FINAL_RETRY_STATUSES else 0.0
         )
-        return _KeepalivePost(
-            status, new_id, detail, untracked, False, retry_after_sec
-        )
-
+        return _KeepalivePost(status, new_id, detail, untracked, False, retry_after_sec)
 
     @staticmethod
     def _turn_delivery_key(turn: dict[str, Any]) -> str:
@@ -6078,9 +5840,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
         return turn_delivery_key(turn)
 
-    def _delivery_record(
-        self, buf: dict[str, Any], turn: dict[str, Any]
-    ) -> dict[str, Any]:
+    def _delivery_record(self, buf: dict[str, Any], turn: dict[str, Any]) -> dict[str, Any]:
         from hermes_a365.plugin.turn_buffer_answer_delivery import (
             get_delivery_record,
             refresh_segment_ids,
@@ -6160,6 +5920,16 @@ class Agent365Adapter(BasePlatformAdapter):
                 chunk_segment_ids=chunk_segment_ids,
             )
         if record.get("had_landed"):
+            if record.get("answer_final_settled"):
+                stream["stream_id"] = ""
+                if not stream.get("closed_by"):
+                    stream["closed_by"] = "turn:other"
+                buf["keepalive"] = stream
+                logger.warning(
+                    "agent365 turn buffer answer plain fallback: chat_id=%s reason=user cancelled",
+                    chat_id,
+                )
+                return ("fallback", "user cancelled")
             record["state"] = "DONE"
             self._remove_turn_segments(buf, chunk_segment_ids)
             self._purge_turn_delivery_records(buf)
@@ -6169,8 +5939,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stream["closed_by"] = "turn:other"
         buf["keepalive"] = stream
         logger.warning(
-            "agent365 turn buffer answer plain fallback: chat_id=%s "
-            "reason=user cancelled",
+            "agent365 turn buffer answer plain fallback: chat_id=%s reason=user cancelled",
             chat_id,
         )
         return ("fallback", "user cancelled")
@@ -6207,8 +5976,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     chunk_segment_ids=chunk_segment_ids,
                 )
             if stream_id and (
-                stream_id == record.get("bound_stream_id")
-                or closed_by == f"turn:{turn_key}"
+                stream_id == record.get("bound_stream_id") or closed_by == f"turn:{turn_key}"
             ):
                 stream["stream_id"] = ""
             buf["keepalive"] = stream
@@ -6226,16 +5994,6 @@ class Agent365Adapter(BasePlatformAdapter):
         if other_key and other_key != turn_key:
             stream["stream_id"] = ""
             buf["keepalive"] = stream
-            if record.get("may_have_landed"):
-                return self._answer_uncertain_for_turn(
-                    chat_id,
-                    buf,
-                    turn,
-                    record,
-                    stream_id=stream_id,
-                    context="stream already closed",
-                    chunk_segment_ids=chunk_segment_ids,
-                )
             logger.warning(
                 "agent365 turn buffer answer plain fallback: chat_id=%s "
                 "status=403 reason=stream already closed",
@@ -6252,7 +6010,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     turn,
                     record,
                     stream_id=stream_id,
-                    context="stream already closed",
+                    context="unknown stream closer",
                     chunk_segment_ids=chunk_segment_ids,
                 )
             logger.warning(
@@ -6263,13 +6021,10 @@ class Agent365Adapter(BasePlatformAdapter):
             return ("fallback", "stream already closed")
         if stream.get("untracked") and self._keepalive_blocks_reply(stream):
             return ("blocked", None)
-        if not stream_id and (
-            stream.get("open_failed") or buf.get("skip_stream_open")
-        ):
+        if not stream_id and (stream.get("open_failed") or buf.get("skip_stream_open")):
             buf.pop("skip_stream_open", None)
             logger.warning(
-                "agent365 turn buffer answer plain fallback: chat_id=%s "
-                "reason=open rejected",
+                "agent365 turn buffer answer plain fallback: chat_id=%s reason=open rejected",
                 chat_id,
             )
             return ("fallback", "open rejected")
@@ -6287,9 +6042,7 @@ class Agent365Adapter(BasePlatformAdapter):
         count_attempt: bool,
     ) -> _KeepalivePost:
         if count_attempt:
-            record["answer_final_attempts"] = int(
-                record.get("answer_final_attempts") or 0
-            ) + 1
+            record["answer_final_attempts"] = int(record.get("answer_final_attempts") or 0) + 1
             record["state"] = "POSTING"
             record["bound_stream_id"] = stream_id
         return await self._post_keepalive_activity(
@@ -6323,6 +6076,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if activity_id:
             self._remember_bot_reply(activity_id, conversation_id=str(chat_id))
         record["state"] = "DONE"
+        record["answer_final_settled"] = True
         self._remove_turn_segments(buf, chunk_segment_ids)
         self._purge_turn_delivery_records(buf)
         msg = (
@@ -6373,9 +6127,7 @@ class Agent365Adapter(BasePlatformAdapter):
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
         if not stream_id:
-            await self._post_informative_locked(
-                chat_id, buf, allow_restart=False, for_answer=True
-            )
+            await self._post_informative_locked(chat_id, buf, allow_restart=False, for_answer=True)
             if self._turn_buffers.get(chat_id) is not buf:
                 return ("retry", None)
             stream = self._keepalive_stream(buf)
@@ -6384,8 +6136,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stream_id = str(stream.get("stream_id") or "")
             if not stream_id:
                 logger.warning(
-                    "agent365 turn buffer answer plain fallback: chat_id=%s "
-                    "reason=open rejected",
+                    "agent365 turn buffer answer plain fallback: chat_id=%s reason=open rejected",
                     chat_id,
                 )
                 return ("fallback", "open rejected")
@@ -6419,9 +6170,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if early is not None:
                 return early
             if not stream_id:
-                if stream.get("untracked") and self._keepalive_blocks_reply(
-                    stream
-                ):
+                if stream.get("untracked") and self._keepalive_blocks_reply(stream):
                     return ("blocked", None)
                 return ("retry", None)
 
@@ -6437,13 +6186,8 @@ class Agent365Adapter(BasePlatformAdapter):
             while self._turn_buffers.get(chat_id) is buf:
                 classified = _classify_answer_final_post(result)
                 if classified == _ANSWER_FINAL_NOT_SENT:
-                    if (
-                        result.status is None
-                        and int(record.get("not_sent_probes_left") or 0) > 0
-                    ):
-                        record["not_sent_probes_left"] = (
-                            int(record["not_sent_probes_left"]) - 1
-                        )
+                    if result.status is None and int(record.get("not_sent_probes_left") or 0) > 0:
+                        record["not_sent_probes_left"] = int(record["not_sent_probes_left"]) - 1
                         result = await self._post_answer_final(
                             chat_id,
                             buf,
@@ -6563,18 +6307,12 @@ class Agent365Adapter(BasePlatformAdapter):
                     delay = result.retry_after_sec
                     if delay <= 0.0:
                         delay = min(
-                            2.0 ** attempts,
+                            2.0**attempts,
                             _ANSWER_FINAL_RETRY_AFTER_CAP_SEC,
                         )
                     delay = _cap_answer_final_retry_delay(stream, delay)
-                    if (
-                        attempts < _ANSWER_FINAL_MAX_ATTEMPTS
-                        and cap_left > 0.0
-                        and delay > 0.0
-                    ):
-                        await self._sleep_turn_buffer_locked(
-                            chat_id, buf, delay
-                        )
+                    if attempts < _ANSWER_FINAL_MAX_ATTEMPTS and cap_left > 0.0 and delay > 0.0:
+                        await self._sleep_turn_buffer_locked(chat_id, buf, delay)
                         if self._turn_buffers.get(chat_id) is not buf:
                             return ("retry", None)
                         stream = self._keepalive_stream(buf)
@@ -6619,9 +6357,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if isinstance(buf, dict):
                 buf.pop("answer_final_in_progress", None)
 
-    async def _sleep_turn_buffer_stream_gap_locked(
-        self, chat_id: str, buf: dict[str, Any]
-    ) -> None:
+    async def _sleep_turn_buffer_stream_gap_locked(self, chat_id: str, buf: dict[str, Any]) -> None:
         """Pace informative→final pairs without blocking the keep-alive task."""
         stream = self._keepalive_state(buf)
         last = float(stream.get("last_emit_mono") or 0.0)
@@ -6677,9 +6413,7 @@ class Agent365Adapter(BasePlatformAdapter):
         during_mint: bool = False,
     ) -> _KeepalivePost:
         message = str(exc)
-        timeout_after_send = (
-            not during_mint and self._keepalive_timeout_after_send(exc)
-        )
+        timeout_after_send = not during_mint and self._keepalive_timeout_after_send(exc)
         untracked = opening and timeout_after_send
         logger.warning(
             "agent365 turn buffer keep-alive POST failed: chat_id=%s error=%s",
@@ -6688,12 +6422,9 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         import httpx
 
-        connect_before_send = (
-            not during_mint
-            and isinstance(
-                exc,
-                (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError),
-            )
+        connect_before_send = not during_mint and isinstance(
+            exc,
+            (httpx.ConnectTimeout, httpx.PoolTimeout, httpx.ConnectError),
         )
         return _KeepalivePost(
             None,
@@ -6716,7 +6447,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if isinstance(record, dict) and record.get("force_plain"):
                     plain_attempts = int(record.get("plain_attempts") or 0)
                     delay = min(
-                        2.0 ** plain_attempts * _TURN_BUFFER_RETRY_DELAY_SEC,
+                        2.0**plain_attempts * _TURN_BUFFER_RETRY_DELAY_SEC,
                         5.0,
                     )
             await asyncio.sleep(delay)
@@ -6819,9 +6550,7 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound = inbound if isinstance(inbound, dict) else {}
         return str(inbound.get("id") or "") == token
 
-    def _turn_for_send(
-        self, buf: dict[str, Any], reply_to: Any | None
-    ) -> dict[str, Any] | None:
+    def _turn_for_send(self, buf: dict[str, Any], reply_to: Any | None) -> dict[str, Any] | None:
         """Pick the turn a send belongs to.
 
         A stream chunk carries ``reply_to`` equal to that turn's activity
@@ -6872,19 +6601,14 @@ class Agent365Adapter(BasePlatformAdapter):
             if any(segment["id"] == message_id for segment in buf["segments"]):
                 return SendResult(
                     success=False,
-                    error=(
-                        "agent365 edit_message: turn buffer segment belongs "
-                        "to another chat"
-                    ),
+                    error=("agent365 edit_message: turn buffer segment belongs to another chat"),
                 )
         return SendResult(
             success=False,
             error="agent365 edit_message: unknown turn buffer segment",
         )
 
-    def _chunk_turn_segments(
-        self, segments: list[dict[str, str]]
-    ) -> list[list[dict[str, str]]]:
+    def _chunk_turn_segments(self, segments: list[dict[str, str]]) -> list[list[dict[str, str]]]:
         """Split one turn's segments into ordered posts that fit the wire limit.
 
         Segments are joined with a blank line. A single segment is already
@@ -6966,8 +6690,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not text or _is_hermes_tool_progress_segment(text):
                     if text and _is_hermes_tool_progress_segment(text):
                         logger.debug(
-                            "agent365 turn buffer omitting tool-progress segment: "
-                            "chat_id=%s",
+                            "agent365 turn buffer omitting tool-progress segment: chat_id=%s",
                             chat_id,
                         )
                     drop_ids.append(str(segment.get("id") or ""))
@@ -7014,17 +6737,13 @@ class Agent365Adapter(BasePlatformAdapter):
                     link_alone = True
             validated_path = turn.get("validated_path")
             path = validated_path if isinstance(validated_path, str) else None
-            first_chunk_on_stream = True
+            stream_record = self._delivery_record(buf, turn)
+            first_chunk_on_stream = not stream_record.get("answer_final_settled")
             for chunk_segments, content in chunks:
-                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
-                    chat_id
-                ):
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(chat_id):
                     return
                 if first_chunk_on_stream:
-                    chunk_ids = [
-                        str(segment.get("id") or "")
-                        for segment in chunk_segments
-                    ]
+                    chunk_ids = [str(segment.get("id") or "") for segment in chunk_segments]
                     record = self._delivery_record(buf, turn)
                     outcome, _final_id = await self._deliver_turn_answer_locked(
                         chat_id,
@@ -7035,18 +6754,14 @@ class Agent365Adapter(BasePlatformAdapter):
                     if outcome == "blocked":
                         if not self._turn_reply_blocked(chat_id):
                             buf["retry_turn_key"] = record["turn_key"]
-                            self._schedule_turn_buffer_retry(
-                                chat_id, record["turn_key"]
-                            )
+                            self._schedule_turn_buffer_retry(chat_id, record["turn_key"])
                         return
                     if outcome == "retry":
                         if not self._turn_reply_blocked(chat_id):
                             record = self._delivery_record(buf, turn)
                             if not record.get("force_plain_exhausted"):
                                 buf["retry_turn_key"] = record["turn_key"]
-                                self._schedule_turn_buffer_retry(
-                                    chat_id, record["turn_key"]
-                                )
+                                self._schedule_turn_buffer_retry(chat_id, record["turn_key"])
                         return
                     if outcome == "uncertain":
                         first_chunk_on_stream = False
@@ -7079,10 +6794,7 @@ class Agent365Adapter(BasePlatformAdapter):
                                 record["plain_due"] = False
                                 self._remove_turn_segments(
                                     buf,
-                                    [
-                                        str(segment.get("id") or "")
-                                        for segment in chunk_segments
-                                    ],
+                                    [str(segment.get("id") or "") for segment in chunk_segments],
                                 )
                                 self._purge_turn_delivery_records(buf)
                                 first_chunk_on_stream = False
@@ -7100,9 +6812,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             else:
                                 record["state"] = "DEFERRED"
                             buf["retry_turn_key"] = record["turn_key"]
-                            self._schedule_turn_buffer_retry(
-                                chat_id, record["turn_key"]
-                            )
+                            self._schedule_turn_buffer_retry(chat_id, record["turn_key"])
                             return
                         live = self._turn_buffers.get(chat_id)
                         if live is None:
@@ -7111,6 +6821,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         record = self._delivery_record(buf, turn)
                         record["state"] = "DONE"
                         record["plain_due"] = False
+                        record["answer_final_settled"] = True
                         self._remove_turn_segments(
                             buf,
                             [str(segment.get("id") or "") for segment in chunk_segments],
@@ -7139,10 +6850,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         )
                         self._remove_turn_segments(
                             buf,
-                            [
-                                str(segment.get("id") or "")
-                                for segment in chunk_segments
-                            ],
+                            [str(segment.get("id") or "") for segment in chunk_segments],
                         )
                         continue
                     logger.warning(
@@ -7164,9 +6872,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             if link_alone and suffix.strip():
                 link_closed = await self._close_turn_buffer_keepalive_locked(chat_id)
-                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(
-                    chat_id
-                ):
+                if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(chat_id):
                     return
                 if not link_closed:
                     turn_key = self._delivery_record(buf, turn)["turn_key"]
@@ -7202,7 +6908,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if buf is None:
                 return
             if not closed:
-                turn_key = self._first_buffered_turn_key(buf)
+                turn_key = self._retry_turn_key_for_buffer(buf)
                 if turn_key:
                     buf["retry_turn_key"] = turn_key
                     self._schedule_turn_buffer_retry(chat_id, turn_key)
@@ -7211,7 +6917,7 @@ class Agent365Adapter(BasePlatformAdapter):
             await self._drop_turn_buffer(chat_id)
             return
         if int(buf.get("depth") or 0) == 0 and buf.get("segments"):
-            turn_key = self._first_buffered_turn_key(buf)
+            turn_key = self._retry_turn_key_for_buffer(buf)
             if turn_key:
                 buf["retry_turn_key"] = turn_key
                 self._schedule_turn_buffer_retry(chat_id, turn_key)
@@ -7309,8 +7015,7 @@ class Agent365Adapter(BasePlatformAdapter):
             result = await self._finalize_coalesced_reply(message_id)
             if not result.success:
                 logger.warning(
-                    "agent365 turn-end coalesced flush failed: "
-                    "chat_id=%s message_id=%s error=%s",
+                    "agent365 turn-end coalesced flush failed: chat_id=%s message_id=%s error=%s",
                     chat_id,
                     message_id,
                     result.error,
@@ -7346,12 +7051,8 @@ class Agent365Adapter(BasePlatformAdapter):
     def _capture_coalesced_turn_target(self, ref: ConversationRef) -> None:
         if not ref.last_inbound_activity_id:
             return
-        turn_key = self._coalesced_reply_turn_key(
-            ref.conversation_id, ref.last_inbound_activity_id
-        )
-        self._store_coalesced_turn_target(
-            turn_key, ref.raw, str(ref.validated_path or "")
-        )
+        turn_key = self._coalesced_reply_turn_key(ref.conversation_id, ref.last_inbound_activity_id)
+        self._store_coalesced_turn_target(turn_key, ref.raw, str(ref.validated_path or ""))
 
     def _store_coalesced_turn_target(
         self,
@@ -7363,9 +7064,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return
 
         chat_id = turn_key[0]
-        order = self._coalesced_turn_target_order_by_chat.setdefault(
-            chat_id, {}
-        )
+        order = self._coalesced_turn_target_order_by_chat.setdefault(chat_id, {})
         while (
             self._coalesced_turn_target_count_by_chat.get(chat_id, 0)
             >= _MAX_COALESCED_TURN_TARGETS_PER_CHAT
@@ -7433,27 +7132,20 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         state = self._coalesced_replies.get(message_id)
         if state is None:
-            generation_count = self._coalesced_generation_count_by_chat.get(
-                chat_id, 0
-            )
+            generation_count = self._coalesced_generation_count_by_chat.get(chat_id, 0)
             live_status_count = sum(
                 1
                 for item in self._coalesced_status.values()
                 if str(item.get("chat_id") or "") == str(chat_id)
             )
-            survivor_count = self._coalesced_reply_survivor_count_by_chat.get(
-                chat_id, 0
-            )
+            survivor_count = self._coalesced_reply_survivor_count_by_chat.get(chat_id, 0)
             if (
                 generation_count + live_status_count + survivor_count
                 >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT
             ):
                 return SendResult(
                     success=False,
-                    error=(
-                        "agent365 send: coalesced reply backlog full for "
-                        f"chat_id={chat_id!r}"
-                    ),
+                    error=(f"agent365 send: coalesced reply backlog full for chat_id={chat_id!r}"),
                 )
             if (
                 len(self._coalesced_replies)
@@ -7476,9 +7168,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "last_update_ts": now,
                 "lifecycle_generation": self._lifecycle_generation,
                 "chat_generation": self._chat_generation(chat_id),
-                "predecessor_delivery": self._coalesced_delivery_tail_by_turn.get(
-                    turn_key
-                ),
+                "predecessor_delivery": self._coalesced_delivery_tail_by_turn.get(turn_key),
                 "delivery_complete": delivered,
             }
             self._coalesced_replies[message_id] = state
@@ -7501,9 +7191,7 @@ class Agent365Adapter(BasePlatformAdapter):
         state["content"] = buffered_content
         self._active_coalesced_reply_by_chat[chat_id] = message_id
         self._active_coalesced_reply_by_turn[turn_key] = message_id
-        self._active_coalesced_reply_ids_by_chat.setdefault(chat_id, set()).add(
-            message_id
-        )
+        self._active_coalesced_reply_ids_by_chat.setdefault(chat_id, set()).add(message_id)
         self._ensure_coalesced_reply_task(message_id)
         return SendResult(success=True, message_id=message_id)
 
@@ -7518,9 +7206,9 @@ class Agent365Adapter(BasePlatformAdapter):
         loop_now: float,
     ) -> SendResult:
         requested_state = self._coalesced_replies.get(message_id)
-        if requested_state is not None and str(
-            requested_state.get("chat_id") or ""
-        ) != str(chat_id):
+        if requested_state is not None and str(requested_state.get("chat_id") or "") != str(
+            chat_id
+        ):
             return SendResult(
                 success=False,
                 error="agent365 edit_message: coalesced message belongs to another chat",
@@ -7564,9 +7252,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
         return await self._finalize_coalesced_reply(message_id)
 
-    def _deactivate_coalesced_reply(
-        self, message_id: str, state: dict[str, Any]
-    ) -> None:
+    def _deactivate_coalesced_reply(self, message_id: str, state: dict[str, Any]) -> None:
         chat_id = str(state.get("chat_id") or "")
         turn_key = state.get("turn_key")
         if (
@@ -7700,9 +7386,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if remaining > 0:
                     await asyncio.sleep(remaining)
                     continue
-                flushed = await self._flush_stale_coalesced_reply(
-                    message_id, cancel_task=False
-                )
+                flushed = await self._flush_stale_coalesced_reply(message_id, cancel_task=False)
                 if flushed or message_id not in self._coalesced_replies:
                     return
                 state = self._coalesced_replies[message_id]
@@ -7711,8 +7395,7 @@ class Agent365Adapter(BasePlatformAdapter):
             raise
         except Exception as e:
             logger.warning(
-                "agent365 coalesced reply watchdog failed: "
-                "message_id=%s error=%s",
+                "agent365 coalesced reply watchdog failed: message_id=%s error=%s",
                 message_id,
                 e,
             )
@@ -7736,9 +7419,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 message_id,
                 chat_id,
             )
-            self._drop_coalesced_reply_state(
-                message_id, cancel_task=cancel_task
-            )
+            self._drop_coalesced_reply_state(message_id, cancel_task=cancel_task)
             return False
 
         if self._http_client is None or self._bridge_cfg is None:
@@ -7748,9 +7429,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
                 message_id,
             )
-            self._drop_coalesced_reply_state(
-                message_id, cancel_task=cancel_task
-            )
+            self._drop_coalesced_reply_state(message_id, cancel_task=cancel_task)
             return False
 
         task, claimed = self._claim_coalesced_reply_finalize(message_id)
@@ -7760,8 +7439,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if result.success:
             if claimed:
                 logger.warning(
-                    "agent365 auto-flushed stale coalesced reply: "
-                    "chat_id=%s message_id=%s",
+                    "agent365 auto-flushed stale coalesced reply: chat_id=%s message_id=%s",
                     chat_id,
                     message_id,
                 )
@@ -7775,14 +7453,8 @@ class Agent365Adapter(BasePlatformAdapter):
             result.error,
         )
         failed_state = self._coalesced_replies.get(message_id)
-        if (
-            claimed
-            and failed_state is not None
-            and not failed_state.get("finalize_task")
-        ):
-            self._drop_coalesced_reply_state(
-                message_id, cancel_task=cancel_task
-            )
+        if claimed and failed_state is not None and not failed_state.get("finalize_task"):
+            self._drop_coalesced_reply_state(message_id, cancel_task=cancel_task)
         return False
 
     def _drop_coalesced_reply_state(
@@ -7820,15 +7492,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 and self._coalesced_delivery_tail_by_turn.get(turn_key) is delivered
             ):
                 self._coalesced_delivery_tail_by_turn.pop(turn_key, None)
-        if (
-            isinstance(turn_key, tuple)
-            and turn_key not in self._coalesced_generation_count_by_turn
-        ):
+        if isinstance(turn_key, tuple) and turn_key not in self._coalesced_generation_count_by_turn:
             turn_owner = self._coalesced_turn_owners.pop(turn_key, None)
             if restore_turn_target and turn_owner is not None:
-                self._store_coalesced_turn_target(
-                    turn_key, turn_owner[0], turn_owner[1]
-                )
+                self._store_coalesced_turn_target(turn_key, turn_owner[0], turn_owner[1])
         current = asyncio.current_task()
         owner = state.get("finalize_owner_task")
         tasks = [
@@ -7877,22 +7544,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 for item in self._coalesced_status.values()
                 if str(item.get("chat_id") or "") == str(chat_id)
             )
-            generation_count = self._coalesced_generation_count_by_chat.get(
-                chat_id, 0
-            )
-            survivor_count = self._coalesced_reply_survivor_count_by_chat.get(
-                chat_id, 0
-            )
+            generation_count = self._coalesced_generation_count_by_chat.get(chat_id, 0)
+            survivor_count = self._coalesced_reply_survivor_count_by_chat.get(chat_id, 0)
             if (
                 generation_count + live_status_count + survivor_count
                 >= _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT
             ):
                 return SendResult(
                     success=False,
-                    error=(
-                        "agent365 status: outbound backlog full for "
-                        f"chat_id={chat_id!r}"
-                    ),
+                    error=(f"agent365 status: outbound backlog full for chat_id={chat_id!r}"),
                 )
             if (
                 len(self._coalesced_replies)
@@ -7919,10 +7579,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._ensure_coalesced_status_task(key)
             return SendResult(success=True, message_id=key)
         aggregate_chars = sum(len(str(item)) for item in lines) + len(lines)
-        if (
-            len(lines) >= _MAX_STATUS_LINES
-            or aggregate_chars + len(line) > self.MAX_MESSAGE_LENGTH
-        ):
+        if len(lines) >= _MAX_STATUS_LINES or aggregate_chars + len(line) > self.MAX_MESSAGE_LENGTH:
             return SendResult(
                 success=False,
                 error="agent365 status: coalesced status buffer full",
@@ -7937,9 +7594,7 @@ class Agent365Adapter(BasePlatformAdapter):
         task = self._coalesced_status_tasks.get(key)
         if task is not None and not task.done():
             return
-        self._coalesced_status_tasks[key] = asyncio.create_task(
-            self._watch_coalesced_status(key)
-        )
+        self._coalesced_status_tasks[key] = asyncio.create_task(self._watch_coalesced_status(key))
 
     async def _watch_coalesced_status(self, key: str) -> None:
         try:
@@ -7959,9 +7614,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not isinstance(opened_ts, (int, float)):
                     opened_ts = loop_now
                     state["opened_ts"] = opened_ts
-                lifetime_remaining = _MAX_STATUS_BUFFER_AGE_SEC - (
-                    loop_now - float(opened_ts)
-                )
+                lifetime_remaining = _MAX_STATUS_BUFFER_AGE_SEC - (loop_now - float(opened_ts))
                 remaining = min(
                     _STATUS_COALESCE_FLUSH_AFTER_SEC - age,
                     lifetime_remaining,
@@ -8017,8 +7670,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if self._http_client is None or self._bridge_cfg is None:
             logger.warning(
-                "agent365 dropping coalesced status while disconnected: "
-                "chat_id=%s key=%s",
+                "agent365 dropping coalesced status while disconnected: chat_id=%s key=%s",
                 chat_id,
                 key,
             )
@@ -8054,8 +7706,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if not result.success:
             logger.warning(
-                "agent365 coalesced status flush failed: "
-                "chat_id=%s key=%s error=%s",
+                "agent365 coalesced status flush failed: chat_id=%s key=%s error=%s",
                 chat_id,
                 key,
                 result.error,
@@ -8080,9 +7731,7 @@ class Agent365Adapter(BasePlatformAdapter):
         current task is still running — it is called from inside the flush
         (the watchdog task is about to return), so the stale entry must be
         replaced rather than reused."""
-        self._coalesced_status_tasks[key] = asyncio.create_task(
-            self._watch_coalesced_status(key)
-        )
+        self._coalesced_status_tasks[key] = asyncio.create_task(self._watch_coalesced_status(key))
 
     def _drop_coalesced_status_state(self, key: str) -> None:
         self._coalesced_status.pop(key, None)
@@ -8091,9 +7740,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if task is not None and task is not current:
             task.cancel()
 
-    async def _send_proactive(
-        self, chat_id: str, content: str
-    ) -> SendResult:
+    async def _send_proactive(self, chat_id: str, content: str) -> SendResult:
         """Slice 19x-b (#4): cron-driven outbound for a chat the gateway
         hasn't seen an inbound for this lifetime.
 
@@ -8378,9 +8025,7 @@ class Agent365Adapter(BasePlatformAdapter):
         except Exception:
             bf_stream_id = None
         if not bf_stream_id:
-            logger.warning(
-                "agent365 stream-start 201 without id; falling back"
-            )
+            logger.warning("agent365 stream-start 201 without id; falling back")
             return None
         bf_stream_id = str(bf_stream_id)
         self._remember_bot_reply(bf_stream_id, conversation_id=str(chat_id))
@@ -8406,9 +8051,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._active_stream_by_chat[chat_id] = bf_stream_id
         if not finalize:
             return SendResult(success=True, message_id=bf_stream_id)
-        final_result = await self.edit_message(
-            chat_id, bf_stream_id, clean_content, finalize=True
-        )
+        final_result = await self.edit_message(chat_id, bf_stream_id, clean_content, finalize=True)
         if final_result.success:
             return SendResult(
                 success=True,
@@ -8416,9 +8059,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         return final_result
 
-    async def _post_activity(
-        self, *, inbound: dict[str, Any], activity: dict[str, Any]
-    ) -> None:
+    async def _post_activity(self, *, inbound: dict[str, Any], activity: dict[str, Any]) -> None:
         """POST a fresh activity (not a reply) to the inbound's
         serviceUrl. Used by ``send_typing``. Reuses ``send_reply``'s
         outbound user-FIC token chain via the bridge module."""
@@ -8428,9 +8069,7 @@ class Agent365Adapter(BasePlatformAdapter):
         service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
         conv_id = (inbound.get("conversation") or {}).get("id")
         if not service_url or not conv_id:
-            raise RuntimeError(
-                "agent365 _post_activity: serviceUrl / conversation.id missing"
-            )
+            raise RuntimeError("agent365 _post_activity: serviceUrl / conversation.id missing")
         chat_id = str(conv_id)
         generation = self._lifecycle_generation
         chat_generation = self._chat_generation(chat_id)
@@ -8468,9 +8107,7 @@ class Agent365Adapter(BasePlatformAdapter):
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
             raise RuntimeError("agent365: adapter lifecycle changed")
         if resp.status_code >= 300:
-            raise RuntimeError(
-                f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}"
-            )
+            raise RuntimeError(f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}")
 
     async def _delete_activity(
         self,
@@ -8545,15 +8182,11 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         return False
 
-    async def _remove_file_consent_card(
-        self, activity: dict[str, Any], *, chat_id: str
-    ) -> None:
+    async def _remove_file_consent_card(self, activity: dict[str, Any], *, chat_id: str) -> None:
         """Remove the FileConsentCard the user answered (#183)."""
         reply_to = str(activity.get("replyToId") or "").strip()
         if reply_to:
-            await self._delete_activity(
-                inbound=activity, activity_id=reply_to, chat_id=chat_id
-            )
+            await self._delete_activity(inbound=activity, activity_id=reply_to, chat_id=chat_id)
 
     async def _send_file_consent_decline_notice(
         self, activity: dict[str, Any], *, validated_path: str | None
@@ -8661,8 +8294,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 or ""
             )
             logger.info(
-                "agent365 status suppressed while turn active: "
-                "chat_id=%s status_key=%s active=%s",
+                "agent365 status suppressed while turn active: chat_id=%s status_key=%s active=%s",
                 chat_id,
                 status_key,
                 active,
@@ -8684,9 +8316,7 @@ class Agent365Adapter(BasePlatformAdapter):
             inbound=inbound,
         )
 
-    async def send_typing(
-        self, chat_id: str, metadata: dict[str, Any] | None = None
-    ) -> None:
+    async def send_typing(self, chat_id: str, metadata: dict[str, Any] | None = None) -> None:
         """Send a BF ``typing`` activity on a personal (Teams 1:1) chat.
 
         Copilot Chat arrives as ``groupChat``. A typing activity there is
@@ -8707,10 +8337,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # #185: BF has no "stop typing" activity. While a personal stream is
         # open, typing is redundant; after ``streamType=final`` Hermes may still
         # pulse until ``on_processing_complete`` — skip those late ticks.
-        if (
-            chat_id in self._active_stream_by_chat
-            or chat_id in self._personal_stream_final_posted
-        ):
+        if chat_id in self._active_stream_by_chat or chat_id in self._personal_stream_final_posted:
             return None
         # Slice 19x-d (#4): bump last_used_at on typing too.
         self._conversations.mark_used(chat_id)
@@ -8734,10 +8361,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # Typing failures are best-effort — never raise into the
             # gateway's pulse loop. The converted RuntimeError is only
             # produced when the adapter itself is tearing the chat down.
-            if (
-                isinstance(e, RuntimeError)
-                and str(e) == "agent365 outbound operation cancelled"
-            ):
+            if isinstance(e, RuntimeError) and str(e) == "agent365 outbound operation cancelled":
                 logger.debug(
                     "agent365 send_typing cancelled during teardown for %s: %s",
                     chat_id,
@@ -8819,9 +8443,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 send_image: adapter lifecycle changed",
             )
-        self._remember_bot_reply(
-            _connector_activity_id(response), conversation_id=str(chat_id)
-        )
+        self._remember_bot_reply(_connector_activity_id(response), conversation_id=str(chat_id))
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     # ── #76c outbound file transfer (FileConsentCard → OneDrive) ───────────
@@ -8866,9 +8488,7 @@ class Agent365Adapter(BasePlatformAdapter):
         text = f"📎 {file_name}"
         if caption:
             text = f"{caption}\n{text}"
-        return await self.send(
-            chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata
-        )
+        return await self.send(chat_id=chat_id, content=text, reply_to=reply_to, metadata=metadata)
 
     async def _send_file_consent(
         self,
@@ -8898,12 +8518,8 @@ class Agent365Adapter(BasePlatformAdapter):
             return SendResult(success=False, error=msg)
         conv = inbound.get("conversation") or {}
         if str(conv.get("conversationType") or "") != "personal":
-            logger.info(
-                "agent365 send_file: non-personal chat %s → text fallback", chat_id
-            )
-            return await self._file_text_fallback(
-                chat_id, file_name, caption, reply_to, metadata
-            )
+            logger.info("agent365 send_file: non-personal chat %s → text fallback", chat_id)
+            return await self._file_text_fallback(chat_id, file_name, caption, reply_to, metadata)
         # R3-P1: if no tenant host is pinned, file transfer is disabled — degrade
         # to the text fallback BEFORE offering a FileConsentCard that can never
         # complete (the accept-time upload would be refused by the empty
@@ -8914,9 +8530,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "extra.file_host_allowlist unset → text fallback (file transfer "
                 "disabled; pin the tenant SharePoint/OneDrive host to enable)"
             )
-            return await self._file_text_fallback(
-                chat_id, file_name, caption, reply_to, metadata
-            )
+            return await self._file_text_fallback(chat_id, file_name, caption, reply_to, metadata)
         if self._http_client is None or self._bridge_cfg is None:
             msg = "agent365 send_file: adapter not connected"
             logger.error(msg)
@@ -9033,8 +8647,12 @@ class Agent365Adapter(BasePlatformAdapter):
         degrade to the base text fallback."""
         name = file_name or os.path.basename(file_path) or "file"
         return await self._send_file_consent(
-            chat_id, file_path, caption or "", name,
-            reply_to=reply_to, metadata=metadata,
+            chat_id,
+            file_path,
+            caption or "",
+            name,
+            reply_to=reply_to,
+            metadata=metadata,
         )
 
     async def send_image_file(
@@ -9052,8 +8670,12 @@ class Agent365Adapter(BasePlatformAdapter):
         text fallback."""
         name = os.path.basename(image_path) or "image"
         return await self._send_file_consent(
-            chat_id, image_path, caption or "", name,
-            reply_to=reply_to, metadata=metadata,
+            chat_id,
+            image_path,
+            caption or "",
+            name,
+            reply_to=reply_to,
+            metadata=metadata,
         )
 
     async def _handle_file_consent(
@@ -9078,14 +8700,10 @@ class Agent365Adapter(BasePlatformAdapter):
         consent_chat_id = str((activity.get("conversation") or {}).get("id") or "")
 
         async def _remove_consent_card() -> None:
-            await self._remove_file_consent_card(
-                activity, chat_id=consent_chat_id
-            )
+            await self._remove_file_consent_card(activity, chat_id=consent_chat_id)
 
         if action != "accept":
-            logger.info(
-                "agent365 fileConsent action=%s consent=%s", action, consent_id[:8]
-            )
+            logger.info("agent365 fileConsent action=%s consent=%s", action, consent_id[:8])
             await _remove_consent_card()
             if (
                 action == "decline"
@@ -9104,9 +8722,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # replay, or a spoofed id. Ack without uploading. A Bot Framework
             # retry lands here after the pending entry was popped; the wire is
             # the same empty ack serve returns for a deduped invoke (#132).
-            logger.warning(
-                "agent365 fileConsent accept for unknown consent=%s", consent_id[:8]
-            )
+            logger.warning("agent365 fileConsent accept for unknown consent=%s", consent_id[:8])
             await _remove_consent_card()
             return invoke.empty_invoke_ack()
 
@@ -9114,8 +8730,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if (
             self._disconnecting
             or pending.get("lifecycle_generation") != self._lifecycle_generation
-            or pending.get("chat_generation")
-            != self._chat_generation(pending_chat_id)
+            or pending.get("chat_generation") != self._chat_generation(pending_chat_id)
         ):
             logger.warning(
                 "agent365 fileConsent accept for expired lifecycle consent=%s",
@@ -9164,9 +8779,7 @@ class Agent365Adapter(BasePlatformAdapter):
             not upload_url
             or client is None
             or not self._lifecycle_is_current(generation, client)
-            or not self._chat_lifecycle_is_current(
-                pending_chat_id, chat_generation
-            )
+            or not self._chat_lifecycle_is_current(pending_chat_id, chat_generation)
         ):
             logger.warning("agent365 fileConsent accept missing uploadUrl/client")
             await _remove_consent_card()
@@ -9177,7 +8790,8 @@ class Agent365Adapter(BasePlatformAdapter):
         if not _is_allowed_file_host(upload_url, self._file_host_allowlist):
             logger.warning(
                 "agent365 fileConsent uploadUrl not on the configured tenant host "
-                "allowlist; refused (%.60s)", upload_url
+                "allowlist; refused (%.60s)",
+                upload_url,
             )
             await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
@@ -9233,12 +8847,9 @@ class Agent365Adapter(BasePlatformAdapter):
 
         if not self._lifecycle_is_current(
             generation, client
-        ) or not self._chat_lifecycle_is_current(
-            pending_chat_id, chat_generation
-        ):
+        ) or not self._chat_lifecycle_is_current(pending_chat_id, chat_generation):
             logger.warning(
-                "agent365 fileConsent upload completed after lifecycle change "
-                "consent=%s",
+                "agent365 fileConsent upload completed after lifecycle change consent=%s",
                 consent_id[:8],
             )
             await _remove_consent_card()
@@ -9280,9 +8891,7 @@ class Agent365Adapter(BasePlatformAdapter):
         except Exception as e:
             logger.warning("agent365 fileConsent info card failed: %s", e)
 
-        logger.info(
-            "agent365 fileConsent uploaded %d bytes consent=%s", size, consent_id[:8]
-        )
+        logger.info("agent365 fileConsent uploaded %d bytes consent=%s", size, consent_id[:8])
         return invoke.InvokeResponse(status=200, body={})
 
     # ── #80 Teams messageReaction + #73(c) feedback correlation ───────────
@@ -9444,9 +9053,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if not applied:
             return JSONResponse({"status": "acked", "reason": "unrelated"})
         if self._reactions_dispatch_agent_turn:
-            await self._dispatch_reaction_events(
-                activity, applied, authorized_sender_id=user_id
-            )
+            await self._dispatch_reaction_events(activity, applied, authorized_sender_id=user_id)
         return JSONResponse({"status": "acked", "reactions": len(applied)})
 
     def _stored_reaction_changes(
@@ -9515,10 +9122,7 @@ class Agent365Adapter(BasePlatformAdapter):
         meta = self._bot_reply_ids.get(reply_to)
         if not isinstance(meta, dict):
             return "unrelated"
-        if (
-            meta.get("conversation_id") != conv_id
-            or meta.get("tenant_id") != configured
-        ):
+        if meta.get("conversation_id") != conv_id or meta.get("tenant_id") != configured:
             return "unrelated"
         existing = self._feedback_by_message_id.get(reply_to)
         if isinstance(existing, dict):
@@ -9551,8 +9155,7 @@ class Agent365Adapter(BasePlatformAdapter):
         user_activity_id = self._cached_user_activity_id(conv_id)
         if not user_activity_id:
             logger.warning(
-                "agent365 messageReaction recorded without a turn: "
-                "no cached user activity"
+                "agent365 messageReaction recorded without a turn: no cached user activity"
             )
             return
         for action, identity in changes:
@@ -9570,8 +9173,7 @@ class Agent365Adapter(BasePlatformAdapter):
             admission_key = sk or f"agent365:{conv_id}"
             if not self._reserve_agent_turn_admission(admission_key):
                 logger.warning(
-                    "agent365 messageReaction recorded without a turn: "
-                    "active turns full"
+                    "agent365 messageReaction recorded without a turn: active turns full"
                 )
                 continue
             turn_guard = asyncio.Event()
@@ -9590,9 +9192,7 @@ class Agent365Adapter(BasePlatformAdapter):
             try:
                 await self.handle_message(event)
             except Exception:
-                logger.exception(
-                    "agent365 messageReaction turn failed action=%s", action
-                )
+                logger.exception("agent365 messageReaction turn failed action=%s", action)
             finally:
                 _AGENT_TURN_LIFECYCLE.reset(turn_token)
             if sk is None:
@@ -9620,9 +9220,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
     # ── #73(c) feedback loop + #82 handoff (invoke children) ──────────────
 
-    async def _handle_feedback_submit(
-        self, ctx: invoke.InvokeContext
-    ) -> invoke.InvokeResponse:
+    async def _handle_feedback_submit(self, ctx: invoke.InvokeContext) -> invoke.InvokeResponse:
         """#73(c): ``message/submitAction`` — the user pressed thumbs up/down on
         a reply (or submitted the feedback form). Teams stores nothing, so we
         record the reaction keyed by the replied message id (best-effort,
@@ -9643,9 +9241,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if isinstance(feedback, str):
             encoded = feedback.encode("utf-8")
             if len(encoded) > _MAX_FEEDBACK_TEXT_BYTES:
-                feedback = encoded[:_MAX_FEEDBACK_TEXT_BYTES].decode(
-                    "utf-8", errors="ignore"
-                )
+                feedback = encoded[:_MAX_FEEDBACK_TEXT_BYTES].decode("utf-8", errors="ignore")
         # The reply the reaction targets: Teams sets replyToId on the invoke.
         # Merge into the existing #73/#80 row. Replacing the dict would drop
         # ``native_reactions`` recorded for the same bot reply.
@@ -9701,9 +9297,7 @@ class Agent365Adapter(BasePlatformAdapter):
             rec["user_oid"] = user_oid
         _bound_feedback_map(self._feedback_by_message_id)
 
-    async def _handle_message_fetch_task(
-        self, ctx: invoke.InvokeContext
-    ) -> invoke.InvokeResponse:
+    async def _handle_message_fetch_task(self, ctx: invoke.InvokeContext) -> invoke.InvokeResponse:
         """#73(c): ``message/fetchTask`` — Teams requests a custom feedback form.
         We use the built-in ``feedbackLoop type:"default"`` (no custom form), so
         there is nothing to render; ack with a benign empty task so Teams closes
@@ -9720,10 +9314,7 @@ class Agent365Adapter(BasePlatformAdapter):
         bot in Teams. Fall back to the blueprint only when no BF app is set (the
         single-identity deployment where they coincide)."""
         bot_id = self.bf_app_id or self.blueprint_app_id or ""
-        return (
-            "https://teams.microsoft.com/l/chat/0/0"
-            f"?users=28:{bot_id}&continuation={token}"
-        )
+        return f"https://teams.microsoft.com/l/chat/0/0?users=28:{bot_id}&continuation={token}"
 
     def _maybe_append_handoff_link(self, chat_id: str, content: str) -> str:
         """#82: append a "continue in Teams" deep link to a degraded non-personal
@@ -10075,9 +9666,7 @@ class Agent365Adapter(BasePlatformAdapter):
         not mint another pin.
         """
         reply_activity_id = self._remember_handoff_destination(ctx)
-        event = self._build_handoff_message_event(
-            ctx, record, reply_activity_id=reply_activity_id
-        )
+        event = self._build_handoff_message_event(ctx, record, reply_activity_id=reply_activity_id)
         task = asyncio.get_running_loop().create_task(self._dispatch_handoff_event(event))
         self._handoff_dispatch_tasks.add(task)
         task.add_done_callback(self._handoff_dispatch_tasks.discard)
@@ -10214,8 +9803,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "version": "1.5",
             "body": [{"type": "TextBlock", "text": text, "wrap": True}],
             "actions": [
-                {"type": "Action.Submit", "title": title, "data": data}
-                for (title, data) in actions
+                {"type": "Action.Submit", "title": title, "data": data} for (title, data) in actions
             ],
         }
 
@@ -10292,9 +9880,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error=f"agent365 {log_context}: adapter lifecycle changed",
             )
-        self._remember_bot_reply(
-            _connector_activity_id(response), conversation_id=str(chat_id)
-        )
+        self._remember_bot_reply(_connector_activity_id(response), conversation_id=str(chat_id))
         return SendResult(success=True, message_id=str(inbound.get("id") or ""))
 
     async def send_exec_approval(
@@ -10486,9 +10072,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
         mark_awaiting_text(clarify_id)
 
-    async def _handle_card_action(
-        self, activity: dict[str, Any], value: dict[str, Any]
-    ) -> Any:
+    async def _handle_card_action(self, activity: dict[str, Any], value: dict[str, Any]) -> Any:
         """Route a card ``Action.Submit`` back to the gateway's pending-approval
         resolver. Never dispatches to the agent loop; always acks 200 (the button
         press is a control signal, not a user turn). Resolver errors degrade to a
@@ -10509,8 +10093,7 @@ class Agent365Adapter(BasePlatformAdapter):
             or capability.get("conversation_id") != conv_id
             or capability.get("user_id") != user_id
             or capability.get("tenant_id") != self.tenant_id.lower()
-            or capability.get("lifecycle_generation")
-            != self._lifecycle_generation
+            or capability.get("lifecycle_generation") != self._lifecycle_generation
             or capability.get("chat_generation") != self._chat_generation(conv_id)
             or self._disconnecting
             or conv_id in self._retiring_chats
@@ -10529,24 +10112,20 @@ class Agent365Adapter(BasePlatformAdapter):
         action_chat_generation = int(capability["chat_generation"])
         action_task = asyncio.current_task()
         if action_task is not None:
-            self._card_action_tasks_by_chat.setdefault(conv_id, set()).add(
-                action_task
-            )
+            self._card_action_tasks_by_chat.setdefault(conv_id, set()).add(action_task)
         try:
             if kind == _CARD_KIND_EXEC_APPROVAL:
-                self._gw_resolve_approval(
-                    str(resolver.get("session_key") or ""), choice
-                )
+                self._gw_resolve_approval(str(resolver.get("session_key") or ""), choice)
             elif kind == _CARD_KIND_SLASH_CONFIRM:
                 follow = await self._gw_resolve_slash_confirm(
                     str(resolver.get("session_key") or ""),
                     str(resolver.get("confirm_id") or ""),
                     choice,
                 )
-                if follow and self._lifecycle_is_current(
-                    action_generation
-                ) and self._chat_lifecycle_is_current(
-                    conv_id, action_chat_generation
+                if (
+                    follow
+                    and self._lifecycle_is_current(action_generation)
+                    and self._chat_lifecycle_is_current(conv_id, action_chat_generation)
                 ):
                     # The resolver returns a follow-up (command result / cancelled
                     # notice) the adapter must post as a new message.
@@ -10622,9 +10201,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 message = err.get("message")
                 if not isinstance(message, str):
                     message = ""
-                body = json.dumps(
-                    {"code": code, "message": message}, ensure_ascii=False
-                )
+                body = json.dumps({"code": code, "message": message}, ensure_ascii=False)
             else:
                 body = json.dumps(parsed, ensure_ascii=False)
         if not body:
@@ -10700,14 +10277,12 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> bool:
         """Wait out the streaming gap. False when the turn has moved on."""
         await asyncio.sleep(_STREAMING_MIN_GAP_SEC)
-        return self._lifecycle_is_current(
-            generation, client
-        ) and self._chat_lifecycle_is_current(chat_id, chat_generation)
+        return self._lifecycle_is_current(generation, client) and self._chat_lifecycle_is_current(
+            chat_id, chat_generation
+        )
 
     @staticmethod
-    def _personal_reply_anchor(
-        reply_to: Any, inbound: dict[str, Any] | None
-    ) -> str:
+    def _personal_reply_anchor(reply_to: Any, inbound: dict[str, Any] | None) -> str:
         """Activity id this personal stream belongs to.
 
         A send carries ``reply_to``. An edit that opens the stream does
@@ -10795,11 +10370,7 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """Update the held follow-up. Finalize posts it once."""
         hold = self._nested_personal_reply.get(str(chat_id))
-        if (
-            hold is None
-            or str(hold.get("id") or "") != str(message_id)
-            or hold.get("posted")
-        ):
+        if hold is None or str(hold.get("id") or "") != str(message_id) or hold.get("posted"):
             return SendResult(success=True, message_id=str(message_id))
         hold["text"] = _strip_streaming_cursor(content)
         if not finalize:
@@ -10808,10 +10379,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if not isinstance(inbound, dict):
             return SendResult(
                 success=False,
-                error=(
-                    "agent365 edit_message: no cached inbound for "
-                    f"chat_id={chat_id!r}"
-                ),
+                error=(f"agent365 edit_message: no cached inbound for chat_id={chat_id!r}"),
             )
         return await self._flush_nested_personal_reply(
             chat_id,
@@ -10958,9 +10526,7 @@ class Agent365Adapter(BasePlatformAdapter):
         content = state.get("last_content") or " "
         if not isinstance(content, str) or not content:
             content = " "
-        result = await self.edit_message(
-            str(chat_id), str(message_id), content, finalize=True
-        )
+        result = await self.edit_message(str(chat_id), str(message_id), content, finalize=True)
         if not result.success:
             logger.warning(
                 "agent365 personal stream turn-end finalize not accepted: "
@@ -11056,10 +10622,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if str(state.get("chat_id") or "") != str(chat_id):
                 return SendResult(
                     success=False,
-                    error=(
-                        "agent365 edit_message: coalesced message belongs "
-                        "to another chat"
-                    ),
+                    error=("agent365 edit_message: coalesced message belongs to another chat"),
                 )
             owner_inbound = state.get("inbound")
             if not isinstance(owner_inbound, dict):
@@ -11261,9 +10824,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not self._lifecycle_is_current(
                     generation, client
                 ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
-                    self._drop_stream_state_if_unopened(
-                        chat_id, message_id, state
-                    )
+                    self._drop_stream_state_if_unopened(chat_id, message_id, state)
                     return SendResult(
                         success=False,
                         error="agent365 edit_message: adapter lifecycle changed",
@@ -11291,15 +10852,11 @@ class Agent365Adapter(BasePlatformAdapter):
                     bf_error_body=last_error,
                     attempt=attempt,
                 )
-                if self._stream_edit_should_retry(
-                    state, http_status=None, attempt=attempt
-                ):
+                if self._stream_edit_should_retry(state, http_status=None, attempt=attempt):
                     if not await self._pause_before_stream_retry(
                         chat_id, generation, chat_generation, client
                     ):
-                        self._drop_stream_state_if_unopened(
-                            chat_id, message_id, state
-                        )
+                        self._drop_stream_state_if_unopened(chat_id, message_id, state)
                         return SendResult(
                             success=False,
                             error="agent365 edit_message: adapter lifecycle changed",
@@ -11347,9 +10904,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         error="streaming start returned no id",
                     )
                 state["bf_stream_id"] = str(stream_id)
-                self._remember_bot_reply(
-                    str(stream_id), conversation_id=str(chat_id)
-                )
+                self._remember_bot_reply(str(stream_id), conversation_id=str(chat_id))
                 self._active_stream_by_chat[chat_id] = message_id
                 if finalize:
                     # The activity just sent was the open, not the final.
@@ -11384,9 +10939,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         bf_error_body="2xx without a streamId; final not sent",
                         attempt=attempt,
                     )
-                    self._drop_stream_state_if_unopened(
-                        chat_id, message_id, state
-                    )
+                    self._drop_stream_state_if_unopened(chat_id, message_id, state)
                     return SendResult(
                         success=False,
                         error="streaming start returned no id",
@@ -11395,9 +10948,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._drop_stream_state(chat_id, message_id)
                     self._record_recently_finalized(message_id, chat_id, loop_now)
                     self._mark_personal_stream_final_posted(chat_id)
-                return SendResult(
-                    success=True, message_id=state.get("bf_stream_id") or ""
-                )
+                return SendResult(success=True, message_id=state.get("bf_stream_id") or "")
 
             code, body = self._bf_error_parts(resp)
             self._log_personal_stream_edit_failure(
@@ -11455,24 +11006,18 @@ class Agent365Adapter(BasePlatformAdapter):
             if resp.status_code == 429:
                 last_error = "streaming rate limited"
             else:
-                last_error = (
-                    f"agent365 edit_message HTTP {resp.status_code}: {body}"
-                )
+                last_error = f"agent365 edit_message HTTP {resp.status_code}: {body}"
             # Transient failures on an open stream are retried. Anything
             # else keeps the stream (accept-and-continue) unless the 403
             # branch above already dropped it. Personal chats do not fall
             # over to the non-personal coalesce buffer: a second bubble
             # is the pre-#64 failure mode, and a plain send while this
             # stream is open is suppressed.
-            if self._stream_edit_should_retry(
-                state, http_status=resp.status_code, attempt=attempt
-            ):
+            if self._stream_edit_should_retry(state, http_status=resp.status_code, attempt=attempt):
                 if not await self._pause_before_stream_retry(
                     chat_id, generation, chat_generation, client
                 ):
-                    self._drop_stream_state_if_unopened(
-                        chat_id, message_id, state
-                    )
+                    self._drop_stream_state_if_unopened(chat_id, message_id, state)
                     return SendResult(
                         success=False,
                         error="agent365 edit_message: adapter lifecycle changed",
@@ -11601,7 +11146,8 @@ class Agent365Adapter(BasePlatformAdapter):
         if 200 <= resp.status_code < 300:
             logger.info(
                 "agent365 auto-finalize stale stream %s: status=%s",
-                bf_stream_id, resp.status_code,
+                bf_stream_id,
+                resp.status_code,
             )
             self._drop_stream_state(chat_id, message_id)
             loop_now = asyncio.get_event_loop().time()
@@ -11650,10 +11196,7 @@ class Agent365Adapter(BasePlatformAdapter):
             opened_ts = loop_now
             state["opened_ts"] = opened_ts
         age = loop_now - float(opened_ts)
-        if (
-            failures >= _STREAMING_FINALIZE_MAX_FAILURES
-            or age >= _STREAMING_FORCE_DROP_AFTER_SEC
-        ):
+        if failures >= _STREAMING_FINALIZE_MAX_FAILURES or age >= _STREAMING_FORCE_DROP_AFTER_SEC:
             logger.warning(
                 "agent365 force-dropping stale stream after failed finalize: "
                 "chat_id=%s message_id=%s failures=%s age=%.1fs reason=%s",
@@ -11684,9 +11227,7 @@ class Agent365Adapter(BasePlatformAdapter):
         """Drop ``_recently_finalized`` entries older than the TTL."""
         cutoff = now - self._recently_finalized_ttl_sec
         stale = [
-            key
-            for key, finalized_at in self._recently_finalized.items()
-            if finalized_at < cutoff
+            key for key, finalized_at in self._recently_finalized.items() if finalized_at < cutoff
         ]
         for k in stale:
             self._recently_finalized.pop(k, None)
@@ -11764,9 +11305,7 @@ class Agent365Adapter(BasePlatformAdapter):
             and not self._lifecycle_owner_survivor_count_by_chat.get(chat_id, 0)
         )
 
-    async def _release_unadopted_retirements(
-        self, armed: list[str], committed: set[str]
-    ) -> None:
+    async def _release_unadopted_retirements(self, armed: list[str], committed: set[str]) -> None:
         for chat_id in armed:
             if not self._retirement_not_adopted(chat_id):
                 continue
@@ -11830,11 +11369,7 @@ class Agent365Adapter(BasePlatformAdapter):
             interrupted = await self._hard_interrupt_session(session_key)
             if guard is not None:
                 guard.set()
-            if (
-                isinstance(prior, asyncio.Task)
-                and not prior.done()
-                and prior is not current
-            ):
+            if isinstance(prior, asyncio.Task) and not prior.done() and prior is not current:
                 prior.cancel()
             return {
                 "session_key": session_key,
@@ -11844,9 +11379,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
         if not pending:
             return []
-        return list(
-            await asyncio.gather(*(signal_one(*item) for item in pending))
-        )
+        return list(await asyncio.gather(*(signal_one(*item) for item in pending)))
 
     async def _finish_matched_agent_turns(self, specs: list[dict[str, Any]]) -> None:
         """Await session-task cancellation concurrently and release settled mappings."""
@@ -11882,9 +11415,7 @@ class Agent365Adapter(BasePlatformAdapter):
         specs = await self._signal_matched_agent_turns(chat_ids)
         await self._finish_matched_agent_turns(specs)
 
-    async def _commit_matched_agent_turns(
-        self, chat_ids: list[str], committed: set[str]
-    ) -> None:
+    async def _commit_matched_agent_turns(self, chat_ids: list[str], committed: set[str]) -> None:
         """Interrupt matched turns, then wait for their session tasks.
 
         Irreversible. Call only after the cancellable uninstall phase has
@@ -12092,16 +11623,12 @@ class Agent365Adapter(BasePlatformAdapter):
         if task is None or task.done():
             if len(self._registry_eviction_tasks) >= _MAX_INBOUND_TASKS:
                 return False
-            state, mutation = _reserve_persist_mutation(
-                self._conversations_path, owner
-            )
+            state, mutation = _reserve_persist_mutation(self._conversations_path, owner)
             if mutation is None:
                 return False
             reservation = (state, mutation, owner)
             self._registry_evicting_chats.add(chat_id)
-            task = asyncio.create_task(
-                self._evict_conversation_impl(chat_id, reservation)
-            )
+            task = asyncio.create_task(self._evict_conversation_impl(chat_id, reservation))
             self._registry_eviction_tasks[chat_id] = task
             task.add_done_callback(
                 lambda completed, owner=chat_id: self._registry_eviction_done(owner, completed)
@@ -12151,9 +11678,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if self._advance_chat_generation(chat_id) is None:
                 return False
             self._retiring_chats.add(chat_id)
-            cleanup_task = asyncio.create_task(
-                self._teardown_chat_state_impl(chat_id)
-            )
+            cleanup_task = asyncio.create_task(self._teardown_chat_state_impl(chat_id))
             self._chat_teardown_tasks[chat_id] = cleanup_task
             cleanup_task.add_done_callback(
                 lambda task, owner=chat_id: self._chat_teardown_done(owner, task)
@@ -12170,9 +11695,7 @@ class Agent365Adapter(BasePlatformAdapter):
             raise asyncio.CancelledError()
         return True
 
-    def _chat_teardown_done(
-        self, chat_id: str, task: asyncio.Task[None]
-    ) -> None:
+    def _chat_teardown_done(self, chat_id: str, task: asyncio.Task[None]) -> None:
         if self._chat_teardown_tasks.get(chat_id) is task:
             self._chat_teardown_tasks.pop(chat_id, None)
             if not self._coalesced_reply_survivor_count_by_chat.get(chat_id, 0):
@@ -12281,9 +11804,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._coalesced_turn_owners.pop(turn_key, None)
         self._active_coalesced_reply_ids_by_chat.pop(chat_id, None)
         self._coalesced_generation_count_by_chat.pop(chat_id, None)
-        target_order = self._coalesced_turn_target_order_by_chat.pop(
-            chat_id, {}
-        )
+        target_order = self._coalesced_turn_target_order_by_chat.pop(chat_id, {})
         for turn_key in target_order:
             self._drop_coalesced_turn_target(turn_key)
         self._coalesced_turn_target_count_by_chat.pop(chat_id, None)
@@ -12484,9 +12005,7 @@ def _ensure_xdg_generated_config_symlink(
     # path directly, nothing to do.
     if target_abs == xdg_path.absolute():
         out["status"] = "noop"
-        out["message"] = (
-            f"Generated config already at XDG path {xdg_path}; no symlink needed."
-        )
+        out["message"] = f"Generated config already at XDG path {xdg_path}; no symlink needed."
         return out
 
     # Ensure parent dir exists.
@@ -12505,9 +12024,7 @@ def _ensure_xdg_generated_config_symlink(
         current_abs = current if current.is_absolute() else xdg_path.parent / current
         if current_abs.resolve() == target_abs:
             out["status"] = "noop"
-            out["message"] = (
-                f"XDG symlink already points at {target_abs}; no change."
-            )
+            out["message"] = f"XDG symlink already points at {target_abs}; no change."
             return out
         # Wrong target — repair.
         try:
@@ -12518,8 +12035,7 @@ def _ensure_xdg_generated_config_symlink(
             return out
         out["status"] = "repaired"
         out["message"] = (
-            f"Repaired XDG symlink {xdg_path} → {target_abs} "
-            f"(was pointing at {current_abs})."
+            f"Repaired XDG symlink {xdg_path} → {target_abs} (was pointing at {current_abs})."
         )
         return out
 
@@ -12601,6 +12117,7 @@ def _detect_drift(
             return config
         try:
             from hermes_cli.config import load_config
+
             cfg_ = load_config()
             return cfg_ if isinstance(cfg_, dict) else None
         except Exception:
@@ -12655,9 +12172,7 @@ def _detect_drift(
     #    block survived a tenant change.
     stanza_slug = extra.get("slug")
     agent_slugs = (
-        sorted(d.name for d in agents_dir.iterdir() if d.is_dir())
-        if agents_dir.is_dir()
-        else []
+        sorted(d.name for d in agents_dir.iterdir() if d.is_dir()) if agents_dir.is_dir() else []
     )
     if stanza_slug and agent_slugs and stanza_slug not in agent_slugs:
         drift.append(
@@ -12686,10 +12201,14 @@ def _detect_drift(
         needs_reseed = True
         # Detect tenant from az for the reseed hint.
         import subprocess as _subprocess
+
         try:
             r = _subprocess.run(
                 ["az", "account", "show", "--query", "tenantId", "-o", "tsv"],
-                capture_output=True, text=True, timeout=10, check=False,
+                capture_output=True,
+                text=True,
+                timeout=10,
+                check=False,
             )
             if r.returncode == 0:
                 detected_tenant = r.stdout.strip()
@@ -12727,10 +12246,8 @@ def _detect_drift(
     #    `a365 publish` fails with "agentBlueprintId missing".
     target_path = _Path(generated_path_hint)
     xdg_path = _xdg_generated_config_path(home_dir)
-    if (
-        target_path.is_file()
-        and target_path.resolve() != xdg_path.absolute()
-    ):
+    if target_path.is_file() and target_path.resolve() != xdg_path.absolute():
+
         def _fix_xdg() -> None:
             _ensure_xdg_generated_config_symlink(target_path, home=home_dir)
 
@@ -12749,9 +12266,7 @@ def _detect_drift(
         elif xdg_path.is_symlink():
             try:
                 current = xdg_path.readlink()
-                current_abs = (
-                    current if current.is_absolute() else xdg_path.parent / current
-                )
+                current_abs = current if current.is_absolute() else xdg_path.parent / current
                 if current_abs.resolve() != target_path.resolve():
                     drift.append(
                         {
@@ -12832,8 +12347,7 @@ def _gate_env_secret_write(
         return True
     except OSError as e:
         print_warning(
-            f"Could not check permissions on {env_path} ({e}); refusing to "
-            "write the secret there."
+            f"Could not check permissions on {env_path} ({e}); refusing to write the secret there."
         )
         return False
     if not (mode & 0o077):
@@ -12959,8 +12473,7 @@ def interactive_setup() -> None:
     existing_app = get_env_value("A365_APP_ID")
     if existing_tenant and existing_app and not drift_force_reconfigure:
         print_info(
-            f"agent365: already configured (tenant={existing_tenant[:8]}…, "
-            f"app={existing_app[:8]}…)"
+            f"agent365: already configured (tenant={existing_tenant[:8]}…, app={existing_app[:8]}…)"
         )
         if not prompt_yes_no("Reconfigure agent365?", False):
             return
@@ -13065,9 +12578,7 @@ def interactive_setup() -> None:
     #      tries) to avoid silently writing an empty stanza.
     agents_dir = active_hermes_home / "agents"
     slug_options = (
-        sorted(d.name for d in agents_dir.iterdir() if d.is_dir())
-        if agents_dir.is_dir()
-        else []
+        sorted(d.name for d in agents_dir.iterdir() if d.is_dir()) if agents_dir.is_dir() else []
     )
     existing_slug = get_env_value("AGENT_IDENTITY")
     if slug_options:
@@ -13229,9 +12740,7 @@ def interactive_setup() -> None:
     # 7. Allow-all toggle.
     print()
     print_info("🔒 Access control")
-    print_info(
-        "Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user."
-    )
+    print_info("Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user.")
     print_info(
         "Production: set A365_ALLOWED_USERS to AAD object IDs, activity user IDs, "
         "or UPN/email aliases present in the signed activity."
@@ -13243,9 +12752,7 @@ def interactive_setup() -> None:
     if allow_all:
         save_env_value("A365_ALLOW_ALL_USERS", "true")
         save_env_value("A365_ALLOWED_USERS", "")
-        print_warning(
-            "⚠️  Open access — any signed-in tenant user can DM the bot."
-        )
+        print_warning("⚠️  Open access — any signed-in tenant user can DM the bot.")
     else:
         save_env_value("A365_ALLOW_ALL_USERS", "false")
         allowed = prompt(
@@ -13299,9 +12806,7 @@ def interactive_setup() -> None:
         save_config(config)
         print_success("Wrote gateway.platforms.agent365 stanza")
     else:
-        print_info(
-            "gateway.platforms.agent365 stanza unchanged — skipping config.yaml write."
-        )
+        print_info("gateway.platforms.agent365 stanza unchanged — skipping config.yaml write.")
 
     print()
     print_success("Agent 365 configuration saved.")

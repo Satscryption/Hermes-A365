@@ -445,10 +445,16 @@ class TestRegister:
 class TestDetectDrift:
     """Slice 19r-b: _detect_drift() returns operator-config issues."""
 
-    def _make_home(self, tmp_path: Path, *, env: str = "", agents: list[str] | None = None,
-                   a365_config: dict[str, Any] | None = None,
-                   generated: dict[str, Any] | None = None,
-                   generated_filename: str = "a365.generated.config.json") -> Path:
+    def _make_home(
+        self,
+        tmp_path: Path,
+        *,
+        env: str = "",
+        agents: list[str] | None = None,
+        a365_config: dict[str, Any] | None = None,
+        generated: dict[str, Any] | None = None,
+        generated_filename: str = "a365.generated.config.json",
+    ) -> Path:
         """Build a fake home dir with the bits _detect_drift reads."""
         (tmp_path / ".hermes").mkdir()
         (tmp_path / ".hermes" / ".env").write_text(env)
@@ -458,9 +464,11 @@ class TestDetectDrift:
             (agents_root / slug).mkdir()
         if a365_config is not None:
             import json as _json
+
             (tmp_path / "a365.config.json").write_text(_json.dumps(a365_config))
         if generated is not None:
             import json as _json
+
             (tmp_path / generated_filename).write_text(_json.dumps(generated))
         return tmp_path
 
@@ -493,9 +501,7 @@ class TestDetectDrift:
         # doesn't surface xdg_symlink_missing here.
         xdg_dir = home / ".config" / "a365"
         xdg_dir.mkdir(parents=True)
-        (xdg_dir / "a365.generated.config.json").symlink_to(
-            home / "a365.generated.config.json"
-        )
+        (xdg_dir / "a365.generated.config.json").symlink_to(home / "a365.generated.config.json")
         drift = adapter_mod._detect_drift(home=home, config={})
         assert [d["key"] for d in drift] == []
 
@@ -518,13 +524,7 @@ class TestDetectDrift:
 
     def test_slug_present_no_drift(self, tmp_path: Path) -> None:
         home = self._make_home(tmp_path, agents=["inbox-helper-r8", "test-agent"])
-        cfg = {
-            "gateway": {
-                "platforms": {
-                    "agent365": {"extra": {"slug": "inbox-helper-r8"}}
-                }
-            }
-        }
+        cfg = {"gateway": {"platforms": {"agent365": {"extra": {"slug": "inbox-helper-r8"}}}}}
         drift = adapter_mod._detect_drift(home=home, config=cfg)
         assert "slug_orphan" not in [d["key"] for d in drift]
 
@@ -552,9 +552,11 @@ class TestDetectDrift:
         if fixer is None:
             # az not available in test env — skip the reseed assertion.
             import pytest as _pytest
+
             _pytest.skip("az not in PATH; fixer was not constructed")
         fixer()
         import json as _json
+
         cur = _json.loads((home / "a365.config.json").read_text())
         # clientAppId always reseeds to the well-known GUID.
         assert cur["clientAppId"] == adapter_mod._AGENT365_CLI_APP_ID
@@ -574,11 +576,7 @@ class TestDetectDrift:
         home = self._make_home(tmp_path)
         bad_path = str(tmp_path / "nope.json")
         cfg = {
-            "gateway": {
-                "platforms": {
-                    "agent365": {"extra": {"generated_config_path": bad_path}}
-                }
-            }
+            "gateway": {"platforms": {"agent365": {"extra": {"generated_config_path": bad_path}}}}
         }
         drift = adapter_mod._detect_drift(home=home, config=cfg)
         keys = [d["key"] for d in drift]
@@ -588,13 +586,12 @@ class TestDetectDrift:
         # Path exists but agentBlueprintId is empty.
         gen_path = tmp_path / "stale.json"
         import json as _json
+
         gen_path.write_text(_json.dumps({"agentBlueprintId": ""}))
         home = self._make_home(tmp_path)
         cfg = {
             "gateway": {
-                "platforms": {
-                    "agent365": {"extra": {"generated_config_path": str(gen_path)}}
-                }
+                "platforms": {"agent365": {"extra": {"generated_config_path": str(gen_path)}}}
             }
         }
         drift = adapter_mod._detect_drift(home=home, config=cfg)
@@ -610,13 +607,7 @@ class TestDetectDrift:
             a365_config={"tenantId": "", "clientAppId": ""},
             generated={"agentBlueprintId": "11111111-bbbb-bbbb-bbbb-bbbbbbbbbbbb"},
         )
-        cfg = {
-            "gateway": {
-                "platforms": {
-                    "agent365": {"extra": {"slug": "orphan-slug"}}
-                }
-            }
-        }
+        cfg = {"gateway": {"platforms": {"agent365": {"extra": {"slug": "orphan-slug"}}}}}
         drift = adapter_mod._detect_drift(home=home, config=cfg)
         keys = [d["key"] for d in drift]
         assert len(set(keys)) == len(keys)
@@ -757,9 +748,7 @@ class TestDetectDriftXdgSymlink:
         (tmp_path / ".hermes" / "agents").mkdir()
         xdg_dir = tmp_path / ".config" / "a365"
         xdg_dir.mkdir(parents=True)
-        (xdg_dir / "a365.generated.config.json").write_text(
-            '{"agentBlueprintId": "x"}'
-        )
+        (xdg_dir / "a365.generated.config.json").write_text('{"agentBlueprintId": "x"}')
         drift = adapter_mod._detect_drift(home=tmp_path, config={})
         keys = [d["key"] for d in drift]
         assert "xdg_symlink_missing" not in keys
@@ -789,17 +778,13 @@ class TestIsConnected:
     Earlier 19m drafts had a 0-arg version that would have crashed
     the loader's status check at first call."""
 
-    def test_takes_config_argument(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_takes_config_argument(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_TENANT_ID", "t")
         monkeypatch.setenv("A365_APP_ID", "a")
         cfg = _StubPlatformConfig(extra={})
         assert adapter_mod.is_connected(cfg) is True
 
-    def test_returns_false_when_unconfigured(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_false_when_unconfigured(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("A365_TENANT_ID", raising=False)
         monkeypatch.delenv("A365_APP_ID", raising=False)
         cfg = _StubPlatformConfig(extra={})
@@ -807,25 +792,19 @@ class TestIsConnected:
 
 
 class TestValidateConfig:
-    def test_accepts_extra_with_tenant_and_app(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_accepts_extra_with_tenant_and_app(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("A365_TENANT_ID", raising=False)
         monkeypatch.delenv("A365_APP_ID", raising=False)
         cfg = _StubPlatformConfig(extra={"tenant_id": "t", "app_id": "a"})
         assert adapter_mod.validate_config(cfg) is True
 
-    def test_accepts_env_when_extra_empty(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_accepts_env_when_extra_empty(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_TENANT_ID", "tenant-1")
         monkeypatch.setenv("A365_APP_ID", "app-1")
         cfg = _StubPlatformConfig(extra={})
         assert adapter_mod.validate_config(cfg) is True
 
-    def test_rejects_when_neither_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_rejects_when_neither_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv("A365_TENANT_ID", raising=False)
         monkeypatch.delenv("A365_APP_ID", raising=False)
         cfg = _StubPlatformConfig(extra={})
@@ -860,9 +839,7 @@ class TestAdapterConstruction:
 
         conv_path = tmp_path / "failed-connect-owner.json"
         active = _make_adapter(monkeypatch, conversations_path=str(conv_path))
-        replacement = _make_adapter(
-            monkeypatch, conversations_path=str(conv_path)
-        )
+        replacement = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         await active._activate_persist_owner()
 
         def fail_config() -> Any:
@@ -923,9 +900,7 @@ class TestAdapterConstruction:
         monkeypatch.setitem(
             sys.modules,
             "uvicorn",
-            types.SimpleNamespace(
-                Config=lambda *_args, **_kwargs: object(), Server=FakeServer
-            ),
+            types.SimpleNamespace(Config=lambda *_args, **_kwargs: object(), Server=FakeServer),
         )
         a = _make_adapter(monkeypatch)
         monkeypatch.setattr(a, "_make_bridge_config", MagicMock(return_value=MagicMock()))
@@ -977,9 +952,7 @@ class TestAdapterConstruction:
         monkeypatch.setitem(
             sys.modules,
             "uvicorn",
-            types.SimpleNamespace(
-                Config=lambda *_args, **_kwargs: object(), Server=FakeServer
-            ),
+            types.SimpleNamespace(Config=lambda *_args, **_kwargs: object(), Server=FakeServer),
         )
         a = _make_adapter(monkeypatch)
         monkeypatch.setattr(a, "_make_bridge_config", MagicMock(return_value=MagicMock()))
@@ -1019,9 +992,7 @@ class TestAdapterConstruction:
         monkeypatch.setitem(
             sys.modules,
             "uvicorn",
-            types.SimpleNamespace(
-                Config=lambda *_args, **_kwargs: object(), Server=DeadServer
-            ),
+            types.SimpleNamespace(Config=lambda *_args, **_kwargs: object(), Server=DeadServer),
         )
         a = _make_adapter(monkeypatch)
         monkeypatch.setattr(a, "_make_bridge_config", MagicMock(return_value=MagicMock()))
@@ -1035,9 +1006,7 @@ class TestAdapterConstruction:
         assert a._http_client is None
         client.aclose.assert_awaited_once()
 
-    def test_init_pulls_slug_and_port_from_extra(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_init_pulls_slug_and_port_from_extra(self, monkeypatch: pytest.MonkeyPatch) -> None:
         for k in (
             "AGENT_IDENTITY",
             "HERMES_BRIDGE_PORT",
@@ -1092,9 +1061,7 @@ class TestAdapterConstruction:
         monkeypatch.setenv("A365_TENANT_ID", "t")
         monkeypatch.setenv("A365_APP_ID", "a")
         monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
-        cfg = _StubPlatformConfig(
-            extra={"generated_config_path": str(cfg_path)}
-        )
+        cfg = _StubPlatformConfig(extra={"generated_config_path": str(cfg_path)})
         a = adapter_mod.Agent365Adapter(cfg)
         # Lazy-loaded only when the bridge config is built.
         assert a.blueprint_client_secret == ""
@@ -1111,18 +1078,14 @@ class TestAdapterConstruction:
         hermes_constants.get_hermes_home = lambda: tmp_path
         monkeypatch.setitem(sys.modules, "hermes_constants", hermes_constants)
 
-        with pytest.raises(
-            RuntimeError, match=r"profile \.env is group/world-readable"
-        ):
+        with pytest.raises(RuntimeError, match=r"profile \.env is group/world-readable"):
             adapter_mod.Agent365Adapter(_StubPlatformConfig())
 
     def test_preflight_rejects_loose_profile_env_before_scoped_reads(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         env_path = tmp_path / ".env"
-        env_path.write_text(
-            "A365_TENANT_ID=exposed-tenant\nA365_APP_ID=exposed-app\n"
-        )
+        env_path.write_text("A365_TENANT_ID=exposed-tenant\nA365_APP_ID=exposed-app\n")
         env_path.chmod(0o644)
         hermes_constants = types.ModuleType("hermes_constants")
         hermes_constants.get_hermes_home = lambda: tmp_path
@@ -1249,9 +1212,7 @@ class TestAdapterConstruction:
         assert adapter.blueprint_client_secret == "scoped-secret"
         assert adapter._generated_config_path == tmp_path / "a365.generated.config.json"
 
-    def test_unscoped_secret_api_skew_fails_closed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_unscoped_secret_api_skew_fails_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         class UnscopedSecretError(RuntimeError):
             pass
 
@@ -1274,18 +1235,14 @@ class TestAdapterConstruction:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         cfg_path = tmp_path / "a365.generated.config.json"
-        cfg_path.write_text(
-            '{"agentBlueprintClientSecret": "stale-exposed-secret"}'
-        )
+        cfg_path.write_text('{"agentBlueprintClientSecret": "stale-exposed-secret"}')
         cfg_path.chmod(0o644)
         monkeypatch.setenv("A365_TENANT_ID", "tenant")
         monkeypatch.setenv("A365_APP_ID", "app")
         monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "environment-secret")
 
         adapter = adapter_mod.Agent365Adapter(
-            _StubPlatformConfig(
-                extra={"generated_config_path": str(cfg_path)}
-            )
+            _StubPlatformConfig(extra={"generated_config_path": str(cfg_path)})
         )
 
         with pytest.raises(RuntimeError, match="group/world-readable"):
@@ -1301,9 +1258,7 @@ class TestAdapterConstruction:
         cfg_path = tmp_path / "a365.generated.config.json"
         cfg_path.write_text("{}")
         cfg_path.chmod(0o600)
-        cfg = _StubPlatformConfig(
-            extra={"generated_config_path": str(cfg_path)}
-        )
+        cfg = _StubPlatformConfig(extra={"generated_config_path": str(cfg_path)})
         a = adapter_mod.Agent365Adapter(cfg)
         with pytest.raises(RuntimeError, match="missing"):
             a._make_bridge_config()
@@ -1331,9 +1286,7 @@ class TestAdapterConstruction:
         monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "secret")
         monkeypatch.delenv("A365_AGENT_IDENTITY_IDS", raising=False)
         adapter = adapter_mod.Agent365Adapter(
-            _StubPlatformConfig(
-                extra={"agent_identity_ids": ["From-Extra", "second"]}
-            )
+            _StubPlatformConfig(extra={"agent_identity_ids": ["From-Extra", "second"]})
         )
         assert adapter._make_bridge_config().agent_identity_ids == (
             "from-extra",
@@ -1347,9 +1300,7 @@ class TestAdapterConstruction:
 
 
 class TestMessagesRoute:
-    def test_untrusted_service_url_returns_403(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_untrusted_service_url_returns_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -1364,9 +1315,7 @@ class TestMessagesRoute:
         assert "untrusted serviceUrl" in r.json()["detail"]
         assert a._handled_events == []
 
-    def test_missing_authorization_returns_401(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_missing_authorization_returns_401(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -1374,9 +1323,7 @@ class TestMessagesRoute:
         r = client.post("/api/messages", json=_make_inbound())
         assert r.status_code == 401
 
-    def test_valid_jwt_dispatches_message_event(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_valid_jwt_dispatches_message_event(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Patch the bridge's validator + http client so we can drive
         the route end-to-end without a real Microsoft JWKS / token."""
         from fastapi.testclient import TestClient
@@ -1601,9 +1548,7 @@ class TestMessagesRoute:
         assert a._conversations.get("conv-unroutable-repeat") is None
         extract_media.assert_not_awaited()
 
-    def test_duplicate_delivery_short_circuits(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_duplicate_delivery_short_circuits(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -1624,9 +1569,7 @@ class TestMessagesRoute:
         # Only one dispatch despite two POSTs.
         assert len(a._handled_events) == 1
 
-    def test_conversation_update_acked_no_dispatch(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_conversation_update_acked_no_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -1666,19 +1609,25 @@ class TestMessagesRoutePathBDispatch:
         import base64
         import json
 
-        header = base64.urlsafe_b64encode(
-            json.dumps({"alg": "RS256", "typ": "JWT", "kid": "fake"}).encode()
-        ).rstrip(b"=").decode()
-        payload = base64.urlsafe_b64encode(
-            json.dumps({"iss": iss, "aud": "bot-app-id", "exp": 9999999999}).encode()
-        ).rstrip(b"=").decode()
+        header = (
+            base64.urlsafe_b64encode(
+                json.dumps({"alg": "RS256", "typ": "JWT", "kid": "fake"}).encode()
+            )
+            .rstrip(b"=")
+            .decode()
+        )
+        payload = (
+            base64.urlsafe_b64encode(
+                json.dumps({"iss": iss, "aud": "bot-app-id", "exp": 9999999999}).encode()
+            )
+            .rstrip(b"=")
+            .decode()
+        )
         # Padded fake signature — adapter doesn't decode it; only
         # validator branches care, and those are monkeypatched.
         return f"{header}.{payload}.AAAA"
 
-    def test_bf_iss_dispatches_to_bf_validator(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_bf_iss_dispatches_to_bf_validator(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """BF-issued token → adapter calls ``validate_inbound_jwt_bf``
         with the activity's serviceUrl + bot app id, NOT the A365
         validator. With ``bf_app_id`` unset (default), the expected
@@ -1720,9 +1669,7 @@ class TestMessagesRoutePathBDispatch:
         assert len(a._handled_events) == 1
         assert a._handled_events[0].text == "hello path B"
 
-    def test_bf_iss_uses_bf_app_id_when_set(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_bf_iss_uses_bf_app_id_when_set(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """#36: when the adapter is configured with a separate Path B
         identity (``bf_app_id``), inbound BF JWTs are validated
         against THAT app id rather than the blueprint. Mirrors the
@@ -1754,9 +1701,7 @@ class TestMessagesRoutePathBDispatch:
         assert a.bf_app_id == "path-b-app-id"
         assert a.bf_client_secret == "path-b-secret"
 
-    def test_aad_iss_dispatches_to_a365_validator(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_aad_iss_dispatches_to_a365_validator(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Path A token (AAD-v2 issuer) → adapter calls ``validate_inbound_jwt``,
         NOT the BF validator."""
         from fastapi.testclient import TestClient
@@ -1808,9 +1753,7 @@ class TestMessagesRoutePathBDispatch:
         a365_validator.assert_not_awaited()
         bf_validator.assert_not_awaited()
 
-    def test_bf_validator_failure_returns_403(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_bf_validator_failure_returns_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """BF validator diagnostics stay server-side on a fixed public 403."""
         from fastapi.testclient import TestClient
 
@@ -1956,9 +1899,7 @@ class TestLifecycleRegistryAction:
 
     def test_installation_default_action_upserts(self) -> None:
         # Missing/empty action is treated as add (capture, don't evict).
-        assert adapter_mod._lifecycle_registry_action(
-            {"type": "installationUpdate"}
-        ) == "upsert"
+        assert adapter_mod._lifecycle_registry_action({"type": "installationUpdate"}) == "upsert"
 
     def test_installation_remove_evicts(self) -> None:
         body = {"type": "installationUpdate", "action": "remove"}
@@ -1993,9 +1934,12 @@ class TestLifecycleRegistryAction:
     def test_conversation_update_without_members_is_none(self) -> None:
         # Plain conversationUpdate (topic rename etc.) — leave to
         # _should_dispatch's existing ack-and-bail.
-        assert adapter_mod._lifecycle_registry_action(
-            {"type": "conversationUpdate", "recipient": {"id": "bot-1"}}
-        ) is None
+        assert (
+            adapter_mod._lifecycle_registry_action(
+                {"type": "conversationUpdate", "recipient": {"id": "bot-1"}}
+            )
+            is None
+        )
 
     def test_conversation_update_bot_removed_evicts(self) -> None:
         # The bot being kicked from a group is a real uninstall signal on
@@ -2140,9 +2084,7 @@ class TestLifecycleCapture:
         monkeypatch.setattr(bridge, "validate_inbound_jwt", blocked_jwt)
         a._http_client = MagicMock()
         transport = httpx.ASGITransport(app=a.build_app())
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             admitted = asyncio.create_task(
                 client.post(
                     "/api/messages",
@@ -2169,9 +2111,7 @@ class TestLifecycleCapture:
     ) -> None:
         import httpx
 
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         bridge = adapter_mod._import_bridge()
         jwt_started = asyncio.Event()
@@ -2189,9 +2129,7 @@ class TestLifecycleCapture:
         monkeypatch.setattr(bridge, "validate_inbound_jwt", resistant_jwt)
         a._http_client = MagicMock()
         transport = httpx.ASGITransport(app=a.build_app())
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             request = asyncio.create_task(
                 client.post(
                     "/api/messages",
@@ -2232,9 +2170,7 @@ class TestLifecycleCapture:
         a._connect_ready.clear()
         transport = httpx.ASGITransport(app=a.build_app())
 
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             request = asyncio.create_task(
                 client.post(
                     "/api/messages",
@@ -2774,9 +2710,7 @@ class TestLifecycleCapture:
             "recipient": {"id": "28:channel-acct", "applicationId": "copilot"},
             "conversation": {"id": "a:personal"},
         }
-        assert weak._uninstall_conversation_ids(
-            weak_activity, jwt_app_id=app_id
-        ) == ["a:personal"]
+        assert weak._uninstall_conversation_ids(weak_activity, jwt_app_id=app_id) == ["a:personal"]
 
     def test_bot_removed_from_one_chat_does_not_retire_sibling(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2786,9 +2720,7 @@ class TestLifecycleCapture:
         # stays cached.
         a = _make_adapter(monkeypatch)
         personal = _make_inbound(path="B", conv_id="a:personal", activity_id="p")
-        group = _make_inbound(
-            path="B", conv_id="19:copilot@thread.v2", activity_id="g"
-        )
+        group = _make_inbound(path="B", conv_id="19:copilot@thread.v2", activity_id="g")
         group["conversation"]["conversationType"] = "groupChat"
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(personal))
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(group))
@@ -2878,12 +2810,8 @@ class TestLifecycleCapture:
 
         monkeypatch.setattr(a, "handle_message", spawn_turn)
 
-        def message(
-            conv_id: str, from_id: str, aad: str, recipient_id: str
-        ) -> dict[str, Any]:
-            body = _make_inbound(
-                path="B", conv_id=conv_id, activity_id=f"act-{conv_id}"
-            )
+        def message(conv_id: str, from_id: str, aad: str, recipient_id: str) -> dict[str, Any]:
+            body = _make_inbound(path="B", conv_id=conv_id, activity_id=f"act-{conv_id}")
             body["conversation"]["conversationType"] = "groupChat"
             body["from"] = {"id": from_id, "aadObjectId": aad, "name": "User"}
             body["recipient"] = {"id": recipient_id, "name": "Bot"}
@@ -3126,6 +3054,7 @@ class TestLifecycleCapture:
         _done, pending = await asyncio.wait({turn_task}, timeout=1)
         assert not pending
         import contextlib
+
         with contextlib.suppress(asyncio.CancelledError):
             turn_task.result()
         frozen = ticks["n"]
@@ -3313,9 +3242,7 @@ class TestLifecycleCapture:
             if isinstance(retry_task, asyncio.Task) and not retry_task.done():
                 retry_task.cancel()
             await asyncio.wait_for(
-                asyncio.gather(
-                    outbound_task, turn_task, retry_task, return_exceptions=True
-                ),
+                asyncio.gather(outbound_task, turn_task, retry_task, return_exceptions=True),
                 timeout=1,
             )
 
@@ -3597,9 +3524,7 @@ class TestLifecycleCapture:
             return await original_recovery(*args, **kwargs)
 
         monkeypatch.setattr(a, "_evict_armed_after_cancel", watch_recovery)
-        eviction = asyncio.create_task(
-            a._evict_conversations([personal, chat_a, chat_b])
-        )
+        eviction = asyncio.create_task(a._evict_conversations([personal, chat_a, chat_b]))
         try:
             assert await asyncio.to_thread(entered[key_a].wait, 2)
             assert await asyncio.to_thread(entered[key_b].wait, 2)
@@ -3977,9 +3902,7 @@ class TestLifecycleCapture:
         release = asyncio.Event()
         original = a._evict_conversation_impl
 
-        async def blocked(
-            chat_id: str, reservation: tuple[dict[str, Any], int, int]
-        ) -> bool:
+        async def blocked(chat_id: str, reservation: tuple[dict[str, Any], int, int]) -> bool:
             if chat_id == personal:
                 entered.set()
                 await release.wait()
@@ -4051,9 +3974,7 @@ class TestLifecycleCapture:
         await asyncio.sleep(0)
         original = a._evict_conversation_impl
 
-        async def mark_personal(
-            chat_id: str, reservation: tuple[dict[str, Any], int, int]
-        ) -> bool:
+        async def mark_personal(chat_id: str, reservation: tuple[dict[str, Any], int, int]) -> bool:
             if chat_id == personal:
                 personal_started.set()
             return await original(chat_id, reservation)
@@ -4084,9 +4005,7 @@ class TestLifecycleCapture:
         import httpx
 
         monkeypatch.setattr(adapter_mod, "_MAX_CHAT_LIFECYCLE_GENERATIONS", 1)
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         bridge = adapter_mod._import_bridge()
         jwt_started = asyncio.Event()
@@ -4156,9 +4075,7 @@ class TestLifecycleCapture:
         release_reply_survivor = asyncio.Event()
 
         reply_survivor = asyncio.create_task(release_reply_survivor.wait())
-        a._track_coalesced_reply_survivor(
-            reply_survivor, "conv-existing-survivor"
-        )
+        a._track_coalesced_reply_survivor(reply_survivor, "conv-existing-survivor")
 
         async def stalled_persist(_reservation: Any = None) -> None:
             persist_started.set()
@@ -4190,9 +4107,7 @@ class TestLifecycleCapture:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_INBOUND_TASKS", 1)
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         release_teardown = asyncio.Event()
         persistence_started = asyncio.Event()
@@ -4213,9 +4128,7 @@ class TestLifecycleCapture:
         a._registry_eviction_tasks["conv-nested-owner"] = owner
 
         await asyncio.wait_for(a.disconnect(), timeout=0.5)
-        assert a._lifecycle_owner_survivors == {
-            owner: "conv-nested-owner"
-        }
+        assert a._lifecycle_owner_survivors == {owner: "conv-nested-owner"}
 
         release_teardown.set()
         await persistence_started.wait()
@@ -4276,9 +4189,7 @@ class TestLifecycleCapture:
             assert chat_id == "conv-eviction-one"
             first_started.set()
             await release_first.wait()
-            adapter_mod._complete_persist_mutation(
-                reservation[0], reservation[1]
-            )
+            adapter_mod._complete_persist_mutation(reservation[0], reservation[1])
             return True
 
         monkeypatch.setattr(a, "_evict_conversation_impl", blocked_eviction)
@@ -4299,9 +4210,7 @@ class TestLifecycleCapture:
         client = self._client(a, monkeypatch)
         caplog.set_level("INFO")
         body = self._lifecycle_body(type="installationUpdate", action="add")
-        client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert "inbound activity type=installationUpdate action=add" in caplog.text
         assert "channelId=msteams" in caplog.text
 
@@ -4311,9 +4220,7 @@ class TestLifecycleCapture:
         a = _make_adapter(monkeypatch)
         client = self._client(a, monkeypatch)
         body = self._lifecycle_body(type="installationUpdate", action="add")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert r.json() == {"status": "acked", "lifecycle": "upsert"}
         # Never reached the agent loop (fixes the wasted-turn mishandling).
@@ -4328,9 +4235,7 @@ class TestLifecycleCapture:
         assert spec["path"] == "B"
         assert spec["conversation_id"] == "conv-install"
 
-    def test_lifecycle_capture_stamps_validated_path(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_lifecycle_capture_stamps_validated_path(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # #106 review follow-up (L4): a lifecycle-captured ref must stamp the
         # JWT-validated path so a later proactive mint off it binds to the
         # validated path, not the untrusted activity body. Before the fix the
@@ -4339,12 +4244,8 @@ class TestLifecycleCapture:
         # validator dispatch defaults to the Path A branch → validated_path "A".)
         a = _make_adapter(monkeypatch)
         client = self._client(a, monkeypatch)
-        body = self._lifecycle_body(
-            conv_id="conv-vp", type="installationUpdate", action="add"
-        )
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        body = self._lifecycle_body(conv_id="conv-vp", type="installationUpdate", action="add")
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.json() == {"status": "acked", "lifecycle": "upsert"}
         ref = a._conversations.get("conv-vp")
         assert ref is not None
@@ -4365,16 +4266,12 @@ class TestLifecycleCapture:
             type="conversationUpdate",
             membersAdded=[{"id": "user-x"}, {"id": "agent-1"}],
         )
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.json() == {"status": "acked", "lifecycle": "upsert"}
         assert a._handled_events == []
         assert "conv-add" in a._conversations
 
-    def test_lifecycle_does_not_clobber_active_chat(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_lifecycle_does_not_clobber_active_chat(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Clobber regression: a real user message captured this lifetime,
         # then a bot-add conversationUpdate for the SAME conv must NOT
         # overwrite the cached user-message raw / last_inbound id (which
@@ -4382,12 +4279,8 @@ class TestLifecycleCapture:
         # seen-this-lifetime (keep its reply path, not flip to proactive).
         a = _make_adapter(monkeypatch)
         client = self._client(a, monkeypatch)
-        msg = _make_inbound(
-            path="B", conv_id="conv-live", activity_id="user-act-1", text="hi"
-        )
-        r1 = client.post(
-            "/api/messages", json=msg, headers={"Authorization": "Bearer a.b.c"}
-        )
+        msg = _make_inbound(path="B", conv_id="conv-live", activity_id="user-act-1", text="hi")
+        r1 = client.post("/api/messages", json=msg, headers={"Authorization": "Bearer a.b.c"})
         assert r1.json()["status"] == "dispatched"
         assert "conv-live" in a._seen_inbounds_this_lifetime
         assert a._conversations.get("conv-live").last_inbound_activity_id == "user-act-1"
@@ -4398,30 +4291,22 @@ class TestLifecycleCapture:
             type="conversationUpdate",
             membersAdded=[{"id": "agent-1"}],
         )
-        r2 = client.post(
-            "/api/messages", json=lc, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r2 = client.post("/api/messages", json=lc, headers={"Authorization": "Bearer a.b.c"})
         assert r2.json() == {"status": "acked", "lifecycle": "upsert"}
         ref = a._conversations.get("conv-live")
         assert ref.last_inbound_activity_id == "user-act-1"  # not clobbered
         assert ref.raw.get("id") == "user-act-1"
         assert "conv-live" in a._seen_inbounds_this_lifetime
 
-    def test_installation_remove_evicts_ref(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_installation_remove_evicts_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         # Pre-seed as if the chat was captured earlier this lifetime.
         seed = _make_inbound(path="B", conv_id="conv-rm")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
         a._seen_inbounds_this_lifetime.add("conv-rm")
         client = self._client(a, monkeypatch)
-        body = self._lifecycle_body(
-            conv_id="conv-rm", type="installationUpdate", action="remove"
-        )
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        body = self._lifecycle_body(conv_id="conv-rm", type="installationUpdate", action="remove")
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.json() == {"status": "acked", "lifecycle": "evict"}
         assert a._handled_events == []
         assert "conv-rm" not in a._conversations
@@ -4444,9 +4329,7 @@ class TestLifecycleCapture:
             action="remove",
         )
 
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
 
         assert r.json() == {"status": "acked", "lifecycle": "evict"}
         assert a._handled_events == []
@@ -4517,12 +4400,8 @@ class TestLifecycleCapture:
         a._coalesced_reply_tasks["mid-other"] = other_task
 
         client = self._client(a, monkeypatch)
-        body = self._lifecycle_body(
-            conv_id="conv-rm", type="installationUpdate", action="remove"
-        )
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        body = self._lifecycle_body(conv_id="conv-rm", type="installationUpdate", action="remove")
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.json() == {"status": "acked", "lifecycle": "evict"}
 
         assert "conv-rm" not in a._active_stream_by_chat
@@ -4540,9 +4419,7 @@ class TestLifecycleCapture:
         assert "conv-other" in a._active_coalesced_reply_by_chat
         other_task.cancel.assert_not_called()
 
-    def test_seen_inbounds_set_stays_bounded(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_seen_inbounds_set_stays_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # L2 (#105): the per-lifetime seen-set can't grow without limit on a
         # long-running gateway. With a low cap, posting more distinct chats
         # than the cap keeps the set bounded.
@@ -4550,9 +4427,7 @@ class TestLifecycleCapture:
         a = _make_adapter(monkeypatch)
         client = self._client(a, monkeypatch)
         for i in range(8):
-            body = _make_inbound(
-                path="B", conv_id=f"conv-{i}", activity_id=f"act-{i}"
-            )
+            body = _make_inbound(path="B", conv_id=f"conv-{i}", activity_id=f"act-{i}")
             r = client.post(
                 "/api/messages",
                 json=body,
@@ -4575,21 +4450,15 @@ class TestLifecycleCapture:
             a._seen_inbounds_this_lifetime.add(f"other-{i}")
         assert len(a._seen_inbounds_this_lifetime) == 4
         client = self._client(a, monkeypatch)
-        body = _make_inbound(
-            path="B", conv_id="fresh-chat", activity_id="act-fresh"
-        )
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        body = _make_inbound(path="B", conv_id="fresh-chat", activity_id="act-fresh")
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         # The just-received chat is retained (so send() takes the reply path,
         # not proactive) and the cap still holds.
         assert "fresh-chat" in a._seen_inbounds_this_lifetime
         assert len(a._seen_inbounds_this_lifetime) <= 4
 
-    def test_registry_cap_enforced_on_dispatch(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_registry_cap_enforced_on_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # M11 (#105): the durable registry is bounded on the dispatch hot
         # path. With a low cap, posting more distinct chats than the cap keeps
         # the registry bounded (enforce_cap is wired in after upsert).
@@ -4597,9 +4466,7 @@ class TestLifecycleCapture:
         a = _make_adapter(monkeypatch)
         client = self._client(a, monkeypatch)
         for i in range(8):
-            body = _make_inbound(
-                path="B", conv_id=f"reg-{i}", activity_id=f"act-{i}"
-            )
+            body = _make_inbound(path="B", conv_id=f"reg-{i}", activity_id=f"act-{i}")
             r = client.post(
                 "/api/messages",
                 json=body,
@@ -4626,9 +4493,7 @@ class TestLifecycleCapture:
         a = _make_adapter(monkeypatch)
         for cid in ("stale-inflight", "stale-idle"):
             a._conversations.upsert(
-                adapter_mod.ConversationRef(
-                    conversation_id=cid, service_url="https://x/"
-                ),
+                adapter_mod.ConversationRef(conversation_id=cid, service_url="https://x/"),
                 now=1000.0,  # both ancient / LRU
             )
         # A turn is in flight for "stale-inflight": the base holds its session
@@ -4639,9 +4504,7 @@ class TestLifecycleCapture:
         client = self._client(a, monkeypatch)
         # A fresh inbound pushes the registry over cap (2) → enforce_cap runs.
         body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         # The in-flight stale entry survived; the idle stale one was evicted.
         assert "stale-inflight" in a._conversations
@@ -4657,9 +4520,7 @@ class TestLifecycleCapture:
         a = _make_adapter(monkeypatch)
         for cid in ("awaiting-approval", "idle"):
             a._conversations.upsert(
-                adapter_mod.ConversationRef(
-                    conversation_id=cid, service_url="https://x/"
-                ),
+                adapter_mod.ConversationRef(conversation_id=cid, service_url="https://x/"),
                 now=1000.0,
             )
         a._card_capabilities["nonce"] = {
@@ -4671,9 +4532,7 @@ class TestLifecycleCapture:
 
         client = self._client(a, monkeypatch)
         body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert "awaiting-approval" in a._conversations
         assert "idle" not in a._conversations
@@ -4686,9 +4545,7 @@ class TestLifecycleCapture:
         a = _make_adapter(monkeypatch)
         for cid in ("expired-card", "idle"):
             a._conversations.upsert(
-                adapter_mod.ConversationRef(
-                    conversation_id=cid, service_url="https://x/"
-                ),
+                adapter_mod.ConversationRef(conversation_id=cid, service_url="https://x/"),
                 now=1000.0,
             )
         a._card_capabilities["nonce"] = {
@@ -4699,32 +4556,24 @@ class TestLifecycleCapture:
 
         client = self._client(a, monkeypatch)
         body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert "expired-card" not in a._conversations
         assert "fresh" in a._conversations
 
-    def test_registry_cap_keeps_open_ended_clarify(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_registry_cap_keeps_open_ended_clarify(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
         a = _make_adapter(monkeypatch)
         for cid in ("awaiting-text", "idle"):
             a._conversations.upsert(
-                adapter_mod.ConversationRef(
-                    conversation_id=cid, service_url="https://x/"
-                ),
+                adapter_mod.ConversationRef(conversation_id=cid, service_url="https://x/"),
                 now=1000.0,
             )
         a._awaiting_text_chats["awaiting-text"] = time.monotonic()
 
         client = self._client(a, monkeypatch)
         body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert "awaiting-text" in a._conversations
         assert "idle" not in a._conversations
@@ -4737,16 +4586,12 @@ class TestLifecycleCapture:
         # resolve, and send() must still post the resume.
         monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
         a = _make_adapter(monkeypatch)
-        awaiting = _make_inbound(
-            conv_id="awaiting-approval", activity_id="act-wait"
-        )
+        awaiting = _make_inbound(conv_id="awaiting-approval", activity_id="act-wait")
         ref = adapter_mod.ConversationRef.from_activity(awaiting)
         assert ref is not None
         a._conversations.upsert(ref, now=1000.0)
         a._conversations.upsert(
-            adapter_mod.ConversationRef(
-                conversation_id="idle", service_url="https://x/"
-            ),
+            adapter_mod.ConversationRef(conversation_id="idle", service_url="https://x/"),
             now=1000.0,
         )
         a._card_capabilities["nonce"] = {
@@ -4757,15 +4602,11 @@ class TestLifecycleCapture:
 
         client = self._client(a, monkeypatch)
         body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert "awaiting-approval" in a._conversations
         assert "idle" not in a._conversations
-        await _assert_cached_send_resolves(
-            a, monkeypatch, "awaiting-approval", "act-wait"
-        )
+        await _assert_cached_send_resolves(a, monkeypatch, "awaiting-approval", "act-wait")
 
     @pytest.mark.asyncio
     async def test_something_else_stays_protected_and_send_resolves_after_cap(
@@ -4780,9 +4621,7 @@ class TestLifecycleCapture:
         assert ref is not None
         a._conversations.upsert(ref, now=1000.0)
         a._conversations.upsert(
-            adapter_mod.ConversationRef(
-                conversation_id="idle", service_url="https://x/"
-            ),
+            adapter_mod.ConversationRef(conversation_id="idle", service_url="https://x/"),
             now=1000.0,
         )
         mark = MagicMock()
@@ -4804,15 +4643,11 @@ class TestLifecycleCapture:
 
         client = self._client(a, monkeypatch)
         body = _make_inbound(path="B", conv_id="fresh", activity_id="act-f")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert "awaiting-other" in a._conversations
         assert "idle" not in a._conversations
-        await _assert_cached_send_resolves(
-            a, monkeypatch, "awaiting-other", "act-other"
-        )
+        await _assert_cached_send_resolves(a, monkeypatch, "awaiting-other", "act-other")
 
     def test_registry_cap_never_evicts_current_turn_when_saturated(
         self, monkeypatch: pytest.MonkeyPatch
@@ -4826,18 +4661,14 @@ class TestLifecycleCapture:
         a = _make_adapter(monkeypatch)
         for cid in ("pin-0", "pin-1"):
             a._conversations.upsert(
-                adapter_mod.ConversationRef(
-                    conversation_id=cid, service_url="https://x/"
-                ),
+                adapter_mod.ConversationRef(conversation_id=cid, service_url="https://x/"),
                 now=1000.0,
             )
             a._conversations.pin(cid)
 
         client = self._client(a, monkeypatch)
         body = _make_inbound(path="B", conv_id="current-turn", activity_id="act-c")
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         # Current-turn entry survives (its reply target); pinned entries too.
         assert "current-turn" in a._conversations
@@ -4992,15 +4823,11 @@ class TestBuildProactiveTargetSpec:
             "text": "hello",
         }
 
-    def test_returns_none_when_chat_not_in_registry(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_when_chat_not_in_registry(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         assert a._build_proactive_target_spec("never-seen") is None
 
-    def test_returns_none_when_ref_has_no_raw(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_returns_none_when_ref_has_no_raw(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Registry entries can carry just metadata when persisted with
         # raw stripped — that's still un-routable for proactive.
         from hermes_a365.plugin.conversations import ConversationRef
@@ -5016,9 +4843,7 @@ class TestBuildProactiveTargetSpec:
         )
         assert a._build_proactive_target_spec("raw-stripped") is None
 
-    def test_path_a_inbound_produces_complete_spec(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_path_a_inbound_produces_complete_spec(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from hermes_a365.plugin.conversations import ConversationRef
 
         a = _make_adapter(monkeypatch)
@@ -5121,9 +4946,7 @@ class TestBuildProactiveTargetSpec:
         assert spec is not None
         assert spec["tenant_id"] == "11111111-2222-3333-4444-555555555555"
 
-    def test_channel_id_default_when_missing(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_channel_id_default_when_missing(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from hermes_a365.plugin.conversations import ConversationRef
 
         a = _make_adapter(monkeypatch)
@@ -5134,9 +4957,7 @@ class TestBuildProactiveTargetSpec:
         assert spec is not None
         assert spec["channel_id"] == "msteams"
 
-    def test_chat_type_propagated_from_ref(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_chat_type_propagated_from_ref(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from hermes_a365.plugin.conversations import ConversationRef
 
         a = _make_adapter(monkeypatch)
@@ -5173,9 +4994,7 @@ class TestBuildProactiveTargetSpec:
         assert spec["recipient"] == {}
         assert spec["path"] == "unknown"
 
-    def test_does_not_mutate_registry_or_raw(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_does_not_mutate_registry_or_raw(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Pure function — caller can't observe state changes.
         import copy as _copy
 
@@ -5213,9 +5032,7 @@ class TestSend:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         # Slice 19x-e (#27): production fills this set on inbound capture.
         a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
@@ -5270,9 +5087,7 @@ class TestSend:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -5292,9 +5107,7 @@ class TestSend:
         self, monkeypatch: pytest.MonkeyPatch, status_code: int
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -5369,9 +5182,7 @@ class TestSendGate:
         a._http_client.post = AsyncMock(return_value=mock_resp)
 
         bridge = adapter_mod._import_bridge()
-        monkeypatch.setattr(
-            bridge, "acquire_outbound_token", AsyncMock(return_value="tok")
-        )
+        monkeypatch.setattr(bridge, "acquire_outbound_token", AsyncMock(return_value="tok"))
         # send_reply must NOT fire — gate routes us through proactive.
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -5388,9 +5199,7 @@ class TestSendGate:
         assert send_reply_mock.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_proactive_send_carries_ai_label(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_proactive_send_carries_ai_label(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # #73(a): proactive (sendToConversation) messages are AI-generated
         # content too.
         a = _make_adapter(monkeypatch)
@@ -5420,9 +5229,7 @@ class TestSendGate:
         a._http_client = MagicMock()
         a._http_client.post = AsyncMock(return_value=mock_resp)
         bridge = adapter_mod._import_bridge()
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "A"))
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "A")))
 
         result = await a.send(chat_id="c1", content="proactive ping")
         assert result.success is True
@@ -5493,9 +5300,7 @@ class TestSendGate:
         # acquire_outbound_token would be called by the proactive path;
         # if the gate is wrong and we go proactive, this mock catches it.
         proactive_token_mock = AsyncMock(return_value="should-not-fire")
-        monkeypatch.setattr(
-            bridge, "acquire_outbound_token", proactive_token_mock
-        )
+        monkeypatch.setattr(bridge, "acquire_outbound_token", proactive_token_mock)
 
         result = await a.send(chat_id="conv-Y", content="reply")
         assert result.success is True
@@ -5518,9 +5323,7 @@ class TestSendGate:
 
         conv_path = tmp_path / "convs.json"
         seed = ConversationRegistry()
-        seed.upsert(
-            ConversationRef.from_activity(_make_inbound(conv_id="conv-survive"))
-        )
+        seed.upsert(ConversationRef.from_activity(_make_inbound(conv_id="conv-survive")))
         seed.save(conv_path)
 
         # First adapter — pretend the inbound was processed in a
@@ -5543,9 +5346,7 @@ class TestSendGate:
 class TestSendProactive:
     """send() falls through to _send_proactive when no cached inbound."""
 
-    def _seed_registry_path_a(
-        self, adapter, *, conv_id: str = "conv-proactive"
-    ) -> None:
+    def _seed_registry_path_a(self, adapter, *, conv_id: str = "conv-proactive") -> None:
         from hermes_a365.plugin.conversations import ConversationRef
 
         adapter._conversations.upsert(
@@ -5665,9 +5466,7 @@ class TestSendProactive:
             "unknown" in (result.error or "").lower()
         )
 
-    def _seed_registry_path_b(
-        self, adapter, *, conv_id: str = "conv-proactive-b"
-    ) -> None:
+    def _seed_registry_path_b(self, adapter, *, conv_id: str = "conv-proactive-b") -> None:
         """#33: a classic Bot Framework inbound shape — no agentic
         identifiers, serviceUrl on the BF host-suffix allowlist."""
         from hermes_a365.plugin.conversations import ConversationRef
@@ -5746,8 +5545,7 @@ class TestSendProactive:
         # so it could classify Path B.
         dispatcher_call = bridge.acquire_reply_token.await_args.kwargs
         assert (
-            dispatcher_call["activity"]["serviceUrl"]
-            == "https://smba.trafficmanager.net/emea/x/"
+            dispatcher_call["activity"]["serviceUrl"] == "https://smba.trafficmanager.net/emea/x/"
         )
         assert dispatcher_call["bf_cache"] is a._bf_token_cache
 
@@ -5887,9 +5685,7 @@ class TestGetChatInfo:
         assert info == {"name": "unknown", "type": "personal", "chat_id": "unknown"}
 
     @pytest.mark.asyncio
-    async def test_resolves_name_and_type_from_cache(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_resolves_name_and_type_from_cache(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         cached = _make_inbound(conv_id="conv-G")
         cached["conversation"]["conversationType"] = "groupChat"
@@ -5931,9 +5727,7 @@ class TestConversationRef:
     def test_from_dict_tolerates_extra_keys(self) -> None:
         # Future-schema fields shouldn't break round-trip; they land in
         # `raw` so we don't lose them.
-        payload = adapter_mod.ConversationRef.from_activity(
-            _make_inbound()
-        ).to_dict()
+        payload = adapter_mod.ConversationRef.from_activity(_make_inbound()).to_dict()
         payload["future_field_we_dont_know_about"] = "ok"
         ref = adapter_mod.ConversationRef.from_dict(payload)
         assert ref.conversation_id == "conv-1"
@@ -5978,9 +5772,7 @@ class TestConversationRef:
         assert ref.raw == {}
         assert ref.raw.get("conversation") is None  # the call that used to crash
 
-    def test_from_dict_reprojects_deep_raw_preserving_routing(
-        self, tmp_path: Path
-    ) -> None:
+    def test_from_dict_reprojects_deep_raw_preserving_routing(self, tmp_path: Path) -> None:
         # M11 (#105) review: M10 guards a NON-dict raw, but a PRE-M11 / corrupted
         # file can carry a *dict* raw nested arbitrarily deep. The READ side
         # re-projects it through the same size-bounded allowlist: the deep bloat
@@ -6274,18 +6066,22 @@ class TestConversationRegistry:
         )
 
         reg = ConversationRegistry()
-        reg.upsert(ConversationRef(
-            conversation_id="conv-X",
-            service_url="https://svc.trafficmanager.net/",
-            chat_name="original",
-        ))
+        reg.upsert(
+            ConversationRef(
+                conversation_id="conv-X",
+                service_url="https://svc.trafficmanager.net/",
+                chat_name="original",
+            )
+        )
         # Second upsert with empty chat_name must not wipe the existing one.
-        reg.upsert(ConversationRef(
-            conversation_id="conv-X",
-            service_url="https://svc.trafficmanager.net/",
-            chat_name=None,
-            last_inbound_activity_id="act-2",
-        ))
+        reg.upsert(
+            ConversationRef(
+                conversation_id="conv-X",
+                service_url="https://svc.trafficmanager.net/",
+                chat_name=None,
+                last_inbound_activity_id="act-2",
+            )
+        )
         ref = reg.get("conv-X")
         assert ref is not None
         assert ref.chat_name == "original"
@@ -6460,9 +6256,7 @@ class TestPruneOldEntries:
 
     def test_active_session_keys_none_is_treated_as_empty(self) -> None:
         reg = self._reg_with([{"id": "stale", "last_used_at": 1000.0}])
-        dropped = reg.prune_old_entries(
-            max_age_days=10, active_session_keys=None, now=1_000_000.0
-        )
+        dropped = reg.prune_old_entries(max_age_days=10, active_session_keys=None, now=1_000_000.0)
         assert dropped == 1
 
     def test_returns_count_of_dropped(self) -> None:
@@ -6518,9 +6312,7 @@ class TestPinUnpin:
         )
 
         reg = ConversationRegistry()
-        reg.upsert(
-            ConversationRef(conversation_id="c1", service_url="https://x/", pinned=True)
-        )
+        reg.upsert(ConversationRef(conversation_id="c1", service_url="https://x/", pinned=True))
         assert reg.unpin("c1") is True
         assert reg.get("c1").pinned is False
 
@@ -6568,15 +6360,9 @@ class TestPinUnpin:
         )
 
         reg = ConversationRegistry()
-        reg.upsert(
-            ConversationRef(conversation_id="c1", service_url="https://x/", pinned=True)
-        )
+        reg.upsert(ConversationRef(conversation_id="c1", service_url="https://x/", pinned=True))
         # Re-upsert with pinned=False (default) — must NOT unpin.
-        reg.upsert(
-            ConversationRef(
-                conversation_id="c1", service_url="https://x/", pinned=False
-            )
-        )
+        reg.upsert(ConversationRef(conversation_id="c1", service_url="https://x/", pinned=False))
         assert reg.get("c1").pinned is True
 
 
@@ -6717,9 +6503,7 @@ class TestAdapterPersistsRegistry:
 
 class TestSendTyping:
     @pytest.mark.asyncio
-    async def test_no_op_when_no_cached_inbound(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_no_op_when_no_cached_inbound(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         # Should swallow silently — gateway typing pulse must not throw.
         await a.send_typing("missing")
@@ -6746,9 +6530,7 @@ class TestSendTyping:
             "acquire_outbound_token",
             AsyncMock(return_value="bearer-xyz"),
         )
-        post_mock = AsyncMock(
-            return_value=MagicMock(status_code=200, text="")
-        )
+        post_mock = AsyncMock(return_value=MagicMock(status_code=200, text=""))
         a._http_client.post = post_mock
 
         await a.send_typing("conv-T")
@@ -6766,9 +6548,7 @@ class TestSendTyping:
         assert headers["Authorization"] == "Bearer bearer-xyz"
 
     @pytest.mark.asyncio
-    async def test_no_typing_on_non_personal_chat(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_no_typing_on_non_personal_chat(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Copilot Chat arrives as groupChat. A typing activity there is
         # accepted, but the merged reply never renders. Personal 1:1
         # still posts the indicator.
@@ -6814,9 +6594,7 @@ class TestSendTyping:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id="conv-stream-typing")
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-stream-typing"))
         )
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -6841,9 +6619,7 @@ class TestSendTyping:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id="conv-after-final")
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-after-final"))
         )
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -6869,9 +6645,7 @@ class TestSendTyping:
         a = _make_adapter(monkeypatch)
         chat_id = "conv-flag-lifecycle"
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id=chat_id)
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id=chat_id))
         )
         a._personal_processing_depth[chat_id] = 1
         a._mark_personal_stream_final_posted(chat_id)
@@ -6930,6 +6704,7 @@ class TestSendTyping:
         event = SimpleNamespace(
             raw_message={"conversation": {"id": chat_id}},
         )
+
         async def fail_finalize(_chat: str) -> None:
             return None
 
@@ -6938,13 +6713,9 @@ class TestSendTyping:
         assert chat_id not in a._personal_stream_final_posted
 
     @pytest.mark.asyncio
-    async def test_typing_failure_swallowed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_typing_failure_swallowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -6986,9 +6757,7 @@ class TestSendTyping:
             await task
 
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id="conv-typing-cancel")
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-typing-cancel"))
         )
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -7061,9 +6830,7 @@ class TestSendTyping:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id="conv-typing-down")
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-typing-down"))
         )
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -7104,9 +6871,7 @@ class TestSendImage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -7135,13 +6900,9 @@ class TestSendImage:
         assert body[1]["text"] == "my cat"
 
     @pytest.mark.asyncio
-    async def test_no_caption_omits_textblock(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_no_caption_omits_textblock(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -7152,9 +6913,7 @@ class TestSendImage:
         assert result.success is True
 
     @pytest.mark.asyncio
-    async def test_no_cached_inbound_returns_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_no_cached_inbound_returns_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         result = await a.send_image("missing", "https://example.test/x.png")
         assert result.success is False
@@ -7199,9 +6958,7 @@ class TestSendImage:
         self, monkeypatch: pytest.MonkeyPatch, status_code: int
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -7272,9 +7029,7 @@ class TestEditMessage:
 
         if post_responses is None:
 
-            async def _default_turn_buffer_post(
-                *_args: Any, **kwargs: Any
-            ) -> MagicMock:
+            async def _default_turn_buffer_post(*_args: Any, **kwargs: Any) -> MagicMock:
                 activity = kwargs.get("json") or {}
                 entities = activity.get("entities") or []
                 entity = entities[0] if entities else {}
@@ -7350,9 +7105,7 @@ class TestEditMessage:
         assert "https://schema.org/Message" in types
         streaminfo = next(e for e in final_body["entities"] if e["type"] == "streaminfo")
         assert streaminfo["streamType"] == "final"
-        ai = next(
-            e for e in final_body["entities"] if e["type"] == "https://schema.org/Message"
-        )
+        ai = next(e for e in final_body["entities"] if e["type"] == "https://schema.org/Message")
         assert ai["additionalType"] == ["AIGeneratedContent"]
 
     @pytest.mark.asyncio
@@ -7363,17 +7116,13 @@ class TestEditMessage:
         inbound = _make_inbound(conv_id="conv-S-double-final")
         first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-1"})
         final = MagicMock(status_code=202, text="", json=lambda: {})
-        post_mock = self._wire_adapter(
-            a, inbound=inbound, post_responses=[first, final]
-        )
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=[first, final])
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
 
         await a.edit_message("conv-S-double-final", "m1", "Hi", finalize=False)
         await a.edit_message("conv-S-double-final", "m1", "Done", finalize=True)
-        duplicate = await a.edit_message(
-            "conv-S-double-final", "m1", "Done", finalize=True
-        )
+        duplicate = await a.edit_message("conv-S-double-final", "m1", "Done", finalize=True)
 
         assert duplicate.success is True
         assert duplicate.message_id == ""
@@ -7672,9 +7421,7 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 0
         assert post_mock.await_count == 2
-        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
-            "Thursday, 16 October."
-        )
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == ("Thursday, 16 October.")
 
         await a.on_processing_start(event)
         only_progress = await a.send(
@@ -7746,9 +7493,7 @@ class TestEditMessage:
             "\u270d\ufe0f Writing the patch is done.",
             "💻 Running date",
         ):
-            result = await a.send(
-                chat_id="conv-G-answer", content=content, reply_to=None
-            )
+            result = await a.send(chat_id="conv-G-answer", content=content, reply_to=None)
             assert result.success is True
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 0
@@ -7781,9 +7526,7 @@ class TestEditMessage:
             message_id="act-outer",
         )
         await a.on_processing_start(outer_event)
-        outer = await a.send(
-            chat_id="conv-G-nest", content="Outer draft", reply_to="act-outer"
-        )
+        outer = await a.send(chat_id="conv-G-nest", content="Outer draft", reply_to="act-outer")
         assert outer.success is True
         outer_id = str(outer.message_id)
         inbound["id"] = "act-followup"
@@ -7809,9 +7552,7 @@ class TestEditMessage:
             content="Follow-up reply",
             reply_to="act-followup",
         )
-        follow_note = await a.send(
-            chat_id="conv-G-nest", content="Follow-up note", reply_to=None
-        )
+        follow_note = await a.send(chat_id="conv-G-nest", content="Follow-up note", reply_to=None)
         assert outer_again.success is True
         assert follow.success is True
         assert follow_note.success is True
@@ -7836,9 +7577,7 @@ class TestEditMessage:
             outer_id,
             str(outer_again.message_id),
         ]
-        edited = await a.edit_message(
-            "conv-G-nest", outer_id, "Outer final", finalize=True
-        )
+        edited = await a.edit_message("conv-G-nest", outer_id, "Outer final", finalize=True)
         assert edited.success is True
         await a.on_processing_complete(outer_event, outcome="success")
         assert send_reply_mock.await_count == 1
@@ -7984,9 +7723,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        sent = await a.send(
-            chat_id="conv-G-live", content="Still streaming", reply_to="act-1"
-        )
+        sent = await a.send(chat_id="conv-G-live", content="Still streaming", reply_to="act-1")
         assert sent.success is True
         await asyncio.sleep(0)
         assert send_reply_mock.await_count == 0
@@ -8001,9 +7738,7 @@ class TestEditMessage:
         assert edited.success is True
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 0
-        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
-            "Still streaming, edited"
-        )
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == ("Still streaming, edited")
         assert "conv-G-live" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -8030,9 +7765,7 @@ class TestEditMessage:
             if activity["type"] == "message":
                 final_posts.append(activity["text"])
                 return MagicMock(status_code=202, text="", json=lambda: {})
-            return MagicMock(
-                status_code=201, text="", json=lambda: {"id": "stream-once"}
-            )
+            return MagicMock(status_code=201, text="", json=lambda: {"id": "stream-once"})
 
         a._http_client.post = post
 
@@ -8091,9 +7824,7 @@ class TestEditMessage:
             message_id="act-followup",
         )
         await a.on_processing_start(follow)
-        await a.send(
-            chat_id="conv-G-hold", content="Follow-up reply", reply_to="act-followup"
-        )
+        await a.send(chat_id="conv-G-hold", content="Follow-up reply", reply_to="act-followup")
         await a.on_processing_complete(follow, outcome="success")
         await asyncio.sleep(0)
         assert send_reply_mock.await_count == 1
@@ -8208,9 +7939,7 @@ class TestEditMessage:
             await retry
         assert calls["n"] == 2
         assert post_mock.await_count == 1
-        assert post_mock.await_args.kwargs["headers"]["Authorization"] == (
-            "Bearer bearer-test"
-        )
+        assert post_mock.await_args.kwargs["headers"]["Authorization"] == ("Bearer bearer-test")
         assert "conv-G-token" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -8324,9 +8053,7 @@ class TestEditMessage:
         )
         await a.on_processing_start(event)
         task = a._turn_buffers["conv-G-short"]["keepalive_task"]
-        sent = await a.send(
-            chat_id="conv-G-short", content="Short answer", reply_to="act-1"
-        )
+        sent = await a.send(chat_id="conv-G-short", content="Short answer", reply_to="act-1")
         assert sent.success is True
         assert post_mock.await_count == 0
         await a.on_processing_complete(event, outcome="success")
@@ -8402,15 +8129,16 @@ class TestEditMessage:
         assert str(sent.message_id).startswith("turnbuf:")
         assert order == []
         await self._spin_until(
-            lambda: a._turn_buffers.get("conv-G-long", {})
-            .get("keepalive", {})
-            .get("stream_id")
-            == "ka-1"
+            lambda: (
+                a._turn_buffers.get("conv-G-long", {}).get("keepalive", {}).get("stream_id")
+                == "ka-1"
+            )
         )
         await a._emit_turn_buffer_keepalive("conv-G-long")
-        assert [entity["streamType"] for entity in (
-            body["entities"][0] for body in bodies
-        )] == ["informative", "informative"]
+        assert [entity["streamType"] for entity in (body["entities"][0] for body in bodies)] == [
+            "informative",
+            "informative",
+        ]
         first, second = bodies
         assert first["type"] == "typing"
         assert first["text"] == "Working on it."
@@ -8652,9 +8380,7 @@ class TestEditMessage:
             message_id="act-followup",
         )
         await a.on_processing_start(follow_event)
-        await a.send(
-            chat_id="conv-G-ka-nest", content="Follow-up answer", reply_to="act-followup"
-        )
+        await a.send(chat_id="conv-G-ka-nest", content="Follow-up answer", reply_to="act-followup")
         await a.on_processing_complete(follow_event, outcome="success")
         assert order == ["informative", "final"]
         assert replies == []
@@ -8662,9 +8388,9 @@ class TestEditMessage:
         ka = a._turn_buffers["conv-G-ka-nest"]["keepalive"]
         assert ka.get("stream_id") == ""
         assert ka.get("closed_by") == "turn:2:act-followup"
-        assert [
-            segment["text"] for segment in a._turn_buffers["conv-G-ka-nest"]["segments"]
-        ] == ["Outer answer"]
+        assert [segment["text"] for segment in a._turn_buffers["conv-G-ka-nest"]["segments"]] == [
+            "Outer answer"
+        ]
         await a.on_processing_complete(outer_event, outcome="success")
         assert order == ["informative", "final", "reply"]
         assert replies == [("act-outer", "Outer answer")]
@@ -9113,12 +8839,7 @@ class TestEditMessage:
             seen.append("continue" if "streamId" in entity else "start")
             if "streamId" in entity:
                 payload = {
-                    "error": {
-                        "message": (
-                            "Content stream finished due to "
-                            "exceeded streaming time"
-                        )
-                    }
+                    "error": {"message": ("Content stream finished due to exceeded streaming time")}
                 }
                 return MagicMock(
                     status_code=403,
@@ -9181,9 +8902,7 @@ class TestEditMessage:
         a._retiring_chats.add("conv-G-teardown-final")
         assert a._advance_chat_generation("conv-G-teardown-final") is not None
         await a._teardown_chat_state_impl("conv-G-teardown-final")
-        assert finals == [
-            {"type": "streaminfo", "streamId": "ka-down", "streamType": "final"}
-        ]
+        assert finals == [{"type": "streaminfo", "streamId": "ka-down", "streamType": "final"}]
         assert "conv-G-teardown-final" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -9763,9 +9482,7 @@ class TestEditMessage:
             message_id="act-outer",
         )
         await a.on_processing_start(outer_event)
-        await a.send(
-            chat_id="conv-G-ka-race", content="Outer answer", reply_to="act-outer"
-        )
+        await a.send(chat_id="conv-G-ka-race", content="Outer answer", reply_to="act-outer")
         buf = a._turn_buffers["conv-G-ka-race"]
         buf["keepalive"] = {
             "stream_id": "ka-race",
@@ -9878,9 +9595,7 @@ class TestEditMessage:
             "sequence": 1,
             "opened_mono": time.monotonic(),
         }
-        await a.send(
-            chat_id="conv-G-mint-403", content="Plain once", reply_to=None
-        )
+        await a.send(chat_id="conv-G-mint-403", content="Plain once", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
         assert mint_calls["n"] == 2
         assert finals["n"] == 1
@@ -9934,9 +9649,7 @@ class TestEditMessage:
             "sequence": 1,
             "opened_mono": time.monotonic(),
         }
-        await a.send(
-            chat_id="conv-G-ct-rpe-503", content="Uncertain path", reply_to=None
-        )
+        await a.send(chat_id="conv-G-ct-rpe-503", content="Uncertain path", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
         assert finals["n"] >= adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
         assert send_reply_mock.await_count == 0
@@ -10037,9 +9750,7 @@ class TestEditMessage:
         )
         await a.on_processing_start(outer_event)
         buf = a._turn_buffers["conv-G-nest-latch"]
-        await a.send(
-            chat_id="conv-G-nest-latch", content="Outer body", reply_to=None
-        )
+        await a.send(chat_id="conv-G-nest-latch", content="Outer body", reply_to=None)
         outer_turn = buf["turns"][0]
         outer_key = a._turn_delivery_key(outer_turn)
         outer_rec = a._delivery_record(buf, outer_turn)
@@ -10057,9 +9768,7 @@ class TestEditMessage:
         await a.on_processing_start(inner_event)
         assert buf["delivery_by_turn"][outer_key]["may_have_landed"] is True
         before = dict(buf["delivery_by_turn"][outer_key])
-        await a.send(
-            chat_id="conv-G-nest-latch", content="Inner body", reply_to="act-inner"
-        )
+        await a.send(chat_id="conv-G-nest-latch", content="Inner body", reply_to="act-inner")
         after = buf["delivery_by_turn"][outer_key]
         assert after["may_have_landed"] == before["may_have_landed"]
         assert after["deferral_count"] == before["deferral_count"]
@@ -10095,9 +9804,7 @@ class TestEditMessage:
         )
         await a.on_processing_start(outer_event)
         monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _c: False)
-        await a.send(
-            chat_id="conv-G-inner-land", content="Outer pending", reply_to="act-outer"
-        )
+        await a.send(chat_id="conv-G-inner-land", content="Outer pending", reply_to="act-outer")
         buf = a._turn_buffers["conv-G-inner-land"]
         buf["keepalive"] = {
             "stream_id": "ka-share",
@@ -10111,9 +9818,7 @@ class TestEditMessage:
             message_id="act-inner",
         )
         await a.on_processing_start(inner_event)
-        await a.send(
-            chat_id="conv-G-inner-land", content="Inner lands", reply_to="act-inner"
-        )
+        await a.send(chat_id="conv-G-inner-land", content="Inner lands", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
         buf = a._turn_buffers["conv-G-inner-land"]
         outer_turn = next(t for t in buf["turns"] if t["seq"] == "1")
@@ -10132,9 +9837,7 @@ class TestEditMessage:
         assert "conv-G-inner-land" not in a._turn_buffers
 
     @pytest.mark.asyncio
-    async def test_not_sent_then_not_sent_defers(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_not_sent_then_not_sent_defers(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import httpx
 
         a = _make_adapter(monkeypatch)
@@ -10252,9 +9955,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         log_ctx = (
-            caplog.at_level(logging.WARNING)
-            if caplog is not None
-            else contextlib.nullcontext()
+            caplog.at_level(logging.WARNING) if caplog is not None else contextlib.nullcontext()
         )
         with log_ctx:
             await a.on_processing_start(event)
@@ -10270,10 +9971,7 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 0
         assert "conv-G-term-unc" not in a._turn_buffers
         if caplog is not None:
-            assert any(
-                "terminal stream response" in record.message
-                for record in caplog.records
-            )
+            assert any("terminal stream response" in record.message for record in caplog.records)
 
     @pytest.mark.asyncio
     async def test_may_have_landed_then_defer_does_not_plain_post(
@@ -10480,9 +10178,7 @@ class TestEditMessage:
                 return MagicMock(
                     status_code=403,
                     text="content stream is not allowed",
-                    json=lambda: {
-                        "error": {"message": "content stream is not allowed"}
-                    },
+                    json=lambda: {"error": {"message": "content stream is not allowed"}},
                 )
             return self._http_result(201, "ka-csna")
 
@@ -10628,9 +10324,30 @@ class TestEditMessage:
         buf = a._turn_buffers["conv-G-def-cap"]
         turn = buf["turns"][0]
         record = a._delivery_record(buf, turn)
-        record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+        record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT - 1
         record["state"] = "DEFERRED"
         buf["retry_turn_key"] = record["turn_key"]
+
+        async def deliver_side_effect(*_args: Any, **_kwargs: Any) -> tuple[str, str | None]:
+            live = a._turn_buffers.get("conv-G-def-cap")
+            if isinstance(live, dict):
+                rec = a._delivery_record(live, live["turns"][0])
+                if rec.get("plain_due"):
+                    return ("fallback", "stream retry exhausted")
+            return ("retry", None)
+
+        monkeypatch.setattr(
+            a,
+            "_deliver_turn_answer_locked",
+            AsyncMock(side_effect=deliver_side_effect),
+        )
+        a._schedule_turn_buffer_retry("conv-G-def-cap", record["turn_key"])
+        for _ in range(5):
+            await asyncio.sleep(0)
+            task = buf.get("retry_task")
+            if isinstance(task, asyncio.Task) and not task.done():
+                await task
+        assert record.get("deferral_count") == (adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT)
         a._schedule_turn_buffer_retry("conv-G-def-cap", record["turn_key"])
         for _ in range(5):
             await asyncio.sleep(0)
@@ -10766,8 +10483,22 @@ class TestEditMessage:
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals == []
         buf["segments"] = []
+        closed_by_snap: list[str] = []
+        original_final = a._post_keepalive_final_locked
+
+        async def capture_final(chat_id: str, buf_arg: dict[str, Any] | None = None) -> bool:
+            result = await original_final(chat_id, buf_arg)
+            live = a._turn_buffers.get(chat_id)
+            if isinstance(live, dict):
+                stream = live.get("keepalive")
+                if isinstance(stream, dict):
+                    closed_by_snap.append(str(stream.get("closed_by") or ""))
+            return result
+
+        monkeypatch.setattr(a, "_post_keepalive_final_locked", capture_final)
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals == [adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT]
+        assert "keepalive" in closed_by_snap
         assert buf["keepalive"]["stream_id"] == "ka-seg"
         await a._drop_turn_buffer("conv-G-ka-seg")
 
@@ -10800,9 +10531,7 @@ class TestEditMessage:
             message_id="act-outer",
         )
         await a.on_processing_start(outer_event)
-        await a.send(
-            chat_id="conv-G-outer-no", content="Outer pending", reply_to="act-outer"
-        )
+        await a.send(chat_id="conv-G-outer-no", content="Outer pending", reply_to="act-outer")
         buf = a._turn_buffers["conv-G-outer-no"]
         buf["keepalive"] = {
             "stream_id": "ka-share2",
@@ -10816,9 +10545,7 @@ class TestEditMessage:
             message_id="act-inner",
         )
         await a.on_processing_start(inner_event)
-        await a.send(
-            chat_id="conv-G-outer-no", content="Inner lands", reply_to="act-inner"
-        )
+        await a.send(chat_id="conv-G-outer-no", content="Inner lands", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
         assert outer_finals["n"] == 0
         await a.on_processing_complete(outer_event, outcome="success")
@@ -10860,9 +10587,7 @@ class TestEditMessage:
             message_id="act-outer",
         )
         await a.on_processing_start(outer_event)
-        await a.send(
-            chat_id="conv-G-in-ac", content="Outer wait", reply_to="act-outer"
-        )
+        await a.send(chat_id="conv-G-in-ac", content="Outer wait", reply_to="act-outer")
         buf = a._turn_buffers["conv-G-in-ac"]
         buf["keepalive"] = {
             "stream_id": "ka-inac",
@@ -10883,15 +10608,10 @@ class TestEditMessage:
         outer_rec = buf["delivery_by_turn"][outer_key]
         assert outer_rec.get("had_landed") is False
         assert outer_rec.get("may_have_landed") is False
-        assert [s["text"] for s in buf["segments"] if s["turn"] == "1"] == [
-            "Outer wait"
-        ]
+        assert [s["text"] for s in buf["segments"] if s["turn"] == "1"] == ["Outer wait"]
         await a.on_processing_complete(outer_event, outcome="success")
         assert send_reply_mock.await_count == 2
-        texts = [
-            call.kwargs["reply"]["text"]
-            for call in send_reply_mock.await_args_list
-        ]
+        texts = [call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list]
         assert texts == ["Inner ac", "Outer wait"]
         await a._drop_turn_buffer("conv-G-in-ac")
 
@@ -11023,32 +10743,18 @@ class TestEditMessage:
             message_id="act-outer",
         )
         await a.on_processing_start(outer_event)
-        await a.send(
-            chat_id="conv-G-r5-unc", content="Outer maybe", reply_to="act-outer"
-        )
+        await a.send(chat_id="conv-G-r5-unc", content="Outer maybe", reply_to="act-outer")
         buf = a._turn_buffers["conv-G-r5-unc"]
         outer_turn = buf["turns"][0]
         record = a._delivery_record(buf, outer_turn)
         record["may_have_landed"] = True
         record["had_landed"] = True
         buf["keepalive"] = {
-            "stream_id": "ka-r5",
+            "stream_id": "",
             "sequence": 1,
             "opened_mono": time.monotonic(),
+            "closed_by": "turn:other",
         }
-        inbound["id"] = "act-inner"
-        inner_event = _StubMessageEvent(
-            text="inner",
-            source=_StubSessionSource(platform=None, chat_id="conv-G-r5-unc"),
-            message_id="act-inner",
-        )
-        await a.on_processing_start(inner_event)
-        await a.send(chat_id="conv-G-r5-unc", content="Inner done", reply_to="act-inner")
-        await a.on_processing_complete(inner_event, outcome="success")
-        inner_turn = next(t for t in buf["turns"] if t["seq"] == "2")
-        inner_key = a._turn_delivery_key(inner_turn)
-        buf["keepalive"]["closed_by"] = f"turn:{inner_key}"
-        buf["keepalive"]["stream_id"] = ""
         await a.on_processing_complete(outer_event, outcome="success")
         assert send_reply_mock.await_count == 0
         assert "conv-G-r5-unc" not in a._turn_buffers
@@ -11057,7 +10763,100 @@ class TestEditMessage:
     async def test_outer_rule_five_plain_after_inner_accepted_final(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        await self.test_inner_lands_outer_pending_plain_posts_outer(monkeypatch)
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-r5-plain", activity_id="act-outer")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _c: False)
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-r5p")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        outer_event = _StubMessageEvent(
+            text="outer",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-r5-plain"),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(outer_event)
+        await a.send(chat_id="conv-G-r5-plain", content="Outer plain", reply_to="act-outer")
+        buf = a._turn_buffers["conv-G-r5-plain"]
+        buf["keepalive"] = {
+            "stream_id": "ka-r5p",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        inbound["id"] = "act-inner"
+        inner_event = _StubMessageEvent(
+            text="inner",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-r5-plain"),
+            message_id="act-inner",
+        )
+        await a.on_processing_start(inner_event)
+        await a.send(chat_id="conv-G-r5-plain", content="Inner final", reply_to="act-inner")
+        await a.on_processing_complete(inner_event, outcome="success")
+        await a.on_processing_complete(outer_event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Outer plain"
+        assert "conv-G-r5-plain" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_outer_other_turn_key_may_have_landed_still_plain_posts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-r5-key", activity_id="act-outer")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _c: False)
+        a._http_client.post = AsyncMock(side_effect=lambda *_a, **_k: self._http_result(202))
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        outer_event = _StubMessageEvent(
+            text="outer",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-r5-key"),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(outer_event)
+        await a.send(chat_id="conv-G-r5-key", content="Outer still", reply_to="act-outer")
+        buf = a._turn_buffers["conv-G-r5-key"]
+        outer_turn = buf["turns"][0]
+        record = a._delivery_record(buf, outer_turn)
+        record["may_have_landed"] = True
+        record["had_landed"] = True
+        inbound["id"] = "act-inner"
+        inner_event = _StubMessageEvent(
+            text="inner",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-r5-key"),
+            message_id="act-inner",
+        )
+
+        async def post_inner(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-inner")
+            return self._http_result(202)
+
+        a._http_client.post = post_inner
+        await a.on_processing_start(inner_event)
+        await a.send(chat_id="conv-G-r5-key", content="Inner final", reply_to="act-inner")
+        await a.on_processing_complete(inner_event, outcome="success")
+        record["may_have_landed"] = True
+        record["had_landed"] = True
+        await a.on_processing_complete(outer_event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Outer still"
 
     @pytest.mark.asyncio
     async def test_plain_fallback_failure_counts_one_deferral(
@@ -11119,49 +10918,50 @@ class TestEditMessage:
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
-        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _c: False)
         parts = [char * 1500 for char in ("A", "B", "C")]
-        first = f"{parts[0]}\n\n{parts[1]}"
-
-        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
-            activity = kwargs["json"]
-            if activity.get("type") == "message":
-                return MagicMock(status_code=202, text="", json=lambda: {})
-            return MagicMock(
-                status_code=201, text="", json=lambda: {"id": "stream-ov"}
-            )
-
         event = _StubMessageEvent(
             text="hi",
             source=_StubSessionSource(platform=None, chat_id="conv-G-cancel-ov"),
             message_id="act-1",
         )
+        bridge = adapter_mod._import_bridge()
+        replies: list[str] = []
+
+        async def send_reply(**kwargs: Any) -> None:
+            replies.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _c: False)
         await a.on_processing_start(event)
-        for part in parts:
-            await a.send(chat_id="conv-G-cancel-ov", content=part, reply_to=None)
         buf = a._turn_buffers["conv-G-cancel-ov"]
+        keepalive_task = buf.get("keepalive_task")
+        if isinstance(keepalive_task, asyncio.Task):
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        await a.send(chat_id="conv-G-cancel-ov", content=parts[2], reply_to=None)
+        turn = buf["turns"][0]
+        turn["open"] = False
+        record = a._delivery_record(buf, turn)
+        record["answer_final_settled"] = True
+        record["had_landed"] = True
         buf["keepalive"] = {
             "stream_id": "stream-ov",
             "sequence": 1,
             "opened_mono": time.monotonic(),
             "stopped": True,
         }
-        turn = buf["turns"][0]
-        record = a._delivery_record(buf, turn)
-        record["had_landed"] = True
-        record["may_have_landed"] = False
-        chunk_ids = [
-            str(s["id"]) for s in buf["segments"] if s["text"] in (parts[0], parts[1])
-        ]
+        chunk_ids = [str(s["id"]) for s in buf["segments"]]
         outcome, _ = await a._deliver_turn_answer_locked(
             "conv-G-cancel-ov",
             turn,
-            first,
+            parts[2],
             chunk_ids,
         )
-        assert outcome == "delivered"
-        assert not any(s["text"] in (parts[0], parts[1]) for s in buf["segments"])
+        assert outcome == "fallback"
         assert any(s["text"] == parts[2] for s in buf["segments"])
+        buf["keepalive"]["stopped"] = False
+        await a._flush_turn_buffer("conv-G-cancel-ov")
+        assert parts[2] in replies
 
     @pytest.mark.asyncio
     async def test_overflow_tail_failure_schedules_retry_with_turn_key(
@@ -11174,16 +10974,17 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
         parts = [char * 1500 for char in ("A", "B", "C")]
-        first = f"{parts[0]}\n\n{parts[1]}"
         calls = {"n": 0}
+        informative_posts = {"n": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             activity = kwargs["json"]
             if activity.get("type") == "message":
+                entity = activity["entities"][0]
+                if entity.get("streamType") == "informative" and "streamId" not in entity:
+                    informative_posts["n"] += 1
                 return MagicMock(status_code=202, text="", json=lambda: {})
-            return MagicMock(
-                status_code=201, text="", json=lambda: {"id": "stream-ovr"}
-            )
+            return MagicMock(status_code=201, text="", json=lambda: {"id": "stream-ovr"})
 
         a._http_client.post = post
         bridge = adapter_mod._import_bridge()
@@ -11208,6 +11009,9 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         buf = a._turn_buffers["conv-G-ov-retry"]
         turn_key = a._delivery_record(buf, buf["turns"][0])["turn_key"]
+        record = a._delivery_record(buf, buf["turns"][0])
+        assert record.get("answer_final_settled") is True
+        assert informative_posts["n"] == 0
         task = buf.get("retry_task")
         assert isinstance(task, asyncio.Task)
         assert not task.done()
@@ -11215,8 +11019,10 @@ class TestEditMessage:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         buf["retry_task"] = None
+        informative_posts["n"] = 0
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
         await a._flush_turn_buffer("conv-G-ov-retry")
+        assert informative_posts["n"] == 0
         assert "conv-G-ov-retry" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -11245,6 +11051,48 @@ class TestEditMessage:
         await a._flush_turn_buffer(chat)
         buf = a._turn_buffers[chat]
         turn_key = a._turn_delivery_key(buf["turns"][0])
+        assert buf.get("retry_turn_key") == turn_key
+        task = buf.get("retry_task")
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_progress_only_keepalive_close_failure_schedules_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-prog-ka"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "validated_path": "A",
+                    "activity_id": "act-1",
+                    "open": False,
+                }
+            ],
+            "segments": [],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+            "keepalive": {
+                "stream_id": "ka-prog",
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            },
+        }
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
+        monkeypatch.setattr(
+            a,
+            "_close_turn_buffer_keepalive_locked",
+            AsyncMock(return_value=False),
+        )
+        await a._flush_turn_buffer(chat)
+        buf = a._turn_buffers[chat]
+        turn_key = a._delivery_record(buf, buf["turns"][0])["turn_key"]
         assert buf.get("retry_turn_key") == turn_key
         task = buf.get("retry_task")
         assert isinstance(task, asyncio.Task)
@@ -11426,9 +11274,7 @@ class TestEditMessage:
         assert "conv-G-silent" not in a._turn_buffers
 
     @pytest.mark.asyncio
-    async def test_uncertain_is_the_only_drop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_uncertain_is_the_only_drop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import httpx
 
         a = _make_adapter(monkeypatch)
@@ -11660,9 +11506,7 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 0
         assert "conv-P-buf" not in a._turn_buffers
         final = post_mock.await_args.kwargs["json"]
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-personal"
         assert final["text"] == "Hello"
@@ -11738,17 +11582,13 @@ class TestEditMessage:
         caplog.set_level("INFO")
 
         notice = "No home channel is configured. Use /sethome to set one."
-        withheld = await a.send_private_notice(
-            "conv-notice-group", "user-1", notice
-        )
+        withheld = await a.send_private_notice("conv-notice-group", "user-1", notice)
         assert withheld.success is True
         assert send_reply_mock.await_count == 0
         assert "withholding operational notice" in caplog.text
         assert "groupChat" in caplog.text
 
-        sent = await a.send_private_notice(
-            "conv-notice-personal", "user-1", notice
-        )
+        sent = await a.send_private_notice("conv-notice-personal", "user-1", notice)
         assert sent.success is True
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == notice
@@ -11759,9 +11599,7 @@ class TestEditMessage:
         monkeypatch.setattr(adapter_mod, "_MAX_RECENTLY_FINALIZED", 3)
         a = _make_adapter(monkeypatch)
         for index in range(4):
-            a._record_recently_finalized(
-                f"coalesced:{index}", "conv-G", now=float(index)
-            )
+            a._record_recently_finalized(f"coalesced:{index}", "conv-G", now=float(index))
         assert list(a._recently_finalized) == [
             ("conv-G", "coalesced:1"),
             ("conv-G", "coalesced:2"),
@@ -11774,9 +11612,7 @@ class TestEditMessage:
             now=a._recently_finalized_ttl_sec + 10.0,
         )
         assert a._recently_finalized == {
-            ("conv-G", "coalesced:fresh"): (
-                a._recently_finalized_ttl_sec + 10.0
-            )
+            ("conv-G", "coalesced:fresh"): (a._recently_finalized_ttl_sec + 10.0)
         }
 
     @pytest.mark.asyncio
@@ -11825,10 +11661,10 @@ class TestEditMessage:
             finalize=True,
         )
 
-        assert [
-            call.kwargs["reply"]["text"]
-            for call in send_reply_mock.await_args_list
-        ] == ["First segment", "Second segment updated"]
+        assert [call.kwargs["reply"]["text"] for call in send_reply_mock.await_args_list] == [
+            "First segment",
+            "Second segment updated",
+        ]
         assert ("conv-G-segments", first.message_id) in a._recently_finalized
         assert ("conv-G-segments", second.message_id) in a._recently_finalized
         assert a._coalesced_replies == {}
@@ -11855,9 +11691,7 @@ class TestEditMessage:
         message_id = str(first.message_id)
         state = a._coalesced_replies[message_id]
         loop_now = asyncio.get_event_loop().time()
-        state["last_update_ts"] = (
-            loop_now - adapter_mod._COALESCED_REPLY_FLUSH_AFTER_SEC - 1.0
-        )
+        state["last_update_ts"] = loop_now - adapter_mod._COALESCED_REPLY_FLUSH_AFTER_SEC - 1.0
 
         flushed = await a._flush_stale_coalesced_reply(message_id)
 
@@ -11914,32 +11748,22 @@ class TestEditMessage:
                 started.set()
                 await release.wait()
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=blocking_send_reply)
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=blocking_send_reply))
 
-        first = await a.send(
-            chat_id="conv-G-overlap", content="First", reply_to="act-1"
-        )
+        first = await a.send(chat_id="conv-G-overlap", content="First", reply_to="act-1")
         first_finalize = asyncio.create_task(
-            a.edit_message(
-                "conv-G-overlap", str(first.message_id), "First", finalize=True
-            )
+            a.edit_message("conv-G-overlap", str(first.message_id), "First", finalize=True)
         )
         await started.wait()
 
-        second = await a.send(
-            chat_id="conv-G-overlap", content="Second", reply_to="act-1"
-        )
+        second = await a.send(chat_id="conv-G-overlap", content="Second", reply_to="act-1")
         assert second.message_id != first.message_id
         assert a._active_coalesced_reply_by_chat["conv-G-overlap"] == second.message_id
 
         release.set()
         assert (await first_finalize).success is True
         assert second.message_id in a._coalesced_replies
-        await a.edit_message(
-            "conv-G-overlap", str(second.message_id), "Second", finalize=True
-        )
+        await a.edit_message("conv-G-overlap", str(second.message_id), "Second", finalize=True)
         assert sent == ["First", "Second"]
 
     @pytest.mark.asyncio
@@ -11961,9 +11785,7 @@ class TestEditMessage:
 
         send_reply_mock = AsyncMock(side_effect=blocking_send_reply)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
-        first = await a.send(
-            chat_id="conv-G-finalize-race", content="Only once", reply_to="act-1"
-        )
+        first = await a.send(chat_id="conv-G-finalize-race", content="Only once", reply_to="act-1")
 
         explicit = asyncio.create_task(
             a.edit_message(
@@ -11974,9 +11796,7 @@ class TestEditMessage:
             )
         )
         await started.wait()
-        watchdog = asyncio.create_task(
-            a._flush_stale_coalesced_reply(str(first.message_id))
-        )
+        watchdog = asyncio.create_task(a._flush_stale_coalesced_reply(str(first.message_id)))
         await asyncio.sleep(0)
         release.set()
 
@@ -12004,9 +11824,7 @@ class TestEditMessage:
 
         send_reply_mock = AsyncMock(side_effect=blocking_send_reply)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
-        first = await a.send(
-            chat_id="conv-G-double-final", content="Only once", reply_to="act-1"
-        )
+        first = await a.send(chat_id="conv-G-double-final", content="Only once", reply_to="act-1")
         args = ("conv-G-double-final", str(first.message_id), "Only once")
         finalize_one = asyncio.create_task(a.edit_message(*args, finalize=True))
         await started.wait()
@@ -12036,12 +11854,8 @@ class TestEditMessage:
             await release.wait()
             raise RuntimeError("connector down")
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=failing_send_reply)
-        )
-        first = await a.send(
-            chat_id="conv-G-failed-overlap", content="First", reply_to="act-1"
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=failing_send_reply))
+        first = await a.send(chat_id="conv-G-failed-overlap", content="First", reply_to="act-1")
         first_finalize = asyncio.create_task(
             a.edit_message(
                 "conv-G-failed-overlap",
@@ -12051,17 +11865,12 @@ class TestEditMessage:
             )
         )
         await started.wait()
-        second = await a.send(
-            chat_id="conv-G-failed-overlap", content="Second", reply_to="act-1"
-        )
+        second = await a.send(chat_id="conv-G-failed-overlap", content="Second", reply_to="act-1")
         release.set()
 
         assert (await first_finalize).success is False
         assert second.message_id in a._coalesced_replies
-        assert (
-            a._active_coalesced_reply_by_chat["conv-G-failed-overlap"]
-            == second.message_id
-        )
+        assert a._active_coalesced_reply_by_chat["conv-G-failed-overlap"] == second.message_id
 
         successful_send = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", successful_send)
@@ -12085,18 +11894,16 @@ class TestEditMessage:
         result = await second_finalize
         assert retry.success is True
         assert result.success is True
-        assert [
-            call.kwargs["reply"]["text"]
-            for call in successful_send.await_args_list
-        ] == ["First", "Second"]
+        assert [call.kwargs["reply"]["text"] for call in successful_send.await_args_list] == [
+            "First",
+            "Second",
+        ]
 
     @pytest.mark.asyncio
     async def test_coalesced_generation_backlog_is_bounded_per_chat(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT", 2
-        )
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT", 2)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-backlog")
         inbound["conversation"]["conversationType"] = "groupChat"
@@ -12111,21 +11918,13 @@ class TestEditMessage:
                 started.set()
                 await release.wait()
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=blocking_send_reply)
-        )
-        first = await a.send(
-            chat_id="conv-G-backlog", content="First", reply_to="act-1"
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=blocking_send_reply))
+        first = await a.send(chat_id="conv-G-backlog", content="First", reply_to="act-1")
         first_finalize = asyncio.create_task(
-            a.edit_message(
-                "conv-G-backlog", str(first.message_id), "First", finalize=True
-            )
+            a.edit_message("conv-G-backlog", str(first.message_id), "First", finalize=True)
         )
         await started.wait()
-        second = await a.send(
-            chat_id="conv-G-backlog", content="Second", reply_to="act-1"
-        )
+        second = await a.send(chat_id="conv-G-backlog", content="Second", reply_to="act-1")
         second_finalize = asyncio.create_task(
             a.edit_message(
                 "conv-G-backlog",
@@ -12139,9 +11938,7 @@ class TestEditMessage:
 
         states_before = set(a._coalesced_replies)
         tasks_before = set(a._coalesced_reply_tasks)
-        rejected = await a.send(
-            chat_id="conv-G-backlog", content="Third", reply_to="act-1"
-        )
+        rejected = await a.send(chat_id="conv-G-backlog", content="Third", reply_to="act-1")
         assert rejected.success is False
         assert "backlog full" in str(rejected.error)
         assert set(a._coalesced_replies) == states_before
@@ -12185,9 +11982,7 @@ class TestEditMessage:
 
         first_a = await a.send(chat_id="conv-A", content="A", reply_to="act-A")
         first_b = await a.send(chat_id="conv-B", content="B", reply_to="act-B")
-        result = await a.edit_message(
-            "conv-A", str(first_b.message_id), "poison", finalize=True
-        )
+        result = await a.edit_message("conv-A", str(first_b.message_id), "poison", finalize=True)
 
         assert result.success is False
         assert "another chat" in str(result.error)
@@ -12229,15 +12024,9 @@ class TestEditMessage:
                 cancelled.set()
                 raise
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply)
-        )
-        first = await a.send(
-            chat_id="conv-evict-finalizing", content="First", reply_to="act-1"
-        )
-        other_reply = await a.send(
-            chat_id="conv-evict-other", content="Other", reply_to="act-2"
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply))
+        first = await a.send(chat_id="conv-evict-finalizing", content="First", reply_to="act-1")
+        other_reply = await a.send(chat_id="conv-evict-other", content="Other", reply_to="act-2")
         finalize = asyncio.create_task(
             a.edit_message(
                 "conv-evict-finalizing",
@@ -12256,10 +12045,7 @@ class TestEditMessage:
         assert first.message_id not in a._coalesced_replies
         assert "conv-evict-finalizing" not in a._active_coalesced_reply_by_chat
         assert other_reply.message_id in a._coalesced_replies
-        assert (
-            a._active_coalesced_reply_by_chat["conv-evict-other"]
-            == other_reply.message_id
-        )
+        assert a._active_coalesced_reply_by_chat["conv-evict-other"] == other_reply.message_id
         a._drop_coalesced_reply_state(str(other_reply.message_id))
 
     @pytest.mark.asyncio
@@ -12283,9 +12069,7 @@ class TestEditMessage:
                 cancelled.set()
                 raise
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply)
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply))
         first = await a.send(
             chat_id="conv-disconnect-finalizing", content="First", reply_to="act-1"
         )
@@ -12323,12 +12107,8 @@ class TestEditMessage:
             started.set()
             await asyncio.Event().wait()
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply)
-        )
-        first = await a.send(
-            chat_id="conv-disconnect-chain", content="First", reply_to="act-1"
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=blocked_send_reply))
+        first = await a.send(chat_id="conv-disconnect-chain", content="First", reply_to="act-1")
         first_finalize = asyncio.create_task(
             a.edit_message(
                 "conv-disconnect-chain",
@@ -12339,15 +12119,9 @@ class TestEditMessage:
         )
         await started.wait()
 
-        second = await a.send(
-            chat_id="conv-disconnect-chain", content="Second", reply_to="act-1"
-        )
-        first_complete = a._coalesced_replies[first.message_id][
-            "delivery_complete"
-        ]
-        second_complete = a._coalesced_replies[second.message_id][
-            "delivery_complete"
-        ]
+        second = await a.send(chat_id="conv-disconnect-chain", content="Second", reply_to="act-1")
+        first_complete = a._coalesced_replies[first.message_id]["delivery_complete"]
+        second_complete = a._coalesced_replies[second.message_id]["delivery_complete"]
         second_finalize = asyncio.create_task(
             a.edit_message(
                 "conv-disconnect-chain",
@@ -12406,9 +12180,7 @@ class TestEditMessage:
     async def test_disconnect_bounds_cancellation_resistant_delivery(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.05
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.05)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-disconnect-resistant")
         inbound["conversation"]["conversationType"] = "groupChat"
@@ -12505,9 +12277,7 @@ class TestEditMessage:
     async def test_chat_teardown_tracks_resistant_delivery_until_completion(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_REPLY_SURVIVORS", 1)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-evict-resistant")
@@ -12527,12 +12297,8 @@ class TestEditMessage:
                     cancelled.set()
                     continue
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply)
-        )
-        first = await a.send(
-            chat_id="conv-evict-resistant", content="First", reply_to="act-1"
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply))
+        first = await a.send(chat_id="conv-evict-resistant", content="First", reply_to="act-1")
         finalize = asyncio.create_task(
             a.edit_message(
                 "conv-evict-resistant",
@@ -12544,13 +12310,9 @@ class TestEditMessage:
         await started.wait()
         delivery = a._coalesced_replies[first.message_id]["finalize_task"]
 
-        teardown = asyncio.create_task(
-            a._teardown_chat_state("conv-evict-resistant")
-        )
+        teardown = asyncio.create_task(a._teardown_chat_state("conv-evict-resistant"))
         await cancelled.wait()
-        joined_teardown = asyncio.create_task(
-            a._teardown_chat_state("conv-evict-resistant")
-        )
+        joined_teardown = asyncio.create_task(a._teardown_chat_state("conv-evict-resistant"))
         teardown.cancel()
         await asyncio.sleep(0)
         teardown.cancel()
@@ -12599,12 +12361,8 @@ class TestEditMessage:
                 raise
             delivered.set()
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply)
-        )
-        send = asyncio.create_task(
-            a.send(chat_id="conv-oneshot-evict", content="One shot")
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply))
+        send = asyncio.create_task(a.send(chat_id="conv-oneshot-evict", content="One shot"))
         await started.wait()
         await a._teardown_chat_state("conv-oneshot-evict")
         await cancelled.wait()
@@ -12619,9 +12377,7 @@ class TestEditMessage:
     async def test_survivor_counts_against_generation_admission_budget(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS", 1)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-survivor-budget")
@@ -12639,12 +12395,8 @@ class TestEditMessage:
                 except asyncio.CancelledError:
                     continue
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply)
-        )
-        first = await a.send(
-            chat_id="conv-survivor-budget", content="First", reply_to="act-1"
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply))
+        first = await a.send(chat_id="conv-survivor-budget", content="First", reply_to="act-1")
         finalize = asyncio.create_task(
             a.edit_message(
                 "conv-survivor-budget",
@@ -12658,9 +12410,7 @@ class TestEditMessage:
         await a.disconnect()
 
         a._http_client = MagicMock()
-        rejected = await a.send(
-            chat_id="conv-survivor-budget", content="Second", reply_to="act-1"
-        )
+        rejected = await a.send(chat_id="conv-survivor-budget", content="Second", reply_to="act-1")
         assert rejected.success is False
         assert "disconnecting" in str(rejected.error)
 
@@ -12668,9 +12418,7 @@ class TestEditMessage:
         await delivery
         await asyncio.sleep(0)
         assert a._coalesced_reply_survivors == {}
-        accepted = await a.send(
-            chat_id="conv-survivor-budget", content="Second", reply_to="act-1"
-        )
+        accepted = await a.send(chat_id="conv-survivor-budget", content="Second", reply_to="act-1")
         assert accepted.success is True
         a._drop_coalesced_reply_state(str(accepted.message_id))
         with pytest.raises(asyncio.CancelledError):
@@ -12967,33 +12715,21 @@ class TestEditMessage:
             ]
         )
 
-        start_a = await a._send_stream_start(
-            chat_id="conv-equal-A", content="A", inbound=inbound_a
-        )
-        start_b = await a._send_stream_start(
-            chat_id="conv-equal-B", content="B", inbound=inbound_b
-        )
+        start_a = await a._send_stream_start(chat_id="conv-equal-A", content="A", inbound=inbound_a)
+        start_b = await a._send_stream_start(chat_id="conv-equal-B", content="B", inbound=inbound_b)
         assert start_a is not None and start_a.success
         assert start_b is not None and start_b.success
         assert ("conv-equal-A", "bf-shared") in a._streams
         assert ("conv-equal-B", "bf-shared") in a._streams
 
-        edit_a = await a.edit_message(
-            "conv-equal-A", "bf-shared", "A2", finalize=False
-        )
-        edit_b = await a.edit_message(
-            "conv-equal-B", "bf-shared", "B2", finalize=False
-        )
+        edit_a = await a.edit_message("conv-equal-A", "bf-shared", "A2", finalize=False)
+        edit_b = await a.edit_message("conv-equal-B", "bf-shared", "B2", finalize=False)
         assert edit_a.success and edit_b.success
         assert a._streams[("conv-equal-A", "bf-shared")]["sequence"] == 2
         assert a._streams[("conv-equal-B", "bf-shared")]["sequence"] == 2
 
-        final_a = await a.edit_message(
-            "conv-equal-A", "bf-shared", "A done", finalize=True
-        )
-        final_b = await a.edit_message(
-            "conv-equal-B", "bf-shared", "B done", finalize=True
-        )
+        final_a = await a.edit_message("conv-equal-A", "bf-shared", "A done", finalize=True)
+        final_b = await a.edit_message("conv-equal-B", "bf-shared", "B done", finalize=True)
         assert final_a.success and final_b.success
         assert ("conv-equal-A", "bf-shared") not in a._streams
         assert ("conv-equal-B", "bf-shared") not in a._streams
@@ -13022,9 +12758,7 @@ class TestEditMessage:
             await release_token.wait()
             return "token", "A"
 
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token)
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token))
         old_client = a._http_client
         old_client.post = AsyncMock()
         old_client.aclose = AsyncMock()
@@ -13058,9 +12792,7 @@ class TestEditMessage:
             await release_token.wait()
             return "token", "A"
 
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token)
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token))
         old_client = a._http_client
         old_client.post = AsyncMock()
         old_client.aclose = AsyncMock()
@@ -13105,15 +12837,11 @@ class TestEditMessage:
             await release_token.wait()
             return "token", "A"
 
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token)
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token))
         old_client = a._http_client
         old_client.post = AsyncMock()
         old_client.aclose = AsyncMock()
-        send = asyncio.create_task(
-            a.send("conv-stale-old", "New", reply_to="act-1")
-        )
+        send = asyncio.create_task(a.send("conv-stale-old", "New", reply_to="act-1"))
         await token_started.wait()
         await a.disconnect()
         replacement = MagicMock()
@@ -13134,9 +12862,7 @@ class TestEditMessage:
         old = _make_adapter(monkeypatch)
         replacement = _make_adapter(monkeypatch)
         guard = asyncio.Event()
-        token = adapter_mod._AGENT_TURN_LIFECYCLE.set(
-            (id(old), "conv-old-adapter", 0, 0, guard)
-        )
+        token = adapter_mod._AGENT_TURN_LIFECYCLE.set((id(old), "conv-old-adapter", 0, 0, guard))
         try:
             result = await replacement.send("conv-old-adapter", "stale")
         finally:
@@ -13153,9 +12879,7 @@ class TestEditMessage:
         inbound = _make_inbound(conv_id="conv-stream-B")
         self._wire_adapter(a, inbound=inbound)
         a._active_stream_by_chat["conv-stream-B"] = "stream-B"
-        a._streams[("conv-stream-A", "stream-A")] = {
-            "chat_id": "conv-stream-A"
-        }
+        a._streams[("conv-stream-A", "stream-A")] = {"chat_id": "conv-stream-A"}
         a._streams[("conv-stream-B", "stream-B")] = {
             "chat_id": "conv-stream-B",
             "bf_stream_id": "bf-B",
@@ -13163,9 +12887,7 @@ class TestEditMessage:
             "last_emit_ts": 0.0,
         }
 
-        result = await a.edit_message(
-            "conv-stream-B", "stream-A", "content from A", finalize=True
-        )
+        result = await a.edit_message("conv-stream-B", "stream-A", "content from A", finalize=True)
 
         assert result.success is False
         assert "another chat" in str(result.error)
@@ -13189,12 +12911,8 @@ class TestEditMessage:
             "chat_id": "conv-rollover-live",
             "lines": ["old"],
         }
-        a._pending_file_uploads["pending-rollover"] = {
-            "conversation_id": "conv-rollover-live"
-        }
-        a._card_capabilities["card-rollover"] = {
-            "conversation_id": "conv-rollover-live"
-        }
+        a._pending_file_uploads["pending-rollover"] = {"conversation_id": "conv-rollover-live"}
+        a._card_capabilities["card-rollover"] = {"conversation_id": "conv-rollover-live"}
         await a._teardown_chat_state("conv-churn-3")
 
         assert len(a._chat_lifecycle_generation) <= 2
@@ -13253,9 +12971,7 @@ class TestEditMessage:
                 except asyncio.CancelledError:
                     continue
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply)
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply))
         first = await a.send(
             chat_id="conv-rollover-resistant",
             content="First",
@@ -13279,9 +12995,7 @@ class TestEditMessage:
         assert first.message_id in a._coalesced_replies
         assert len(a._chat_lifecycle_generation) <= 1
 
-        replacement = _make_inbound(
-            conv_id="conv-rollover-replacement", activity_id="act-2"
-        )
+        replacement = _make_inbound(conv_id="conv-rollover-replacement", activity_id="act-2")
         replacement["conversation"]["conversationType"] = "groupChat"
         replacement_ref = adapter_mod.ConversationRef.from_activity(replacement)
         assert replacement_ref is not None
@@ -13338,12 +13052,8 @@ class TestEditMessage:
         )
         await post_started.wait()
         assert ("conv-detached-A", "local-final") in a._streams
-        a._streams[("conv-detached-A", "extra-detached")] = {
-            "chat_id": "conv-detached-A"
-        }
-        a._streams[("conv-detached-B", "local-final")] = {
-            "chat_id": "conv-detached-B"
-        }
+        a._streams[("conv-detached-A", "extra-detached")] = {"chat_id": "conv-detached-A"}
+        a._streams[("conv-detached-B", "local-final")] = {"chat_id": "conv-detached-B"}
 
         await a._teardown_chat_state("conv-detached-A")
         assert ("conv-detached-A", "local-final") not in a._streams
@@ -13367,9 +13077,7 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        inbound_a = _make_inbound(
-            conv_id="conv-G-users", activity_id="act-user-A"
-        )
+        inbound_a = _make_inbound(conv_id="conv-G-users", activity_id="act-user-A")
         inbound_a["conversation"]["conversationType"] = "groupChat"
         inbound_a["from"] = {"id": "user-A", "name": "A"}
         self._wire_adapter(a, inbound=inbound_a)
@@ -13381,9 +13089,7 @@ class TestEditMessage:
         ref_a.validated_path = "A"
         a._capture_coalesced_turn_target(ref_a)
 
-        inbound_b = _make_inbound(
-            conv_id="conv-G-users", activity_id="act-user-B", path="B"
-        )
+        inbound_b = _make_inbound(conv_id="conv-G-users", activity_id="act-user-B", path="B")
         inbound_b["conversation"]["conversationType"] = "groupChat"
         inbound_b["from"] = {"id": "user-B", "name": "B"}
         ref_b = adapter_mod.ConversationRef.from_activity(inbound_b)
@@ -13394,20 +13100,14 @@ class TestEditMessage:
 
         # Turn B is now the latest durable registry entry before delayed turn A
         # asks to send. Exact turn-target capture must still route A to A.
-        first = await a.send(
-            chat_id="conv-G-users", content="Reply A", reply_to="act-user-A"
-        )
-        second = await a.send(
-            chat_id="conv-G-users", content="Reply B", reply_to="act-user-B"
-        )
+        first = await a.send(chat_id="conv-G-users", content="Reply A", reply_to="act-user-A")
+        second = await a.send(chat_id="conv-G-users", content="Reply B", reply_to="act-user-B")
 
         assert first.message_id != second.message_id
         assert a._coalesced_replies[first.message_id]["inbound"]["id"] == "act-user-A"
         assert a._coalesced_replies[second.message_id]["inbound"]["id"] == "act-user-B"
 
-        await a.send(
-            chat_id="conv-G-users", content="Reply A updated", reply_to="act-user-A"
-        )
+        await a.send(chat_id="conv-G-users", content="Reply A updated", reply_to="act-user-A")
         assert a._coalesced_replies[first.message_id]["content"] == "Reply A updated"
         assert a._coalesced_replies[first.message_id]["inbound"]["from"]["id"] == "user-A"
 
@@ -13429,18 +13129,18 @@ class TestEditMessage:
             )
         ).success is True
 
-        assert [
-            call.kwargs["inbound"]["id"]
-            for call in send_reply_mock.await_args_list
-        ] == ["act-user-B", "act-user-A"]
-        assert [
-            call.kwargs["reply"]["replyToId"]
-            for call in send_reply_mock.await_args_list
-        ] == ["act-user-B", "act-user-A"]
-        assert [
-            call.kwargs["validated_path"]
-            for call in send_reply_mock.await_args_list
-        ] == ["B", "A"]
+        assert [call.kwargs["inbound"]["id"] for call in send_reply_mock.await_args_list] == [
+            "act-user-B",
+            "act-user-A",
+        ]
+        assert [call.kwargs["reply"]["replyToId"] for call in send_reply_mock.await_args_list] == [
+            "act-user-B",
+            "act-user-A",
+        ]
+        assert [call.kwargs["validated_path"] for call in send_reply_mock.await_args_list] == [
+            "B",
+            "A",
+        ]
 
     @pytest.mark.asyncio
     async def test_global_coalesced_generation_budget_bounds_many_chats(
@@ -13469,9 +13169,7 @@ class TestEditMessage:
             assert result.success is True
             accepted.append((chat_id, result.message_id))
 
-        third_inbound = _make_inbound(
-            conv_id="conv-global-3", activity_id="act-3"
-        )
+        third_inbound = _make_inbound(conv_id="conv-global-3", activity_id="act-3")
         third_inbound["conversation"]["conversationType"] = "groupChat"
         third_ref = adapter_mod.ConversationRef.from_activity(third_inbound)
         assert third_ref is not None
@@ -13479,9 +13177,7 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(third_ref)
         a._conversations.upsert(third_ref)
         a._seen_inbounds_this_lifetime.add("conv-global-3")
-        rejected = await a.send(
-            chat_id="conv-global-3", content="Reply 3", reply_to="act-3"
-        )
+        rejected = await a.send(chat_id="conv-global-3", content="Reply 3", reply_to="act-3")
 
         assert rejected.success is False
         assert "global" in str(rejected.error)
@@ -13514,9 +13210,7 @@ class TestEditMessage:
         assert a._coalesced_replies == {}
         assert a._coalesced_reply_tasks == {}
 
-        accepted = await a.send(
-            chat_id="conv-G-content-bound", content="keep", reply_to="act-1"
-        )
+        accepted = await a.send(chat_id="conv-G-content-bound", content="keep", reply_to="act-1")
         state = a._coalesced_replies[accepted.message_id]
         captured_inbound = state["inbound"]
         rejected_update = await a.edit_message(
@@ -13538,13 +13232,9 @@ class TestEditMessage:
         inbound = _make_inbound(conv_id="conv-G-idempotent-drop")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
-        first = await a.send(
-            chat_id="conv-G-idempotent-drop", content="First", reply_to="act-1"
-        )
+        first = await a.send(chat_id="conv-G-idempotent-drop", content="First", reply_to="act-1")
 
-        assert a._coalesced_generation_count_by_chat == {
-            "conv-G-idempotent-drop": 1
-        }
+        assert a._coalesced_generation_count_by_chat == {"conv-G-idempotent-drop": 1}
         a._drop_coalesced_reply_state(str(first.message_id))
         a._drop_coalesced_reply_state(str(first.message_id))
         assert a._coalesced_generation_count_by_chat == {}
@@ -13556,16 +13246,12 @@ class TestEditMessage:
     ) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_TURN_TARGETS_PER_CHAT", 2)
         a = _make_adapter(monkeypatch)
-        first_inbound = _make_inbound(
-            conv_id="conv-G-target-cap", activity_id="act-1"
-        )
+        first_inbound = _make_inbound(conv_id="conv-G-target-cap", activity_id="act-1")
         first_inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=first_inbound)
 
         for activity_id in ("act-2", "act-3"):
-            inbound = _make_inbound(
-                conv_id="conv-G-target-cap", activity_id=activity_id
-            )
+            inbound = _make_inbound(conv_id="conv-G-target-cap", activity_id=activity_id)
             inbound["conversation"]["conversationType"] = "groupChat"
             ref = adapter_mod.ConversationRef.from_activity(inbound)
             assert ref is not None
@@ -13577,15 +13263,11 @@ class TestEditMessage:
             "conv-G-target-cap",
             "act-1",
         ) not in a._coalesced_turn_targets
-        rejected = await a.send(
-            chat_id="conv-G-target-cap", content="Late reply", reply_to="act-1"
-        )
+        rejected = await a.send(chat_id="conv-G-target-cap", content="Late reply", reply_to="act-1")
         assert rejected.success is False
         assert "no cached inbound for exact turn" in str(rejected.error)
         assert a._coalesced_replies == {}
-        assert a._coalesced_turn_target_count_by_chat == {
-            "conv-G-target-cap": 2
-        }
+        assert a._coalesced_turn_target_count_by_chat == {"conv-G-target-cap": 2}
 
         await a._teardown_chat_state("conv-G-target-cap")
         assert a._coalesced_turn_targets == {}
@@ -13596,9 +13278,7 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(
-            conv_id="conv-G-lifetime-evicted", activity_id="act-exact"
-        )
+        inbound = _make_inbound(conv_id="conv-G-lifetime-evicted", activity_id="act-exact")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         proactive = AsyncMock()
@@ -13620,9 +13300,7 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(
-            conv_id="conv-G-restarted", activity_id="act-before-restart"
-        )
+        inbound = _make_inbound(conv_id="conv-G-restarted", activity_id="act-before-restart")
         inbound["conversation"]["conversationType"] = "groupChat"
         ref = adapter_mod.ConversationRef.from_activity(inbound)
         assert ref is not None
@@ -13643,15 +13321,11 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        group = _make_inbound(
-            conv_id="conv-mixed-latest", activity_id="act-group"
-        )
+        group = _make_inbound(conv_id="conv-mixed-latest", activity_id="act-group")
         group["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=group)
 
-        personal = _make_inbound(
-            conv_id="conv-mixed-latest", activity_id="act-personal"
-        )
+        personal = _make_inbound(conv_id="conv-mixed-latest", activity_id="act-personal")
         personal_ref = adapter_mod.ConversationRef.from_activity(personal)
         assert personal_ref is not None
         personal_ref.validated_path = "A"
@@ -13671,10 +13345,7 @@ class TestEditMessage:
         assert result.success is True
         assert result.message_id in a._coalesced_replies
         assert stream_start.await_count == 0
-        assert (
-            a._coalesced_replies[result.message_id]["inbound"]["id"]
-            == "act-group"
-        )
+        assert a._coalesced_replies[result.message_id]["inbound"]["id"] == "act-group"
         finalized = await a.edit_message(
             "conv-mixed-latest",
             str(result.message_id),
@@ -13694,9 +13365,7 @@ class TestEditMessage:
         inbound_a = _make_inbound(conv_id="conv-target-A", activity_id="act-A")
         inbound_a["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound_a)
-        generation_a = await a.send(
-            chat_id="conv-target-A", content="A", reply_to="act-A"
-        )
+        generation_a = await a.send(chat_id="conv-target-A", content="A", reply_to="act-A")
 
         inbound_b = _make_inbound(conv_id="conv-target-B", activity_id="act-B")
         inbound_b["conversation"]["conversationType"] = "groupChat"
@@ -13711,9 +13380,7 @@ class TestEditMessage:
         assert generation_a.message_id not in a._coalesced_replies
         assert ("conv-target-B", "act-B") in a._coalesced_turn_targets
 
-        result_b = await a.send(
-            chat_id="conv-target-B", content="B", reply_to="act-B"
-        )
+        result_b = await a.send(chat_id="conv-target-B", content="B", reply_to="act-B")
         assert result_b.success is True
         assert result_b.message_id in a._coalesced_replies
         a._drop_coalesced_reply_state(str(result_b.message_id))
@@ -13791,7 +13458,8 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-S")
         first_resp = MagicMock(
-            status_code=201, text="",
+            status_code=201,
+            text="",
             json=lambda: {"id": "bf-stream-abc"},
         )
         post_mock = self._wire_adapter(a, inbound=inbound, post_responses=first_resp)
@@ -13812,9 +13480,7 @@ class TestEditMessage:
         # First request must NOT include streamId.
         assert "streamId" not in entity
         # State now tracks the BF-side stream id.
-        assert a._streams[("conv-S", "hermes-msg-1")]["bf_stream_id"] == (
-            "bf-stream-abc"
-        )
+        assert a._streams[("conv-S", "hermes-msg-1")]["bf_stream_id"] == ("bf-stream-abc")
         assert a._active_stream_by_chat["conv-S"] == "hermes-msg-1"
 
     @pytest.mark.asyncio
@@ -13915,9 +13581,7 @@ class TestEditMessage:
         assert "conv-CC" not in a._active_stream_by_chat
 
     @pytest.mark.asyncio
-    async def test_no_inbound_returns_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_no_inbound_returns_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         r = await a.edit_message("missing-conv", "m1", "x")
         assert r.success is False
@@ -13928,18 +13592,14 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         # _http_client / _bridge_cfg deliberately left None.
         r = await a.edit_message("conv-1", "m1", "x")
         assert r.success is False
         assert "not connected" in (r.error or "")
 
     @pytest.mark.asyncio
-    async def test_throttles_intermediate_chunks(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_throttles_intermediate_chunks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-T")
         responses = [
@@ -13959,9 +13619,9 @@ class TestEditMessage:
         # Second call: state["last_emit_ts"] is recent → sleep close to MIN_GAP.
         sleeps = [c.args[0] for c in sleep_mock.await_args_list if c.args]
         # At least one sleep should be at or near the MIN_GAP threshold.
-        assert any(
-            0.0 < s <= adapter_mod._STREAMING_MIN_GAP_SEC + 0.01 for s in sleeps
-        ), f"expected a throttle sleep, got {sleeps!r}"
+        assert any(0.0 < s <= adapter_mod._STREAMING_MIN_GAP_SEC + 0.01 for s in sleeps), (
+            f"expected a throttle sleep, got {sleeps!r}"
+        )
 
     @pytest.mark.asyncio
     async def test_403_content_stream_timeout_returns_terminal(
@@ -14004,9 +13664,7 @@ class TestEditMessage:
         )
 
     @pytest.mark.asyncio
-    async def test_403_stop_button_returns_terminal(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_403_stop_button_returns_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-Y")
         first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-y"})
@@ -14046,9 +13704,7 @@ class TestEditMessage:
             MagicMock(status_code=429, text="", json=lambda: rate_body)
             for _ in range(adapter_mod._STREAM_EDIT_MAX_ATTEMPTS)
         ]
-        post_mock = self._wire_adapter(
-            a, inbound=inbound, post_responses=[first, *rate_responses]
-        )
+        post_mock = self._wire_adapter(a, inbound=inbound, post_responses=[first, *rate_responses])
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
         caplog.set_level("WARNING")
@@ -14098,9 +13754,7 @@ class TestEditMessage:
         assert r.success is True
 
     @pytest.mark.asyncio
-    async def test_first_201_without_id_is_failure(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_first_201_without_id_is_failure(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Defensive: if Microsoft returns 201 but no id (shouldn't
         # happen per spec, but the spec docs are sometimes wrong),
         # we surface a failure so Hermes falls back.
@@ -14155,9 +13809,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
 
-        result = await a.edit_message(
-            "conv-one", "m1", "Pong 2.", finalize=True
-        )
+        result = await a.edit_message("conv-one", "m1", "Pong 2.", finalize=True)
         assert result.success is True
         assert result.message_id == "bf-one"
         assert post_mock.await_count == 2
@@ -14170,18 +13822,14 @@ class TestEditMessage:
         assert "streamId" not in opened["entities"][0]
         assert final["type"] == "message"
         assert final["text"] == "Pong 2."
-        final_info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        final_info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert final_info["streamType"] == "final"
         assert final_info["streamId"] == "bf-one"
         assert "streamSequence" not in final_info
         assert ("conv-one", "m1") not in a._streams
         assert "conv-one" not in a._active_stream_by_chat
 
-        duplicate = await a.edit_message(
-            "conv-one", "m1", "Pong 2.", finalize=True
-        )
+        duplicate = await a.edit_message("conv-one", "m1", "Pong 2.", finalize=True)
         assert duplicate.success is True
         assert post_mock.await_count == 2
 
@@ -14191,9 +13839,7 @@ class TestEditMessage:
     ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-retry")
-        failure = {
-            "error": {"code": "BadGateway", "message": "connector reset"}
-        }
+        failure = {"error": {"code": "BadGateway", "message": "connector reset"}}
         responses = [
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-retry"}),
             MagicMock(status_code=502, text="", json=lambda body=failure: body),
@@ -14222,9 +13868,7 @@ class TestEditMessage:
         # Not retried, not dropped, not coalesced into a second bubble.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-keep")
-        failure = {
-            "error": {"code": "BadSyntax", "message": "prefix mismatch"}
-        }
+        failure = {"error": {"code": "BadSyntax", "message": "prefix mismatch"}}
         responses = [
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-keep"}),
             MagicMock(status_code=400, text="", json=lambda body=failure: body),
@@ -14254,9 +13898,7 @@ class TestEditMessage:
         closed = await a.edit_message("conv-keep", "m1", "A B C", finalize=True)
         assert closed.success is True
         final = post_mock.await_args.kwargs["json"]
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-keep"
         assert ("conv-keep", "m1") not in a._streams
@@ -14270,9 +13912,7 @@ class TestEditMessage:
         # has to be captured, and finalize has to post streamType=final.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-reopen")
-        failure = {
-            "error": {"code": "ServiceUnavailable", "message": "upstream"}
-        }
+        failure = {"error": {"code": "ServiceUnavailable", "message": "upstream"}}
         responses = [
             MagicMock(status_code=503, text="", json=lambda body=failure: body),
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-reopen"}),
@@ -14295,9 +13935,7 @@ class TestEditMessage:
         final = post_mock.await_args_list[2].kwargs["json"]
         assert opened["entities"][0]["streamType"] == "streaming"
         assert "streamId" not in opened["entities"][0]
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-reopen"
         assert ("conv-reopen", "m1") not in a._streams
@@ -14345,9 +13983,7 @@ class TestEditMessage:
         # The gateway's following final send must not open another stream.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-landed", activity_id="act-1")
-        gateway = {
-            "error": {"code": "BadGateway", "message": "connector reset"}
-        }
+        gateway = {"error": {"code": "BadGateway", "message": "connector reset"}}
         completed = {
             "error": {
                 "code": "ContentStreamNotAllowed",
@@ -14367,9 +14003,7 @@ class TestEditMessage:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         await a.edit_message("conv-landed", "m1", "Pong 2.")
-        result = await a.edit_message(
-            "conv-landed", "m1", "Pong 2.", finalize=True
-        )
+        result = await a.edit_message("conv-landed", "m1", "Pong 2.", finalize=True)
         assert result.success is True
         assert result.message_id == "bf-landed"
         assert ("conv-landed", "m1") not in a._streams
@@ -14428,9 +14062,7 @@ class TestEditMessage:
         await a.on_processing_start(outer)
         await a.on_processing_start(follow)
         await a.edit_message("conv-follow", "m1", "Pong 2.")
-        landed = await a.edit_message(
-            "conv-follow", "m1", "Pong 2.", finalize=True
-        )
+        landed = await a.edit_message("conv-follow", "m1", "Pong 2.", finalize=True)
         assert landed.success is True
         assert post_mock.await_count == 3
         assert "act-1" in a._personal_final_landed["conv-follow"]
@@ -14445,9 +14077,7 @@ class TestEditMessage:
         assert same.message_id == ""
         assert post_mock.await_count == 3
 
-        follow_in = _make_inbound(
-            conv_id="conv-follow", activity_id="act-follow", text="follow"
-        )
+        follow_in = _make_inbound(conv_id="conv-follow", activity_id="act-follow", text="follow")
         ref = adapter_mod.ConversationRef.from_activity(follow_in)
         assert ref is not None
         ref.validated_path = "A"
@@ -14464,9 +14094,7 @@ class TestEditMessage:
         final = post_mock.await_args_list[4].kwargs["json"]
         assert opened["text"] == "Follow up."
         assert opened["entities"][0]["streamType"] == "streaming"
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-next"
         assert final["text"] == "Follow up."
@@ -14607,10 +14235,7 @@ class TestSendOrUpdateStatus:
             "🔄 Primary model failed — switching to fallback: gpt-5.4",
             "❌ API failed after 3 retries — giving up.",
         ]
-        results = [
-            await a.send_or_update_status("conv-G-st", "lifecycle", line)
-            for line in lines
-        ]
+        results = [await a.send_or_update_status("conv-G-st", "lifecycle", line) for line in lines]
         key = a._coalesced_status_key("conv-G-st", "lifecycle")
         # Buffered under one synthetic key; nothing sent during the burst.
         assert all(r.message_id == key for r in results)
@@ -14643,10 +14268,7 @@ class TestSendOrUpdateStatus:
         await asyncio.sleep(0.05)
 
         assert send_reply_mock.await_count == 1
-        assert (
-            send_reply_mock.await_args.kwargs["reply"]["text"]
-            == "same line\ndifferent"
-        )
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "same line\ndifferent"
 
     @pytest.mark.asyncio
     async def test_status_cannot_buffer_while_old_client_closes(
@@ -14671,9 +14293,7 @@ class TestSendOrUpdateStatus:
         disconnect = asyncio.create_task(a.disconnect())
         await close_started.wait()
 
-        rejected = await a.send_or_update_status(
-            "conv-status-disconnect", "lifecycle", "Too late"
-        )
+        rejected = await a.send_or_update_status("conv-status-disconnect", "lifecycle", "Too late")
         assert rejected.success is False
         assert a._coalesced_status == {}
 
@@ -14689,12 +14309,8 @@ class TestSendOrUpdateStatus:
     async def test_teardown_tracks_resistant_status_flush_and_preserves_other_chat(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
-        monkeypatch.setattr(
-            adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT", 1
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT", 1)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-status-retire")
         inbound["conversation"]["conversationType"] = "groupChat"
@@ -14711,12 +14327,8 @@ class TestSendOrUpdateStatus:
                 except asyncio.CancelledError:
                     continue
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply)
-        )
-        result = await a.send_or_update_status(
-            "conv-status-retire", "lifecycle", "Working"
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply))
+        result = await a.send_or_update_status("conv-status-retire", "lifecycle", "Working")
         key = str(result.message_id)
         original_watchdog = a._coalesced_status_tasks[key]
         original_watchdog.cancel()
@@ -14769,9 +14381,7 @@ class TestSendOrUpdateStatus:
     async def test_disconnect_tracks_resistant_status_flush_until_completion(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-status-disconnect-resistant")
         inbound["conversation"]["conversationType"] = "groupChat"
@@ -14788,9 +14398,7 @@ class TestSendOrUpdateStatus:
                 except asyncio.CancelledError:
                     continue
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply)
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=resistant_send_reply))
         result = await a.send_or_update_status(
             "conv-status-disconnect-resistant", "lifecycle", "Working"
         )
@@ -14827,14 +14435,10 @@ class TestSendOrUpdateStatus:
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
 
-        first = await a.send(
-            chat_id="conv-G-act", content="partial ▉", reply_to="act-1"
-        )
+        first = await a.send(chat_id="conv-G-act", content="partial ▉", reply_to="act-1")
         assert "conv-G-act" in a._active_coalesced_reply_by_chat
 
-        res = await a.send_or_update_status(
-            "conv-G-act", "lifecycle", "⚠️ trying fallback"
-        )
+        res = await a.send_or_update_status("conv-G-act", "lifecycle", "⚠️ trying fallback")
         # Suppressed: points at the active reply, never buffered as status,
         # never its own bubble.
         assert res.success is True
@@ -14843,26 +14447,20 @@ class TestSendOrUpdateStatus:
         assert send_reply_mock.await_count == 0
 
         # Finalize the reply so no watchdog lingers past the test.
-        await a.edit_message(
-            "conv-G-act", str(first.message_id), "partial done", finalize=True
-        )
+        await a.edit_message("conv-G-act", str(first.message_id), "partial done", finalize=True)
 
     @pytest.mark.asyncio
     async def test_reply_and_status_share_the_same_admission_budget(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT", 1
-        )
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT", 1)
         monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_REPLY_GENERATIONS", 1)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-shared-budget")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire(a, inbound)
 
-        reply = await a.send(
-            chat_id="conv-shared-budget", content="Reply", reply_to="act-1"
-        )
+        reply = await a.send(chat_id="conv-shared-budget", content="Reply", reply_to="act-1")
         assert reply.success is True
         rejected_status = a._buffer_coalesced_status(
             chat_id="conv-shared-budget",
@@ -14904,9 +14502,7 @@ class TestSendOrUpdateStatus:
         )
         assert first.success is True
         key = str(first.message_id)
-        assert len(a._coalesced_status[key]["lines"][0]) == (
-            adapter_mod._MAX_STATUS_LINE_CHARS
-        )
+        assert len(a._coalesced_status[key]["lines"][0]) == (adapter_mod._MAX_STATUS_LINE_CHARS)
 
         results = [
             a._buffer_coalesced_status(
@@ -14920,9 +14516,7 @@ class TestSendOrUpdateStatus:
         lines = a._coalesced_status[key]["lines"]
         assert any(result.success is False for result in results)
         assert len(lines) <= adapter_mod._MAX_STATUS_LINES
-        assert sum(len(line) for line in lines) + len(lines) - 1 <= (
-            a.MAX_MESSAGE_LENGTH
-        )
+        assert sum(len(line) for line in lines) + len(lines) - 1 <= (a.MAX_MESSAGE_LENGTH)
         a._drop_coalesced_status_state(key)
         await asyncio.sleep(0)
 
@@ -14940,14 +14534,10 @@ class TestSendOrUpdateStatus:
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        await a.send_or_update_status(
-            "conv-status-lifetime", "lifecycle", "line-0"
-        )
+        await a.send_or_update_status("conv-status-lifetime", "lifecycle", "line-0")
         for index in range(1, 4):
             await asyncio.sleep(0.004)
-            await a.send_or_update_status(
-                "conv-status-lifetime", "lifecycle", f"line-{index}"
-            )
+            await a.send_or_update_status("conv-status-lifetime", "lifecycle", f"line-{index}")
         await asyncio.sleep(0.04)
 
         assert send_reply.await_count == 1
@@ -14974,17 +14564,13 @@ class TestSendOrUpdateStatus:
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
 
         # 1) Status fires with no active turn → buffered, watchdog armed.
-        res = await a.send_or_update_status(
-            "conv-G-buf", "lifecycle", "⚠️ trying fallback"
-        )
+        res = await a.send_or_update_status("conv-G-buf", "lifecycle", "⚠️ trying fallback")
         key = a._coalesced_status_key("conv-G-buf", "lifecycle")
         assert res.message_id == key
         assert key in a._coalesced_status
 
         # 2) The turn's first reply chunk opens a coalesced reply for the chat.
-        reply = await a.send(
-            chat_id="conv-G-buf", content="partial ▉", reply_to="act-1"
-        )
+        reply = await a.send(chat_id="conv-G-buf", content="partial ▉", reply_to="act-1")
         assert "conv-G-buf" in a._active_coalesced_reply_by_chat
         send_reply_mock.reset_mock()
 
@@ -15053,9 +14639,7 @@ class TestSendOrUpdateStatus:
         assert a._coalesced_status_tasks == {}
 
     @pytest.mark.asyncio
-    async def test_empty_status_is_noop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_empty_status_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-empty")
         inbound["conversation"]["conversationType"] = "groupChat"
@@ -15139,9 +14723,7 @@ class TestSendOrUpdateStatus:
         send_mock = AsyncMock(return_value=sentinel)
         monkeypatch.setattr(a, "send", send_mock)
 
-        res = await a.send_or_update_status(
-            "conv-G-warn", "warn", "⚠️ auxiliary compression failed"
-        )
+        res = await a.send_or_update_status("conv-G-warn", "warn", "⚠️ auxiliary compression failed")
         assert res is sentinel
         send_mock.assert_awaited_once_with(
             "conv-G-warn", "⚠️ auxiliary compression failed", metadata=None
@@ -15163,10 +14745,7 @@ class TestStreamingOverflowLimit:
         token = a._enter_stream_overflow_limit("conv-p")
         adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
         cap = a.streaming_overflow_limit()
-        assert (
-            cap
-            == adapter_mod.Agent365Adapter._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
-        )
+        assert cap == adapter_mod.Agent365Adapter._TEAMS_PERSONAL_STREAM_OVERFLOW_UTF16_LIMIT
         assert cap > a.MAX_MESSAGE_LENGTH
         a._reset_stream_overflow_limit_for_task()
         assert a.streaming_overflow_limit() is None
@@ -15253,9 +14832,7 @@ class TestStreamingOverflowLimit:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id="conv-walk")
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-walk"))
         )
         token = a._enter_stream_overflow_limit("conv-walk")
         adapter_mod._STREAM_OVERFLOW_RESET_TOKEN.set(token)
@@ -15273,9 +14850,7 @@ class TestStreamingOverflowLimit:
         a = _make_adapter(monkeypatch)
         chat_id = "conv-cancel-overflow"
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id=chat_id)
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id=chat_id))
         )
         a._seen_inbounds_this_lifetime.add(chat_id)
         a._personal_processing_depth[chat_id] = 1
@@ -15343,14 +14918,19 @@ class TestSendStreamStart:
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
 
         # 201 with stream id → success.
-        post_mock = AsyncMock(return_value=MagicMock(
-            status_code=201, text="",
-            json=lambda: {"id": "bf-stream-from-send"},
-        ))
+        post_mock = AsyncMock(
+            return_value=MagicMock(
+                status_code=201,
+                text="",
+                json=lambda: {"id": "bf-stream-from-send"},
+            )
+        )
         a._http_client.post = post_mock
 
         result = await a.send(
-            chat_id="conv-S1", content="Hello", reply_to="inbound-id-1",
+            chat_id="conv-S1",
+            content="Hello",
+            reply_to="inbound-id-1",
         )
         assert result.success is True
         # The returned message_id is the BF stream id (Hermes will pass
@@ -15389,7 +14969,8 @@ class TestSendStreamStart:
 
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(
-            bridge, "acquire_outbound_token",
+            bridge,
+            "acquire_outbound_token",
             AsyncMock(return_value="bearer-stream"),
         )
         # send_reply must NOT be called.
@@ -15456,7 +15037,9 @@ class TestSendStreamStart:
         a._http_client.post = AsyncMock()
 
         result = await a.send(
-            chat_id="conv-C", content="Using browser tool…", reply_to=None,
+            chat_id="conv-C",
+            content="Using browser tool…",
+            reply_to=None,
         )
         assert result.success is True
         assert send_reply_mock.await_count == 1
@@ -15544,9 +15127,7 @@ class TestSendStreamStart:
             ]
         )
 
-        result = await a.send(
-            chat_id="conv-X2", content="new content", reply_to="inbound-id-1"
-        )
+        result = await a.send(chat_id="conv-X2", content="new content", reply_to="inbound-id-1")
         assert result.success is True
         assert result.message_id == "bf-new"
         assert a._http_client.post.await_count == 2
@@ -15596,9 +15177,7 @@ class TestSendStreamStart:
             return_value=MagicMock(status_code=503, text="busy", json=lambda: {})
         )
 
-        result = await a.send(
-            chat_id="conv-X3", content="new content", reply_to="inbound-id-1"
-        )
+        result = await a.send(chat_id="conv-X3", content="new content", reply_to="inbound-id-1")
         assert result.success is False
         assert "active stream still open" in (result.error or "")
         assert a._http_client.post.await_count == 1
@@ -15645,12 +15224,8 @@ class TestSendStreamStart:
             ]
         )
 
-        first = await a.send(
-            chat_id="conv-X4", content="new content", reply_to="inbound-id-1"
-        )
-        second = await a.send(
-            chat_id="conv-X4", content="new content", reply_to="inbound-id-1"
-        )
+        first = await a.send(chat_id="conv-X4", content="new content", reply_to="inbound-id-1")
+        second = await a.send(chat_id="conv-X4", content="new content", reply_to="inbound-id-1")
 
         assert first.success is False
         assert second.success is True
@@ -15698,9 +15273,7 @@ class TestSendStreamStart:
             ]
         )
 
-        result = await a.send(
-            chat_id="conv-X5", content="new content", reply_to="inbound-id-1"
-        )
+        result = await a.send(chat_id="conv-X5", content="new content", reply_to="inbound-id-1")
         assert result.success is True
         assert result.message_id == "bf-new"
         assert a._http_client.post.await_count == 2
@@ -15753,13 +15326,17 @@ class TestSendStreamStart:
 
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(
-            bridge, "acquire_outbound_token",
+            bridge,
+            "acquire_outbound_token",
             AsyncMock(return_value="bearer-fail"),
         )
-        a._http_client.post = AsyncMock(return_value=MagicMock(
-            status_code=503, text="upstream busy",
-            json=lambda: {},
-        ))
+        a._http_client.post = AsyncMock(
+            return_value=MagicMock(
+                status_code=503,
+                text="upstream busy",
+                json=lambda: {},
+            )
+        )
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
 
@@ -15786,12 +15363,17 @@ class TestSendStreamStart:
 
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(
-            bridge, "acquire_outbound_token",
+            bridge,
+            "acquire_outbound_token",
             AsyncMock(return_value="bearer-x"),
         )
-        a._http_client.post = AsyncMock(return_value=MagicMock(
-            status_code=201, text="", json=lambda: {},
-        ))
+        a._http_client.post = AsyncMock(
+            return_value=MagicMock(
+                status_code=201,
+                text="",
+                json=lambda: {},
+            )
+        )
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
 
@@ -15812,9 +15394,7 @@ class TestSendStreamStart:
         assert ("c1", "m1") not in a._streams
         assert "c1" not in a._active_stream_by_chat
 
-    def test_drop_stream_state_only_clears_chat_slot_when_id_matches(
-        self, monkeypatch
-    ) -> None:
+    def test_drop_stream_state_only_clears_chat_slot_when_id_matches(self, monkeypatch) -> None:
         # Defensive: if a different stream is active in the chat slot,
         # don't clobber it.
         a = _make_adapter(monkeypatch)
@@ -15839,9 +15419,7 @@ class TestSendStreamStart:
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-short"}),
             MagicMock(status_code=202, text="", json=lambda: {}),
         ]
-        post_mock = TestEditMessage._wire_adapter(
-            a, inbound=inbound, post_responses=responses
-        )
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
 
@@ -15860,17 +15438,13 @@ class TestSendStreamStart:
         assert "streamId" not in opened["entities"][0]
         assert final["type"] == "message"
         assert final["text"] == "Pong 2."
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-short"
         assert "streamSequence" not in info
         assert "conv-short" not in a._active_stream_by_chat
 
-        again = await a.edit_message(
-            "conv-short", "bf-short", "Pong 2.", finalize=True
-        )
+        again = await a.edit_message("conv-short", "bf-short", "Pong 2.", finalize=True)
         assert again.success is True
         assert post_mock.await_count == 2
 
@@ -15886,9 +15460,7 @@ class TestSendStreamStart:
             MagicMock(status_code=400, text="", json=lambda body=failure: body),
             MagicMock(status_code=202, text="", json=lambda: {}),
         ]
-        post_mock = TestEditMessage._wire_adapter(
-            a, inbound=inbound, post_responses=responses
-        )
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
         caplog.set_level("WARNING")
@@ -15918,9 +15490,7 @@ class TestSendStreamStart:
         await a.on_processing_complete(event, outcome="success")
         assert post_mock.await_count == 3
         final = post_mock.await_args.kwargs["json"]
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-reject"
         assert "conv-reject" not in a._active_stream_by_chat
@@ -15935,15 +15505,11 @@ class TestSendStreamStart:
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-end"}),
             MagicMock(status_code=202, text="", json=lambda: {}),
         ]
-        post_mock = TestEditMessage._wire_adapter(
-            a, inbound=inbound, post_responses=responses
-        )
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
 
-        opened = await a.send(
-            chat_id="conv-end", content="Pong 2.", reply_to="act-1"
-        )
+        opened = await a.send(chat_id="conv-end", content="Pong 2.", reply_to="act-1")
         assert opened.success is True
         assert post_mock.await_count == 1
         assert a._active_stream_by_chat["conv-end"] == "bf-end"
@@ -15958,9 +15524,7 @@ class TestSendStreamStart:
         final = post_mock.await_args.kwargs["json"]
         assert final["type"] == "message"
         assert final["text"] == "Pong 2."
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-end"
         assert "conv-end" not in a._active_stream_by_chat
@@ -15977,9 +15541,7 @@ class TestSendStreamStart:
         post_mock = TestEditMessage._wire_adapter(
             a,
             inbound=inbound,
-            post_responses=[
-                MagicMock(status_code=503, text="", json=lambda body=failure: body)
-            ],
+            post_responses=[MagicMock(status_code=503, text="", json=lambda body=failure: body)],
         )
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
@@ -15999,9 +15561,7 @@ class TestSendStreamStart:
         assert post_mock.await_count == 1
         assert "conv-plain" not in a._active_stream_by_chat
 
-        follow = await a.edit_message(
-            "conv-plain", result.message_id, "Pong 2.", finalize=True
-        )
+        follow = await a.edit_message("conv-plain", result.message_id, "Pong 2.", finalize=True)
         assert follow.success is True
         assert post_mock.await_count == 1
         assert send_reply.await_count == 1
@@ -16019,9 +15579,7 @@ class TestSendStreamStart:
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-nest"}),
             MagicMock(status_code=202, text="", json=lambda: {}),
         ]
-        post_mock = TestEditMessage._wire_adapter(
-            a, inbound=inbound, post_responses=responses
-        )
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
         bridge = adapter_mod._import_bridge()
@@ -16039,9 +15597,7 @@ class TestSendStreamStart:
             message_id="act-follow",
         )
         await a.on_processing_start(outer)
-        opened = await a.send(
-            chat_id="conv-nest", content="Hello", reply_to="act-1"
-        )
+        opened = await a.send(chat_id="conv-nest", content="Hello", reply_to="act-1")
         assert opened.success is True
         assert post_mock.await_count == 1
         await a.on_processing_start(follow)
@@ -16057,9 +15613,7 @@ class TestSendStreamStart:
         assert send_reply.await_count == 1
         assert post_mock.await_count == 1
         assert a._active_stream_by_chat["conv-nest"] == "bf-nest"
-        edit = await a.edit_message(
-            "conv-nest", nested.message_id, "Follow up.", finalize=True
-        )
+        edit = await a.edit_message("conv-nest", nested.message_id, "Follow up.", finalize=True)
         assert edit.success is True
         assert post_mock.await_count == 1
 
@@ -16071,9 +15625,7 @@ class TestSendStreamStart:
         assert post_mock.await_count == 2
         final = post_mock.await_args.kwargs["json"]
         assert final["text"] == "Hello"
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-nest"
         assert "conv-nest" not in a._active_stream_by_chat
@@ -16090,9 +15642,7 @@ class TestSendStreamStart:
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-prev"}),
             MagicMock(status_code=202, text="", json=lambda: {}),
         ]
-        post_mock = TestEditMessage._wire_adapter(
-            a, inbound=inbound, post_responses=responses
-        )
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
         bridge = adapter_mod._import_bridge()
@@ -16110,9 +15660,7 @@ class TestSendStreamStart:
             message_id="act-follow",
         )
         await a.on_processing_start(outer)
-        opened = await a.send(
-            chat_id="conv-prev", content="Hello", reply_to="act-1"
-        )
+        opened = await a.send(chat_id="conv-prev", content="Hello", reply_to="act-1")
         assert opened.success is True
         assert post_mock.await_count == 1
         await a.on_processing_start(follow)
@@ -16129,9 +15677,7 @@ class TestSendStreamStart:
         assert post_mock.await_count == 1
         assert ("conv-prev", preview.message_id) not in a._recently_finalized
 
-        edited = await a.edit_message(
-            "conv-prev", preview.message_id, "Hi there ▉", finalize=False
-        )
+        edited = await a.edit_message("conv-prev", preview.message_id, "Hi there ▉", finalize=False)
         assert edited.success is True
         assert send_reply.await_count == 0
         assert post_mock.await_count == 1
@@ -16157,11 +15703,7 @@ class TestSendStreamStart:
         assert post_mock.await_count == 2
         outer_final = post_mock.await_args.kwargs["json"]
         assert outer_final["text"] == "Hello"
-        info = next(
-            entity
-            for entity in outer_final["entities"]
-            if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in outer_final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-prev"
 
@@ -16175,9 +15717,7 @@ class TestSendStreamStart:
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-close"}),
             MagicMock(status_code=202, text="", json=lambda: {}),
         ]
-        post_mock = TestEditMessage._wire_adapter(
-            a, inbound=inbound, post_responses=responses
-        )
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
         bridge = adapter_mod._import_bridge()
@@ -16195,9 +15735,7 @@ class TestSendStreamStart:
         assert post_mock.await_count == 2
         final = post_mock.await_args.kwargs["json"]
         assert final["text"] == "Pong 2."
-        info = next(
-            entity for entity in final["entities"] if entity["type"] == "streaminfo"
-        )
+        info = next(entity for entity in final["entities"] if entity["type"] == "streaminfo")
         assert info["streamType"] == "final"
         assert info["streamId"] == "bf-close"
         assert send_reply.await_count == 0
@@ -16212,9 +15750,7 @@ class TestSendStreamStart:
         post_mock = TestEditMessage._wire_adapter(
             a,
             inbound=inbound,
-            post_responses=MagicMock(
-                status_code=201, text="", json=lambda: {"id": "bf-preview"}
-            ),
+            post_responses=MagicMock(status_code=201, text="", json=lambda: {"id": "bf-preview"}),
         )
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
@@ -16254,15 +15790,10 @@ class TestSendStreamStart:
         assert str(result.message_id).startswith("coalesced:")
         assert post_mock.await_count == 0
         assert "conv-cc" not in a._active_stream_by_chat
-        closed = await a.edit_message(
-            "conv-cc", str(result.message_id), "Pong 2.", finalize=True
-        )
+        closed = await a.edit_message("conv-cc", str(result.message_id), "Pong 2.", finalize=True)
         assert closed.success is True
         assert send_reply.await_count == 1
         assert post_mock.await_count == 0
-
-
-
 
 
 class TestPluginRegisterCli:
@@ -16325,9 +15856,7 @@ class TestRegisterCliDispatch:
     matching script's `run` function with a Namespace shaped the way
     that script expects."""
 
-    def test_doctor_dispatch_routes_to_doctor_run(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_doctor_dispatch_routes_to_doctor_run(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import hermes_a365.doctor as _doctor
 
         captured: dict[str, Any] = {}
@@ -16344,9 +15873,7 @@ class TestRegisterCliDispatch:
         assert captured["args"].human is True
         assert captured["args"].no_network is False
 
-    def test_status_dispatch_carries_agent_name(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_status_dispatch_carries_agent_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import hermes_a365.status as _status
 
         captured: dict[str, Any] = {}
@@ -16363,9 +15890,7 @@ class TestRegisterCliDispatch:
         assert captured["args"].agent_name == "inbox-helper"
         assert captured["args"].human is True
 
-    def test_cleanup_dispatch_carries_required_flags(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_cleanup_dispatch_carries_required_flags(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import hermes_a365.cleanup as _cleanup
 
         captured: dict[str, Any] = {}
@@ -16391,9 +15916,7 @@ class TestRegisterCliDispatch:
         assert rc == 0
         assert captured["args"].agent_name == "foo"
         assert captured["args"].purge_orphans is True
-        assert captured["args"].orphan_instance_id == [
-            "11111111-1111-1111-1111-111111111111"
-        ]
+        assert captured["args"].orphan_instance_id == ["11111111-1111-1111-1111-111111111111"]
 
     def test_register_dispatch_carries_apply_and_recover_flags(
         self, monkeypatch: pytest.MonkeyPatch
@@ -16467,17 +15990,13 @@ class TestRegisterCliDispatch:
 
         monkeypatch.setattr(_activity_bridge, "run", _fake_run)
         parser = _build_a365_parser()
-        ns = parser.parse_args(
-            ["a365", "activity-bridge", "verify", "--slug", "inbox-helper"]
-        )
+        ns = parser.parse_args(["a365", "activity-bridge", "verify", "--slug", "inbox-helper"])
         rc = cli_mod.a365_command(ns)
         assert rc == 0
         assert captured["args"].cmd == "verify"
         assert captured["args"].slug == "inbox-helper"
 
-    def test_unknown_verb_returns_2(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_unknown_verb_returns_2(self, capsys: pytest.CaptureFixture[str]) -> None:
         # No subcommand at all → usage + 2.
         ns_empty = type("NS", (), {})()
         rc = cli_mod.a365_command(ns_empty)  # type: ignore[arg-type]
@@ -16501,9 +16020,7 @@ class TestRegisterCliDispatch:
 
 
 class TestConversationsPruneConfig:
-    def test_default_max_age_is_30_days(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_default_max_age_is_30_days(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         assert a._conversations_prune_max_age_days == 30.0
 
@@ -16515,19 +16032,13 @@ class TestConversationsPruneConfig:
         a = _make_adapter(monkeypatch, conversations_prune_max_age_days=0.5)
         assert a._conversations_prune_max_age_days == 0.5
 
-    def test_extra_override_string_int(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_extra_override_string_int(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # YAML may surface this as a string depending on quoting.
         a = _make_adapter(monkeypatch, conversations_prune_max_age_days="14")
         assert a._conversations_prune_max_age_days == 14.0
 
-    def test_invalid_value_falls_back_to_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        a = _make_adapter(
-            monkeypatch, conversations_prune_max_age_days="not-a-number"
-        )
+    def test_invalid_value_falls_back_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        a = _make_adapter(monkeypatch, conversations_prune_max_age_days="not-a-number")
         assert a._conversations_prune_max_age_days == 30.0
 
 
@@ -16574,9 +16085,7 @@ class TestPruneConversations:
         original = a._conversations.prune_old_entries
         captured: dict[str, Any] = {}
 
-        def _spy(
-            max_age_days: float, *, active_session_keys=None, now=None
-        ) -> int:
+        def _spy(max_age_days: float, *, active_session_keys=None, now=None) -> int:
             captured["max_age_days"] = max_age_days
             captured["active_session_keys"] = set(active_session_keys or [])
             captured["now"] = now
@@ -16603,9 +16112,7 @@ class TestPruneConversations:
 
         a = _make_adapter(monkeypatch, conversations_prune_max_age_days=10)
         for cid in ("awaiting-approval", "stale-chat"):
-            a._conversations.upsert(
-                ConversationRef(conversation_id=cid, service_url="https://x/")
-            )
+            a._conversations.upsert(ConversationRef(conversation_id=cid, service_url="https://x/"))
             a._conversations._by_id[cid].last_used_at = 1000.0
         a._card_capabilities["nonce"] = {
             "kind": "clarify",
@@ -16625,9 +16132,7 @@ class TestPruneConversations:
         from hermes_a365.plugin.conversations import ConversationRef
 
         a = _make_adapter(monkeypatch, conversations_prune_max_age_days=10)
-        awaiting = _make_inbound(
-            conv_id="awaiting-approval", activity_id="act-wait"
-        )
+        awaiting = _make_inbound(conv_id="awaiting-approval", activity_id="act-wait")
         ref = ConversationRef.from_activity(awaiting)
         assert ref is not None
         a._conversations.upsert(ref)
@@ -16645,9 +16150,7 @@ class TestPruneConversations:
         dropped = await a.prune_conversations()
         assert dropped == 1
         assert "stale-chat" not in a._conversations
-        await _assert_cached_send_resolves(
-            a, monkeypatch, "awaiting-approval", "act-wait"
-        )
+        await _assert_cached_send_resolves(a, monkeypatch, "awaiting-approval", "act-wait")
 
     @pytest.mark.asyncio
     async def test_prune_resume_send_resolves_after_something_else(
@@ -16681,9 +16184,7 @@ class TestPruneConversations:
         assert dropped == 1
         assert "awaiting-other" in a._conversations
         assert "stale-chat" not in a._conversations
-        await _assert_cached_send_resolves(
-            a, monkeypatch, "awaiting-other", "act-other"
-        )
+        await _assert_cached_send_resolves(a, monkeypatch, "awaiting-other", "act-other")
 
     @pytest.mark.asyncio
     async def test_saves_to_disk_when_anything_dropped(
@@ -16700,11 +16201,7 @@ class TestPruneConversations:
             conversations_path=str(conv_path),
             conversations_prune_max_age_days=10,
         )
-        a._conversations.upsert(
-            ConversationRef(
-                conversation_id="stale", service_url="https://x/"
-            )
-        )
+        a._conversations.upsert(ConversationRef(conversation_id="stale", service_url="https://x/"))
         a._conversations._by_id["stale"].last_used_at = 1000.0  # ancient
         # Persist initial state so we can confirm the post-prune save.
         await a._persist_conversations()
@@ -16743,18 +16240,12 @@ class TestPruneConversations:
                 _time.sleep(0.25)  # the first (older) snapshot's write is slow
             real_write(path, payload)
 
-        monkeypatch.setattr(
-            ConversationRegistry, "write_payload", staticmethod(slow_write)
-        )
+        monkeypatch.setattr(ConversationRegistry, "write_payload", staticmethod(slow_write))
 
-        a._conversations.upsert(
-            ConversationRef(conversation_id="A", service_url="https://x/")
-        )
+        a._conversations.upsert(ConversationRef(conversation_id="A", service_url="https://x/"))
         t1 = _asyncio.create_task(a._persist_conversations())
         await _asyncio.sleep(0.02)  # let t1 take the lock + start its slow write
-        a._conversations.upsert(
-            ConversationRef(conversation_id="B", service_url="https://x/")
-        )
+        a._conversations.upsert(ConversationRef(conversation_id="B", service_url="https://x/"))
         t2 = _asyncio.create_task(a._persist_conversations())
         await _asyncio.gather(t1, t2)
 
@@ -16793,18 +16284,12 @@ class TestPruneConversations:
                 _time.sleep(0.25)  # the first (older) snapshot's write is slow
             real_write(path, payload)
 
-        monkeypatch.setattr(
-            ConversationRegistry, "write_payload", staticmethod(slow_write)
-        )
+        monkeypatch.setattr(ConversationRegistry, "write_payload", staticmethod(slow_write))
 
-        a._conversations.upsert(
-            ConversationRef(conversation_id="A", service_url="https://x/")
-        )
+        a._conversations.upsert(ConversationRef(conversation_id="A", service_url="https://x/"))
         t1 = _asyncio.create_task(a._persist_conversations())
         await _asyncio.sleep(0.02)  # let t1 take the lock + start its slow write
-        a._conversations.upsert(
-            ConversationRef(conversation_id="B", service_url="https://x/")
-        )
+        a._conversations.upsert(ConversationRef(conversation_id="B", service_url="https://x/"))
         t2 = _asyncio.create_task(a._persist_conversations())
         # Cancel the OLDER save's awaiter mid-write; the shielded inner keeps
         # running to completion, still holding the lock.
@@ -16845,14 +16330,10 @@ class TestPruneConversations:
                 await _asyncio.sleep(0)
             raise AssertionError(detail)
 
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         conv_path = tmp_path / "shared.json"
         old = _make_adapter(monkeypatch, conversations_path=str(conv_path))
-        replacement = _make_adapter(
-            monkeypatch, conversations_path=str(conv_path)
-        )
+        replacement = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         real_write = ConversationRegistry.write_payload
         old_started = _threading.Event()
         release_old = _threading.Event()
@@ -16860,8 +16341,7 @@ class TestPruneConversations:
 
         def blocked_old_write(path: Path, payload: Any) -> None:
             ids = {
-                str(item.get("conversation_id") or "")
-                for item in payload.get("conversations", [])
+                str(item.get("conversation_id") or "") for item in payload.get("conversations", [])
             }
             if ids == {"old"}:
                 old_started.set()
@@ -16882,9 +16362,7 @@ class TestPruneConversations:
             # Fuse only: the write task sets this as soon as it blocks.
             assert await _asyncio.to_thread(old_started.wait, 10)
             old._conversations.upsert(
-                ConversationRef(
-                    conversation_id="queued-stale", service_url="https://x/"
-                )
+                ConversationRef(conversation_id="queued-stale", service_url="https://x/")
             )
             queued_stale_save = _asyncio.create_task(old._persist_conversations())
             await _until(
@@ -16900,16 +16378,12 @@ class TestPruneConversations:
 
             await old.disconnect()
             assert old._disconnecting is True
-            replacement_activation = _asyncio.create_task(
-                replacement._activate_persist_owner()
-            )
+            replacement_activation = _asyncio.create_task(replacement._activate_persist_owner())
 
             def _replacement_waiting_on_shielded_write() -> bool:
                 with adapter_mod._PERSIST_STATE_GUARD:
                     state = adapter_mod._persist_state(old._conversations_path)
-                    return bool(int(state["handoff_owner"])) and bool(
-                        state["pending"]
-                    )
+                    return bool(int(state["handoff_owner"])) and bool(state["pending"])
 
             await _until(
                 _replacement_waiting_on_shielded_write,
@@ -16919,9 +16393,7 @@ class TestPruneConversations:
             release_old.set()
             await replacement_activation
             replacement._conversations.upsert(
-                ConversationRef(
-                    conversation_id="replacement", service_url="https://x/"
-                )
+                ConversationRef(conversation_id="replacement", service_url="https://x/")
             )
             await replacement._persist_conversations()
             await _asyncio.sleep(0)
@@ -16955,8 +16427,7 @@ class TestPruneConversations:
 
         def blocked_first_write(path: Path, payload: Any) -> None:
             ids = {
-                str(item.get("conversation_id") or "")
-                for item in payload.get("conversations", [])
+                str(item.get("conversation_id") or "") for item in payload.get("conversations", [])
             }
             if ids == {"old-first"}:
                 first_started.set()
@@ -16979,9 +16450,7 @@ class TestPruneConversations:
         )
         queued_old_save = _asyncio.create_task(old._persist_conversations())
         await _asyncio.sleep(0)
-        replacement_activation = _asyncio.create_task(
-            replacement._activate_persist_owner()
-        )
+        replacement_activation = _asyncio.create_task(replacement._activate_persist_owner())
         await _asyncio.sleep(0.02)
         release_first.set()
         await _asyncio.wait_for(
@@ -17040,14 +16509,9 @@ class TestPruneConversations:
 
         conv_path = tmp_path / "failed-owner-rollback.json"
         active = _make_adapter(monkeypatch, conversations_path=str(conv_path))
-        replacement = _make_adapter(
-            monkeypatch, conversations_path=str(conv_path)
-        )
+        replacement = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         active_owner = await active._activate_persist_owner()
-        assert (
-            await replacement._activate_persist_owner(tentative=True)
-            > active_owner
-        )
+        assert await replacement._activate_persist_owner(tentative=True) > active_owner
         replacement._http_client = MagicMock()
         replacement._http_client.aclose = AsyncMock()
 
@@ -17055,9 +16519,7 @@ class TestPruneConversations:
 
         assert replacement._persist_owner_sequence is None
         transport = httpx.ASGITransport(app=replacement.build_app())
-        async with httpx.AsyncClient(
-            transport=transport, base_url="http://testserver"
-        ) as client:
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
             rejected = await client.post(
                 "/api/messages",
                 json=_make_inbound(conv_id="conv-failed-owner"),
@@ -17153,17 +16615,13 @@ class TestPruneConversations:
             )
         )
         assert await _asyncio.to_thread(b_write_started.wait, 1.0)
-        c_activation = _asyncio.create_task(
-            failed_c._activate_persist_owner(tentative=True)
-        )
+        c_activation = _asyncio.create_task(failed_c._activate_persist_owner(tentative=True))
         await _asyncio.sleep(0.02)
         assert not c_activation.done()
 
         failed_b._release_failed_persist_owner()
         release_b_write.set()
-        await _asyncio.wait_for(
-            _asyncio.gather(b_save, c_activation), timeout=1.0
-        )
+        await _asyncio.wait_for(_asyncio.gather(b_save, c_activation), timeout=1.0)
         failed_c._release_failed_persist_owner()
 
         active._conversations.upsert(
@@ -17231,8 +16689,7 @@ class TestPruneConversations:
 
         def blocked_first_write(path: Path, payload: Any) -> None:
             ids = {
-                str(item.get("conversation_id") or "")
-                for item in payload.get("conversations", [])
+                str(item.get("conversation_id") or "") for item in payload.get("conversations", [])
             }
             if ids == {"seed", "during-handoff"}:
                 first_started.set()
@@ -17245,29 +16702,21 @@ class TestPruneConversations:
             staticmethod(blocked_first_write),
         )
         active._conversations.upsert(
-            ConversationRef(
-                conversation_id="during-handoff", service_url="https://x/"
-            )
+            ConversationRef(conversation_id="during-handoff", service_url="https://x/")
         )
         first_save = _asyncio.create_task(active._persist_conversations())
         assert await _asyncio.to_thread(first_started.wait, 1.0)
-        activation = _asyncio.create_task(
-            replacement._activate_persist_owner(tentative=True)
-        )
+        activation = _asyncio.create_task(replacement._activate_persist_owner(tentative=True))
         await _asyncio.sleep(0.02)
         assert not activation.done()
 
         active._conversations.upsert(
-            ConversationRef(
-                conversation_id="late-handoff", service_url="https://x/"
-            )
+            ConversationRef(conversation_id="late-handoff", service_url="https://x/")
         )
         late_save = _asyncio.create_task(active._persist_conversations())
         await _asyncio.sleep(0.02)
         release_first.set()
-        await _asyncio.wait_for(
-            _asyncio.gather(first_save, late_save, activation), timeout=1.0
-        )
+        await _asyncio.wait_for(_asyncio.gather(first_save, late_save, activation), timeout=1.0)
 
         assert "during-handoff" in replacement._conversations
         assert "late-handoff" in replacement._conversations
@@ -17312,9 +16761,7 @@ class TestPruneConversations:
         monkeypatch.setattr(active, "_teardown_chat_state", blocked_teardown)
         eviction = _asyncio.create_task(active._evict_conversation("revoked"))
         await teardown_started.wait()
-        activation = _asyncio.create_task(
-            replacement._activate_persist_owner(tentative=True)
-        )
+        activation = _asyncio.create_task(replacement._activate_persist_owner(tentative=True))
         await _asyncio.sleep(0.02)
         assert not activation.done()
 
@@ -17327,9 +16774,7 @@ class TestPruneConversations:
         assert "revoked" in ConversationRegistry.load(conv_path)
 
         release_teardown.set()
-        await _asyncio.wait_for(
-            _asyncio.gather(eviction, activation), timeout=1.0
-        )
+        await _asyncio.wait_for(_asyncio.gather(eviction, activation), timeout=1.0)
         assert "revoked" not in replacement._conversations
         assert "unrelated" in replacement._conversations
         assert "revoked" not in ConversationRegistry.load(conv_path)
@@ -17345,14 +16790,10 @@ class TestPruneConversations:
         cancelled = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         successor = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         active_owner = await active._activate_persist_owner()
-        state, sequence = adapter_mod._reserve_persist_sequence(
-            conv_path, active_owner
-        )
+        state, sequence = adapter_mod._reserve_persist_sequence(conv_path, active_owner)
         assert sequence is not None
 
-        activation = _asyncio.create_task(
-            cancelled._activate_persist_owner(tentative=True)
-        )
+        activation = _asyncio.create_task(cancelled._activate_persist_owner(tentative=True))
         await _asyncio.sleep(0.02)
         assert not activation.done()
         activation.cancel()
@@ -17378,9 +16819,7 @@ class TestPruneConversations:
         timed_out = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         successor = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         active_owner = await active._activate_persist_owner()
-        state, sequence = adapter_mod._reserve_persist_sequence(
-            conv_path, active_owner
-        )
+        state, sequence = adapter_mod._reserve_persist_sequence(conv_path, active_owner)
         assert sequence is not None
 
         with pytest.raises(TimeoutError, match="persistence handoff timed out"):
@@ -17410,9 +16849,7 @@ class TestPruneConversations:
         )
         await old._persist_conversations()
 
-        replacement = _make_adapter(
-            monkeypatch, conversations_path=str(conv_path)
-        )
+        replacement = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         assert "revoked" in replacement._conversations
         old._conversations.evict("revoked")
         await old._persist_conversations()
@@ -17446,9 +16883,7 @@ class TestPruneConversations:
             ConversationRef(conversation_id="revoked", service_url="https://x/")
         )
         await old._persist_conversations()
-        replacement = _make_adapter(
-            monkeypatch, conversations_path=str(conv_path)
-        )
+        replacement = _make_adapter(monkeypatch, conversations_path=str(conv_path))
         assert "revoked" in replacement._conversations
 
         real_write = ConversationRegistry.write_payload
@@ -17459,8 +16894,7 @@ class TestPruneConversations:
         def blocked_write(path: Path, payload: Any) -> None:
             nonlocal blocked_once
             ids = {
-                str(item.get("conversation_id") or "")
-                for item in payload.get("conversations", [])
+                str(item.get("conversation_id") or "") for item in payload.get("conversations", [])
             }
             if ids == {"revoked"} and not blocked_once:
                 blocked_once = True
@@ -17479,9 +16913,7 @@ class TestPruneConversations:
         uninstall_save = _asyncio.create_task(old._persist_conversations())
         await _asyncio.sleep(0.02)
 
-        activation = _asyncio.create_task(
-            replacement._activate_persist_owner()
-        )
+        activation = _asyncio.create_task(replacement._activate_persist_owner())
         await _asyncio.sleep(0.02)
         assert not activation.done()
         activation.cancel()
@@ -17512,9 +16944,7 @@ class TestPruneConversations:
             conversations_path=str(conv_path),
             conversations_prune_max_age_days=30,
         )
-        a._conversations.upsert(
-            ConversationRef(conversation_id="fresh", service_url="https://x/")
-        )
+        a._conversations.upsert(ConversationRef(conversation_id="fresh", service_url="https://x/"))
         # Don't seed an initial save -- if nothing drops, the prune
         # path should not write anything either.
 
@@ -17563,9 +16993,7 @@ class TestMarkUsedFromOutboundPaths:
         assert after > before
 
     @pytest.mark.asyncio
-    async def test_send_proactive_bumps_last_used_at(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_proactive_bumps_last_used_at(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from hermes_a365.plugin.conversations import ConversationRef
 
         a = _make_adapter(monkeypatch)
@@ -17601,9 +17029,7 @@ class TestMarkUsedFromOutboundPaths:
         a._http_client = MagicMock()
         a._http_client.post = AsyncMock(return_value=mock_resp)
         bridge = adapter_mod._import_bridge()
-        monkeypatch.setattr(
-            bridge, "acquire_outbound_token", AsyncMock(return_value="tok")
-        )
+        monkeypatch.setattr(bridge, "acquire_outbound_token", AsyncMock(return_value="tok"))
         # Force proactive path.
         monkeypatch.setattr(a, "_cached_inbound_for", lambda _c: None)
 
@@ -17615,9 +17041,7 @@ class TestMarkUsedFromOutboundPaths:
         assert after > before
 
     @pytest.mark.asyncio
-    async def test_send_typing_bumps_last_used_at(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_typing_bumps_last_used_at(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(
             adapter_mod.ConversationRef.from_activity(_make_inbound()),
@@ -17633,9 +17057,7 @@ class TestMarkUsedFromOutboundPaths:
         assert after > before
 
     @pytest.mark.asyncio
-    async def test_send_image_bumps_last_used_at(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_image_bumps_last_used_at(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(
             adapter_mod.ConversationRef.from_activity(_make_inbound()),
@@ -17715,9 +17137,7 @@ class TestActivityToEvent:
         assert evt.raw_message["text"] == "<at>Hermes Inbox Helper R8</at>"
         assert evt.raw_message["entities"][0]["text"] == "<at>Hermes Inbox Helper R8</at>"
 
-    def test_cc_groupchat_no_text_field_is_noop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_cc_groupchat_no_text_field_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Real CC raw: text already clean; mention entity has NO `text` field.
         act = {
             "id": "act-2",
@@ -17745,9 +17165,7 @@ class TestActivityToEvent:
         )
         assert self._event(monkeypatch, act).text == "status please"
 
-    def test_non_recipient_mention_preserved(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_non_recipient_mention_preserved(self, monkeypatch: pytest.MonkeyPatch) -> None:
         other = {
             "type": "mention",
             "mentioned": {"id": "29:someone-else", "name": "Alice"},
@@ -17769,9 +17187,7 @@ class TestActivityToEvent:
         )
         assert self._event(monkeypatch, act).text == "hi"
 
-    def test_multiline_body_not_reflowed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_multiline_body_not_reflowed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         act = self._channel_activity(
             text="<at>Bot</at> line one\nline two",
             entities=[self._mention("<at>Bot</at>")],
@@ -17788,18 +17204,14 @@ class TestActivityToEvent:
         }
         assert self._event(monkeypatch, act).text == "plain dm message"
 
-    def test_recipient_missing_no_stripping(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_recipient_missing_no_stripping(self, monkeypatch: pytest.MonkeyPatch) -> None:
         act = {
             "id": "a",
             "text": "<at>Bot</at> hello",
             "from": {"id": "29:u"},
             "recipient": None,
             "conversation": {"id": "c", "conversationType": "channel"},
-            "entities": [
-                {"type": "mention", "mentioned": {"id": "x"}, "text": "<at>Bot</at>"}
-            ],
+            "entities": [{"type": "mention", "mentioned": {"id": "x"}, "text": "<at>Bot</at>"}],
         }
         # recipient_id == "" -> helper returns text unchanged.
         assert self._event(monkeypatch, act).text == "<at>Bot</at> hello"
@@ -17869,9 +17281,7 @@ class TestInvokeRoute:
         body["value"] = {"commandId": "x"} if value is None else value
         return body
 
-    def test_task_fetch_returns_sync_invoke_response(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_task_fetch_returns_sync_invoke_response(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a, client = self._client(monkeypatch)
         r = client.post(
             "/api/messages",
@@ -17901,9 +17311,7 @@ class TestInvokeRoute:
         assert "error" in r.json()
         assert a._handled_events == []
 
-    def test_non_dict_value_handled_gracefully(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_non_dict_value_handled_gracefully(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # task/fetch ignores value; a non-dict value must not 500.
         _a, client = self._client(monkeypatch)
         r = client.post(
@@ -17914,9 +17322,7 @@ class TestInvokeRoute:
         assert r.status_code == 200
         assert r.json()["task"]["type"] == "continue"
 
-    def test_message_activity_still_dispatches(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_message_activity_still_dispatches(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Regression: the invoke branch must not capture normal messages.
         a, client = self._client(monkeypatch)
         r = client.post(
@@ -17948,9 +17354,7 @@ class TestInvokeRoute:
         # Never dispatched to the fire-and-forget agent loop either.
         assert a._handled_events == []
 
-    def test_handler_exception_returns_empty_ack(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_handler_exception_returns_empty_ack(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # A handler crash degrades to the canonical empty ack (#132): HTTP 200
         # + JSON {}, the same wire serve uses. Never a 5xx (#97), and never
         # JSON null (Teams: "Payload cannot be null").
@@ -17970,9 +17374,7 @@ class TestInvokeRoute:
         assert r.json() == {}
         assert a._handled_events == []
 
-    def test_claims_wired_into_invoke_context(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_claims_wired_into_invoke_context(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # The load-bearing new behavior: the validated JWT claims (previously
         # discarded) feed InvokeContext identity.
         from fastapi.testclient import TestClient
@@ -18218,9 +17620,7 @@ class TestInboundMedia:
 
         owner = asyncio.create_task(active_turn())
         first_adapter._media_leases_by_session["session-media"] = leases
-        first_adapter._watch_agent_turn_owner(
-            "session-media", asyncio.Event(), owner
-        )
+        first_adapter._watch_agent_turn_owner("session-media", asyncio.Event(), owner)
 
         rejected = await replacement._download_inbound_media(
             "https://contoso.sharepoint.com/two",
@@ -18274,13 +17674,9 @@ class TestInboundMedia:
             lease_paths=failed_leases,
         )
         assert active is not None and failed is not None
-        active_adapter._media_leases_by_session["shared-session"] = (
-            active_leases | failed_leases
-        )
+        active_adapter._media_leases_by_session["shared-session"] = active_leases | failed_leases
 
-        active_adapter._release_request_media_leases(
-            "shared-session", failed_leases
-        )
+        active_adapter._release_request_media_leases("shared-session", failed_leases)
         pressure = await replacement._download_inbound_media(
             "https://contoso.sharepoint.com/pressure",
             headers=None,
@@ -18332,9 +17728,7 @@ class TestInboundMedia:
         a = self._adapter(monkeypatch, tmp_path)
         stream = self._stream(a, b"PNGDATA")
         bridge = adapter_mod._import_bridge()
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(return_value=("BEARER", "A"))
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(return_value=("BEARER", "A")))
         activity = {
             "id": "act-img",
             "attachments": [
@@ -18348,9 +17742,7 @@ class TestInboundMedia:
         assert p.read_bytes() == b"PNGDATA"
         assert p.suffix == ".png"
         # contentUrl fetched WITH the reply bearer.
-        assert (
-            stream.call_args.kwargs["headers"]["Authorization"] == "Bearer BEARER"
-        )
+        assert stream.call_args.kwargs["headers"]["Authorization"] == "Bearer BEARER"
 
     @pytest.mark.asyncio
     async def test_inbound_media_token_mint_cannot_cross_disconnect(
@@ -18371,9 +17763,7 @@ class TestInboundMedia:
                 raise
             return "STALE", "A"
 
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token)
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(side_effect=delayed_token))
         old_client = a._http_client
         old_client.aclose = AsyncMock()
         activity = _make_inbound(conv_id="conv-media-token")
@@ -18383,9 +17773,7 @@ class TestInboundMedia:
                 "contentUrl": "https://smba.trafficmanager.net/att/1",
             }
         ]
-        extraction = asyncio.create_task(
-            a._extract_inbound_media(activity, validated_path="A")
-        )
+        extraction = asyncio.create_task(a._extract_inbound_media(activity, validated_path="A"))
         await started.wait()
 
         await a.disconnect()
@@ -18434,9 +17822,7 @@ class TestInboundMedia:
                 },
             }
         ]
-        extraction = asyncio.create_task(
-            a._extract_inbound_media(activity, validated_path="A")
-        )
+        extraction = asyncio.create_task(a._extract_inbound_media(activity, validated_path="A"))
         await started.wait()
 
         await a.disconnect()
@@ -18493,9 +17879,7 @@ class TestInboundMedia:
                 },
             }
         ]
-        extraction = asyncio.create_task(
-            a._extract_inbound_media(activity, validated_path="A")
-        )
+        extraction = asyncio.create_task(a._extract_inbound_media(activity, validated_path="A"))
         await exit_started.wait()
 
         await a.disconnect()
@@ -18671,9 +18055,7 @@ class TestInboundMedia:
         assert out == ([], [], adapter_mod.MessageType.TEXT)  # over cap → dropped
         assert consumed["chunks"] < 10  # aborted after MAX+1, not fully consumed
 
-    def test_activity_to_event_populates_media(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_activity_to_event_populates_media(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         ev = a._activity_to_event(
             _make_inbound(text="see pic"),
@@ -18760,9 +18142,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -18794,9 +18174,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         started = asyncio.Event()
@@ -18814,9 +18192,9 @@ class TestOutboundFiles:
         file_path.write_bytes(b"late consent bytes")
         offer = asyncio.create_task(a.send_document("conv-1", str(file_path)))
         await started.wait()
-        consent_id = send_reply.await_args.kwargs["reply"]["attachments"][0][
-            "content"
-        ]["acceptContext"]["consentId"]
+        consent_id = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
+            "acceptContext"
+        ]["consentId"]
 
         await a.disconnect()
         a._http_client = MagicMock()
@@ -18840,9 +18218,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -18889,9 +18265,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -18908,9 +18282,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -19017,9 +18389,7 @@ class TestOutboundFiles:
         old_client.aclose = AsyncMock()
         acceptance = asyncio.create_task(
             a._handle_file_consent(
-                self._consent_activity(
-                    upload_info={"uploadUrl": self._GOOD_UPLOAD}
-                ),
+                self._consent_activity(upload_info={"uploadUrl": self._GOOD_UPLOAD}),
                 validated_path="A",
             )
         )
@@ -19138,9 +18508,7 @@ class TestOutboundFiles:
             AsyncMock(return_value=("token", "B")),
         )
         resp = await a._handle_file_consent(
-            self._consent_activity(
-                upload_info={"uploadUrl": self._GOOD_UPLOAD}
-            ),
+            self._consent_activity(upload_info={"uploadUrl": self._GOOD_UPLOAD}),
             validated_path="A",
         )
         assert resp.status == 200
@@ -19154,9 +18522,7 @@ class TestOutboundFiles:
         self._connect(a)
         a._http_client.put = AsyncMock()
         resp = await a._handle_file_consent(
-            self._consent_activity(
-                consent_id="nope", upload_info={"uploadUrl": "https://x/y"}
-            ),
+            self._consent_activity(consent_id="nope", upload_info={"uploadUrl": "https://x/y"}),
             validated_path="A",
         )
         assert resp.status == 200
@@ -19246,9 +18612,7 @@ class TestOutboundFiles:
             },
         }
         client = TestClient(a.build_app())
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         # Handled inline — never dispatched to the fire-and-forget agent loop.
         assert a._handled_events == []
@@ -19294,9 +18658,7 @@ class TestOutboundFiles:
         self._seed_pending(a, f)
         a._http_client.put = AsyncMock()
         # Attacker-controlled upload destination — bytes must never be POSTed.
-        act = self._consent_activity(
-            upload_info={"uploadUrl": "https://evil.example.com/collect"}
-        )
+        act = self._consent_activity(upload_info={"uploadUrl": "https://evil.example.com/collect"})
         await self._accept_and_assert_no_put(a, monkeypatch, act)
 
     @pytest.mark.asyncio
@@ -19338,9 +18700,7 @@ class TestOutboundFiles:
         f = tmp_path / "r.pdf"
         f.write_bytes(b"data")
         # Offered well beyond the TTL.
-        self._seed_pending(
-            a, f, created_at=time.time() - adapter_mod._PENDING_UPLOAD_TTL_SEC - 10
-        )
+        self._seed_pending(a, f, created_at=time.time() - adapter_mod._PENDING_UPLOAD_TTL_SEC - 10)
         a._http_client.put = AsyncMock()
         act = self._consent_activity(upload_info={"uploadUrl": self._GOOD_UPLOAD})
         await self._accept_and_assert_no_put(a, monkeypatch, act)
@@ -19384,9 +18744,7 @@ class TestOutboundFiles:
     ) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_CORRELATOR_ENTRIES", 3)
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
@@ -19398,19 +18756,13 @@ class TestOutboundFiles:
 
     # ── R3-P1: profile-scoped host allowlist + fail-before-offer ──────────
 
-    def test_file_host_allowlist_from_profile_config(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_file_host_allowlist_from_profile_config(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # extra.file_host_allowlist (list) is read + normalised (lower/strip).
         monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
-        a = _make_adapter(
-            monkeypatch, file_host_allowlist=["Contoso.SharePoint.com", " x ", ""]
-        )
+        a = _make_adapter(monkeypatch, file_host_allowlist=["Contoso.SharePoint.com", " x ", ""])
         assert a._file_host_allowlist == ("contoso.sharepoint.com", "x")
 
-    def test_file_host_allowlist_env_fallback(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_file_host_allowlist_env_fallback(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "env.sharepoint.com")
         a = _make_adapter(monkeypatch)  # no profile extra
         assert a._file_host_allowlist == ("env.sharepoint.com",)
@@ -19430,9 +18782,7 @@ class TestOutboundFiles:
         a = _make_adapter(monkeypatch, file_host_allowlist=bad)
         assert a._file_host_allowlist == ()
 
-    def test_two_profiles_reject_each_others_host(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_two_profiles_reject_each_others_host(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # Multiplex safety: profile A's pin must not accept profile B's tenant host.
         monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
         a = _make_adapter(monkeypatch, file_host_allowlist=["tenant-a.sharepoint.com"])
@@ -19452,9 +18802,7 @@ class TestOutboundFiles:
         # offered (a consent flow that could never complete is never presented).
         monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._seen_inbounds_this_lifetime.add("conv-1")
         self._connect(a)
         a._file_host_allowlist = ()  # empty ⇒ fail-closed
@@ -19469,10 +18817,7 @@ class TestOutboundFiles:
         assert a._pending_file_uploads == {}  # no consent recorded
         reply = send_reply.await_args.kwargs["reply"]
         atts = reply.get("attachments") or []
-        assert all(
-            att.get("contentType") != adapter_mod._FILE_CONSENT_CONTENT_TYPE
-            for att in atts
-        )
+        assert all(att.get("contentType") != adapter_mod._FILE_CONSENT_CONTENT_TYPE for att in atts)
         assert "r.pdf" in (reply.get("text") or "")
 
 
@@ -19483,9 +18828,7 @@ class TestOutboundFiles:
 
 class TestFeedbackAndCitations:
     def _connected_send(self, monkeypatch: pytest.MonkeyPatch, a: Any) -> Any:
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -19497,9 +18840,7 @@ class TestFeedbackAndCitations:
         return send_reply
 
     @pytest.mark.asyncio
-    async def test_send_stamps_feedback_channel_data(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_stamps_feedback_channel_data(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         send_reply = self._connected_send(monkeypatch, a)
         await a.send(chat_id="conv-1", content="hi")
@@ -19507,9 +18848,7 @@ class TestFeedbackAndCitations:
         assert reply["channelData"] == {"feedbackLoop": {"type": "default"}}
 
     @pytest.mark.asyncio
-    async def test_feedback_disabled_by_env(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_feedback_disabled_by_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_FEEDBACK_LOOP", "0")
         a = _make_adapter(monkeypatch)
         send_reply = self._connected_send(monkeypatch, a)
@@ -19549,9 +18888,7 @@ class TestFeedbackAndCitations:
         )
 
     @pytest.mark.asyncio
-    async def test_feedback_submit_records_reaction(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_feedback_submit_records_reaction(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         resp = await a._handle_feedback_submit(self._feedback_ctx())
         assert resp.status == 200
@@ -19564,16 +18901,12 @@ class TestFeedbackAndCitations:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        resp = await a._handle_feedback_submit(
-            self._feedback_ctx(action_name="somethingElse")
-        )
+        resp = await a._handle_feedback_submit(self._feedback_ctx(action_name="somethingElse"))
         assert resp.status == 200
         assert a._feedback_by_message_id == {}
 
     @pytest.mark.asyncio
-    async def test_message_fetch_task_acks(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_message_fetch_task_acks(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         ctx = adapter_mod.invoke.build_invoke_context(
             {"type": "invoke", "name": "message/fetchTask", "conversation": {}},
@@ -19583,9 +18916,7 @@ class TestFeedbackAndCitations:
         resp = await a._handle_message_fetch_task(ctx)
         assert resp.status == 200
 
-    def test_invoke_registry_has_children(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_invoke_registry_has_children(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         for name in ("task/fetch", "message/submitAction", "message/fetchTask", "handoff/action"):
             assert name in a._invoke_registry
@@ -19598,9 +18929,7 @@ class TestFeedbackAndCitations:
 
 class TestInteractiveCards:
     def _connect(self, a: Any) -> None:
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -19608,9 +18937,7 @@ class TestInteractiveCards:
         a._bf_token_cache = MagicMock()
 
     @pytest.mark.asyncio
-    async def test_send_exec_approval_card(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_exec_approval_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._connect(a)
         bridge = adapter_mod._import_bridge()
@@ -19624,8 +18951,7 @@ class TestInteractiveCards:
         assert att["contentType"] == "application/vnd.microsoft.card.adaptive"
         actions = att["content"]["actions"]
         assert all(
-            set(act["data"]) == {"hermes_kind", "capability", "choice_id"}
-            for act in actions
+            set(act["data"]) == {"hermes_kind", "capability", "choice_id"} for act in actions
         )
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
         assert list(capability["choices"].values()) == ["once", "session", "always", "deny"]
@@ -19649,12 +18975,8 @@ class TestInteractiveCards:
             started.set()
             await release.wait()
 
-        monkeypatch.setattr(
-            bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply)
-        )
-        send = asyncio.create_task(
-            a.send_exec_approval("conv-1", "danger", "sess-1")
-        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply))
+        send = asyncio.create_task(a.send_exec_approval("conv-1", "danger", "sess-1"))
         await started.wait()
         await a._teardown_chat_state("conv-1")
         release.set()
@@ -19676,9 +18998,9 @@ class TestInteractiveCards:
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
         result = await a.send_exec_approval("conv-1", "danger", "sess-1")
         assert result.success is True
-        value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
-            "actions"
-        ][0]["data"]
+        value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
 
         await a._teardown_chat_state("conv-1")
         response = await a._handle_card_action(_make_inbound(), value)
@@ -19687,22 +19009,16 @@ class TestInteractiveCards:
         resolver.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_send_slash_confirm_card(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_slash_confirm_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        result = await a.send_slash_confirm(
-            "conv-1", "Confirm", "Run it?", "sess-1", "cfm-9"
-        )
+        result = await a.send_slash_confirm("conv-1", "Confirm", "Run it?", "sess-1", "cfm-9")
         assert result.success is True
-        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
-            "actions"
-        ]
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
         assert list(capability["choices"].values()) == ["once", "always", "cancel"]
         assert capability["resolver"] == {
@@ -19712,22 +19028,16 @@ class TestInteractiveCards:
         assert all("confirm_id" not in act["data"] for act in actions)
 
     @pytest.mark.asyncio
-    async def test_send_clarify_with_choices(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_send_clarify_with_choices(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        result = await a.send_clarify(
-            "conv-1", "Which one?", ["Alpha", "Beta"], "clr-1", "sess-1"
-        )
+        result = await a.send_clarify("conv-1", "Which one?", ["Alpha", "Beta"], "clr-1", "sess-1")
         assert result.success is True
-        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
-            "actions"
-        ]
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
         assert [act["title"] for act in actions] == ["Alpha", "Beta", "Something else"]
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
         assert list(capability["choices"].values()) == ["Alpha", "Beta", "__other__"]
@@ -19770,18 +19080,13 @@ class TestInteractiveCards:
         # Not ours / not a card submit.
         assert a._extract_card_action({"type": "message", "text": "hi"}) is None
         assert a._extract_card_action({"type": "message", "value": "x"}) is None
-        assert (
-            a._extract_card_action({"type": "message", "value": {"hermes_kind": "nope"}})
-            is None
-        )
+        assert a._extract_card_action({"type": "message", "value": {"hermes_kind": "nope"}}) is None
         # An invoke (not a message) carrying the tag is not a card submit.
         invoke_shaped = {"type": "invoke", "value": {"hermes_kind": "exec_approval"}}
         assert a._extract_card_action(invoke_shaped) is None
 
     @pytest.mark.asyncio
-    async def test_handle_card_action_exec_approval(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_handle_card_action_exec_approval(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
@@ -19837,9 +19142,7 @@ class TestInteractiveCards:
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
-        monkeypatch.setattr(
-            a, "_gw_resolve_slash_confirm", AsyncMock(return_value="Command ran.")
-        )
+        monkeypatch.setattr(a, "_gw_resolve_slash_confirm", AsyncMock(return_value="Command ran."))
         activity = _make_inbound(conv_id="conv-1")
         value = _seed_card_capability(
             a,
@@ -19857,9 +19160,7 @@ class TestInteractiveCards:
     async def test_inflight_card_action_cannot_post_after_chat_teardown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(
-            adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01
-        )
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         self._connect(a)
         bridge = adapter_mod._import_bridge()
@@ -19944,16 +19245,12 @@ class TestInteractiveCards:
         assert a._awaiting_text_chats["conv-1"] > 0
         assert "conv-1" in a._registry_protected_conversation_ids()
 
-    def test_route_card_submit_not_dispatched(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_route_card_submit_not_dispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
         bridge = adapter_mod._import_bridge()
-        monkeypatch.setattr(
-            bridge, "validate_inbound_jwt", AsyncMock(return_value={"oid": "o1"})
-        )
+        monkeypatch.setattr(bridge, "validate_inbound_jwt", AsyncMock(return_value={"oid": "o1"}))
         a._http_client = MagicMock()
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
@@ -19967,9 +19264,7 @@ class TestInteractiveCards:
             resolver={"session_key": "sess-1"},
         )
         client = TestClient(a.build_app())
-        r = client.post(
-            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
-        )
+        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "card_action"
         # Routed to the resolver, NOT the agent loop.
@@ -19986,9 +19281,7 @@ class TestHandoff:
     def test_mint_handoff_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(
-                _make_inbound(conv_id="conv-cc")
-            )
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-cc"))
         )
         link = a._mint_handoff_link("conv-cc", reason="test")
         assert link is not None
@@ -20011,16 +19304,12 @@ class TestHandoff:
         link = a._mint_handoff_link("conv-cc2", reason="test")
         assert f"28:{a.blueprint_app_id}" in link
 
-    def test_mint_handoff_link_unknown_conv(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_mint_handoff_link_unknown_conv(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         assert a._mint_handoff_link("ghost", reason="x") is None
 
     @pytest.mark.asyncio
-    async def test_handle_handoff_action_known_token(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_handle_handoff_action_known_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         a._handoff_tokens["tok-1"] = {"conversation_id": "conv-cc", "chat_type": "groupChat"}
         ctx = adapter_mod.invoke.build_invoke_context(
@@ -20056,18 +19345,14 @@ class TestHandoff:
         resp = await a._handle_handoff_action(ctx)
         assert resp.status == 200
 
-    def test_append_handoff_link_disabled_by_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_append_handoff_link_disabled_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-cc")
         inbound["conversation"]["conversationType"] = "groupChat"
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         assert a._maybe_append_handoff_link("conv-cc", "body") == "body"
 
-    def test_append_handoff_link_enabled_nonpersonal(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_append_handoff_link_enabled_nonpersonal(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_HANDOFF_LINK", "1")
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-cc")
@@ -20077,9 +19362,7 @@ class TestHandoff:
         assert "Continue in Teams" in out
         assert "body" in out
 
-    def test_append_handoff_link_personal_unchanged(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_append_handoff_link_personal_unchanged(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_HANDOFF_LINK", "1")
         a = _make_adapter(monkeypatch)
         # _make_inbound default is personal.
@@ -20457,9 +19740,7 @@ class TestHandoffSessionPin:
         assert link is not None
         token = link.split("continuation=")[1]
         bridge = adapter_mod._import_bridge()
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "B"))
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "B")))
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
         mock_resp = MagicMock()
@@ -20603,9 +19884,7 @@ class TestHandoffSessionPin:
                 await asyncio.gather(*pending, return_exceptions=True)
 
     @pytest.mark.asyncio
-    async def test_pin_skipped_when_admission_full(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_pin_skipped_when_admission_full(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_ACTIVE_AGENT_TURNS", 0)
         adapter = self._ready(monkeypatch, _live_origin_row())
         link = adapter._mint_handoff_link("conv-cc", reason="test")
@@ -20631,9 +19910,7 @@ class TestCorrelatorBounds:
         assert list(m) == ["2", "3", "4"]
 
     @pytest.mark.asyncio
-    async def test_feedback_map_is_bounded(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_feedback_map_is_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_CORRELATOR_ENTRIES", 3)
         a = _make_adapter(monkeypatch)
         for i in range(6):
@@ -20683,9 +19960,7 @@ class TestCorrelatorBounds:
             "value": {
                 "action": "accept",
                 "context": {"consentId": "c1"},
-                "uploadInfo": {
-                    "uploadUrl": "https://contoso-my.sharepoint.com/up"
-                },
+                "uploadInfo": {"uploadUrl": "https://contoso-my.sharepoint.com/up"},
             },
             "conversation": {"id": "conv-1"},
         }
@@ -20695,9 +19970,7 @@ class TestCorrelatorBounds:
         assert a._http_client.put.await_count == 0
 
     @pytest.mark.asyncio
-    async def test_disconnect_clears_correlator_maps(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_disconnect_clears_correlator_maps(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         a._feedback_by_message_id["m"] = {"reaction": "like"}
         a._bot_reply_ids["reply-1"] = {
@@ -20745,9 +20018,7 @@ class TestSlugIngestion:
             _make_adapter(monkeypatch, slug=None)
         assert "../../tmp/evil" not in str(exc_info.value)
 
-    def test_absent_slug_resolves_to_default(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_absent_slug_resolves_to_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
         # No extra slug + no AGENT_IDENTITY → the supported single-profile
         # 'default' dir (missing-slug behaviour is preserved).
         monkeypatch.delenv("AGENT_IDENTITY", raising=False)
@@ -20810,9 +20081,7 @@ class TestConversationsActivitiesUrl:
         url = adapter_mod._conversations_activities_url(
             "https://smba.trafficmanager.net/amer", ".."
         )
-        assert url == (
-            "https://smba.trafficmanager.net/amer/v3/conversations/%2E%2E/activities"
-        )
+        assert url == ("https://smba.trafficmanager.net/amer/v3/conversations/%2E%2E/activities")
         assert "/../" not in url
 
     @pytest.mark.asyncio
@@ -20854,16 +20123,12 @@ class TestConversationsActivitiesUrl:
         a._http_client = MagicMock()
         a._http_client.post = AsyncMock(return_value=mock_resp)
         bridge = adapter_mod._import_bridge()
-        monkeypatch.setattr(
-            bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "A"))
-        )
+        monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "A")))
 
         result = await a.send(chat_id=conv_id, content="proactive ping")
         assert result.success is True
         url = a._http_client.post.await_args.args[0]
-        assert url.endswith(
-            "/v3/conversations/19%3Aabc%40thread.tacv2%3Bmessageid%3D1/activities"
-        )
+        assert url.endswith("/v3/conversations/19%3Aabc%40thread.tacv2%3Bmessageid%3D1/activities")
         assert "19:abc@" not in url
         body = a._http_client.post.await_args.kwargs["json"]
         assert body["conversation"]["id"] == conv_id
@@ -20941,9 +20206,7 @@ class TestGateEnvSecretWrite:
         assert (env.stat().st_mode & 0o777) == 0o644
         assert len(calls["prompts"]) == 2
 
-    def test_permissive_env_explicit_override_names_mode(
-        self, tmp_path: Path
-    ) -> None:
+    def test_permissive_env_explicit_override_names_mode(self, tmp_path: Path) -> None:
         env = tmp_path / ".env"
         env.write_text("EXISTING=1\n")
         env.chmod(0o644)
@@ -21036,9 +20299,7 @@ class TestGatewaySecretsProviderWiring:
         # env/config — the provider supplies it.
         monkeypatch.delenv("A365_BF_CLIENT_SECRET", raising=False)
         monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
-        fake = self._provider(
-            {(self._TENANT, self._BF_APP): "bf-from-keychain"}
-        )
+        fake = self._provider({(self._TENANT, self._BF_APP): "bf-from-keychain"})
 
         a = _make_adapter(monkeypatch)
 
@@ -21050,9 +20311,7 @@ class TestGatewaySecretsProviderWiring:
     def test_env_bf_secret_still_wins(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_BF_APP_ID", self._BF_APP)
         monkeypatch.setenv("A365_BF_CLIENT_SECRET", "bf-from-env")
-        fake = self._provider(
-            {(self._TENANT, self._BF_APP): "bf-from-keychain"}
-        )
+        fake = self._provider({(self._TENANT, self._BF_APP): "bf-from-keychain"})
 
         a = _make_adapter(monkeypatch)
 
@@ -21156,9 +20415,7 @@ class TestGatewaySecretsProviderWiring:
         a = _make_adapter(monkeypatch)
         a.blueprint_client_secret = ""
         rotated: dict[str, str] = {"value": ""}
-        monkeypatch.setattr(
-            a, "_load_secret_from_generated_config", lambda: rotated["value"]
-        )
+        monkeypatch.setattr(a, "_load_secret_from_generated_config", lambda: rotated["value"])
 
         # First call: generated config empty -> provider fills the miss.
         assert a._ensure_secret() == "from-keychain"
@@ -21309,9 +20566,7 @@ class TestGatewaySecretsProviderWiring:
         # a convention the next edit can quietly break.
         self._provider({(self._TENANT, self._BLUEPRINT_APP): "sup3r-s3cret"})
 
-        result = adapter_mod._probe_secret_at_rest(
-            self._TENANT, self._BLUEPRINT_APP
-        )
+        result = adapter_mod._probe_secret_at_rest(self._TENANT, self._BLUEPRINT_APP)
 
         assert result == (True, True, "fake-store")
         assert "sup3r-s3cret" not in repr(result)
@@ -21385,9 +20640,7 @@ class TestSenderAllowlistAgreement:
         monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
         monkeypatch.setenv("A365_ALLOWED_USERS", "user-a,user-b")
         self._write(self._home(monkeypatch) / ".env", "A365_ALLOWED_USERS=user-a,user-b\n")
-        adapter = adapter_mod.Agent365Adapter(
-            _StubPlatformConfig(extra={"slug": "inbox-helper"})
-        )
+        adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"slug": "inbox-helper"}))
         assert adapter._allowed_users == ("user-a", "user-b")
         assert adapter._allow_all_users is False
         assert adapter._sender_allowlist_configured is True
@@ -21406,9 +20659,7 @@ class TestSenderAllowlistAgreement:
         from hermes_a365.activity_bridge import BridgeConfigError
 
         with pytest.raises(BridgeConfigError, match="sender allowlists disagree"):
-            adapter_mod.Agent365Adapter(
-                _StubPlatformConfig(extra={"slug": "inbox-helper"})
-            )
+            adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"slug": "inbox-helper"}))
 
     def test_process_only_policy_is_refused_when_profile_file_exists(
         self, monkeypatch: pytest.MonkeyPatch
@@ -21451,8 +20702,7 @@ class TestSenderAllowlistAgreement:
         target = tmp_path / "real-agent"
         self._write(
             target / ".env",
-            "A365_TENANT_ID=2699fca3-dac6-40a2-bcea-62ce05e2ee9b\n"
-            "A365_ALLOWED_USERS=user-b\n",
+            "A365_TENANT_ID=2699fca3-dac6-40a2-bcea-62ce05e2ee9b\nA365_ALLOWED_USERS=user-b\n",
         )
         link = home / "agents" / "inbox-helper"
         link.parent.mkdir(parents=True, exist_ok=True)
@@ -22087,9 +21337,7 @@ class TestUnhandledInboundActivityTypes:
         assert response.json() == {"status": "acked", "reason": "unhandled_type"}
         assert a._handled_events == []
 
-    def test_empty_message_is_acked_not_dispatched(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_empty_message_is_acked_not_dispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         client = self._client(monkeypatch, a)
         body = _make_inbound(text="")
@@ -22101,9 +21349,7 @@ class TestUnhandledInboundActivityTypes:
         assert response.json() == {"status": "acked", "reason": "empty_message"}
         assert a._handled_events == []
 
-    def test_real_message_still_dispatches(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_real_message_still_dispatches(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         client = self._client(monkeypatch, a)
         response = client.post(
@@ -22257,9 +21503,7 @@ class TestMessageReaction:
         assert a._conversations.get("conv-1").last_inbound_activity_id == "user-act"
         assert self._other(a)["feedback"] == "keep"
 
-    def test_remove_and_existing_thumbs_record(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_remove_and_existing_thumbs_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         a._feedback_by_message_id["reply-1"] = {
@@ -22285,9 +21529,7 @@ class TestMessageReaction:
         assert a._handled_events[0].text == "reaction:removed:heart"
         assert self._other(a)["feedback"] == "keep"
 
-    def test_add_then_remove_keeps_latest_action(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_add_then_remove_keeps_latest_action(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22304,9 +21546,7 @@ class TestMessageReaction:
         assert slot["action"] == "removed"
         assert [event.text for event in a._handled_events] == ["reaction:removed:like"]
 
-    def test_distinct_add_and_remove_both_emit(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_distinct_add_and_remove_both_emit(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22327,9 +21567,7 @@ class TestMessageReaction:
             "reaction:removed:heart",
         ]
 
-    def test_replay_does_not_apply_twice(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_replay_does_not_apply_twice(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22357,9 +21595,7 @@ class TestMessageReaction:
             "missing-tenant",
         ],
     )
-    def test_malformed_does_not_mutate(
-        self, monkeypatch: pytest.MonkeyPatch, mutate: str
-    ) -> None:
+    def test_malformed_does_not_mutate(self, monkeypatch: pytest.MonkeyPatch, mutate: str) -> None:
         a = _make_adapter(monkeypatch)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22394,9 +21630,7 @@ class TestMessageReaction:
         assert a._handled_events == []
         assert self._other(a)["feedback"] == "keep"
 
-    def test_cross_tenant_does_not_mutate(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_cross_tenant_does_not_mutate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22418,9 +21652,7 @@ class TestMessageReaction:
         assert a._handled_events == []
         assert self._other(a)["feedback"] == "keep"
 
-    def test_disagreeing_tenant_claims_fail_closed(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_disagreeing_tenant_claims_fail_closed(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22440,9 +21672,7 @@ class TestMessageReaction:
             "user_oid": "someone",
         }
 
-    def test_unrelated_message_does_not_mutate(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_unrelated_message_does_not_mutate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22458,9 +21688,7 @@ class TestMessageReaction:
         assert a._handled_events == []
         assert self._other(a)["feedback"] == "keep"
 
-    def test_other_conversation_does_not_mutate(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_other_conversation_does_not_mutate(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._seed(a)
         a._feedback_by_message_id["reply-1"] = {
@@ -22480,9 +21708,7 @@ class TestMessageReaction:
         assert "native_reactions" not in a._feedback_by_message_id["reply-1"]
         assert a._handled_events == []
 
-    def test_non_teams_channel_is_ignored(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_non_teams_channel_is_ignored(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._seed(a)
         client = self._client(monkeypatch, a)
@@ -22514,9 +21740,7 @@ class TestMessageReaction:
         assert a._handled_events == []
         assert self._other(a)["feedback"] == "keep"
 
-    def test_unauthorized_sender_does_not_record(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_unauthorized_sender_does_not_record(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         self._seed(a)
         a._allow_all_users = False
@@ -22531,9 +21755,7 @@ class TestMessageReaction:
         assert "reply-1" not in a._feedback_by_message_id
         assert a._handled_events == []
 
-    def test_path_b_jwt_gate_still_records(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_path_b_jwt_gate_still_records(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch, dispatch_turn=True)
         self._seed(a)
         bridge = adapter_mod._import_bridge()
@@ -22575,9 +21797,7 @@ class TestMessageReaction:
         assert a._feedback_by_message_id == {}
         assert a._handled_events == []
 
-    def test_native_reaction_slots_are_bounded(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_native_reaction_slots_are_bounded(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setattr(adapter_mod, "_MAX_NATIVE_REACTIONS_PER_MESSAGE", 1)
         a = self._adapter(monkeypatch)
         self._seed(a)
@@ -22614,9 +21834,7 @@ class TestMessageReaction:
         assert [event.text for event in a._handled_events] == ["reaction:added:heart"]
 
     @pytest.mark.asyncio
-    async def test_teardown_drops_chat_reply_ids(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_teardown_drops_chat_reply_ids(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         a._remember_bot_reply("reply-1", conversation_id="conv-1")
         a._remember_bot_reply("reply-2", conversation_id="conv-2")
@@ -22629,9 +21847,7 @@ class TestMessageReaction:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound())
-        )
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._seen_inbounds_this_lifetime.add("conv-1")
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -22762,9 +21978,7 @@ class TestMessageReaction:
         assert response.json()["reactions"] == 1
         assert a._handled_events == []
         assert (
-            a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]["like"][
-                "action"
-            ]
+            a._feedback_by_message_id["reply-1"]["native_reactions"]["user-1"]["like"]["action"]
             == "added"
         )
 
@@ -22874,14 +22088,10 @@ class TestMessageReaction:
             "feedback": None,
             "conversation_id": "conv-1",
             "user_oid": "user-1",
-            "native_reactions": {
-                "user-1": {"like": {"action": "added", "type": "like"}}
-            },
+            "native_reactions": {"user-1": {"like": {"action": "added", "type": "like"}}},
         }
         a._feedback_by_message_id["reply-1"] = dict(original)
-        a._feedback_by_message_id["reply-1"]["native_reactions"] = original[
-            "native_reactions"
-        ]
+        a._feedback_by_message_id["reply-1"]["native_reactions"] = original["native_reactions"]
         ctx = adapter_mod.invoke.build_invoke_context(
             {
                 "type": "invoke",
