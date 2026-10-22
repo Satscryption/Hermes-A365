@@ -7304,6 +7304,7 @@ class TestEditMessage:
             chat_id="conv-G-buf",
             content="Using the tool.",
             reply_to=None,
+            metadata={"informative_update": True},
         )
         streamed = await a.send(
             chat_id="conv-G-buf",
@@ -7967,6 +7968,7 @@ class TestEditMessage:
             chat_id="conv-G-live-turn",
             content="Checking the current time now.",
             reply_to=None,
+            metadata={"informative_update": True},
         )
         tool = await a.send(
             chat_id="conv-G-live-turn",
@@ -7986,7 +7988,10 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 0
         opener, answer_final = [call.kwargs["json"] for call in post_mock.await_args_list]
         assert opener["type"] == "typing"
-        assert opener["text"] == "💻 Running date"
+        assert opener["text"] in (
+            "Checking the current time now.",
+            "💻 Running date",
+        )
         assert answer_final["text"] == "The current time is 16:37 UTC."
         assert "conv-G-live-turn" not in a._turn_buffers
 

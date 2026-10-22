@@ -222,9 +222,11 @@ Each turn-buffer segment carries a `kind` set at append time (and refreshed on `
 
 | `kind` | How it is assigned | Informative stream | Answer `streamType=final` |
 |---|---|---|---|
-| `answer` | `send` / `edit_message` with `reply_to` set to the turn activity id (stream chunks and finalized edits) | never | yes — only these segments are joined into the final body |
-| `progress` | unscoped `send` whose text matches `_is_hermes_tool_progress_segment` | latest progress/commentary text on keep-alive and on flush opener | never (emoji filter remains a backstop) |
-| `commentary` | unscoped `send` that is not tool-progress (interim assistant lines) | same as progress | never |
+| `answer` | default for `send` / `edit_message` unless progress or informative metadata (below) | never | yes — joined into the final body |
+| `progress` | text matches `_is_hermes_tool_progress_segment` (Hermes tool-progress bubbles) | latest progress/commentary text on keep-alive and on flush opener | never (emoji filter remains a backstop) |
+| `commentary` | `send` metadata `informative_update: true` (interim assistant lines) | same as progress | never |
+
+Plain unscoped `send()` text with no progress shape and no `informative_update` metadata stays `answer` and reaches the final, so existing single-reply turns are unchanged.
 
 When an informative stream is already open (`keepalive.stream_id` set), new progress or commentary segments schedule a continuation POST with the latest informative text. If no stream is open yet, that text is included on the first informative opener at flush (or on the keep-alive opener once #181 fires). Personal Teams 1:1 does not use the turn buffer; this split applies only to Copilot Chat / non-personal buffered turns.
 

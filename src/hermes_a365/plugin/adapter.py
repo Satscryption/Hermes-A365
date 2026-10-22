@@ -769,13 +769,23 @@ def _is_hermes_tool_progress_segment(text: str) -> bool:
     return all(_is_hermes_tool_progress_line(line) for line in lines)
 
 
-def _classify_turn_buffer_segment_kind(text: str, *, reply_to: Any | None) -> str:
+def _metadata_marks_informative_segment(metadata: Any | None) -> bool:
+    """True when Hermes marks an unscoped send as interim informative text (#186)."""
+    return isinstance(metadata, dict) and bool(metadata.get("informative_update"))
+
+
+def _classify_turn_buffer_segment_kind(
+    text: str,
+    *,
+    reply_to: Any | None,
+    metadata: Any | None = None,
+) -> str:
     """Classify a buffered segment for informative vs answer delivery (#186)."""
-    if reply_to is not None:
-        return "answer"
     if _is_hermes_tool_progress_segment(text):
         return "progress"
-    return "commentary"
+    if _metadata_marks_informative_segment(metadata):
+        return "commentary"
+    return "answer"
 
 
 def _refresh_turn_buffer_segment_kind_after_edit(segment: dict[str, str]) -> None:
@@ -4727,7 +4737,12 @@ class Agent365Adapter(BasePlatformAdapter):
         # is what Hermes cancels when it stops the stream consumer.
         if str(chat_id) in self._turn_buffers:
             self._conversations.mark_used(chat_id)
-            return self._append_turn_buffer_segment(str(chat_id), content, reply_to=reply_to)
+            return self._append_turn_buffer_segment(
+                str(chat_id),
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+            )
 
         turn_key: tuple[str, str] | None = None
         turn_validated_path: str | None = None
@@ -5101,10 +5116,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 "depth": 1,
                 "lock": asyncio.Lock(),
                 "keepalive": self._orphan_keepalive.pop(str(chat_id), {}),
+                "processing_active": True,
             }
         else:
             buf.setdefault("turns", []).append(turn)
             buf["depth"] = sum(1 for item in buf["turns"] if item.get("open"))
+            buf["processing_active"] = True
         # One task per chat. A nested start leaves the running task in
         # place; a task that already exited is replaced.
         self._schedule_turn_buffer_keepalive(chat_id)
@@ -5389,10 +5406,9 @@ class Agent365Adapter(BasePlatformAdapter):
         buf = self._turn_buffers.get(chat_id)
         if not isinstance(buf, dict):
             return False
-        if int(buf.get("depth") or 0) > 0:
+        if buf.get("processing_active"):
             return True
-        # Hermes can close processing while segments are still buffered (#181).
-        if buf.get("segments"):
+        if int(buf.get("depth") or 0) > 0:
             return True
         return bool(self._keepalive_blocks_reply(self._keepalive_state(buf)))
 
@@ -5406,8 +5422,8 @@ class Agent365Adapter(BasePlatformAdapter):
             return "needed=false (depth 0 or buffer gone)"
         depth = int(buf.get("depth") or 0)
         if (
-            depth <= 0
-            and not buf.get("segments")
+            not buf.get("processing_active")
+            and depth <= 0
             and not self._keepalive_blocks_reply(self._keepalive_state(buf))
         ):
             return "needed=false (depth 0 or buffer gone)"
@@ -6702,6 +6718,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._close_innermost_turn(chat_id)
                 await self._flush_turn_buffer(chat_id)
                 await self._flush_pending_coalesced_replies(chat_id)
+                buf = self._turn_buffers.get(chat_id)
+                if isinstance(buf, dict) and int(buf.get("depth") or 0) == 0:
+                    buf["processing_active"] = False
                 # #161: the stream consumer's finalize edit runs on a task
                 # Hermes cancels at turn end. A short reply often still has
                 # the pacing gap left, so streamType=final never lands and
@@ -6727,7 +6746,12 @@ class Agent365Adapter(BasePlatformAdapter):
             await parent(event, outcome)
 
     def _append_turn_buffer_segment(
-        self, chat_id: str, content: str, *, reply_to: Any | None = None
+        self,
+        chat_id: str,
+        content: str,
+        *,
+        reply_to: Any | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> SendResult:
         """Append one local segment onto the turn it belongs to. No network."""
         buf = self._turn_buffers.get(chat_id)
@@ -6759,7 +6783,11 @@ class Agent365Adapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=own[-1]["id"])
         self._turn_buffer_seq += 1
         segment_id = f"turnbuf:{self._turn_buffer_seq}"
-        kind = _classify_turn_buffer_segment_kind(text, reply_to=reply_to)
+        kind = _classify_turn_buffer_segment_kind(
+            text,
+            reply_to=reply_to,
+            metadata=metadata,
+        )
         segments.append({"id": segment_id, "text": text, "turn": turn_seq, "kind": kind})
         if kind in ("progress", "commentary"):
             self._schedule_informative_segment_refresh(str(chat_id))
@@ -6885,21 +6913,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 drop_ids.append(str(segment.get("id") or ""))
                 continue
             kept.append(segment)
-        if not kept:
-            nonempty = [
-                segment
-                for segment in turn_segments
-                if str(segment.get("text") or "")
-                and self._turn_buffer_segment_kind(segment) != "progress"
-                and not _is_hermes_tool_progress_segment(str(segment.get("text") or ""))
-            ]
-            if len(nonempty) == 1:
-                kept = nonempty
-                drop_ids = [
-                    str(segment.get("id") or "")
-                    for segment in turn_segments
-                    if segment not in kept
-                ]
         return kept, drop_ids
 
     def _turn_buffer_handoff_suffix(self, chat_id: str) -> str:
