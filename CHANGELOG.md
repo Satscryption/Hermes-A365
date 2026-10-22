@@ -34,8 +34,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   cancellation hits during the first-interval wait while the turn is still
   live; DEBUG logs cover stale lifecycle after mint and `_keepalive_turn`
   missing on keep-alive final. `processing_active` clears in a `finally` on
+<<<<<<< HEAD
   `on_processing_complete`. Block opening a second informative stream while an
   abandoned `stream_id` still blocks replies (#199).
+=======
+  `on_processing_complete`. Cancel in-flight `segment_informative_task` on buffer
+  drop and disconnect.
+>>>>>>> 4765bd5 (Fix #181 keep-alive reschedule and Grok review follow-ups)
 
 - **Copilot Chat informative vs answer text (#186).** Tool-progress lines and
   `send` metadata `informative_update: true` update informative stream text;
