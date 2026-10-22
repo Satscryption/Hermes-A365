@@ -149,6 +149,15 @@ in v0.9.2 (`f4d85bcd`) but had been listed under `[Unreleased]`.
   status, so these paths do not return a 5xx, and it rejects a JSON `null`
   invoke payload (`Payload cannot be null`). The plugin no longer answers
   a handler crash with `500` and `{"error": "invoke handler error"}`.
+- **Copilot Chat turn-buffer replies use one informative stream final (#182).**
+  Non-personal turn buffers now deliver the merged answer as
+  `streamType=final` on the same `streamId` as informative keep-alive
+  updates (or a flush-time informative opener when none exists), instead
+  of a plain `send_reply` after a keep-alive-text final. Plain
+  `send_reply` remains for rejected opens, user-cancelled streams,
+  two-minute cap expiry, and overflow chunks after the final. Teams 1:1
+  `streamType=streaming` edits are unchanged. Live Copilot Chat
+  placeholder fill is still required before treating this as closed.
 
 - **Teams 1:1 streaming edits log the connector failure, and a short reply sends `streamType=final` (#83, #161).**
   A personal edit that fails now logs `http_status`, `bf_error_code`, and
