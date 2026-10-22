@@ -11276,13 +11276,14 @@ class TestEditMessage:
         assert close_mock.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_progress_only_keepalive_close_clears_stream_after_deferral_cap(
+    async def test_abandoned_keepalive_id_blocks_second_informative_open(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        chat = "conv-G-prog-cap"
+        chat = "conv-G-abandon-ka"
         inbound = _make_inbound(conv_id=chat, activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
+        opened_mono = time.monotonic()
         a._turn_buffers[chat] = {
             "turns": [
                 {
@@ -11297,9 +11298,9 @@ class TestEditMessage:
             "depth": 0,
             "lock": asyncio.Lock(),
             "keepalive": {
-                "stream_id": "ka-linger",
+                "stream_id": "ka-abandon",
                 "sequence": 1,
-                "opened_mono": time.monotonic(),
+                "opened_mono": opened_mono,
             },
         }
         buf = a._turn_buffers[chat]
@@ -11308,14 +11309,89 @@ class TestEditMessage:
         record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
         record["state"] = "DEFERRED"
         buf["retry_turn_key"] = record["turn_key"]
-        monkeypatch.setattr(
-            a,
-            "_close_turn_buffer_keepalive_locked",
-            AsyncMock(return_value=False),
-        )
         a._schedule_turn_buffer_retry(chat, record["turn_key"])
-        assert str(buf["keepalive"].get("stream_id") or "") == ""
+        assert buf["keepalive"]["stream_id"] == "ka-abandon"
         assert not buf.get("retry_task")
+
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _c: False)
+        wire = {"informative_open": 0, "final": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            self._observe_stream_wire_activity(activity, wire)
+            entity = activity["entities"][0]
+            if entity.get("streamType") == "final":
+                assert entity.get("streamId") == "ka-abandon"
+                return MagicMock(status_code=202, text="", json=lambda: {})
+            return self._http_result(201, "should-not-open")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        event = _StubMessageEvent(
+            text="follow-up",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-2",
+        )
+        await a.on_processing_start(event)
+        keepalive_task = buf.get("keepalive_task")
+        if isinstance(keepalive_task, asyncio.Task):
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        await a.send(chat_id=chat, content="Hello again", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert wire["informative_open"] == 0
+        assert wire["final"] == 1
+        assert send_reply_mock.await_count == 0
+        assert "conv-G-abandon-ka" not in a._turn_buffers
+
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "validated_path": "A",
+                    "activity_id": "act-3",
+                    "open": True,
+                }
+            ],
+            "segments": [],
+            "depth": 1,
+            "lock": asyncio.Lock(),
+            "keepalive": {
+                "stream_id": "ka-abandon",
+                "sequence": 1,
+                "opened_mono": opened_mono
+                - adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+                - 1.0,
+            },
+        }
+        buf = a._turn_buffers[chat]
+        a._clear_expired_untracked(chat)
+        assert str(buf["keepalive"].get("stream_id") or "") == ""
+        assert buf.get("skip_stream_open") is True
+
+        wire["informative_open"] = 0
+        wire["final"] = 0
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        inbound["id"] = "act-3"
+        event2 = _StubMessageEvent(
+            text="after cap",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-3",
+        )
+        await a.on_processing_start(event2)
+        await a.send(chat_id=chat, content="Plain after cap", reply_to=None)
+        await a.on_processing_complete(event2, outcome="success")
+        assert wire["informative_open"] == 0
+        assert wire["final"] == 0
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain after cap"
 
     @pytest.mark.asyncio
     async def test_keepalive_close_failure_schedules_retry_with_turn_key(

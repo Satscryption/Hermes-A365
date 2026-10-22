@@ -5135,7 +5135,13 @@ class Agent365Adapter(BasePlatformAdapter):
             if opened <= 0.0:
                 return True
             return time.monotonic() - opened < _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-        return bool(str(stream.get("stream_id") or ""))
+        stream_id = str(stream.get("stream_id") or "")
+        if not stream_id:
+            return False
+        opened = float(stream.get("opened_mono") or 0.0)
+        if opened <= 0.0:
+            return True
+        return time.monotonic() - opened < _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
 
     def _turn_buffer_retry_pending(self, buf: dict[str, Any]) -> bool:
         if int(buf.get("depth") or 0) != 0:
@@ -5270,18 +5276,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 record["state"] = "FORCED_PLAIN"
                 record["plain_attempts"] = 0
             if not buf.get("segments"):
-                stream = self._keepalive_stream(buf)
-                stream_id = str(stream.get("stream_id") or "")
-                if stream_id:
-                    stream["stream_id"] = ""
-                    buf["keepalive"] = stream
-                    logger.warning(
-                        "agent365 turn buffer clearing lingering keep-alive stream: "
-                        "chat_id=%s stream_id=%s deferrals=%s",
-                        chat_id,
-                        stream_id,
-                        deferrals,
-                    )
                 return
             record["plain_due"] = True
             buf["retry_turn_key"] = turn_key
@@ -5513,9 +5507,25 @@ class Agent365Adapter(BasePlatformAdapter):
 
     def _clear_expired_untracked(self, chat_id: str) -> None:
         buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return
         stream = self._keepalive_state(buf)
         if stream.get("untracked") and not self._keepalive_blocks_reply(stream):
             buf["keepalive"] = {}
+            buf["skip_stream_open"] = True
+            return
+        stream_id = str(stream.get("stream_id") or "")
+        if stream_id and _keepalive_stream_age_sec(stream) >= _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC:
+            logger.warning(
+                "agent365 turn buffer keep-alive stream cap expired: "
+                "chat_id=%s stream_id=%s",
+                chat_id,
+                stream_id,
+            )
+            stream["stream_id"] = ""
+            if not stream.get("closed_by"):
+                stream["closed_by"] = "turn:other"
+            buf["keepalive"] = stream
             buf["skip_stream_open"] = True
 
     async def _post_informative_locked(
@@ -5944,6 +5954,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
                 return ("fallback", "user cancelled")
             record["state"] = "DONE"
+            record["answer_final_settled"] = True
             self._remove_turn_segments(buf, chunk_segment_ids)
             self._purge_turn_delivery_records(buf)
             return ("delivered", None)
