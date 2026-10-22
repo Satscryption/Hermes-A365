@@ -5384,6 +5384,22 @@ class Agent365Adapter(BasePlatformAdapter):
             task.cancel()
             task.add_done_callback(_consume_turn_buffer_retry_result)
 
+    @staticmethod
+    def _first_buffered_turn_key(buf: dict[str, Any]) -> str | None:
+        from hermes_a365.plugin.turn_buffer_answer_delivery import turn_delivery_key
+
+        turns = [t for t in (buf.get("turns") or []) if isinstance(t, dict)]
+        by_seq = {str(t.get("seq") or ""): t for t in turns}
+        for segment in buf.get("segments") or []:
+            seq = str(segment.get("turn") or "")
+            turn = by_seq.get(seq)
+            if turn is not None:
+                return turn_delivery_key(turn)
+        retry = buf.get("retry_turn_key")
+        if retry:
+            return str(retry)
+        return None
+
     def _delivery_record_for_key(
         self, buf: dict[str, Any], turn_key: str
     ) -> dict[str, Any] | None:
@@ -6145,6 +6161,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         if record.get("had_landed"):
             record["state"] = "DONE"
+            self._remove_turn_segments(buf, chunk_segment_ids)
             self._purge_turn_delivery_records(buf)
             return ("delivered", None)
         stream["stream_id"] = ""
@@ -6209,6 +6226,16 @@ class Agent365Adapter(BasePlatformAdapter):
         if other_key and other_key != turn_key:
             stream["stream_id"] = ""
             buf["keepalive"] = stream
+            if record.get("may_have_landed"):
+                return self._answer_uncertain_for_turn(
+                    chat_id,
+                    buf,
+                    turn,
+                    record,
+                    stream_id=stream_id,
+                    context="stream already closed",
+                    chunk_segment_ids=chunk_segment_ids,
+                )
             logger.warning(
                 "agent365 turn buffer answer plain fallback: chat_id=%s "
                 "status=403 reason=stream already closed",
@@ -6218,6 +6245,16 @@ class Agent365Adapter(BasePlatformAdapter):
         if closed_by == "turn:other":
             stream["stream_id"] = ""
             buf["keepalive"] = stream
+            if record.get("may_have_landed"):
+                return self._answer_uncertain_for_turn(
+                    chat_id,
+                    buf,
+                    turn,
+                    record,
+                    stream_id=stream_id,
+                    context="stream already closed",
+                    chunk_segment_ids=chunk_segment_ids,
+                )
             logger.warning(
                 "agent365 turn buffer answer plain fallback: chat_id=%s "
                 "status=403 reason=stream already closed",
@@ -6953,7 +6990,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     "agent365 turn buffer flush skipped: invalid inbound chat_id=%s",
                     chat_id,
                 )
-                self._schedule_turn_buffer_retry(chat_id)
+                turn_key = self._delivery_record(buf, turn)["turn_key"]
+                buf["retry_turn_key"] = turn_key
+                self._schedule_turn_buffer_retry(chat_id, turn_key)
                 return
             chunks: list[tuple[list[dict[str, str]], str]] = []
             for chunk in self._chunk_turn_segments(kept):
@@ -7059,9 +7098,6 @@ class Agent365Adapter(BasePlatformAdapter):
                                     int(record.get("plain_attempts") or 0) + 1
                                 )
                             else:
-                                record["deferral_count"] = (
-                                    int(record.get("deferral_count") or 0) + 1
-                                )
                                 record["state"] = "DEFERRED"
                             buf["retry_turn_key"] = record["turn_key"]
                             self._schedule_turn_buffer_retry(
@@ -7114,7 +7150,9 @@ class Agent365Adapter(BasePlatformAdapter):
                         chat_id,
                         error,
                     )
-                    self._schedule_turn_buffer_retry(chat_id)
+                    turn_key = self._delivery_record(buf, turn)["turn_key"]
+                    buf["retry_turn_key"] = turn_key
+                    self._schedule_turn_buffer_retry(chat_id, turn_key)
                     return
                 live = self._turn_buffers.get(chat_id)
                 if live is None:
@@ -7131,7 +7169,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 ):
                     return
                 if not link_closed:
-                    self._schedule_turn_buffer_retry(chat_id)
+                    turn_key = self._delivery_record(buf, turn)["turn_key"]
+                    buf["retry_turn_key"] = turn_key
+                    self._schedule_turn_buffer_retry(chat_id, turn_key)
                     return
                 link_result = await self._send_reply_activity(
                     inbound=inbound,
@@ -7162,13 +7202,19 @@ class Agent365Adapter(BasePlatformAdapter):
             if buf is None:
                 return
             if not closed:
-                self._schedule_turn_buffer_retry(chat_id)
+                turn_key = self._first_buffered_turn_key(buf)
+                if turn_key:
+                    buf["retry_turn_key"] = turn_key
+                    self._schedule_turn_buffer_retry(chat_id, turn_key)
                 return
         if int(buf.get("depth") or 0) == 0 and not buf.get("segments"):
             await self._drop_turn_buffer(chat_id)
             return
         if int(buf.get("depth") or 0) == 0 and buf.get("segments"):
-            self._schedule_turn_buffer_retry(chat_id)
+            turn_key = self._first_buffered_turn_key(buf)
+            if turn_key:
+                buf["retry_turn_key"] = turn_key
+                self._schedule_turn_buffer_retry(chat_id, turn_key)
 
     @staticmethod
     def _remove_turn_segments(buf: dict[str, Any], ids: list[str]) -> None:
