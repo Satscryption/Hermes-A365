@@ -8646,6 +8646,107 @@ class TestEditMessage:
             and chat in record.message
             for record in caplog.records
         )
+        assert any(
+            "stage=turn_end" in record.message and chat in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
+    async def test_keepalive_stage_logs_reach_info(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-ka-stage-log"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-stage")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            await a.on_processing_start(event)
+            await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+            await self._spin_until(lambda: len(posts) >= 1)
+        assert any("stage=scheduled" in r.message for r in caplog.records)
+        assert any("stage=first_interval" in r.message for r in caplog.records)
+        assert any("stage=before_acquire_reply_token" in r.message for r in caplog.records)
+        assert any("stage=after_activity_post" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_unscoped_send_after_marked_answer_is_commentary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-commentary-kind"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Draft", reply_to="act-1")
+        interim = await a.send(chat_id=chat, content="I'll check that now.", reply_to=None)
+        assert interim.success is True
+        segment = next(s for s in a._turn_buffers[chat]["segments"] if s["id"] == interim.message_id)
+        assert segment["kind"] == "commentary"
+
+    @pytest.mark.asyncio
+    async def test_thread_metadata_commentary_opens_informative_before_idle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-thread-commentary"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-thread")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        buf = a._turn_buffers[chat]
+        prompt = buf.get("keepalive_prompt_task")
+        assert isinstance(prompt, asyncio.Task)
+        await prompt
+        assert len(posts) >= 1
+        assert posts[0]["text"] == "I'll run the sleep, then reply."
 
     @pytest.mark.asyncio
     async def test_edit_message_reclassifies_commentary_to_answer(

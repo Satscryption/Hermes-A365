@@ -30,11 +30,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Copilot Chat turn-buffer keep-alive (Refs #181).** DEBUG at turn end (before
-  buffer drop and in `on_processing_complete` when the buffer remains) records
-  keep-alive task pending state and elapsed time since scheduling; DEBUG after
-  the first-interval sleep and before token mint / activity POST. At most one
-  keep-alive revival per turn while `depth > 0` or `processing_active`.
+- **Copilot Chat turn-buffer keep-alive (Refs #181).** Once-per-turn INFO stage
+  lines (`scheduled`, `first_interval`, mint, activity POST, `turn_end`) reach
+  `agent.log` under `logging.level=DEBUG` (keep-alive diagnostics are no longer
+  DEBUG-only). Progress/commentary segments prompt an informative open without
+  waiting for the idle window; Hermes thread metadata classifies interim
+  commentary. Coalesce informative refresh while a post is in flight. At most
+  one keep-alive revival per turn while `depth > 0` or `processing_active`.
   `processing_active` clears in a `finally` on `on_processing_complete`.
   Progress-only flush sets `skip_stream_open` so a closed informative stream is
   not reopened. Cancel in-flight `segment_informative_task` on buffer drop and

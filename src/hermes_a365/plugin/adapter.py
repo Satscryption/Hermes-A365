@@ -91,6 +91,47 @@ from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
+
+def _configure_plugin_logging() -> None:
+    """Align ``hermes_a365`` loggers with ``logging.level`` on ``agent.log``.
+
+    Hermes routes file logging through the root logger; child loggers must not
+    stay at INFO when the operator sets DEBUG. Keep-alive stage lines also emit
+    at INFO (once per turn per stage) so walk/debug runs do not depend on DEBUG
+    reaching this package.
+    """
+    root = logging.getLogger()
+    if root.getEffectiveLevel() <= logging.DEBUG:
+        logging.getLogger("hermes_a365").setLevel(logging.DEBUG)
+
+
+def _turn_buffer_stage_logged(buf: dict[str, Any] | None, stage: str) -> bool:
+    if not isinstance(buf, dict):
+        return False
+    logged = buf.get("_keepalive_stage_logged")
+    if not isinstance(logged, set):
+        logged = set()
+        buf["_keepalive_stage_logged"] = logged
+    if stage in logged:
+        return True
+    logged.add(stage)
+    return False
+
+
+def _log_turn_buffer_stage(
+    buf: dict[str, Any] | None,
+    chat_id: str,
+    stage: str,
+    message: str,
+    *args: Any,
+    level: int = logging.INFO,
+) -> None:
+    """Rate-limit keep-alive stage lines to once per buffer per stage."""
+    if level == logging.INFO and _turn_buffer_stage_logged(buf, stage):
+        return
+    logger.log(level, message, *args)
+
+
 # ---------------------------------------------------------------------------
 # Hermes harness imports.
 # ---------------------------------------------------------------------------
@@ -771,7 +812,16 @@ def _is_hermes_tool_progress_segment(text: str) -> bool:
 
 def _metadata_marks_informative_segment(metadata: Any | None) -> bool:
     """True when Hermes marks an unscoped send as interim informative text (#186)."""
-    return isinstance(metadata, dict) and bool(metadata.get("informative_update"))
+    if not isinstance(metadata, dict):
+        return False
+    if metadata.get("informative_update"):
+        return True
+    # Hermes 0.19 commentary uses thread metadata only (stream_consumer).
+    if metadata.get("thread_id") and not metadata.get("notify") and not metadata.get(
+        "expect_edits"
+    ):
+        return True
+    return False
 
 
 def _segment_is_marked_answer_from_send(
@@ -821,11 +871,19 @@ def _classify_turn_buffer_segment_kind(
     *,
     reply_to: Any | None,
     metadata: Any | None = None,
+    turn_segments: list[dict[str, Any]] | None = None,
 ) -> str:
     """Classify a buffered segment for informative vs answer delivery (#186)."""
     if _is_hermes_tool_progress_segment(text):
         return "progress"
     if _metadata_marks_informative_segment(metadata):
+        return "commentary"
+    if _segment_is_marked_answer_from_send(reply_to, metadata):
+        return "answer"
+    prior = list(turn_segments or [])
+    if any(_segment_is_marked_answer(segment) for segment in prior):
+        return "commentary"
+    if prior:
         return "commentary"
     return "answer"
 
@@ -5206,6 +5264,19 @@ class Agent365Adapter(BasePlatformAdapter):
             bool(buf.get("processing_active")),
             str(self._keepalive_state(buf).get("stream_id") or ""),
         )
+        _log_turn_buffer_stage(
+            buf,
+            chat_id,
+            "turn_end",
+            "agent365 turn buffer keep-alive stage: chat_id=%s stage=turn_end "
+            "task_pending=%s scheduled_elapsed_sec=%s depth=%s processing_active=%s stream_id=%s",
+            chat_id,
+            pending,
+            f"{elapsed:.3f}" if elapsed is not None else "n/a",
+            int(buf.get("depth") or 0),
+            bool(buf.get("processing_active")),
+            str(self._keepalive_state(buf).get("stream_id") or ""),
+        )
 
     async def _drop_turn_buffer(self, chat_id: str) -> None:
         """Drop the buffer, cancel its retry, and close a keep-alive stream.
@@ -5423,6 +5494,13 @@ class Agent365Adapter(BasePlatformAdapter):
             "agent365 turn buffer keep-alive scheduled: chat_id=%s",
             chat_id,
         )
+        _log_turn_buffer_stage(
+            buf,
+            chat_id,
+            "scheduled",
+            "agent365 turn buffer keep-alive stage: chat_id=%s stage=scheduled",
+            chat_id,
+        )
 
     @staticmethod
     def _turn_buffer_live_for_keepalive(buf: dict[str, Any]) -> bool:
@@ -5564,6 +5642,38 @@ class Agent365Adapter(BasePlatformAdapter):
             return latest[:_INFORMATIVE_TEXT_MAX_CHARS]
         return _TURN_BUFFER_KEEPALIVE_TEXT
 
+    def _schedule_prompt_keepalive_emit(self, chat_id: str) -> None:
+        """Open or refresh the informative stream without waiting for the idle window."""
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict) or buf.get("answer_final_in_progress"):
+            return
+        if not self._turn_buffer_live_for_keepalive(buf):
+            return
+        stream = self._keepalive_state(buf)
+        if stream.get("stopped") or stream.get("untracked") or buf.get("skip_stream_open"):
+            return
+        task = buf.get("keepalive_prompt_task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            return
+        started = asyncio.create_task(self._prompt_keepalive_emit(chat_id))
+        started.add_done_callback(_consume_turn_buffer_retry_result)
+        buf["keepalive_prompt_task"] = started
+
+    async def _prompt_keepalive_emit(self, chat_id: str) -> None:
+        try:
+            await self._emit_turn_buffer_keepalive(chat_id)
+        except asyncio.CancelledError:
+            raise
+        except RuntimeError as exc:
+            if str(exc) == "agent365 outbound operation cancelled":
+                logger.debug(
+                    "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
+                    chat_id,
+                    "swallowed RuntimeError",
+                )
+                return
+            raise
+
     def _schedule_informative_segment_refresh(self, chat_id: str) -> None:
         """Push progress/commentary into an open informative stream when possible."""
         buf = self._turn_buffers.get(chat_id)
@@ -5573,10 +5683,13 @@ class Agent365Adapter(BasePlatformAdapter):
         if stream.get("stopped") or stream.get("untracked"):
             return
         if not str(stream.get("stream_id") or ""):
+            self._schedule_prompt_keepalive_emit(chat_id)
             return
         task = buf.get("segment_informative_task")
         if isinstance(task, asyncio.Task) and not task.done():
+            buf["segment_informative_pending"] = True
             return
+        buf["segment_informative_pending"] = False
         started = asyncio.create_task(self._push_informative_segment_text(chat_id))
         started.add_done_callback(_consume_turn_buffer_retry_result)
         buf["segment_informative_task"] = started
@@ -5595,6 +5708,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
                 return
             raise
+        finally:
+            buf = self._turn_buffers.get(chat_id)
+            if isinstance(buf, dict) and buf.pop("segment_informative_pending", False):
+                self._schedule_informative_segment_refresh(chat_id)
 
     async def _turn_buffer_keepalive(self, chat_id: str) -> None:
         """Keep a long non-personal turn alive without touching ``send``.
@@ -5630,6 +5747,16 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.debug(
                 "agent365 turn buffer keep-alive first interval elapsed: "
                 "chat_id=%s elapsed_sec=%s will_post=%s",
+                chat_id,
+                f"{elapsed_first:.3f}" if elapsed_first is not None else "n/a",
+                will_post,
+            )
+            _log_turn_buffer_stage(
+                buf_after_sleep if isinstance(buf_after_sleep, dict) else None,
+                chat_id,
+                "first_interval",
+                "agent365 turn buffer keep-alive stage: chat_id=%s stage=first_interval "
+                "elapsed_sec=%s will_post=%s",
                 chat_id,
                 f"{elapsed_first:.3f}" if elapsed_first is not None else "n/a",
                 will_post,
@@ -5859,6 +5986,7 @@ class Agent365Adapter(BasePlatformAdapter):
         *,
         allow_restart: bool,
         for_answer: bool = False,
+        turn_for_text: dict[str, Any] | None = None,
     ) -> bool:
         """Return True when a 403 should be followed by one new sequence."""
         if self._turn_buffers.get(chat_id) is not buf:
@@ -5883,7 +6011,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return False
-        turn = self._keepalive_turn(buf)
+        turn = turn_for_text if isinstance(turn_for_text, dict) else self._keepalive_turn(buf)
         if turn is None:
             logger.debug(
                 "agent365 turn buffer keep-alive exit: chat_id=%s reason=_keepalive_turn None",
@@ -6153,8 +6281,20 @@ class Agent365Adapter(BasePlatformAdapter):
         mint_path = path if path is not None else self._validated_path_for_inbound(inbound)
         # Retry mint timeouts only when a stream id is already held; an
         # opener mint failure is retried by the deferred flush retry.
+        buf_for_log = self._turn_buffers.get(chat_id)
         logger.debug(
             "agent365 turn buffer keep-alive post: chat_id=%s stage=before_acquire_reply_token "
+            "opening=%s final=%s stream_id=%s",
+            chat_id,
+            opening,
+            final,
+            stream_id or "(none)",
+        )
+        _log_turn_buffer_stage(
+            buf_for_log if isinstance(buf_for_log, dict) else None,
+            chat_id,
+            "before_acquire_reply_token",
+            "agent365 turn buffer keep-alive stage: chat_id=%s stage=before_acquire_reply_token "
             "opening=%s final=%s stream_id=%s",
             chat_id,
             opening,
@@ -6182,17 +6322,52 @@ class Agent365Adapter(BasePlatformAdapter):
                 if str(exc) == "agent365 outbound operation cancelled":
                     raise
                 if mint_attempt == 0 and self._keepalive_timeout_after_send(exc):
+                    _log_turn_buffer_stage(
+                        buf_for_log if isinstance(buf_for_log, dict) else None,
+                        chat_id,
+                        "mint_timeout",
+                        "agent365 turn buffer keep-alive stage: chat_id=%s stage=mint_timeout "
+                        "opening=%s final=%s error=%s",
+                        chat_id,
+                        opening,
+                        final,
+                        exc,
+                        level=logging.WARNING,
+                    )
                     continue
                 return self._keepalive_post_exception(
                     chat_id, exc, opening=opening, during_mint=True
                 )
             except Exception as exc:
                 if mint_attempt == 0 and self._keepalive_timeout_after_send(exc):
+                    _log_turn_buffer_stage(
+                        buf_for_log if isinstance(buf_for_log, dict) else None,
+                        chat_id,
+                        "mint_timeout",
+                        "agent365 turn buffer keep-alive stage: chat_id=%s stage=mint_timeout "
+                        "opening=%s final=%s error=%s",
+                        chat_id,
+                        opening,
+                        final,
+                        exc,
+                        level=logging.WARNING,
+                    )
                     continue
                 return self._keepalive_post_exception(
                     chat_id, exc, opening=opening, during_mint=True
                 )
         if token is None:
+            _log_turn_buffer_stage(
+                buf_for_log if isinstance(buf_for_log, dict) else None,
+                chat_id,
+                "mint_failed",
+                "agent365 turn buffer keep-alive stage: chat_id=%s stage=mint_failed "
+                "opening=%s final=%s",
+                chat_id,
+                opening,
+                final,
+                level=logging.WARNING,
+            )
             return empty
         if not for_teardown and (
             not self._lifecycle_is_current(generation, client)
@@ -6206,6 +6381,16 @@ class Agent365Adapter(BasePlatformAdapter):
             return empty
         logger.debug(
             "agent365 turn buffer keep-alive post: chat_id=%s stage=before_activity_post "
+            "opening=%s final=%s",
+            chat_id,
+            opening,
+            final,
+        )
+        _log_turn_buffer_stage(
+            buf_for_log if isinstance(buf_for_log, dict) else None,
+            chat_id,
+            "before_activity_post",
+            "agent365 turn buffer keep-alive stage: chat_id=%s stage=before_activity_post "
             "opening=%s final=%s",
             chat_id,
             opening,
@@ -6232,6 +6417,17 @@ class Agent365Adapter(BasePlatformAdapter):
         status_after = getattr(resp, "status_code", None)
         logger.debug(
             "agent365 turn buffer keep-alive post: chat_id=%s stage=after_activity_post "
+            "status=%s opening=%s final=%s",
+            chat_id,
+            status_after,
+            opening,
+            final,
+        )
+        _log_turn_buffer_stage(
+            buf_for_log if isinstance(buf_for_log, dict) else None,
+            chat_id,
+            "after_activity_post",
+            "agent365 turn buffer keep-alive stage: chat_id=%s stage=after_activity_post "
             "status=%s opening=%s final=%s",
             chat_id,
             status_after,
@@ -6561,7 +6757,13 @@ class Agent365Adapter(BasePlatformAdapter):
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
         if not stream_id:
-            await self._post_informative_locked(chat_id, buf, allow_restart=False, for_answer=True)
+            await self._post_informative_locked(
+                chat_id,
+                buf,
+                allow_restart=False,
+                for_answer=True,
+                turn_for_text=turn,
+            )
             if self._turn_buffers.get(chat_id) is not buf:
                 return ("retry", None)
             stream = self._keepalive_stream(buf)
@@ -6987,6 +7189,7 @@ class Agent365Adapter(BasePlatformAdapter):
             text,
             reply_to=reply_to,
             metadata=metadata,
+            turn_segments=own,
         )
         segments.append(
             {
@@ -13327,6 +13530,7 @@ def interactive_setup() -> None:
 def register(ctx: Any) -> None:
     """Plugin entry point — invoked by the Hermes plugin system at
     gateway startup."""
+    _configure_plugin_logging()
     ctx.register_platform(
         name="agent365",
         label="Microsoft Agent 365",
