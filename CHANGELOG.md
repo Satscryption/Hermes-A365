@@ -35,8 +35,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   `agent.log` (`hermes_a365` logger at INFO unless root is DEBUG). First interim
   Hermes send (thread metadata) opens the informative stream as live progress;
   commentary-first plus queued resend delivers only the resend as the answer.
-  Cancel `keepalive_prompt_task` on drop/disconnect; ignore opener stream ids
-  when the buffer is already gone. Coalesce informative refresh while a post is
+  Cancel `keepalive_prompt_task` on drop/disconnect. Opener stream ids adopt only
+  onto the same `buf_identity`, otherwise `_orphan_keepalive`; flush never drops
+  prose unless it was posted on the informative stream (`informative_displayed`).
+  Last non-tool-progress segment is always the answer when no marked answer exists.
+  Re-check `hermes_a365` log level on gateway connect and first inbound. Coalesce
+  informative refresh while a post is in flight.
   in flight. At most one keep-alive revival per turn while `depth > 0` or
   `processing_active`.
   `processing_active` clears in a `finally` on `on_processing_complete`.

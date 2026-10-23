@@ -8561,6 +8561,12 @@ class TestEditMessage:
             content="Checking the time now.",
             metadata=thread_meta,
         )
+        await self._spin_until(
+            lambda: any(
+                segment.get("informative_displayed")
+                for segment in a._turn_buffers[chat]["segments"]
+            )
+        )
         await a.send(
             chat_id=chat,
             content="💻 Running date in the sandbox...",
@@ -8715,6 +8721,12 @@ class TestEditMessage:
             content="I'll run the sleep, then reply.",
             metadata={"thread_id": "29:copilot"},
         )
+        await self._spin_until(
+            lambda: any(
+                segment.get("informative_displayed")
+                for segment in a._turn_buffers[chat]["segments"]
+            )
+        )
         await a.send(
             chat_id=chat,
             content="Queued follow-up body",
@@ -8760,6 +8772,169 @@ class TestEditMessage:
         )
         await self._spin_until(lambda: len(posts) >= 1)
         assert posts[0]["text"] == "I'll run the sleep, then reply."
+
+    @pytest.mark.asyncio
+    async def test_commentary_tool_progress_queued_resend_posts_final_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-cmt-tool-queued"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-ctq")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await self._spin_until(
+            lambda: any(
+                segment.get("informative_displayed")
+                for segment in a._turn_buffers[chat]["segments"]
+            )
+        )
+        await a.send(chat_id=chat, content="💻 Running date", reply_to=None)
+        await a.send(
+            chat_id=chat,
+            content="Queued follow-up body",
+            reply_to=None,
+            metadata={"thread_id": "29:copilot"},
+        )
+        await a.on_processing_complete(event, outcome="success")
+        finals = [body for body in posts if body.get("type") == "message"]
+        assert finals
+        assert finals[-1]["text"] == "Queued follow-up body"
+
+    @pytest.mark.asyncio
+    async def test_two_interim_commentary_lines_plus_answer_delivers_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-two-interim"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-2i")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="First interim line.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await self._spin_until(
+            lambda: bool(
+                str(a._turn_buffers[chat].get("keepalive", {}).get("stream_id") or "")
+            )
+        )
+        await a.send(
+            chat_id=chat,
+            content="Second interim line.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await self._spin_until(
+            lambda: any(
+                post.get("text") == "Second interim line." for post in posts
+            )
+        )
+        await a.send(chat_id=chat, content="Final answer body.", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == "Final answer body."
+
+    @pytest.mark.asyncio
+    async def test_two_part_answer_without_metadata_delivers_both_parts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-two-part"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Part one of the answer.", reply_to=None)
+        await a.send(chat_id=chat, content="Part two of the answer.", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert post_mock.await_args_list[-1].kwargs["json"]["text"] == (
+            "Part one of the answer.\n\nPart two of the answer."
+        )
+
+    @pytest.mark.asyncio
+    async def test_drop_during_answer_path_opener_orphans_stream_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-ans-opener-drop"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        gate = asyncio.Event()
+        opener_entered = asyncio.Event()
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                opener_entered.set()
+                await gate.wait()
+                return self._http_result(201, "ka-ans-drop")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer text only.", reply_to=None)
+        flush_task = asyncio.create_task(a.on_processing_complete(event, outcome="success"))
+        await self._spin_until(opener_entered.is_set)
+        await a._drop_turn_buffer(chat)
+        gate.set()
+        await flush_task
+        assert a._orphan_keepalive.get(chat, {}).get("stream_id") == "ka-ans-drop"
 
     @pytest.mark.asyncio
     async def test_turn_end_logs_keepalive_at_buffer_drop_on_success(
@@ -9640,6 +9815,7 @@ class TestEditMessage:
                     "lock": asyncio.Lock(),
                     "keepalive": {},
                     "keepalive_task": old.get("keepalive_task"),
+                    "buf_identity": old.get("buf_identity"),
                 }
                 return self._http_result(202, "kept-id")
             return self._http_result(202)

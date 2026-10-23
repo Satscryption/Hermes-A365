@@ -897,8 +897,11 @@ def _reconcile_turn_buffer_kinds_for_flush(segments: list[dict[str, Any]], seq: 
         text = str(segment.get("text") or "")
         if _is_hermes_tool_progress_segment(text):
             segment["kind"] = "progress"
-            continue
-        if has_marked_answer:
+    if has_marked_answer:
+        for segment in turn_segments:
+            text = str(segment.get("text") or "")
+            if _is_hermes_tool_progress_segment(text):
+                continue
             if segment.get("informative_update"):
                 segment["kind"] = "commentary"
                 continue
@@ -906,34 +909,20 @@ def _reconcile_turn_buffer_kinds_for_flush(segments: list[dict[str, Any]], seq: 
                 segment["kind"] = "answer"
                 continue
             segment["kind"] = "commentary"
-            continue
-        if segment.get("kind") == "progress":
-            continue
-        if segment.get("kind") == "commentary":
-            segment["kind"] = "progress"
-            continue
-        if segment.get("informative_update"):
-            segment["kind"] = "progress"
-            continue
-        segment["kind"] = "answer"
-        segment["informative_update"] = False
-    if not has_marked_answer and len(turn_segments) == 1:
-        turn_segments[0]["kind"] = "answer"
-        turn_segments[0]["informative_update"] = False
-    if not has_marked_answer and len(turn_segments) == 2:
-        first, last = turn_segments[0], turn_segments[1]
-        first_text = str(first.get("text") or "")
-        last_text = str(last.get("text") or "")
-        if (
-            not _segment_is_marked_answer(first)
-            and not _segment_is_marked_answer(last)
-            and not _is_hermes_tool_progress_segment(first_text)
-            and not _is_hermes_tool_progress_segment(last_text)
-        ):
-            first["kind"] = "progress"
-            first["informative_update"] = False
-            last["kind"] = "answer"
-            last["informative_update"] = False
+        return
+    prose = [
+        segment
+        for segment in turn_segments
+        if not _is_hermes_tool_progress_segment(str(segment.get("text") or ""))
+    ]
+    if not prose:
+        return
+    for segment in prose[:-1]:
+        if str(segment.get("kind") or "") == "answer":
+            segment["kind"] = "commentary"
+    last = prose[-1]
+    last["kind"] = "answer"
+    last["informative_update"] = False
 
 
 def _classify_turn_buffer_segment_kind(
@@ -947,21 +936,12 @@ def _classify_turn_buffer_segment_kind(
     if _is_hermes_tool_progress_segment(text):
         return "progress"
     prior = list(turn_segments or [])
+    if _segment_is_marked_answer_from_send(reply_to, metadata):
+        return "answer"
     if _is_hermes_interim_thread_send(metadata, prior):
         return "commentary"
     if _metadata_marks_informative_segment(metadata, turn_segments=prior):
         return "commentary"
-    if _segment_is_marked_answer_from_send(reply_to, metadata):
-        return "answer"
-    if (
-        prior
-        and isinstance(metadata, dict)
-        and metadata.get("thread_id")
-        and not metadata.get("informative_update")
-        and not metadata.get("notify")
-        and not metadata.get("expect_edits")
-    ):
-        return "answer"
     if any(_segment_is_marked_answer(segment) for segment in prior):
         return "commentary"
     return "answer"
@@ -2834,7 +2814,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 # send() gate that picks replyToActivity vs
                 # sendToConversation. Per-lifetime, not persisted.
                 seen = self._seen_inbounds_this_lifetime
+                first_inbound_this_lifetime = not seen
                 seen.add(ref.conversation_id)
+                if first_inbound_this_lifetime:
+                    _configure_plugin_logging()
                 # L2 (#105): bound the set, but NEVER evict the chat we just
                 # received — the send() gate above routes reply-vs-proactive
                 # off its membership, so evicting it would misroute THIS turn's
@@ -3389,6 +3372,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._disconnecting:
             logger.warning("agent365 connect deferred while outbound tasks retire")
             return False
+        _configure_plugin_logging()
         if is_reconnect:
             # Provider hits are intentionally cached during one connection,
             # but a reconnect is the operator-visible boundary for picking up
@@ -5318,8 +5302,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 "lock": asyncio.Lock(),
                 "keepalive": self._orphan_keepalive.pop(str(chat_id), {}),
                 "processing_active": True,
+                "buf_identity": str(uuid.uuid4()),
             }
         else:
+            self._ensure_turn_buffer_identity(buf)
             buf.setdefault("turns", []).append(turn)
             buf["depth"] = sum(1 for item in buf["turns"] if item.get("open"))
             buf["processing_active"] = True
@@ -5455,6 +5441,17 @@ class Agent365Adapter(BasePlatformAdapter):
         if remaining > 0.0:
             await asyncio.sleep(remaining)
 
+    @staticmethod
+    def _ensure_turn_buffer_identity(buf: dict[str, Any]) -> None:
+        if not str(buf.get("buf_identity") or ""):
+            buf["buf_identity"] = str(uuid.uuid4())
+
+    @staticmethod
+    def _turn_buffers_share_identity(left: dict[str, Any], right: dict[str, Any]) -> bool:
+        left_id = str(left.get("buf_identity") or "")
+        right_id = str(right.get("buf_identity") or "")
+        return bool(left_id) and left_id == right_id
+
     def _remember_keepalive(self, chat_id: str, buf: dict[str, Any], state: dict[str, Any]) -> None:
         """Store stream state on the live buffer, or as an orphan.
 
@@ -5466,22 +5463,43 @@ class Agent365Adapter(BasePlatformAdapter):
         if live is buf:
             buf["keepalive"] = state
             return
-        if live is None:
-            if state.get("stream_id"):
-                logger.debug(
-                    "agent365 turn buffer keep-alive drop: chat_id=%s "
-                    "reason=buffer gone before stream id stored stream_id=%s",
-                    chat_id,
-                    state.get("stream_id"),
-                )
+        if isinstance(live, dict) and self._turn_buffers_share_identity(live, buf):
+            live["keepalive"] = state
             return
-        if isinstance(live, dict):
-            current = self._keepalive_state(live)
-            if not self._keepalive_blocks_reply(current) and not current.get("stopped"):
-                live["keepalive"] = state
-                return
+        if live is None or isinstance(live, dict):
+            if state.get("stream_id") or state.get("untracked") or state.get("stopped"):
+                self._orphan_keepalive[str(chat_id)] = state
+            return
         if state.get("stream_id") or state.get("untracked") or state.get("stopped"):
             self._orphan_keepalive[str(chat_id)] = state
+
+    def _adopt_opened_keepalive_stream(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        opened_state: dict[str, Any],
+        *,
+        posted_text: str = "",
+        turn_for_text: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """Attach a new opener stream id to the right buffer, or orphan it."""
+        live = self._turn_buffers.get(chat_id)
+        if live is buf:
+            target: dict[str, Any] | None = buf
+        elif isinstance(live, dict) and self._turn_buffers_share_identity(live, buf):
+            target = live
+        else:
+            self._orphan_keepalive[str(chat_id)] = opened_state
+            logger.debug(
+                "agent365 turn buffer keep-alive orphan opener: chat_id=%s stream_id=%s",
+                chat_id,
+                opened_state.get("stream_id"),
+            )
+            return None
+        self._remember_keepalive(chat_id, target, opened_state)
+        if posted_text and isinstance(turn_for_text, dict):
+            self._mark_informative_displayed_segments(target, turn_for_text, posted_text)
+        return target
 
     def _cancel_turn_buffer_retries(self) -> None:
         for buf in self._turn_buffers.values():
@@ -5738,6 +5756,23 @@ class Agent365Adapter(BasePlatformAdapter):
         if _is_hermes_tool_progress_segment(text):
             return "progress"
         return "answer"
+
+    @staticmethod
+    def _mark_informative_displayed_segments(
+        buf: dict[str, Any], turn: dict[str, Any], posted_text: str
+    ) -> None:
+        posted = str(posted_text or "").strip()
+        if not posted or posted == _TURN_BUFFER_KEEPALIVE_TEXT:
+            return
+        seq = str(turn.get("seq") or "")
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            kind = Agent365Adapter._turn_buffer_segment_kind(segment)
+            if kind not in ("progress", "commentary"):
+                continue
+            if str(segment.get("text") or "").strip() == posted:
+                segment["informative_displayed"] = True
 
     def _informative_text_for_turn(
         self, buf: dict[str, Any], turn: dict[str, Any] | None
@@ -6165,20 +6200,16 @@ class Agent365Adapter(BasePlatformAdapter):
                 "sequence": 1,
                 "opened_mono": time.monotonic(),
             }
-            live = self._turn_buffers.get(chat_id)
-            if live is buf:
-                target = buf
-            elif isinstance(live, dict):
-                target = live
-            else:
-                logger.debug(
-                    "agent365 turn buffer keep-alive drop: chat_id=%s "
-                    "reason=buffer gone after opener stream_id=%s",
-                    chat_id,
-                    new_id,
-                )
+            target = self._adopt_opened_keepalive_stream(
+                chat_id,
+                buf,
+                opened_state,
+                posted_text=informative_text,
+                turn_for_text=turn,
+            )
+            if target is None:
+                self._remember_bot_reply(new_id, conversation_id=str(chat_id))
                 return False
-            self._remember_keepalive(chat_id, target, opened_state)
             self._touch_keepalive_emit(chat_id, target)
             self._remember_bot_reply(new_id, conversation_id=str(chat_id))
             logger.info(
@@ -6191,6 +6222,8 @@ class Agent365Adapter(BasePlatformAdapter):
             stream["sequence"] = sequence
             self._remember_keepalive(chat_id, buf, stream)
             self._touch_keepalive_emit(chat_id, buf)
+            if not for_answer:
+                self._mark_informative_displayed_segments(buf, turn, informative_text)
             logger.info(
                 "agent365 turn buffer keep-alive: chat_id=%s stream_id=%s sequence=%s",
                 chat_id,
@@ -7453,23 +7486,56 @@ class Agent365Adapter(BasePlatformAdapter):
             for segment in segments
             if str(segment.get("turn") or "") == seq
         ]
+        has_marked_answer = any(
+            _segment_is_marked_answer(segment) for segment in turn_segments
+        )
+        first_marked_idx = next(
+            (
+                index
+                for index, segment in enumerate(turn_segments)
+                if _segment_is_marked_answer(segment)
+            ),
+            len(turn_segments),
+        )
         kept: list[dict[str, str]] = []
         drop_ids: list[str] = []
-        for segment in turn_segments:
+        for index, segment in enumerate(turn_segments):
             text = str(segment.get("text") or "")
-            kind = self._turn_buffer_segment_kind(segment)
-            if not text or kind in ("progress", "commentary"):
-                if text and kind == "progress" and chat_id:
+            if not text:
+                drop_ids.append(str(segment.get("id") or ""))
+                continue
+            if _is_hermes_tool_progress_segment(text):
+                if chat_id:
                     logger.debug(
                         "agent365 turn buffer omitting tool-progress segment: chat_id=%s",
                         chat_id,
                     )
                 drop_ids.append(str(segment.get("id") or ""))
                 continue
-            if _is_hermes_tool_progress_segment(text):
-                drop_ids.append(str(segment.get("id") or ""))
+            kind = self._turn_buffer_segment_kind(segment)
+            if kind in ("progress", "commentary"):
+                if has_marked_answer:
+                    if index < first_marked_idx:
+                        if segment.get("informative_update") or segment.get(
+                            "informative_displayed"
+                        ):
+                            drop_ids.append(str(segment.get("id") or ""))
+                        else:
+                            kept.append(segment)
+                    else:
+                        drop_ids.append(str(segment.get("id") or ""))
+                elif segment.get("informative_displayed"):
+                    drop_ids.append(str(segment.get("id") or ""))
+                else:
+                    kept.append(segment)
                 continue
             kept.append(segment)
+        if not kept:
+            for segment in reversed(turn_segments):
+                text = str(segment.get("text") or "")
+                if text and not _is_hermes_tool_progress_segment(text):
+                    kept = [segment]
+                    break
         return kept, drop_ids
 
     def _turn_buffer_handoff_suffix(self, chat_id: str) -> str:
