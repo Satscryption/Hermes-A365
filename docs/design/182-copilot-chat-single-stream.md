@@ -78,7 +78,7 @@ Hermes cancels the stream-consumer task at turn end. A POST inside `send` dies a
 
 The keep-alive task (#155) still waits `_TURN_BUFFER_KEEPALIVE_FIRST_SEC` (25s) and still posts informative updates on `buf["keepalive"]`. This design does not make it fire, and does not move its first post. That is #181.
 
-Tool-progress lines that match `_is_hermes_tool_progress_segment` are still dropped from the final body. Commentary is still joined into the answer with `\n\n`. Changing that split is #186.
+Tool-progress and interim commentary are routed to informative stream text (#186); only `kind=answer` segments are joined into the `streamType=final` body.
 
 Personal chats never open `_turn_buffers`.
 
@@ -206,15 +206,21 @@ Walk092 C2: inbound 19:29:57, `sleep 40`, turn end 19:30:42, reply 19:30:43. The
 
 Walk092 C2 final included the tool-progress line and interim commentary (`segments=3`, 58 characters). The intended split is progress in the informative text and only the answer in the final.
 
-Today `_flush_closed_turns` already drops a segment when `_is_hermes_tool_progress_segment` is true (exact Hermes `{emoji} {verb}{connector}{preview}` lines, including `💻 Running …`). A segment that mixes progress with other text is kept whole. Commentary (`reply_to is None`, not a progress line) is joined into the final. `test_turn_buffer_merges_commentary_edited_segment_and_duplicate_final` locks that join. #182 keeps it.
+Hermes 0.19.0 does not set `informative_update` on interim commentary (`gateway/stream_consumer.py` `_send_commentary` → plain `adapter.send` with thread metadata only). The adapter therefore classifies at flush using the send shape Hermes actually uses (see table below).
 
-#186, after this lands:
+### Segment classification (#186 shipped)
 
-- Informative `text` is already a parameter, not the answer. Pass the latest progress or commentary segment (trimmed to `_INFORMATIVE_TEXT_MAX_CHARS`) on the keep-alive update and on the flush-time opener. Leave the answer out of that text.
-- Stop joining those segments into the final. The final `text` is the answer segment only.
-- Do not put progress on the final activity, and do not put the answer on an informative activity. After the first `streamType=streaming` chunk, informative updates stop rendering; stay on `informative` for progress.
-- The pure-progress filter can stay as a backstop, but #186 should classify by segment role (`reply_to` scoped stream chunk vs unscoped progress/commentary), not only by emoji shape. The walk line may already match the emoji filter and still have been merged because it shared a segment with commentary, or the quoted log may be counting buffer segments before the filter. Check the walk log before changing the filter.
-- Per-platform `display.tool_progress: off` remains the workaround that does not need this delivery path.
+Each turn-buffer segment stores the send shape (`reply_to`, `notify`, `expect_edits`, `informative_update`). `_reconcile_turn_buffer_kinds_for_flush` runs before the final body is built (and `edit_message` can refresh `kind` when progress text becomes answer text):
+
+| `kind` | Rule | Informative stream | Answer `streamType=final` |
+|---|---|---|---|
+| `progress` | text matches `_is_hermes_tool_progress_segment` (Hermes tool-progress bubbles) | latest progress/commentary text on keep-alive and on flush opener | never |
+| `answer` | `reply_to` set, or `metadata.notify`, or `metadata.expect_edits` (streamed/final answer from Hermes) | never | yes — joined into the final body |
+| `commentary` | unscoped send (no `reply_to`, no `notify`, no `expect_edits`) **and** the same turn also has at least one marked-answer segment; or `informative_update: true` | same as progress | never |
+
+If the turn has **no** marked-answer segment, unscoped sends stay `answer` (lone reply, or `gateway/run.py` queued follow-up resend with metadata only). Per-platform `display.tool_progress: off` remains the workaround that does not need this delivery path.
+
+When an informative stream is already open (`keepalive.stream_id` set), new progress or commentary segments schedule a continuation POST with the latest informative text. If no stream is open yet, that text is included on the first informative opener at flush (or on the keep-alive opener once #181 fires). Personal Teams 1:1 does not use the turn buffer; this split applies only to Copilot Chat / non-personal buffered turns.
 
 ## Test plan
 
@@ -230,7 +236,7 @@ Rewrite the assertions that require `send_reply` of the answer and a keep-alive 
 | `test_failed_final_keeps_stream_and_segments` | The failing POSTs are finals whose text is the answer. `send_reply` stays 0. `stream_id` and segments remain. |
 | `test_failed_final_retry_then_posts_one_reply` | First answer-final fails, retry final succeeds, no `send_reply`. |
 | `test_nested_complete_closes_keepalive_before_followup_reply` | Withdrawn as an expectation. Replace it with the nested rows in the [test matrix](#test-matrix). |
-| `test_turn_buffer_merges_commentary_edited_segment_and_duplicate_final` | Wire is the final. Body is still commentary plus answer plus the handoff line. `send_reply` stays 0. This test is the #186 seam; do not drop commentary here. |
+| `test_turn_buffer_merges_commentary_edited_segment_and_duplicate_final` | Wire is the final. Body is the marked answer only (commentary/progress omitted from final). `send_reply` stays 0. |
 | `test_turn_buffer_omits_hermes_tool_progress` and `test_turn_buffer_keeps_one_line_answers_sharing_progress_shape` | Same bodies as now, carried on the final. |
 | `test_untracked_open_waits_out_the_cap_then_posts_one_reply` | Unchanged: no second stream; one plain reply after the cap. |
 | `test_personal_chat_is_not_turn_buffered`, `test_personal_chat_does_not_schedule_keepalive`, `TestSendStreamStart` | Unchanged. Personal final is still `streamType=streaming` then `streamType=final`. |

@@ -30,6 +30,31 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Copilot Chat turn-buffer keep-alive (Refs #181).** Once-per-turn INFO stage
+  lines (`scheduled`, `first_interval`, mint, activity POST, `turn_end`) reach
+  `agent.log` (`hermes_a365` stays at ``NOTSET`` and inherits root; register only
+  relaxes an explicit child level stricter than root). First interim
+  Hermes send (thread metadata) opens the informative stream as live progress;
+  commentary-first plus queued resend delivers only the resend as the answer.
+  Cancel `keepalive_prompt_task` on drop/disconnect. Opener stream ids adopt only
+  onto the same `buf_identity`, otherwise `_orphan_keepalive`; flush never drops
+  prose unless it was posted on the informative stream (`informative_displayed`).
+  Last non-tool-progress segment is always the answer when no marked answer exists.
+  Re-check `hermes_a365` log level on gateway connect and first inbound. Coalesce
+  informative refresh while a post is in flight.
+  in flight. At most one keep-alive revival per turn while `depth > 0` or
+  `processing_active`.
+  `processing_active` clears in a `finally` on `on_processing_complete`.
+  Progress-only flush sets `skip_stream_open` so a closed informative stream is
+  not reopened. Cancel in-flight `segment_informative_task` on buffer drop and
+  disconnect.
+
+- **Copilot Chat informative vs answer text (#186).** Flush-time segment roles:
+  tool-progress shape → informative only; `reply_to` / `notify` / `expect_edits`
+  → answer; unscoped sends are commentary only when the same turn also has a
+  marked answer (else they stay the answer). `informative_update` metadata
+  remains an extra commentary hook. Personal 1:1 streaming is unchanged.
+
 - **Copilot Chat publish version and catalog id handling (#171).**
   `publish --copilot-chat --apply` fails closed when there is no matching
   `copilot-chat-publish.json` record for the target catalog `manifest.id` and
