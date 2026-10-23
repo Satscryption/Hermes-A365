@@ -8393,6 +8393,70 @@ class TestEditMessage:
         assert task.cancelled()
 
     @pytest.mark.asyncio
+    async def test_drop_turn_buffer_cancels_keepalive_prompt_task(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-prompt-cancel"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        task = asyncio.create_task(asyncio.sleep(3600))
+        a._turn_buffers[chat]["keepalive_prompt_task"] = task
+        await a._drop_turn_buffer(chat)
+        assert task.cancelled()
+
+    @pytest.mark.asyncio
+    async def test_late_keepalive_opener_after_buffer_drop_does_not_orphan_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-late-opener"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        gate = asyncio.Event()
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            await gate.wait()
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-late")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="Interim line",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await self._spin_until(
+            lambda: isinstance(
+                a._turn_buffers.get(chat, {}).get("keepalive_prompt_task"), asyncio.Task
+            )
+        )
+        await a._drop_turn_buffer(chat)
+        gate.set()
+        await asyncio.sleep(0.05)
+        assert chat not in a._orphan_keepalive
+        assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
     async def test_progress_only_successful_close_skips_second_informative_open(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -8618,6 +8682,84 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         final = next(body for body in posts if body.get("type") == "message")
         assert final["text"] == "Queued follow-up body"
+
+    @pytest.mark.asyncio
+    async def test_hermes_commentary_first_then_queued_resend_delivers_resend(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-commentary-queued"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-cq")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await a.send(
+            chat_id=chat,
+            content="Queued follow-up body",
+            reply_to=None,
+            metadata={"thread_id": "29:copilot"},
+        )
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == "Queued follow-up body"
+        assert "I'll run the sleep" not in final["text"]
+
+    @pytest.mark.asyncio
+    async def test_first_interim_thread_metadata_opens_informative_before_idle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-first-interim"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-first")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await self._spin_until(lambda: len(posts) >= 1)
+        assert posts[0]["text"] == "I'll run the sleep, then reply."
 
     @pytest.mark.asyncio
     async def test_turn_end_logs_keepalive_at_buffer_drop_on_success(

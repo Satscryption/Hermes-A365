@@ -93,16 +93,18 @@ logger = logging.getLogger(__name__)
 
 
 def _configure_plugin_logging() -> None:
-    """Align ``hermes_a365`` loggers with ``logging.level`` on ``agent.log``.
+    """Ensure ``hermes_a365`` loggers are not quieter than INFO on ``agent.log``.
 
-    Hermes routes file logging through the root logger; child loggers must not
-    stay at INFO when the operator sets DEBUG. Keep-alive stage lines also emit
-    at INFO (once per turn per stage) so walk/debug runs do not depend on DEBUG
-    reaching this package.
+    Hermes routes file logging through the root logger. INFO keep-alive stage
+    lines must not be blocked by a child logger left at WARNING; DEBUG is
+    enabled when the root effective level is DEBUG.
     """
     root = logging.getLogger()
+    pkg = logging.getLogger("hermes_a365")
     if root.getEffectiveLevel() <= logging.DEBUG:
-        logging.getLogger("hermes_a365").setLevel(logging.DEBUG)
+        pkg.setLevel(logging.DEBUG)
+    else:
+        pkg.setLevel(logging.INFO)
 
 
 def _turn_buffer_stage_logged(buf: dict[str, Any] | None, stage: str) -> bool:
@@ -810,6 +812,20 @@ def _is_hermes_tool_progress_segment(text: str) -> bool:
     return all(_is_hermes_tool_progress_line(line) for line in lines)
 
 
+def _is_hermes_interim_thread_send(
+    metadata: Any | None, prior_segments: list[dict[str, Any]]
+) -> bool:
+    """Hermes 0.19 interim commentary: unscoped send with thread metadata only."""
+    if not isinstance(metadata, dict):
+        return False
+    return (
+        bool(metadata.get("thread_id"))
+        and not metadata.get("notify")
+        and not metadata.get("expect_edits")
+        and not prior_segments
+    )
+
+
 def _metadata_marks_informative_segment(
     metadata: Any | None, *, turn_segments: list[dict[str, Any]] | None = None
 ) -> bool:
@@ -829,6 +845,24 @@ def _metadata_marks_informative_segment(
     ):
         return True
     return False
+
+
+def _segment_stores_informative_update_flag(
+    metadata: Any | None, *, turn_segments: list[dict[str, Any]] | None = None
+) -> bool:
+    """Whether to persist ``informative_update`` on the segment for flush rules."""
+    prior = list(turn_segments or [])
+    if not _metadata_marks_informative_segment(metadata, turn_segments=prior):
+        return False
+    # Queued resend after interim commentary shares thread metadata (#186 walk).
+    if (
+        prior
+        and isinstance(metadata, dict)
+        and metadata.get("thread_id")
+        and not metadata.get("informative_update")
+    ):
+        return False
+    return True
 
 
 def _segment_is_marked_answer_from_send(
@@ -864,13 +898,42 @@ def _reconcile_turn_buffer_kinds_for_flush(segments: list[dict[str, Any]], seq: 
         if _is_hermes_tool_progress_segment(text):
             segment["kind"] = "progress"
             continue
-        if segment.get("informative_update"):
+        if has_marked_answer:
+            if segment.get("informative_update"):
+                segment["kind"] = "commentary"
+                continue
+            if _segment_is_marked_answer(segment):
+                segment["kind"] = "answer"
+                continue
             segment["kind"] = "commentary"
             continue
-        if _segment_is_marked_answer(segment):
-            segment["kind"] = "answer"
+        if segment.get("kind") == "progress":
             continue
-        segment["kind"] = "commentary" if has_marked_answer else "answer"
+        if segment.get("kind") == "commentary":
+            segment["kind"] = "progress"
+            continue
+        if segment.get("informative_update"):
+            segment["kind"] = "progress"
+            continue
+        segment["kind"] = "answer"
+        segment["informative_update"] = False
+    if not has_marked_answer and len(turn_segments) == 1:
+        turn_segments[0]["kind"] = "answer"
+        turn_segments[0]["informative_update"] = False
+    if not has_marked_answer and len(turn_segments) == 2:
+        first, last = turn_segments[0], turn_segments[1]
+        first_text = str(first.get("text") or "")
+        last_text = str(last.get("text") or "")
+        if (
+            not _segment_is_marked_answer(first)
+            and not _segment_is_marked_answer(last)
+            and not _is_hermes_tool_progress_segment(first_text)
+            and not _is_hermes_tool_progress_segment(last_text)
+        ):
+            first["kind"] = "progress"
+            first["informative_update"] = False
+            last["kind"] = "answer"
+            last["informative_update"] = False
 
 
 def _classify_turn_buffer_segment_kind(
@@ -884,13 +947,22 @@ def _classify_turn_buffer_segment_kind(
     if _is_hermes_tool_progress_segment(text):
         return "progress"
     prior = list(turn_segments or [])
+    if _is_hermes_interim_thread_send(metadata, prior):
+        return "commentary"
     if _metadata_marks_informative_segment(metadata, turn_segments=prior):
         return "commentary"
     if _segment_is_marked_answer_from_send(reply_to, metadata):
         return "answer"
+    if (
+        prior
+        and isinstance(metadata, dict)
+        and metadata.get("thread_id")
+        and not metadata.get("informative_update")
+        and not metadata.get("notify")
+        and not metadata.get("expect_edits")
+    ):
+        return "answer"
     if any(_segment_is_marked_answer(segment) for segment in prior):
-        return "commentary"
-    if prior:
         return "commentary"
     return "answer"
 
@@ -3664,6 +3736,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_target_count_by_chat.clear()
         self._cancel_turn_buffer_retries()
         for chat_id, buf in list(self._turn_buffers.items()):
+            self._cancel_keepalive_prompt_task(buf)
             self._cancel_segment_informative_task(buf)
             await self._cancel_keepalive_and_close(str(chat_id), buf)
         self._turn_buffers.clear()
@@ -5272,6 +5345,13 @@ class Agent365Adapter(BasePlatformAdapter):
         if isinstance(task, asyncio.Task) and not task.done() and task is not current:
             task.cancel()
 
+    @staticmethod
+    def _cancel_keepalive_prompt_task(buf: dict[str, Any]) -> None:
+        task = buf.get("keepalive_prompt_task")
+        current = asyncio.current_task()
+        if isinstance(task, asyncio.Task) and not task.done() and task is not current:
+            task.cancel()
+
     def _log_turn_buffer_keepalive_at_turn_end(self, chat_id: str, buf: dict[str, Any]) -> None:
         task = buf.get("keepalive_task")
         scheduled = buf.get("keepalive_scheduled_mono")
@@ -5317,6 +5397,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._log_turn_buffer_keepalive_at_turn_end(chat_id, buf)
         buf = self._turn_buffers.pop(chat_id, None)
         if buf is not None:
+            self._cancel_keepalive_prompt_task(buf)
             self._cancel_segment_informative_task(buf)
             self._cancel_turn_buffer_retry(buf)
             await self._cancel_keepalive_and_close(chat_id, buf)
@@ -5384,6 +5465,15 @@ class Agent365Adapter(BasePlatformAdapter):
         live = self._turn_buffers.get(chat_id)
         if live is buf:
             buf["keepalive"] = state
+            return
+        if live is None:
+            if state.get("stream_id"):
+                logger.debug(
+                    "agent365 turn buffer keep-alive drop: chat_id=%s "
+                    "reason=buffer gone before stream id stored stream_id=%s",
+                    chat_id,
+                    state.get("stream_id"),
+                )
             return
         if isinstance(live, dict):
             current = self._keepalive_state(live)
@@ -5556,6 +5646,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
     @staticmethod
     def _cancel_turn_buffer_keepalive(buf: dict[str, Any]) -> None:
+        Agent365Adapter._cancel_keepalive_prompt_task(buf)
         task = buf.get("keepalive_task")
         current = asyncio.current_task()
         if isinstance(task, asyncio.Task) and not task.done() and task is not current:
@@ -6074,8 +6165,21 @@ class Agent365Adapter(BasePlatformAdapter):
                 "sequence": 1,
                 "opened_mono": time.monotonic(),
             }
-            self._remember_keepalive(chat_id, buf, opened_state)
-            self._touch_keepalive_emit(chat_id, buf)
+            live = self._turn_buffers.get(chat_id)
+            if live is buf:
+                target = buf
+            elif isinstance(live, dict):
+                target = live
+            else:
+                logger.debug(
+                    "agent365 turn buffer keep-alive drop: chat_id=%s "
+                    "reason=buffer gone after opener stream_id=%s",
+                    chat_id,
+                    new_id,
+                )
+                return False
+            self._remember_keepalive(chat_id, target, opened_state)
+            self._touch_keepalive_emit(chat_id, target)
             self._remember_bot_reply(new_id, conversation_id=str(chat_id))
             logger.info(
                 "agent365 turn buffer keep-alive started: chat_id=%s stream_id=%s",
@@ -7226,13 +7330,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 "reply_to": str(reply_to) if reply_to is not None else "",
                 "notify": bool((metadata or {}).get("notify")),
                 "expect_edits": bool((metadata or {}).get("expect_edits")),
-                "informative_update": _metadata_marks_informative_segment(
+                "informative_update": _segment_stores_informative_update_flag(
                     metadata, turn_segments=own
                 ),
             }
         )
         _reclassify_interim_segments_before_marked_answer(segments, turn_seq)
         kind = str(segments[-1].get("kind") or kind)
+        if _is_hermes_interim_thread_send(metadata, own):
+            self._schedule_prompt_keepalive_emit(str(chat_id))
         if kind in ("progress", "commentary"):
             self._schedule_informative_segment_refresh(str(chat_id))
         elif any(
