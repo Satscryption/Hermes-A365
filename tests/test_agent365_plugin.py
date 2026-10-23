@@ -8996,7 +8996,9 @@ class TestEditMessage:
         )
         import logging
 
-        with caplog.at_level(logging.INFO):
+        adapter_mod.register(_FakeCtx())
+        assert logging.getLogger("hermes_a365").level == logging.NOTSET
+        with caplog.at_level(logging.DEBUG):
             await a.on_processing_start(event)
             await a.send(chat_id=chat, content="Answer", reply_to="act-1")
             await self._spin_until(lambda: len(posts) >= 1)

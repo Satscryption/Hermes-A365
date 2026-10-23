@@ -8,7 +8,18 @@ golden fixtures.
 
 from __future__ import annotations
 
+import logging
+
 import pytest
+
+
+@pytest.fixture(autouse=True)
+def _reset_hermes_a365_logger_level() -> None:
+    """Keep ``register()`` from pinning ``hermes_a365`` across shuffled tests."""
+    pkg = logging.getLogger("hermes_a365")
+    pkg.setLevel(logging.NOTSET)
+    yield
+    pkg.setLevel(logging.NOTSET)
 
 
 def pytest_addoption(parser):  # type: ignore[no-untyped-def]

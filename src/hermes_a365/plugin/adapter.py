@@ -93,18 +93,19 @@ logger = logging.getLogger(__name__)
 
 
 def _configure_plugin_logging() -> None:
-    """Ensure ``hermes_a365`` loggers are not quieter than INFO on ``agent.log``.
+    """Relax a too-strict ``hermes_a365`` logger without pinning verbosity.
 
-    Hermes routes file logging through the root logger. INFO keep-alive stage
-    lines must not be blocked by a child logger left at WARNING; DEBUG is
-    enabled when the root effective level is DEBUG.
+    Hermes routes file logging through the root logger. Leave the package
+    logger at ``NOTSET`` so it inherits ``logging.level`` on ``agent.log``.
+    Only lower an explicit child level that is stricter than the root.
     """
     root = logging.getLogger()
     pkg = logging.getLogger("hermes_a365")
-    if root.getEffectiveLevel() <= logging.DEBUG:
-        pkg.setLevel(logging.DEBUG)
-    else:
-        pkg.setLevel(logging.INFO)
+    if pkg.level == logging.NOTSET:
+        return
+    root_level = root.getEffectiveLevel()
+    if pkg.level > root_level:
+        pkg.setLevel(logging.DEBUG if root_level <= logging.DEBUG else logging.INFO)
 
 
 def _turn_buffer_stage_logged(buf: dict[str, Any] | None, stage: str) -> bool:

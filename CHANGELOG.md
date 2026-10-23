@@ -32,7 +32,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - **Copilot Chat turn-buffer keep-alive (Refs #181).** Once-per-turn INFO stage
   lines (`scheduled`, `first_interval`, mint, activity POST, `turn_end`) reach
-  `agent.log` (`hermes_a365` logger at INFO unless root is DEBUG). First interim
+  `agent.log` (`hermes_a365` stays at ``NOTSET`` and inherits root; register only
+  relaxes an explicit child level stricter than root). First interim
   Hermes send (thread metadata) opens the informative stream as live progress;
   commentary-first plus queued resend delivers only the resend as the answer.
   Cancel `keepalive_prompt_task` on drop/disconnect. Opener stream ids adopt only
