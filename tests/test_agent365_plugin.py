@@ -9025,7 +9025,9 @@ class TestEditMessage:
         await a.send(chat_id=chat, content="Draft", reply_to="act-1")
         interim = await a.send(chat_id=chat, content="I'll check that now.", reply_to=None)
         assert interim.success is True
-        segment = next(s for s in a._turn_buffers[chat]["segments"] if s["id"] == interim.message_id)
+        segment = next(
+            s for s in a._turn_buffers[chat]["segments"] if s["id"] == interim.message_id
+        )
         assert segment["kind"] == "commentary"
 
     @pytest.mark.asyncio

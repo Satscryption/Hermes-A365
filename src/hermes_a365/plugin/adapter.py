@@ -838,14 +838,12 @@ def _metadata_marks_informative_segment(
     # Hermes 0.19 commentary reuses thread metadata; a lone queued resend also
     # carries thread metadata but is the only segment on the turn.
     prior = list(turn_segments or [])
-    if (
+    return bool(
         metadata.get("thread_id")
         and not metadata.get("notify")
         and not metadata.get("expect_edits")
         and prior
-    ):
-        return True
-    return False
+    )
 
 
 def _segment_stores_informative_update_flag(
@@ -856,14 +854,12 @@ def _segment_stores_informative_update_flag(
     if not _metadata_marks_informative_segment(metadata, turn_segments=prior):
         return False
     # Queued resend after interim commentary shares thread metadata (#186 walk).
-    if (
+    return not (
         prior
         and isinstance(metadata, dict)
         and metadata.get("thread_id")
         and not metadata.get("informative_update")
-    ):
-        return False
-    return True
+    )
 
 
 def _segment_is_marked_answer_from_send(
@@ -7373,9 +7369,7 @@ class Agent365Adapter(BasePlatformAdapter):
         kind = str(segments[-1].get("kind") or kind)
         if _is_hermes_interim_thread_send(metadata, own):
             self._schedule_prompt_keepalive_emit(str(chat_id))
-        if kind in ("progress", "commentary"):
-            self._schedule_informative_segment_refresh(str(chat_id))
-        elif any(
+        if kind in ("progress", "commentary") or any(
             str(segment.get("kind") or "") in ("progress", "commentary")
             for segment in segments
             if str(segment.get("turn") or "") == turn_seq
