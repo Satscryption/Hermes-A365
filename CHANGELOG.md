@@ -30,14 +30,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- **Copilot Chat turn-buffer keep-alive (#181).** DEBUG at `on_processing_complete`
-  records whether the keep-alive task is still pending and elapsed time since
-  scheduling; at most one keep-alive revival per turn while `depth > 0` or
-  `processing_active`. Stale lifecycle after mint and missing `_keepalive_turn`
-  on keep-alive final are logged. `processing_active` clears in a `finally` on
-  `on_processing_complete`. Progress-only flush sets `skip_stream_open` so a
-  closed informative stream is not reopened. Cancel in-flight
-  `segment_informative_task` on buffer drop and disconnect.
+- **Copilot Chat turn-buffer keep-alive (Refs #181).** DEBUG at turn end (before
+  buffer drop and in `on_processing_complete` when the buffer remains) records
+  keep-alive task pending state and elapsed time since scheduling; DEBUG after
+  the first-interval sleep and before token mint / activity POST. At most one
+  keep-alive revival per turn while `depth > 0` or `processing_active`.
+  `processing_active` clears in a `finally` on `on_processing_complete`.
+  Progress-only flush sets `skip_stream_open` so a closed informative stream is
+  not reopened. Cancel in-flight `segment_informative_task` on buffer drop and
+  disconnect.
 
 - **Copilot Chat informative vs answer text (#186).** Flush-time segment roles:
   tool-progress shape → informative only; `reply_to` / `notify` / `expect_edits`

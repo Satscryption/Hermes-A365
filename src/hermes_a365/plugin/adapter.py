@@ -839,6 +839,7 @@ def _refresh_turn_buffer_segment_kind_after_edit(segment: dict[str, str]) -> Non
         segment["kind"] = "progress"
     elif segment.get("kind") in ("progress", "commentary"):
         segment["kind"] = "answer"
+        segment["informative_update"] = False
 
 
 def _hermes_progress_target_is_sentence(target: str) -> bool:
@@ -5187,6 +5188,25 @@ class Agent365Adapter(BasePlatformAdapter):
         if isinstance(task, asyncio.Task) and not task.done() and task is not current:
             task.cancel()
 
+    def _log_turn_buffer_keepalive_at_turn_end(self, chat_id: str, buf: dict[str, Any]) -> None:
+        task = buf.get("keepalive_task")
+        scheduled = buf.get("keepalive_scheduled_mono")
+        elapsed: float | None = None
+        if isinstance(scheduled, (int, float)):
+            elapsed = time.monotonic() - float(scheduled)
+        pending = isinstance(task, asyncio.Task) and not task.done()
+        logger.debug(
+            "agent365 turn buffer keep-alive at turn end: "
+            "chat_id=%s task_pending=%s scheduled_elapsed_sec=%s depth=%s "
+            "processing_active=%s stream_id=%s",
+            chat_id,
+            pending,
+            f"{elapsed:.3f}" if elapsed is not None else "n/a",
+            int(buf.get("depth") or 0),
+            bool(buf.get("processing_active")),
+            str(self._keepalive_state(buf).get("stream_id") or ""),
+        )
+
     async def _drop_turn_buffer(self, chat_id: str) -> None:
         """Drop the buffer, cancel its retry, and close a keep-alive stream.
 
@@ -5195,6 +5215,9 @@ class Agent365Adapter(BasePlatformAdapter):
         to post.
         """
         chat_id = str(chat_id)
+        buf = self._turn_buffers.get(chat_id)
+        if isinstance(buf, dict):
+            self._log_turn_buffer_keepalive_at_turn_end(chat_id, buf)
         buf = self._turn_buffers.pop(chat_id, None)
         if buf is not None:
             self._cancel_segment_informative_task(buf)
@@ -5582,8 +5605,35 @@ class Agent365Adapter(BasePlatformAdapter):
         ending or the chat being torn down; it must propagate so the
         task does not post after the buffer is gone.
         """
+        scheduled_mono: float | None = None
+        buf0 = self._turn_buffers.get(chat_id)
+        if isinstance(buf0, dict):
+            raw = buf0.get("keepalive_scheduled_mono")
+            if isinstance(raw, (int, float)):
+                scheduled_mono = float(raw)
         try:
             await asyncio.sleep(_TURN_BUFFER_KEEPALIVE_FIRST_SEC)
+            elapsed_first: float | None = None
+            if scheduled_mono is not None:
+                elapsed_first = time.monotonic() - scheduled_mono
+            buf_after_sleep = self._turn_buffers.get(chat_id)
+            will_post = False
+            if isinstance(buf_after_sleep, dict):
+                stream_after = self._keepalive_state(buf_after_sleep)
+                will_post = (
+                    self._turn_buffer_keepalive_needed(chat_id)
+                    and self._turn_buffer_live_for_keepalive(buf_after_sleep)
+                    and not buf_after_sleep.get("answer_final_in_progress")
+                    and not stream_after.get("stopped")
+                    and not stream_after.get("untracked")
+                )
+            logger.debug(
+                "agent365 turn buffer keep-alive first interval elapsed: "
+                "chat_id=%s elapsed_sec=%s will_post=%s",
+                chat_id,
+                f"{elapsed_first:.3f}" if elapsed_first is not None else "n/a",
+                will_post,
+            )
             while self._turn_buffer_keepalive_needed(chat_id):
                 buf = self._turn_buffers.get(chat_id)
                 stream = self._keepalive_state(buf)
@@ -5727,7 +5777,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 and _keepalive_rotation_due(time.monotonic() - float(opened))
                 and not self._buffer_has_kept_answer_segments(buf)
             ):
-                rotated = await self._post_keepalive_final_locked(chat_id, buf)
+                if self._turn_buffer_live_for_keepalive(buf):
+                    rotated = await self._post_keepalive_final_locked(chat_id, buf)
+                else:
+                    logger.debug(
+                        "agent365 turn buffer keep-alive skip rotation final: "
+                        "chat_id=%s reason=turn ended",
+                        chat_id,
+                    )
+                    rotated = False
         if rotated and _STREAMING_MIN_GAP_SEC > 0:
             await asyncio.sleep(_STREAMING_MIN_GAP_SEC)
         restart = await self._post_informative_under_lock(chat_id, allow_restart=True)
@@ -6034,12 +6092,22 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return empty
         if retiring and not for_teardown:
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: "
+                "chat_id=%s reason=retiring and not teardown",
+                chat_id,
+            )
             return empty
         raw_conv = inbound.get("conversation")
         conv = raw_conv if isinstance(raw_conv, dict) else {}
         service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
         conv_id = conv.get("id")
         if not service_url or not conv_id:
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: "
+                "chat_id=%s reason=missing serviceUrl or conversation id",
+                chat_id,
+            )
             return empty
         generation = self._lifecycle_generation
         chat_generation = self._chat_generation(chat_id)
@@ -6085,6 +6153,14 @@ class Agent365Adapter(BasePlatformAdapter):
         mint_path = path if path is not None else self._validated_path_for_inbound(inbound)
         # Retry mint timeouts only when a stream id is already held; an
         # opener mint failure is retried by the deferred flush retry.
+        logger.debug(
+            "agent365 turn buffer keep-alive post: chat_id=%s stage=before_acquire_reply_token "
+            "opening=%s final=%s stream_id=%s",
+            chat_id,
+            opening,
+            final,
+            stream_id or "(none)",
+        )
         for mint_attempt in range(2 if stream_id else 1):
             try:
                 token, _minted = await self._await_outbound(
@@ -6128,6 +6204,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return empty
+        logger.debug(
+            "agent365 turn buffer keep-alive post: chat_id=%s stage=before_activity_post "
+            "opening=%s final=%s",
+            chat_id,
+            opening,
+            final,
+        )
         try:
             resp = await self._await_outbound(
                 chat_id,
@@ -6146,6 +6229,15 @@ class Agent365Adapter(BasePlatformAdapter):
             return self._keepalive_post_exception(chat_id, exc, opening=opening)
         except Exception as exc:
             return self._keepalive_post_exception(chat_id, exc, opening=opening)
+        status_after = getattr(resp, "status_code", None)
+        logger.debug(
+            "agent365 turn buffer keep-alive post: chat_id=%s stage=after_activity_post "
+            "status=%s opening=%s final=%s",
+            chat_id,
+            status_after,
+            opening,
+            final,
+        )
         # A lifecycle change after the response must not drop an id the
         # service already issued. The caller stores it, including when
         # this buffer object is no longer the live one.
@@ -6845,23 +6937,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if chat_id:
                 buf = self._turn_buffers.get(chat_id)
                 if isinstance(buf, dict):
-                    task = buf.get("keepalive_task")
-                    scheduled = buf.get("keepalive_scheduled_mono")
-                    elapsed: float | None = None
-                    if isinstance(scheduled, (int, float)):
-                        elapsed = time.monotonic() - float(scheduled)
-                    pending = isinstance(task, asyncio.Task) and not task.done()
-                    logger.debug(
-                        "agent365 turn buffer keep-alive at processing complete: "
-                        "chat_id=%s task_pending=%s scheduled_elapsed_sec=%s depth=%s "
-                        "processing_active=%s stream_id=%s",
-                        chat_id,
-                        pending,
-                        f"{elapsed:.3f}" if elapsed is not None else "n/a",
-                        int(buf.get("depth") or 0),
-                        bool(buf.get("processing_active")),
-                        str(self._keepalive_state(buf).get("stream_id") or ""),
-                    )
+                    self._log_turn_buffer_keepalive_at_turn_end(chat_id, buf)
                     if int(buf.get("depth") or 0) == 0:
                         buf["processing_active"] = False
                 self._reset_stream_overflow_limit_for_task()

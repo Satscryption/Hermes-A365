@@ -8620,6 +8620,34 @@ class TestEditMessage:
         assert final["text"] == "Queued follow-up body"
 
     @pytest.mark.asyncio
+    async def test_turn_end_logs_keepalive_at_buffer_drop_on_success(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-turn-end-ka-log"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Done.", reply_to="act-1")
+        import logging
+
+        with caplog.at_level(logging.DEBUG):
+            await a.on_processing_complete(event, outcome="success")
+        assert any(
+            "agent365 turn buffer keep-alive at turn end" in record.message
+            and chat in record.message
+            for record in caplog.records
+        )
+
+    @pytest.mark.asyncio
     async def test_edit_message_reclassifies_commentary_to_answer(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -8644,6 +8672,12 @@ class TestEditMessage:
         result = await a.edit_message(chat, segment_id, "The answer is 42.")
         assert result.success is True
         segment = next(s for s in a._turn_buffers[chat]["segments"] if s["id"] == segment_id)
+        assert segment["kind"] == "answer"
+        assert segment.get("informative_update") is False
+        seq = str(a._turn_buffers[chat]["turns"][0]["seq"])
+        adapter_mod._reconcile_turn_buffer_kinds_for_flush(
+            a._turn_buffers[chat]["segments"], seq
+        )
         assert segment["kind"] == "answer"
 
     @pytest.mark.asyncio
