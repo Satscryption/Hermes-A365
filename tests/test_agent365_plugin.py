@@ -8741,12 +8741,13 @@ class TestEditMessage:
             content="I'll run the sleep, then reply.",
             metadata={"thread_id": "29:copilot"},
         )
-        buf = a._turn_buffers[chat]
-        prompt = buf.get("keepalive_prompt_task")
-        assert isinstance(prompt, asyncio.Task)
-        await prompt
-        assert len(posts) >= 1
-        assert posts[0]["text"] == "I'll run the sleep, then reply."
+        await a.send(chat_id=chat, content="slept", reply_to="act-1")
+        await self._spin_until(lambda: len(posts) >= 1)
+        assert any(
+            body.get("text") == "I'll run the sleep, then reply."
+            for body in posts
+            if body.get("type") == "typing"
+        )
 
     @pytest.mark.asyncio
     async def test_edit_message_reclassifies_commentary_to_answer(

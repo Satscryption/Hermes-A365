@@ -810,15 +810,22 @@ def _is_hermes_tool_progress_segment(text: str) -> bool:
     return all(_is_hermes_tool_progress_line(line) for line in lines)
 
 
-def _metadata_marks_informative_segment(metadata: Any | None) -> bool:
+def _metadata_marks_informative_segment(
+    metadata: Any | None, *, turn_segments: list[dict[str, Any]] | None = None
+) -> bool:
     """True when Hermes marks an unscoped send as interim informative text (#186)."""
     if not isinstance(metadata, dict):
         return False
     if metadata.get("informative_update"):
         return True
-    # Hermes 0.19 commentary uses thread metadata only (stream_consumer).
-    if metadata.get("thread_id") and not metadata.get("notify") and not metadata.get(
-        "expect_edits"
+    # Hermes 0.19 commentary reuses thread metadata; a lone queued resend also
+    # carries thread metadata but is the only segment on the turn.
+    prior = list(turn_segments or [])
+    if (
+        metadata.get("thread_id")
+        and not metadata.get("notify")
+        and not metadata.get("expect_edits")
+        and prior
     ):
         return True
     return False
@@ -876,16 +883,35 @@ def _classify_turn_buffer_segment_kind(
     """Classify a buffered segment for informative vs answer delivery (#186)."""
     if _is_hermes_tool_progress_segment(text):
         return "progress"
-    if _metadata_marks_informative_segment(metadata):
+    prior = list(turn_segments or [])
+    if _metadata_marks_informative_segment(metadata, turn_segments=prior):
         return "commentary"
     if _segment_is_marked_answer_from_send(reply_to, metadata):
         return "answer"
-    prior = list(turn_segments or [])
     if any(_segment_is_marked_answer(segment) for segment in prior):
         return "commentary"
     if prior:
         return "commentary"
     return "answer"
+
+
+def _reclassify_interim_segments_before_marked_answer(
+    segments: list[dict[str, Any]], turn_seq: str
+) -> None:
+    """Promote earlier unscoped sends to commentary once an answer exists (#186)."""
+    turn_segments = [
+        segment
+        for segment in segments
+        if str(segment.get("turn") or "") == turn_seq and isinstance(segment, dict)
+    ]
+    if not any(_segment_is_marked_answer(segment) for segment in turn_segments):
+        return
+    for segment in turn_segments:
+        if _segment_is_marked_answer(segment):
+            continue
+        if _is_hermes_tool_progress_segment(str(segment.get("text") or "")):
+            continue
+        segment["kind"] = "commentary"
 
 
 def _refresh_turn_buffer_segment_kind_after_edit(segment: dict[str, str]) -> None:
@@ -7200,10 +7226,20 @@ class Agent365Adapter(BasePlatformAdapter):
                 "reply_to": str(reply_to) if reply_to is not None else "",
                 "notify": bool((metadata or {}).get("notify")),
                 "expect_edits": bool((metadata or {}).get("expect_edits")),
-                "informative_update": _metadata_marks_informative_segment(metadata),
+                "informative_update": _metadata_marks_informative_segment(
+                    metadata, turn_segments=own
+                ),
             }
         )
+        _reclassify_interim_segments_before_marked_answer(segments, turn_seq)
+        kind = str(segments[-1].get("kind") or kind)
         if kind in ("progress", "commentary"):
+            self._schedule_informative_segment_refresh(str(chat_id))
+        elif any(
+            str(segment.get("kind") or "") in ("progress", "commentary")
+            for segment in segments
+            if str(segment.get("turn") or "") == turn_seq
+        ):
             self._schedule_informative_segment_refresh(str(chat_id))
         return SendResult(success=True, message_id=segment_id)
 
