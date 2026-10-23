@@ -5771,8 +5771,16 @@ class Agent365Adapter(BasePlatformAdapter):
             if str(segment.get("text") or "").strip() == posted:
                 segment["informative_displayed"] = True
 
+    @staticmethod
+    def _is_placeholder_informative_text(text: str) -> bool:
+        return str(text or "").strip() == _TURN_BUFFER_KEEPALIVE_TEXT
+
     def _informative_text_for_turn(
-        self, buf: dict[str, Any], turn: dict[str, Any] | None
+        self,
+        buf: dict[str, Any],
+        turn: dict[str, Any] | None,
+        *,
+        answer_preview: str | None = None,
     ) -> str:
         if not isinstance(turn, dict):
             return _TURN_BUFFER_KEEPALIVE_TEXT
@@ -5789,7 +5797,26 @@ class Agent365Adapter(BasePlatformAdapter):
                 latest = text
         if latest:
             return latest[:_INFORMATIVE_TEXT_MAX_CHARS]
+        preview = str(answer_preview or "").strip()
+        if preview:
+            return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
         return _TURN_BUFFER_KEEPALIVE_TEXT
+
+    def _marked_answer_preview_for_turn(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> str:
+        seq = str(turn.get("seq") or "")
+        parts: list[str] = []
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            kind = self._turn_buffer_segment_kind(segment)
+            if not _segment_is_marked_answer(segment) and kind != "answer":
+                continue
+            text = str(segment.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts)
 
     def _schedule_prompt_keepalive_emit(self, chat_id: str) -> None:
         """Open or refresh the informative stream without waiting for the idle window."""
@@ -6168,7 +6195,23 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return False
         sequence = 1 if not stream_id else int(stream.get("sequence") or 0) + 1
-        informative_text = self._informative_text_for_turn(buf, turn)
+        answer_preview = (
+            self._marked_answer_preview_for_turn(buf, turn) if for_answer else None
+        )
+        informative_text = self._informative_text_for_turn(
+            buf, turn, answer_preview=answer_preview
+        )
+        if (
+            not for_answer
+            and not stream_id
+            and self._is_placeholder_informative_text(informative_text)
+        ):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s "
+                "reason=deferred placeholder opener",
+                chat_id,
+            )
+            return False
         result = await self._post_keepalive_activity(
             chat_id,
             turn,
@@ -6357,6 +6400,17 @@ class Agent365Adapter(BasePlatformAdapter):
         if not body_text:
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s reason=empty text",
+                chat_id,
+            )
+            return empty
+        if (
+            not final
+            and not stream_id
+            and Agent365Adapter._is_placeholder_informative_text(body_text)
+        ):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s "
+                "reason=deferred placeholder opener",
                 chat_id,
             )
             return empty
@@ -6875,6 +6929,16 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         if log_suffix:
             msg += f" ({log_suffix})"
+        routing = record.get("routing_summary")
+        if isinstance(routing, dict):
+            self._log_turn_buffer_routing_summary(
+                chat_id,
+                buf,
+                turn,
+                drop_ids=list(routing.get("drop_ids") or []),
+                final_chars=int(routing.get("final_chars") or len(content)),
+            )
+            record.pop("routing_summary", None)
         logger.info(msg)
         return ("delivered", activity_id)
 
@@ -6948,6 +7012,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stream_id = str(stream.get("stream_id") or "")
 
         buf["answer_final_in_progress"] = True
+        self._cancel_segment_informative_task(buf)
         try:
             await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
             buf = self._turn_buffers.get(chat_id)
@@ -7484,17 +7549,9 @@ class Agent365Adapter(BasePlatformAdapter):
         has_marked_answer = any(
             _segment_is_marked_answer(segment) for segment in turn_segments
         )
-        first_marked_idx = next(
-            (
-                index
-                for index, segment in enumerate(turn_segments)
-                if _segment_is_marked_answer(segment)
-            ),
-            len(turn_segments),
-        )
         kept: list[dict[str, str]] = []
         drop_ids: list[str] = []
-        for index, segment in enumerate(turn_segments):
+        for segment in turn_segments:
             text = str(segment.get("text") or "")
             if not text:
                 drop_ids.append(str(segment.get("id") or ""))
@@ -7510,28 +7567,51 @@ class Agent365Adapter(BasePlatformAdapter):
             kind = self._turn_buffer_segment_kind(segment)
             if kind in ("progress", "commentary"):
                 if has_marked_answer:
-                    if index < first_marked_idx:
-                        if segment.get("informative_update") or segment.get(
-                            "informative_displayed"
-                        ):
-                            drop_ids.append(str(segment.get("id") or ""))
-                        else:
-                            kept.append(segment)
-                    else:
-                        drop_ids.append(str(segment.get("id") or ""))
-                elif segment.get("informative_displayed"):
                     drop_ids.append(str(segment.get("id") or ""))
-                else:
-                    kept.append(segment)
+                    continue
+                if segment.get("informative_displayed"):
+                    drop_ids.append(str(segment.get("id") or ""))
+                    continue
+                kept.append(segment)
                 continue
             kept.append(segment)
         if not kept:
             for segment in reversed(turn_segments):
                 text = str(segment.get("text") or "")
-                if text and not _is_hermes_tool_progress_segment(text):
-                    kept = [segment]
-                    break
+                if not text or _is_hermes_tool_progress_segment(text):
+                    continue
+                if has_marked_answer and not _segment_is_marked_answer(segment):
+                    continue
+                kept = [segment]
+                break
         return kept, drop_ids
+
+    def _log_turn_buffer_routing_summary(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        *,
+        drop_ids: list[str],
+        final_chars: int,
+    ) -> None:
+        seq = str(turn.get("seq") or "")
+        commentary_informative = 0
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            if self._turn_buffer_segment_kind(segment) != "commentary":
+                continue
+            if segment.get("informative_displayed"):
+                commentary_informative += 1
+        logger.info(
+            "agent365 turn buffer routing summary: chat_id=%s "
+            "commentary_informative=%s segments_omitted_from_final=%s final_chars=%s",
+            chat_id,
+            commentary_informative,
+            len(drop_ids),
+            final_chars,
+        )
 
     def _turn_buffer_handoff_suffix(self, chat_id: str) -> str:
         """The opt-in handoff line, minted once, or empty when it does not apply."""
@@ -7636,6 +7716,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 if first_chunk_on_stream:
                     chunk_ids = [str(segment.get("id") or "") for segment in chunk_segments]
                     record = self._delivery_record(buf, turn)
+                    record["routing_summary"] = {
+                        "drop_ids": list(drop_ids),
+                        "final_chars": len(content),
+                    }
                     outcome, _final_id = await self._deliver_turn_answer_locked(
                         chat_id,
                         turn,
