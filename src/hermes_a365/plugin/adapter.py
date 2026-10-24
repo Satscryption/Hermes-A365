@@ -1955,6 +1955,9 @@ class Agent365Adapter(BasePlatformAdapter):
         # the next tick does not open a second stream.
         self._turn_buffers: dict[str, dict[str, Any]] = {}
         self._orphan_keepalive: dict[str, dict[str, Any]] = {}
+        # Chats whose buffer was dropped: a late informative opener must be
+        # closed, not carried into the next turn (#203).
+        self._orphan_keepalive_drop_pending: set[str] = set()
         self._turn_buffer_seq = 0
 
         # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
@@ -3721,7 +3724,9 @@ class Agent365Adapter(BasePlatformAdapter):
             self._cancel_segment_informative_task(buf)
             await self._cancel_keepalive_and_close(str(chat_id), buf)
         self._turn_buffers.clear()
-        self._orphan_keepalive.clear()
+        for orphan_chat in list(self._orphan_keepalive):
+            await self._teardown_orphan_keepalive(str(orphan_chat), inbound=None)
+        self._orphan_keepalive_drop_pending.clear()
         for stream_key in list(self._streams):
             message_id = stream_key[1]
             chat_id = stream_key[0]
@@ -5292,6 +5297,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "open": True,
         }
         if buf is None:
+            self._orphan_keepalive_drop_pending.discard(str(chat_id))
             self._turn_buffers[chat_id] = {
                 "turns": [turn],
                 "segments": [],
@@ -5376,15 +5382,22 @@ class Agent365Adapter(BasePlatformAdapter):
         """
         chat_id = str(chat_id)
         buf = self._turn_buffers.get(chat_id)
+        teardown_inbound: dict[str, Any] | None = None
         if isinstance(buf, dict):
             self._log_turn_buffer_keepalive_at_turn_end(chat_id, buf)
+            turn = self._keepalive_turn(buf)
+            if isinstance(turn, dict):
+                inbound = turn.get("inbound")
+                if isinstance(inbound, dict):
+                    teardown_inbound = inbound
         buf = self._turn_buffers.pop(chat_id, None)
         if buf is not None:
             self._cancel_keepalive_prompt_task(buf)
             self._cancel_segment_informative_task(buf)
             self._cancel_turn_buffer_retry(buf)
             await self._cancel_keepalive_and_close(chat_id, buf)
-        self._orphan_keepalive.pop(chat_id, None)
+        await self._teardown_orphan_keepalive(chat_id, inbound=teardown_inbound)
+        self._orphan_keepalive_drop_pending.add(chat_id)
 
     @staticmethod
     def _keepalive_state(buf: dict[str, Any] | None) -> dict[str, Any]:
@@ -5486,6 +5499,27 @@ class Agent365Adapter(BasePlatformAdapter):
         elif isinstance(live, dict) and self._turn_buffers_share_identity(live, buf):
             target = live
         else:
+            if str(chat_id) in self._orphan_keepalive_drop_pending:
+                self._orphan_keepalive_drop_pending.discard(str(chat_id))
+                stream_id = str(opened_state.get("stream_id") or "")
+                logger.debug(
+                    "agent365 turn buffer keep-alive closing orphan opener after drop: "
+                    "chat_id=%s stream_id=%s",
+                    chat_id,
+                    stream_id or "(none)",
+                )
+                if stream_id and isinstance(turn_for_text, dict):
+                    inbound = turn_for_text.get("inbound")
+                    if isinstance(inbound, dict):
+                        started = asyncio.create_task(
+                            self._teardown_orphan_stream(
+                                chat_id,
+                                stream_id,
+                                inbound=inbound,
+                            )
+                        )
+                        started.add_done_callback(_consume_turn_buffer_retry_result)
+                return None
             self._orphan_keepalive[str(chat_id)] = opened_state
             logger.debug(
                 "agent365 turn buffer keep-alive orphan opener: chat_id=%s stream_id=%s",
@@ -5606,6 +5640,10 @@ class Agent365Adapter(BasePlatformAdapter):
         short reply would already have been posted, then posts on its
         own task. ``send`` stays free of that network await.
         """
+        # Tests set FIRST_SEC to 3600 to mean "manual emit only"; do not spawn
+        # a sleeper that would block asyncio teardown for an hour.
+        if _TURN_BUFFER_KEEPALIVE_FIRST_SEC >= 3600:
+            return
         buf = self._turn_buffers.get(chat_id)
         if buf is None or self._disconnecting or str(chat_id) in self._retiring_chats:
             return
@@ -5692,6 +5730,42 @@ class Agent365Adapter(BasePlatformAdapter):
         turn = self._keepalive_turn(buf)
         if turn is None:
             return
+        await self._teardown_orphan_stream(
+            chat_id, stream_id, inbound=turn.get("inbound")
+        )
+
+    async def _teardown_orphan_keepalive(
+        self, chat_id: str, *, inbound: dict[str, Any] | None = None
+    ) -> None:
+        """Close a live orphan stream_id instead of discarding it (#203)."""
+        state = self._orphan_keepalive.pop(str(chat_id), None)
+        if not isinstance(state, dict):
+            return
+        stream_id = str(state.get("stream_id") or "")
+        if not stream_id:
+            return
+        await self._teardown_orphan_stream(chat_id, stream_id, inbound=inbound)
+
+    async def _teardown_orphan_stream(
+        self,
+        chat_id: str,
+        stream_id: str,
+        *,
+        inbound: Any | None = None,
+    ) -> None:
+        resolved = inbound if isinstance(inbound, dict) else self._cached_inbound_for(chat_id)
+        if not isinstance(resolved, dict):
+            logger.warning(
+                "agent365 turn buffer keep-alive orphan teardown skipped: "
+                "chat_id=%s stream_id=%s reason=no inbound",
+                chat_id,
+                stream_id,
+            )
+            return
+        turn = {
+            "inbound": resolved,
+            "validated_path": self._validated_path_for(chat_id),
+        }
         try:
             await asyncio.wait_for(
                 self._post_keepalive_activity(
@@ -5771,8 +5845,16 @@ class Agent365Adapter(BasePlatformAdapter):
             if str(segment.get("text") or "").strip() == posted:
                 segment["informative_displayed"] = True
 
+    @staticmethod
+    def _is_placeholder_informative_text(text: str) -> bool:
+        return str(text or "").strip() == _TURN_BUFFER_KEEPALIVE_TEXT
+
     def _informative_text_for_turn(
-        self, buf: dict[str, Any], turn: dict[str, Any] | None
+        self,
+        buf: dict[str, Any],
+        turn: dict[str, Any] | None,
+        *,
+        answer_preview: str | None = None,
     ) -> str:
         if not isinstance(turn, dict):
             return _TURN_BUFFER_KEEPALIVE_TEXT
@@ -5789,7 +5871,26 @@ class Agent365Adapter(BasePlatformAdapter):
                 latest = text
         if latest:
             return latest[:_INFORMATIVE_TEXT_MAX_CHARS]
+        preview = str(answer_preview or "").strip()
+        if preview:
+            return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
         return _TURN_BUFFER_KEEPALIVE_TEXT
+
+    def _marked_answer_preview_for_turn(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> str:
+        seq = str(turn.get("seq") or "")
+        parts: list[str] = []
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            kind = self._turn_buffer_segment_kind(segment)
+            if not _segment_is_marked_answer(segment) and kind != "answer":
+                continue
+            text = str(segment.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        return "\n\n".join(parts)
 
     def _schedule_prompt_keepalive_emit(self, chat_id: str) -> None:
         """Open or refresh the informative stream without waiting for the idle window."""
@@ -6168,7 +6269,23 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return False
         sequence = 1 if not stream_id else int(stream.get("sequence") or 0) + 1
-        informative_text = self._informative_text_for_turn(buf, turn)
+        answer_preview = (
+            self._marked_answer_preview_for_turn(buf, turn) if for_answer else None
+        )
+        informative_text = self._informative_text_for_turn(
+            buf, turn, answer_preview=answer_preview
+        )
+        if (
+            not for_answer
+            and not stream_id
+            and self._is_placeholder_informative_text(informative_text)
+        ):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s "
+                "reason=deferred placeholder opener",
+                chat_id,
+            )
+            return False
         result = await self._post_keepalive_activity(
             chat_id,
             turn,
@@ -6357,6 +6474,17 @@ class Agent365Adapter(BasePlatformAdapter):
         if not body_text:
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s reason=empty text",
+                chat_id,
+            )
+            return empty
+        if (
+            not final
+            and not stream_id
+            and Agent365Adapter._is_placeholder_informative_text(body_text)
+        ):
+            logger.debug(
+                "agent365 turn buffer keep-alive skip post: chat_id=%s "
+                "reason=deferred placeholder opener",
                 chat_id,
             )
             return empty
@@ -6875,6 +7003,16 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         if log_suffix:
             msg += f" ({log_suffix})"
+        routing = record.get("routing_summary")
+        if isinstance(routing, dict):
+            self._log_turn_buffer_routing_summary(
+                chat_id,
+                buf,
+                turn,
+                drop_ids=list(routing.get("drop_ids") or []),
+                final_chars=int(routing.get("final_chars") or len(content)),
+            )
+            record.pop("routing_summary", None)
         logger.info(msg)
         return ("delivered", activity_id)
 
@@ -6948,6 +7086,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stream_id = str(stream.get("stream_id") or "")
 
         buf["answer_final_in_progress"] = True
+        self._cancel_segment_informative_task(buf)
         try:
             await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
             buf = self._turn_buffers.get(chat_id)
@@ -7484,17 +7623,9 @@ class Agent365Adapter(BasePlatformAdapter):
         has_marked_answer = any(
             _segment_is_marked_answer(segment) for segment in turn_segments
         )
-        first_marked_idx = next(
-            (
-                index
-                for index, segment in enumerate(turn_segments)
-                if _segment_is_marked_answer(segment)
-            ),
-            len(turn_segments),
-        )
         kept: list[dict[str, str]] = []
         drop_ids: list[str] = []
-        for index, segment in enumerate(turn_segments):
+        for segment in turn_segments:
             text = str(segment.get("text") or "")
             if not text:
                 drop_ids.append(str(segment.get("id") or ""))
@@ -7510,28 +7641,51 @@ class Agent365Adapter(BasePlatformAdapter):
             kind = self._turn_buffer_segment_kind(segment)
             if kind in ("progress", "commentary"):
                 if has_marked_answer:
-                    if index < first_marked_idx:
-                        if segment.get("informative_update") or segment.get(
-                            "informative_displayed"
-                        ):
-                            drop_ids.append(str(segment.get("id") or ""))
-                        else:
-                            kept.append(segment)
-                    else:
-                        drop_ids.append(str(segment.get("id") or ""))
-                elif segment.get("informative_displayed"):
                     drop_ids.append(str(segment.get("id") or ""))
-                else:
-                    kept.append(segment)
+                    continue
+                if segment.get("informative_displayed"):
+                    drop_ids.append(str(segment.get("id") or ""))
+                    continue
+                kept.append(segment)
                 continue
             kept.append(segment)
         if not kept:
             for segment in reversed(turn_segments):
                 text = str(segment.get("text") or "")
-                if text and not _is_hermes_tool_progress_segment(text):
-                    kept = [segment]
-                    break
+                if not text or _is_hermes_tool_progress_segment(text):
+                    continue
+                if has_marked_answer and not _segment_is_marked_answer(segment):
+                    continue
+                kept = [segment]
+                break
         return kept, drop_ids
+
+    def _log_turn_buffer_routing_summary(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        *,
+        drop_ids: list[str],
+        final_chars: int,
+    ) -> None:
+        seq = str(turn.get("seq") or "")
+        commentary_informative = 0
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            if self._turn_buffer_segment_kind(segment) != "commentary":
+                continue
+            if segment.get("informative_displayed"):
+                commentary_informative += 1
+        logger.info(
+            "agent365 turn buffer routing summary: chat_id=%s "
+            "commentary_informative=%s segments_omitted_from_final=%s final_chars=%s",
+            chat_id,
+            commentary_informative,
+            len(drop_ids),
+            final_chars,
+        )
 
     def _turn_buffer_handoff_suffix(self, chat_id: str) -> str:
         """The opt-in handoff line, minted once, or empty when it does not apply."""
@@ -7636,6 +7790,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 if first_chunk_on_stream:
                     chunk_ids = [str(segment.get("id") or "") for segment in chunk_segments]
                     record = self._delivery_record(buf, turn)
+                    record["routing_summary"] = {
+                        "drop_ids": list(drop_ids),
+                        "final_chars": len(content),
+                    }
                     outcome, _final_id = await self._deliver_turn_answer_locked(
                         chat_id,
                         turn,
