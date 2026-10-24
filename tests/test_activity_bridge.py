@@ -842,6 +842,59 @@ class TestValidateInboundJwt:
         # First call hits both URLs (2 requests). Subsequent calls use the cache (0 each).
         assert request_count["n"] == 2
 
+    async def test_jwks_refresh_fails_closed_past_ttl_and_grace(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        from hermes_a365.activity_bridge import (
+            JWKS_CACHE_GRACE_SECONDS,
+            JWKS_CACHE_TTL_SECONDS,
+            _refresh_jwks,
+        )
+
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id")
+        cache = _JwksCache()
+        cache.keys_by_kid = {"test-kid-1": _jwt.PyJWK(jwk)}
+        now = 1_000_000.0
+        cache.fetched_at = now - JWKS_CACHE_TTL_SECONDS - JWKS_CACHE_GRACE_SECONDS - 1.0
+
+        async def fail_fetch() -> dict[str, Any]:
+            raise RuntimeError("jwks outage")
+
+        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+            await _refresh_jwks(cache, fail_fetch, now=now)
+
+        async with httpx.AsyncClient(transport=_jwks_transport(jwk)) as client:
+            with pytest.raises(JwtValidationError):
+                await validate_inbound_jwt(
+                    token=token,
+                    tenant_id=TEST_TENANT_ID,
+                    expected_app_id="bot-app-id",
+                    client=client,
+                    cache=cache,
+                    now=now,
+                )
+
+    async def test_jwks_unknown_kid_triggers_refresh(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, good_jwk = rsa_keypair
+        stale_jwk = {**good_jwk, "kid": "stale-kid"}
+        token = _make_token(priv, aud="bot-app-id")
+        cache = _JwksCache()
+        cache.keys_by_kid = {"stale-kid": _jwt.PyJWK(stale_jwk)}
+        cache.fetched_at = _time.time()
+
+        async with httpx.AsyncClient(transport=_jwks_transport(good_jwk)) as client:
+            claims = await validate_inbound_jwt(
+                token=token,
+                tenant_id=TEST_TENANT_ID,
+                expected_app_id="bot-app-id",
+                client=client,
+                cache=cache,
+            )
+        assert claims["aud"] == "bot-app-id"
+
 
 # ---------------------------------------------------------------------------
 # #34 — Path B (classic Bot Framework) JWT validation
@@ -3284,11 +3337,11 @@ class TestServeAppDedupe:
         assert len(capture["webhook"]) == 1
         assert len(capture["reply"]) == 1
 
-    def test_principal_bound_key_prevents_authenticated_preseed(
+    def test_distinct_activity_types_do_not_share_dedupe_key(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
-        # A control activity from one principal must not pre-seed the delivery
-        # key for a later message from another principal.
+        # Different activity types / senders must not share a delivery key even
+        # when the activity id is reused (this is not the M3 same-body case).
         priv, jwk = rsa_keypair
         cfg = _cfg()
         cfg.tenant_id = TEST_TENANT_ID
@@ -3333,6 +3386,49 @@ class TestServeAppDedupe:
         assert first.json()["status"] == "acked"
         assert second.status_code == 200
         assert second.json()["status"] == "no_reply"
+        assert len(capture["webhook"]) == 1
+
+    def test_same_body_different_jti_preseed_characterization(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        # M3 (#86 F5): accepted residual — same unsigned body + two valid
+        # tokens that differ only in jti still collides on the body-derived key.
+        priv, jwk = rsa_keypair
+        cfg = _cfg()
+        cfg.tenant_id = TEST_TENANT_ID
+        cfg.blueprint_client_id = "bot-app-id"
+        preseed_token = _make_token(
+            priv, aud=cfg.blueprint_client_id, extra={"jti": "preseed-jti"}
+        )
+        victim_token = _make_token(
+            priv, aud=cfg.blueprint_client_id, extra={"jti": "victim-jti"}
+        )
+        activity = _inbound_message_activity(conv_id="conv-m3")
+        activity["id"] = "shared-activity-id"
+        activity["conversation"]["tenantId"] = TEST_TENANT_ID
+        activity["recipient"]["tenantId"] = TEST_TENANT_ID
+        activity["recipient"]["agenticAppId"] = cfg.blueprint_client_id
+        activity["text"] = "legitimate delivery"
+
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(
+            cfg, capture=capture, jwk=jwk, webhook_response={"text": "hi back"}
+        ) as client:
+            first = client.post(
+                "/api/messages",
+                json=activity,
+                headers={"Authorization": f"Bearer {preseed_token}"},
+            )
+            second = client.post(
+                "/api/messages",
+                json=activity,
+                headers={"Authorization": f"Bearer {victim_token}"},
+            )
+
+        assert first.status_code == 200
+        assert first.json()["status"] == "replied"
+        assert second.status_code == 200
+        assert second.json()["status"] == "duplicate"
         assert len(capture["webhook"]) == 1
 
     def test_deduped_invoke_returns_benign_ack_not_marker(self) -> None:
@@ -3713,7 +3809,9 @@ class TestTokenFactory:
             "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
             "conversation": {"tenantId": "t"},
         }
-        assert await self._factory().for_graph(activity) == "tokenA"
+        assert (
+            await self._factory().for_graph(activity, validated_path="A") == "tokenA"
+        )
         assert mint.await_args.kwargs["scope"] == f"{ab.GRAPH_RESOURCE}/.default"
 
     @pytest.mark.asyncio
@@ -3729,14 +3827,35 @@ class TestTokenFactory:
             "recipient": {},
             "conversation": {},
         }
-        assert await self._factory().for_graph(activity) == "tokenB"
+        assert (
+            await self._factory().for_graph(activity, validated_path="B") == "tokenB"
+        )
         assert mint.call_args.kwargs["resource"] == ab.GRAPH_RESOURCE
+
+    @pytest.mark.asyncio
+    async def test_for_graph_binds_validated_path_not_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        mint = MagicMock(return_value={"access_token": "tokenB"})
+        monkeypatch.setattr(ab, "acquire_token", mint)
+        activity = {
+            "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
+            "conversation": {"tenantId": "t"},
+            "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
+        }
+        assert (
+            await self._factory().for_graph(activity, validated_path="B") == "tokenB"
+        )
+        mint.assert_called_once()
 
     @pytest.mark.asyncio
     async def test_for_graph_unknown_path_raises(self) -> None:
         with pytest.raises(RuntimeError, match="Path A or Path B"):
             await self._factory().for_graph(
-                {"recipient": {}, "conversation": {}, "serviceUrl": "https://x.example/y"}
+                {"recipient": {}, "conversation": {}, "serviceUrl": "https://x.example/y"},
+                validated_path=None,
             )
 
     @pytest.mark.asyncio
@@ -4046,6 +4165,72 @@ class TestServeSecretsProviderWiring:
 
 
 class TestSecurityRequestBoundary:
+    def test_deeply_nested_json_returns_400_not_500(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        body = b"[" * 2000 + b"]" * 2000
+        with _client_for(cfg, capture=capture) as client:
+            response = client.post(
+                "/api/messages",
+                content=body,
+                headers={"Content-Type": "application/json"},
+            )
+
+        assert response.status_code == 400
+        assert capture["webhook"] == []
+
+    @pytest.mark.asyncio
+    async def test_pre_auth_admission_rejects_excess_inflight_posts(
+        self,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import asyncio
+
+        import hermes_a365.activity_bridge as ab
+
+        priv, jwk = rsa_keypair
+        cfg = _cfg()
+        cfg.blueprint_client_id = "bot-app-id"
+        jwt_started = asyncio.Event()
+        release_jwt = asyncio.Event()
+
+        async def blocked_jwt(**_kwargs: Any) -> dict[str, str]:
+            jwt_started.set()
+            await release_jwt.wait()
+            return {"aud": "bot-app-id", "iss": TEST_AAD_ISSUER, "azp": TEST_APX_AZP}
+
+        monkeypatch.setattr(ab, "validate_inbound_jwt", blocked_jwt)
+        monkeypatch.setattr(ab, "MAX_PRE_AUTH_IN_FLIGHT_POSTS", 1)
+        token = _make_token(priv, aud=cfg.blueprint_client_id)
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        http_client = httpx.AsyncClient(
+            transport=_serve_handler_factory(capture=capture, jwk=jwk)
+        )
+        app = make_app(cfg, http_client=http_client)
+        asgi = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=asgi, base_url="http://testserver") as client:
+            admitted = asyncio.create_task(
+                client.post(
+                    "/api/messages",
+                    json=_inbound_message_activity(),
+                    headers={"Authorization": f"Bearer {token}"},
+                )
+            )
+            await jwt_started.wait()
+            rejected = await client.post(
+                "/api/messages",
+                json=_inbound_message_activity(conv_id="conv-two"),
+                headers={"Authorization": f"Bearer {token}"},
+            )
+            release_jwt.set()
+            accepted = await admitted
+
+        assert rejected.status_code == 503
+        assert rejected.json()["reason"] == "pre_auth_backlog_full"
+        assert accepted.status_code == 200
+
     def test_oversized_body_is_rejected_before_json_or_auth(self) -> None:
         capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
         client = _client_for(_cfg(), capture=capture)

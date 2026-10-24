@@ -256,10 +256,6 @@ _MEDIA_STATE_GUARD = threading.Lock()
 _MEDIA_STATES: dict[str, dict[str, Any]] = {}
 
 
-class _PreAuthBodyTimeout(Exception):
-    pass
-
-
 def _persist_state(path: Path) -> dict[str, Any]:
     key = str(path.expanduser().resolve(strict=False))
     return _PERSIST_STATES.setdefault(
@@ -377,78 +373,6 @@ def _media_cache_state(path: Path) -> dict[str, Any]:
                 "leased": set(),
             },
         )
-
-
-class _PreAuthAdmissionMiddleware:
-    def __init__(
-        self,
-        app: Any,
-        *,
-        semaphore: asyncio.Semaphore,
-        owner: Any,
-    ) -> None:
-        self.app = app
-        self.semaphore = semaphore
-        self.owner = owner
-
-    async def __call__(self, scope: Any, receive: Any, send: Any) -> None:
-        if scope.get("type") != "http" or scope.get("method") != "POST":
-            await self.app(scope, receive, send)
-            return
-        if self.semaphore.locked():
-            body = b'{"status":"unavailable","reason":"pre_auth_backlog_full"}'
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 503,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode("ascii")),
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
-            return
-        await self.semaphore.acquire()
-        task = asyncio.current_task()
-        if task is not None:
-            self.owner._pre_auth_tasks.add(task)
-            task.add_done_callback(self.owner._pre_auth_tasks.discard)
-        body_complete = False
-        deadline = asyncio.get_running_loop().time() + _PRE_AUTH_BODY_TIMEOUT_SEC
-
-        async def receive_with_deadline() -> Any:
-            nonlocal body_complete
-            if body_complete:
-                return await receive()
-            remaining = deadline - asyncio.get_running_loop().time()
-            try:
-                message = await asyncio.wait_for(receive(), timeout=max(0, remaining))
-            except TimeoutError as exc:
-                raise _PreAuthBodyTimeout from exc
-            if message.get("type") == "http.disconnect" or not message.get("more_body", False):
-                body_complete = True
-            return message
-
-        try:
-            await self.app(scope, receive_with_deadline, send)
-        except _PreAuthBodyTimeout:
-            body = b'{"status":"unavailable","reason":"request_body_timeout"}'
-            await send(
-                {
-                    "type": "http.response.start",
-                    "status": 408,
-                    "headers": [
-                        (b"content-type", b"application/json"),
-                        (b"content-length", str(len(body)).encode("ascii")),
-                    ],
-                }
-            )
-            await send({"type": "http.response.body", "body": body})
-        finally:
-            if task is not None:
-                self.owner._pre_auth_tasks.discard(task)
-            self.semaphore.release()
 
 
 # Bridge helpers are imported lazily inside methods so missing optional
@@ -2281,6 +2205,7 @@ class Agent365Adapter(BasePlatformAdapter):
         from fastapi.responses import JSONResponse
 
         app = FastAPI(title=f"agent365 adapter — {self.slug or 'default'}")
+
         app.add_middleware(
             bridge.BoundedRequestBodyMiddleware,
             max_bytes=bridge.MAX_ACTIVITY_BODY_BYTES,
@@ -2289,7 +2214,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # is outermost so slow/chunked bodies are counted before buffering; the
         # inner limiter still bounds every admitted body before JWT work.
         app.add_middleware(
-            _PreAuthAdmissionMiddleware,
+            bridge.PreAuthAdmissionMiddleware,
             semaphore=self._pre_auth_semaphore,
             owner=self,
         )
@@ -2578,7 +2503,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 # degrade to the canonical empty ack (#132), never an unhandled
                 # HTTP 500 that Microsoft reads as an outage.
                 try:
-                    path_tag = bridge._inbound_path_tag(activity)
+                    path_tag = validated_path if validated_path in ("A", "B") else "unknown"
                     ctx = invoke.build_invoke_context(activity, claims=claims, path_tag=path_tag)
                     resp = await invoke.dispatch_invoke(ctx, registry=self._invoke_registry)
                 except Exception as e:
