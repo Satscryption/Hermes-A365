@@ -7959,6 +7959,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         post_mock = self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -8122,6 +8123,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
         bodies: list[dict[str, Any]] = []
@@ -8854,6 +8856,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
         posts: list[dict[str, Any]] = []
 
@@ -9253,7 +9256,8 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
         posts: list[dict[str, Any]] = []
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -9270,16 +9274,34 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        await a.send(
-            chat_id=chat,
-            content="Found 3 issues in auth.py",
-            metadata={"informative_update": True},
-        )
-        await a.send(
-            chat_id=chat,
-            content="Checking imports next.",
-            metadata={"informative_update": True},
-        )
+        buf = a._turn_buffers[chat]
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        turn_seq = str(turn["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:c1",
+                "text": "Found 3 issues in auth.py",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+            },
+            {
+                "id": "turnbuf:c2",
+                "text": "Checking imports next.",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+            },
+        ]
+        async with adapter_mod.Agent365Adapter._turn_buffer_lock(buf):
+            await a._flush_undisplayed_informative_for_turn_locked(chat, buf, turn)
         await a.send(chat_id=chat, content="All fixed.", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         final = next(body for body in posts if body.get("type") == "message")
@@ -9292,6 +9314,93 @@ class TestEditMessage:
         ]
         assert informative_texts.count("Found 3 issues in auth.py") == 1
         assert informative_texts.count("Checking imports next.") == 1
+        assert informative_texts == [
+            "Found 3 issues in auth.py",
+            "Checking imports next.",
+        ]
+        sequences = [
+            int((body.get("entities") or [{}])[0].get("streamSequence") or 0)
+            for body in posts
+            if body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+        ]
+        assert sequences == list(range(1, len(sequences) + 1))
+        assert posts[-1].get("type") == "message"
+        assert posts[-1].get("text") == "All fixed."
+
+    @pytest.mark.asyncio
+    async def test_throttled_informative_included_in_answer_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-throttle-cmt"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-throttle")
+            if (
+                entity.get("streamType") == "informative"
+                and body.get("text") == "Second line."
+            ):
+                return MagicMock(status_code=429, text="throttled", json=lambda: {})
+            if entity.get("streamType") == "final":
+                return self._http_result(202)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        turn_seq = str(turn["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:t1",
+                "text": "First line.",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+            },
+            {
+                "id": "turnbuf:t2",
+                "text": "Second line.",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+            },
+        ]
+        async with adapter_mod.Agent365Adapter._turn_buffer_lock(buf):
+            await a._flush_undisplayed_informative_for_turn_locked(chat, buf, turn)
+        await a.send(chat_id=chat, content="Done.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        finals = [
+            body.get("text")
+            for body in posts
+            if (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert finals
+        assert finals[-1] == "Second line.\n\nDone."
 
     @pytest.mark.asyncio
     async def test_silent_turn_posts_keepalive_after_first_interval(
@@ -9589,6 +9698,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
         bodies: list[dict[str, Any]] = []
 
@@ -9787,6 +9897,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
         posts = {"n": 0}
 

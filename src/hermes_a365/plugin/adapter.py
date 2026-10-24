@@ -5518,7 +5518,7 @@ class Agent365Adapter(BasePlatformAdapter):
         The id, or the fact that a stream was opened without one, has to
         survive that so the next tick does not start a second stream.
         """
-        opener_epoch = int(state.get("drop_epoch") or buf.get("keepalive_drop_epoch") or 0)
+        opener_epoch = self._resolve_keepalive_drop_epoch(state, buf)
         state = dict(state)
         if state.get("stream_id") or state.get("untracked"):
             state.setdefault("drop_epoch", opener_epoch)
@@ -5560,9 +5560,7 @@ class Agent365Adapter(BasePlatformAdapter):
         elif isinstance(live, dict) and self._turn_buffers_share_identity(live, buf):
             target = live
         else:
-            opener_epoch = int(
-                opened_state.get("drop_epoch") or buf.get("keepalive_drop_epoch") or 0
-            )
+            opener_epoch = self._resolve_keepalive_drop_epoch(opened_state, buf)
             if self._keepalive_opener_is_stale(chat_id, opener_epoch):
                 stream_id = str(opened_state.get("stream_id") or "")
                 logger.debug(
@@ -5906,7 +5904,8 @@ class Agent365Adapter(BasePlatformAdapter):
             kind = Agent365Adapter._turn_buffer_segment_kind(segment)
             if kind not in ("progress", "commentary"):
                 continue
-            if str(segment.get("text") or "").strip() == posted:
+            text = str(segment.get("text") or "").strip()
+            if text == posted and not _is_hermes_tool_progress_segment(text):
                 segment["informative_displayed"] = True
 
     @staticmethod
@@ -5919,7 +5918,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return True
         return bool(buf.get("keepalive_first_interval_elapsed"))
 
-    def _undisplayed_informative_segments(
+    def _informative_segments_pending_display(
         self, buf: dict[str, Any], turn: dict[str, Any]
     ) -> list[dict[str, str]]:
         seq = str(turn.get("seq") or "")
@@ -5930,30 +5929,64 @@ class Agent365Adapter(BasePlatformAdapter):
             kind = self._turn_buffer_segment_kind(segment)
             if kind not in ("progress", "commentary"):
                 continue
-            if segment.get("informative_displayed"):
-                continue
             text = str(segment.get("text") or "").strip()
-            if not text or _is_hermes_tool_progress_segment(text):
+            if not text:
+                continue
+            if segment.get("informative_post_inflight"):
+                continue
+            if segment.get("informative_displayed") and not _is_hermes_tool_progress_segment(
+                text
+            ):
                 continue
             pending.append(segment)
         return pending
 
-    async def _flush_undisplayed_informative_for_turn(
+    def _undisplayed_informative_segments(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> list[dict[str, str]]:
+        return [
+            segment
+            for segment in self._informative_segments_pending_display(buf, turn)
+            if not _is_hermes_tool_progress_segment(str(segment.get("text") or ""))
+        ]
+
+    @staticmethod
+    def _resolve_keepalive_drop_epoch(
+        state: dict[str, Any], buf: dict[str, Any]
+    ) -> int:
+        raw = state.get("drop_epoch")
+        if raw is not None:
+            return int(raw)
+        buf_epoch = buf.get("keepalive_drop_epoch")
+        if buf_epoch is not None:
+            return int(buf_epoch)
+        return 0
+
+    async def _join_segment_informative_task(self, buf: dict[str, Any]) -> None:
+        task = buf.get("segment_informative_task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            buf.pop("segment_informative_pending", None)
+            await asyncio.gather(task, return_exceptions=True)
+        buf["segment_informative_task"] = None
+
+    async def _post_undisplayed_segment_locked(
         self,
         chat_id: str,
         buf: dict[str, Any],
         turn: dict[str, Any],
-    ) -> None:
-        """Post every commentary/progress segment not yet shown live (#202)."""
-        while self._turn_buffers.get(chat_id) is buf:
-            pending = self._undisplayed_informative_segments(buf, turn)
-            if not pending:
-                return
-            segment = pending[0]
-            text = str(segment.get("text") or "").strip()
-            if not text:
-                segment["informative_displayed"] = True
-                continue
+        segment: dict[str, str],
+        *,
+        during_answer_delivery: bool = False,
+    ) -> bool:
+        """Post one undisplayed segment. True when a 403 restart is needed."""
+        text = str(segment.get("text") or "").strip()
+        if not text:
+            segment["informative_displayed"] = True
+            return False
+        if segment.get("informative_post_inflight"):
+            return False
+        segment["informative_post_inflight"] = True
+        try:
             before = bool(segment.get("informative_displayed"))
             restart = await self._post_informative_locked(
                 chat_id,
@@ -5961,14 +5994,57 @@ class Agent365Adapter(BasePlatformAdapter):
                 allow_restart=True,
                 turn_for_text=turn,
                 text_override=text,
+                during_answer_delivery=during_answer_delivery,
+            )
+            if self._turn_buffers.get(chat_id) is not buf:
+                return False
+            if segment.get("informative_displayed") and not before:
+                return restart
+            return restart
+        finally:
+            segment.pop("informative_post_inflight", None)
+
+    async def _flush_undisplayed_informative_for_turn_locked(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        *,
+        during_answer_delivery: bool = False,
+    ) -> None:
+        """Post every undisplayed segment in order. Caller holds the buffer lock."""
+        while self._turn_buffers.get(chat_id) is buf:
+            if buf.get("answer_final_in_progress") and not during_answer_delivery:
+                return
+            pending = self._undisplayed_informative_segments(buf, turn)
+            if not pending:
+                return
+            segment = pending[0]
+            restart = await self._post_undisplayed_segment_locked(
+                chat_id,
+                buf,
+                turn,
+                segment,
+                during_answer_delivery=during_answer_delivery,
             )
             if self._turn_buffers.get(chat_id) is not buf:
                 return
-            if segment.get("informative_displayed") and not before:
-                continue
             if restart:
                 continue
+            if segment.get("informative_displayed"):
+                continue
             return
+
+    async def _flush_undisplayed_informative_for_turn(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+    ) -> None:
+        async with self._turn_buffer_lock(buf):
+            if self._turn_buffers.get(chat_id) is not buf:
+                return
+            await self._flush_undisplayed_informative_for_turn_locked(chat_id, buf, turn)
 
     def _informative_text_for_turn(
         self,
@@ -5979,19 +6055,9 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> str:
         if not isinstance(turn, dict):
             return _TURN_BUFFER_KEEPALIVE_TEXT
-        seq = str(turn.get("seq") or "")
-        latest = ""
-        for segment in buf.get("segments") or []:
-            if str(segment.get("turn") or "") != seq:
-                continue
-            kind = self._turn_buffer_segment_kind(segment)
-            if kind not in ("progress", "commentary"):
-                continue
-            text = str(segment.get("text") or "").strip()
-            if text:
-                latest = text
-        if latest:
-            return latest[:_INFORMATIVE_TEXT_MAX_CHARS]
+        pending = self._informative_segments_pending_display(buf, turn)
+        if pending:
+            return str(pending[0].get("text") or "").strip()[:_INFORMATIVE_TEXT_MAX_CHARS]
         preview = str(answer_preview or "").strip()
         if preview:
             return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
@@ -6068,9 +6134,18 @@ class Agent365Adapter(BasePlatformAdapter):
     async def _push_informative_segment_text(self, chat_id: str) -> None:
         try:
             buf = self._turn_buffers.get(chat_id)
+            if isinstance(buf, dict) and buf.get("answer_final_in_progress"):
+                return
             turn = self._keepalive_turn(buf) if isinstance(buf, dict) else None
             if isinstance(buf, dict) and isinstance(turn, dict):
-                await self._flush_undisplayed_informative_for_turn(chat_id, buf, turn)
+                async with self._turn_buffer_lock(buf):
+                    if self._turn_buffers.get(chat_id) is not buf:
+                        return
+                    if buf.get("answer_final_in_progress"):
+                        return
+                    await self._flush_undisplayed_informative_for_turn_locked(
+                        chat_id, buf, turn
+                    )
             else:
                 await self._post_informative_under_lock(chat_id, allow_restart=False)
         except asyncio.CancelledError:
@@ -6366,11 +6441,16 @@ class Agent365Adapter(BasePlatformAdapter):
         for_answer: bool = False,
         turn_for_text: dict[str, Any] | None = None,
         text_override: str | None = None,
+        during_answer_delivery: bool = False,
     ) -> bool:
         """Return True when a 403 should be followed by one new sequence."""
         if self._turn_buffers.get(chat_id) is not buf:
             return False
-        if not for_answer and buf.get("answer_final_in_progress"):
+        if (
+            not for_answer
+            and buf.get("answer_final_in_progress")
+            and not during_answer_delivery
+        ):
             return False
         if not for_answer and not self._turn_buffer_keepalive_needed(chat_id):
             return False
@@ -6390,6 +6470,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return False
+        if not for_answer and stream_id:
+            await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
+            if self._turn_buffers.get(chat_id) is not buf:
+                return False
+            stream = self._keepalive_state(buf)
+            stream_id = str(stream.get("stream_id") or "")
         turn = turn_for_text if isinstance(turn_for_text, dict) else self._keepalive_turn(buf)
         if turn is None:
             logger.debug(
@@ -6446,7 +6532,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "stream_id": new_id,
                 "sequence": 1,
                 "opened_mono": time.monotonic(),
-                "drop_epoch": int(buf.get("keepalive_drop_epoch") or 0),
+                "drop_epoch": self._resolve_keepalive_drop_epoch({}, buf),
             }
             if isinstance(inbound_snap, dict):
                 opened_state["inbound"] = inbound_snap
@@ -6462,6 +6548,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return False
             self._touch_keepalive_emit(chat_id, target)
             self._remember_bot_reply(new_id, conversation_id=str(chat_id))
+            self._mark_informative_displayed_segments(buf, turn, informative_text)
             logger.info(
                 "agent365 turn buffer keep-alive started: chat_id=%s stream_id=%s",
                 chat_id,
@@ -6472,8 +6559,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stream["sequence"] = sequence
             self._remember_keepalive(chat_id, buf, stream)
             self._touch_keepalive_emit(chat_id, buf)
-            if not for_answer:
-                self._mark_informative_displayed_segments(buf, turn, informative_text)
+            self._mark_informative_displayed_segments(buf, turn, informative_text)
             logger.info(
                 "agent365 turn buffer keep-alive: chat_id=%s stream_id=%s sequence=%s",
                 chat_id,
@@ -6496,7 +6582,22 @@ class Agent365Adapter(BasePlatformAdapter):
                 status,
             )
             self._remember_keepalive(chat_id, buf, {})
-            return True
+            if _STREAMING_MIN_GAP_SEC > 0:
+                await self._sleep_turn_buffer_locked(
+                    chat_id, buf, _STREAMING_MIN_GAP_SEC
+                )
+            if self._turn_buffers.get(chat_id) is not buf:
+                return False
+            return await self._post_informative_locked(
+                chat_id,
+                buf,
+                allow_restart=False,
+                turn_for_text=turn,
+                text_override=text_override
+                if text_override is not None
+                else informative_text,
+                during_answer_delivery=during_answer_delivery,
+            )
         logger.warning(
             "agent365 turn buffer keep-alive failed: chat_id=%s status=%s",
             chat_id,
@@ -7193,9 +7294,20 @@ class Agent365Adapter(BasePlatformAdapter):
         if early is not None:
             return early
 
-        await self._flush_undisplayed_informative_for_turn(chat_id, buf, turn)
+        buf["answer_final_in_progress"] = True
+        self._cancel_segment_informative_task(buf)
+        await self._flush_undisplayed_informative_for_turn_locked(
+            chat_id, buf, turn, during_answer_delivery=True
+        )
         if self._turn_buffers.get(chat_id) is not buf:
             return ("retry", None)
+        pending_informative = [
+            str(segment.get("text") or "").strip()
+            for segment in self._undisplayed_informative_segments(buf, turn)
+        ]
+        if pending_informative:
+            prefix = "\n\n".join(pending_informative)
+            content = f"{prefix}\n\n{content}" if str(content or "").strip() else prefix
 
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
@@ -7206,6 +7318,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 allow_restart=False,
                 for_answer=True,
                 turn_for_text=turn,
+                during_answer_delivery=True,
             )
             if self._turn_buffers.get(chat_id) is not buf:
                 return ("retry", None)
@@ -7230,8 +7343,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 return early
             stream_id = str(stream.get("stream_id") or "")
 
-        buf["answer_final_in_progress"] = True
-        self._cancel_segment_informative_task(buf)
         try:
             await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
             buf = self._turn_buffers.get(chat_id)
