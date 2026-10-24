@@ -1024,6 +1024,9 @@ JWKS_CACHE_TTL_SECONDS = 24 * 3600
 # After TTL, a failed refresh may still use last-known-good keys only within this
 # grace window (#86 F1). Beyond TTL + grace the process fails closed.
 JWKS_CACHE_GRACE_SECONDS = 300.0
+# Minimum wall time between JWKS fetches triggered by an unknown signing ``kid``
+# (#208 review). Prevents unverified-header ``kid`` spam from holding admission.
+JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS = 60.0
 MAX_ACTIVITY_BODY_BYTES = 1024 * 1024
 MAX_JWT_BYTES = 16 * 1024
 MAX_ACTIVITY_JSON_DEPTH = 24
@@ -1895,6 +1898,7 @@ class _JwksCache:
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     failure_count: int = 0
     retry_after: float = 0.0
+    last_forced_refresh_at: float = 0.0
 
 
 def _validate_jwt_shape(token: str) -> None:
@@ -1935,27 +1939,36 @@ async def _refresh_jwks(
     force: bool = False,
 ) -> dict[str, Any]:
     """Single-flight JWKS refresh with failure backoff and bounded staleness."""
+    fetched_at_before_wait = cache.fetched_at
     if (
         not force
         and cache.keys_by_kid
         and (now - cache.fetched_at) < cache.ttl_seconds
     ):
         return cache.keys_by_kid
-    if now < cache.retry_after:
+    if not force and now < cache.retry_after:
         if _jwks_last_known_good_allowed(cache, now):
             return cache.keys_by_kid
         raise JwtValidationError("JWKS refresh temporarily unavailable")
     async with cache.refresh_lock:
+        if cache.keys_by_kid and cache.fetched_at > fetched_at_before_wait:
+            return cache.keys_by_kid
         if (
             not force
             and cache.keys_by_kid
             and (now - cache.fetched_at) < cache.ttl_seconds
         ):
             return cache.keys_by_kid
-        if now < cache.retry_after:
+        if force and (
+            now - cache.last_forced_refresh_at
+        ) < JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS:
+            return cache.keys_by_kid
+        if not force and now < cache.retry_after:
             if _jwks_last_known_good_allowed(cache, now):
                 return cache.keys_by_kid
             raise JwtValidationError("JWKS refresh temporarily unavailable")
+        if force:
+            cache.last_forced_refresh_at = now
         try:
             keys = await fetch()
             if not keys:

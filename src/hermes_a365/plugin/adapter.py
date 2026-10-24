@@ -1207,8 +1207,6 @@ _MAX_COALESCED_REPLY_GENERATIONS_PER_CHAT = 32
 _MAX_COALESCED_REPLY_GENERATIONS = 1024
 _MAX_COALESCED_REPLY_SURVIVORS = _MAX_COALESCED_REPLY_GENERATIONS * 3
 _MAX_INBOUND_TASKS = _MAX_COALESCED_REPLY_GENERATIONS
-_MAX_PRE_AUTH_REQUESTS = 32
-_PRE_AUTH_BODY_TIMEOUT_SEC = 15.0
 _UVICORN_STARTUP_TIMEOUT_SEC = 10.0
 _PERSIST_HANDOFF_TIMEOUT_SEC = 10.0
 _MAX_ACTIVE_AGENT_TURNS = _MAX_INBOUND_TASKS
@@ -1784,7 +1782,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._inbound_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
         self._pre_auth_tasks: set[asyncio.Task[Any]] = set()
         self._pre_auth_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
-        self._pre_auth_semaphore = asyncio.Semaphore(_MAX_PRE_AUTH_REQUESTS)
+        self._pre_auth_semaphore = asyncio.Semaphore(
+            _import_bridge().MAX_PRE_AUTH_IN_FLIGHT_POSTS
+        )
 
         # Slice 19s — per-stream state for BF streaming-response protocol.
         # Keyed on the Hermes-side ``message_id`` (the activity id returned
