@@ -9403,6 +9403,262 @@ class TestEditMessage:
         assert finals[-1] == "Second line.\n\nDone."
 
     @pytest.mark.asyncio
+    async def test_commentary_not_lost_when_answer_delivered_during_stream_gap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-gap-line-b"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0.3)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        gap_entered = asyncio.Event()
+        gap_release = asyncio.Event()
+
+        async def gated_gap(
+            self: adapter_mod.Agent365Adapter, chat_id: str, buf: dict[str, Any]
+        ) -> None:
+            gap_entered.set()
+            lock = adapter_mod.Agent365Adapter._turn_buffer_lock(buf)
+            released = False
+            if lock.locked():
+                lock.release()
+                released = True
+            await gap_release.wait()
+            if released:
+                await lock.acquire()
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_sleep_turn_buffer_stream_gap_locked",
+            gated_gap,
+        )
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-gap-b")
+            if entity.get("streamType") == "final":
+                return self._http_result(202)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        turn_seq = str(turn["seq"])
+        buf["keepalive"] = {
+            "stream_id": "ka-gap-b",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+            "last_emit_mono": time.monotonic() - 0.01,
+        }
+        buf["segments"] = [
+            {
+                "id": "turnbuf:a",
+                "text": "Line A",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+                "informative_displayed": True,
+            },
+            {
+                "id": "turnbuf:b",
+                "text": "Line B",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+            },
+            {
+                "id": "turnbuf:ans",
+                "text": "The answer.",
+                "turn": turn_seq,
+                "kind": "answer",
+                "reply_to": "act-1",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            },
+        ]
+        async def post_line_b() -> None:
+            async with adapter_mod.Agent365Adapter._turn_buffer_lock(buf):
+                segment_b = next(
+                    segment
+                    for segment in buf["segments"]
+                    if str(segment.get("text") or "") == "Line B"
+                )
+                await a._post_undisplayed_segment_locked(
+                    chat, buf, turn, segment_b
+                )
+
+        line_b_task = asyncio.create_task(post_line_b())
+        await asyncio.wait_for(gap_entered.wait(), timeout=5.0)
+        complete_task = asyncio.create_task(
+            a.on_processing_complete(event, outcome="success")
+        )
+        await self._spin_until(
+            lambda: bool(a._turn_buffers.get(chat, {}).get("answer_final_in_progress"))
+        )
+        gap_release.set()
+        await line_b_task
+        await complete_task
+        wire_texts = [body.get("text") for body in posts if body.get("text")]
+        assert wire_texts.count("Line B") == 1
+        assert posts[-1].get("type") == "message"
+        assert "The answer." in (posts[-1].get("text") or "")
+
+    @pytest.mark.asyncio
+    async def test_unmarked_merged_commentary_not_duplicated_on_informative(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-unmarked-dup"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-unmarked")
+            if entity.get("streamType") == "final":
+                return self._http_result(202)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="Part one",
+            reply_to=None,
+            metadata={"informative_update": True},
+        )
+        await a.send(chat_id=chat, content="Part two", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        merged = "Part one\n\nPart two"
+        informative = [
+            body.get("text")
+            for body in posts
+            if body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+        ]
+        assert informative.count("Part one") == 0
+        assert informative.count("Part two") == 0
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == merged
+        assert final["text"].count("Part one") == 1
+
+    @pytest.mark.asyncio
+    async def test_unmarked_merged_commentary_429_does_not_triplicate_part_one(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-unmarked-429"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-unmarked-429")
+            if entity.get("streamType") == "informative" and body.get("text") == "Part one":
+                return MagicMock(status_code=429, text="throttled", json=lambda: {})
+            if entity.get("streamType") == "final":
+                return self._http_result(202)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        turn_seq = str(turn["seq"])
+        buf["keepalive"] = {
+            "stream_id": "ka-unmarked-429",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        buf["segments"] = [
+            {
+                "id": "turnbuf:p1",
+                "text": "Part one",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+            },
+            {
+                "id": "turnbuf:p2",
+                "text": "Part two",
+                "turn": turn_seq,
+                "kind": "answer",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+            },
+        ]
+        await a.on_processing_complete(event, outcome="success")
+        merged = "Part one\n\nPart two"
+        finals = [
+            body.get("text")
+            for body in posts
+            if (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert finals
+        assert finals[-1] == merged
+        assert finals[-1].count("Part one") == 1
+        informative_part_one = [
+            body.get("text")
+            for body in posts
+            if body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+            and body.get("text") == "Part one"
+        ]
+        assert not informative_part_one
+
+    @pytest.mark.asyncio
     async def test_silent_turn_posts_keepalive_after_first_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
