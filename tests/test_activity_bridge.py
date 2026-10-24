@@ -895,6 +895,180 @@ class TestValidateInboundJwt:
             )
         assert claims["aud"] == "bot-app-id"
 
+    async def test_jwks_grace_allows_last_known_good_at_ttl_boundary(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        from hermes_a365.activity_bridge import JWKS_CACHE_TTL_SECONDS, _refresh_jwks
+
+        _, jwk = rsa_keypair
+        cache = _JwksCache()
+        cache.keys_by_kid = {"test-kid-1": _jwt.PyJWK(jwk)}
+        now = 2_000_000.0
+        cache.fetched_at = now - JWKS_CACHE_TTL_SECONDS
+
+        async def fail_fetch() -> dict[str, Any]:
+            raise RuntimeError("jwks outage")
+
+        keys = await _refresh_jwks(cache, fail_fetch, now=now)
+        assert keys == cache.keys_by_kid
+
+    async def test_jwks_grace_allows_last_known_good_just_before_grace_end(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        from hermes_a365.activity_bridge import (
+            JWKS_CACHE_GRACE_SECONDS,
+            JWKS_CACHE_TTL_SECONDS,
+            _refresh_jwks,
+        )
+
+        _, jwk = rsa_keypair
+        cache = _JwksCache()
+        cache.keys_by_kid = {"test-kid-1": _jwt.PyJWK(jwk)}
+        now = 3_000_000.0
+        cache.fetched_at = now - JWKS_CACHE_TTL_SECONDS - JWKS_CACHE_GRACE_SECONDS + 1.0
+
+        async def fail_fetch() -> dict[str, Any]:
+            raise RuntimeError("jwks outage")
+
+        keys = await _refresh_jwks(cache, fail_fetch, now=now)
+        assert keys == cache.keys_by_kid
+
+    async def test_forced_refresh_throttled_within_min_interval(self) -> None:
+        from hermes_a365.activity_bridge import (
+            JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS,
+            _refresh_jwks,
+        )
+
+        cache = _JwksCache()
+        cache.keys_by_kid = {"stale": object()}
+        fetch_count = {"n": 0}
+
+        async def fetch() -> dict[str, Any]:
+            fetch_count["n"] += 1
+            return {"fresh": object()}
+
+        start = 10_000.0
+        await _refresh_jwks(cache, fetch, now=start, force=True)
+        await _refresh_jwks(
+            cache,
+            fetch,
+            now=start + JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS - 1.0,
+            force=True,
+        )
+        assert fetch_count["n"] == 1
+        await _refresh_jwks(
+            cache,
+            fetch,
+            now=start + JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS,
+            force=True,
+        )
+        assert fetch_count["n"] == 2
+
+    async def test_concurrent_unknown_kid_coalesces_to_one_fetch(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        import asyncio
+
+        priv, good_jwk = rsa_keypair
+        stale_jwk = {**good_jwk, "kid": "stale-kid"}
+        token = _make_token(priv, aud="bot-app-id")
+        cache = _JwksCache()
+        cache.keys_by_kid = {"stale-kid": _jwt.PyJWK(stale_jwk)}
+        cache.fetched_at = _time.time()
+        request_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_count["n"] += 1
+            if request.url.path.endswith("openid-configuration"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "issuer": TEST_AAD_ISSUER,
+                        "jwks_uri": (
+                            f"https://login.microsoftonline.com/"
+                            f"{TEST_TENANT_ID}/discovery/v2.0/keys"
+                        ),
+                    },
+                )
+            return httpx.Response(200, json={"keys": [good_jwk]})
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await asyncio.gather(
+                *[
+                    validate_inbound_jwt(
+                        token=token,
+                        tenant_id=TEST_TENANT_ID,
+                        expected_app_id="bot-app-id",
+                        client=client,
+                        cache=cache,
+                    )
+                    for _ in range(8)
+                ]
+            )
+        assert request_count["n"] == 2
+
+    async def test_unknown_kid_within_forced_interval_fails_without_extra_fetch(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        from hermes_a365.activity_bridge import JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS
+
+        priv, good_jwk = rsa_keypair
+        stale_jwk = {**good_jwk, "kid": "stale-kid"}
+        token = _make_token(priv, aud="bot-app-id")
+        cache = _JwksCache()
+        cache.keys_by_kid = {"stale-kid": _jwt.PyJWK(stale_jwk)}
+        fixed_now = 5_000_000.0
+        cache.fetched_at = fixed_now
+        request_count = {"n": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            request_count["n"] += 1
+            if request.url.path.endswith("openid-configuration"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "issuer": TEST_AAD_ISSUER,
+                        "jwks_uri": (
+                            f"https://login.microsoftonline.com/"
+                            f"{TEST_TENANT_ID}/discovery/v2.0/keys"
+                        ),
+                    },
+                )
+            return httpx.Response(200, json={"keys": [good_jwk]})
+
+        transport = httpx.MockTransport(handler)
+        async with httpx.AsyncClient(transport=transport) as client:
+            await validate_inbound_jwt(
+                token=token,
+                tenant_id=TEST_TENANT_ID,
+                expected_app_id="bot-app-id",
+                client=client,
+                cache=cache,
+                now=fixed_now,
+            )
+            assert request_count["n"] == 2
+            cache.keys_by_kid = {"stale-kid": _jwt.PyJWK(stale_jwk)}
+            with pytest.raises(JwtValidationError, match="not in JWKS"):
+                await validate_inbound_jwt(
+                    token=token,
+                    tenant_id=TEST_TENANT_ID,
+                    expected_app_id="bot-app-id",
+                    client=client,
+                    cache=cache,
+                    now=fixed_now + 1.0,
+                )
+            assert request_count["n"] == 2
+            await validate_inbound_jwt(
+                token=token,
+                tenant_id=TEST_TENANT_ID,
+                expected_app_id="bot-app-id",
+                client=client,
+                cache=cache,
+                now=fixed_now + JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS + 1.0,
+            )
+            assert request_count["n"] == 4
+
 
 # ---------------------------------------------------------------------------
 # #34 — Path B (classic Bot Framework) JWT validation
@@ -1075,6 +1249,30 @@ class TestValidateInboundJwtBf:
                     client=client,
                     cache=_JwksCache(),
                 )
+
+    async def test_unknown_kid_triggers_refresh_from_warm_cache(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, good_jwk = rsa_keypair
+        stale_jwk = {**good_jwk, "kid": "stale-kid"}
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        cache = _JwksCache()
+        cache.keys_by_kid = {"stale-kid": _jwt.PyJWK(stale_jwk)}
+        cache.fetched_at = _time.time()
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(good_jwk)) as client:
+            claims = await validate_inbound_jwt_bf(
+                token=token,
+                expected_app_id="bot-app-id",
+                expected_service_url=BF_TEST_SERVICE_URL,
+                client=client,
+                cache=cache,
+            )
+        assert claims["aud"] == "bot-app-id"
 
     async def test_jwks_cache_hits_on_second_call(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]

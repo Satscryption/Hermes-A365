@@ -20753,6 +20753,27 @@ class TestHandoff:
         a = _make_adapter(monkeypatch)
         assert a._mint_handoff_link("ghost", reason="x") is None
 
+    def test_remember_handoff_stamps_validated_path_not_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        activity = _make_inbound(conv_id="conv-handoff-path")
+        activity["recipient"] = {
+            "tenantId": "11111111-1111-1111-1111-111111111111",
+            "agenticAppId": "injected-app",
+            "agenticUserId": "injected-user",
+        }
+        activity["conversation"]["tenantId"] = "11111111-1111-1111-1111-111111111111"
+        ctx = adapter_mod.invoke.build_invoke_context(
+            activity,
+            claims={},
+            path_tag="B",
+        )
+        a._remember_handoff_destination(ctx)
+        ref = a._conversations.get("conv-handoff-path")
+        assert ref is not None
+        assert ref.validated_path == "B"
+
     @pytest.mark.asyncio
     async def test_handle_handoff_action_known_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
