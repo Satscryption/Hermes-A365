@@ -82,13 +82,14 @@ def test_ci_matrix_covers_supported_python_versions() -> None:
     assert "keychain-linux" in text
     assert "wheel-smoke" in text
     assert "hermes-source-smoke" in text
+    assert "pytest --timeout=300" in text
 
 
 def test_v1_compatibility_matrix_is_linked_from_readme() -> None:
     readme = README.read_text()
     assert "references/v1-compatibility-matrix.md" in readme
     matrix = MATRIX.read_text()
-    assert "Snapshot date: 2026-10-20" in matrix
+    assert "Snapshot date: 2026-10-24" in matrix
     assert "Windows" in matrix and "Not supported" in matrix
 
 

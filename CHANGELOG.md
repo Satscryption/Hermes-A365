@@ -20,7 +20,11 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   keychain, wheel fresh-install smoke, Hermes source smoke for `v2026.6.19`
   and `v0.22.2`, and Windows as an unsupported-host negative probe only.
   Windows remains unsupported for the OS keychain layer (no Credential Manager
-  backend). Refs [#126](https://github.com/Satscryption/Hermes-A365/issues/126).
+  backend). Standalone CLI startup warns via ``_runtime_guard`` on unsupported
+  hosts or Python builds outside the CI matrix. CI pytest runs with a 300s
+  per-test timeout (`pytest-timeout`); Hermes source smoke asserts multiplex
+  ``false`` default and two-profile
+  upstream tests. Refs [#126](https://github.com/Satscryption/Hermes-A365/issues/126).
 
 - **`gateway.platforms.agent365.extra.reactions_dispatch_agent_turn`** (default
   `false`). When enabled, a stored Teams `messageReaction` on a bot reply also

@@ -87,6 +87,10 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
+    from hermes_a365._runtime_guard import emit_runtime_warnings
+
+    emit_runtime_warnings()
+
     parser = _build_parser()
     args = parser.parse_args(argv)
 

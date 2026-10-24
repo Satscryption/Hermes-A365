@@ -6,6 +6,8 @@ import tomllib
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 from hermes_a365.compatibility import (
     HERMES_INTEGRATION_SMOKE_REFS,
     HERMES_MULTIPLEX_MIN_CALENDAR,
@@ -110,6 +112,33 @@ def test_probe_hermes_below_plugin_floor_warns_for_standalone_cli() -> None:
         result = probe_hermes_harness()
     assert result.state == "warn"
     assert "standalone CLI" in result.detail
+
+
+def test_runtime_guard_warns_on_unverified_python(monkeypatch: pytest.MonkeyPatch) -> None:
+    import warnings
+
+    from hermes_a365._runtime_guard import emit_runtime_warnings
+
+    monkeypatch.setattr(
+        "hermes_a365._runtime_guard.python_version_tuple",
+        lambda: (3, 15, 0),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        emit_runtime_warnings()
+    assert any("outside the CI-tested" in str(w.message) for w in caught)
+
+
+def test_runtime_guard_warns_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
+    import warnings
+
+    from hermes_a365._runtime_guard import emit_runtime_warnings
+
+    monkeypatch.setattr("hermes_a365._runtime_guard.sys.platform", "win32")
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        emit_runtime_warnings()
+    assert any("Windows is unsupported" in str(w.message) for w in caught)
 
 
 def test_probe_hermes_multiplex_floor_when_config_on() -> None:
