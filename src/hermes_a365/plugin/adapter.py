@@ -5957,9 +5957,39 @@ class Agent365Adapter(BasePlatformAdapter):
         for segment in buf.get("segments") or []:
             if str(segment.get("turn") or "") != seq:
                 continue
-            if self._turn_buffer_segment_kind(segment) == "answer":
+            kind = self._turn_buffer_segment_kind(segment)
+            if kind == "answer":
+                return True
+            if kind == "commentary" and segment.get("informative_update"):
                 return True
         return False
+
+    def _turn_has_unmarked_informative_commentary(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> bool:
+        if self._turn_has_marked_answer(buf, turn):
+            return False
+        seq = str(turn.get("seq") or "")
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            if (
+                self._turn_buffer_segment_kind(segment) == "commentary"
+                and segment.get("informative_update")
+            ):
+                return True
+        return False
+
+    def _segment_reserved_for_unmarked_final(
+        self, buf: dict[str, Any], turn: dict[str, Any], segment: dict[str, str]
+    ) -> bool:
+        if self._turn_has_marked_answer(buf, turn):
+            return False
+        if self._turn_buffer_segment_kind(segment) != "commentary":
+            return False
+        if segment.get("defer_to_final_merge"):
+            return True
+        return bool(segment.get("informative_update"))
 
     def _undisplayed_informative_segments(
         self, buf: dict[str, Any], turn: dict[str, Any]
@@ -6120,9 +6150,16 @@ class Agent365Adapter(BasePlatformAdapter):
         if not isinstance(turn, dict):
             return _TURN_BUFFER_KEEPALIVE_TEXT
         pending = self._informative_segments_pending_display(buf, turn)
+        pending = [
+            segment
+            for segment in pending
+            if not self._segment_reserved_for_unmarked_final(buf, turn, segment)
+        ]
         if pending:
             return str(pending[0].get("text") or "").strip()[:_INFORMATIVE_TEXT_MAX_CHARS]
         preview = str(answer_preview or "").strip()
+        if preview and self._turn_has_unmarked_informative_commentary(buf, turn):
+            preview = ""
         if preview:
             return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
         return _TURN_BUFFER_KEEPALIVE_TEXT
@@ -6563,16 +6600,17 @@ class Agent365Adapter(BasePlatformAdapter):
             if text_override is not None
             else self._informative_text_for_turn(buf, turn, answer_preview=answer_preview)
         )
-        if (
-            not for_answer
-            and self._text_merged_into_unmarked_final(buf, turn, informative_text)
+        if not for_answer and self._text_merged_into_unmarked_final(
+            buf, turn, informative_text
         ):
-            logger.debug(
-                "agent365 turn buffer keep-alive skip post: chat_id=%s "
-                "reason=text merged into unmarked final",
-                chat_id,
-            )
-            return False
+            if text_override is not None:
+                logger.debug(
+                    "agent365 turn buffer keep-alive skip post: chat_id=%s "
+                    "reason=text merged into unmarked final",
+                    chat_id,
+                )
+                return False
+            informative_text = _TURN_BUFFER_KEEPALIVE_TEXT
         if (
             not for_answer
             and not stream_id
@@ -7882,6 +7920,14 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         ):
             last_segment["defer_to_final_merge"] = True
+            for segment in segments:
+                if str(segment.get("turn") or "") != turn_seq:
+                    continue
+                if (
+                    str(segment.get("kind") or "") == "commentary"
+                    and segment.get("informative_update")
+                ):
+                    segment["defer_to_final_merge"] = True
         if _is_hermes_interim_thread_send(metadata, own):
             self._schedule_prompt_keepalive_emit(str(chat_id))
         if not last_segment.get("defer_to_final_merge") and (
