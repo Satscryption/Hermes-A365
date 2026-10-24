@@ -8031,6 +8031,18 @@ class TestEditMessage:
         raise AssertionError("condition not met")
 
     @staticmethod
+    def _schedule_keepalive_sleeper_for_manual_first_sec(
+        adapter: Any, chat_id: str, monkeypatch: pytest.MonkeyPatch
+    ) -> asyncio.Task[Any]:
+        """FIRST_SEC=3600 means manual emit; schedule a sleeper for teardown tests."""
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
+        adapter._schedule_turn_buffer_keepalive(chat_id)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        task = adapter._turn_buffers[chat_id]["keepalive_task"]
+        assert isinstance(task, asyncio.Task)
+        return task
+
+    @staticmethod
     def _http_result(status: int, stream_id: str = "") -> MagicMock:
         payload = {"id": stream_id} if stream_id else {}
         return MagicMock(
@@ -8082,7 +8094,7 @@ class TestEditMessage:
         assert post_mock.await_count == 2
         opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
         assert opener["type"] == "typing"
-        assert opener["text"] == "Working on it."
+        assert opener["text"] == "Short answer"
         assert opener["entities"][0] == {
             "type": "streaminfo",
             "streamType": "informative",
@@ -8140,6 +8152,12 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        progress = await a.send(
+            chat_id="conv-G-long",
+            content="💻 Running date",
+            reply_to=None,
+        )
+        assert progress.success is True
         sent = await a.send(
             chat_id="conv-G-long",
             content="The date is Thursday.",
@@ -8161,13 +8179,13 @@ class TestEditMessage:
         ]
         first, second = bodies
         assert first["type"] == "typing"
-        assert first["text"] == "Working on it."
+        assert first["text"] == "💻 Running date"
         assert "The date is Thursday." not in first["text"]
         assert first["entities"] == [
             {"type": "streaminfo", "streamType": "informative", "streamSequence": 1}
         ]
         assert second["type"] == "typing"
-        assert second["text"] == "Working on it."
+        assert second["text"] == "💻 Running date"
         assert second["entities"] == [
             {
                 "type": "streaminfo",
@@ -8226,6 +8244,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-ka-task", content="💻 Running noop", reply_to=None)
         await a.send(chat_id="conv-G-ka-task", content="Still running", reply_to="act-1")
         await self._spin_until(
             lambda: (
@@ -8234,7 +8253,7 @@ class TestEditMessage:
             )
         )
         assert posts[0]["type"] == "typing"
-        assert posts[0]["text"] == "Working on it."
+        assert posts[0]["text"] == "💻 Running noop"
         await a.on_processing_complete(event, outcome="success")
         assert "conv-G-ka-task" not in a._turn_buffers
 
@@ -8486,12 +8505,12 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        await self._spin_until(lambda: wire["informative_open"] >= 1)
         await a.send(
             chat_id=chat,
             content="💻 Running noop",
             reply_to=None,
         )
+        await self._spin_until(lambda: wire["informative_open"] >= 1)
         await a.on_processing_complete(event, outcome="success")
         assert "conv-G-no-second-ka" not in a._turn_buffers
         assert wire["informative_open"] == 1
@@ -8912,6 +8931,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         gate = asyncio.Event()
         opener_entered = asyncio.Event()
+        finals: list[str] = []
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
@@ -8919,6 +8939,9 @@ class TestEditMessage:
                 opener_entered.set()
                 await gate.wait()
                 return self._http_result(201, "ka-ans-drop")
+            if entity.get("streamType") == "final":
+                finals.append(str(entity.get("streamId") or ""))
+                return self._http_result(202)
             return self._http_result(202)
 
         a._http_client.post = post
@@ -8931,10 +8954,53 @@ class TestEditMessage:
         await a.send(chat_id=chat, content="Answer text only.", reply_to=None)
         flush_task = asyncio.create_task(a.on_processing_complete(event, outcome="success"))
         await self._spin_until(opener_entered.is_set)
-        await a._drop_turn_buffer(chat)
         gate.set()
+        await a._drop_turn_buffer(chat)
         await flush_task
-        assert a._orphan_keepalive.get(chat, {}).get("stream_id") == "ka-ans-drop"
+        await asyncio.sleep(0.05)
+        assert chat not in a._orphan_keepalive
+        assert "ka-ans-drop" in finals
+
+    @pytest.mark.asyncio
+    async def test_orphan_opener_during_drop_await_is_closed_not_discarded(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#203: orphan recorded during ``_cancel_keepalive_and_close`` is finalized."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-203-drop-await"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        finals: list[str] = []
+        original_close = a._cancel_keepalive_and_close
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals.append(str(entity.get("streamId") or ""))
+                return self._http_result(202)
+            return self._http_result(202)
+
+        async def close_inject_orphan(chat_id: str, buf: dict[str, Any]) -> None:
+            a._orphan_keepalive[str(chat_id)] = {
+                "stream_id": "ka-203",
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            }
+            await original_close(chat_id, buf)
+
+        a._http_client.post = post
+        monkeypatch.setattr(a, "_cancel_keepalive_and_close", close_inject_orphan)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a._drop_turn_buffer(chat)
+        assert chat not in a._orphan_keepalive
+        assert "ka-203" in finals
 
     @pytest.mark.asyncio
     async def test_turn_end_logs_keepalive_at_buffer_drop_on_success(
@@ -9000,10 +9066,14 @@ class TestEditMessage:
         assert logging.getLogger("hermes_a365").level == logging.NOTSET
         with caplog.at_level(logging.DEBUG):
             await a.on_processing_start(event)
+            await a.send(
+                chat_id=chat,
+                content="Checking now.",
+                metadata={"thread_id": "29:copilot"},
+            )
             await a.send(chat_id=chat, content="Answer", reply_to="act-1")
             await self._spin_until(lambda: len(posts) >= 1)
         assert any("stage=scheduled" in r.message for r in caplog.records)
-        assert any("stage=first_interval" in r.message for r in caplog.records)
         assert any("stage=before_acquire_reply_token" in r.message for r in caplog.records)
         assert any("stage=after_activity_post" in r.message for r in caplog.records)
 
@@ -9029,6 +9099,140 @@ class TestEditMessage:
             s for s in a._turn_buffers[chat]["segments"] if s["id"] == interim.message_id
         )
         assert segment["kind"] == "commentary"
+
+    @pytest.mark.asyncio
+    async def test_commentary_and_answer_final_omits_commentary_and_shows_informative(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """K1-shaped turn: commentary, tool progress, marked answer (#202)."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-k1-shape"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            assert str(body.get("text") or "").strip()
+            entity = body["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-k1")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        import logging
+
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run that sleep, then reply.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await self._spin_until(
+            lambda: any(
+                p.get("text") == "I'll run that sleep, then reply." and p.get("type") == "typing"
+                for p in posts
+            )
+        )
+        await a.send(chat_id=chat, content="💻 Running sleep 40", reply_to=None)
+        await a.send(chat_id=chat, content="slept", reply_to="act-1")
+        with caplog.at_level(logging.INFO):
+            await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == "slept"
+        assert "I'll run that sleep" not in final["text"]
+        assert any("routing summary" in r.message for r in caplog.records)
+        assert any("commentary_informative=1" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_never_posts_empty_text_activities(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-no-empty-post"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            assert str(body.get("text") or "").strip()
+            entity = body["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-empty")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="Interim line.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        await self._spin_until(lambda: len(posts) >= 1)
+        await a.send(chat_id=chat, content="Done.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        assert posts
+
+    @pytest.mark.asyncio
+    async def test_unshown_commentary_before_marked_answer_not_in_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#202: with a marked answer, commentary never belongs in the final."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-unshown-cmt"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-uc")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="Draft",
+            reply_to="act-1",
+        )
+        await a.send(
+            chat_id=chat,
+            content="Unshown interim.",
+            metadata={"informative_update": True},
+        )
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == "Draft"
 
     @pytest.mark.asyncio
     async def test_thread_metadata_commentary_opens_informative_before_idle(
@@ -9129,6 +9333,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-ka-depth", content="💻 Running noop", reply_to=None)
         await self._spin_until(
             lambda: (
                 a._turn_buffers.get("conv-G-ka-depth", {}).get("keepalive", {}).get("stream_id")
@@ -9161,6 +9366,11 @@ class TestEditMessage:
         )
         with caplog.at_level("DEBUG"):
             await a.on_processing_start(event)
+            await a.send(
+                chat_id="conv-G-ka-log",
+                content="💻 Running noop",
+                reply_to=None,
+            )
             await a._emit_turn_buffer_keepalive("conv-G-ka-log")
         assert any(
             "skip post" in record.message
@@ -9194,12 +9404,12 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        await self._spin_until(lambda: len(bodies) >= 1)
         await a.send(
             chat_id="conv-G-prog-info",
             content="💻 Running sleep 40",
             reply_to=None,
         )
+        await self._spin_until(lambda: len(bodies) >= 1)
         await self._spin_until(lambda: len(bodies) >= 2)
         assert bodies[-1]["text"] == "💻 Running sleep 40"
         answer = await a.send(
@@ -9241,12 +9451,12 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        await self._spin_until(lambda: "informative" in kinds)
         await a.send(
             chat_id="conv-G-prog-only",
             content="💻 Running noop",
             reply_to=None,
         )
+        await self._spin_until(lambda: "informative" in kinds)
         await a.on_processing_complete(event, outcome="success")
         assert kinds.count("informative") == 1
         assert kinds[-1] == "final"
@@ -9289,6 +9499,11 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        await a.send(
+            chat_id="conv-G-rotate",
+            content="💻 Running noop",
+            reply_to=None,
+        )
         buf = a._turn_buffers["conv-G-rotate"]
         buf["keepalive"] = {
             "stream_id": "old-stream",
@@ -9326,6 +9541,19 @@ class TestEditMessage:
         )
         await a.on_processing_start(event)
         buf = a._turn_buffers["conv-G-403"]
+        turn_seq = str(buf["turns"][0]["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:403",
+                "text": "💻 Running noop",
+                "turn": turn_seq,
+                "kind": "progress",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            }
+        ]
         buf["keepalive"] = {
             "stream_id": "old-stream",
             "sequence": 2,
@@ -9374,11 +9602,13 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-ka-fail", content="💻 Running noop", reply_to=None)
         await a.send(chat_id="conv-G-ka-fail", content="Keep me", reply_to=None)
         await a._emit_turn_buffer_keepalive("conv-G-ka-fail")
         assert posts["n"] == 1
         assert [segment["text"] for segment in a._turn_buffers["conv-G-ka-fail"]["segments"]] == [
-            "Keep me"
+            "💻 Running noop",
+            "Keep me",
         ]
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 1
@@ -9402,7 +9632,9 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        task = a._turn_buffers["conv-G-ka-down"]["keepalive_task"]
+        task = self._schedule_keepalive_sleeper_for_manual_first_sec(
+            a, "conv-G-ka-down", monkeypatch
+        )
         await a._teardown_chat_state_impl("conv-G-ka-down")
         await asyncio.sleep(0)
         assert task.cancelled()
@@ -9574,6 +9806,11 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        await a.send(
+            chat_id="conv-G-rotate-early",
+            content="💻 Running noop",
+            reply_to=None,
+        )
         buf = a._turn_buffers["conv-G-rotate-early"]
         max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
         buf["keepalive"] = {
@@ -9613,6 +9850,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-noid", content="💻 Running noop", reply_to=None)
         await a._emit_turn_buffer_keepalive("conv-G-noid")
         assert posts["n"] == 1
         assert a._turn_buffers["conv-G-noid"]["keepalive"]["untracked"] is True
@@ -9661,6 +9899,7 @@ class TestEditMessage:
                 message_id="act-1",
             )
             await a.on_processing_start(event)
+            await a.send(chat_id=chat, content="💻 Running noop", reply_to=None)
             await a._emit_turn_buffer_keepalive(chat)
             assert posts["n"] == 1
             stream = a._turn_buffers[chat]["keepalive"]
@@ -9749,7 +9988,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        task = a._turn_buffers[chat]["keepalive_task"]
+        task = self._schedule_keepalive_sleeper_for_manual_first_sec(a, chat, monkeypatch)
         for _ in range(5):
             await asyncio.sleep(0)
         clock = {"t": 1_000.0}
@@ -9765,6 +10004,20 @@ class TestEditMessage:
 
         monkeypatch.setattr(adapter_mod.time, "monotonic", fake_monotonic)
         monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+        buf = a._turn_buffers[chat]
+        turn_seq = str(buf["turns"][0]["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:untracked",
+                "text": "💻 Running noop",
+                "turn": turn_seq,
+                "kind": "progress",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            }
+        ]
         await a._emit_turn_buffer_keepalive(chat)
         assert posts["n"] == 1
         opened = a._turn_buffers[chat]["keepalive"]["opened_mono"]
@@ -9782,7 +10035,10 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         live = a._turn_buffers[chat]
         assert live["keepalive"]["untracked"] is True
-        assert [segment["text"] for segment in live["segments"]] == ["After the cap"]
+        assert [segment["text"] for segment in live["segments"]] == [
+            "💻 Running noop",
+            "After the cap",
+        ]
         assert replies == []
         assert posts["n"] == 1
         retry = live["retry_task"]
@@ -9831,6 +10087,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        await a.send(chat_id="conv-G-swap", content="💻 Running noop", reply_to=None)
         await a._emit_turn_buffer_keepalive("conv-G-swap")
         live = a._turn_buffers["conv-G-swap"]
         assert live["keepalive"]["stream_id"] == "kept-id"
@@ -9933,6 +10190,19 @@ class TestEditMessage:
             await asyncio.sleep(0)
         monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
         buf = a._turn_buffers["conv-G-403-gap"]
+        turn_seq = str(buf["turns"][0]["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:403-gap",
+                "text": "💻 Running noop",
+                "turn": turn_seq,
+                "kind": "progress",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            }
+        ]
         buf["keepalive"] = {
             "stream_id": "old-stream",
             "sequence": 2,
@@ -11556,7 +11826,19 @@ class TestEditMessage:
         }
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals == []
-        buf["segments"] = []
+        turn_seq = str(buf["turns"][0]["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:ka-seg-progress",
+                "text": "💻 Running noop",
+                "turn": turn_seq,
+                "kind": "progress",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            }
+        ]
         closed_by_snap: list[str] = []
         original_final = a._post_keepalive_final_locked
 
