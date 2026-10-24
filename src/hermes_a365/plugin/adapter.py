@@ -1016,6 +1016,8 @@ _POST_SEND_TIMEOUT_MARKER = "timeout after the request was sent"
 # returned an id, and gives up after a short bound.
 _TURN_BUFFER_KEEPALIVE_FIRST_SEC = 25.0
 _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC = 25.0
+# Test-only: when True, do not spawn the automatic keep-alive sleeper (manual emit).
+_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER = False
 _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC = 120.0
 _TURN_BUFFER_KEEPALIVE_FINAL_BUDGET_SEC = 30.0
 _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC = (
@@ -1955,9 +1957,9 @@ class Agent365Adapter(BasePlatformAdapter):
         # the next tick does not open a second stream.
         self._turn_buffers: dict[str, dict[str, Any]] = {}
         self._orphan_keepalive: dict[str, dict[str, Any]] = {}
-        # Chats whose buffer was dropped: a late informative opener must be
-        # closed, not carried into the next turn (#203).
-        self._orphan_keepalive_drop_pending: set[str] = set()
+        # Incremented when a turn buffer is dropped; late openers from an older
+        # epoch must be finalized, even after a new turn starts (#203).
+        self._keepalive_drop_epoch: dict[str, int] = {}
         self._turn_buffer_seq = 0
 
         # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
@@ -3521,6 +3523,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._retire_all_agent_turns()
             self._chat_lifecycle_generation.clear()
             http_client = self._http_client
+            await self._finalize_keepalive_streams_before_http_teardown()
             self._http_client = None
             self._mark_disconnected()
             cleanup_task = asyncio.create_task(self._disconnect(http_client))
@@ -3680,6 +3683,22 @@ class Agent365Adapter(BasePlatformAdapter):
                         task.cancel()
                     self._track_coalesced_reply_survivor(task, task_chats.get(task, ""))
 
+    async def _finalize_keepalive_streams_before_http_teardown(self) -> None:
+        """Post keep-alive finals while ``_http_client`` is still usable."""
+        self._cancel_turn_buffer_retries()
+        for chat_id, buf in list(self._turn_buffers.items()):
+            self._cancel_keepalive_prompt_task(buf)
+            self._cancel_segment_informative_task(buf)
+            await self._cancel_keepalive_and_close(str(chat_id), buf)
+        self._turn_buffers.clear()
+        for orphan_chat in list(self._orphan_keepalive):
+            state = self._orphan_keepalive.get(orphan_chat) or {}
+            inbound = state.get("inbound")
+            await self._teardown_orphan_keepalive(
+                str(orphan_chat),
+                inbound=inbound if isinstance(inbound, dict) else None,
+            )
+
     async def _finish_disconnect(
         self,
         http_client: Any,
@@ -3719,14 +3738,17 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_target_order_by_chat.clear()
         self._coalesced_turn_target_count_by_chat.clear()
         self._cancel_turn_buffer_retries()
-        for chat_id, buf in list(self._turn_buffers.items()):
+        informative_tasks: list[asyncio.Task[Any]] = []
+        for _chat_id, buf in list(self._turn_buffers.items()):
             self._cancel_keepalive_prompt_task(buf)
+            seg_task = buf.get("segment_informative_task")
             self._cancel_segment_informative_task(buf)
-            await self._cancel_keepalive_and_close(str(chat_id), buf)
+            if isinstance(seg_task, asyncio.Task) and not seg_task.done():
+                informative_tasks.append(seg_task)
+        if informative_tasks:
+            await asyncio.gather(*informative_tasks, return_exceptions=True)
         self._turn_buffers.clear()
-        for orphan_chat in list(self._orphan_keepalive):
-            await self._teardown_orphan_keepalive(str(orphan_chat), inbound=None)
-        self._orphan_keepalive_drop_pending.clear()
+        self._orphan_keepalive.clear()
         for stream_key in list(self._streams):
             message_id = stream_key[1]
             chat_id = stream_key[0]
@@ -5297,7 +5319,6 @@ class Agent365Adapter(BasePlatformAdapter):
             "open": True,
         }
         if buf is None:
-            self._orphan_keepalive_drop_pending.discard(str(chat_id))
             self._turn_buffers[chat_id] = {
                 "turns": [turn],
                 "segments": [],
@@ -5306,6 +5327,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "keepalive": self._orphan_keepalive.pop(str(chat_id), {}),
                 "processing_active": True,
                 "buf_identity": str(uuid.uuid4()),
+                "keepalive_drop_epoch": int(self._keepalive_drop_epoch.get(str(chat_id), 0)),
             }
         else:
             self._ensure_turn_buffer_identity(buf)
@@ -5397,7 +5419,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._cancel_turn_buffer_retry(buf)
             await self._cancel_keepalive_and_close(chat_id, buf)
         await self._teardown_orphan_keepalive(chat_id, inbound=teardown_inbound)
-        self._orphan_keepalive_drop_pending.add(chat_id)
+        self._keepalive_drop_epoch[chat_id] = int(self._keepalive_drop_epoch.get(chat_id, 0)) + 1
 
     @staticmethod
     def _keepalive_state(buf: dict[str, Any] | None) -> dict[str, Any]:
@@ -5462,6 +5484,33 @@ class Agent365Adapter(BasePlatformAdapter):
         right_id = str(right.get("buf_identity") or "")
         return bool(left_id) and left_id == right_id
 
+    def _keepalive_opener_is_stale(self, chat_id: str, opener_drop_epoch: int) -> bool:
+        return int(self._keepalive_drop_epoch.get(str(chat_id), 0)) > int(opener_drop_epoch)
+
+    def _schedule_stale_keepalive_opener_teardown(
+        self,
+        chat_id: str,
+        stream_id: str,
+        *,
+        inbound: dict[str, Any] | None,
+    ) -> None:
+        if not stream_id:
+            return
+        if not isinstance(inbound, dict):
+            inbound = self._cached_inbound_for(chat_id)
+        if not isinstance(inbound, dict):
+            logger.warning(
+                "agent365 turn buffer keep-alive stale opener teardown skipped: "
+                "chat_id=%s stream_id=%s",
+                chat_id,
+                stream_id,
+            )
+            return
+        started = asyncio.create_task(
+            self._teardown_orphan_stream(chat_id, stream_id, inbound=inbound)
+        )
+        started.add_done_callback(_consume_turn_buffer_retry_result)
+
     def _remember_keepalive(self, chat_id: str, buf: dict[str, Any], state: dict[str, Any]) -> None:
         """Store stream state on the live buffer, or as an orphan.
 
@@ -5469,6 +5518,18 @@ class Agent365Adapter(BasePlatformAdapter):
         The id, or the fact that a stream was opened without one, has to
         survive that so the next tick does not start a second stream.
         """
+        opener_epoch = int(state.get("drop_epoch") or buf.get("keepalive_drop_epoch") or 0)
+        state = dict(state)
+        if state.get("stream_id") or state.get("untracked"):
+            state.setdefault("drop_epoch", opener_epoch)
+        if self._keepalive_opener_is_stale(chat_id, opener_epoch):
+            stream_id = str(state.get("stream_id") or "")
+            inbound = state.get("inbound")
+            if isinstance(inbound, dict):
+                self._schedule_stale_keepalive_opener_teardown(
+                    chat_id, stream_id, inbound=inbound
+                )
+            return
         live = self._turn_buffers.get(chat_id)
         if live is buf:
             buf["keepalive"] = state
@@ -5499,26 +5560,25 @@ class Agent365Adapter(BasePlatformAdapter):
         elif isinstance(live, dict) and self._turn_buffers_share_identity(live, buf):
             target = live
         else:
-            if str(chat_id) in self._orphan_keepalive_drop_pending:
-                self._orphan_keepalive_drop_pending.discard(str(chat_id))
+            opener_epoch = int(
+                opened_state.get("drop_epoch") or buf.get("keepalive_drop_epoch") or 0
+            )
+            if self._keepalive_opener_is_stale(chat_id, opener_epoch):
                 stream_id = str(opened_state.get("stream_id") or "")
                 logger.debug(
-                    "agent365 turn buffer keep-alive closing orphan opener after drop: "
-                    "chat_id=%s stream_id=%s",
+                    "agent365 turn buffer keep-alive closing stale opener after drop: "
+                    "chat_id=%s stream_id=%s opener_epoch=%s current_epoch=%s",
                     chat_id,
                     stream_id or "(none)",
+                    opener_epoch,
+                    self._keepalive_drop_epoch.get(str(chat_id), 0),
                 )
                 if stream_id and isinstance(turn_for_text, dict):
                     inbound = turn_for_text.get("inbound")
                     if isinstance(inbound, dict):
-                        started = asyncio.create_task(
-                            self._teardown_orphan_stream(
-                                chat_id,
-                                stream_id,
-                                inbound=inbound,
-                            )
+                        self._schedule_stale_keepalive_opener_teardown(
+                            chat_id, stream_id, inbound=inbound
                         )
-                        started.add_done_callback(_consume_turn_buffer_retry_result)
                 return None
             self._orphan_keepalive[str(chat_id)] = opened_state
             logger.debug(
@@ -5640,9 +5700,8 @@ class Agent365Adapter(BasePlatformAdapter):
         short reply would already have been posted, then posts on its
         own task. ``send`` stays free of that network await.
         """
-        # Tests set FIRST_SEC to 3600 to mean "manual emit only"; do not spawn
-        # a sleeper that would block asyncio teardown for an hour.
-        if _TURN_BUFFER_KEEPALIVE_FIRST_SEC >= 3600:
+        if _TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER or _TURN_BUFFER_KEEPALIVE_FIRST_SEC >= 3600:
+            # FIRST_SEC>=3600 is a legacy test-only sentinel for manual emit.
             return
         buf = self._turn_buffers.get(chat_id)
         if buf is None or self._disconnecting or str(chat_id) in self._retiring_chats:
@@ -5744,7 +5803,12 @@ class Agent365Adapter(BasePlatformAdapter):
         stream_id = str(state.get("stream_id") or "")
         if not stream_id:
             return
-        await self._teardown_orphan_stream(chat_id, stream_id, inbound=inbound)
+        resolved_inbound = inbound
+        if not isinstance(resolved_inbound, dict):
+            stored = state.get("inbound")
+            if isinstance(stored, dict):
+                resolved_inbound = stored
+        await self._teardown_orphan_stream(chat_id, stream_id, inbound=resolved_inbound)
 
     async def _teardown_orphan_stream(
         self,
@@ -5849,6 +5913,63 @@ class Agent365Adapter(BasePlatformAdapter):
     def _is_placeholder_informative_text(text: str) -> bool:
         return str(text or "").strip() == _TURN_BUFFER_KEEPALIVE_TEXT
 
+    @staticmethod
+    def _placeholder_informative_opener_allowed(buf: dict[str, Any], *, for_answer: bool) -> bool:
+        if for_answer:
+            return True
+        return bool(buf.get("keepalive_first_interval_elapsed"))
+
+    def _undisplayed_informative_segments(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> list[dict[str, str]]:
+        seq = str(turn.get("seq") or "")
+        pending: list[dict[str, str]] = []
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            kind = self._turn_buffer_segment_kind(segment)
+            if kind not in ("progress", "commentary"):
+                continue
+            if segment.get("informative_displayed"):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if not text or _is_hermes_tool_progress_segment(text):
+                continue
+            pending.append(segment)
+        return pending
+
+    async def _flush_undisplayed_informative_for_turn(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+    ) -> None:
+        """Post every commentary/progress segment not yet shown live (#202)."""
+        while self._turn_buffers.get(chat_id) is buf:
+            pending = self._undisplayed_informative_segments(buf, turn)
+            if not pending:
+                return
+            segment = pending[0]
+            text = str(segment.get("text") or "").strip()
+            if not text:
+                segment["informative_displayed"] = True
+                continue
+            before = bool(segment.get("informative_displayed"))
+            restart = await self._post_informative_locked(
+                chat_id,
+                buf,
+                allow_restart=True,
+                turn_for_text=turn,
+                text_override=text,
+            )
+            if self._turn_buffers.get(chat_id) is not buf:
+                return
+            if segment.get("informative_displayed") and not before:
+                continue
+            if restart:
+                continue
+            return
+
     def _informative_text_for_turn(
         self,
         buf: dict[str, Any],
@@ -5946,7 +6067,12 @@ class Agent365Adapter(BasePlatformAdapter):
 
     async def _push_informative_segment_text(self, chat_id: str) -> None:
         try:
-            await self._post_informative_under_lock(chat_id, allow_restart=False)
+            buf = self._turn_buffers.get(chat_id)
+            turn = self._keepalive_turn(buf) if isinstance(buf, dict) else None
+            if isinstance(buf, dict) and isinstance(turn, dict):
+                await self._flush_undisplayed_informative_for_turn(chat_id, buf, turn)
+            else:
+                await self._post_informative_under_lock(chat_id, allow_restart=False)
         except asyncio.CancelledError:
             raise
         except RuntimeError as exc:
@@ -5984,6 +6110,8 @@ class Agent365Adapter(BasePlatformAdapter):
             if scheduled_mono is not None:
                 elapsed_first = time.monotonic() - scheduled_mono
             buf_after_sleep = self._turn_buffers.get(chat_id)
+            if isinstance(buf_after_sleep, dict):
+                buf_after_sleep["keepalive_first_interval_elapsed"] = True
             will_post = False
             if isinstance(buf_after_sleep, dict):
                 stream_after = self._keepalive_state(buf_after_sleep)
@@ -6237,6 +6365,7 @@ class Agent365Adapter(BasePlatformAdapter):
         allow_restart: bool,
         for_answer: bool = False,
         turn_for_text: dict[str, Any] | None = None,
+        text_override: str | None = None,
     ) -> bool:
         """Return True when a 403 should be followed by one new sequence."""
         if self._turn_buffers.get(chat_id) is not buf:
@@ -6272,13 +6401,16 @@ class Agent365Adapter(BasePlatformAdapter):
         answer_preview = (
             self._marked_answer_preview_for_turn(buf, turn) if for_answer else None
         )
-        informative_text = self._informative_text_for_turn(
-            buf, turn, answer_preview=answer_preview
+        informative_text = (
+            str(text_override).strip()
+            if text_override is not None
+            else self._informative_text_for_turn(buf, turn, answer_preview=answer_preview)
         )
         if (
             not for_answer
             and not stream_id
             and self._is_placeholder_informative_text(informative_text)
+            and not self._placeholder_informative_opener_allowed(buf, for_answer=False)
         ):
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s "
@@ -6309,11 +6441,15 @@ class Agent365Adapter(BasePlatformAdapter):
         status = result.status
         new_id = result.stream_id
         if status is not None and 200 <= status < 300 and new_id and not stream_id:
+            inbound_snap = turn.get("inbound")
             opened_state = {
                 "stream_id": new_id,
                 "sequence": 1,
                 "opened_mono": time.monotonic(),
+                "drop_epoch": int(buf.get("keepalive_drop_epoch") or 0),
             }
+            if isinstance(inbound_snap, dict):
+                opened_state["inbound"] = inbound_snap
             target = self._adopt_opened_keepalive_stream(
                 chat_id,
                 buf,
@@ -6482,12 +6618,17 @@ class Agent365Adapter(BasePlatformAdapter):
             and not stream_id
             and Agent365Adapter._is_placeholder_informative_text(body_text)
         ):
-            logger.debug(
-                "agent365 turn buffer keep-alive skip post: chat_id=%s "
-                "reason=deferred placeholder opener",
-                chat_id,
+            buf = self._turn_buffers.get(chat_id)
+            allowed = Agent365Adapter._placeholder_informative_opener_allowed(
+                buf, for_answer=False
             )
-            return empty
+            if isinstance(buf, dict) and not allowed:
+                logger.debug(
+                    "agent365 turn buffer keep-alive skip post: chat_id=%s "
+                    "reason=deferred placeholder opener",
+                    chat_id,
+                )
+                return empty
         if final and text is not None:
             payload_text = body_text[: self.MAX_MESSAGE_LENGTH]
         else:
@@ -7051,6 +7192,10 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         if early is not None:
             return early
+
+        await self._flush_undisplayed_informative_for_turn(chat_id, buf, turn)
+        if self._turn_buffers.get(chat_id) is not buf:
+            return ("retry", None)
 
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
