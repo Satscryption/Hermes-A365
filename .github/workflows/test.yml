@@ -51,7 +51,7 @@ jobs:
         run: uv run --python ${{ matrix.python-version }} ruff check .
 
       - name: pytest
-        run: uv run --python ${{ matrix.python-version }} pytest
+        run: uv run --python ${{ matrix.python-version }} pytest --timeout=300
 
   windows-negative:
     runs-on: windows-latest
@@ -69,7 +69,7 @@ jobs:
 
       - name: Unsupported-platform contract tests
         run: >
-          uv run --python 3.14 pytest
+          uv run --python 3.14 pytest --timeout=120
           tests/test_compatibility.py
           tests/test_keychain.py::TestGetBackend::test_windows_unsupported
           tests/test_doctor.py::TestProbeKeychain::test_unsupported_platform_errors
@@ -103,7 +103,7 @@ jobs:
           echo '' | gnome-keyring-daemon --unlock
           export $(gnome-keyring-daemon --start)
           export GNOME_KEYRING_CONTROL
-          uv run --python 3.14 pytest tests/test_keychain_live.py -q
+          uv run --python 3.14 pytest --timeout=120 tests/test_keychain_live.py -q
 
   wheel-smoke:
     runs-on: ubuntu-latest

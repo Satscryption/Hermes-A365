@@ -86,6 +86,36 @@ def _check_ref(ref: str, work: Path) -> list[str]:
     if ref.startswith("v0.") and not multiplex_tests:
         errors.append(f"{ref}: expected multiplex gateway tests on semver line")
 
+    phase0 = checkout / "tests" / "gateway" / "test_multiplex_phase0.py"
+    if multiplex_tests or phase0.is_file():
+        if not phase0.is_file():
+            errors.append(f"{ref}: missing tests/gateway/test_multiplex_phase0.py")
+        else:
+            phase0_text = phase0.read_text(encoding="utf-8", errors="replace")
+            multiplex_off = (
+                "multiplex_profiles is False" in phase0_text
+                or "multiplex_profiles defaults off" in phase0_text
+                or "not GatewayConfig().multiplex_profiles" in phase0_text
+            )
+            if not multiplex_off:
+                errors.append(
+                    f"{ref}: multiplex phase0 tests must cover gateway.multiplex_profiles "
+                    "defaulting to false"
+                )
+            gateway_tests = "\n".join(
+                p.read_text(encoding="utf-8", errors="replace")
+                for p in sorted(checkout.glob("tests/gateway/test_multiplex*.py"))
+            )
+            two_profile = (
+                "test_two_profiles_same_chat" in gateway_tests
+                or "def two_profiles" in gateway_tests
+                or "test_two_profiles_isolated" in gateway_tests
+            )
+            if not two_profile:
+                errors.append(
+                    f"{ref}: multiplex gateway tests must cover a two-profile isolation smoke"
+                )
+
     plugin_entry = checkout / "hermes_cli" / "plugins.py"
     if not plugin_entry.is_file():
         errors.append(f"{ref}: missing hermes_cli/plugins.py (entry-point loader)")

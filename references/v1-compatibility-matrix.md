@@ -1,6 +1,6 @@
 # v1.0 compatibility matrix
 
-Snapshot date: 2026-10-20. Authoritative support policy for Hermes-A365
+Snapshot date: 2026-10-24. Authoritative support policy for Hermes-A365
 v1.0 ([#126](https://github.com/Satscryption/Hermes-A365/issues/126)).
 Coordinates with the public-surface freeze ([#85](https://github.com/Satscryption/Hermes-A365/issues/85))
 and the GA documentation sweep ([#87](https://github.com/Satscryption/Hermes-A365/issues/87)).
@@ -45,8 +45,11 @@ Two install contracts:
 | Copilot→Teams session pin (resolution) | `v2026.9.7` | `0.21.1` | Documented in [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md); `doctor` **warns** below floor |
 
 **CI integration smoke refs:** `v2026.6.19` (multiplex floor) and `v0.22.2`
-(current 3.14 gateway line). A full two-profile live multiplex walk remains
-on the #90 gate.
+(current 3.14 gateway line). `scripts/hermes_compat_smoke.py` checks the
+plugin adapter contract plus upstream multiplex phase-0 tests:
+`gateway.multiplex_profiles` defaults **false** and a **two-profile** session
+isolation smoke exists in Hermes source. A full two-profile live gateway walk
+remains on the #90 gate.
 
 **Recommended for new installs:** latest `v0.22.x` / `v2026.9.x` Hermes on
 Python 3.14 with:
@@ -62,9 +65,9 @@ Tested against live walks (update snapshot dates when re-verified on #90):
 | Tool | Tested / required | Doctor behaviour |
 | --- | --- | --- |
 | **A365 CLI** (`a365`, .NET tool) | Live-verified through **1.1.181**; NuGet may be newer | **Warn** on all builds until Microsoft#408 is walked clean; keep `register --auto-recover-secret` |
-| **Azure CLI** (`az`) | **≥ 2.55.0**, signed in | **Error** if missing; **warn** if not signed in |
-| **PowerShell** (`pwsh`) | **7+** | **Error** if missing |
-| **.NET runtime** | **10+** when CLI installed via `dotnet tool` | Not probed directly; install docs in [`a365-cli-reference.md`](a365-cli-reference.md) |
+| **Azure CLI** (`az`) | **≥ 2.55.0**, signed in; exact build **recorded at final walk (#90)** | **Error** if missing; **warn** if not signed in |
+| **PowerShell** (`pwsh`) | **7+**; exact build **recorded at final walk (#90)** | **Error** if missing |
+| **.NET runtime** | **10+** when CLI installed via `dotnet tool`; exact SDK **recorded at final walk (#90)** | Not probed directly; install docs in [`a365-cli-reference.md`](a365-cli-reference.md) |
 
 Record exact CLI builds used on the #90 walk in the closing report.
 

@@ -105,6 +105,11 @@ Don't use when:
 
 ## Prerequisites
 
+Supported Python versions, host OSes (macOS and Linux; Windows is not
+supported for end-to-end v1 flows), Hermes gateway floors, and Microsoft
+tooling pins are in
+[`references/v1-compatibility-matrix.md`](references/v1-compatibility-matrix.md).
+
 - A Microsoft 365 tenant where the operator has **Global Administrator**
   or **Agent Administrator** role and is enrolled in Microsoft's
   Frontier Preview Program.
@@ -125,7 +130,8 @@ Don't use when:
   device-code/auth-code client. Doctor verifies discoverability via the
   signed-in `az` context.
 - An OS keychain: macOS Security or Linux libsecret (`secret-tool`).
-  Windows is not yet supported.
+  Windows is **unsupported for v1** (no Credential Manager backend in this
+  package); see the compatibility matrix.
 - A tenant license: either the **Agent 365 add-on** ($15/user/month) or
   **Microsoft 365 E7** ($99/user/month). The skill never purchases — it
   recommends; see [`references/license-cost-table.md`](references/license-cost-table.md).
