@@ -349,6 +349,35 @@ diagnostic lines (omit it and the class name is used instead). Making the provid
 *primary* store — routing rotation and the setup wizard's writes through
 it — is deferred to post-1.0 enhancement scope.
 
+### Inbound webhook accepted residuals (#86)
+
+These are deliberate limits of the Bot Framework / A365 connector
+authentication model and the in-process dedupe cache. They do **not**
+block a 1.0 security claim once recorded here (see
+[#206](https://github.com/Satscryption/Hermes-A365/issues/206)).
+
+**M3 — body-derived dedupe pre-seed (F5).** Microsoft does not sign a
+per-delivery or per-sender nonce on connector→bot or A365 inbound JWTs
+(`jti` / `uti` name a token issuance, not an activity). A caller who can
+present a bearer this process will verify can POST the victim's unsigned
+activity body first; a later genuine delivery with the same
+`tenant_id|validated_path|from|recipient.id|conversation.id|activity.id|type`
+key is answered with `{"status":"duplicate"}` for the idempotency TTL
+(default 3600s). **Impact:** availability only (suppressed delivery, not
+forged identity). **Prerequisites:** a valid platform/connector bearer for
+this blueprint and tenant, plus the victim's channel-assigned activity id
+and the other body fields in the key.
+
+**Bot Framework JWKS endorsements (F6).** Path B inbound validation checks
+issuer, audience, signature, and optional `serviceUrl` claim match. It does
+**not** check signing-key `endorsements` against `channelId` when a channel
+requires endorsement; the signer is still Microsoft's connector keys.
+
+**Per-process dedupe (F7).** Idempotency state lives on the `serve` app or
+gateway adapter instance. `activity-bridge serve` starts a single uvicorn
+process; a restart or a second worker treats a retry inside the TTL as new.
+Multiplex mode gives each profile its own adapter cache, not a shared store.
+
 ## What is A365?
 
 [**Microsoft Agent 365**](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/)

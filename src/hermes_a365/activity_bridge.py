@@ -1021,6 +1021,12 @@ logger = logging.getLogger(__name__)
 
 # JWKS cache TTL per Microsoft's published guidance (refresh at least daily).
 JWKS_CACHE_TTL_SECONDS = 24 * 3600
+# After TTL, a failed refresh may still use last-known-good keys only within this
+# grace window (#86 F1). Beyond TTL + grace the process fails closed.
+JWKS_CACHE_GRACE_SECONDS = 300.0
+# Minimum wall time between JWKS fetches triggered by an unknown signing ``kid``
+# (#208 review). Prevents unverified-header ``kid`` spam from holding admission.
+JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS = 60.0
 MAX_ACTIVITY_BODY_BYTES = 1024 * 1024
 MAX_JWT_BYTES = 16 * 1024
 MAX_ACTIVITY_JSON_DEPTH = 24
@@ -1198,6 +1204,30 @@ def _safe_url_host(value: Any) -> str:
         return "invalid"
 
 
+def parse_inbound_activity_payload(raw: bytes) -> dict[str, Any]:
+    """Parse a POST body into an activity dict with structural bounds (#86 F3)."""
+    import json as _json
+
+    try:
+        parsed = _json.loads(raw)
+    except RecursionError as exc:
+        raise ValueError("activity JSON exceeds structural limits") from exc
+    except _json.JSONDecodeError as exc:
+        raise _InboundActivityJsonError(str(exc)) from exc
+    if not isinstance(parsed, dict):
+        try:
+            _validate_activity_structure({"v": parsed})
+        except ValueError as exc:
+            raise ValueError(str(exc)) from exc
+        raise _InboundActivityJsonError("activity body must be a JSON object")
+    _validate_activity_structure(parsed)
+    return parsed
+
+
+class _InboundActivityJsonError(TypeError):
+    """Malformed activity JSON (422 — not a structural limit)."""
+
+
 def _validate_activity_structure(value: Any) -> None:
     """Bound JSON depth/node count after the byte-bounded decode."""
     remaining = MAX_ACTIVITY_JSON_NODES
@@ -1247,6 +1277,17 @@ class BoundedRequestBodyMiddleware:
                 await self._reject(send, 413, b'{"detail":"request body too large"}')
                 return
             more = bool(message.get("more_body", False))
+        if scope.get("path") == "/api/messages":
+            try:
+                parse_inbound_activity_payload(bytes(body))
+            except ValueError as exc:
+                detail = json.dumps({"detail": str(exc)}).encode("utf-8")
+                await self._reject(send, 400, detail)
+                return
+            except _InboundActivityJsonError as exc:
+                detail = json.dumps({"detail": str(exc)}).encode("utf-8")
+                await self._reject(send, 422, detail)
+                return
         delivered = False
 
         async def replay() -> dict[str, Any]:
@@ -1271,6 +1312,93 @@ class BoundedRequestBodyMiddleware:
             }
         )
         await send({"type": "http.response.body", "body": body})
+
+
+class PreAuthBodyTimeout(Exception):
+    """Raised when a POST body does not finish within the pre-auth deadline."""
+
+
+MAX_PRE_AUTH_IN_FLIGHT_POSTS = 32
+PRE_AUTH_BODY_TIMEOUT_SEC = 15.0
+
+
+@dataclass
+class _ServePreAuthState:
+    _pre_auth_tasks: set[asyncio.Task[Any]] = field(default_factory=set)
+
+
+class PreAuthAdmissionMiddleware:
+    """Cap in-flight POSTs and bound body read time before JWT validation (#86 F2)."""
+
+    def __init__(
+        self,
+        app: Any,
+        *,
+        semaphore: asyncio.Semaphore,
+        owner: Any,
+    ) -> None:
+        self.app = app
+        self.semaphore = semaphore
+        self.owner = owner
+
+    async def __call__(self, scope: dict[str, Any], receive: Any, send: Any) -> None:
+        if scope.get("type") != "http" or scope.get("method") != "POST":
+            await self.app(scope, receive, send)
+            return
+        if self.semaphore.locked():
+            body = b'{"status":"unavailable","reason":"pre_auth_backlog_full"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 503,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+            return
+        await self.semaphore.acquire()
+        task = asyncio.current_task()
+        if task is not None:
+            self.owner._pre_auth_tasks.add(task)
+            task.add_done_callback(self.owner._pre_auth_tasks.discard)
+        body_complete = False
+        deadline = asyncio.get_running_loop().time() + PRE_AUTH_BODY_TIMEOUT_SEC
+
+        async def receive_with_deadline() -> Any:
+            nonlocal body_complete
+            if body_complete:
+                return await receive()
+            remaining = deadline - asyncio.get_running_loop().time()
+            try:
+                message = await asyncio.wait_for(receive(), timeout=max(0, remaining))
+            except TimeoutError as exc:
+                raise PreAuthBodyTimeout from exc
+            if message.get("type") == "http.disconnect" or not message.get("more_body", False):
+                body_complete = True
+            return message
+
+        try:
+            await self.app(scope, receive_with_deadline, send)
+        except PreAuthBodyTimeout:
+            body = b'{"status":"unavailable","reason":"request_body_timeout"}'
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 408,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(body)).encode("ascii")),
+                    ],
+                }
+            )
+            await send({"type": "http.response.body", "body": body})
+        finally:
+            if task is not None:
+                self.owner._pre_auth_tasks.discard(task)
+            self.semaphore.release()
 
 
 # ---------------------------------------------------------------------------
@@ -1770,6 +1898,7 @@ class _JwksCache:
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     failure_count: int = 0
     retry_after: float = 0.0
+    last_forced_refresh_at: float = 0.0
 
 
 def _validate_jwt_shape(token: str) -> None:
@@ -1795,26 +1924,51 @@ def _extract_bearer_token(authorization: str | None) -> str:
     return token
 
 
+def _jwks_last_known_good_allowed(cache: _JwksCache, now: float) -> bool:
+    if not cache.keys_by_kid:
+        return False
+    age = now - cache.fetched_at
+    return age < cache.ttl_seconds + JWKS_CACHE_GRACE_SECONDS
+
+
 async def _refresh_jwks(
     cache: _JwksCache,
     fetch: Any,
     *,
     now: float,
+    force: bool = False,
 ) -> dict[str, Any]:
-    """Single-flight JWKS refresh with failure backoff and last-known-good use."""
-    if cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
+    """Single-flight JWKS refresh with failure backoff and bounded staleness."""
+    fetched_at_before_wait = cache.fetched_at
+    if (
+        not force
+        and cache.keys_by_kid
+        and (now - cache.fetched_at) < cache.ttl_seconds
+    ):
         return cache.keys_by_kid
-    if now < cache.retry_after:
-        if cache.keys_by_kid:
+    if not force and now < cache.retry_after:
+        if _jwks_last_known_good_allowed(cache, now):
             return cache.keys_by_kid
         raise JwtValidationError("JWKS refresh temporarily unavailable")
     async with cache.refresh_lock:
-        if cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
+        if cache.keys_by_kid and cache.fetched_at > fetched_at_before_wait:
             return cache.keys_by_kid
-        if now < cache.retry_after:
-            if cache.keys_by_kid:
+        if (
+            not force
+            and cache.keys_by_kid
+            and (now - cache.fetched_at) < cache.ttl_seconds
+        ):
+            return cache.keys_by_kid
+        if force and (
+            now - cache.last_forced_refresh_at
+        ) < JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS:
+            return cache.keys_by_kid
+        if not force and now < cache.retry_after:
+            if _jwks_last_known_good_allowed(cache, now):
                 return cache.keys_by_kid
             raise JwtValidationError("JWKS refresh temporarily unavailable")
+        if force:
+            cache.last_forced_refresh_at = now
         try:
             keys = await fetch()
             if not keys:
@@ -1824,7 +1978,7 @@ async def _refresh_jwks(
             cache.retry_after = now + min(
                 JWKS_FAILURE_BACKOFF_MAX_SECONDS, float(2 ** min(cache.failure_count, 6))
             )
-            if cache.keys_by_kid:
+            if _jwks_last_known_good_allowed(cache, now):
                 logger.warning("JWKS refresh failed; using last-known-good keys")
                 return cache.keys_by_kid
             if isinstance(exc, JwtValidationError):
@@ -2109,13 +2263,25 @@ async def validate_inbound_jwt(
     if _jwt is None:
         raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
     _validate_jwt_shape(token)
-    keys = await _ensure_jwks_loaded(client, cache, tenant_id=tenant_id, now=now)
+    import time as _time
+
+    cur = now if now is not None else _time.time()
+    keys = await _ensure_jwks_loaded(client, cache, tenant_id=tenant_id, now=cur)
     try:
         unverified_header = _jwt.get_unverified_header(token)
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"unverified header parse failed: {e}") from e
     kid = unverified_header.get("kid")
-    if not kid or kid not in keys:
+    if not kid:
+        raise JwtValidationError(f"signing key (kid={kid!r}) not in JWKS")
+    if kid not in keys:
+        keys = await _refresh_jwks(
+            cache,
+            lambda: _fetch_aad_v2_keys(client, tenant_id=tenant_id),
+            now=cur,
+            force=True,
+        )
+    if kid not in keys:
         raise JwtValidationError(f"signing key (kid={kid!r}) not in JWKS")
     expected_issuer = AAD_V2_ISSUER_TEMPLATE.format(tenant_id=tenant_id)
     try:
@@ -2272,13 +2438,25 @@ async def validate_inbound_jwt_bf(
     if _jwt is None:
         raise BridgeConfigError("pyjwt not installed; run `uv sync --extra bridge`")
     _validate_jwt_shape(token)
-    keys = await _ensure_bf_jwks_loaded(client, cache, now=now)
+    import time as _time
+
+    cur = now if now is not None else _time.time()
+    keys = await _ensure_bf_jwks_loaded(client, cache, now=cur)
     try:
         unverified_header = _jwt.get_unverified_header(token)
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"unverified header parse failed: {e}") from e
     kid = unverified_header.get("kid")
-    if not kid or kid not in keys:
+    if not kid:
+        raise JwtValidationError(f"signing key (kid={kid!r}) not in BF JWKS")
+    if kid not in keys:
+        keys = await _refresh_jwks(
+            cache,
+            lambda: _fetch_bf_jwks_keys(client),
+            now=cur,
+            force=True,
+        )
+    if kid not in keys:
         raise JwtValidationError(f"signing key (kid={kid!r}) not in BF JWKS")
     try:
         claims = _jwt.decode(
@@ -2291,6 +2469,12 @@ async def validate_inbound_jwt_bf(
         )
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"BF signature/aud/iss check failed: {e}") from e
+    # **Accepted residual (#86 F6):** JWKS entries may carry channel
+    # ``endorsements`` that should be checked against ``channelId`` when a
+    # channel requires endorsement. This validator does not read
+    # ``endorsements``; the signer is still Microsoft's connector keys.
+    # See README → Security model → Inbound webhook accepted residuals.
+    #
     # Microsoft's BF docs (requirement 7 at
     # /azure/bot-service/rest-api/bot-framework-rest-connector-authentication)
     # say "the token contains a 'serviceUrl' claim with value that
@@ -2923,7 +3107,11 @@ class TokenFactory:
         self._bf_cache = bf_cache
 
     async def for_graph(
-        self, activity: dict[str, Any], *, now: float | None = None
+        self,
+        activity: dict[str, Any],
+        *,
+        validated_path: str | None,
+        now: float | None = None,
     ) -> str:
         """Mint a Microsoft Graph bearer for the inbound activity's identity.
 
@@ -2932,7 +3120,11 @@ class TokenFactory:
         (Graph is exempt from AADSTS82001, so the Path B identity mints it
         directly). Raises for an unclassifiable activity rather than guessing.
         """
-        path_tag = _inbound_path_tag(activity)
+        path_tag = (
+            validated_path
+            if validated_path in ("A", "B")
+            else _inbound_path_tag(activity)
+        )
         if path_tag == "A":
             return await acquire_outbound_token(
                 client=self._client,
@@ -3333,7 +3525,17 @@ def make_app(
 
     _validate_webhook_url(cfg.webhook_url, development_mode=cfg.skip_jwt_validation)
     app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}")
-    app.add_middleware(BoundedRequestBodyMiddleware, max_bytes=MAX_ACTIVITY_BODY_BYTES)
+
+    pre_auth_state = _ServePreAuthState()
+    app.add_middleware(
+        BoundedRequestBodyMiddleware,
+        max_bytes=MAX_ACTIVITY_BODY_BYTES,
+    )
+    app.add_middleware(
+        PreAuthAdmissionMiddleware,
+        semaphore=asyncio.Semaphore(MAX_PRE_AUTH_IN_FLIGHT_POSTS),
+        owner=pre_auth_state,
+    )
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:

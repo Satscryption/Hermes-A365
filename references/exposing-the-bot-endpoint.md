@@ -155,9 +155,12 @@ These are explicitly outside the skill's scope:
 
 - TLS termination, certificate management, certificate rotation.
 - Geographic / region failover.
-- Rate limiting at the network layer (the skill rate-limits at
-  the activity layer where it matters — slice 19i dedupe, future
-  #3's 1 req/s on streaming).
+- Rate limiting at the network layer. Both runtimes cap **32**
+  in-flight `POST /api/messages` requests and apply a **15s** body-read
+  deadline before JWT validation (#86 F2); that is a concurrency backstop,
+  not per-IP rate limiting. Also rate-limit connections and time out slow
+  clients on the reverse proxy or tunnel in front of `serve` / the plugin.
+  Activity-layer dedupe (slice 19i) and streaming caps (#3) remain separate.
 - DDoS / abuse mitigation at the network edge.
 - Observability of network-layer concerns (request latency at
   the tunnel, dropped connections, etc.). The skill emits its own

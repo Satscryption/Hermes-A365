@@ -1569,6 +1569,53 @@ class TestMessagesRoute:
         # Only one dispatch despite two POSTs.
         assert len(a._handled_events) == 1
 
+    def test_same_body_different_bearer_jti_preseed_characterization(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        # M3 (#86 F5): accepted residual — identical activity bodies with two
+        # distinct bearer tokens (e.g. different jti) still share the dedupe key.
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        a._http_client = MagicMock()
+        client = TestClient(a.build_app())
+        body = _make_inbound(conv_id="conv-m3-plugin")
+        first = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        second = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer d.e.f"},
+        )
+        assert first.json()["status"] == "dispatched"
+        assert second.json()["status"] == "duplicate"
+        assert len(a._handled_events) == 1
+
+    def test_deeply_nested_json_returns_400_not_500(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        client = TestClient(a.build_app())
+        body = b"[" * 2000 + b"]" * 2000
+        response = client.post(
+            "/api/messages",
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+        assert response.status_code == 400
+        assert a._handled_events == []
+
     def test_conversation_update_acked_no_dispatch(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
@@ -2201,7 +2248,8 @@ class TestLifecycleCapture:
     async def test_pre_auth_admission_times_out_incomplete_body(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        monkeypatch.setattr(adapter_mod, "_PRE_AUTH_BODY_TIMEOUT_SEC", 0.01)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "PRE_AUTH_BODY_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         semaphore = asyncio.Semaphore(1)
 
@@ -2216,7 +2264,7 @@ class TestLifecycleCapture:
         async def capture(message: dict[str, Any]) -> None:
             sent.append(message)
 
-        middleware = adapter_mod._PreAuthAdmissionMiddleware(
+        middleware = bridge.PreAuthAdmissionMiddleware(
             body_reader,
             semaphore=semaphore,
             owner=a,
@@ -19801,6 +19849,47 @@ class TestInvokeRoute:
         assert ctx.tenant_id == "claim-tid"
         assert ctx.user_upn == "u@x"
 
+    def test_invoke_context_uses_jwt_path_not_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from fastapi.testclient import TestClient
+
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "peek_unverified_iss",
+            lambda _token: bridge.BF_ISSUER,
+        )
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt_bf",
+            AsyncMock(return_value={"aud": "x", "iss": bridge.BF_ISSUER}),
+        )
+        a._http_client = MagicMock()
+        captured: dict[str, Any] = {}
+
+        async def capture(ctx: Any, *, registry: Any = None) -> Any:
+            captured["path_tag"] = ctx.path_tag
+            return adapter_mod.invoke.InvokeResponse(200, {"ok": True})
+
+        monkeypatch.setattr(adapter_mod.invoke, "dispatch_invoke", capture)
+        client = TestClient(a.build_app())
+        body = self._invoke_body()
+        body["recipient"] = {
+            "agenticAppId": "injected-app",
+            "agenticUserId": "injected-user",
+            "tenantId": "11111111-1111-1111-1111-111111111111",
+        }
+        body["conversation"]["tenantId"] = "11111111-1111-1111-1111-111111111111"
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.status_code == 200
+        assert captured["path_tag"] == "B"
+
     @pytest.mark.parametrize(
         ("conversation_type", "expected_chat_type"),
         [("   ", "group"), ("PERSONAL", "dm"), ("CHANNEL", "channel")],
@@ -21695,6 +21784,27 @@ class TestHandoff:
     def test_mint_handoff_link_unknown_conv(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         assert a._mint_handoff_link("ghost", reason="x") is None
+
+    def test_remember_handoff_stamps_validated_path_not_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        activity = _make_inbound(conv_id="conv-handoff-path")
+        activity["recipient"] = {
+            "tenantId": "11111111-1111-1111-1111-111111111111",
+            "agenticAppId": "injected-app",
+            "agenticUserId": "injected-user",
+        }
+        activity["conversation"]["tenantId"] = "11111111-1111-1111-1111-111111111111"
+        ctx = adapter_mod.invoke.build_invoke_context(
+            activity,
+            claims={},
+            path_tag="B",
+        )
+        a._remember_handoff_destination(ctx)
+        ref = a._conversations.get("conv-handoff-path")
+        assert ref is not None
+        assert ref.validated_path == "B"
 
     @pytest.mark.asyncio
     async def test_handle_handoff_action_known_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
