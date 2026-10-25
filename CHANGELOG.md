@@ -8,11 +8,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [0.9.3] — 2026-10-25
 
-v1 compatibility matrix (#126), Copilot Chat turn-buffer streaming and delivery
-(#181–#186, #182, #199, #202–#204), Teams walk092 fixes (#183–#185), Copilot
-publish-state hardening (#171, #196), and inbound activity gating (#180, #188).
-Ships merged work on `main@f612899` (2026-10-25) via PRs #195–#201, #207, and
-#210.
+v1 compatibility matrix (#126), Copilot Chat turn-buffer fixes (#181, #182, #186, #199, #202–#204), Teams walk092 fixes (#183–#185), Copilot publish-state hardening (#171, #196, #200), and inbound activity gating (#180, #188).
+Ships merged work on `main@f612899` (2026-10-24) via PRs #195–#201, #207, and PR #210.
 
 ### Added
 
@@ -74,8 +71,7 @@ Ships merged work on `main@f612899` (2026-10-25) via PRs #195–#201, #207, and
   prose unless it was posted on the informative stream (`informative_displayed`).
   Last non-tool-progress segment is always the answer when no marked answer exists.
   Re-check `hermes_a365` log level on gateway connect and first inbound. Coalesce
-  informative refresh while a post is in flight.
-  in flight. At most one keep-alive revival per turn while `depth > 0` or
+  informative refresh while a post is in flight. At most one keep-alive revival per turn while `depth > 0` or
   `processing_active`.
   `processing_active` clears in a `finally` on `on_processing_complete`.
   Progress-only flush sets `skip_stream_open` so a closed informative stream is
@@ -107,7 +103,7 @@ Ships merged work on `main@f612899` (2026-10-25) via PRs #195–#201, #207, and
   combined `--aiteammate --copilot-chat` default).   Mismatch hints never steer
   operators toward reusing the AI Teammate catalog id on the CEA zip.
 
-- **Copilot Chat publish state follow-up (#171, #196).** Schema v2
+- **Copilot Chat publish state follow-up (#196, #200).** Schema v2
   `tenantId` scope now canonicalises GUID spelling (case, braces,
   hyphenation) on write and compare so it matches `tenant_ids_match`.
   Path-B-only `--manifest-id` mismatch hints keep the “pass the stored
