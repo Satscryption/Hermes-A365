@@ -40,7 +40,7 @@ HERMES_MULTIPLEX_MIN_SEMVER: Final[tuple[int, int, int]] = (0, 17, 0)
 HERMES_SESSION_PIN_RESOLUTION_MIN_SEMVER: Final[tuple[int, int, int]] = (0, 21, 1)
 
 # Integration smoke refs in CI (git tags on NousResearch/hermes-agent).
-HERMES_INTEGRATION_SMOKE_REFS: Final[tuple[str, ...]] = ("v2026.6.19", "v0.22.2")
+HERMES_INTEGRATION_SMOKE_REFS: Final[tuple[str, ...]] = ("v2026.6.19", "v0.22.5")
 
 # --- Microsoft operator tooling (live-verified snapshots; doctor warns on drift) -
 

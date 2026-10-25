@@ -14,7 +14,7 @@ probes the host against this matrix (Python, OS, Hermes floors, keychain).
 | Role | Supported range | CI evidence |
 | --- | --- | --- |
 | **Standalone CLI / wheel** (`hermes-a365`, `pipx install`) | `>=3.11` (3.11–3.14 tested in CI; 3.15+ untested) | **Ubuntu:** ruff + full pytest on 3.11–3.14 |
-| **Hermes gateway plugin** | **Python 3.14** in the Hermes venv | **Ubuntu 3.14** + **macOS 3.14** (same pytest suite; combined install uses `overrides.txt` ([#148](https://github.com/Satscryption/Hermes-A365/issues/148))) |
+| **Hermes gateway plugin** | **Python 3.14** in the Hermes venv | **Ubuntu 3.14** + **macOS 3.14** (same pytest suite; `overrides.txt` for PyJWT on Hermes < v0.22.3 and for FastAPI when `hermes-agent[web]`/`[all]` is present — refs [#148](https://github.com/Satscryption/Hermes-A365/issues/148)) |
 
 Hermes Agent upstream still declares `requires-python = ">=3.11,<3.15"` and
 documents **3.14** as the supported gateway runtime. This package does not
@@ -44,19 +44,33 @@ Two install contracts:
 | `gateway.multiplex_profiles: true` | `v2026.6.19` | `0.17.0` | Source smoke; multiplex config guard in `doctor` |
 | Copilot→Teams session pin (resolution) | `v2026.9.7` | `0.21.1` | Documented in [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md); `doctor` **warns** below floor |
 
-**CI integration smoke refs:** `v2026.6.19` (multiplex floor) and `v0.22.2`
+**CI integration smoke refs:** `v2026.6.19` (multiplex floor) and `v0.22.5`
 (current 3.14 gateway line). `scripts/hermes_compat_smoke.py` checks the
 plugin adapter contract plus upstream multiplex phase-0 tests:
 `gateway.multiplex_profiles` defaults **false** and a **two-profile** session
-isolation smoke exists in Hermes source. A full two-profile live gateway walk
-remains on the #90 gate.
+isolation smoke exists in Hermes source. It does **not** prove PyJWT pins or
+combined `uv pip` resolve (operator-verified on v0.22.5). A full two-profile
+live gateway walk remains on the #90 gate.
 
-**Recommended for new installs:** latest `v0.22.x` / `v2026.9.x` Hermes on
-Python 3.14 with:
+**Recommended for new installs:** Hermes tag **>= v0.22.3** (**v0.22.5**
+recommended) on Python 3.14, installed from the **git tag** or Hermes
+installer / `hermes update` — **not** PyPI (`hermes-agent` latest there is
+`0.19.0`). Core only (no `[web]` / `[all]`):
+
+```bash
+uv pip install 'hermes-a365[bridge]'
+```
+
+For **older supported** Hermes refs (plugin **0.12.0** / `v2026.4.30`, multiplex
+**0.17.0** / `v2026.6.19`, session pin **0.21.1** / `v2026.9.7`, or **v0.22.2**),
+or when `hermes-agent[web]` / `[all]` is present, use:
 
 ```bash
 uv pip install --override overrides.txt 'hermes-a365[bridge]'
 ```
+
+(`overrides.txt`: PyJWT for Hermes < v0.22.3; FastAPI for `[web]`/`[all]`; refs
+#148.)
 
 ## Microsoft operator tooling
 
@@ -95,6 +109,6 @@ Record exact CLI builds used on the #90 walk in the closing report.
 
 ## Related references
 
-- [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md) — PyJWT / FastAPI overrides + session-pin floors
+- [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md) — Hermes v0.22.5 PyJWT resolve + FastAPI override + session-pin floors
 - [`a365-cli-reference.md`](a365-cli-reference.md) — real `a365` subcommands and CLI drift
 - [`live-tenant-test.md`](live-tenant-test.md) — operator walk (uses versions declared here)
