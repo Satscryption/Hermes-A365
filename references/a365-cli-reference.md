@@ -21,6 +21,11 @@ secret-persistence regression against CLI 1.1.181.
 The CLI is **`Microsoft.Agents.A365.DevTools.Cli`** (binary name `a365`),
 distributed as a .NET tool from NuGet:
 
+**Runtime prerequisite (Microsoft Learn):** the Agent 365 CLI requires
+**.NET 8.0 or later** (`Microsoft.NETCore.App`). `hermes a365 doctor` runs
+`dotnet --list-runtimes` and warns when no suitable runtime is installed.
+Source: [Install and use the Agent 365 CLI — Prerequisites](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli#prerequisites).
+
 ```
 dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease
 ```

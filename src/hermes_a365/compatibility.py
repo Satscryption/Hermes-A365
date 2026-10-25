@@ -52,6 +52,8 @@ HERMES_PLUGIN_FLOOR_SMOKE_REF: Final[str] = (
 # --- Microsoft operator tooling (live-verified snapshots; doctor warns on drift) -
 
 AZURE_CLI_MIN: Final[tuple[int, int, int]] = (2, 55, 0)
+# Agent 365 CLI prerequisites: .NET 8.0 or later (Microsoft Learn, agent-365-cli).
+DOTNET_RUNTIME_MIN: Final[tuple[int, int, int]] = (8, 0, 0)
 POWERSHELL_MIN_MAJOR: Final[int] = 7
 A365_CLI_LIVE_VERIFIED: Final[tuple[int, int, int]] = (1, 1, 181)
 

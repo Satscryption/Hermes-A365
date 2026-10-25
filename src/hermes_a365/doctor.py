@@ -6,6 +6,7 @@ verified 2026-05-04) and checks the prereqs the real CLI's own
 
 - ``a365`` CLI present + version
 - ``az`` CLI present, version ≥ matrix floor, signed in
+- ``dotnet`` with ``Microsoft.NETCore.App`` ≥ 8.0 (Agent 365 CLI prerequisite)
 - ``pwsh`` (PowerShell 7+) on PATH — the CLI shells out to it for some
   steps; missing pwsh causes ``setup requirements`` to fail.
 - Custom Entra client app (named ``Agent 365 CLI`` by Microsoft's
@@ -51,6 +52,7 @@ from .activity_bridge import parse_agent_identity_ids
 from .compatibility import (
     A365_CLI_LIVE_VERIFIED,
     AZURE_CLI_MIN,
+    DOTNET_RUNTIME_MIN,
     HERMES_GATEWAY_PYTHON,
     HERMES_MULTIPLEX_MIN_CALENDAR,
     HERMES_PLUGIN_MIN_CALENDAR,
@@ -278,6 +280,73 @@ def probe_az_cli() -> ProbeResult:
         "az_cli",
         _OK,
         f"present and signed in as {user} ({binary}); version {data['version']}",
+        data,
+    )
+
+
+_AGENT365_CLI_DOTNET_DOCS = (
+    "https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli"
+)
+
+
+def parse_dotnet_list_runtimes(text: str) -> tuple[int, int, int] | None:
+    """Return the highest ``Microsoft.NETCore.App`` from ``dotnet --list-runtimes``."""
+
+    best: tuple[int, int, int] | None = None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "Microsoft.NETCore.App":
+            continue
+        triple = _semver_triple_from_text(parts[1])
+        if triple is None:
+            continue
+        if best is None or triple > best:
+            best = triple
+    return best
+
+
+def probe_dotnet_runtime() -> ProbeResult:
+    """``.NET`` runtime for the global ``a365`` dotnet tool (Microsoft docs: 8.0+)."""
+
+    binary = shutil.which("dotnet")
+    min_label = ".".join(str(part) for part in DOTNET_RUNTIME_MIN)
+    if not binary:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"dotnet not found on PATH (Agent 365 CLI requires .NET ≥ {min_label}; "
+                f"see {_AGENT365_CLI_DOTNET_DOCS})"
+            ),
+        )
+    output = safe_run([binary, "--list-runtimes"], timeout=15.0) or ""
+    runtime = parse_dotnet_list_runtimes(output)
+    data: dict[str, Any] = {"path": binary}
+    if runtime is None:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; no Microsoft.NETCore.App runtime found "
+                f"(Agent 365 CLI requires .NET ≥ {min_label})"
+            ),
+            data,
+        )
+    data["version"] = ".".join(str(part) for part in runtime)
+    if runtime < DOTNET_RUNTIME_MIN:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; highest Microsoft.NETCore.App is "
+                f"{data['version']} (Agent 365 CLI requires .NET ≥ {min_label})"
+            ),
+            data,
+        )
+    return ProbeResult(
+        "dotnet_runtime",
+        _OK,
+        f"Microsoft.NETCore.App {data['version']} available ({binary})",
         data,
     )
 
@@ -1069,6 +1138,7 @@ def run_all_probes(
     probes.append(probe_python_runtime())
     probes.append(probe_host_platform())
     probes.append(probe_a365_cli())
+    probes.append(probe_dotnet_runtime())
     probes.append(probe_az_cli())
     probes.append(probe_powershell())
     probes.append(probe_custom_client_app())

@@ -8,10 +8,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **#209 — plugin-floor Hermes smoke and Azure CLI version probe.** CI
-  Hermes source smoke adds tag `v2026.4.30` (plugin floor / Hermes Agent
-  0.12.0). `doctor` parses `az version` and **warns** when a signed-in
-  `az` is below `≥ 2.55.0` instead of reporting ok. Refs
+- **#209 — #126 review follow-ups.** CI Hermes source smoke adds the plugin
+  floor tag `v2026.4.30`. `doctor` parses `az version` and **warns** when a
+  signed-in `az` is below `≥ 2.55.0`; adds a `dotnet --list-runtimes` probe
+  against Microsoft's **.NET 8.0+** Agent 365 CLI prerequisite (replacing the
+  unsourced matrix “10+” claim). Matrix plugin-row evidence wording matches the
+  smoke (AST-check + contract files). `cli.main` keeps calling
+  `emit_runtime_warnings` (tested); register warning tests no longer lift pytest
+  timeout above CI's 300s ceiling. Refs
   [#209](https://github.com/Satscryption/Hermes-A365/issues/209).
 
 - **#148 — Hermes v0.22.3+ PyJWT pin and install docs.** Upstream

@@ -20,10 +20,12 @@ from hermes_a365.doctor import (
     overall_to_exit_code,
     parse_a365_cli_version,
     parse_az_cli_version,
+    parse_dotnet_list_runtimes,
     probe_a365_cli,
     probe_agent_instance_allowlist,
     probe_az_cli,
     probe_custom_client_app,
+    probe_dotnet_runtime,
     probe_file_transfer,
     probe_hermes_harness,
     probe_keychain,
@@ -178,6 +180,50 @@ class TestParseAzCliVersion:
         self, text: str, expected: tuple[int, int, int] | None
     ) -> None:
         assert parse_az_cli_version(text) == expected
+
+
+# ---------------------------------------------------------------------------
+# probe_dotnet_runtime
+# ---------------------------------------------------------------------------
+
+
+class TestProbeDotnetRuntime:
+    def test_missing_dotnet_warns(self) -> None:
+        with patch("hermes_a365.doctor.shutil.which", return_value=None):
+            r = probe_dotnet_runtime()
+        assert r.state == "warn"
+        assert "dotnet not found" in r.detail
+
+    def test_runtime_8_ok(self) -> None:
+        runtimes = "Microsoft.NETCore.App 8.0.10 [/usr/share/dotnet/shared]\n"
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/dotnet"),
+            patch("hermes_a365.doctor.safe_run", return_value=runtimes),
+        ):
+            r = probe_dotnet_runtime()
+        assert r.state == "ok"
+        assert "8.0.10" in r.detail
+
+    def test_runtime_below_8_warns(self) -> None:
+        runtimes = "Microsoft.NETCore.App 6.0.29 [/usr/share/dotnet/shared]\n"
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/dotnet"),
+            patch("hermes_a365.doctor.safe_run", return_value=runtimes),
+        ):
+            r = probe_dotnet_runtime()
+        assert r.state == "warn"
+        assert "6.0.29" in r.detail
+        assert "≥ 8.0" in r.detail
+
+
+class TestParseDotnetListRuntimes:
+    def test_picks_highest_netcore_app(self) -> None:
+        text = (
+            "Microsoft.AspNetCore.App 8.0.10 [/x]\n"
+            "Microsoft.NETCore.App 8.0.10 [/x]\n"
+            "Microsoft.NETCore.App 10.0.0 [/x]\n"
+        )
+        assert parse_dotnet_list_runtimes(text) == (10, 0, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -710,6 +756,7 @@ class TestRunAllProbes:
             "python",
             "host_platform",
             "a365_cli",
+            "dotnet_runtime",
             "az_cli",
             "powershell",
             "custom_client_app",
@@ -739,6 +786,10 @@ class TestRunAllProbes:
             patch(
                 "hermes_a365.doctor.probe_az_cli",
                 return_value=ProbeResult("az_cli", "ok", ""),
+            ),
+            patch(
+                "hermes_a365.doctor.probe_dotnet_runtime",
+                return_value=ProbeResult("dotnet_runtime", "ok", ""),
             ),
             patch(
                 "hermes_a365.doctor.probe_powershell",
