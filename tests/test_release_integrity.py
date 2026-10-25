@@ -336,16 +336,33 @@ def test_live_0_9_1_section_still_parses() -> None:
 
 
 def test_live_0_9_2_section_still_parses() -> None:
-    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.2")
+    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    heading, body = mod.changelog_section(text, "0.9.2")
 
-    assert notes.version == "0.9.2"
-    assert notes.title == (
+    assert heading.startswith("## [0.9.2] \u2014 2026-10-19")
+    assert mod.release_title("v0.9.2", body) == (
         "v0.9.2 \u2014 Publish smoke installs hash-pinned packaging from the requirements file."
     )
+    assert "v0.9.1" in body
+    assert "never published to PyPI" in body
+    assert "fix-forward" in body
+
+
+def test_live_0_9_3_section_still_parses() -> None:
+    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.3")
+
+    assert notes.version == "0.9.3"
+    assert notes.title == (
+        "v0.9.3 \u2014 v1 compatibility matrix (#126), Copilot Chat turn-buffer fixes "
+        "(#181, #182, #186, #199, #202\u2013#204), Teams walk092 fixes (#183\u2013#185), "
+        "Copilot publish-state hardening (#171, #196, #200), and inbound activity "
+        "gating (#180, #188)."
+    )
     assert len(notes.title) <= mod.TITLE_LIMIT
-    assert "v0.9.1" in notes.body
-    assert "never published to PyPI" in notes.body
-    assert "fix-forward" in notes.body
+    assert "main@f612899" in notes.body
+    assert "2026-10-24" in notes.body
+    assert "#126" in notes.body
+    assert "#210" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:
