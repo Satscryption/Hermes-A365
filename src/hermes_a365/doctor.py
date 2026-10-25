@@ -190,30 +190,49 @@ def probe_a365_cli() -> ProbeResult:
     )
 
 
-def parse_az_cli_version(text: str) -> tuple[int, int, int] | None:
-    """Extract Azure CLI ``major.minor.patch`` from ``az version -o json`` output."""
+def _release_semver_triple(text: str) -> tuple[int, int, int] | None:
+    """Parse ``major.minor.patch`` tolerating build metadata and prerelease suffixes."""
 
-    trimmed = text.strip()
-    if trimmed.startswith("{"):
-        try:
-            payload = json.loads(trimmed)
-        except json.JSONDecodeError:
-            payload = None
-        if isinstance(payload, dict):
-            for key in ("azure-cli", "azure_cli"):
-                value = payload.get(key)
-                if isinstance(value, str):
-                    parsed = _semver_triple_from_text(value)
-                    if parsed is not None:
-                        return parsed
-    return _semver_triple_from_text(text)
-
-
-def _semver_triple_from_text(text: str) -> tuple[int, int, int] | None:
-    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", text)
+    match = re.search(
+        r"\bv?(\d+)\.(\d+)\.(\d+)(?:[.+-][0-9A-Za-z.-]+|b\d+)?\b",
+        text,
+    )
     if not match:
         return None
-    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def _load_az_version_json(text: str) -> dict[str, Any] | None:
+    trimmed = text.strip()
+    if not trimmed.startswith("{"):
+        return None
+    candidates = [trimmed]
+    if "\n" in trimmed:
+        candidates.append(trimmed.splitlines()[0])
+    for candidate in candidates:
+        try:
+            payload = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(payload, dict):
+            return payload
+    return None
+
+
+def parse_az_cli_version(text: str) -> tuple[int, int, int] | None:
+    """Extract ``azure-cli`` from ``az version -o json`` (never other JSON fields)."""
+
+    payload = _load_az_version_json(text)
+    if payload is None:
+        return None
+    for key in ("azure-cli", "azure_cli"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            parsed = _release_semver_triple(value)
+            if parsed is not None:
+                return parsed
+    return None
 
 
 def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
@@ -223,11 +242,81 @@ def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
     ``Agent 365 Developer Tools CLI v1.1.171``. Build metadata and
     preview suffixes are irrelevant for the doctor floor check.
     """
-    match = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)(?:[.+-][0-9A-Za-z.-]+)?\b", text)
-    if not match:
-        return None
-    major, minor, patch = match.groups()
-    return int(major), int(minor), int(patch)
+    return _release_semver_triple(text)
+
+
+_DOTNET_PRERELEASE_RE = re.compile(r"-(?:preview|rc|alpha|beta)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class DotnetRuntimeScan:
+    best_stable: tuple[int, int, int] | None
+    best_prerelease: tuple[int, int, int] | None
+
+
+def _parse_dotnet_runtime_token(token: str) -> tuple[tuple[int, int, int] | None, bool]:
+    is_prerelease = bool(_DOTNET_PRERELEASE_RE.search(token))
+    triple = _release_semver_triple(token)
+    return triple, is_prerelease
+
+
+def parse_dotnet_list_runtimes(text: str) -> DotnetRuntimeScan:
+    """Return the highest stable and prerelease ``Microsoft.NETCore.App`` versions."""
+
+    best_stable: tuple[int, int, int] | None = None
+    best_prerelease: tuple[int, int, int] | None = None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "Microsoft.NETCore.App":
+            continue
+        triple, is_prerelease = _parse_dotnet_runtime_token(parts[1])
+        if triple is None:
+            continue
+        if is_prerelease:
+            if best_prerelease is None or triple > best_prerelease:
+                best_prerelease = triple
+        elif best_stable is None or triple > best_stable:
+            best_stable = triple
+    return DotnetRuntimeScan(best_stable=best_stable, best_prerelease=best_prerelease)
+
+
+def _az_account_show_user(binary: str) -> tuple[Literal["ok", "timeout", "failed"], str | None]:
+    try:
+        proc = subprocess.run(
+            [binary, "account", "show", "--query", "user.name", "-o", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ("timeout", None)
+    except OSError:
+        return ("failed", None)
+    if proc.returncode != 0:
+        return ("ok", None)
+    user = proc.stdout.strip()
+    return ("ok", user or None)
+
+
+def _az_signed_out_detail(
+    binary: str,
+    *,
+    parsed_version: tuple[int, int, int] | None,
+    version_label: str | None,
+    version_text: str | None,
+    min_label: str,
+) -> str:
+    detail = f"present at {binary}; not signed in (run `az login`)"
+    if version_label is not None and parsed_version is not None:
+        detail += f"; version {version_label}"
+        if parsed_version < AZURE_CLI_MIN:
+            detail += f" (below required ≥ {min_label})"
+    elif version_text is None:
+        detail += "; could not determine version (`az version` failed or timed out)"
+    elif parsed_version is None:
+        detail += "; could not parse `az version` output"
+    return detail
 
 
 def probe_az_cli() -> ProbeResult:
@@ -239,22 +328,55 @@ def probe_az_cli() -> ProbeResult:
             _ERROR,
             f"az not found on PATH (install Azure CLI ≥ {min_label})",
         )
-    version_text = safe_run([binary, "version", "-o", "json"], timeout=10.0) or ""
-    parsed_version = parse_az_cli_version(version_text)
+    version_text = safe_run([binary, "version", "-o", "json"], timeout=10.0)
+    parsed_version = (
+        parse_az_cli_version(version_text) if version_text is not None else None
+    )
     data: dict[str, Any] = {"path": binary}
+    version_label: str | None = None
     if parsed_version is not None:
-        data["version"] = ".".join(str(part) for part in parsed_version)
+        version_label = ".".join(str(part) for part in parsed_version)
+        data["version"] = version_label
 
-    signed_in = safe_run([binary, "account", "show", "--query", "user.name", "-o", "tsv"])
-    if not signed_in:
+    sign_in_state, user = _az_account_show_user(binary)
+    if sign_in_state == "timeout":
         return ProbeResult(
             "az_cli",
             _WARN,
-            f"present at {binary}; not signed in (run `az login`)",
+            f"present at {binary}; `az account show` timed out (cannot confirm sign-in)",
             data,
         )
-    user = signed_in.strip()
+    if sign_in_state == "failed":
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            f"present at {binary}; could not run `az account show`",
+            data,
+        )
+    if user is None:
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            _az_signed_out_detail(
+                binary,
+                parsed_version=parsed_version,
+                version_label=version_label,
+                version_text=version_text,
+                min_label=min_label,
+            ),
+            data,
+        )
     data["user"] = user
+    if version_text is None:
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            (
+                f"present and signed in as {user} ({binary}); "
+                "`az version` failed or timed out"
+            ),
+            data,
+        )
     if parsed_version is None:
         return ProbeResult(
             "az_cli",
@@ -266,7 +388,6 @@ def probe_az_cli() -> ProbeResult:
             data,
         )
     if parsed_version < AZURE_CLI_MIN:
-        version_label = data["version"]
         return ProbeResult(
             "az_cli",
             _WARN,
@@ -279,7 +400,7 @@ def probe_az_cli() -> ProbeResult:
     return ProbeResult(
         "az_cli",
         _OK,
-        f"present and signed in as {user} ({binary}); version {data['version']}",
+        f"present and signed in as {user} ({binary}); version {version_label}",
         data,
     )
 
@@ -287,22 +408,6 @@ def probe_az_cli() -> ProbeResult:
 _AGENT365_CLI_DOTNET_DOCS = (
     "https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli"
 )
-
-
-def parse_dotnet_list_runtimes(text: str) -> tuple[int, int, int] | None:
-    """Return the highest ``Microsoft.NETCore.App`` from ``dotnet --list-runtimes``."""
-
-    best: tuple[int, int, int] | None = None
-    for line in text.splitlines():
-        parts = line.split()
-        if len(parts) < 2 or parts[0] != "Microsoft.NETCore.App":
-            continue
-        triple = _semver_triple_from_text(parts[1])
-        if triple is None:
-            continue
-        if best is None or triple > best:
-            best = triple
-    return best
 
 
 def probe_dotnet_runtime() -> ProbeResult:
@@ -319,9 +424,31 @@ def probe_dotnet_runtime() -> ProbeResult:
                 f"see {_AGENT365_CLI_DOTNET_DOCS})"
             ),
         )
-    output = safe_run([binary, "--list-runtimes"], timeout=15.0) or ""
-    runtime = parse_dotnet_list_runtimes(output)
+    output = safe_run([binary, "--list-runtimes"], timeout=15.0)
     data: dict[str, Any] = {"path": binary}
+    if output is None:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; `dotnet --list-runtimes` failed or timed out "
+                f"(cannot confirm .NET ≥ {min_label})"
+            ),
+            data,
+        )
+    scan = parse_dotnet_list_runtimes(output)
+    runtime = scan.best_stable
+    if runtime is None and scan.best_prerelease is not None:
+        pre_label = ".".join(str(part) for part in scan.best_prerelease)
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; only prerelease Microsoft.NETCore.App "
+                f"{pre_label} found (GA runtime ≥ {min_label} required)"
+            ),
+            {**data, "version": pre_label, "prerelease": True},
+        )
     if runtime is None:
         return ProbeResult(
             "dotnet_runtime",

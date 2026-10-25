@@ -105,7 +105,7 @@ Record exact CLI builds used on the #90 walk in the closing report.
 | macOS keychain round-trip | No (skipped on GitHub macOS runners) | Operator Mac with unlocked keychain |
 | Linux libsecret round-trip | Yes when Secret Service available (`keychain-linux`) | — |
 | Wheel/sdist build + fresh install smoke | Yes | — |
-| Hermes source tags (import + adapter contract) | Yes (pinned refs) | Full gateway multiplex traffic |
+| Hermes source tags (AST-check + adapter contract files) | Yes (pinned refs) | Full gateway multiplex traffic |
 | Teams / Copilot UI round-trips | — | #90 feature matrix |
 
 ## Related references

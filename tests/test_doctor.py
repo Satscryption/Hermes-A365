@@ -133,19 +133,44 @@ class TestProbeAzCli:
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
             patch(
                 "hermes_a365.doctor.safe_run",
-                side_effect=['{"azure-cli": "2.67.0"}', None],
+                return_value='{"azure-cli": "2.67.0"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", None),
             ),
         ):
             r = probe_az_cli()
         assert r.state == "warn"
         assert "az login" in r.detail
+        assert "2.67.0" in r.detail
+
+    def test_signed_out_includes_old_version(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value='{"azure-cli": "2.54.0"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", None),
+            ),
+        ):
+            r = probe_az_cli()
+        assert "2.54.0" in r.detail
+        assert "≥ 2.55.0" in r.detail
 
     def test_present_and_signed_in_ok(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
             patch(
                 "hermes_a365.doctor.safe_run",
-                side_effect=['{"azure-cli": "2.67.0"}', "alice@contoso.com\n"],
+                return_value='{"azure-cli": "2.67.0"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", "alice@contoso.com"),
             ),
         ):
             r = probe_az_cli()
@@ -158,7 +183,11 @@ class TestProbeAzCli:
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
             patch(
                 "hermes_a365.doctor.safe_run",
-                side_effect=['{"azure-cli": "2.54.0"}', "alice@contoso.com\n"],
+                return_value='{"azure-cli": "2.54.0"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", "alice@contoso.com"),
             ),
         ):
             r = probe_az_cli()
@@ -166,20 +195,52 @@ class TestProbeAzCli:
         assert "2.54.0" in r.detail
         assert "≥ 2.55.0" in r.detail
 
+    def test_account_show_timeout_warns(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value='{"azure-cli": "2.67.0"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("timeout", None),
+            ),
+        ):
+            r = probe_az_cli()
+        assert r.state == "warn"
+        assert "timed out" in r.detail
+
 
 class TestParseAzCliVersion:
     @pytest.mark.parametrize(
         ("text", "expected"),
         [
             ('{"azure-cli": "2.67.0", "azure-cli-core": "2.67.0"}', (2, 67, 0)),
-            ("azure-cli    2.55.0", (2, 55, 0)),
+            ('{"azure-cli": "2.55.0"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0-rc1"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0b1"}', (2, 55, 0)),
             ("not json", None),
+            ("azure-cli    2.55.0", None),
         ],
     )
     def test_extracts_semver(
         self, text: str, expected: tuple[int, int, int] | None
     ) -> None:
         assert parse_az_cli_version(text) == expected
+
+    def test_extension_first_document_uses_azure_cli_only(self) -> None:
+        text = json.dumps(
+            {
+                "extensions": {"devcenter": "8.0.0"},
+                "azure-cli": "2.54.0",
+            }
+        )
+        assert parse_az_cli_version(text) == (2, 54, 0)
+
+    def test_trailing_stderr_warning_line(self) -> None:
+        text = '{"azure-cli": "2.67.0"}\nWARNING: credential protection is on\n'
+        assert parse_az_cli_version(text) == (2, 67, 0)
 
 
 # ---------------------------------------------------------------------------
@@ -215,15 +276,37 @@ class TestProbeDotnetRuntime:
         assert "6.0.29" in r.detail
         assert "≥ 8.0" in r.detail
 
+    def test_list_runtimes_failure_warns(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/dotnet"),
+            patch("hermes_a365.doctor.safe_run", return_value=None),
+        ):
+            r = probe_dotnet_runtime()
+        assert r.state == "warn"
+        assert "failed or timed out" in r.detail
+
+    def test_preview_only_runtime_warns(self) -> None:
+        runtimes = "Microsoft.NETCore.App 8.0.0-preview.7 [/usr/share/dotnet/shared]\n"
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/dotnet"),
+            patch("hermes_a365.doctor.safe_run", return_value=runtimes),
+        ):
+            r = probe_dotnet_runtime()
+        assert r.state == "warn"
+        assert "prerelease" in r.detail
+
 
 class TestParseDotnetListRuntimes:
-    def test_picks_highest_netcore_app(self) -> None:
+    def test_picks_highest_stable_netcore_app(self) -> None:
         text = (
             "Microsoft.AspNetCore.App 8.0.10 [/x]\n"
             "Microsoft.NETCore.App 8.0.10 [/x]\n"
             "Microsoft.NETCore.App 10.0.0 [/x]\n"
+            "Microsoft.NETCore.App 8.0.0-rc.1 [/x]\n"
         )
-        assert parse_dotnet_list_runtimes(text) == (10, 0, 0)
+        scan = parse_dotnet_list_runtimes(text)
+        assert scan.best_stable == (10, 0, 0)
+        assert scan.best_prerelease == (8, 0, 0)
 
 
 # ---------------------------------------------------------------------------

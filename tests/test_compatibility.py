@@ -142,6 +142,7 @@ def test_runtime_guard_quiet_on_supported_host(monkeypatch: pytest.MonkeyPatch) 
 
     from hermes_a365._runtime_guard import emit_runtime_warnings
 
+    monkeypatch.setattr("hermes_a365.compatibility.sys.platform", "linux")
     monkeypatch.setattr("hermes_a365._runtime_guard.sys.platform", "linux")
     monkeypatch.setattr(
         "hermes_a365._runtime_guard.python_version_tuple",
