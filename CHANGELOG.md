@@ -8,11 +8,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- **#148 — Hermes v0.22.5 core resolve without PyJWT override.** Upstream
-  `PyJWT[crypto]==2.15.1` on Python 3.14 satisfies `pyjwt[crypto]>=2.15.0`.
-  `overrides.txt` now carries only `fastapi>=0.143` for environments that also
-  install `hermes-agent[web]`. CI Hermes source smoke includes tag `v0.22.5`.
-  Refs [#148](https://github.com/Satscryption/Hermes-A365/issues/148).
+- **#148 — Hermes v0.22.3+ PyJWT pin and install docs.** Upstream
+  `PyJWT[crypto]==2.15.1` on Python 3.14 (from tag v0.22.3; v0.22.5
+  recommended) satisfies `pyjwt[crypto]>=2.15.0` so core combined resolve on
+  Hermes >= v0.22.3 can omit `overrides.txt`. `overrides.txt` keeps
+  `pyjwt[crypto]>=2.15.0` (required for older supported refs; no-op on
+  v0.22.3+) and `fastapi>=0.143` for `hermes-agent[web]`. Document PyPI has no
+  0.22.x release. CI Hermes source smoke includes tag `v0.22.5`. Refs
+  [#148](https://github.com/Satscryption/Hermes-A365/issues/148).
 
 ## [0.9.3] — 2026-10-25
 

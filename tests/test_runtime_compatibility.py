@@ -1,9 +1,8 @@
-"""#148: keep the bridge security floors; document Hermes resolve + FastAPI override.
+"""#148: keep the bridge security floors; document Hermes resolve + overrides.
 
 v0.9.0+ ships against Python 3.14 without lowering pyjwt[crypto]>=2.15.0.
-Hermes v0.22.5 pins PyJWT 2.15.1, so core combined resolve no longer needs a
-PyJWT override. The optional hermes-agent[web] extra still pins fastapi==0.133.1;
-overrides.txt keeps only the FastAPI replacement for that extra.
+Hermes >= v0.22.3 pins PyJWT 2.15.1; overrides.txt keeps pyjwt for older refs
+and fastapi for hermes-agent[web].
 """
 
 from __future__ import annotations
@@ -34,7 +33,10 @@ FLOORS = {
     "idna": (Version("3.14"), Version("3.15")),
 }
 
-OVERRIDE_LINES = "fastapi>=0.143\n"
+OVERRIDE_LINES = (
+    "pyjwt[crypto]>=2.15.0\n"
+    "fastapi>=0.143\n"
+)
 
 
 def _project() -> dict:
@@ -81,6 +83,7 @@ def test_ci_matrix_covers_supported_python_versions() -> None:
     assert "wheel-smoke" in text
     assert "hermes-source-smoke" in text
     assert "pytest --timeout=300" in text
+    assert "v2026.6.19" in text
     assert "v0.22.5" in text
 
 
@@ -92,14 +95,16 @@ def test_v1_compatibility_matrix_is_linked_from_readme() -> None:
     assert "Windows" in matrix and "Not supported" in matrix
 
 
-def test_override_file_keeps_the_fastapi_floor_for_web_extra() -> None:
+def test_override_file_keeps_the_security_floors() -> None:
     text = OVERRIDES.read_text()
     assert text == OVERRIDE_LINES
+    pyjwt = SpecifierSet(">=2.15.0")
     fastapi_override = SpecifierSet(">=0.143")
+    assert Version("2.13.0") not in pyjwt
+    assert Version("2.15.0") in pyjwt
     assert Version("0.133.1") not in fastapi_override
     assert Version("0.141.1") not in fastapi_override
     assert Version("0.143.0") in fastapi_override
-    assert "pyjwt" not in text.lower()
 
 
 def test_bridge_and_dev_keep_security_floors() -> None:
@@ -135,31 +140,38 @@ def test_handoff_contract_pin_names_hermes_session_apis() -> None:
     assert "does not call `reopen_session`" in text
 
 
-def test_docs_show_fastapi_override_and_hermes_v0225_pyjwt() -> None:
-    for path in (NOTE, README, CHANGELOG):
+def test_docs_show_override_install_and_hermes_v0225_pyjwt() -> None:
+    for path in (NOTE, CHANGELOG):
         text = path.read_text()
         assert "pyjwt[crypto]>=2.15.0" in text
         assert "fastapi>=0.143" in text
         assert "uv pip install --override overrides.txt" in text
         assert "fastapi==0.133.1" in text
         assert "134394" in text
-        assert "refs #148" in text
+        assert "refs #148" in text or "Refs [#148]" in text
     note = NOTE.read_text()
     assert "do not lower" in note.lower()
     assert "--no-deps" in note
     assert "v0.22.5" in note
+    assert "v0.22.3" in note
     assert "PyJWT[crypto]==2.15.1" in note
     assert "hermes-agent[web]" in note
+    assert "no-op" in note.lower() or "no-op" in note
+    assert "fastapi==0.162.0" in note
+    assert "0.19.0" in note
     readme = README.read_text()
+    assert "pyjwt[crypto]>=2.15.0" in readme
+    assert "fastapi>=0.143" in readme
+    assert "uv pip install --override overrides.txt" in readme
     assert "PyJWT[crypto]==2.15.1" in readme or "v0.22.5" in readme
+    assert "no 0.22.x release" in readme.lower() or "has no 0.22" in readme.lower()
+    assert "refs" in readme.lower() and "#148" in readme
     for chunk in note.split("."):
         if "134394" not in chunk or "fastapi" not in chunk.lower():
             continue
         lowered = chunk.lower()
         assert (
-            "is not the fastapi exit" in lowered
-            or "does not mention fastapi" in lowered
-            or "closed" in lowered
+            "is not the fastapi exit" in lowered or "does not mention fastapi" in lowered
         ), chunk
 
 
