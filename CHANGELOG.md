@@ -6,6 +6,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.3] — 2026-10-25
+
+v1 compatibility matrix (#126), Copilot Chat turn-buffer streaming and delivery
+(#181–#186, #182, #199, #202–#204), Teams walk092 fixes (#183–#185), Copilot
+publish-state hardening (#171, #196), and inbound activity gating (#180, #188).
+Ships merged work on `main@f612899` (2026-10-25) via PRs #195–#201, #207, and
+#210.
+
 ### Added
 
 - **#126 — v1 compatibility matrix.** Published
@@ -33,6 +41,27 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   feedback map and logged without invoking the agent.
 
 ### Fixed
+
+- **Copilot Chat turn-buffer delivery as one informative stream final (#182,
+  #199).** Post the merged non-personal answer as ``streamType=final`` on the
+  informative keep-alive stream (or a flush-time opener), with plain
+  ``send_reply`` only for rejected opens, user cancel, cap expiry, and overflow
+  chunks. Per-turn ``answer_delivery`` records classify POST outcomes
+  (``NOT_SENT``, ``MAY_HAVE_LANDED``, ``DELIVERED``, ``ALREADY_COMPLETED``,
+  ``REJECTED_TERMINAL``, ``RETRYABLE``); honour ``Retry-After`` and bounded
+  backoff within the 120s stream cap, then plain-post once. Latch
+  ``may_have_landed`` on ambiguous finals to block duplicate delivery; reuse
+  abandoned keep-alive stream ids until cap expiry instead of opening a second
+  informative stream.
+
+- **Copilot Chat informative commentary (#202, #203, #204).** Route
+  commentary and tool progress to informative streams live; defer placeholder
+  informative openers without a stream id so Copilot never shows an empty agent
+  bubble (#202/#204). Finalize orphan keep-alive stream ids on turn-buffer drop
+  and disconnect (#203). Flush undisplayed commentary to informative before
+  answer finals; on unmarked turns merge commentary into the final body instead
+  of posting it on the keep-alive wire. Skip scheduling the keep-alive sleeper
+  when ``FIRST_SEC>=3600`` (manual-emit test mode).
 
 - **Copilot Chat turn-buffer keep-alive (Refs #181).** Once-per-turn INFO stage
   lines (`scheduled`, `first_interval`, mint, activity POST, `turn_end`) reach
