@@ -5,7 +5,7 @@ verified 2026-05-04) and checks the prereqs the real CLI's own
 ``setup requirements`` enforces:
 
 - ``a365`` CLI present + version
-- ``az`` CLI present + signed in
+- ``az`` CLI present, version ≥ matrix floor, signed in
 - ``pwsh`` (PowerShell 7+) on PATH — the CLI shells out to it for some
   steps; missing pwsh causes ``setup requirements`` to fail.
 - Custom Entra client app (named ``Agent 365 CLI`` by Microsoft's
@@ -188,6 +188,32 @@ def probe_a365_cli() -> ProbeResult:
     )
 
 
+def parse_az_cli_version(text: str) -> tuple[int, int, int] | None:
+    """Extract Azure CLI ``major.minor.patch`` from ``az version -o json`` output."""
+
+    trimmed = text.strip()
+    if trimmed.startswith("{"):
+        try:
+            payload = json.loads(trimmed)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            for key in ("azure-cli", "azure_cli"):
+                value = payload.get(key)
+                if isinstance(value, str):
+                    parsed = _semver_triple_from_text(value)
+                    if parsed is not None:
+                        return parsed
+    return _semver_triple_from_text(text)
+
+
+def _semver_triple_from_text(text: str) -> tuple[int, int, int] | None:
+    match = re.search(r"\b(\d+)\.(\d+)\.(\d+)\b", text)
+    if not match:
+        return None
+    return int(match.group(1)), int(match.group(2)), int(match.group(3))
+
+
 def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
     """Extract the first semantic ``major.minor.patch`` from CLI output.
 
@@ -211,19 +237,48 @@ def probe_az_cli() -> ProbeResult:
             _ERROR,
             f"az not found on PATH (install Azure CLI ≥ {min_label})",
         )
+    version_text = safe_run([binary, "version", "-o", "json"], timeout=10.0) or ""
+    parsed_version = parse_az_cli_version(version_text)
+    data: dict[str, Any] = {"path": binary}
+    if parsed_version is not None:
+        data["version"] = ".".join(str(part) for part in parsed_version)
+
     signed_in = safe_run([binary, "account", "show", "--query", "user.name", "-o", "tsv"])
     if not signed_in:
         return ProbeResult(
             "az_cli",
             _WARN,
             f"present at {binary}; not signed in (run `az login`)",
-            {"path": binary},
+            data,
+        )
+    user = signed_in.strip()
+    data["user"] = user
+    if parsed_version is None:
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            (
+                f"present and signed in as {user} ({binary}); "
+                "could not parse `az version` output"
+            ),
+            data,
+        )
+    if parsed_version < AZURE_CLI_MIN:
+        version_label = data["version"]
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            (
+                f"present and signed in as {user} ({binary}); "
+                f"version {version_label} is below the required ≥ {min_label}"
+            ),
+            data,
         )
     return ProbeResult(
         "az_cli",
         _OK,
-        f"present and signed in as {signed_in.strip()} ({binary})",
-        {"path": binary, "user": signed_in.strip()},
+        f"present and signed in as {user} ({binary}); version {data['version']}",
+        data,
     )
 
 

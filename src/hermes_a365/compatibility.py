@@ -42,6 +42,13 @@ HERMES_SESSION_PIN_RESOLUTION_MIN_SEMVER: Final[tuple[int, int, int]] = (0, 21, 
 # Integration smoke refs in CI (git tags on NousResearch/hermes-agent).
 HERMES_INTEGRATION_SMOKE_REFS: Final[tuple[str, ...]] = ("v2026.6.19", "v0.22.5")
 
+# Plugin-floor evidence (calendar tag only; below the multiplex floor).
+HERMES_PLUGIN_FLOOR_SMOKE_REF: Final[str] = (
+    f"v{HERMES_PLUGIN_MIN_CALENDAR[0]}."
+    f"{HERMES_PLUGIN_MIN_CALENDAR[1]}."
+    f"{HERMES_PLUGIN_MIN_CALENDAR[2]}"
+)
+
 # --- Microsoft operator tooling (live-verified snapshots; doctor warns on drift) -
 
 AZURE_CLI_MIN: Final[tuple[int, int, int]] = (2, 55, 0)

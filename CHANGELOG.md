@@ -8,6 +8,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **#209 — plugin-floor Hermes smoke and Azure CLI version probe.** CI
+  Hermes source smoke adds tag `v2026.4.30` (plugin floor / Hermes Agent
+  0.12.0). `doctor` parses `az version` and **warns** when a signed-in
+  `az` is below `≥ 2.55.0` instead of reporting ok. Refs
+  [#209](https://github.com/Satscryption/Hermes-A365/issues/209).
+
 - **#148 — Hermes v0.22.3+ PyJWT pin and install docs.** Upstream
   `PyJWT[crypto]==2.15.1` on Python 3.14 (from tag v0.22.3; v0.22.5
   recommended) satisfies `pyjwt[crypto]>=2.15.0` so core combined resolve on

@@ -11,6 +11,7 @@ import pytest
 from hermes_a365.compatibility import (
     HERMES_INTEGRATION_SMOKE_REFS,
     HERMES_MULTIPLEX_MIN_CALENDAR,
+    HERMES_PLUGIN_FLOOR_SMOKE_REF,
     HERMES_PLUGIN_MIN_CALENDAR,
     REQUIRES_PYTHON,
     format_calendar_tag,
@@ -58,6 +59,13 @@ def test_hermes_floors() -> None:
     assert not hermes_meets_plugin_floor(parse_hermes_version_text("v2026.4.8"))
     assert hermes_meets_multiplex_floor(parse_hermes_version_text("v2026.6.19"))
     assert not hermes_meets_multiplex_floor(parse_hermes_version_text("v2026.6.5"))
+
+
+def test_plugin_floor_smoke_ref_matches_calendar_floor() -> None:
+    expected = format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR)
+    assert HERMES_PLUGIN_FLOOR_SMOKE_REF == expected
+    workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "test.yml").read_text()
+    assert HERMES_PLUGIN_FLOOR_SMOKE_REF in workflow
 
 
 def test_integration_smoke_refs_meet_floors() -> None:

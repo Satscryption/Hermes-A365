@@ -19,6 +19,7 @@ from hermes_a365.doctor import (
     ProbeResult,
     overall_to_exit_code,
     parse_a365_cli_version,
+    parse_az_cli_version,
     probe_a365_cli,
     probe_agent_instance_allowlist,
     probe_az_cli,
@@ -128,7 +129,10 @@ class TestProbeAzCli:
     def test_present_but_signed_out_warns(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("hermes_a365.doctor.safe_run", return_value=None),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                side_effect=['{"azure-cli": "2.67.0"}', None],
+            ),
         ):
             r = probe_az_cli()
         assert r.state == "warn"
@@ -137,11 +141,43 @@ class TestProbeAzCli:
     def test_present_and_signed_in_ok(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
-            patch("hermes_a365.doctor.safe_run", return_value="alice@contoso.com\n"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                side_effect=['{"azure-cli": "2.67.0"}', "alice@contoso.com\n"],
+            ),
         ):
             r = probe_az_cli()
         assert r.state == "ok"
         assert "alice@contoso.com" in r.detail
+        assert "2.67.0" in r.detail
+
+    def test_signed_in_below_floor_warns(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                side_effect=['{"azure-cli": "2.54.0"}', "alice@contoso.com\n"],
+            ),
+        ):
+            r = probe_az_cli()
+        assert r.state == "warn"
+        assert "2.54.0" in r.detail
+        assert "≥ 2.55.0" in r.detail
+
+
+class TestParseAzCliVersion:
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ('{"azure-cli": "2.67.0", "azure-cli-core": "2.67.0"}', (2, 67, 0)),
+            ("azure-cli    2.55.0", (2, 55, 0)),
+            ("not json", None),
+        ],
+    )
+    def test_extracts_semver(
+        self, text: str, expected: tuple[int, int, int] | None
+    ) -> None:
+        assert parse_az_cli_version(text) == expected
 
 
 # ---------------------------------------------------------------------------
