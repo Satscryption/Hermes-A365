@@ -471,34 +471,39 @@ plugin loader auto-discovers `agent365` via the
 `hermes_agent.plugins` entry point. No `~/.hermes/plugins/agent365/`
 directory required:
 
-0.9.0 ships against Hermes' Python 3.14 runtime. This package still requires
-`pyjwt[crypto]>=2.15.0` and does not lower that floor. Hermes `main` pins
-`PyJWT[crypto]==2.13.0` on Python 3.14.
-[NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
-tracks the PyJWT pin only and is not the FastAPI exit. Separately,
-`hermes-agent[web]` pins `fastapi==0.133.1`, which does not meet
-`fastapi>=0.141.1`. refs #148
+0.9.0+ ships against Hermes' Python 3.14 runtime. This package still requires
+`pyjwt[crypto]>=2.15.0` and does not lower that floor. Hermes **v0.22.5**
+pins `PyJWT[crypto]==2.15.1` on Python 3.14, so core combined resolve no
+longer needs a PyJWT override
+([NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
+closed 2026-10-22). Separately, `hermes-agent[web]` still pins
+`fastapi==0.133.1`, which does not meet `fastapi>=0.141.1`. refs #148
 ([#148](https://github.com/Satscryption/Hermes-A365/issues/148)).
-Until each of those pins moves, install into the Hermes 3.14 environment
-with the override file in this repo:
 
-```text
-pyjwt[crypto]>=2.15.0
-fastapi>=0.143
-```
-
-`fastapi>=0.143` is what replaces the `hermes-agent[web]` pin. It is above
-this package's `fastapi>=0.141.1` floor. The PyJWT line is always required
-on the Hermes 3.14 runtime.
+Install into the Hermes 3.14 environment (core line, no `[web]` extra):
 
 ```bash
-uv pip install --override overrides.txt 'hermes-a365[bridge]'
+uv pip install 'hermes-a365[bridge]'
 hermes plugins list                # `agent365` should appear with source=entrypoint
 ```
 
-Point that command at the Hermes environment when it is not already
+When `hermes-agent[web]` or `[all]` is also installed, use the FastAPI
+override file in this repo:
+
+```text
+fastapi>=0.143
+```
+
+```bash
+uv pip install --override overrides.txt 'hermes-a365[bridge]'
+```
+
+`fastapi>=0.143` replaces the `hermes-agent[web]` pin and stays above this
+package's `fastapi>=0.141.1` floor.
+
+Point install commands at the Hermes environment when it is not already
 selected, for example
-`uv pip install --python ~/.hermes/hermes-agent/venv/bin/python --override overrides.txt 'hermes-a365[bridge]'`.
+`uv pip install --python ~/.hermes/hermes-agent/venv/bin/python 'hermes-a365[bridge]'`.
 Details: [`references/hermes-runtime-compatibility.md`](references/hermes-runtime-compatibility.md).
 
 **Local development** (from a checkout):

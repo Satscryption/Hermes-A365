@@ -6,6 +6,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **#148 — Hermes v0.22.5 core resolve without PyJWT override.** Upstream
+  `PyJWT[crypto]==2.15.1` on Python 3.14 satisfies `pyjwt[crypto]>=2.15.0`.
+  `overrides.txt` now carries only `fastapi>=0.143` for environments that also
+  install `hermes-agent[web]`. CI Hermes source smoke includes tag `v0.22.5`.
+  Refs [#148](https://github.com/Satscryption/Hermes-A365/issues/148).
+
 ## [0.9.3] — 2026-10-25
 
 v1 compatibility matrix (#126), Copilot Chat turn-buffer fixes (#181, #182, #186, #199, #202–#204), Teams walk092 fixes (#183–#185), Copilot publish-state hardening (#171, #196, #200), and inbound activity gating (#180, #188).
