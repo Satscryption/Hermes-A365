@@ -349,20 +349,34 @@ def test_live_0_9_2_section_still_parses() -> None:
 
 
 def test_live_0_9_3_section_still_parses() -> None:
-    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.3")
+    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    heading, body = mod.changelog_section(text, "0.9.3")
 
-    assert notes.version == "0.9.3"
-    assert notes.title == (
+    assert heading.startswith("## [0.9.3] \u2014 2026-10-25")
+    assert mod.release_title("v0.9.3", body) == (
         "v0.9.3 \u2014 v1 compatibility matrix (#126), Copilot Chat turn-buffer fixes "
         "(#181, #182, #186, #199, #202\u2013#204), Teams walk092 fixes (#183\u2013#185), "
         "Copilot publish-state hardening (#171, #196, #200), and inbound activity "
         "gating (#180, #188)."
     )
+    assert "main@f612899" in body
+    assert "#210" in body
+
+
+def test_live_0_9_4_section_still_parses() -> None:
+    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.4")
+
+    assert notes.version == "0.9.4"
+    assert notes.title == (
+        "v0.9.4 \u2014 Inbound webhook JWKS fail-closed and admission hardening "
+        "(#86, #205, #206), Hermes v0.22.3+ PyJWT pin (#148), and v1 matrix review "
+        "follow-ups (#209)."
+    )
     assert len(notes.title) <= mod.TITLE_LIMIT
-    assert "main@f612899" in notes.body
-    assert "2026-10-24" in notes.body
-    assert "#126" in notes.body
-    assert "#210" in notes.body
+    assert "main@50e32745" in notes.body
+    assert "2026-10-26" in notes.body
+    assert "#208" in notes.body
+    assert "#221" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:
