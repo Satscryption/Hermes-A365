@@ -8,6 +8,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+<<<<<<< HEAD
 - **#217 — Copilot Chat first-turn live render.** Path B turn-buffer delivery
   waits until the informative stream reaches a configurable minimum age before
   posting the answer final on the first turn after ``membersAdded`` / install
@@ -16,6 +17,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   ``HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC``,
   ``HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC``. Refs
   [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
+=======
+- **#190 — Outbound 429 / Retry-After handling.** Shared
+  ``hermes_a365.outbound_retry`` helper retries Bot Framework replies,
+  proactive sends, typing (at most one retry), stream edits (honouring
+  ``Retry-After`` when present), OneDrive upload PUTs, and
+  ``activity_bridge.send_reply`` on HTTP 429 and transient 5xx with
+  capped ``Retry-After``, jittered exponential backoff, and bounded
+  attempts. Refs
+  [#190](https://github.com/Satscryption/Hermes-A365/issues/190).
+>>>>>>> 0f8b3a9 (Add shared outbound retry helper for 429 and Retry-After (#190))
 
 - **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a
   live ``--directline-probe`` conversation starts, **WARN** only when the

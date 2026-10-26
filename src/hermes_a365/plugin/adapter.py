@@ -1103,17 +1103,9 @@ def _keepalive_user_cancelled(detail: str) -> bool:
 
 
 def _parse_retry_after_seconds(resp: Any) -> float:
-    headers = getattr(resp, "headers", None)
-    if headers is None:
-        return 0.0
-    raw = headers.get("Retry-After") or headers.get("retry-after")
-    if raw is None:
-        return 0.0
-    try:
-        parsed = max(0.0, float(raw))
-    except (TypeError, ValueError):
-        return 0.0
-    return min(parsed, _ANSWER_FINAL_RETRY_AFTER_CAP_SEC)
+    from hermes_a365.outbound_retry import parse_retry_after_seconds
+
+    return parse_retry_after_seconds(resp, cap_sec=_ANSWER_FINAL_RETRY_AFTER_CAP_SEC)
 
 
 def _keepalive_stream_age_sec(stream: dict[str, Any]) -> float:
@@ -9471,14 +9463,24 @@ class Agent365Adapter(BasePlatformAdapter):
         service_url = target["service_url"].rstrip("/")
         url = _conversations_activities_url(service_url, target["conversation_id"])
 
+        from hermes_a365.outbound_retry import (
+            OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+            request_with_outbound_retry,
+        )
+
         try:
             resp = await self._await_outbound(
                 chat_id,
-                client.post(
-                    url,
-                    json=activity,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=15.0,
+                request_with_outbound_retry(
+                    lambda: client.post(
+                        url,
+                        json=activity,
+                        headers={"Authorization": f"Bearer {token}"},
+                        timeout=15.0,
+                    ),
+                    call_site="adapter._send_proactive",
+                    max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+                    allow_transient_5xx=True,
                 ),
             )
         except Exception as e:
@@ -9711,13 +9713,26 @@ class Agent365Adapter(BasePlatformAdapter):
             generation, client
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
             raise RuntimeError("agent365: adapter lifecycle changed")
-        resp = await self._await_outbound(
-            chat_id,
-            client.post(
+        from hermes_a365.outbound_retry import (
+            OUTBOUND_TYPING_MAX_ATTEMPTS,
+            request_with_outbound_retry,
+        )
+
+        async def _post_once() -> Any:
+            return await client.post(
                 url,
                 json=activity,
                 headers={"Authorization": f"Bearer {token}"},
                 timeout=15.0,
+            )
+
+        resp = await self._await_outbound(
+            chat_id,
+            request_with_outbound_retry(
+                _post_once,
+                call_site="adapter._post_activity",
+                max_attempts=OUTBOUND_TYPING_MAX_ATTEMPTS,
+                allow_transient_5xx=False,
             ),
         )
         if not self._lifecycle_is_current(
@@ -10439,18 +10454,28 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
             await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
+        from hermes_a365.outbound_retry import (
+            OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+            request_with_outbound_retry,
+        )
+
         try:
             put_resp = await self._await_outbound(
                 pending_chat_id,
-                client.put(
-                    upload_url,
-                    content=data,
-                    headers={
-                        "Content-Length": str(size),
-                        "Content-Range": f"bytes 0-{size - 1}/{size}",
-                    },
-                    timeout=60.0,
-                    follow_redirects=False,
+                request_with_outbound_retry(
+                    lambda: client.put(
+                        upload_url,
+                        content=data,
+                        headers={
+                            "Content-Length": str(size),
+                            "Content-Range": f"bytes 0-{size - 1}/{size}",
+                        },
+                        timeout=60.0,
+                        follow_redirects=False,
+                    ),
+                    call_site="adapter._handle_file_consent.upload",
+                    max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+                    allow_transient_5xx=True,
                 ),
             )
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
@@ -11892,11 +11917,24 @@ class Agent365Adapter(BasePlatformAdapter):
         generation: int,
         chat_generation: int,
         client: Any,
+        *,
+        delay_sec: float | None = None,
     ) -> bool:
         """Wait out the streaming gap. False when the turn has moved on."""
-        await asyncio.sleep(_STREAMING_MIN_GAP_SEC)
+        wait = _STREAMING_MIN_GAP_SEC if delay_sec is None else max(0.0, delay_sec)
+        await asyncio.sleep(wait)
         return self._lifecycle_is_current(generation, client) and self._chat_lifecycle_is_current(
             chat_id, chat_generation
+        )
+
+    @staticmethod
+    def _stream_edit_retry_delay_sec(attempt: int, response: Any | None) -> float:
+        from hermes_a365.outbound_retry import compute_backoff_delay_sec
+
+        return compute_backoff_delay_sec(
+            attempt,
+            response,
+            fallback_delay_sec=_STREAMING_MIN_GAP_SEC,
         )
 
     @staticmethod
@@ -12471,8 +12509,20 @@ class Agent365Adapter(BasePlatformAdapter):
                     attempt=attempt,
                 )
                 if self._stream_edit_should_retry(state, http_status=None, attempt=attempt):
+                    delay = self._stream_edit_retry_delay_sec(attempt, None)
+                    logger.info(
+                        "outbound send retry: call_site=adapter.edit_message "
+                        "status=none attempt=%s/%s delay_sec=%.2f",
+                        attempt,
+                        _STREAM_EDIT_MAX_ATTEMPTS,
+                        delay,
+                    )
                     if not await self._pause_before_stream_retry(
-                        chat_id, generation, chat_generation, client
+                        chat_id,
+                        generation,
+                        chat_generation,
+                        client,
+                        delay_sec=delay,
                     ):
                         self._drop_stream_state_if_unopened(chat_id, message_id, state)
                         return SendResult(
@@ -12632,8 +12682,21 @@ class Agent365Adapter(BasePlatformAdapter):
             # is the pre-#64 failure mode, and a plain send while this
             # stream is open is suppressed.
             if self._stream_edit_should_retry(state, http_status=resp.status_code, attempt=attempt):
+                delay = self._stream_edit_retry_delay_sec(attempt, resp)
+                logger.info(
+                    "outbound send retry: call_site=adapter.edit_message "
+                    "status=%s attempt=%s/%s delay_sec=%.2f",
+                    resp.status_code,
+                    attempt,
+                    _STREAM_EDIT_MAX_ATTEMPTS,
+                    delay,
+                )
                 if not await self._pause_before_stream_retry(
-                    chat_id, generation, chat_generation, client
+                    chat_id,
+                    generation,
+                    chat_generation,
+                    client,
+                    delay_sec=delay,
                 ):
                     self._drop_stream_state_if_unopened(chat_id, message_id, state)
                     return SendResult(

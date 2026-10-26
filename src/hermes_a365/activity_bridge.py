@@ -3436,12 +3436,25 @@ async def send_reply(
         bf_cache=bf_cache,
         validated_path=validated_path,
     )
-    try:
-        response = await client.post(
+    from hermes_a365.outbound_retry import (
+        OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+        request_with_outbound_retry,
+    )
+
+    async def _post_once() -> Any:
+        return await client.post(
             url,
             json=reply,
             headers={"Authorization": f"Bearer {token}"},
             timeout=15.0,
+        )
+
+    try:
+        response = await request_with_outbound_retry(
+            _post_once,
+            call_site="activity_bridge.send_reply",
+            max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+            allow_transient_5xx=True,
         )
     except Exception as exc:
         # Only this POST can have stored the activity. A ReadTimeout or
