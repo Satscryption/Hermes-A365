@@ -13,12 +13,15 @@ import test_agent365_plugin as plugin_tests
 from hermes_a365.outbound_retry import (
     OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
     OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+    OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
+    OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC,
     OUTBOUND_RETRY_AFTER_CAP_SEC,
     OUTBOUND_TYPING_MAX_ATTEMPTS,
     OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC,
     clamp_retry_delay_sec,
     compute_backoff_delay_sec,
     is_retryable_http_status,
+    outbound_attempt_timeout_sec,
     parse_retry_after_seconds,
     request_with_outbound_retry,
 )
@@ -81,6 +84,42 @@ class TestClampRetryDelay:
 
     def test_zero_budget_returns_zero(self) -> None:
         assert clamp_retry_delay_sec(2.0, 0.0) == 0.0
+
+
+class TestOutboundAttemptTimeout:
+    def test_onedrive_cap_exceeds_bf_default_when_budget_allows(self) -> None:
+        import time
+
+        deadline = time.monotonic() + 120.0
+        bf_timeout = outbound_attempt_timeout_sec(
+            deadline,
+            attempt_cap_sec=OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
+        )
+        upload_timeout = outbound_attempt_timeout_sec(
+            deadline,
+            attempt_cap_sec=OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC,
+        )
+        assert bf_timeout == OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC
+        assert upload_timeout == OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC
+        assert upload_timeout > bf_timeout
+
+    @pytest.mark.asyncio
+    async def test_upload_retry_uses_sixty_second_attempt_cap(self) -> None:
+        seen: list[float] = []
+
+        async def send_once(timeout_sec: float) -> MagicMock:
+            seen.append(timeout_sec)
+            return _resp(201)
+
+        await request_with_outbound_retry(
+            send_once,
+            call_site="test.upload",
+            max_attempts=1,
+            total_budget_sec=120.0,
+            attempt_timeout_sec=OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC,
+        )
+        assert seen == [OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC]
+        assert seen[0] > OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC
 
 
 @pytest.mark.asyncio

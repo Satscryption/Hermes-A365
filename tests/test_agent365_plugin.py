@@ -21802,6 +21802,7 @@ class TestOutboundFiles:
             self._consent_activity(action="decline"), validated_path="A"
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         assert a._http_client.put.await_count == 0
         assert a._http_client.delete.await_count == 1
         assert send_reply.await_count == 1
@@ -21834,6 +21835,7 @@ class TestOutboundFiles:
         for _ in range(2):
             resp = await a._handle_file_consent(activity, validated_path="A")
             assert resp.status == 200
+            await a._drain_file_consent_upload_tasks()
         assert send_reply.await_count == 1
 
     @pytest.mark.asyncio
@@ -21858,6 +21860,7 @@ class TestOutboundFiles:
             self._consent_activity(action="decline"), validated_path="A"
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         assert send_reply.await_count == 1
 
     @pytest.mark.asyncio

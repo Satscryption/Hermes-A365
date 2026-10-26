@@ -2618,6 +2618,7 @@ async def _post_token_request(
 ) -> dict[str, Any]:
     """POST a form-encoded token request and return the parsed JSON."""
     from hermes_a365.outbound_retry import (
+        OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
         can_start_outbound_attempt,
         outbound_attempt_timeout_sec,
     )
@@ -2628,7 +2629,7 @@ async def _post_token_request(
         TENANT_TOKEN_URL_TEMPLATE.format(tenant_id=tenant_id),
         data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=outbound_attempt_timeout_sec(deadline),
+        timeout=outbound_attempt_timeout_sec(deadline, attempt_cap_sec=OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC),
     )
     resp.raise_for_status()
     return resp.json()
@@ -2928,6 +2929,7 @@ async def acquire_bf_s2s_token(
             "httpx not installed; run `uv sync --extra bridge`"
         )
     from hermes_a365.outbound_retry import (
+        OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
         can_start_outbound_attempt,
         outbound_attempt_timeout_sec,
     )
@@ -2943,7 +2945,7 @@ async def acquire_bf_s2s_token(
             "client_secret": blueprint_client_secret,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=outbound_attempt_timeout_sec(deadline),
+        timeout=outbound_attempt_timeout_sec(deadline, attempt_cap_sec=OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC),
     )
     if resp.status_code >= 400:
         # Try to surface AADSTS82001 specifically — it has a fix that
@@ -3254,6 +3256,12 @@ async def forward_to_webhook(
         max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
         deadline=deadline,
     )
+    if resp is None:
+        logger.warning(
+            "activity_bridge.forward_to_webhook: outbound ack budget exhausted "
+            "before operator webhook completed"
+        )
+        raise RuntimeError("operator webhook ack budget exhausted")
     resp.raise_for_status()
     if not resp.content:
         return {}

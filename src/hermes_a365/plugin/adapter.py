@@ -82,7 +82,7 @@ import stat
 import threading
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from datetime import datetime
 from pathlib import Path
@@ -2070,6 +2070,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
         self._file_consent_upload_tasks: set[asyncio.Task[Any]] = set()
+        self._slash_confirm_followup_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
         # Decline notices are sent once per consentId (BF invoke retries).
         self._file_consent_decline_notified: set[str] = set()
         self._card_capabilities: dict[str, dict[str, Any]] = {}
@@ -3579,6 +3580,7 @@ class Agent365Adapter(BasePlatformAdapter):
             await self._drain_chat_teardowns()
             await self._drain_persist_tasks()
             await self._drain_coalesced_reply_tasks(current)
+            await self._drain_file_consent_upload_tasks()
         finally:
             await self._finish_disconnect(http_client, current)
 
@@ -7090,14 +7092,29 @@ class Agent365Adapter(BasePlatformAdapter):
             opening,
             final,
         )
+        from hermes_a365.outbound_retry import (
+            OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
+            OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+            request_with_outbound_retry,
+        )
+
+        async def _post_once(timeout_sec: float) -> Any:
+            return await client.post(
+                url,
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=timeout_sec,
+            )
+
         try:
             resp = await self._await_outbound(
                 chat_id,
-                client.post(
-                    url,
-                    json=activity,
-                    headers={"Authorization": f"Bearer {token}"},
-                    timeout=15.0,
+                request_with_outbound_retry(
+                    _post_once,
+                    call_site="adapter._post_keepalive_activity",
+                    max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+                    allow_transient_5xx=False,
+                    total_budget_sec=OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
                 ),
             )
         except asyncio.CancelledError:
@@ -7108,6 +7125,12 @@ class Agent365Adapter(BasePlatformAdapter):
             return self._keepalive_post_exception(chat_id, exc, opening=opening)
         except Exception as exc:
             return self._keepalive_post_exception(chat_id, exc, opening=opening)
+        if resp is None:
+            return self._keepalive_post_exception(
+                chat_id,
+                RuntimeError("keep-alive POST outbound budget exhausted"),
+                opening=opening,
+            )
         status_after = getattr(resp, "status_code", None)
         logger.debug(
             "agent365 turn buffer keep-alive post: chat_id=%s stage=after_activity_post "
@@ -9719,6 +9742,7 @@ class Agent365Adapter(BasePlatformAdapter):
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
             raise RuntimeError("agent365: adapter lifecycle changed")
         from hermes_a365.outbound_retry import (
+            OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
             OUTBOUND_TYPING_MAX_ATTEMPTS,
             request_with_outbound_retry,
         )
@@ -9738,12 +9762,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 call_site="adapter._post_activity",
                 max_attempts=OUTBOUND_TYPING_MAX_ATTEMPTS,
                 allow_transient_5xx=False,
+                total_budget_sec=OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
             ),
         )
         if not self._lifecycle_is_current(
             generation, client
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
             raise RuntimeError("agent365: adapter lifecycle changed")
+        if resp is None:
+            raise RuntimeError("agent365 _post_activity: outbound budget exhausted")
         if resp.status_code >= 300:
             raise RuntimeError(f"agent365 _post_activity: {resp.status_code} {resp.text[:200]}")
 
@@ -10316,6 +10343,57 @@ class Agent365Adapter(BasePlatformAdapter):
             metadata=metadata,
         )
 
+    def _post_ack_outbound_task_done(self, task: asyncio.Task[Any]) -> None:
+        self._file_consent_upload_tasks.discard(task)
+        if task.cancelled():
+            logger.debug("agent365 post-ack outbound task cancelled")
+            return
+        exc = task.exception()
+        if exc is not None:
+            logger.warning("agent365 post-ack outbound task failed: %s", exc)
+
+    def _spawn_file_consent_post_ack(
+        self, coro: Awaitable[None], *, label: str
+    ) -> None:
+        async def _runner() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning("agent365 fileConsent post-ack %s failed: %s", label, exc)
+
+        task = asyncio.create_task(_runner())
+        self._file_consent_upload_tasks.add(task)
+        task.add_done_callback(self._post_ack_outbound_task_done)
+
+    def _spawn_slash_confirm_followup(self, conv_id: str, coro: Awaitable[None]) -> None:
+        async def _runner() -> None:
+            try:
+                await coro
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error("agent365 slash_confirm follow-up post failed: %s", exc)
+
+        task = asyncio.create_task(_runner())
+        self._file_consent_upload_tasks.add(task)
+        if conv_id:
+            self._slash_confirm_followup_tasks_by_chat.setdefault(conv_id, set()).add(task)
+
+        def _done(t: asyncio.Task[Any]) -> None:
+            self._post_ack_outbound_task_done(t)
+            if not conv_id:
+                return
+            tasks = self._slash_confirm_followup_tasks_by_chat.get(conv_id)
+            if tasks is None:
+                return
+            tasks.discard(t)
+            if not tasks:
+                self._slash_confirm_followup_tasks_by_chat.pop(conv_id, None)
+
+        task.add_done_callback(_done)
+
     async def _handle_file_consent(
         self, activity: dict[str, Any], *, validated_path: str | None
     ) -> invoke.InvokeResponse:
@@ -10340,20 +10418,27 @@ class Agent365Adapter(BasePlatformAdapter):
         async def _remove_consent_card() -> None:
             await self._remove_file_consent_card(activity, chat_id=consent_chat_id)
 
+        def _schedule_remove_consent_card(*, label: str) -> None:
+            self._spawn_file_consent_post_ack(_remove_consent_card(), label=label)
+
         if action != "accept":
             logger.info("agent365 fileConsent action=%s consent=%s", action, consent_id[:8])
-            await _remove_consent_card()
-            if (
+            send_decline_notice = (
                 action == "decline"
                 and consent_id
                 and consent_id not in self._file_consent_decline_notified
-            ):
+            )
+            if send_decline_notice:
                 self._file_consent_decline_notified.add(consent_id)
-                await self._send_file_consent_decline_notice(
-                    activity, validated_path=validated_path
-                )
-            # Benign ack: nothing to render. HTTP 200 + JSON {} (#132).
-            # Null is rejected by Teams ("Payload cannot be null").
+
+            async def _decline_followup() -> None:
+                await _remove_consent_card()
+                if send_decline_notice:
+                    await self._send_file_consent_decline_notice(
+                        activity, validated_path=validated_path
+                    )
+
+            self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
             return invoke.empty_invoke_ack()
         if pending is None:
             # Consent we don't know about — restart dropped the in-memory map, a
@@ -10361,7 +10446,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # retry lands here after the pending entry was popped; the wire is
             # the same empty ack serve returns for a deduped invoke (#132).
             logger.warning("agent365 fileConsent accept for unknown consent=%s", consent_id[:8])
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="unknown_consent")
             return invoke.empty_invoke_ack()
 
         pending_chat_id = str(pending.get("conversation_id") or "")
@@ -10374,7 +10459,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent accept for expired lifecycle consent=%s",
                 consent_id[:8],
             )
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="expired_lifecycle")
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F2 / R2-P1 — capability model, not authenticated-user check.
@@ -10398,13 +10483,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent accept context mismatch consent=%s",
                 consent_id[:8],
             )
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="context_mismatch")
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F3: a consent the user answers long after the offer is stale.
         if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
             logger.warning("agent365 fileConsent accept expired consent=%s", consent_id[:8])
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="consent_expired")
             return invoke.InvokeResponse(status=200, body={})
 
         upload_info = value.get("uploadInfo")
@@ -10420,7 +10505,7 @@ class Agent365Adapter(BasePlatformAdapter):
             or not self._chat_lifecycle_is_current(pending_chat_id, chat_generation)
         ):
             logger.warning("agent365 fileConsent accept missing uploadUrl/client")
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="missing_upload_url")
             return invoke.InvokeResponse(status=200, body={})
         # R2-P1: only POST bytes to an EXACT configured tenant SharePoint/OneDrive
         # host — a `*.sharepoint.com` suffix would accept an attacker-owned tenant's
@@ -10431,14 +10516,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 "allowlist; refused (%.60s)",
                 upload_url,
             )
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="upload_host_denied")
             return invoke.InvokeResponse(status=200, body={})
 
         # Re-validate the path (may have been removed since the offer).
         safe_path = self.validate_media_delivery_path(str(pending.get("path") or ""))
         if safe_path is None:
             logger.warning("agent365 fileConsent accept: file no longer available")
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="file_unavailable")
             return invoke.InvokeResponse(status=200, body={})
         # R2-P2: read the current bytes ONCE through a bounded descriptor, then
         # verify size + SHA-256 against the offer. A file that grew past the cap,
@@ -10448,16 +10533,16 @@ class Agent365Adapter(BasePlatformAdapter):
         data = _read_file_bounded(safe_path, _MAX_OUTBOUND_FILE_BYTES)
         if data is None:
             logger.warning("agent365 fileConsent: file unreadable or over-cap at accept")
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="file_unreadable")
             return invoke.InvokeResponse(status=200, body={})
         size = len(data)
         if size <= 0 or size != int(pending.get("size") or -1):
             logger.warning("agent365 fileConsent: size changed since offer")
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="size_mismatch")
             return invoke.InvokeResponse(status=200, body={})
         if hashlib.sha256(data).hexdigest() != pending.get("sha256"):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
-            await _remove_consent_card()
+            _schedule_remove_consent_card(label="digest_mismatch")
             return invoke.InvokeResponse(status=200, body={})
         upload_task = asyncio.create_task(
             self._run_file_consent_upload_accept(
@@ -10477,7 +10562,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         )
         self._file_consent_upload_tasks.add(upload_task)
-        upload_task.add_done_callback(self._file_consent_upload_tasks.discard)
+        upload_task.add_done_callback(self._post_ack_outbound_task_done)
         return invoke.InvokeResponse(status=200, body={})
 
     async def _drain_file_consent_upload_tasks(self) -> None:
@@ -10510,6 +10595,7 @@ class Agent365Adapter(BasePlatformAdapter):
         from hermes_a365.outbound_retry import (
             OUTBOUND_DEFAULT_MAX_ATTEMPTS,
             OUTBOUND_FILE_UPLOAD_TOTAL_BUDGET_SEC,
+            OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC,
             request_with_outbound_retry,
         )
 
@@ -10521,7 +10607,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     "Content-Length": str(size),
                     "Content-Range": f"bytes 0-{size - 1}/{size}",
                 },
-                timeout=min(60.0, timeout_sec),
+                timeout=timeout_sec,
                 follow_redirects=False,
             )
 
@@ -10534,6 +10620,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
                     allow_transient_5xx=True,
                     total_budget_sec=OUTBOUND_FILE_UPLOAD_TOTAL_BUDGET_SEC,
+                    attempt_timeout_sec=OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC,
                 ),
             )
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
@@ -11829,19 +11916,13 @@ class Agent365Adapter(BasePlatformAdapter):
                     follow_text = str(follow)
 
                     async def _post_slash_confirm_follow() -> None:
-                        try:
-                            await self._send_reply_activity(
-                                inbound=activity,
-                                content=follow_text,
-                                log_context="slash_confirm",
-                            )
-                        except Exception as post_err:
-                            logger.error(
-                                "agent365 slash_confirm follow-up post failed: %s",
-                                post_err,
-                            )
+                        await self._send_reply_activity(
+                            inbound=activity,
+                            content=follow_text,
+                            log_context="slash_confirm",
+                        )
 
-                    asyncio.create_task(_post_slash_confirm_follow())
+                    self._spawn_slash_confirm_followup(conv_id, _post_slash_confirm_follow())
             elif kind == _CARD_KIND_CLARIFY:
                 clarify_id = str(resolver.get("clarify_id") or "")
                 if choice == "__other__":
@@ -13504,6 +13585,9 @@ class Agent365Adapter(BasePlatformAdapter):
             if owner_chat_id == chat_id
         }
         for task in self._card_action_tasks_by_chat.get(chat_id, set()):
+            if task is not current:
+                task_chats[task] = chat_id
+        for task in self._slash_confirm_followup_tasks_by_chat.get(chat_id, set()):
             if task is not current:
                 task_chats[task] = chat_id
         for key, task in self._coalesced_status_tasks.items():

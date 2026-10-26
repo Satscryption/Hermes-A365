@@ -39,6 +39,7 @@ OUTBOUND_RETRY_AFTER_CAP_SEC = 30.0
 OUTBOUND_DEFAULT_MAX_ATTEMPTS = 4
 OUTBOUND_TYPING_MAX_ATTEMPTS = 2  # initial try + at most one retry
 OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC = 15.0
+OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC = 60.0
 # Post-ack adapter sends (send, proactive, typing, turn-buffer).
 OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC = 25.0
 # Serve ``/api/messages``: absolute end-to-end budget under BF ~15s activity timeout.
@@ -62,12 +63,13 @@ def remaining_until_deadline(deadline: float | None) -> float | None:
 
 def outbound_attempt_timeout_sec(
     deadline: float | None,
-    default: float = OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
+    *,
+    attempt_cap_sec: float = OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
 ) -> float:
     remaining = remaining_until_deadline(deadline)
     if remaining is None:
-        return default
-    return min(default, remaining)
+        return attempt_cap_sec
+    return min(attempt_cap_sec, remaining)
 
 
 def can_start_outbound_attempt(deadline: float | None) -> bool:
@@ -189,6 +191,7 @@ async def request_with_outbound_retry(
     fallback_delay_sec: float = 0.0,
     deadline: float | None = None,
     total_budget_sec: float | None = None,
+    attempt_timeout_sec: float | None = None,
     sleep: SleepFn | None = None,
     before_retry: Callable[[int, int, Any], Awaitable[bool]] | None = None,
 ) -> Any:
@@ -197,6 +200,11 @@ async def request_with_outbound_retry(
         raise ValueError("max_attempts must be >= 1")
     sleep_fn: SleepFn = sleep if sleep is not None else asyncio.sleep
     eff_deadline = resolve_outbound_deadline(deadline=deadline, total_budget_sec=total_budget_sec)
+    attempt_cap = (
+        attempt_timeout_sec
+        if attempt_timeout_sec is not None
+        else OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC
+    )
 
     last_response: Any = None
     for attempt in range(1, max_attempts + 1):
@@ -206,7 +214,10 @@ async def request_with_outbound_retry(
                 call_site,
             )
             break
-        timeout = outbound_attempt_timeout_sec(eff_deadline)
+        timeout = outbound_attempt_timeout_sec(
+            eff_deadline,
+            attempt_cap_sec=attempt_cap,
+        )
         if eff_deadline is not None and timeout <= 0.0:
             logger.warning(
                 "outbound send gave up: call_site=%s reason=ack_budget_before_attempt",
