@@ -220,9 +220,37 @@ class TestRequestWithOutboundRetry:
         assert result.status_code == 201
         assert calls == 2
 
-    async def test_total_sleep_stays_within_budget(
+    async def test_fail_fast_when_sleep_would_leave_no_attempt_budget(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        clock = 0.0
+
+        def monotonic() -> float:
+            return clock
+
+        sleeps: list[float] = []
+
+        async def sleep(delay: float) -> None:
+            nonlocal clock
+            sleeps.append(delay)
+            clock += delay
+
+        monkeypatch.setattr("hermes_a365.outbound_retry.time.monotonic", monotonic)
+
+        async def send_once(_timeout_sec: float) -> MagicMock:
+            return _resp(429, "1")
+
+        result = await request_with_outbound_retry(
+            send_once,
+            call_site="test",
+            max_attempts=4,
+            total_budget_sec=1.5,
+            sleep=sleep,
+        )
+        assert result.status_code == 429
+        assert sleeps == []
+
+    async def test_total_sleep_stays_within_budget(self, monkeypatch: pytest.MonkeyPatch) -> None:
         sleeps: list[float] = []
         clock = 0.0
 
@@ -406,9 +434,7 @@ class TestCallSiteFamilies:
         assert post_mock.await_count == OUTBOUND_TYPING_MAX_ATTEMPTS
         assert sleep_mock.await_count == 1
 
-    async def test_proactive_send_does_not_retry_503(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_proactive_send_does_not_retry_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from hermes_a365.plugin.conversations import ConversationRef
 
         a = plugin_tests._make_adapter(monkeypatch)
@@ -535,7 +561,6 @@ class TestStreamEditRetryCap:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import asyncio
-
 
         a = plugin_tests._make_adapter(monkeypatch)
         state = {"opened_ts": 100.0}

@@ -786,9 +786,7 @@ def _segment_stores_informative_update_flag(
     )
 
 
-def _segment_is_marked_answer_from_send(
-    reply_to: Any | None, metadata: Any | None
-) -> bool:
+def _segment_is_marked_answer_from_send(reply_to: Any | None, metadata: Any | None) -> bool:
     if reply_to is not None and str(reply_to):
         return True
     if not isinstance(metadata, dict):
@@ -865,9 +863,7 @@ def _classify_turn_buffer_segment_kind(
     return "answer"
 
 
-def _turn_segments_for_seq(
-    segments: list[dict[str, Any]], turn_seq: str
-) -> list[dict[str, Any]]:
+def _turn_segments_for_seq(segments: list[dict[str, Any]], turn_seq: str) -> list[dict[str, Any]]:
     return [
         segment
         for segment in segments
@@ -1882,9 +1878,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._inbound_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
         self._pre_auth_tasks: set[asyncio.Task[Any]] = set()
         self._pre_auth_tasks_by_chat: dict[str, set[asyncio.Task[Any]]] = {}
-        self._pre_auth_semaphore = asyncio.Semaphore(
-            _import_bridge().MAX_PRE_AUTH_IN_FLIGHT_POSTS
-        )
+        self._pre_auth_semaphore = asyncio.Semaphore(_import_bridge().MAX_PRE_AUTH_IN_FLIGHT_POSTS)
 
         # Slice 19s — per-stream state for BF streaming-response protocol.
         # Keyed on the Hermes-side ``message_id`` (the activity id returned
@@ -5564,9 +5558,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stream_id = str(state.get("stream_id") or "")
             inbound = state.get("inbound")
             if isinstance(inbound, dict):
-                self._schedule_stale_keepalive_opener_teardown(
-                    chat_id, stream_id, inbound=inbound
-                )
+                self._schedule_stale_keepalive_opener_teardown(chat_id, stream_id, inbound=inbound)
             return
         live = self._turn_buffers.get(chat_id)
         if live is buf:
@@ -5825,9 +5817,7 @@ class Agent365Adapter(BasePlatformAdapter):
         turn = self._keepalive_turn(buf)
         if turn is None:
             return
-        await self._teardown_orphan_stream(
-            chat_id, stream_id, inbound=turn.get("inbound")
-        )
+        await self._teardown_orphan_stream(chat_id, stream_id, inbound=turn.get("inbound"))
 
     async def _teardown_orphan_keepalive(
         self, chat_id: str, *, inbound: dict[str, Any] | None = None
@@ -5970,9 +5960,7 @@ class Agent365Adapter(BasePlatformAdapter):
             text = str(segment.get("text") or "").strip()
             if not text:
                 continue
-            if segment.get("informative_displayed") and not _is_hermes_tool_progress_segment(
-                text
-            ):
+            if segment.get("informative_displayed") and not _is_hermes_tool_progress_segment(text):
                 continue
             pending.append(segment)
         return pending
@@ -5986,9 +5974,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _unmarked_final_merge_active(
-        self, buf: dict[str, Any], turn: dict[str, Any]
-    ) -> bool:
+    def _unmarked_final_merge_active(self, buf: dict[str, Any], turn: dict[str, Any]) -> bool:
         if self._turn_has_marked_answer(buf, turn):
             return False
         seq = str(turn.get("seq") or "")
@@ -6011,9 +5997,8 @@ class Agent365Adapter(BasePlatformAdapter):
         for segment in buf.get("segments") or []:
             if str(segment.get("turn") or "") != seq:
                 continue
-            if (
-                self._turn_buffer_segment_kind(segment) == "commentary"
-                and segment.get("informative_update")
+            if self._turn_buffer_segment_kind(segment) == "commentary" and segment.get(
+                "informative_update"
             ):
                 return True
         return False
@@ -6088,9 +6073,7 @@ class Agent365Adapter(BasePlatformAdapter):
         return pending
 
     @staticmethod
-    def _resolve_keepalive_drop_epoch(
-        state: dict[str, Any], buf: dict[str, Any]
-    ) -> int:
+    def _resolve_keepalive_drop_epoch(state: dict[str, Any], buf: dict[str, Any]) -> int:
         raw = state.get("drop_epoch")
         if raw is not None:
             return int(raw)
@@ -6202,9 +6185,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
         return _TURN_BUFFER_KEEPALIVE_TEXT
 
-    def _marked_answer_preview_for_turn(
-        self, buf: dict[str, Any], turn: dict[str, Any]
-    ) -> str:
+    def _marked_answer_preview_for_turn(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
         seq = str(turn.get("seq") or "")
         parts: list[str] = []
         for segment in buf.get("segments") or []:
@@ -6282,9 +6263,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         return
                     if buf.get("answer_final_in_progress"):
                         return
-                    await self._flush_undisplayed_informative_for_turn_locked(
-                        chat_id, buf, turn
-                    )
+                    await self._flush_undisplayed_informative_for_turn_locked(chat_id, buf, turn)
             else:
                 await self._post_informative_under_lock(chat_id, allow_restart=False)
         except asyncio.CancelledError:
@@ -6560,8 +6539,7 @@ class Agent365Adapter(BasePlatformAdapter):
         stream_id = str(stream.get("stream_id") or "")
         if stream_id and _keepalive_stream_age_sec(stream) >= _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC:
             logger.warning(
-                "agent365 turn buffer keep-alive stream cap expired: "
-                "chat_id=%s stream_id=%s",
+                "agent365 turn buffer keep-alive stream cap expired: chat_id=%s stream_id=%s",
                 chat_id,
                 stream_id,
             )
@@ -6586,11 +6564,7 @@ class Agent365Adapter(BasePlatformAdapter):
         """Return True when a 403 should be followed by one new sequence."""
         if self._turn_buffers.get(chat_id) is not buf:
             return False
-        if (
-            not for_answer
-            and buf.get("answer_final_in_progress")
-            and not during_answer_delivery
-        ):
+        if not for_answer and buf.get("answer_final_in_progress") and not during_answer_delivery:
             return False
         if not for_answer and not self._turn_buffer_keepalive_needed(chat_id):
             return False
@@ -6616,11 +6590,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return False
             stream = self._keepalive_state(buf)
             stream_id = str(stream.get("stream_id") or "")
-        if (
-            not for_answer
-            and buf.get("answer_final_in_progress")
-            and not during_answer_delivery
-        ):
+        if not for_answer and buf.get("answer_final_in_progress") and not during_answer_delivery:
             return False
         turn = turn_for_text if isinstance(turn_for_text, dict) else self._keepalive_turn(buf)
         if turn is None:
@@ -6630,17 +6600,13 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return False
         sequence = 1 if not stream_id else int(stream.get("sequence") or 0) + 1
-        answer_preview = (
-            self._marked_answer_preview_for_turn(buf, turn) if for_answer else None
-        )
+        answer_preview = self._marked_answer_preview_for_turn(buf, turn) if for_answer else None
         informative_text = (
             str(text_override).strip()
             if text_override is not None
             else self._informative_text_for_turn(buf, turn, answer_preview=answer_preview)
         )
-        if not for_answer and self._text_merged_into_unmarked_final(
-            buf, turn, informative_text
-        ):
+        if not for_answer and self._text_merged_into_unmarked_final(buf, turn, informative_text):
             if text_override is not None:
                 logger.debug(
                     "agent365 turn buffer keep-alive skip post: chat_id=%s "
@@ -6748,9 +6714,7 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             self._remember_keepalive(chat_id, buf, {})
             if _STREAMING_MIN_GAP_SEC > 0:
-                await self._sleep_turn_buffer_locked(
-                    chat_id, buf, _STREAMING_MIN_GAP_SEC
-                )
+                await self._sleep_turn_buffer_locked(chat_id, buf, _STREAMING_MIN_GAP_SEC)
             if self._turn_buffers.get(chat_id) is not buf:
                 return False
             return await self._post_informative_locked(
@@ -6758,9 +6722,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 buf,
                 allow_restart=False,
                 turn_for_text=turn,
-                text_override=text_override
-                if text_override is not None
-                else informative_text,
+                text_override=text_override if text_override is not None else informative_text,
                 during_answer_delivery=during_answer_delivery,
                 segment=segment,
             )
@@ -6847,6 +6809,26 @@ class Agent365Adapter(BasePlatformAdapter):
         stream["last_emit_mono"] = time.monotonic()
         self._remember_keepalive(chat_id, buf, stream)
 
+    def _keepalive_stream_outbound_deadline(
+        self,
+        chat_id: str,
+        *,
+        shared_deadline: float | None = None,
+    ) -> float:
+        """Absolute monotonic deadline for keep-alive POST retries.
+
+        Uses the post-ack 25s adapter budget. Answer-final delivery passes
+        ``shared_deadline`` (stream soft cap at loop start) so outer 429
+        retries do not reset the budget and no POST starts after the cap.
+        """
+        from hermes_a365.outbound_retry import OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+
+        now = time.monotonic()
+        deadline = now + OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+        if shared_deadline is not None:
+            deadline = min(deadline, shared_deadline)
+        return deadline
+
     async def _post_keepalive_activity(
         self,
         chat_id: str,
@@ -6858,6 +6840,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for_teardown: bool = False,
         text: str | None = None,
         message_chrome: bool = False,
+        outbound_deadline: float | None = None,
     ) -> _KeepalivePost:
         """POST one informative update or a stream final.
 
@@ -6886,9 +6869,7 @@ class Agent365Adapter(BasePlatformAdapter):
             and Agent365Adapter._is_placeholder_informative_text(body_text)
         ):
             buf = self._turn_buffers.get(chat_id)
-            allowed = Agent365Adapter._placeholder_informative_opener_allowed(
-                buf, for_answer=False
-            )
+            allowed = Agent365Adapter._placeholder_informative_opener_allowed(buf, for_answer=False)
             if isinstance(buf, dict) and not allowed:
                 logger.debug(
                     "agent365 turn buffer keep-alive skip post: chat_id=%s "
@@ -7093,7 +7074,6 @@ class Agent365Adapter(BasePlatformAdapter):
             final,
         )
         from hermes_a365.outbound_retry import (
-            OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
             OUTBOUND_DEFAULT_MAX_ATTEMPTS,
             request_with_outbound_retry,
         )
@@ -7106,6 +7086,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 timeout=timeout_sec,
             )
 
+        eff_deadline = self._keepalive_stream_outbound_deadline(
+            chat_id,
+            shared_deadline=outbound_deadline,
+        )
         try:
             resp = await self._await_outbound(
                 chat_id,
@@ -7114,7 +7098,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     call_site="adapter._post_keepalive_activity",
                     max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
                     allow_transient_5xx=False,
-                    total_budget_sec=OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
+                    deadline=eff_deadline,
                 ),
             )
         except asyncio.CancelledError:
@@ -7390,6 +7374,7 @@ class Agent365Adapter(BasePlatformAdapter):
         stream_id: str,
         content: str,
         count_attempt: bool,
+        outbound_deadline: float | None = None,
     ) -> _KeepalivePost:
         if count_attempt:
             record["answer_final_attempts"] = int(record.get("answer_final_attempts") or 0) + 1
@@ -7403,6 +7388,7 @@ class Agent365Adapter(BasePlatformAdapter):
             final=True,
             text=content,
             message_chrome=True,
+            outbound_deadline=outbound_deadline,
         )
 
     def _finish_delivered(
@@ -7558,9 +7544,7 @@ class Agent365Adapter(BasePlatformAdapter):
             buf = self._turn_buffers.get(chat_id)
             if not isinstance(buf, dict):
                 return ("retry", None)
-            await self._ensure_copilot_min_stream_age_before_final_locked(
-                chat_id, buf, turn
-            )
+            await self._ensure_copilot_min_stream_age_before_final_locked(chat_id, buf, turn)
             buf = self._turn_buffers.get(chat_id)
             if not isinstance(buf, dict):
                 return ("retry", None)
@@ -7581,6 +7565,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     return ("blocked", None)
                 return ("retry", None)
 
+            answer_outbound_deadline = time.monotonic() + _answer_final_cap_remaining_sec(stream)
             result = await self._post_answer_final(
                 chat_id,
                 buf,
@@ -7589,6 +7574,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 stream_id=stream_id,
                 content=content,
                 count_attempt=True,
+                outbound_deadline=answer_outbound_deadline,
             )
             while self._turn_buffers.get(chat_id) is buf:
                 classified = _classify_answer_final_post(result)
@@ -7603,6 +7589,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             stream_id=stream_id,
                             content=content,
                             count_attempt=False,
+                            outbound_deadline=answer_outbound_deadline,
                         )
                         continue
                     record["state"] = "DEFERRED"
@@ -7634,6 +7621,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             stream_id=stream_id,
                             content=content,
                             count_attempt=False,
+                            outbound_deadline=answer_outbound_deadline,
                         )
                         continue
                     record["state"] = "DEFERRED"
@@ -7734,6 +7722,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             stream_id=stream_id,
                             content=content,
                             count_attempt=True,
+                            outbound_deadline=answer_outbound_deadline,
                         )
                         continue
                     if record.get("may_have_landed"):
@@ -7804,10 +7793,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if turn.get("copilot_post_member_added"):
             return True
-        return (
-            self._turn_buffer_turn_duration_sec(turn)
-            <= _COPILOT_SHORT_TURN_MAX_DURATION_SEC
-        )
+        return self._turn_buffer_turn_duration_sec(turn) <= _COPILOT_SHORT_TURN_MAX_DURATION_SEC
 
     async def _ensure_copilot_min_stream_age_before_final_locked(
         self,
@@ -8066,9 +8052,8 @@ class Agent365Adapter(BasePlatformAdapter):
             for segment in segments:
                 if str(segment.get("turn") or "") != turn_seq:
                     continue
-                if (
-                    str(segment.get("kind") or "") == "commentary"
-                    and segment.get("informative_update")
+                if str(segment.get("kind") or "") == "commentary" and segment.get(
+                    "informative_update"
                 ):
                     segment["defer_to_final_merge"] = True
         if _is_hermes_interim_thread_send(metadata, own):
@@ -8191,14 +8176,8 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> tuple[list[dict[str, str]], list[str]]:
         """Split one turn's segments into answer bodies vs informative-only drops."""
         _reconcile_turn_buffer_kinds_for_flush(segments, seq)
-        turn_segments = [
-            segment
-            for segment in segments
-            if str(segment.get("turn") or "") == seq
-        ]
-        has_marked_answer = any(
-            _segment_is_marked_answer(segment) for segment in turn_segments
-        )
+        turn_segments = [segment for segment in segments if str(segment.get("turn") or "") == seq]
+        has_marked_answer = any(_segment_is_marked_answer(segment) for segment in turn_segments)
         kept: list[dict[str, str]] = []
         drop_ids: list[str] = []
         for segment in turn_segments:
@@ -10352,9 +10331,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if exc is not None:
             logger.warning("agent365 post-ack outbound task failed: %s", exc)
 
-    def _spawn_file_consent_post_ack(
-        self, coro: Awaitable[None], *, label: str
-    ) -> None:
+    def _spawn_file_consent_post_ack(self, coro: Awaitable[None], *, label: str) -> None:
         async def _runner() -> None:
             try:
                 await coro
@@ -12078,16 +12055,10 @@ class Agent365Adapter(BasePlatformAdapter):
     @staticmethod
     def _personal_stream_cap_remaining_sec(state: dict[str, Any], loop_now: float) -> float:
         opened_ts = state.get("opened_ts")
-        age = (
-            loop_now - float(opened_ts)
-            if isinstance(opened_ts, (int, float))
-            else 0.0
-        )
+        age = loop_now - float(opened_ts) if isinstance(opened_ts, (int, float)) else 0.0
         return max(
             0.0,
-            _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-            - _ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
-            - age,
+            _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC - _ANSWER_FINAL_STREAM_CAP_MARGIN_SEC - age,
         )
 
     def _stream_edit_retry_delay_sec(

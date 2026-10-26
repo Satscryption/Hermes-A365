@@ -376,7 +376,8 @@ def acquire_token(
             "scope": f"{resource}/.default",
         }
     ).encode("utf-8")
-    req = urllib.request.Request(        url,
+    req = urllib.request.Request(
+        url,
         data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
         method="POST",
@@ -474,9 +475,7 @@ def probe_generated_config(
     secret_source = "generated config"
     provider_state = None
     if not secret:
-        provider_state = resolve_secret_state(
-            tenant_id, str(blueprint_id), existing=""
-        )
+        provider_state = resolve_secret_state(tenant_id, str(blueprint_id), existing="")
         secret = provider_state.value
         if secret:
             secret_source = f"provider: {provider_state.provider}"
@@ -512,8 +511,7 @@ def probe_generated_config(
             ProbeResult(
                 "generated_config",
                 _ERROR,
-                f"{path} has no agentBlueprintClientSecret {provider_note}; "
-                f"{remediation}",
+                f"{path} has no agentBlueprintClientSecret {provider_note}; {remediation}",
             ),
             {},
         )
@@ -523,10 +521,7 @@ def probe_generated_config(
     except OSError:
         mode = -1
     extra: dict[str, Any] = {"blueprint_id": blueprint_id, "mode": f"0{mode:o}"}
-    detail = (
-        f"appId={blueprint_id[:8]}… secret loaded from {secret_source} "
-        f"(mode=0{mode:o})"
-    )
+    detail = f"appId={blueprint_id[:8]}… secret loaded from {secret_source} (mode=0{mode:o})"
     return (
         ProbeResult("generated_config", _OK, detail, extra),
         {"blueprint_id": blueprint_id, "client_secret": secret},
@@ -577,9 +572,7 @@ def probe_bf_secret(agent_env: dict[str, str]) -> ProbeResult:
     )
 
 
-def probe_token_acquisition(
-    *, tenant_id: str, client_id: str, client_secret: str
-) -> ProbeResult:
+def probe_token_acquisition(*, tenant_id: str, client_id: str, client_secret: str) -> ProbeResult:
     """Probe ``client_credentials`` against Microsoft Graph.
 
     Slice 19e (issue #6) reframed this probe. Originally it targeted
@@ -674,9 +667,7 @@ def probe_fmi_exchange(
             {"aadsts": aadsts},
         )
     except urllib.error.URLError as e:
-        return ProbeResult(
-            "fmi_exchange", _ERROR, f"network error: {e.reason}"
-        )
+        return ProbeResult("fmi_exchange", _ERROR, f"network error: {e.reason}")
     return ProbeResult(
         "fmi_exchange",
         _OK,
@@ -697,9 +688,7 @@ def probe_reachability(hosts: tuple[str, ...] = _REACHABILITY_HOSTS) -> ProbeRes
             f"unreachable: {unreachable}",
             {"unreachable": unreachable},
         )
-    return ProbeResult(
-        "reachability", _OK, f"reachable: {list(hosts)}", {"hosts": list(hosts)}
-    )
+    return ProbeResult("reachability", _OK, f"reachable: {list(hosts)}", {"hosts": list(hosts)})
 
 
 def probe_otlp_endpoint(endpoint: str | None) -> ProbeResult:
@@ -712,9 +701,7 @@ def probe_otlp_endpoint(endpoint: str | None) -> ProbeResult:
     try:
         host = urlparse(endpoint).hostname
     except ValueError:
-        return ProbeResult(
-            "otlp_endpoint", _ERROR, f"unparseable URL: {endpoint!r}"
-        )
+        return ProbeResult("otlp_endpoint", _ERROR, f"unparseable URL: {endpoint!r}")
     if not host:
         return ProbeResult(
             "otlp_endpoint",
@@ -775,11 +762,7 @@ def run_verify(
     )
     report.probes.append(gen_probe)
 
-    if (
-        local_probe.state == _ERROR
-        or bf_probe.state == _ERROR
-        or gen_probe.state == _ERROR
-    ):
+    if local_probe.state == _ERROR or bf_probe.state == _ERROR or gen_probe.state == _ERROR:
         # Skip auth probes — we don't have what we need.
         for name in ("token_acquisition", "fmi_exchange"):
             report.probes.append(
@@ -838,14 +821,17 @@ def render_human(report: VerifyReport) -> str:
 
 
 def render_json(report: VerifyReport) -> str:
-    return json.dumps(
-        {
-            "slug": report.slug,
-            "overall": report.overall,
-            "probes": [asdict(p) for p in report.probes],
-        },
-        indent=2,
-    ) + "\n"
+    return (
+        json.dumps(
+            {
+                "slug": report.slug,
+                "overall": report.overall,
+                "probes": [asdict(p) for p in report.probes],
+            },
+            indent=2,
+        )
+        + "\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -876,18 +862,14 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         type=Path,
         help="path to a365.generated.config.json (default: ./a365.generated.config.json)",
     )
-    verify.add_argument(
-        "--human", action="store_true", help="formatted output (default: JSON)"
-    )
+    verify.add_argument("--human", action="store_true", help="formatted output (default: JSON)")
 
     serve = sub.add_parser(
         "serve",
         help="long-running BF webhook adapter (slice 19b)",
     )
     serve.add_argument("--slug", required=True)
-    serve.add_argument(
-        "--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)"
-    )
+    serve.add_argument("--host", default="127.0.0.1", help="bind address (default: 127.0.0.1)")
     serve.add_argument("--port", type=int, default=3978)
     serve.add_argument(
         "--webhook",
@@ -1013,9 +995,7 @@ BF_S2S_SCOPE = "https://api.botframework.com/.default"
 # Other A365 services may join this list as we observe them.
 DEFAULT_INBOUND_AZP_ALLOWLIST: tuple[str, ...] = (APX_PRODUCTION_APP_ID,)
 USER_FIC_GRANT = "user_fic"
-JWT_BEARER_ASSERTION_TYPE = (
-    "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
-)
+JWT_BEARER_ASSERTION_TYPE = "urn:ietf:params:oauth:client-assertion-type:jwt-bearer"
 
 logger = logging.getLogger(__name__)
 
@@ -1173,9 +1153,7 @@ def _activity_requires_end_user_auth(activity: dict[str, Any]) -> bool:
     sender = activity.get("from")
     sender_id = str(sender.get("id") or "") if isinstance(sender, dict) else ""
     return not (
-        activity_type == "event"
-        or sender_id == "system"
-        or sender_id.startswith("no-reply@")
+        activity_type == "event" or sender_id == "system" or sender_id.startswith("no-reply@")
     )
 
 
@@ -1192,8 +1170,7 @@ def _safe_log_field(value: Any, *, limit: int = 160) -> str:
     """Bound and escape body-derived fields before they reach text logs."""
     text = str(value or "")[:limit]
     return "".join(
-        ch if ch.isprintable() and ch not in "\r\n\x1b" else f"\\x{ord(ch):02x}"
-        for ch in text
+        ch if ch.isprintable() and ch not in "\r\n\x1b" else f"\\x{ord(ch):02x}" for ch in text
     )
 
 
@@ -1455,9 +1432,7 @@ class BridgeConfig:
     # that case is logged as a startup WARNING.
     idempotency_max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
     # Slice 19j: DNS suffixes acceptable on the inbound `serviceUrl`.
-    trusted_service_url_suffixes: tuple[str, ...] = (
-        DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
-    )
+    trusted_service_url_suffixes: tuple[str, ...] = DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
     # #36: optional separate Path B identity (non-agentic). When set,
     # used as `expected_app_id` for inbound BF JWT validation AND as
     # the `client_id` / `client_secret` for outbound BF S2S mint.
@@ -1572,14 +1547,11 @@ def parse_sender_allowlist(env: Mapping[str, str], *, source: str) -> SenderAllo
     users_are_text = not has_users or isinstance(users_raw, str)
     allow_is_text = not has_all or isinstance(allow_raw, str)
     if not users_are_text or not allow_is_text:
-        raise BridgeConfigError(
-            f"sender allowlist in {source} is not text; refusing to start"
-        )
+        raise BridgeConfigError(f"sender allowlist in {source} is not text; refusing to start")
     token = allow_raw.strip().lower()
     if has_all and token not in _SENDER_ALLOW_TRUE | _SENDER_ALLOW_FALSE:
         raise BridgeConfigError(
-            f"A365_ALLOW_ALL_USERS in {source} is not a recognized on/off value; "
-            "refusing to start"
+            f"A365_ALLOW_ALL_USERS in {source} is not a recognized on/off value; refusing to start"
         )
     allow_all = has_all and token in _SENDER_ALLOW_TRUE
     users = _parse_allowed_user_list(users_raw) if has_users else ()
@@ -1616,9 +1588,7 @@ def select_profile_sender_env(
         if profile_file_exists
         else None
     )
-    scoped_policy = parse_sender_allowlist(
-        scoped_env, source="the process environment"
-    )
+    scoped_policy = parse_sender_allowlist(scoped_env, source="the process environment")
     if file_policy is None and scoped_policy is not None:
         raise BridgeConfigError(
             "profile .env does not state the process allowlist. "
@@ -1654,9 +1624,7 @@ def resolve_sender_allowlist(
     policies that are not equal, fails closed. Neither source configured is
     deny-all rather than allow-all.
     """
-    profile = parse_sender_allowlist(
-        profile_env, source="the profile env (~/.hermes/.env)"
-    )
+    profile = parse_sender_allowlist(profile_env, source="the profile env (~/.hermes/.env)")
     agent = parse_sender_allowlist(agent_env, source="the per-agent env")
     if agent is not None and profile is None:
         raise BridgeConfigError(
@@ -1791,8 +1759,7 @@ def load_bridge_config(
         if tenant_id:
             if blueprint_state.reachable:
                 provider_clause = (
-                    f"and the secrets provider ({blueprint_state.provider}) "
-                    "supplied none either. "
+                    f"and the secrets provider ({blueprint_state.provider}) supplied none either. "
                 )
                 remediation = (
                     "Common cause: `a365 publish` was run after `register` and "
@@ -1804,8 +1771,7 @@ def load_bridge_config(
                 )
             else:
                 provider_clause = (
-                    f"and the secrets provider ({blueprint_state.provider}) "
-                    "was unreachable. "
+                    f"and the secrets provider ({blueprint_state.provider}) was unreachable. "
                 )
                 remediation = "Restore provider access and retry startup."
         else:
@@ -1877,9 +1843,7 @@ def load_bridge_config(
         allowed_users=sender_policy.allowed_users,
         allow_all_users=sender_policy.allow_all_users,
         sender_allowlist_configured=sender_policy.configured,
-        agent_identity_ids=parse_agent_identity_ids(
-            agent_env.get("A365_AGENT_IDENTITY_IDS")
-        ),
+        agent_identity_ids=parse_agent_identity_ids(agent_env.get("A365_AGENT_IDENTITY_IDS")),
     )
 
 
@@ -1940,11 +1904,7 @@ async def _refresh_jwks(
 ) -> dict[str, Any]:
     """Single-flight JWKS refresh with failure backoff and bounded staleness."""
     fetched_at_before_wait = cache.fetched_at
-    if (
-        not force
-        and cache.keys_by_kid
-        and (now - cache.fetched_at) < cache.ttl_seconds
-    ):
+    if not force and cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
         return cache.keys_by_kid
     if not force and now < cache.retry_after:
         if _jwks_last_known_good_allowed(cache, now):
@@ -1953,15 +1913,12 @@ async def _refresh_jwks(
     async with cache.refresh_lock:
         if cache.keys_by_kid and cache.fetched_at > fetched_at_before_wait:
             return cache.keys_by_kid
-        if (
-            not force
-            and cache.keys_by_kid
-            and (now - cache.fetched_at) < cache.ttl_seconds
-        ):
+        if not force and cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
             return cache.keys_by_kid
-        if force and (
-            now - cache.last_forced_refresh_at
-        ) < JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS:
+        if (
+            force
+            and (now - cache.last_forced_refresh_at) < JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS
+        ):
             return cache.keys_by_kid
         if not force and now < cache.retry_after:
             if _jwks_last_known_good_allowed(cache, now):
@@ -2026,8 +1983,7 @@ class _IdempotencyCache:
             self.max_entries = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
         if self.max_entries > MAX_IDEMPOTENCY_MAX_ENTRIES:
             logger.warning(
-                "inbound idempotency cap %d exceeds the supported ceiling; "
-                "clamping to %d",
+                "inbound idempotency cap %d exceeds the supported ceiling; clamping to %d",
                 self.max_entries,
                 MAX_IDEMPOTENCY_MAX_ENTRIES,
             )
@@ -2067,9 +2023,7 @@ class _IdempotencyCache:
         cur = now if now is not None else _time.monotonic()
         # Store a fixed-size digest rather than the caller-controlled raw ids.
         # ``surrogatepass`` keeps hashing total for any string JSON may decode.
-        cache_key = hashlib.sha256(
-            delivery_id.encode("utf-8", errors="surrogatepass")
-        ).hexdigest()
+        cache_key = hashlib.sha256(delivery_id.encode("utf-8", errors="surrogatepass")).hexdigest()
         # Drop expired entries from the front — O(1) amortized, not a full scan.
         while self.seen:
             oldest_key = next(iter(self.seen))
@@ -2094,9 +2048,7 @@ class _IdempotencyCache:
 
     def forget(self, delivery_id: str) -> None:
         """Forget one delivery so a retryable transport failure can retry it."""
-        cache_key = hashlib.sha256(
-            delivery_id.encode("utf-8", errors="surrogatepass")
-        ).hexdigest()
+        cache_key = hashlib.sha256(delivery_id.encode("utf-8", errors="surrogatepass")).hexdigest()
         self.seen.pop(cache_key, None)
 
 
@@ -2119,9 +2071,11 @@ def _activity_delivery_id(
     the reader knows exactly how many chars ``conv`` occupies, so no two
     distinct pairs can produce the same key.
     """
-    conv = (activity.get("conversation") or {}).get("id") if isinstance(
-        activity.get("conversation"), dict
-    ) else None
+    conv = (
+        (activity.get("conversation") or {}).get("id")
+        if isinstance(activity.get("conversation"), dict)
+        else None
+    )
     activity_id = activity.get("id")
     if not isinstance(conv, str) or not conv:
         return None
@@ -2302,9 +2256,7 @@ async def validate_inbound_jwt(
             "This is a config bug; populate inbound_azp_allowlist."
         )
     if azp not in azp_allowlist:
-        raise JwtValidationError(
-            f"azp {azp!r} not in allowlist {list(azp_allowlist)!r}"
-        )
+        raise JwtValidationError(f"azp {azp!r} not in allowlist {list(azp_allowlist)!r}")
     return claims
 
 
@@ -2547,9 +2499,7 @@ class _FmiCache:
 class _UserTokenCache:
     """Cache for the final per-user access token at the messaging resource."""
 
-    by_key: dict[tuple[str, str, str, str], tuple[str, float]] = field(
-        default_factory=dict
-    )
+    by_key: dict[tuple[str, str, str, str], tuple[str, float]] = field(default_factory=dict)
     """``{(tenant_id, agent_app_instance_id, agentic_user_id, scope): (token, exp)}``
 
     #100-M1: keyed on the FULL identity tuple (matching ``_FmiCache``), not just
@@ -2629,7 +2579,10 @@ async def _post_token_request(
         TENANT_TOKEN_URL_TEMPLATE.format(tenant_id=tenant_id),
         data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=outbound_attempt_timeout_sec(deadline, attempt_cap_sec=OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC),
+        timeout=outbound_attempt_timeout_sec(
+            deadline,
+            attempt_cap_sec=OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
+        ),
     )
     resp.raise_for_status()
     return resp.json()
@@ -2759,9 +2712,7 @@ async def acquire_outbound_token(
     import time as _time
 
     cur = now if now is not None else _time.time()
-    tenant_id, agent_app_instance_id, agentic_user_id = _agentic_ids_from_activity(
-        activity
-    )
+    tenant_id, agent_app_instance_id, agentic_user_id = _agentic_ids_from_activity(activity)
 
     # H1 (#100, #123 walk) — recipient.agenticAppId is an UNAUTHENTICATED body
     # field, yet it names the identity every FMI stage mints under (fmi_path,
@@ -2925,9 +2876,7 @@ async def acquire_bf_s2s_token(
     # Use the lower-level post + parse explicitly so we can detect
     # AADSTS82001 and re-raise with a clear pointer for operators.
     if _httpx is None:
-        raise BridgeConfigError(
-            "httpx not installed; run `uv sync --extra bridge`"
-        )
+        raise BridgeConfigError("httpx not installed; run `uv sync --extra bridge`")
     from hermes_a365.outbound_retry import (
         OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
         can_start_outbound_attempt,
@@ -2945,7 +2894,10 @@ async def acquire_bf_s2s_token(
             "client_secret": blueprint_client_secret,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=outbound_attempt_timeout_sec(deadline, attempt_cap_sec=OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC),
+        timeout=outbound_attempt_timeout_sec(
+            deadline,
+            attempt_cap_sec=OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
+        ),
     )
     if resp.status_code >= 400:
         # Try to surface AADSTS82001 specifically — it has a fix that
@@ -3057,9 +3009,7 @@ async def acquire_reply_token(
     # as a TypeError at the call boundary instead of silently trusting the body —
     # the gap the #106 red-team caught. A BF-validated (Path B) inbound carrying
     # injected agentic ids can thus never be minted via the Path A user-FIC chain.
-    path_tag = (
-        validated_path if validated_path in ("A", "B") else _inbound_path_tag(activity)
-    )
+    path_tag = validated_path if validated_path in ("A", "B") else _inbound_path_tag(activity)
     if path_tag == "A":
         token = await acquire_outbound_token(
             client=client,
@@ -3154,9 +3104,7 @@ class TokenFactory:
         (Graph is exempt from AADSTS82001, so the Path B identity mints it
         directly). Raises for an unclassifiable activity rather than guessing.
         """
-        path_tag = (
-            validated_path if validated_path in ("A", "B") else "unknown"
-        )
+        path_tag = validated_path if validated_path in ("A", "B") else "unknown"
         if path_tag == "A":
             return await acquire_outbound_token(
                 client=self._client,
@@ -3171,9 +3119,7 @@ class TokenFactory:
             payload = acquire_token(
                 tenant_id=self._cfg.tenant_id,
                 client_id=self._cfg.bf_app_id or self._cfg.blueprint_client_id,
-                client_secret=(
-                    self._cfg.bf_client_secret or self._cfg.blueprint_client_secret
-                ),
+                client_secret=(self._cfg.bf_client_secret or self._cfg.blueprint_client_secret),
                 resource=GRAPH_RESOURCE,
             )
             return str(payload["access_token"])
@@ -3200,9 +3146,7 @@ class TokenFactory:
 
     async def for_workiq(self, server: Any) -> str:
         """Work IQ V2 token bootstrap — a #21 hook, not implemented in v0.8.0."""
-        raise NotImplementedError(
-            "TokenFactory.for_workiq (Work IQ V2 token bootstrap) is #21"
-        )
+        raise NotImplementedError("TokenFactory.for_workiq (Work IQ V2 token bootstrap) is #21")
 
 
 # ---------------------------------------------------------------------------
@@ -3325,9 +3269,7 @@ def build_ai_message_entity(citations: Any = None) -> dict[str, Any]:
             keywords = src.get("keywords")
             if isinstance(keywords, list) and keywords:
                 appearance["keywords"] = [str(k) for k in keywords]
-            claims.append(
-                {"@type": "Claim", "position": i, "appearance": appearance}
-            )
+            claims.append({"@type": "Claim", "position": i, "appearance": appearance})
     if claims:
         entity["citation"] = claims
     return entity
@@ -3583,9 +3525,7 @@ def make_app(
     fakes; production passes ``None`` and we construct real ones.
     """
     if _FastAPI is None or _httpx is None:
-        raise BridgeConfigError(
-            "serve mode requires the bridge extras: `uv sync --extra bridge`"
-        )
+        raise BridgeConfigError("serve mode requires the bridge extras: `uv sync --extra bridge`")
 
     if http_client is None:
         http_client = _httpx.AsyncClient()
@@ -3757,8 +3697,7 @@ def make_app(
             if isinstance(channel_data, dict):
                 event_type = str(channel_data.get("eventType") or "")
             logger.debug(
-                "inbound acked without forwarding: unhandled activity "
-                "type=%s eventType=%s",
+                "inbound acked without forwarding: unhandled activity type=%s eventType=%s",
                 _safe_log_field(activity_type),
                 _safe_log_field(event_type),
             )
@@ -3855,9 +3794,7 @@ def make_app(
             # failure, not an operator invokeResponse: same empty ack as a
             # webhook error (#132).
             if not isinstance(webhook_resp, dict):
-                logger.warning(
-                    "invoke handler error: %s", type(webhook_resp).__name__
-                )
+                logger.warning("invoke handler error: %s", type(webhook_resp).__name__)
                 return _empty_invoke_ack_response()
             invoke_response = webhook_resp.get("invokeResponse") or {
                 "status": 200,
@@ -4000,9 +3937,7 @@ def cmd_update_endpoint(args: argparse.Namespace) -> int:
         print("ERROR: a365 CLI not on PATH", file=sys.stderr)
         return 2
     try:
-        expected_tenant, _source = resolve_expected_tenant(
-            _resolve_hermes_home(), args.tenant_id
-        )
+        expected_tenant, _source = resolve_expected_tenant(_resolve_hermes_home(), args.tenant_id)
     except TenantResolutionError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 2

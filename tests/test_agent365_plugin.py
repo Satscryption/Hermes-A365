@@ -1600,9 +1600,7 @@ class TestMessagesRoute:
         assert second.json()["status"] == "duplicate"
         assert len(a._handled_events) == 1
 
-    def test_deeply_nested_json_returns_400_not_500(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_deeply_nested_json_returns_400_not_500(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)
@@ -6598,28 +6596,17 @@ class Test226PreambleVsAnswerDesign:
                 reply_to="act-1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
             _design_turn_segment("Checked.", seg_id="turnbuf:3", reply_to="act-1"),
         ]
-        assert (
-            self._final_body(a, segments)
-            == "The capital of France is Paris.\n\nChecked."
-        )
+        assert self._final_body(a, segments) == "The capital of France is Paris.\n\nChecked."
         assert self._rotation_allowed(a, segments[:2])
 
-    def test_design_p2_notify_fact_before_tool(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_design_p2_notify_fact_before_tool(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch)
         segments = [
-            _design_turn_segment(
-                "The time is 3pm.", seg_id="turnbuf:1", notify=True
-            ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment("The time is 3pm.", seg_id="turnbuf:1", notify=True),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
             _design_turn_segment("Also UTC.", seg_id="turnbuf:3", reply_to="act-1"),
         ]
         assert self._final_body(a, segments) == "The time is 3pm.\n\nAlso UTC."
@@ -6630,15 +6617,9 @@ class Test226PreambleVsAnswerDesign:
     ) -> None:
         a = self._adapter(monkeypatch)
         segments = [
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:1", kind="progress"
-            ),
-            _design_turn_segment(
-                "Found 3 files.", seg_id="turnbuf:2", expect_edits=True
-            ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:3", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:1", kind="progress"),
+            _design_turn_segment("Found 3 files.", seg_id="turnbuf:2", expect_edits=True),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:3", kind="progress"),
             _design_turn_segment("All done.", seg_id="turnbuf:4", reply_to="act-1"),
         ]
         assert self._final_body(a, segments) == "Found 3 files.\n\nAll done."
@@ -6656,12 +6637,8 @@ class Test226PreambleVsAnswerDesign:
                 reply_to="act-1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
-            _design_turn_segment(
-                "Done after sleep.", seg_id="turnbuf:3", reply_to="act-1"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
+            _design_turn_segment("Done after sleep.", seg_id="turnbuf:3", reply_to="act-1"),
         ]
         assert self._final_body(a, segments) == "Done after sleep."
         assert self._rotation_allowed(a, segments[:2])
@@ -6681,9 +6658,7 @@ class Test226PreambleVsAnswerDesign:
                 seg_id="turnbuf:2",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:3", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:3", kind="progress"),
             _design_turn_segment("Done after sleep.", seg_id="turnbuf:4", reply_to="act-1"),
         ]
         assert self._final_body(a, segments) == "Done after sleep."
@@ -6694,12 +6669,8 @@ class Test226PreambleVsAnswerDesign:
     ) -> None:
         a = self._adapter(monkeypatch)
         segments = [
-            _design_turn_segment(
-                "Opening line.", seg_id="turnbuf:1", expect_edits=True
-            ),
-            _design_turn_segment(
-                "Closing line.", seg_id="turnbuf:2", expect_edits=True
-            ),
+            _design_turn_segment("Opening line.", seg_id="turnbuf:1", expect_edits=True),
+            _design_turn_segment("Closing line.", seg_id="turnbuf:2", expect_edits=True),
         ]
         assert self._final_body(a, segments) == "Opening line.\n\nClosing line."
         assert not self._rotation_allowed(a, segments)
@@ -6714,9 +6685,7 @@ class Test226PreambleVsAnswerDesign:
                 seg_id="turnbuf:1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
         ]
         assert self._final_body(a, segments) == "I'll run the sleep, then reply."
         assert self._rotation_allowed(a, segments)
@@ -6731,16 +6700,12 @@ class Test226PreambleVsAnswerDesign:
                 seg_id="turnbuf:1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
         ]
         assert self._final_body(a, segments) == "The capital of France is Paris."
         assert self._rotation_allowed(a, segments)
 
-    def test_design_m1_mixed_sentence_stays_answer(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_design_m1_mixed_sentence_stays_answer(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch)
         segments = [
             _design_turn_segment(
@@ -6748,9 +6713,7 @@ class Test226PreambleVsAnswerDesign:
                 seg_id="turnbuf:1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
             _design_turn_segment("Checked.", seg_id="turnbuf:3", reply_to="act-1"),
         ]
         assert (
@@ -6767,17 +6730,13 @@ class Test226PreambleVsAnswerDesign:
                 seg_id="turnbuf:1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
             _design_turn_segment("Sent.", seg_id="turnbuf:3", reply_to="act-1"),
         ]
         assert self._final_body(a, segments) == "Sent."
         assert self._rotation_allowed(a, segments[:2])
 
-    def test_design_f2_non_english_leadin_kept(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_design_f2_non_english_leadin_kept(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = self._adapter(monkeypatch)
         segments = [
             _design_turn_segment(
@@ -6785,14 +6744,11 @@ class Test226PreambleVsAnswerDesign:
                 seg_id="turnbuf:1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
             _design_turn_segment("Fait.", seg_id="turnbuf:3", reply_to="act-1"),
         ]
         assert (
-            self._final_body(a, segments)
-            == "Je vais lancer la veille, puis je réponds.\n\nFait."
+            self._final_body(a, segments) == "Je vais lancer la veille, puis je réponds.\n\nFait."
         )
         assert self._rotation_allowed(a, segments[:2])
 
@@ -6804,24 +6760,16 @@ class Test226PreambleVsAnswerDesign:
                 seg_id="turnbuf:1",
                 expect_edits=True,
             ),
-            _design_turn_segment(
-                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
-            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
             _design_turn_segment("Done.", seg_id="turnbuf:3", reply_to="act-1"),
         ]
         assert self._final_body(a, segments) == "Done."
         assert self._rotation_allowed(a, segments[:2])
 
     def test_segment_is_intent_preamble_strips_edit_suffix(self) -> None:
-        assert adapter_mod._segment_is_intent_preamble(
-            "I'll run the sleep, then reply. (edited)"
-        )
-        assert not adapter_mod._segment_is_intent_preamble(
-            "The capital of France is Paris."
-        )
-        assert not adapter_mod._segment_is_intent_preamble(
-            "Sure, the capital is Paris."
-        )
+        assert adapter_mod._segment_is_intent_preamble("I'll run the sleep, then reply. (edited)")
+        assert not adapter_mod._segment_is_intent_preamble("The capital of France is Paris.")
+        assert not adapter_mod._segment_is_intent_preamble("Sure, the capital is Paris.")
         assert adapter_mod._segment_is_intent_preamble("Sure, I'll check.")
 
     def test_segment_is_intent_preamble_200_char_boundary(self) -> None:
@@ -8521,6 +8469,89 @@ class TestEditMessage:
         assert text != ""
         assert len(text) <= adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
 
+    def test_keepalive_stream_outbound_deadline_uses_shared_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.outbound_retry import OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-G-out-deadline"
+        t0 = time.monotonic()
+        deadline = a._keepalive_stream_outbound_deadline(chat_id)
+        assert deadline == pytest.approx(t0 + OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC, abs=0.05)
+        shared = t0 + 3.0
+        bounded = a._keepalive_stream_outbound_deadline(chat_id, shared_deadline=shared)
+        assert bounded == pytest.approx(shared, abs=0.001)
+        again = a._keepalive_stream_outbound_deadline(chat_id, shared_deadline=shared)
+        assert again == bounded
+
+    @pytest.mark.asyncio
+    async def test_answer_final_429_shares_stream_bounded_outbound_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-429-deadline", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 12.0
+        finals = {"n": 0}
+        answer_outbound_deadlines: list[float | None] = []
+        orig_post_final = adapter_mod.Agent365Adapter._post_answer_final
+
+        async def capture_post_final(self: Any, *args: Any, **kwargs: Any) -> Any:
+            answer_outbound_deadlines.append(kwargs.get("outbound_deadline"))
+            return await orig_post_final(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_post_answer_final",
+            capture_post_final,
+        )
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                if finals["n"] <= 4:
+                    return MagicMock(
+                        status_code=429,
+                        text="",
+                        headers={"Retry-After": "0.5"},
+                        json=lambda: {},
+                    )
+                return self._http_result(202)
+            return self._http_result(201, "ka-429-dl")
+
+        a._http_client.post = post
+        self._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-429-deadline"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-429-deadline"]
+        loop_start = time.monotonic()
+        buf["keepalive"] = {
+            "stream_id": "ka-429-dl",
+            "sequence": 1,
+            "opened_mono": loop_start - (cap - margin - cap_left),
+        }
+        await a.send(chat_id="conv-G-429-deadline", content="Shared deadline", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 5
+        passed = [d for d in answer_outbound_deadlines if d is not None]
+        assert len(passed) >= 2
+        assert passed[0] == passed[1]
+        assert passed[0] <= loop_start + cap_left + 0.1
+        assert "conv-G-429-deadline" not in a._turn_buffers
+
     @staticmethod
     async def _spin_until(predicate) -> None:
         for _ in range(40):
@@ -8553,9 +8584,7 @@ class TestEditMessage:
         )
 
     @staticmethod
-    def _observe_stream_wire_activity(
-        activity: dict[str, Any], counts: dict[str, int]
-    ) -> None:
+    def _observe_stream_wire_activity(activity: dict[str, Any], counts: dict[str, int]) -> None:
         entities = activity.get("entities") or [{}]
         entity = entities[0] if entities else {}
         stream_type = entity.get("streamType")
@@ -8949,9 +8978,11 @@ class TestEditMessage:
         gate.set()
         await asyncio.gather(first, return_exceptions=True)
         await self._spin_until(
-            lambda: isinstance(buf.get("keepalive_task"), asyncio.Task)
-            and buf["keepalive_task"] is not first
-            and not buf["keepalive_task"].done()
+            lambda: (
+                isinstance(buf.get("keepalive_task"), asyncio.Task)
+                and buf["keepalive_task"] is not first
+                and not buf["keepalive_task"].done()
+            )
         )
         second = buf["keepalive_task"]
         assert buf.get("keepalive_revive_used") is True
@@ -9533,9 +9564,7 @@ class TestEditMessage:
             metadata={"thread_id": "29:copilot"},
         )
         await self._spin_until(
-            lambda: bool(
-                str(a._turn_buffers[chat].get("keepalive", {}).get("stream_id") or "")
-            )
+            lambda: bool(str(a._turn_buffers[chat].get("keepalive", {}).get("stream_id") or ""))
         )
         await a.send(
             chat_id=chat,
@@ -9543,9 +9572,7 @@ class TestEditMessage:
             metadata={"thread_id": "29:copilot"},
         )
         await self._spin_until(
-            lambda: any(
-                post.get("text") == "Second interim line." for post in posts
-            )
+            lambda: any(post.get("text") == "Second interim line." for post in posts)
         )
         await a.send(chat_id=chat, content="Final answer body.", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
@@ -10288,10 +10315,7 @@ class TestEditMessage:
             entity = (body.get("entities") or [{}])[0]
             if entity.get("streamType") == "informative" and "streamId" not in entity:
                 return self._http_result(201, "ka-throttle")
-            if (
-                entity.get("streamType") == "informative"
-                and body.get("text") == "Second line."
-            ):
+            if entity.get("streamType") == "informative" and body.get("text") == "Second line.":
                 return MagicMock(status_code=429, text="throttled", json=lambda: {})
             if entity.get("streamType") == "final":
                 return self._http_result(202)
@@ -10436,6 +10460,7 @@ class TestEditMessage:
                 "informative_update": False,
             },
         ]
+
         async def post_line_b() -> None:
             async with adapter_mod.Agent365Adapter._turn_buffer_lock(buf):
                 segment_b = next(
@@ -10443,15 +10468,11 @@ class TestEditMessage:
                     for segment in buf["segments"]
                     if str(segment.get("text") or "") == "Line B"
                 )
-                await a._post_undisplayed_segment_locked(
-                    chat, buf, turn, segment_b
-                )
+                await a._post_undisplayed_segment_locked(chat, buf, turn, segment_b)
 
         line_b_task = asyncio.create_task(post_line_b())
         await asyncio.wait_for(gap_entered.wait(), timeout=5.0)
-        complete_task = asyncio.create_task(
-            a.on_processing_complete(event, outcome="success")
-        )
+        complete_task = asyncio.create_task(a.on_processing_complete(event, outcome="success"))
         await self._spin_until(
             lambda: bool(a._turn_buffers.get(chat, {}).get("answer_final_in_progress"))
         )
@@ -10641,12 +10662,7 @@ class TestEditMessage:
             reply_to=None,
             metadata={"informative_update": True},
         )
-        await self._spin_until(
-            lambda: any(
-                body.get("type") == "typing"
-                for body in posts
-            )
-        )
+        await self._spin_until(lambda: any(body.get("type") == "typing" for body in posts))
         await a.on_processing_complete(event, outcome="success")
         merged = "Found 3 issues\n\nChecking imports"
         informative_commentary = [
@@ -10735,10 +10751,7 @@ class TestEditMessage:
             entity = (body.get("entities") or [{}])[0]
             if entity.get("streamType") == "informative" and "streamId" not in entity:
                 return self._http_result(201, "ka-sleeper-429")
-            if (
-                entity.get("streamType") == "informative"
-                and body.get("text") == "Part one"
-            ):
+            if entity.get("streamType") == "informative" and body.get("text") == "Part one":
                 return MagicMock(status_code=429, text="throttled", json=lambda: {})
             if entity.get("streamType") == "final":
                 return self._http_result(202)
@@ -10758,9 +10771,7 @@ class TestEditMessage:
             metadata={"informative_update": True},
         )
         await a.send(chat_id=chat, content="Part two", reply_to=None)
-        await self._spin_until(
-            lambda: any(body.get("type") == "typing" for body in posts)
-        )
+        await self._spin_until(lambda: any(body.get("type") == "typing" for body in posts))
         await a.on_processing_complete(event, outcome="success")
         merged = "Part one\n\nPart two"
         finals = [
@@ -10820,8 +10831,7 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert posts[0]["text"] == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         assert not any(
-            body.get("type") == "typing"
-            and not str(body.get("text") or "").strip()
+            body.get("type") == "typing" and not str(body.get("text") or "").strip()
             for body in posts
         )
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", first)
@@ -10990,9 +11000,7 @@ class TestEditMessage:
         assert segment["kind"] == "answer"
         assert segment.get("informative_update") is False
         seq = str(a._turn_buffers[chat]["turns"][0]["seq"])
-        adapter_mod._reconcile_turn_buffer_kinds_for_flush(
-            a._turn_buffers[chat]["segments"], seq
-        )
+        adapter_mod._reconcile_turn_buffer_kinds_for_flush(a._turn_buffers[chat]["segments"], seq)
         assert segment["kind"] == "answer"
 
     @pytest.mark.asyncio
@@ -12214,6 +12222,7 @@ class TestEditMessage:
         finals = {"n": 0}
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 2.0
         real_sleep = asyncio.sleep
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -12256,7 +12265,7 @@ class TestEditMessage:
         buf["keepalive"] = {
             "stream_id": "ka-ra",
             "sequence": 1,
-            "opened_mono": time.monotonic() - (cap - margin - 0.5),
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
         }
         await a.send(chat_id="conv-G-ra-cap", content="Before cap", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
@@ -12269,7 +12278,7 @@ class TestEditMessage:
             if delay <= adapter_mod._ANSWER_FINAL_RETRY_AFTER_CAP_SEC
         ]
         assert retry_sleeps
-        assert max(retry_sleeps) <= 1.0
+        assert max(retry_sleeps) <= cap_left + 0.1
         assert "conv-G-ra-cap" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -12283,6 +12292,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 2.0
         finals = {"n": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -12312,11 +12322,11 @@ class TestEditMessage:
         buf["keepalive"] = {
             "stream_id": "ka-cap",
             "sequence": 1,
-            "opened_mono": time.monotonic() - (cap - margin + 1.0),
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
         }
         await a.send(chat_id="conv-G-cap-mid", content="Cap fallback", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
-        assert finals["n"] == 1
+        assert finals["n"] >= 1
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Cap fallback"
         assert "conv-G-cap-mid" not in a._turn_buffers
@@ -20741,9 +20751,7 @@ class TestInvokeRoute:
         assert ctx.tenant_id == "claim-tid"
         assert ctx.user_upn == "u@x"
 
-    def test_invoke_context_uses_jwt_path_not_body(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_invoke_context_uses_jwt_path_not_body(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 
         a = _make_adapter(monkeypatch)

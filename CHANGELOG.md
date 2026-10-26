@@ -28,13 +28,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   and BF reply; each outbound attempt clamps its HTTP timeout to the
   remaining budget with a per-call ceiling (15s Bot Framework by default,
   60s for OneDrive upload PUT) and skips starting a new attempt when too
-  little time remains. A 429 whose ``Retry-After`` exceeds the remainder
-  fails fast instead of sleeping; an exhausted serve deadline surfaces as a
-  clean webhook error instead of an internal failure. Plugin file-consent
-  invoke handling returns the HTTP ack immediately and runs card removal,
-  decline notices, and upload follow-up in retained background tasks.
-  Post-ack adapter sends (send, proactive, typing, Copilot turn-buffer
-  keep-alive POST) share a separate 25s relative retry budget. Refs
+  little time remains.   A 429 whose ``Retry-After`` exceeds the remainder, or whose backoff sleep
+  would leave too little time for another attempt, fails fast instead of
+  sleeping; an exhausted serve deadline surfaces as a clean webhook error
+  instead of an internal failure. Plugin file-consent invoke handling returns
+  the HTTP ack immediately and runs card removal, decline notices, and upload
+  follow-up in retained background tasks. Post-ack adapter sends (send,
+  proactive, typing, Copilot turn-buffer keep-alive POST) share a separate
+  25s retry budget clamped to the Copilot stream soft cap; answer-final outer
+  429 retries reuse one absolute outbound deadline so a fresh 25s window
+  cannot start a POST after the stream expires. Refs
   [#190](https://github.com/Satscryption/Hermes-A365/issues/190).
 
 - **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a

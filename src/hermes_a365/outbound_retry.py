@@ -271,6 +271,14 @@ async def request_with_outbound_retry(
                 status,
             )
             return last_response
+        if remaining is not None and (remaining - delay) < OUTBOUND_MIN_ATTEMPT_BUDGET_SEC:
+            logger.warning(
+                "outbound send gave up: call_site=%s status=%s "
+                "reason=retry_would_exhaust_attempt_budget",
+                call_site,
+                status,
+            )
+            return last_response
         logger.info(
             "outbound send retry: call_site=%s status=%s attempt=%s/%s delay_sec=%.2f",
             call_site,
