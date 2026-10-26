@@ -12,7 +12,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   segments (`reply_to` / `expect_edits`) that precede Hermes tool-progress on
   the same turn are reclassified as commentary: they post on the informative
   stream, drop from the answer final, and no longer block keep-alive stream
-  rotation. Refs
+  rotation; the same rule is re-applied after ``edit_message`` refreshes
+  segment kind. Refs
   [#214](https://github.com/Satscryption/Hermes-A365/issues/214).
 
 - **#209 — #126 review follow-ups.** CI Hermes source smoke adds the plugin
