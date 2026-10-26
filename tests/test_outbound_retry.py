@@ -15,6 +15,7 @@ from hermes_a365.outbound_retry import (
     OUTBOUND_DEFAULT_MAX_ATTEMPTS,
     OUTBOUND_RETRY_AFTER_CAP_SEC,
     OUTBOUND_TYPING_MAX_ATTEMPTS,
+    OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC,
     clamp_retry_delay_sec,
     compute_backoff_delay_sec,
     is_retryable_http_status,
@@ -92,7 +93,7 @@ class TestRequestWithOutboundRetry:
 
         calls = 0
 
-        async def send_once() -> MagicMock:
+        async def send_once(_timeout_sec: float) -> MagicMock:
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -112,7 +113,7 @@ class TestRequestWithOutboundRetry:
     async def test_gives_up_after_max_attempts(self) -> None:
         calls = 0
 
-        async def send_once() -> MagicMock:
+        async def send_once(_timeout_sec: float) -> MagicMock:
             nonlocal calls
             calls += 1
             return _resp(429, "1")
@@ -129,7 +130,7 @@ class TestRequestWithOutboundRetry:
     async def test_no_retry_on_400(self) -> None:
         calls = 0
 
-        async def send_once() -> MagicMock:
+        async def send_once(_timeout_sec: float) -> MagicMock:
             nonlocal calls
             calls += 1
             return _resp(400)
@@ -146,7 +147,7 @@ class TestRequestWithOutboundRetry:
     async def test_no_retry_on_503_by_default(self) -> None:
         calls = 0
 
-        async def send_once() -> MagicMock:
+        async def send_once(_timeout_sec: float) -> MagicMock:
             nonlocal calls
             calls += 1
             return _resp(503)
@@ -163,7 +164,7 @@ class TestRequestWithOutboundRetry:
     async def test_transient_5xx_when_enabled(self) -> None:
         calls = 0
 
-        async def send_once() -> MagicMock:
+        async def send_once(_timeout_sec: float) -> MagicMock:
             nonlocal calls
             calls += 1
             if calls == 1:
@@ -197,9 +198,11 @@ class TestRequestWithOutboundRetry:
             clock += delay
 
         calls = 0
+        attempt_starts: list[float] = []
 
-        async def send_once() -> MagicMock:
+        async def send_once(_timeout_sec: float) -> MagicMock:
             nonlocal calls
+            attempt_starts.append(clock)
             calls += 1
             return _resp(429, "20")
 
@@ -213,6 +216,33 @@ class TestRequestWithOutboundRetry:
         assert result.status_code == 429
         assert sum(sleeps) <= 10.0
         assert all(s <= 10.0 for s in sleeps)
+        assert all(t < 10.0 for t in attempt_starts)
+
+    async def test_retry_after_exceeding_budget_fails_fast(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        clock = 0.0
+
+        def monotonic() -> float:
+            return clock
+
+        calls = 0
+
+        async def send_once(_timeout_sec: float) -> MagicMock:
+            nonlocal calls
+            calls += 1
+            return _resp(429, "120")
+
+        monkeypatch.setattr("hermes_a365.outbound_retry.time.monotonic", monotonic)
+        result = await request_with_outbound_retry(
+            send_once,
+            call_site="test",
+            max_attempts=4,
+            total_budget_sec=5.0,
+            sleep=AsyncMock(),
+        )
+        assert result.status_code == 429
+        assert calls == 1
 
 
 class TestComputeBackoff:
@@ -315,16 +345,16 @@ class TestCallSiteFamilies:
     async def test_adapter_post_activity_typing_at_most_one_retry(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tests.test_agent365_plugin import TestEditMessage, _make_adapter, _make_inbound
-
-        a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-typing")
+        a = plugin_tests._make_adapter(monkeypatch)
+        inbound = plugin_tests._make_inbound(conv_id="conv-typing")
         posts = [
             MagicMock(status_code=429, headers={"Retry-After": "1"}, text=""),
             MagicMock(status_code=429, headers={"Retry-After": "1"}, text=""),
         ]
-        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=posts)
-        TestEditMessage._patch_token_mint(monkeypatch)
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=posts
+        )
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
         monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
         sleep_mock = AsyncMock()
         monkeypatch.setattr("hermes_a365.outbound_retry.asyncio.sleep", sleep_mock)
@@ -341,17 +371,16 @@ class TestCallSiteFamilies:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from hermes_a365.plugin.conversations import ConversationRef
-        from tests.test_agent365_plugin import TestEditMessage, _make_adapter, _make_inbound
 
-        a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-pro")
+        a = plugin_tests._make_adapter(monkeypatch)
+        inbound = plugin_tests._make_inbound(conv_id="conv-pro")
         a._conversations.upsert(ConversationRef.from_activity(inbound), now=100.0)
-        post_mock = TestEditMessage._wire_adapter(
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(
             a,
             inbound=inbound,
             post_responses=[MagicMock(status_code=503, headers={}, text="")],
         )
-        TestEditMessage._patch_token_mint(monkeypatch)
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
         monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
 
         result = await a._send_proactive("conv-pro", "hello")
@@ -359,10 +388,19 @@ class TestCallSiteFamilies:
         assert post_mock.await_count == 1
 
     async def test_file_consent_upload_retries_429(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from tests.test_agent365_plugin import _make_adapter, _make_inbound
+        import asyncio
 
-        a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-file")
+        a = plugin_tests._make_adapter(monkeypatch)
+        pending_tasks: list[asyncio.Task[Any]] = []
+        real_create_task = asyncio.create_task
+
+        def _capture_upload_task(coro: Any) -> asyncio.Task[Any]:
+            task = real_create_task(coro)
+            pending_tasks.append(task)
+            return task
+
+        monkeypatch.setattr(asyncio, "create_task", _capture_upload_task)
+        inbound = plugin_tests._make_inbound(conv_id="conv-file")
         puts = [
             MagicMock(status_code=429, headers={"Retry-After": "1"}),
             MagicMock(status_code=201, headers={}),
@@ -421,16 +459,17 @@ class TestCallSiteFamilies:
         }
         resp = await a._handle_file_consent(activity, validated_path="A")
         assert resp.status == 200
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks)
         assert client.put.await_count == 2
 
     async def test_stream_edit_honours_retry_after_floor(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         import hermes_a365.plugin.adapter as adapter_mod
-        from tests.test_agent365_plugin import TestEditMessage, _make_adapter, _make_inbound
 
-        a = _make_adapter(monkeypatch)
-        inbound = _make_inbound(conv_id="conv-stream")
+        a = plugin_tests._make_adapter(monkeypatch)
+        inbound = plugin_tests._make_inbound(conv_id="conv-stream")
         first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-s"})
         rate = MagicMock(
             status_code=429,
@@ -439,9 +478,11 @@ class TestCallSiteFamilies:
             json=lambda: {"error": {"code": "TooManyRequests", "message": "wait"}},
         )
         ok = MagicMock(status_code=202, text="", json=lambda: {})
-        TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=[first, rate, ok])
-        TestEditMessage._patch_token_mint(monkeypatch)
-        sleep_mock = TestEditMessage._no_sleep(monkeypatch)
+        plugin_tests.TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=[first, rate, ok]
+        )
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
+        sleep_mock = plugin_tests.TestEditMessage._no_sleep(monkeypatch)
         monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
 
         await a.edit_message("conv-stream", "m1", "A")
@@ -508,12 +549,14 @@ class TestWebhookReplyBudget:
             allow_500: bool = False,
             retry_after_cap: float = 30.0,
             fallback_delay_sec: float = 0.0,
+            deadline: float | None = None,
             total_budget_sec: float | None = None,
             sleep: Any = None,
             before_retry: Any = None,
         ) -> Any:
+            seen["deadline"] = deadline
             seen["budget"] = total_budget_sec
-            return await send_once()
+            return await send_once(15.0)
 
         monkeypatch.setattr(
             "hermes_a365.outbound_retry.request_with_outbound_retry",
@@ -533,6 +576,7 @@ class TestWebhookReplyBudget:
             "conversation": {"id": "c1"},
             "id": "a1",
         }
+        ack_deadline = 9999.0
         await bridge.send_reply(
             inbound=inbound,
             reply={"type": "message", "text": "hi"},
@@ -541,7 +585,135 @@ class TestWebhookReplyBudget:
             fmi_cache=MagicMock(),
             user_cache=MagicMock(),
             validated_path="A",
-            retry_total_budget_sec=OUTBOUND_WEBHOOK_REPLY_TOTAL_BUDGET_SEC,
+            deadline=ack_deadline,
         )
-        assert seen["budget"] == OUTBOUND_WEBHOOK_REPLY_TOTAL_BUDGET_SEC
-        assert OUTBOUND_WEBHOOK_REPLY_TOTAL_BUDGET_SEC < OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+        assert seen["deadline"] == ack_deadline
+        assert seen["budget"] is None
+        assert OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC < OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+
+
+@pytest.mark.asyncio
+class TestAckPathTiming:
+    async def test_file_consent_invoke_acks_before_upload(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+        import hashlib
+        import time
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        inbound = plugin_tests._make_inbound(conv_id="conv-file-ack")
+        gate = asyncio.Event()
+
+        async def slow_put(*_args: Any, **_kwargs: Any) -> MagicMock:
+            await gate.wait()
+            return MagicMock(status_code=201, headers={})
+
+        client = MagicMock()
+        client.put = AsyncMock(side_effect=slow_put)
+        a._http_client = client
+        monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
+        monkeypatch.setattr(a, "_remove_file_consent_card", AsyncMock())
+        monkeypatch.setattr(a, "validate_media_delivery_path", lambda _p: "/tmp/x")
+        monkeypatch.setattr(
+            "hermes_a365.plugin.adapter._read_file_bounded",
+            lambda _p, _c: b"data",
+        )
+        monkeypatch.setattr(
+            "hermes_a365.plugin.adapter._is_allowed_file_host",
+            lambda _u, _a: True,
+        )
+        a._file_host_allowlist = ("tenant.sharepoint.com",)
+        activity = {
+            "type": "invoke",
+            "conversation": inbound["conversation"],
+            "from": inbound["from"],
+            "serviceUrl": inbound["serviceUrl"],
+            "value": {
+                "action": "accept",
+                "context": {"consentId": "ack-abc"},
+                "uploadInfo": {
+                    "uploadUrl": "https://tenant.sharepoint.com/upload",
+                    "contentUrl": "https://tenant.sharepoint.com/x",
+                    "name": "f.txt",
+                },
+            },
+        }
+        a._pending_file_uploads["ack-abc"] = {
+            "path": "/tmp/x",
+            "name": "f.txt",
+            "size": 4,
+            "sha256": hashlib.sha256(b"data").hexdigest(),
+            "conversation_id": inbound["conversation"]["id"],
+            "user_id": inbound["from"]["id"],
+            "service_url": inbound["serviceUrl"],
+            "validated_path": "A",
+            "lifecycle_generation": a._lifecycle_generation,
+            "chat_generation": a._chat_generation(inbound["conversation"]["id"]),
+            "created_at": time.time(),
+        }
+        started = time.monotonic()
+        resp = await a._handle_file_consent(activity, validated_path="A")
+        ack_elapsed = time.monotonic() - started
+        assert resp.status == 200
+        assert ack_elapsed < 1.0
+        assert client.put.await_count == 0
+        gate.set()
+        for _ in range(50):
+            if client.put.await_count:
+                break
+            await asyncio.sleep(0)
+        assert client.put.await_count == 1
+
+    async def test_card_action_acks_before_slash_followup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+        import time
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        gate = asyncio.Event()
+
+        async def slow_send(*_args: Any, **_kwargs: Any) -> None:
+            await gate.wait()
+
+        monkeypatch.setattr(a, "_send_reply_activity", slow_send)
+        monkeypatch.setattr(
+            a,
+            "_gw_resolve_slash_confirm",
+            AsyncMock(return_value="Done."),
+        )
+        activity = plugin_tests._make_inbound(conv_id="conv-card-ack")
+        value = plugin_tests._seed_card_capability(
+            a,
+            activity,
+            kind="slash_confirm",
+            choice="once",
+            resolver={"session_key": "sess-1", "confirm_id": "cfm-1"},
+        )
+        started = time.monotonic()
+        resp = await a._handle_card_action(activity, value)
+        ack_elapsed = time.monotonic() - started
+        assert resp.status_code == 200
+        assert ack_elapsed < 1.0
+        gate.set()
+        await asyncio.sleep(0)
+
+    async def test_edit_message_no_retry_when_delay_none(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = plugin_tests._make_adapter(monkeypatch)
+        inbound = plugin_tests._make_inbound(conv_id="conv-none-delay")
+        first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-s"})
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=[first]
+        )
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
+        await a.edit_message("conv-none-delay", "m1", "A")
+        post_mock.reset_mock()
+        post_mock.side_effect = RuntimeError("network blip")
+        monkeypatch.setattr(a, "_stream_edit_retry_delay_sec", lambda *_a, **_k: None)
+        result = await a.edit_message("conv-none-delay", "m1", "A B")
+        assert result.success is False
+        assert post_mock.await_count == 1

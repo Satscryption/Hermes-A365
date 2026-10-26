@@ -21,9 +21,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   ``hermes_a365.outbound_retry`` helper retries Bot Framework replies and
   proactive sends on HTTP 429 only (no 5xx replay on non-idempotent
   creates), typing on 429 only (at most one retry), stream edits with
-  capped ``Retry-After``, OneDrive upload PUTs on 429 and transient 5xx,
-  and ``activity_bridge.send_reply`` with a cumulative retry budget that
-  fits the #214 keepalive interval. Refs
+  capped ``Retry-After`` (no retry when the remaining stream lifetime is
+  below the streaming minimum gap), and OneDrive upload PUTs on 429 and
+  transient 5xx off the invoke ack path. Serve ``/api/messages`` shares one
+  absolute ~14s ack deadline across operator webhook forward, token mint,
+  and BF reply; each outbound attempt clamps its HTTP timeout to the
+  remaining budget (capped at 15s) and skips starting a new attempt when
+  too little time remains. A 429 whose ``Retry-After`` exceeds the remainder
+  fails fast instead of sleeping. Post-ack adapter sends (send, proactive,
+  typing, Copilot turn-buffer) keep a separate 25s relative budget. Refs
   [#190](https://github.com/Satscryption/Hermes-A365/issues/190).
 
 - **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a

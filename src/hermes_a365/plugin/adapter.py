@@ -2069,6 +2069,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # ``_active_stream_by_chat``) — a gateway restart drops pending offers,
         # so a late Accept acks gracefully without an upload.
         self._pending_file_uploads: dict[str, dict[str, Any]] = {}
+        self._file_consent_upload_tasks: set[asyncio.Task[Any]] = set()
         # Decline notices are sent once per consentId (BF invoke retries).
         self._file_consent_decline_notified: set[str] = set()
         self._card_capabilities: dict[str, dict[str, Any]] = {}
@@ -9469,16 +9470,19 @@ class Agent365Adapter(BasePlatformAdapter):
             request_with_outbound_retry,
         )
 
+        async def _post_once(timeout_sec: float) -> Any:
+            return await client.post(
+                url,
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=timeout_sec,
+            )
+
         try:
             resp = await self._await_outbound(
                 chat_id,
                 request_with_outbound_retry(
-                    lambda: client.post(
-                        url,
-                        json=activity,
-                        headers={"Authorization": f"Bearer {token}"},
-                        timeout=15.0,
-                    ),
+                    _post_once,
                     call_site="adapter._send_proactive",
                     max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
                     total_budget_sec=OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
@@ -9719,12 +9723,12 @@ class Agent365Adapter(BasePlatformAdapter):
             request_with_outbound_retry,
         )
 
-        async def _post_once() -> Any:
+        async def _post_once(timeout_sec: float) -> Any:
             return await client.post(
                 url,
                 json=activity,
                 headers={"Authorization": f"Bearer {token}"},
-                timeout=15.0,
+                timeout=timeout_sec,
             )
 
         resp = await self._await_outbound(
@@ -10455,26 +10459,77 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
             await _remove_consent_card()
             return invoke.InvokeResponse(status=200, body={})
+        upload_task = asyncio.create_task(
+            self._run_file_consent_upload_accept(
+                activity=activity,
+                validated_path=validated_path,
+                pending=pending,
+                upload_info=upload_info,
+                upload_url=upload_url,
+                data=data,
+                size=size,
+                consent_id=consent_id,
+                pending_chat_id=pending_chat_id,
+                generation=generation,
+                chat_generation=chat_generation,
+                client=client,
+                remove_consent_card=_remove_consent_card,
+            )
+        )
+        self._file_consent_upload_tasks.add(upload_task)
+        upload_task.add_done_callback(self._file_consent_upload_tasks.discard)
+        return invoke.InvokeResponse(status=200, body={})
+
+    async def _drain_file_consent_upload_tasks(self) -> None:
+        """Wait for post-ack file-consent upload tasks (tests and shutdown)."""
+        for _ in range(200):
+            if not self._file_consent_upload_tasks:
+                return
+            tasks = list(self._file_consent_upload_tasks)
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await asyncio.sleep(0)
+
+    async def _run_file_consent_upload_accept(
+        self,
+        *,
+        activity: dict[str, Any],
+        validated_path: str | None,
+        pending: dict[str, Any],
+        upload_info: dict[str, Any],
+        upload_url: str,
+        data: bytes,
+        size: int,
+        consent_id: str,
+        pending_chat_id: str,
+        generation: int,
+        chat_generation: int,
+        client: Any,
+        remove_consent_card: Any,
+    ) -> None:
+        """Upload bytes and post the FileInfoCard off the invoke ack path."""
         from hermes_a365.outbound_retry import (
             OUTBOUND_DEFAULT_MAX_ATTEMPTS,
             OUTBOUND_FILE_UPLOAD_TOTAL_BUDGET_SEC,
             request_with_outbound_retry,
         )
 
+        async def _put_once(timeout_sec: float) -> Any:
+            return await client.put(
+                upload_url,
+                content=data,
+                headers={
+                    "Content-Length": str(size),
+                    "Content-Range": f"bytes 0-{size - 1}/{size}",
+                },
+                timeout=min(60.0, timeout_sec),
+                follow_redirects=False,
+            )
+
         try:
             put_resp = await self._await_outbound(
                 pending_chat_id,
                 request_with_outbound_retry(
-                    lambda: client.put(
-                        upload_url,
-                        content=data,
-                        headers={
-                            "Content-Length": str(size),
-                            "Content-Range": f"bytes 0-{size - 1}/{size}",
-                        },
-                        timeout=60.0,
-                        follow_redirects=False,
-                    ),
+                    _put_once,
                     call_site="adapter._handle_file_consent.upload",
                     max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
                     allow_transient_5xx=True,
@@ -10484,12 +10539,12 @@ class Agent365Adapter(BasePlatformAdapter):
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
             if status_code < 200 or status_code >= 300:
                 logger.error("agent365 fileConsent upload HTTP %s", status_code)
-                await _remove_consent_card()
-                return invoke.InvokeResponse(status=200, body={})
+                await remove_consent_card()
+                return
         except Exception as e:
             logger.error("agent365 fileConsent upload failed: %s", e)
-            await _remove_consent_card()
-            return invoke.InvokeResponse(status=200, body={})
+            await remove_consent_card()
+            return
 
         if not self._lifecycle_is_current(
             generation, client
@@ -10498,14 +10553,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 fileConsent upload completed after lifecycle change consent=%s",
                 consent_id[:8],
             )
-            await _remove_consent_card()
-            return invoke.InvokeResponse(status=200, body={})
+            await remove_consent_card()
+            return
 
-        await _remove_consent_card()
+        await remove_consent_card()
 
-        # Confirm with a FileInfoCard so the file renders inline in the chat.
-        # Best-effort — the upload already succeeded, so a failed card is logged,
-        # not surfaced as an error.
         info_card = {
             "contentType": _FILE_INFO_CONTENT_TYPE,
             "contentUrl": upload_info.get("contentUrl"),
@@ -10538,7 +10590,6 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 fileConsent info card failed: %s", e)
 
         logger.info("agent365 fileConsent uploaded %d bytes consent=%s", size, consent_id[:8])
-        return invoke.InvokeResponse(status=200, body={})
 
     # ── #80 Teams messageReaction + #73(c) feedback correlation ───────────
 
@@ -11773,11 +11824,24 @@ class Agent365Adapter(BasePlatformAdapter):
                     and self._lifecycle_is_current(action_generation)
                     and self._chat_lifecycle_is_current(conv_id, action_chat_generation)
                 ):
-                    # The resolver returns a follow-up (command result / cancelled
-                    # notice) the adapter must post as a new message.
-                    await self._send_reply_activity(
-                        inbound=activity, content=str(follow), log_context="slash_confirm"
-                    )
+                    # Post the follow-up after the HTTP ack so connector retries
+                    # cannot hit a consumed capability while send_reply is slow.
+                    follow_text = str(follow)
+
+                    async def _post_slash_confirm_follow() -> None:
+                        try:
+                            await self._send_reply_activity(
+                                inbound=activity,
+                                content=follow_text,
+                                log_context="slash_confirm",
+                            )
+                        except Exception as post_err:
+                            logger.error(
+                                "agent365 slash_confirm follow-up post failed: %s",
+                                post_err,
+                            )
+
+                    asyncio.create_task(_post_slash_confirm_follow())
             elif kind == _CARD_KIND_CLARIFY:
                 clarify_id = str(resolver.get("clarify_id") or "")
                 if choice == "__other__":
@@ -11930,34 +11994,44 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_id, chat_generation
         )
 
-    def _stream_edit_retry_delay_sec(
-        self,
-        attempt: int,
-        response: Any | None,
-        state: dict[str, Any],
-        loop_now: float,
-    ) -> float:
-        from hermes_a365.outbound_retry import compute_backoff_delay_sec
-
-        delay = compute_backoff_delay_sec(
-            attempt,
-            response,
-            fallback_delay_sec=_STREAMING_MIN_GAP_SEC,
-        )
-        delay = max(delay, _STREAMING_MIN_GAP_SEC)
+    @staticmethod
+    def _personal_stream_cap_remaining_sec(state: dict[str, Any], loop_now: float) -> float:
         opened_ts = state.get("opened_ts")
         age = (
             loop_now - float(opened_ts)
             if isinstance(opened_ts, (int, float))
             else 0.0
         )
-        remaining = max(
+        return max(
             0.0,
             _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
             - _ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
             - age,
         )
-        return min(delay, remaining)
+
+    def _stream_edit_retry_delay_sec(
+        self,
+        attempt: int,
+        response: Any | None,
+        state: dict[str, Any],
+    ) -> float | None:
+        """Delay before a stream-edit retry, or None when the cap forbids another POST."""
+        from hermes_a365.outbound_retry import compute_backoff_delay_sec
+
+        loop_now = asyncio.get_event_loop().time()
+        remaining = self._personal_stream_cap_remaining_sec(state, loop_now)
+        if remaining < _STREAMING_MIN_GAP_SEC:
+            return None
+        delay = compute_backoff_delay_sec(
+            attempt,
+            response,
+            fallback_delay_sec=_STREAMING_MIN_GAP_SEC,
+        )
+        delay = max(delay, _STREAMING_MIN_GAP_SEC)
+        capped = min(delay, remaining)
+        if capped < _STREAMING_MIN_GAP_SEC:
+            return None
+        return capped
 
     @staticmethod
     def _personal_reply_anchor(reply_to: Any, inbound: dict[str, Any] | None) -> str:
@@ -12531,9 +12605,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     attempt=attempt,
                 )
                 if self._stream_edit_should_retry(state, http_status=None, attempt=attempt):
-                    delay = self._stream_edit_retry_delay_sec(
-                        attempt, None, state, loop_now
-                    )
+                    delay = self._stream_edit_retry_delay_sec(attempt, None, state)
+                    if delay is None:
+                        self._drop_stream_state_if_unopened(chat_id, message_id, state)
+                        return SendResult(success=False, error=last_error)
                     logger.info(
                         "outbound send retry: call_site=adapter.edit_message "
                         "status=none attempt=%s/%s delay_sec=%.2f",
@@ -12706,7 +12781,10 @@ class Agent365Adapter(BasePlatformAdapter):
             # is the pre-#64 failure mode, and a plain send while this
             # stream is open is suppressed.
             if self._stream_edit_should_retry(state, http_status=resp.status_code, attempt=attempt):
-                delay = self._stream_edit_retry_delay_sec(attempt, resp, state, loop_now)
+                delay = self._stream_edit_retry_delay_sec(attempt, resp, state)
+                if delay is None:
+                    self._drop_stream_state_if_unopened(chat_id, message_id, state)
+                    return SendResult(success=False, error=last_error)
                 logger.info(
                     "outbound send retry: call_site=adapter.edit_message "
                     "status=%s attempt=%s/%s delay_sec=%.2f",

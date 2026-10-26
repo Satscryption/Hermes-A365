@@ -21713,6 +21713,7 @@ class TestOutboundFiles:
         )
 
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         # Bytes PUT to the pre-authenticated OneDrive session with the range header.
         assert a._http_client.put.await_count == 1
         assert a._http_client.put.await_args.args[0] == upload_info["uploadUrl"]
@@ -21770,6 +21771,7 @@ class TestOutboundFiles:
 
         release_put.set()
         response = await asyncio.wait_for(acceptance, timeout=0.5)
+        await a._drain_file_consent_upload_tasks()
 
         assert response.status == 200
         assert old_client.put.await_count == 1
@@ -21881,6 +21883,7 @@ class TestOutboundFiles:
             validated_path="A",
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         assert a._http_client.delete.await_count == 1
 
     @pytest.mark.asyncio
@@ -21939,13 +21942,15 @@ class TestOutboundFiles:
             validated_path="A",
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         # Upload failed → no confirmation card, pending consumed (no retry loop).
         assert send_reply.await_count == 0
         assert "c1" not in a._pending_file_uploads
 
     # ── route: fileConsent/invoke reaches the handler ─────────────────────
 
-    def test_route_file_consent_invoke_dispatches_handler(
+    @pytest.mark.asyncio
+    async def test_route_file_consent_invoke_dispatches_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from fastapi.testclient import TestClient
@@ -21985,6 +21990,7 @@ class TestOutboundFiles:
         assert r.status_code == 200, r.text
         # Handled inline — never dispatched to the fire-and-forget agent loop.
         assert a._handled_events == []
+        await a._drain_file_consent_upload_tasks()
         assert a._http_client.put.await_count == 1
         assert "c1" not in a._pending_file_uploads
 
@@ -22522,6 +22528,10 @@ class TestInteractiveCards:
         )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
+        for _ in range(50):
+            if send_reply.await_count:
+                break
+            await asyncio.sleep(0)
         # The resolver's follow-up text is posted as a reply.
         assert send_reply.await_args.kwargs["reply"]["text"] == "Command ran."
 

@@ -6,19 +6,19 @@ proactive ``sendToConversation`` POST) retry **HTTP 429 only** — a 502/503/504
 may already have stored the activity, matching existing ReadTimeout handling.
 
 Idempotent or safe-to-repeat calls may opt into transient 5xx retries (full-range
-OneDrive upload PUT; stream edits on an open stream with the legacy edit rules).
+OneDrive upload PUT after invoke ack; stream edits on an open stream).
 
 Call sites wired through :func:`request_with_outbound_retry`:
 
-- ``activity_bridge.send_reply`` — BF reply POST (**429 only**; total budget
-  fits the #214 keepalive interval).
+- ``activity_bridge.send_reply`` — BF reply POST (**429 only**); adapter callers
+  use a 25s relative budget (#214 keepalive); serve ``/api/messages`` shares one
+  absolute ack deadline for webhook forward, token mint, and reply.
 - ``adapter._post_activity`` — typing (**429 only**, at most one retry).
 - ``adapter._send_proactive`` — proactive POST (**429 only**).
-- ``adapter._send_reply_activity`` — via ``send_reply``.
-- ``adapter.edit_message`` stream POST loop — 429/500/502/503/504 with the
-  stream-edit attempt budget; ``Retry-After`` is floored at the streaming gap
-  and capped by remaining stream lifetime.
-- ``adapter._handle_file_consent`` — OneDrive upload PUT (429 + transient 5xx).
+- ``adapter.edit_message`` stream POST loop — honours ``Retry-After`` floored at
+  the streaming gap and capped by live remaining stream lifetime; no retry when
+  remainder is below the gap.
+- ``adapter._handle_file_consent`` upload — post-ack background task (60s budget).
 """
 
 from __future__ import annotations
@@ -38,16 +38,59 @@ logger = logging.getLogger(__name__)
 OUTBOUND_RETRY_AFTER_CAP_SEC = 30.0
 OUTBOUND_DEFAULT_MAX_ATTEMPTS = 4
 OUTBOUND_TYPING_MAX_ATTEMPTS = 2  # initial try + at most one retry
-# Keep total retry wait within adapter._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC (#214).
+OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC = 15.0
+# Post-ack adapter sends (send, proactive, typing, turn-buffer).
 OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC = 25.0
+# Serve ``/api/messages``: absolute end-to-end budget under BF ~15s activity timeout.
+OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC = 14.0
+OUTBOUND_MIN_ATTEMPT_BUDGET_SEC = 1.0
 OUTBOUND_FILE_UPLOAD_TOTAL_BUDGET_SEC = 60.0
 
 RETRYABLE_THROTTLE = frozenset({429})
 RETRYABLE_TRANSIENT_5XX = frozenset({502, 503, 504})
-# Teams stream edits also retry 500 (existing _STREAM_EDIT_RETRY_STATUSES).
 RETRYABLE_STREAM_EDIT = RETRYABLE_THROTTLE | RETRYABLE_TRANSIENT_5XX | frozenset({500})
 
 SleepFn = Callable[[float], Awaitable[Any]]
+SendOnceFn = Callable[[float], Awaitable[Any]]
+
+
+def remaining_until_deadline(deadline: float | None) -> float | None:
+    if deadline is None:
+        return None
+    return max(0.0, deadline - time.monotonic())
+
+
+def outbound_attempt_timeout_sec(
+    deadline: float | None,
+    default: float = OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
+) -> float:
+    remaining = remaining_until_deadline(deadline)
+    if remaining is None:
+        return default
+    return min(default, remaining)
+
+
+def can_start_outbound_attempt(deadline: float | None) -> bool:
+    remaining = remaining_until_deadline(deadline)
+    if remaining is None:
+        return True
+    return remaining >= OUTBOUND_MIN_ATTEMPT_BUDGET_SEC
+
+
+def resolve_outbound_deadline(
+    *,
+    deadline: float | None = None,
+    total_budget_sec: float | None = None,
+) -> float | None:
+    if deadline is not None:
+        return deadline
+    if total_budget_sec is not None and total_budget_sec > 0.0:
+        return time.monotonic() + total_budget_sec
+    return None
+
+
+def new_webhook_ack_deadline() -> float:
+    return time.monotonic() + OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC
 
 
 def parse_retry_after_seconds(
@@ -121,7 +164,6 @@ def compute_backoff_delay_sec(
         return retry_after
     if fallback_delay_sec > 0.0:
         return fallback_delay_sec
-    # attempt 1 failed → wait ~1s before attempt 2, etc.
     exp = min(max_exponential_sec, float(2 ** max(0, attempt - 1)))
     jittered = random.uniform(0.5 * exp, exp)
     return min(jittered, max_exponential_sec)
@@ -137,7 +179,7 @@ def clamp_retry_delay_sec(delay: float, remaining_budget_sec: float | None) -> f
 
 
 async def request_with_outbound_retry(
-    send_once: Callable[[], Awaitable[Any]],
+    send_once: SendOnceFn,
     *,
     call_site: str,
     max_attempts: int = OUTBOUND_DEFAULT_MAX_ATTEMPTS,
@@ -145,33 +187,33 @@ async def request_with_outbound_retry(
     allow_500: bool = False,
     retry_after_cap: float = OUTBOUND_RETRY_AFTER_CAP_SEC,
     fallback_delay_sec: float = 0.0,
+    deadline: float | None = None,
     total_budget_sec: float | None = None,
     sleep: SleepFn | None = None,
     before_retry: Callable[[int, int, Any], Awaitable[bool]] | None = None,
 ) -> Any:
-    """Execute ``send_once`` until success, non-retryable status, or attempts exhausted.
-
-    ``send_once`` must perform one HTTP round-trip and return a response-like object
-    with ``status_code``. Exceptions propagate immediately (not retried here).
-
-    When ``total_budget_sec`` is set, cumulative sleep between attempts is clamped so
-    the helper does not exceed that wall-clock budget (monotonic clock).
-    """
+    """Execute ``send_once(timeout_sec)`` until success, failure, or budget exhausted."""
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
     sleep_fn: SleepFn = sleep if sleep is not None else asyncio.sleep
-    deadline: float | None = None
-    if total_budget_sec is not None and total_budget_sec > 0.0:
-        deadline = time.monotonic() + total_budget_sec
-
-    def remaining_budget() -> float | None:
-        if deadline is None:
-            return None
-        return max(0.0, deadline - time.monotonic())
+    eff_deadline = resolve_outbound_deadline(deadline=deadline, total_budget_sec=total_budget_sec)
 
     last_response: Any = None
     for attempt in range(1, max_attempts + 1):
-        last_response = await send_once()
+        if not can_start_outbound_attempt(eff_deadline):
+            logger.warning(
+                "outbound send gave up: call_site=%s reason=ack_budget_before_attempt",
+                call_site,
+            )
+            break
+        timeout = outbound_attempt_timeout_sec(eff_deadline)
+        if eff_deadline is not None and timeout <= 0.0:
+            logger.warning(
+                "outbound send gave up: call_site=%s reason=ack_budget_before_attempt",
+                call_site,
+            )
+            break
+        last_response = await send_once(timeout)
         status = http_status_code(last_response)
         if status is None:
             return last_response
@@ -191,14 +233,27 @@ async def request_with_outbound_retry(
                 attempt,
             )
             return last_response
+        remaining = remaining_until_deadline(eff_deadline)
+        retry_after = (
+            parse_retry_after_seconds(last_response, cap_sec=retry_after_cap)
+            if status in RETRYABLE_THROTTLE
+            else 0.0
+        )
+        if remaining is not None and retry_after > remaining:
+            logger.warning(
+                "outbound send gave up: call_site=%s status=%s reason=retry_after_exceeds_budget",
+                call_site,
+                status,
+            )
+            return last_response
         delay = compute_backoff_delay_sec(
             attempt,
             last_response,
             retry_after_cap=retry_after_cap,
             fallback_delay_sec=fallback_delay_sec,
         )
-        delay = clamp_retry_delay_sec(delay, remaining_budget())
-        if delay <= 0.0:
+        delay = clamp_retry_delay_sec(delay, remaining)
+        if delay <= 0.0 or not can_start_outbound_attempt(eff_deadline):
             logger.warning(
                 "outbound send gave up: call_site=%s status=%s reason=retry_budget_exhausted",
                 call_site,

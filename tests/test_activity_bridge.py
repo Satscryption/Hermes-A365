@@ -3010,6 +3010,67 @@ class TestServeApp:
         assert "/v3/conversations/conv-1/activities/1234" in reply_url
         assert capture["reply"][0]["body"]["text"] == "hi back"
 
+    def test_serve_webhook_ack_deadline_on_slow_429(self) -> None:
+        import time
+
+        from hermes_a365.outbound_retry import OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC
+
+        capture: dict[str, Any] = {
+            "webhook": [],
+            "reply": [],
+            "token": [],
+            "reply_times": [],
+        }
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            url = str(req.url)
+            if "/oauth2/v2.0/token" in url:
+                body = req.content.decode()
+                params: dict[str, str] = {}
+                for kv in body.split("&"):
+                    k, _, v = kv.partition("=")
+                    params[k] = urllib.parse.unquote_plus(v)
+                capture["token"].append(params)
+                grant = params.get("grant_type", "")
+                if params.get("fmi_path"):
+                    return httpx.Response(
+                        200, json={"access_token": "T1", "expires_in": 3600}
+                    )
+                if grant == "user_fic":
+                    return httpx.Response(
+                        200, json={"access_token": "FINAL", "expires_in": 3600}
+                    )
+                return httpx.Response(
+                    200, json={"access_token": "T2", "expires_in": 3600}
+                )
+            if url.startswith("https://hook.test/responder"):
+                capture["webhook"].append(time.monotonic())
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "3600"},
+                    text="throttled",
+                )
+            if "/v3/conversations/" in url:
+                capture["reply_times"].append(time.monotonic())
+                capture["reply"].append(
+                    {"url": url, "body": json.loads(req.content)}
+                )
+                return httpx.Response(200, json={})
+            return httpx.Response(404, text=f"unhandled {url}")
+
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        app = make_app(cfg, http_client=http_client)
+        started = time.monotonic()
+        with TestClient(app) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+        elapsed = time.monotonic() - started
+        assert r.status_code == 200
+        assert elapsed < OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC + 2.5
+        deadline_end = started + OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC + 1.0
+        assert all(t <= deadline_end for t in capture["reply_times"])
+
     def test_reply_url_percent_encodes_inbound_ids(self) -> None:
         # #103/M4: conv id / activity id come from the inbound webhook body and
         # are interpolated into the outbound BF URL. A Teams-shaped conv id and

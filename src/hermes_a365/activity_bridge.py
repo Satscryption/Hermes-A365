@@ -2610,14 +2610,25 @@ def _agentic_ids_from_activity(activity: dict[str, Any]) -> tuple[str, str, str]
 
 
 async def _post_token_request(
-    client: Any, *, tenant_id: str, body: dict[str, str]
+    client: Any,
+    *,
+    tenant_id: str,
+    body: dict[str, str],
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """POST a form-encoded token request and return the parsed JSON."""
+    from hermes_a365.outbound_retry import (
+        can_start_outbound_attempt,
+        outbound_attempt_timeout_sec,
+    )
+
+    if not can_start_outbound_attempt(deadline):
+        raise RuntimeError("outbound ack budget exhausted before token request")
     resp = await client.post(
         TENANT_TOKEN_URL_TEMPLATE.format(tenant_id=tenant_id),
         data=body,
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=15.0,
+        timeout=outbound_attempt_timeout_sec(deadline),
     )
     resp.raise_for_status()
     return resp.json()
@@ -2630,11 +2641,13 @@ async def acquire_t1_token(
     blueprint_client_id: str,
     blueprint_client_secret: str,
     agent_app_instance_id: str,
+    deadline: float | None = None,
 ) -> tuple[str, float]:
     """T1: blueprint impersonates the agent identity (FMI exchange)."""
     payload = await _post_token_request(
         client,
         tenant_id=tenant_id,
+        deadline=deadline,
         body={
             "client_id": blueprint_client_id,
             "scope": FMI_TOKEN_SCOPE,
@@ -2652,11 +2665,13 @@ async def acquire_t2_token(
     tenant_id: str,
     agent_app_instance_id: str,
     t1: str,
+    deadline: float | None = None,
 ) -> tuple[str, float]:
     """T2: agent identity asserts itself using T1 as client_assertion."""
     payload = await _post_token_request(
         client,
         tenant_id=tenant_id,
+        deadline=deadline,
         body={
             "client_id": agent_app_instance_id,
             "scope": FMI_TOKEN_SCOPE,
@@ -2677,11 +2692,13 @@ async def acquire_user_fic_token(
     t2: str,
     agentic_user_id: str,
     scope: str = APX_PRODUCTION_SCOPE,
+    deadline: float | None = None,
 ) -> tuple[str, float]:
     """Final stage: user-context token via ``grant_type=user_fic``."""
     payload = await _post_token_request(
         client,
         tenant_id=tenant_id,
+        deadline=deadline,
         body={
             "client_id": agent_app_instance_id,
             "scope": scope,
@@ -2729,6 +2746,7 @@ async def acquire_outbound_token(
     user_cache: _UserTokenCache,
     scope: str = APX_PRODUCTION_SCOPE,
     now: float | None = None,
+    deadline: float | None = None,
 ) -> str:
     """Return a bearer token for replying to ``activity`` at ``scope``.
 
@@ -2827,12 +2845,14 @@ async def acquire_outbound_token(
             blueprint_client_id=cfg.blueprint_client_id,
             blueprint_client_secret=cfg.blueprint_client_secret,
             agent_app_instance_id=agent_app_instance_id,
+            deadline=deadline,
         )
         t2, t2_ttl = await acquire_t2_token(
             client=client,
             tenant_id=tenant_id,
             agent_app_instance_id=agent_app_instance_id,
             t1=t1,
+            deadline=deadline,
         )
         fmi_cache.by_key[fmi_key] = (t1, t2, cur + min(t1_ttl, t2_ttl))
 
@@ -2844,6 +2864,7 @@ async def acquire_outbound_token(
         t2=t2,
         agentic_user_id=agentic_user_id,
         scope=scope,
+        deadline=deadline,
     )
     user_cache.by_key[user_key] = (final, cur + final_ttl)
     return final
@@ -2863,6 +2884,7 @@ async def acquire_bf_s2s_token(
     bf_cache: _BfTokenCache,
     scope: str = BF_S2S_SCOPE,
     now: float | None = None,
+    deadline: float | None = None,
 ) -> str:
     """Mint a classic Bot Framework S2S bearer for Path B outbound.
 
@@ -2905,6 +2927,13 @@ async def acquire_bf_s2s_token(
         raise BridgeConfigError(
             "httpx not installed; run `uv sync --extra bridge`"
         )
+    from hermes_a365.outbound_retry import (
+        can_start_outbound_attempt,
+        outbound_attempt_timeout_sec,
+    )
+
+    if not can_start_outbound_attempt(deadline):
+        raise RuntimeError("outbound ack budget exhausted before BF S2S token request")
     resp = await client.post(
         TENANT_TOKEN_URL_TEMPLATE.format(tenant_id=tenant_id),
         data={
@@ -2914,7 +2943,7 @@ async def acquire_bf_s2s_token(
             "client_secret": blueprint_client_secret,
         },
         headers={"Content-Type": "application/x-www-form-urlencoded"},
-        timeout=15.0,
+        timeout=outbound_attempt_timeout_sec(deadline),
     )
     if resp.status_code >= 400:
         # Try to surface AADSTS82001 specifically — it has a fix that
@@ -2998,6 +3027,7 @@ async def acquire_reply_token(
     scope_b: str = BF_S2S_SCOPE,
     now: float | None = None,
     validated_path: str | None,
+    deadline: float | None = None,
 ) -> tuple[str, str]:
     """Dispatch outbound token mint by inbound path.
 
@@ -3037,6 +3067,7 @@ async def acquire_reply_token(
             user_cache=user_cache,
             scope=scope_a,
             now=now,
+            deadline=deadline,
         )
         return token, "A"
     if path_tag == "B":
@@ -3058,6 +3089,7 @@ async def acquire_reply_token(
             bf_cache=bf_cache,
             scope=scope_b,
             now=now,
+            deadline=deadline,
         )
         return token, "B"
     raise RuntimeError(
@@ -3195,15 +3227,32 @@ def build_webhook_envelope(activity: dict[str, Any], cfg: BridgeConfig) -> dict[
 
 
 async def forward_to_webhook(
-    *, envelope: dict[str, Any], cfg: BridgeConfig, client: Any
+    *,
+    envelope: dict[str, Any],
+    cfg: BridgeConfig,
+    client: Any,
+    deadline: float | None = None,
 ) -> dict[str, Any]:
     """POST the envelope to the operator's responder. Returns the parsed
     response. Raises ``RuntimeError`` on non-2xx so the caller can render
     a fallback Adaptive Card."""
-    resp = await client.post(
-        cfg.webhook_url,
-        json=envelope,
-        timeout=cfg.webhook_timeout_seconds,
+    from hermes_a365.outbound_retry import (
+        OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+        request_with_outbound_retry,
+    )
+
+    async def send_once(timeout_sec: float) -> Any:
+        return await client.post(
+            cfg.webhook_url,
+            json=envelope,
+            timeout=min(cfg.webhook_timeout_seconds, timeout_sec),
+        )
+
+    resp = await request_with_outbound_retry(
+        send_once,
+        call_site="activity_bridge.forward_to_webhook",
+        max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+        deadline=deadline,
     )
     resp.raise_for_status()
     if not resp.content:
@@ -3391,6 +3440,8 @@ async def send_reply(
     user_cache: _UserTokenCache,
     bf_cache: _BfTokenCache | None = None,
     validated_path: str | None,
+    deadline: float | None = None,
+    retry_total_budget_sec: float | None = None,
 ) -> Any:
     """POST a reply Activity to the inbound's serviceUrl.
 
@@ -3435,6 +3486,7 @@ async def send_reply(
         user_cache=user_cache,
         bf_cache=bf_cache,
         validated_path=validated_path,
+        deadline=deadline,
     )
     from hermes_a365.outbound_retry import (
         OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
@@ -3442,12 +3494,22 @@ async def send_reply(
         request_with_outbound_retry,
     )
 
-    async def _post_once() -> Any:
+    retry_kwargs: dict[str, Any] = {}
+    if deadline is not None:
+        retry_kwargs["deadline"] = deadline
+    else:
+        retry_kwargs["total_budget_sec"] = (
+            retry_total_budget_sec
+            if retry_total_budget_sec is not None
+            else OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+        )
+
+    async def _post_once(timeout_sec: float) -> Any:
         return await client.post(
             url,
             json=reply,
             headers={"Authorization": f"Bearer {token}"},
-            timeout=15.0,
+            timeout=timeout_sec,
         )
 
     try:
@@ -3455,7 +3517,7 @@ async def send_reply(
             _post_once,
             call_site="activity_bridge.send_reply",
             max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
-            total_budget_sec=OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
+            **retry_kwargs,
         )
     except Exception as exc:
         # Only this POST can have stored the activity. A ReadTimeout or
@@ -3562,6 +3624,9 @@ def make_app(
         activity: dict[str, Any] = _Body(...),  # noqa: B008 — FastAPI idiom
         authorization: str | None = _Header(default=None),
     ) -> Any:
+        from hermes_a365.outbound_retry import new_webhook_ack_deadline
+
+        ack_deadline = new_webhook_ack_deadline()
         try:
             _validate_activity_structure(activity)
         except ValueError as exc:
@@ -3725,7 +3790,10 @@ def make_app(
         envelope = build_webhook_envelope(activity, cfg)
         try:
             webhook_resp = await forward_to_webhook(
-                envelope=envelope, cfg=cfg, client=http_client
+                envelope=envelope,
+                cfg=cfg,
+                client=http_client,
+                deadline=ack_deadline,
             )
         except Exception as e:
             # An invoke's reply is the HTTP body of THIS request (#96/#97), so
@@ -3761,6 +3829,7 @@ def make_app(
                     user_cache=user_cache,
                     bf_cache=bf_cache,
                     validated_path=validated_path,
+                    deadline=ack_deadline,
                 )
             except Exception as reply_error:
                 return _reply_failed_response(reply_error)
@@ -3816,6 +3885,7 @@ def make_app(
                 user_cache=user_cache,
                 bf_cache=bf_cache,
                 validated_path=validated_path,
+                deadline=ack_deadline,
             )
         except Exception as e:
             return _reply_failed_response(e)
