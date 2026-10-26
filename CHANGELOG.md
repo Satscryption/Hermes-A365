@@ -6,6 +6,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.4] — 2026-10-26
+
+Inbound webhook JWKS fail-closed and admission hardening (#86, #205, #206),
+Hermes v0.22.3+ PyJWT pin (#148), and v1 matrix review follow-ups (#209).
+Ships merged work on `main@50e32745` (2026-10-26) via PRs #208, #219, and
+#221.
+
 ### Changed
 
 - **#209 — #126 review follow-ups.** CI Hermes source smoke adds the plugin
@@ -28,6 +35,23 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   v0.22.3+) and `fastapi>=0.143` for `hermes-agent[web]`. Document PyPI has no
   0.22.x release. CI Hermes source smoke includes tag `v0.22.5`. Refs
   [#148](https://github.com/Satscryption/Hermes-A365/issues/148).
+
+### Fixed
+
+- **#86 — inbound webhook JWKS, admission, and JWT path binding (#205,
+  #206).** JWKS caches fail closed after TTL when refresh fails, with a 300s
+  grace window; unknown `kid` forces refresh on both AAD and Bot Framework
+  validators (coalesced waiters, 60s forced-refresh throttle). `make_app`
+  reuses `PreAuthAdmissionMiddleware` (32 in-flight POSTs, 15s body deadline)
+  on `activity-bridge serve` alongside existing body/size limits; reverse-proxy
+  guidance updated. `BoundedRequestBodyMiddleware` pre-parses `/api/messages`
+  bodies via `parse_inbound_activity_payload` so deep nesting returns 400
+  instead of 500. Plugin invoke context and `TokenFactory.for_graph` require
+  the JWT-validated path (`validated_path` on handoff). README records
+  accepted M3 dedupe, BF JWKS endorsement, and per-process dedupe residuals.
+  Refs [#86](https://github.com/Satscryption/Hermes-A365/issues/86),
+  [#205](https://github.com/Satscryption/Hermes-A365/issues/205),
+  [#206](https://github.com/Satscryption/Hermes-A365/issues/206).
 
 ## [0.9.3] — 2026-10-25
 
@@ -2649,5 +2673,6 @@ Microsoft.Agents.A365.DevTools.Cli **1.1.171** (round-5 walkthrough,
   operators (only "blocked" via the M365 Admin Centre). Microsoft
   platform limitation; not a wrapper bug.
 
-[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.4...HEAD
+[0.9.4]: https://github.com/satscryption/Hermes-A365/compare/v0.9.3...v0.9.4
 [0.1.0]: https://github.com/satscryption/Hermes-A365/releases/tag/v0.1.0
