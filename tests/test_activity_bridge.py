@@ -4057,6 +4057,47 @@ class TestTokenFactory:
             )
 
     @pytest.mark.asyncio
+    async def test_for_graph_fail_closed_without_validated_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        path_a_mint = AsyncMock(return_value="tokenA")
+        path_b_mint = MagicMock(return_value={"access_token": "tokenB"})
+        monkeypatch.setattr(ab, "acquire_outbound_token", path_a_mint)
+        monkeypatch.setattr(ab, "acquire_token", path_b_mint)
+        path_a_activity = {
+            "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
+            "conversation": {"tenantId": "t"},
+        }
+        path_b_activity = {
+            "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
+            "recipient": {},
+            "conversation": {},
+        }
+        for activity in (path_a_activity, path_b_activity):
+            with pytest.raises(RuntimeError, match="Path A or Path B"):
+                await self._factory().for_graph(activity, validated_path=None)
+        path_a_mint.assert_not_called()
+        path_b_mint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_for_graph_fail_closed_on_non_ab_validated_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        mint = AsyncMock(return_value="tokenA")
+        monkeypatch.setattr(ab, "acquire_outbound_token", mint)
+        activity = {
+            "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
+            "conversation": {"tenantId": "t"},
+        }
+        with pytest.raises(RuntimeError, match="Path A or Path B"):
+            await self._factory().for_graph(activity, validated_path="unknown")
+        mint.assert_not_called()
+
+    @pytest.mark.asyncio
     async def test_for_app_and_for_workiq_not_implemented(self) -> None:
         tf = self._factory()
         with pytest.raises(NotImplementedError):

@@ -34,6 +34,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   the installed version is below the floor. The v1 support matrix documents az
   and .NET prerelease warn behaviour.
 
+- **#225 — `TokenFactory.for_graph` JWT path binding.** When
+  ``validated_path`` is not ``A`` or ``B``, fail closed to ``unknown`` (raise)
+  instead of re-deriving the path from the unauthenticated activity body — the
+  same rule plugin invoke already uses. Refs
+  [#225](https://github.com/Satscryption/Hermes-A365/issues/225).
+
 ### Changed
 
 - **#226 — Copilot pre-tool answers vs intent lead-ins.** Marked segments before
@@ -85,7 +91,8 @@ Ships merged work on `main@50e32745` (2026-10-26) via PRs #208, #219, and
   Hermes >= v0.22.3 can omit `overrides.txt`. `overrides.txt` keeps
   `pyjwt[crypto]>=2.15.0` (required for older supported refs; no-op on
   v0.22.3+) and `fastapi>=0.143` for `hermes-agent[web]`. Document PyPI has no
-  0.22.x release. CI Hermes source smoke includes tag `v0.22.5`. Refs
+  0.22.x release. CI Hermes source smoke includes tag `v0.22.5` (dropped
+  `v0.22.2` from `.github/workflows/test.yml`). Refs
   [#148](https://github.com/Satscryption/Hermes-A365/issues/148).
 
 ### Fixed
@@ -98,8 +105,8 @@ Ships merged work on `main@50e32745` (2026-10-26) via PRs #208, #219, and
   on `activity-bridge serve` alongside existing body/size limits; reverse-proxy
   guidance updated. `BoundedRequestBodyMiddleware` pre-parses `/api/messages`
   bodies via `parse_inbound_activity_payload` so deep nesting returns 400
-  instead of 500. Plugin invoke context and `TokenFactory.for_graph` require
-  the JWT-validated path (`validated_path` on handoff). README records
+  instead of 500. Plugin invoke context requires the JWT-validated path
+  (``validated_path`` on handoff; otherwise ``unknown``). README records
   accepted M3 dedupe, BF JWKS endorsement, and per-process dedupe residuals.
   Refs [#86](https://github.com/Satscryption/Hermes-A365/issues/86),
   [#205](https://github.com/Satscryption/Hermes-A365/issues/205),
@@ -811,9 +818,10 @@ down afterwards).
   agentic user. The mint-site documentation and tests now characterize the body-
   driven `user_fic` request and verify token-endpoint rejection fails closed.
   Live positive/negative Entra validation remains required by #107/#123.
-  **#100 M3** (dedupe pre-seed) remains unresolved and is explicitly owned by #86
-  (v0.9.3); a signed-token route test records the current suppress-on-pre-seed
-  behavior. Also corrected a stale module docstring that still advertised the
+  **#100 M3** (dedupe pre-seed) was recorded as an accepted residual in v0.9.4
+  ([#208](https://github.com/Satscryption/Hermes-A365/issues/208)); a signed-token
+  route test records the current suppress-on-pre-seed behavior. Also corrected a
+  stale module docstring that still advertised the
   pre-M2 `serviceUrl` allowlist.
 
 ### Destructive-CLI hardening (#102, WP1–WP3)
