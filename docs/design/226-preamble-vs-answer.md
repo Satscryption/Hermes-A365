@@ -1,12 +1,10 @@
 # #226 — Preamble versus a genuine answer before tool progress
 
-Status: design only. Do not treat this file as shipped behaviour.
+Status: implemented in PR [#234](https://github.com/Satscryption/Hermes-A365/pull/234) (shipped behaviour matches [Test cases](#test-cases)).
 Target issue: [#226](https://github.com/Satscryption/Hermes-A365/issues/226).
 Tree this was written against: `main` `868362ec` (PR [#223](https://github.com/Satscryption/Hermes-A365/pull/223) merged, the #214 rule).
 Related: [#214](https://github.com/Satscryption/Hermes-A365/issues/214), [#228](https://github.com/Satscryption/Hermes-A365/issues/228), [#217](https://github.com/Satscryption/Hermes-A365/issues/217), [#212](https://github.com/Satscryption/Hermes-A365/issues/212), [#227](https://github.com/Satscryption/Hermes-A365/issues/227), [#186](https://github.com/Satscryption/Hermes-A365/issues/186), [#182](https://github.com/Satscryption/Hermes-A365/issues/182).
 Copilot single-stream context: [182-copilot-chat-single-stream.md](182-copilot-chat-single-stream.md).
-
-The implementation PR should say `Fixes #226` and stay draft until the rows in [Test cases](#test-cases) pass. This note does not implement them.
 
 ## Recommendation
 
@@ -221,7 +219,6 @@ Record these on the v0.9.5 candidate in the walk095 note. #227's other scope ite
 
 ## Out of scope
 
-- Implementing the predicate, the rotation change, or the #228 flag clear.
 - Option 3's Hermes metadata. Revisit it only if a future Hermes splits lead-in from content inside one tool-call segment. Passing `finish_reason` through unchanged does not do that.
 - Personal 1:1 `streamType=streaming`.
 - Rewriting the #212 keepalive copy, the #217 stream-age hold, or the #182 delivery state machine.
