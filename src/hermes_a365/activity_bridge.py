@@ -3080,9 +3080,9 @@ class TokenFactory:
     handler needs — distinct from the reply/serviceUrl token
     ``acquire_reply_token`` mints.
 
-    Path A vs Path B selection reuses ``_inbound_path_tag`` — the SAME
-    classifier ``acquire_reply_token`` uses — so it does NOT re-derive the
-    token chain. In v0.8.0 no shipped invoke handler needs a tool token
+    ``for_graph`` binds Path A vs Path B to the JWT-validated ``validated_path``
+    (fail-closed when it is not ``A``/``B``). In v0.8.0 no shipped invoke handler
+    needs a tool token
     (``task/fetch`` is a pure card echo), so this is the landed *foundation
     seam* that v0.8.1 tool-backed names (``signin/tokenExchange``,
     ``fileConsent/invoke``, a Graph-backed ``search``) plug into without
@@ -3121,9 +3121,7 @@ class TokenFactory:
         directly). Raises for an unclassifiable activity rather than guessing.
         """
         path_tag = (
-            validated_path
-            if validated_path in ("A", "B")
-            else _inbound_path_tag(activity)
+            validated_path if validated_path in ("A", "B") else "unknown"
         )
         if path_tag == "A":
             return await acquire_outbound_token(
