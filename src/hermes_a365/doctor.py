@@ -5,7 +5,8 @@ verified 2026-05-04) and checks the prereqs the real CLI's own
 ``setup requirements`` enforces:
 
 - ``a365`` CLI present + version
-- ``az`` CLI present + signed in
+- ``az`` CLI present, version ≥ matrix floor, signed in
+- ``dotnet`` with ``Microsoft.NETCore.App`` ≥ 8.0 (Agent 365 CLI prerequisite)
 - ``pwsh`` (PowerShell 7+) on PATH — the CLI shells out to it for some
   steps; missing pwsh causes ``setup requirements`` to fail.
 - Custom Entra client app (named ``Agent 365 CLI`` by Microsoft's
@@ -51,6 +52,7 @@ from .activity_bridge import parse_agent_identity_ids
 from .compatibility import (
     A365_CLI_LIVE_VERIFIED,
     AZURE_CLI_MIN,
+    DOTNET_RUNTIME_MIN,
     HERMES_GATEWAY_PYTHON,
     HERMES_MULTIPLEX_MIN_CALENDAR,
     HERMES_PLUGIN_MIN_CALENDAR,
@@ -188,6 +190,82 @@ def probe_a365_cli() -> ProbeResult:
     )
 
 
+def _release_semver_triple(text: str) -> tuple[int, int, int] | None:
+    """Parse ``major.minor.patch`` tolerating build metadata and prerelease suffixes."""
+
+    match = re.search(
+        r"\bv?(\d+)\.(\d+)\.(\d+)(?:[.+-][0-9A-Za-z.-]+|b\d+)?\b",
+        text,
+    )
+    if not match:
+        return None
+    major, minor, patch = match.groups()
+    return int(major), int(minor), int(patch)
+
+
+def _load_az_version_json(text: str) -> dict[str, Any] | None:
+    """Parse the first JSON object in an ``az version -o json`` stream.
+
+    ``safe_run`` merges stderr into stdout, so the payload may be preceded or
+    followed by ``WARNING:`` lines and pretty-printed across multiple lines.
+    """
+
+    if not text:
+        return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        payload, _end = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+_AZ_CLI_PRERELEASE_RE = re.compile(
+    r"-(?:preview|rc|alpha|beta)|\d+b\d+",
+    re.IGNORECASE,
+)
+
+
+def _az_cli_version_is_prerelease(raw: str) -> bool:
+    return bool(_AZ_CLI_PRERELEASE_RE.search(raw))
+
+
+def _az_cli_version_below_floor(
+    parsed: tuple[int, int, int] | None,
+    raw: str | None,
+) -> bool:
+    if parsed is None:
+        return False
+    if raw and _az_cli_version_is_prerelease(raw):
+        return True
+    return parsed < AZURE_CLI_MIN
+
+
+def parse_az_cli_version_fields(
+    text: str,
+) -> tuple[str | None, tuple[int, int, int] | None]:
+    """Return ``(azure-cli raw string, parsed triple)`` from version JSON."""
+
+    payload = _load_az_version_json(text)
+    if payload is None:
+        return None, None
+    for key in ("azure-cli", "azure_cli"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value, _release_semver_triple(value)
+    return None, None
+
+
+def parse_az_cli_version(text: str) -> tuple[int, int, int] | None:
+    """Extract ``azure-cli`` from ``az version -o json`` (never other JSON fields)."""
+
+    _raw, parsed = parse_az_cli_version_fields(text)
+    return parsed
+
+
 def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
     """Extract the first semantic ``major.minor.patch`` from CLI output.
 
@@ -195,11 +273,82 @@ def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
     ``Agent 365 Developer Tools CLI v1.1.171``. Build metadata and
     preview suffixes are irrelevant for the doctor floor check.
     """
-    match = re.search(r"\bv?(\d+)\.(\d+)\.(\d+)(?:[.+-][0-9A-Za-z.-]+)?\b", text)
-    if not match:
-        return None
-    major, minor, patch = match.groups()
-    return int(major), int(minor), int(patch)
+    return _release_semver_triple(text)
+
+
+_DOTNET_PRERELEASE_RE = re.compile(r"-(?:preview|rc|alpha|beta)", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class DotnetRuntimeScan:
+    best_stable: tuple[int, int, int] | None
+    best_prerelease: tuple[int, int, int] | None
+
+
+def _parse_dotnet_runtime_token(token: str) -> tuple[tuple[int, int, int] | None, bool]:
+    is_prerelease = bool(_DOTNET_PRERELEASE_RE.search(token))
+    triple = _release_semver_triple(token)
+    return triple, is_prerelease
+
+
+def parse_dotnet_list_runtimes(text: str) -> DotnetRuntimeScan:
+    """Return the highest stable and prerelease ``Microsoft.NETCore.App`` versions."""
+
+    best_stable: tuple[int, int, int] | None = None
+    best_prerelease: tuple[int, int, int] | None = None
+    for line in text.splitlines():
+        parts = line.split()
+        if len(parts) < 2 or parts[0] != "Microsoft.NETCore.App":
+            continue
+        triple, is_prerelease = _parse_dotnet_runtime_token(parts[1])
+        if triple is None:
+            continue
+        if is_prerelease:
+            if best_prerelease is None or triple > best_prerelease:
+                best_prerelease = triple
+        elif best_stable is None or triple > best_stable:
+            best_stable = triple
+    return DotnetRuntimeScan(best_stable=best_stable, best_prerelease=best_prerelease)
+
+
+def _az_account_show_user(binary: str) -> tuple[Literal["ok", "timeout", "failed"], str | None]:
+    try:
+        proc = subprocess.run(
+            [binary, "account", "show", "--query", "user.name", "-o", "tsv"],
+            capture_output=True,
+            text=True,
+            timeout=10.0,
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return ("timeout", None)
+    except OSError:
+        return ("failed", None)
+    if proc.returncode != 0:
+        return ("ok", None)
+    user = proc.stdout.strip()
+    return ("ok", user or None)
+
+
+def _az_signed_out_detail(
+    binary: str,
+    *,
+    parsed_version: tuple[int, int, int] | None,
+    raw_version: str | None,
+    version_label: str | None,
+    version_text: str | None,
+    min_label: str,
+) -> str:
+    detail = f"present at {binary}; not signed in (run `az login`)"
+    if version_label is not None and parsed_version is not None:
+        detail += f"; version {version_label}"
+        if _az_cli_version_below_floor(parsed_version, raw_version):
+            detail += f" (below required ≥ {min_label})"
+    elif version_text is None:
+        detail += "; could not determine version (`az version` failed or timed out)"
+    elif parsed_version is None:
+        detail += "; could not parse `az version` output"
+    return detail
 
 
 def probe_az_cli() -> ProbeResult:
@@ -211,19 +360,158 @@ def probe_az_cli() -> ProbeResult:
             _ERROR,
             f"az not found on PATH (install Azure CLI ≥ {min_label})",
         )
-    signed_in = safe_run([binary, "account", "show", "--query", "user.name", "-o", "tsv"])
-    if not signed_in:
+    version_text = safe_run([binary, "version", "-o", "json"], timeout=10.0)
+    raw_version: str | None = None
+    parsed_version: tuple[int, int, int] | None = None
+    if version_text is not None:
+        raw_version, parsed_version = parse_az_cli_version_fields(version_text)
+    data: dict[str, Any] = {"path": binary}
+    version_label: str | None = None
+    if raw_version is not None:
+        version_label = raw_version
+        data["version"] = raw_version
+    elif parsed_version is not None:
+        version_label = ".".join(str(part) for part in parsed_version)
+        data["version"] = version_label
+
+    sign_in_state, user = _az_account_show_user(binary)
+    if sign_in_state == "timeout":
         return ProbeResult(
             "az_cli",
             _WARN,
-            f"present at {binary}; not signed in (run `az login`)",
-            {"path": binary},
+            f"present at {binary}; `az account show` timed out (cannot confirm sign-in)",
+            data,
+        )
+    if sign_in_state == "failed":
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            f"present at {binary}; could not run `az account show`",
+            data,
+        )
+    if user is None:
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            _az_signed_out_detail(
+                binary,
+                parsed_version=parsed_version,
+                raw_version=raw_version,
+                version_label=version_label,
+                version_text=version_text,
+                min_label=min_label,
+            ),
+            data,
+        )
+    data["user"] = user
+    if version_text is None:
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            (
+                f"present and signed in as {user} ({binary}); "
+                "`az version` failed or timed out"
+            ),
+            data,
+        )
+    if parsed_version is None:
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            (
+                f"present and signed in as {user} ({binary}); "
+                "could not parse `az version` output"
+            ),
+            data,
+        )
+    if _az_cli_version_below_floor(parsed_version, raw_version):
+        return ProbeResult(
+            "az_cli",
+            _WARN,
+            (
+                f"present and signed in as {user} ({binary}); "
+                f"version {version_label} is below the required ≥ {min_label}"
+            ),
+            data,
         )
     return ProbeResult(
         "az_cli",
         _OK,
-        f"present and signed in as {signed_in.strip()} ({binary})",
-        {"path": binary, "user": signed_in.strip()},
+        f"present and signed in as {user} ({binary}); version {version_label}",
+        data,
+    )
+
+
+_AGENT365_CLI_DOTNET_DOCS = (
+    "https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli"
+)
+
+
+def probe_dotnet_runtime() -> ProbeResult:
+    """``.NET`` runtime for the global ``a365`` dotnet tool (Microsoft docs: 8.0+)."""
+
+    binary = shutil.which("dotnet")
+    min_label = ".".join(str(part) for part in DOTNET_RUNTIME_MIN)
+    if not binary:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"dotnet not found on PATH (Agent 365 CLI requires .NET ≥ {min_label}; "
+                f"see {_AGENT365_CLI_DOTNET_DOCS})"
+            ),
+        )
+    output = safe_run([binary, "--list-runtimes"], timeout=15.0)
+    data: dict[str, Any] = {"path": binary}
+    if output is None:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; `dotnet --list-runtimes` failed or timed out "
+                f"(cannot confirm .NET ≥ {min_label})"
+            ),
+            data,
+        )
+    scan = parse_dotnet_list_runtimes(output)
+    runtime = scan.best_stable
+    if runtime is None and scan.best_prerelease is not None:
+        pre_label = ".".join(str(part) for part in scan.best_prerelease)
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; only prerelease Microsoft.NETCore.App "
+                f"{pre_label} found (GA runtime ≥ {min_label} required)"
+            ),
+            {**data, "version": pre_label, "prerelease": True},
+        )
+    if runtime is None:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; no Microsoft.NETCore.App runtime found "
+                f"(Agent 365 CLI requires .NET ≥ {min_label})"
+            ),
+            data,
+        )
+    data["version"] = ".".join(str(part) for part in runtime)
+    if runtime < DOTNET_RUNTIME_MIN:
+        return ProbeResult(
+            "dotnet_runtime",
+            _WARN,
+            (
+                f"present at {binary}; highest Microsoft.NETCore.App is "
+                f"{data['version']} (Agent 365 CLI requires .NET ≥ {min_label})"
+            ),
+            data,
+        )
+    return ProbeResult(
+        "dotnet_runtime",
+        _OK,
+        f"Microsoft.NETCore.App {data['version']} available ({binary})",
+        data,
     )
 
 
@@ -1014,6 +1302,7 @@ def run_all_probes(
     probes.append(probe_python_runtime())
     probes.append(probe_host_platform())
     probes.append(probe_a365_cli())
+    probes.append(probe_dotnet_runtime())
     probes.append(probe_az_cli())
     probes.append(probe_powershell())
     probes.append(probe_custom_client_app())

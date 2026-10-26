@@ -958,7 +958,6 @@ class TestAutoRecoverSecret:
         assert outcome.blueprint_app_id == "bp-app-id"
 
 
-@pytest.mark.timeout(600)
 class TestReportMissingSecretWarning:
     def test_includes_az_credential_reset_append(self, tmp_path: Path) -> None:
         path = tmp_path / "a365.generated.config.json"

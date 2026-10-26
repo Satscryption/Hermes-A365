@@ -40,11 +40,12 @@ Two install contracts:
 
 | Mode | Minimum Hermes (calendar tag) | Minimum Hermes Agent (semver) | Evidence |
 | --- | --- | --- | --- |
-| Plugin (single-profile or multiplex off) | `v2026.4.30` (Teams adapter ship tag; pairs with **0.12.0**) | `0.12.0` | CI Hermes source smoke (import + contract files); plugin unit tests |
+| Plugin (single-profile or multiplex off) | `v2026.4.30` (Teams adapter ship tag; pairs with **0.12.0**) | `0.12.0` | CI Hermes source smoke (AST-check + contract files); plugin unit tests |
 | `gateway.multiplex_profiles: true` | `v2026.6.19` | `0.17.0` | Source smoke; multiplex config guard in `doctor` |
 | Copilot→Teams session pin (resolution) | `v2026.9.7` | `0.21.1` | Documented in [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md); `doctor` **warns** below floor |
 
-**CI integration smoke refs:** `v2026.6.19` (multiplex floor) and `v0.22.5`
+**CI Hermes source smoke refs:** `v2026.4.30` (plugin floor), `v2026.6.19`
+(multiplex floor), and `v0.22.5`
 (current 3.14 gateway line). `scripts/hermes_compat_smoke.py` checks the
 plugin adapter contract plus upstream multiplex phase-0 tests:
 `gateway.multiplex_profiles` defaults **false** and a **two-profile** session
@@ -79,9 +80,9 @@ Tested against live walks (update snapshot dates when re-verified on #90):
 | Tool | Tested / required | Doctor behaviour |
 | --- | --- | --- |
 | **A365 CLI** (`a365`, .NET tool) | Live-verified through **1.1.181**; NuGet may be newer | **Warn** on all builds until Microsoft#408 is walked clean; keep `register --auto-recover-secret` |
-| **Azure CLI** (`az`) | **≥ 2.55.0**, signed in; exact build **recorded at final walk (#90)** | **Error** if missing; **warn** if not signed in |
+| **Azure CLI** (`az`) | **≥ 2.55.0**, signed in; exact build **recorded at final walk (#90)** | **Error** if missing; **warn** if not signed in or below **≥ 2.55.0** |
 | **PowerShell** (`pwsh`) | **7+**; exact build **recorded at final walk (#90)** | **Error** if missing |
-| **.NET runtime** | **10+** when CLI installed via `dotnet tool`; exact SDK **recorded at final walk (#90)** | Not probed directly; install docs in [`a365-cli-reference.md`](a365-cli-reference.md) |
+| **.NET runtime** (`dotnet`) | **≥ 8.0** (`Microsoft.NETCore.App`; [Microsoft Agent 365 CLI prerequisites](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli#prerequisites)) | **Warn** if `dotnet` missing, no `Microsoft.NETCore.App` runtime listed, or highest runtime **< 8.0** |
 
 Record exact CLI builds used on the #90 walk in the closing report.
 
@@ -104,7 +105,7 @@ Record exact CLI builds used on the #90 walk in the closing report.
 | macOS keychain round-trip | No (skipped on GitHub macOS runners) | Operator Mac with unlocked keychain |
 | Linux libsecret round-trip | Yes when Secret Service available (`keychain-linux`) | — |
 | Wheel/sdist build + fresh install smoke | Yes | — |
-| Hermes source tags (import + adapter contract) | Yes (pinned refs) | Full gateway multiplex traffic |
+| Hermes source tags (AST-check + adapter contract files) | Yes (pinned refs) | Full gateway multiplex traffic |
 | Teams / Copilot UI round-trips | — | #90 feature matrix |
 
 ## Related references

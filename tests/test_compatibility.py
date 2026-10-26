@@ -11,6 +11,7 @@ import pytest
 from hermes_a365.compatibility import (
     HERMES_INTEGRATION_SMOKE_REFS,
     HERMES_MULTIPLEX_MIN_CALENDAR,
+    HERMES_PLUGIN_FLOOR_SMOKE_REF,
     HERMES_PLUGIN_MIN_CALENDAR,
     REQUIRES_PYTHON,
     format_calendar_tag,
@@ -58,6 +59,13 @@ def test_hermes_floors() -> None:
     assert not hermes_meets_plugin_floor(parse_hermes_version_text("v2026.4.8"))
     assert hermes_meets_multiplex_floor(parse_hermes_version_text("v2026.6.19"))
     assert not hermes_meets_multiplex_floor(parse_hermes_version_text("v2026.6.5"))
+
+
+def test_plugin_floor_smoke_ref_matches_calendar_floor() -> None:
+    expected = format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR)
+    assert expected == HERMES_PLUGIN_FLOOR_SMOKE_REF
+    workflow = (Path(__file__).parents[1] / ".github" / "workflows" / "test.yml").read_text()
+    assert HERMES_PLUGIN_FLOOR_SMOKE_REF in workflow
 
 
 def test_integration_smoke_refs_meet_floors() -> None:
@@ -127,6 +135,31 @@ def test_runtime_guard_warns_on_unverified_python(monkeypatch: pytest.MonkeyPatc
         warnings.simplefilter("always")
         emit_runtime_warnings()
     assert any("outside the CI-tested" in str(w.message) for w in caught)
+
+
+def test_runtime_guard_quiet_on_supported_host(monkeypatch: pytest.MonkeyPatch) -> None:
+    import warnings
+
+    from hermes_a365._runtime_guard import emit_runtime_warnings
+
+    monkeypatch.setattr("hermes_a365.compatibility.sys.platform", "linux")
+    monkeypatch.setattr("hermes_a365._runtime_guard.sys.platform", "linux")
+    monkeypatch.setattr(
+        "hermes_a365._runtime_guard.python_version_tuple",
+        lambda: (3, 14, 0),
+    )
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        emit_runtime_warnings()
+    assert not caught
+
+
+def test_cli_main_calls_emit_runtime_warnings() -> None:
+    with patch("hermes_a365._runtime_guard.emit_runtime_warnings") as emit:
+        from hermes_a365.cli import main
+
+        main([])
+    emit.assert_called_once()
 
 
 def test_runtime_guard_warns_on_windows(monkeypatch: pytest.MonkeyPatch) -> None:
