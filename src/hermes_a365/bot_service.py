@@ -1980,43 +1980,55 @@ _TOKEN_FAILURE_MARKERS = (
     "invalid_token",
     "token validation",
 )
+# Gateway allowlist rejections (adapter.py logs reason=unauthorized-end-user and
+# returns detail="end user is not authorized"). No other substring heuristics.
 _ALLOWLIST_MARKERS = (
-    "allowed_users",
     "end user is not authorized",
-    "not allowlisted",
     "unauthorized-end-user",
 )
+
+_PATH_A_MISSING_MESSAGING_ENDPOINT_HINT = (
+    "Check messagingEndpoint in that file — `a365 publish` nulls it. Restore via "
+    "`hermes-a365 activity-bridge update-endpoint ... --apply` or hand-edit after "
+    "`register` / `update-endpoint`."
+)
+
+
+def _response_is_allowlist_rejection(lowered: str) -> bool:
+    return any(marker in lowered for marker in _ALLOWLIST_MARKERS)
+
+
+def _directline_allowlist_warn(status: int, detail: str) -> ProbeResult:
+    return ProbeResult(
+        "runtime_auth",
+        "WARN",
+        "reachable; auth OK (Direct Line conversation started and the bot token "
+        f"check passed); test identity {_PROBE_USER_ID!r} not allowlisted "
+        f"(A365_ALLOWED_USERS; HTTP {status}). Add {_PROBE_USER_ID} to "
+        "A365_ALLOWED_USERS for the probed agent, or set A365_ALLOW_ALL_USERS on "
+        "a disposable probe, then re-run `bot-service verify --directline-probe`. "
+        f"Response: {detail}",
+    )
 
 
 def _directline_activity_failure(status: int, response: dict[str, Any]) -> ProbeResult:
     """Classify a Direct Line activity POST that the bot endpoint rejected.
 
     Conversation start has already succeeded, so the Direct Line secret and
-    bot token check passed. A 403 from this gateway is the allowlist
-    (``403 reason=unauthorized-end-user``) when the probe user is absent
-    from ``A365_ALLOWED_USERS``, not a Bot Framework credential failure.
+    bot token check passed. The gateway allowlist (``unauthorized-end-user`` /
+    ``end user is not authorized``) is not a Bot Framework credential failure.
     """
     detail = json.dumps(response, sort_keys=True)
     lowered = detail.lower()
     token_failed = any(marker in lowered for marker in _TOKEN_FAILURE_MARKERS)
-    allowlist = any(marker in lowered for marker in _ALLOWLIST_MARKERS)
-    if status == 403 and not token_failed:
-        why = (
-            "the activity body names unauthorized-end-user / the end-user allowlist"
-            if allowlist
-            else "the gateway logs `403 reason=unauthorized-end-user` for this case"
-        )
-        return ProbeResult(
-            "runtime_auth",
-            "ERROR",
-            "auth OK (Direct Line conversation started and the bot token check "
-            f"passed), but the probe user {_PROBE_USER_ID!r} is not allowlisted "
-            f"(HTTP {status}; {why}). Add {_PROBE_USER_ID} to A365_ALLOWED_USERS "
-            "for the probed agent, or set A365_ALLOW_ALL_USERS on a disposable "
-            "probe, then re-run `bot-service verify --directline-probe`. "
-            f"Response: {detail}",
-        )
-    if "403" in detail or "Failed to send activity" in detail or "BotError" in detail:
+    if not token_failed and _response_is_allowlist_rejection(lowered):
+        return _directline_allowlist_warn(status, detail)
+    if (
+        status == 403
+        or "403" in detail
+        or "Failed to send activity" in detail
+        or "BotError" in detail
+    ):
         return ProbeResult(
             "runtime_auth",
             "ERROR",
@@ -2060,8 +2072,10 @@ def _path_endpoint_parity_probe(
     if not path_a_endpoint:
         return ProbeResult(
             "path_endpoint_parity",
-            "OK",
-            f"skipped; {generated_config_path} has no messagingEndpoint",
+            "WARN",
+            f"skipped: {generated_config_path} has no messagingEndpoint "
+            "(Path A activity-bridge endpoint unknown; cannot compare to Path B). "
+            f"{_PATH_A_MISSING_MESSAGING_ENDPOINT_HINT}",
         )
     bot_service_endpoint = path_b_endpoint or config.messagingEndpoint
     if path_a_endpoint.rstrip("/") != bot_service_endpoint.rstrip("/"):

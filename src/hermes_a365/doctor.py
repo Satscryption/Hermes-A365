@@ -223,14 +223,42 @@ def _load_az_version_json(text: str) -> dict[str, Any] | None:
     return payload if isinstance(payload, dict) else None
 
 
-_AZ_CLI_PRERELEASE_RE = re.compile(
-    r"-(?:preview|rc|alpha|beta)|\d+b\d+",
-    re.IGNORECASE,
-)
+_AZ_CLI_TRIPLE_RE = re.compile(r"^\s*(\d+)\.(\d+)\.(\d+)")
+
+
+def _az_cli_suffix_is_prerelease(suffix: str) -> bool:
+    lowered = suffix.lower().strip()
+    if not lowered:
+        return False
+    if re.match(r"^(?:b|rc)\d+", lowered):
+        return True
+    if re.search(r"(?:^|[.~-])(?:dev|rc|preview|alpha|beta)", lowered):
+        return True
+    if re.match(r"^[~.-]*b\d+", lowered):
+        return True
+    return bool(re.match(r"^~(?:b|rc)\d+", lowered))
+
+
+def parse_az_cli_release(raw: str) -> tuple[tuple[int, int, int] | None, bool]:
+    """Parse an ``azure-cli`` version string into a triple and prerelease flag."""
+
+    text = raw.strip()
+    match = _AZ_CLI_TRIPLE_RE.match(text)
+    if not match:
+        return None, False
+    triple = (int(match.group(1)), int(match.group(2)), int(match.group(3)))
+    suffix = text[match.end() :]
+    if "+" in suffix:
+        suffix = suffix.split("+", 1)[0]
+    suffix = suffix.strip()
+    if not suffix:
+        return triple, False
+    return triple, _az_cli_suffix_is_prerelease(suffix)
 
 
 def _az_cli_version_is_prerelease(raw: str) -> bool:
-    return bool(_AZ_CLI_PRERELEASE_RE.search(raw))
+    _triple, is_prerelease = parse_az_cli_release(raw)
+    return is_prerelease
 
 
 def _az_cli_version_below_floor(
@@ -239,9 +267,9 @@ def _az_cli_version_below_floor(
 ) -> bool:
     if parsed is None:
         return False
-    if raw and _az_cli_version_is_prerelease(raw):
+    if parsed < AZURE_CLI_MIN:
         return True
-    return parsed < AZURE_CLI_MIN
+    return bool(raw and _az_cli_version_is_prerelease(raw) and parsed == AZURE_CLI_MIN)
 
 
 def parse_az_cli_version_fields(
@@ -255,7 +283,8 @@ def parse_az_cli_version_fields(
     for key in ("azure-cli", "azure_cli"):
         value = payload.get(key)
         if isinstance(value, str):
-            return value, _release_semver_triple(value)
+            triple, _is_prerelease = parse_az_cli_release(value)
+            return value, triple
     return None, None
 
 
@@ -330,6 +359,26 @@ def _az_account_show_user(binary: str) -> tuple[Literal["ok", "timeout", "failed
     return ("ok", user or None)
 
 
+def _az_cli_version_detail_suffix(
+    *,
+    version_label: str | None,
+    parsed_version: tuple[int, int, int] | None,
+    raw_version: str | None,
+    version_text: str | None,
+    min_label: str,
+) -> str:
+    if version_label is not None and parsed_version is not None:
+        suffix = f"; version {version_label}"
+        if _az_cli_version_below_floor(parsed_version, raw_version):
+            suffix += f" (below required ≥ {min_label})"
+        return suffix
+    if version_text is None:
+        return "; could not determine version (`az version` failed or timed out)"
+    if parsed_version is None:
+        return "; could not parse `az version` output"
+    return ""
+
+
 def _az_signed_out_detail(
     binary: str,
     *,
@@ -340,14 +389,13 @@ def _az_signed_out_detail(
     min_label: str,
 ) -> str:
     detail = f"present at {binary}; not signed in (run `az login`)"
-    if version_label is not None and parsed_version is not None:
-        detail += f"; version {version_label}"
-        if _az_cli_version_below_floor(parsed_version, raw_version):
-            detail += f" (below required ≥ {min_label})"
-    elif version_text is None:
-        detail += "; could not determine version (`az version` failed or timed out)"
-    elif parsed_version is None:
-        detail += "; could not parse `az version` output"
+    detail += _az_cli_version_detail_suffix(
+        version_label=version_label,
+        parsed_version=parsed_version,
+        raw_version=raw_version,
+        version_text=version_text,
+        min_label=min_label,
+    )
     return detail
 
 
@@ -376,17 +424,35 @@ def probe_az_cli() -> ProbeResult:
 
     sign_in_state, user = _az_account_show_user(binary)
     if sign_in_state == "timeout":
+        timeout_detail = (
+            f"present at {binary}; `az account show` timed out (cannot confirm sign-in)"
+        )
+        timeout_detail += _az_cli_version_detail_suffix(
+            version_label=version_label,
+            parsed_version=parsed_version,
+            raw_version=raw_version,
+            version_text=version_text,
+            min_label=min_label,
+        )
         return ProbeResult(
             "az_cli",
             _WARN,
-            f"present at {binary}; `az account show` timed out (cannot confirm sign-in)",
+            timeout_detail,
             data,
         )
     if sign_in_state == "failed":
+        failed_detail = f"present at {binary}; could not run `az account show`"
+        failed_detail += _az_cli_version_detail_suffix(
+            version_label=version_label,
+            parsed_version=parsed_version,
+            raw_version=raw_version,
+            version_text=version_text,
+            min_label=min_label,
+        )
         return ProbeResult(
             "az_cli",
             _WARN,
-            f"present at {binary}; could not run `az account show`",
+            failed_detail,
             data,
         )
     if user is None:

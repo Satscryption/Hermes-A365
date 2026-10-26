@@ -17,6 +17,23 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   ``HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC``. Refs
   [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
 
+- **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a
+  live ``--directline-probe`` conversation starts, **WARN** only when the
+  activity response body explicitly carries ``unauthorized-end-user`` or
+  ``end user is not authorized`` (including HTTP **502** bodies that embed that
+  gateway signal). Other **403** / connector failures stay **ERROR**.
+  ``path_endpoint_parity`` **warns** when the generated config has no
+  ``messagingEndpoint``, with remediation that does not recommend ``a365
+  publish``.
+
+- **#222 — `doctor` az CLI floor follow-ups (#221).** Parses common PEP 440 /
+  Azure CLI prerelease spellings (``rcN``, ``bN``, ``-dev``, ``~rcN``, etc.).
+  Warns on GA below **≥ 2.55.0**, prerelease at the floor, and prerelease below
+  the floor; newer prereleases (for example ``2.60.0rc1``) do not warn.
+  ``az account show`` timeout / OSError detail adds the floor sentence only when
+  the installed version is below the floor. The v1 support matrix documents az
+  and .NET prerelease warn behaviour.
+
 ## [0.9.4] — 2026-10-26
 
 Inbound webhook JWKS fail-closed and admission hardening (#86, #205, #206),

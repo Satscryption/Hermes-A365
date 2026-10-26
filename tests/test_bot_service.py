@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 from hermes_a365.bot_service import (
+    _PATH_A_MISSING_MESSAGING_ENDPOINT_HINT,
     SIDECAR_SCHEMA_VERSION,
     BotServiceConfig,
     BotServiceCreateInputs,
@@ -1544,6 +1545,22 @@ def test_validate_confirm_rejects_missing_and_mismatch() -> None:
     _validate_confirm("Hermes Inbox Helper", "Hermes Inbox Helper")
 
 
+def test_verify_warns_when_generated_config_has_no_messaging_endpoint(tmp_path: Path) -> None:
+    sidecar = _write_sidecar(tmp_path)
+    generated_config = tmp_path / "a365.generated.config.json"
+    generated_config.write_text("{}")
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
+
+    report = verify_bot_service(sidecar, runner=runner, generated_config_path=generated_config)
+
+    assert report.ok is True
+    parity = next(result for result in report.results if result.name == "path_endpoint_parity")
+    assert parity.status == "WARN"
+    assert "no messagingEndpoint" in parity.detail
+    assert "cannot compare to Path B" in parity.detail
+    assert _PATH_A_MISSING_MESSAGING_ENDPOINT_HINT in parity.detail
+
+
 def test_verify_warns_when_path_a_and_path_b_endpoints_drift(tmp_path: Path) -> None:
     sidecar = _write_sidecar(tmp_path)
     generated_config = tmp_path / "a365.generated.config.json"
@@ -1785,12 +1802,61 @@ def test_directline_403_after_token_check_names_the_allowlist(
     monkeypatch.setattr(bot_service, "_http_json", _allowlisted_403)
     result = directline_runtime_probe(cfg, _SecretRunner())
 
-    assert result.status == "ERROR"
+    assert result.status == "WARN"
+    assert "reachable" in result.detail
     assert "auth OK" in result.detail
     assert "not allowlisted" in result.detail
     assert "A365_ALLOWED_USERS" in result.detail
     assert "hermes-a365-verify" in result.detail
     assert "rejected a Path B BF Connector token" not in result.detail
+
+
+class TestDirectlineActivityFailureClassification:
+    def test_bare_403_without_allowlist_marker_is_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(403, {"error": "Forbidden"})
+        assert result.status == "ERROR"
+        assert "BF Connector token" in result.detail
+
+    def test_boterror_403_without_allowlist_marker_is_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            403, {"code": "BotError", "message": "upstream failure"}
+        )
+        assert result.status == "ERROR"
+        assert "BF Connector token" in result.detail
+
+    def test_502_body_with_allowlist_marker_is_warn(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": "Bad Gateway",
+                "body": "403 reason=unauthorized-end-user",
+            },
+        )
+        assert result.status == "WARN"
+        assert "not allowlisted" in result.detail
+
+    def test_502_body_with_only_failed_to_send_activity_is_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {"error": "Failed to send activity", "status": 403},
+        )
+        assert result.status == "ERROR"
+        assert "BF Connector token" in result.detail
+
+    def test_502_body_with_only_403_text_is_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(502, {"message": "HTTP 403 from connector"})
+        assert result.status == "ERROR"
+        assert "BF Connector token" in result.detail
 
 
 def test_directline_403_with_token_failure_stays_a_credential_error(

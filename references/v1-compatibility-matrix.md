@@ -80,9 +80,9 @@ Tested against live walks (update snapshot dates when re-verified on #90):
 | Tool | Tested / required | Doctor behaviour |
 | --- | --- | --- |
 | **A365 CLI** (`a365`, .NET tool) | Live-verified through **1.1.181**; NuGet may be newer | **Warn** on all builds until Microsoft#408 is walked clean; keep `register --auto-recover-secret` |
-| **Azure CLI** (`az`) | **≥ 2.55.0**, signed in; exact build **recorded at final walk (#90)** | **Error** if missing; **warn** if not signed in or below **≥ 2.55.0** |
+| **Azure CLI** (`az`) | **≥ 2.55.0**, signed in; exact build **recorded at final walk (#90)** | **Error** if missing; **warn** if not signed in or below **≥ 2.55.0** (prerelease at the floor warns; newer prereleases do not) |
 | **PowerShell** (`pwsh`) | **7+**; exact build **recorded at final walk (#90)** | **Error** if missing |
-| **.NET runtime** (`dotnet`) | **≥ 8.0** (`Microsoft.NETCore.App`; [Microsoft Agent 365 CLI prerequisites](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli#prerequisites)) | **Warn** if `dotnet` missing, no `Microsoft.NETCore.App` runtime listed, or highest runtime **< 8.0** |
+| **.NET runtime** (`dotnet`) | **≥ 8.0** (`Microsoft.NETCore.App`; [Microsoft Agent 365 CLI prerequisites](https://learn.microsoft.com/en-us/microsoft-agent-365/developer/agent-365-cli#prerequisites)) | **Warn** if `dotnet` missing, no `Microsoft.NETCore.App` runtime listed, highest GA runtime **< 8.0**, or only prerelease/rc runtimes are installed |
 
 Record exact CLI builds used on the #90 walk in the closing report.
 
