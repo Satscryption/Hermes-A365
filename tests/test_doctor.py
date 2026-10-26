@@ -19,6 +19,7 @@ from hermes_a365.doctor import (
     ProbeResult,
     overall_to_exit_code,
     parse_a365_cli_version,
+    parse_az_cli_release,
     parse_az_cli_version,
     parse_dotnet_list_runtimes,
     probe_a365_cli,
@@ -212,6 +213,22 @@ class TestProbeAzCli:
         assert "2.55.0b1" in r.detail
         assert "≥ 2.55.0" in r.detail
 
+    def test_signed_in_prerelease_above_floor_ok(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value='{"azure-cli": "2.60.0b1"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", "alice@contoso.com"),
+            ),
+        ):
+            r = probe_az_cli()
+        assert r.state == "ok"
+        assert "2.60.0b1" in r.detail
+
     def test_account_show_timeout_warns(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
@@ -227,6 +244,44 @@ class TestProbeAzCli:
             r = probe_az_cli()
         assert r.state == "warn"
         assert "timed out" in r.detail
+        assert "2.67.0" in r.detail
+        assert "≥ 2.55.0" not in r.detail
+
+    def test_account_show_oserror_includes_version_and_floor_when_below(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value='{"azure-cli": "2.54.0"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("failed", None),
+            ),
+        ):
+            r = probe_az_cli()
+        assert r.state == "warn"
+        assert "could not run `az account show`" in r.detail
+        assert "2.54.0" in r.detail
+        assert "≥ 2.55.0" in r.detail
+
+    def test_account_show_timeout_includes_floor_when_version_below(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value='{"azure-cli": "2.54.0"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("timeout", None),
+            ),
+        ):
+            r = probe_az_cli()
+        assert r.state == "warn"
+        assert "timed out" in r.detail
+        assert "2.54.0" in r.detail
+        assert "≥ 2.55.0" in r.detail
 
 
 class TestParseAzCliVersion:
@@ -237,6 +292,13 @@ class TestParseAzCliVersion:
             ('{"azure-cli": "2.55.0"}', (2, 55, 0)),
             ('{"azure-cli": "2.55.0-rc1"}', (2, 55, 0)),
             ('{"azure-cli": "2.55.0b1"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0-b1"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0.dev1"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0-dev"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0~b1"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0~rc1"}', (2, 55, 0)),
+            ('{"azure-cli": "2.55.0rc1"}', (2, 55, 0)),
+            ('{"azure-cli": "2.60.0rc1"}', (2, 60, 0)),
             ("not json", None),
             ("azure-cli    2.55.0", None),
         ],
@@ -245,6 +307,62 @@ class TestParseAzCliVersion:
         self, text: str, expected: tuple[int, int, int] | None
     ) -> None:
         assert parse_az_cli_version(text) == expected
+
+    @pytest.mark.parametrize(
+        ("raw", "expected_triple", "expected_prerelease"),
+        [
+            ("2.55.0", (2, 55, 0), False),
+            ("2.55.0-b1", (2, 55, 0), True),
+            ("2.55.0.dev1", (2, 55, 0), True),
+            ("2.55.0-dev", (2, 55, 0), True),
+            ("2.55.0~b1", (2, 55, 0), True),
+            ("2.55.0~rc1", (2, 55, 0), True),
+            ("2.55.0b1", (2, 55, 0), True),
+            ("2.55.0rc1", (2, 55, 0), True),
+            ("2.60.0rc1", (2, 60, 0), True),
+            ("2.54.0rc1", (2, 54, 0), True),
+        ],
+    )
+    def test_parse_az_cli_release_prerelease_flags(
+        self,
+        raw: str,
+        expected_triple: tuple[int, int, int],
+        expected_prerelease: bool,
+    ) -> None:
+        triple, is_prerelease = parse_az_cli_release(raw)
+        assert triple == expected_triple
+        assert is_prerelease is expected_prerelease
+
+    @pytest.mark.parametrize(
+        ("raw", "expect_floor_in_detail"),
+        [
+            ("2.60.0rc1", False),
+            ("2.55.0rc1", True),
+            ("2.54.0rc1", True),
+        ],
+    )
+    def test_signed_in_prerelease_rc_floor_probe(
+        self, raw: str, expect_floor_in_detail: bool
+    ) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value=json.dumps({"azure-cli": raw}),
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", "alice@contoso.com"),
+            ),
+        ):
+            r = probe_az_cli()
+        if expect_floor_in_detail:
+            assert r.state == "warn"
+            assert raw in r.detail
+            assert "≥ 2.55.0" in r.detail
+        else:
+            assert r.state == "ok"
+            assert raw in r.detail
 
     def test_extension_first_document_uses_azure_cli_only(self) -> None:
         text = json.dumps(
