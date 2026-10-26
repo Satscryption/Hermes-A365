@@ -981,6 +981,31 @@ _TURN_BUFFER_KEEPALIVE_TEXT = "Working on it."
 _INFORMATIVE_TEXT_MAX_CHARS = 1000
 
 
+def _turn_buffer_env_float(name: str, default: float) -> float:
+    raw = _profile_env(name)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        parsed = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return max(0.0, parsed)
+
+
+# #217 — Copilot Chat first-turn / short-turn live render: wait until the
+# informative stream has been open long enough before posting the final so
+# informative→final pairs that land too close together do not leave an empty
+# bubble until reload. Scoped to Path B turn-buffer delivery only.
+_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC = _turn_buffer_env_float(
+    "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC",
+    3.0,
+)
+_COPILOT_SHORT_TURN_MAX_DURATION_SEC = _turn_buffer_env_float(
+    "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC",
+    3.0,
+)
+
+
 class _KeepalivePost(NamedTuple):
     """One informative or final POST.
 
@@ -1909,6 +1934,8 @@ class Agent365Adapter(BasePlatformAdapter):
         # opening POST was in flight) lives in ``_orphan_keepalive`` so
         # the next tick does not open a second stream.
         self._turn_buffers: dict[str, dict[str, Any]] = {}
+        # #217 — first user turn after membersAdded / install on Copilot Chat.
+        self._copilot_member_added_pending: dict[str, float] = {}
         self._orphan_keepalive: dict[str, dict[str, Any]] = {}
         # Incremented when a turn buffer is dropped; late openers from an older
         # epoch must be finalized, even after a new turn starts (#203).
@@ -2673,6 +2700,11 @@ class Agent365Adapter(BasePlatformAdapter):
                             _complete_persist_mutation(reservation[0], reservation[1])
                             raise
                         await self._persist_conversations(reservation)
+                    self._note_copilot_member_added_pending(
+                        lifecycle_conv_id,
+                        activity,
+                        validated_path,
+                    )
                 logger.info(
                     "inbound lifecycle type=%s action=%s conv=%s",
                     str(activity.get("type") or ""),
@@ -5271,7 +5303,10 @@ class Agent365Adapter(BasePlatformAdapter):
             "validated_path": self._validated_path_for(chat_id),
             "activity_id": str(snapshot.get("id") or ""),
             "open": True,
+            "started_mono": time.monotonic(),
         }
+        if str(chat_id) in self._copilot_member_added_pending:
+            turn["copilot_post_member_added"] = True
         if buf is None:
             self._turn_buffers[chat_id] = {
                 "turns": [turn],
@@ -7337,6 +7372,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 final_chars=int(routing.get("final_chars") or len(content)),
             )
             record.pop("routing_summary", None)
+        self._clear_copilot_post_member_added(chat_id, turn)
         logger.info(msg)
         return ("delivered", activity_id)
 
@@ -7446,6 +7482,12 @@ class Agent365Adapter(BasePlatformAdapter):
 
         try:
             await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
+            buf = self._turn_buffers.get(chat_id)
+            if not isinstance(buf, dict):
+                return ("retry", None)
+            await self._ensure_copilot_min_stream_age_before_final_locked(
+                chat_id, buf, turn
+            )
             buf = self._turn_buffers.get(chat_id)
             if not isinstance(buf, dict):
                 return ("retry", None)
@@ -7648,6 +7690,79 @@ class Agent365Adapter(BasePlatformAdapter):
             buf = self._turn_buffers.get(chat_id)
             if isinstance(buf, dict):
                 buf.pop("answer_final_in_progress", None)
+
+    def _note_copilot_member_added_pending(
+        self,
+        conv_id: str | None,
+        activity: dict[str, Any],
+        validated_path: str | None,
+    ) -> None:
+        """Remember Copilot Chat member-added so the next turn can pace the final (#217)."""
+        if not conv_id or validated_path != "B":
+            return
+        activity_type = str(activity.get("type") or "")
+        if activity_type not in ("conversationUpdate", "installationUpdate"):
+            return
+        conv = activity.get("conversation")
+        if not isinstance(conv, dict):
+            return
+        if str(conv.get("conversationType") or "").lower() != "groupchat":
+            return
+        self._copilot_member_added_pending[str(conv_id)] = time.monotonic()
+
+    @staticmethod
+    def _is_copilot_turn_buffer_turn(turn: dict[str, Any]) -> bool:
+        if str(turn.get("validated_path") or "") != "B":
+            return False
+        inbound = turn.get("inbound")
+        inbound = inbound if isinstance(inbound, dict) else {}
+        conv = inbound.get("conversation")
+        conv = conv if isinstance(conv, dict) else {}
+        return str(conv.get("conversationType") or "").lower() == "groupchat"
+
+    def _turn_buffer_turn_duration_sec(self, turn: dict[str, Any]) -> float:
+        started = turn.get("started_mono")
+        if not isinstance(started, (int, float)):
+            return float("inf")
+        return time.monotonic() - float(started)
+
+    def _copilot_needs_min_stream_age_before_final(self, turn: dict[str, Any]) -> bool:
+        if not self._is_copilot_turn_buffer_turn(turn):
+            return False
+        if turn.get("copilot_post_member_added"):
+            return True
+        return (
+            self._turn_buffer_turn_duration_sec(turn)
+            <= _COPILOT_SHORT_TURN_MAX_DURATION_SEC
+        )
+
+    async def _ensure_copilot_min_stream_age_before_final_locked(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+    ) -> None:
+        """Hold the final until the Copilot informative stream meets minimum age (#217)."""
+        if not self._copilot_needs_min_stream_age_before_final(turn):
+            return
+        min_age = _COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC
+        if min_age <= 0:
+            return
+        while self._turn_buffers.get(chat_id) is buf:
+            stream = self._keepalive_stream(buf)
+            if not str(stream.get("stream_id") or ""):
+                return
+            age = _keepalive_stream_age_sec(stream)
+            if age >= min_age:
+                return
+            await self._sleep_turn_buffer_locked(chat_id, buf, min_age - age)
+            if self._turn_buffers.get(chat_id) is not buf:
+                return
+
+    def _clear_copilot_post_member_added(self, chat_id: str, turn: dict[str, Any]) -> None:
+        if turn.get("copilot_post_member_added"):
+            turn.pop("copilot_post_member_added", None)
+            self._copilot_member_added_pending.pop(str(chat_id), None)
 
     async def _sleep_turn_buffer_stream_gap_locked(self, chat_id: str, buf: dict[str, Any]) -> None:
         """Pace informative→final pairs without blocking the keep-alive task."""

@@ -6,6 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#217 — Copilot Chat first-turn live render.** Path B turn-buffer delivery
+  waits until the informative stream reaches a configurable minimum age before
+  posting the answer final on the first turn after ``membersAdded`` / install
+  and on short turns (default ≤3s). Preserves informative lead-in and keep-alive
+  rotation (#214); Teams 1:1 personal streaming is unchanged. Tunables:
+  ``HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC``,
+  ``HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC``. Refs
+  [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
+
 ## [0.9.4] — 2026-10-26
 
 Inbound webhook JWKS fail-closed and admission hardening (#86, #205, #206),

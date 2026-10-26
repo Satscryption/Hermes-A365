@@ -8126,6 +8126,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         post_mock = self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 0)
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -8158,6 +8159,160 @@ class TestEditMessage:
         assert "streamSequence" not in final["entities"][0]
         assert task.cancelled()
         assert "conv-G-short" not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_copilot_first_turn_after_member_added_waits_min_stream_age(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "B")),
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 3.0)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_SHORT_TURN_MAX_DURATION_SEC", 3.0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        sleep_mock = self._no_sleep(monkeypatch)
+        a._copilot_member_added_pending[chat] = time.monotonic()
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        turn = a._turn_buffers[chat]["turns"][0]
+        assert turn.get("copilot_post_member_added") is True
+        assert turn.get("validated_path") == "B"
+        await a.send(chat_id=chat, content="Hello. Smoke check OK.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 2.5
+        ]
+        assert waits, "expected a min-stream-age wait before the final"
+        assert post_mock.await_count == 2
+        final = post_mock.await_args_list[-1].kwargs["json"]
+        assert final["entities"][0]["streamType"] == "final"
+        assert chat not in a._copilot_member_added_pending
+
+    @pytest.mark.asyncio
+    async def test_copilot_short_turn_waits_min_stream_age(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-short-age"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "B")),
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 2.5)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_SHORT_TURN_MAX_DURATION_SEC", 3.0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        sleep_mock = self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        assert a._turn_buffers[chat]["turns"][0].get("validated_path") == "B"
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 2.0
+        ]
+        assert waits
+        assert post_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_copilot_later_long_turn_skips_extra_min_stream_age_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-later"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "B")),
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 3.0)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_SHORT_TURN_MAX_DURATION_SEC", 3.0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        sleep_mock = self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        turn = a._turn_buffers[chat]["turns"][0]
+        turn["started_mono"] = time.monotonic() - 10.0
+        assert turn.get("validated_path") == "B"
+        await a.send(chat_id=chat, content="Later answer.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        long_waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 2.5
+        ]
+        assert not long_waits
+        assert post_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_teams_personal_turn_skips_copilot_min_stream_age_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "a:personal-chat"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "personal"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        ensure_mock = AsyncMock()
+        monkeypatch.setattr(a, "_ensure_copilot_min_stream_age_before_final_locked", ensure_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        assert chat not in a._turn_buffers
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        ensure_mock.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_long_turn_keepalive_final_precedes_one_reply(
