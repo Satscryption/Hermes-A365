@@ -204,35 +204,66 @@ def _release_semver_triple(text: str) -> tuple[int, int, int] | None:
 
 
 def _load_az_version_json(text: str) -> dict[str, Any] | None:
-    trimmed = text.strip()
-    if not trimmed.startswith("{"):
+    """Parse the first JSON object in an ``az version -o json`` stream.
+
+    ``safe_run`` merges stderr into stdout, so the payload may be preceded or
+    followed by ``WARNING:`` lines and pretty-printed across multiple lines.
+    """
+
+    if not text:
         return None
-    candidates = [trimmed]
-    if "\n" in trimmed:
-        candidates.append(trimmed.splitlines()[0])
-    for candidate in candidates:
-        try:
-            payload = json.loads(candidate)
-        except json.JSONDecodeError:
-            continue
-        if isinstance(payload, dict):
-            return payload
-    return None
+    start = text.find("{")
+    if start < 0:
+        return None
+    decoder = json.JSONDecoder()
+    try:
+        payload, _end = decoder.raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+_AZ_CLI_PRERELEASE_RE = re.compile(
+    r"-(?:preview|rc|alpha|beta)|\d+b\d+",
+    re.IGNORECASE,
+)
+
+
+def _az_cli_version_is_prerelease(raw: str) -> bool:
+    return bool(_AZ_CLI_PRERELEASE_RE.search(raw))
+
+
+def _az_cli_version_below_floor(
+    parsed: tuple[int, int, int] | None,
+    raw: str | None,
+) -> bool:
+    if parsed is None:
+        return False
+    if raw and _az_cli_version_is_prerelease(raw):
+        return True
+    return parsed < AZURE_CLI_MIN
+
+
+def parse_az_cli_version_fields(
+    text: str,
+) -> tuple[str | None, tuple[int, int, int] | None]:
+    """Return ``(azure-cli raw string, parsed triple)`` from version JSON."""
+
+    payload = _load_az_version_json(text)
+    if payload is None:
+        return None, None
+    for key in ("azure-cli", "azure_cli"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            return value, _release_semver_triple(value)
+    return None, None
 
 
 def parse_az_cli_version(text: str) -> tuple[int, int, int] | None:
     """Extract ``azure-cli`` from ``az version -o json`` (never other JSON fields)."""
 
-    payload = _load_az_version_json(text)
-    if payload is None:
-        return None
-    for key in ("azure-cli", "azure_cli"):
-        value = payload.get(key)
-        if isinstance(value, str):
-            parsed = _release_semver_triple(value)
-            if parsed is not None:
-                return parsed
-    return None
+    _raw, parsed = parse_az_cli_version_fields(text)
+    return parsed
 
 
 def parse_a365_cli_version(text: str) -> tuple[int, int, int] | None:
@@ -303,6 +334,7 @@ def _az_signed_out_detail(
     binary: str,
     *,
     parsed_version: tuple[int, int, int] | None,
+    raw_version: str | None,
     version_label: str | None,
     version_text: str | None,
     min_label: str,
@@ -310,7 +342,7 @@ def _az_signed_out_detail(
     detail = f"present at {binary}; not signed in (run `az login`)"
     if version_label is not None and parsed_version is not None:
         detail += f"; version {version_label}"
-        if parsed_version < AZURE_CLI_MIN:
+        if _az_cli_version_below_floor(parsed_version, raw_version):
             detail += f" (below required ≥ {min_label})"
     elif version_text is None:
         detail += "; could not determine version (`az version` failed or timed out)"
@@ -329,12 +361,16 @@ def probe_az_cli() -> ProbeResult:
             f"az not found on PATH (install Azure CLI ≥ {min_label})",
         )
     version_text = safe_run([binary, "version", "-o", "json"], timeout=10.0)
-    parsed_version = (
-        parse_az_cli_version(version_text) if version_text is not None else None
-    )
+    raw_version: str | None = None
+    parsed_version: tuple[int, int, int] | None = None
+    if version_text is not None:
+        raw_version, parsed_version = parse_az_cli_version_fields(version_text)
     data: dict[str, Any] = {"path": binary}
     version_label: str | None = None
-    if parsed_version is not None:
+    if raw_version is not None:
+        version_label = raw_version
+        data["version"] = raw_version
+    elif parsed_version is not None:
         version_label = ".".join(str(part) for part in parsed_version)
         data["version"] = version_label
 
@@ -360,6 +396,7 @@ def probe_az_cli() -> ProbeResult:
             _az_signed_out_detail(
                 binary,
                 parsed_version=parsed_version,
+                raw_version=raw_version,
                 version_label=version_label,
                 version_text=version_text,
                 min_label=min_label,
@@ -387,7 +424,7 @@ def probe_az_cli() -> ProbeResult:
             ),
             data,
         )
-    if parsed_version < AZURE_CLI_MIN:
+    if _az_cli_version_below_floor(parsed_version, raw_version):
         return ProbeResult(
             "az_cli",
             _WARN,

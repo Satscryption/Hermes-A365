@@ -195,6 +195,23 @@ class TestProbeAzCli:
         assert "2.54.0" in r.detail
         assert "≥ 2.55.0" in r.detail
 
+    def test_signed_in_prerelease_at_floor_warns(self) -> None:
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch(
+                "hermes_a365.doctor.safe_run",
+                return_value='{"azure-cli": "2.55.0b1"}',
+            ),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", "alice@contoso.com"),
+            ),
+        ):
+            r = probe_az_cli()
+        assert r.state == "warn"
+        assert "2.55.0b1" in r.detail
+        assert "≥ 2.55.0" in r.detail
+
     def test_account_show_timeout_warns(self) -> None:
         with (
             patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
@@ -241,6 +258,38 @@ class TestParseAzCliVersion:
     def test_trailing_stderr_warning_line(self) -> None:
         text = '{"azure-cli": "2.67.0"}\nWARNING: credential protection is on\n'
         assert parse_az_cli_version(text) == (2, 67, 0)
+
+    def test_pretty_json_with_warnings_before_and_after(self) -> None:
+        text = (
+            "WARNING: AAZ credential protection is on\n"
+            "{\n"
+            '  "extensions": {"devcenter": "9.0.0"},\n'
+            '  "azure-cli": "2.67.0"\n'
+            "}\n"
+            "WARNING: trailing diagnostic\n"
+        )
+        assert parse_az_cli_version(text) == (2, 67, 0)
+
+    def test_pretty_json_probe_reads_version_not_extensions(self) -> None:
+        stream = (
+            "WARNING: leading\n"
+            "{\n"
+            '  "extensions": {"devcenter": "8.0.0"},\n'
+            '  "azure-cli": "2.54.0"\n'
+            "}\n"
+        )
+        with (
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/az"),
+            patch("hermes_a365.doctor.safe_run", return_value=stream),
+            patch(
+                "hermes_a365.doctor._az_account_show_user",
+                return_value=("ok", "alice@contoso.com"),
+            ),
+        ):
+            r = probe_az_cli()
+        assert r.state == "warn"
+        assert "2.54.0" in r.detail
+        assert "8.0.0" not in r.detail
 
 
 # ---------------------------------------------------------------------------
