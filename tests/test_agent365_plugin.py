@@ -4424,6 +4424,12 @@ class TestLifecycleCapture:
         # coalesced-status slots for the chat AND cancel their watchdog tasks,
         # so no debounce later fires a doomed POST into the evicted chat. An
         # unrelated chat's state must survive.
+        async def _instant_sleep(_delay: float = 0.0, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         seed = _make_inbound(path="B", conv_id="conv-rm")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
@@ -7519,7 +7525,46 @@ class TestEditMessage:
         observe the requested duration without actually waiting."""
         sleep_mock = AsyncMock()
         monkeypatch.setattr("asyncio.sleep", sleep_mock)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", sleep_mock)
         return sleep_mock
+
+    @staticmethod
+    def _fast_turn_buffer_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Avoid real wall-clock waits in defer/retry paths (#242)."""
+
+        async def _instant_sleep(_delay: float = 0.0, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0.0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 0.0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0.0)
+
+        async def _noop_wait_out_untracked_keepalive(_self: Any, _buf: dict[str, Any]) -> None:
+            return None
+
+        async def _noop_deferred_turn_buffer_retry(_self: Any, _chat_id: str) -> None:
+            return None
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_wait_out_untracked_keepalive",
+            _noop_wait_out_untracked_keepalive,
+        )
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_deferred_turn_buffer_retry",
+            _noop_deferred_turn_buffer_retry,
+        )
+
+    @staticmethod
+    async def _cancel_turn_buffer_retry_task(buf: dict[str, Any]) -> None:
+        task = buf.get("retry_task")
+        if isinstance(task, asyncio.Task):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def test_class_sets_requires_edit_finalize(self) -> None:
         # endStream() is mandatory in BF streaming-ux; the flag tells
@@ -8530,6 +8575,53 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain after cap budget"
         assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_answer_final_budget_exhausted_uncertain_when_may_have_landed(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from hermes_a365.plugin.turn_buffer_answer_delivery import set_may_have_landed
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-cap-budget-mhl"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 0.5
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-cap-mhl",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
+        }
+        await a.send(chat_id=chat, content="Maybe landed", reply_to=None)
+        turn = buf["turns"][0]
+        record = a._delivery_record(buf, turn)
+        set_may_have_landed(record)
+        with caplog.at_level(logging.WARNING):
+            await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 0
+        assert chat not in a._turn_buffers
+        assert any(
+            "stream outbound budget exhausted" in record.message for record in caplog.records
+        )
 
     def test_keepalive_stream_outbound_deadline_uses_shared_cap(
         self, monkeypatch: pytest.MonkeyPatch
@@ -13085,13 +13177,12 @@ class TestEditMessage:
     ) -> None:
         import httpx
 
+        self._fast_turn_buffer_clocks(monkeypatch)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-mhl-defer", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        self._no_sleep(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
         finals = {"n": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -13121,14 +13212,11 @@ class TestEditMessage:
         }
         await a.send(chat_id="conv-G-mhl-defer", content="Stay", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
+        await self._cancel_turn_buffer_retry_task(buf)
         assert finals["n"] == 2
         assert send_reply_mock.await_count == 0
         assert buf["keepalive"]["stream_id"] == "ka-md"
         assert [s["text"] for s in buf["segments"]] == ["Stay"]
-        task = buf.get("retry_task")
-        if isinstance(task, asyncio.Task):
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_already_completed_without_landing_plain_posts(
@@ -13313,13 +13401,12 @@ class TestEditMessage:
     async def test_unknown_403_defers_without_plain_post(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        self._fast_turn_buffer_clocks(monkeypatch)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-unk403", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        self._no_sleep(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
@@ -13349,25 +13436,21 @@ class TestEditMessage:
         }
         await a.send(chat_id="conv-G-unk403", content="Defer me", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
+        await self._cancel_turn_buffer_retry_task(buf)
         assert send_reply_mock.await_count == 0
         assert buf["keepalive"]["stream_id"] == "ka-u403"
         assert [s["text"] for s in buf["segments"]] == ["Defer me"]
-        task = buf.get("retry_task")
-        if isinstance(task, asyncio.Task):
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_other_4xx_defers_without_plain_post(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        self._fast_turn_buffer_clocks(monkeypatch)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-400", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        self._no_sleep(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
@@ -13393,12 +13476,9 @@ class TestEditMessage:
         }
         await a.send(chat_id="conv-G-400", content="Wait", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
+        await self._cancel_turn_buffer_retry_task(buf)
         assert send_reply_mock.await_count == 0
         assert buf["keepalive"]["stream_id"] == "ka-400"
-        task = buf.get("retry_task")
-        if isinstance(task, asyncio.Task):
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_deferral_cap_is_three_then_force_plain(

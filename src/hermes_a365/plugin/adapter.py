@@ -7589,6 +7589,16 @@ class Agent365Adapter(BasePlatformAdapter):
                 classified = _classify_answer_final_post(result)
                 if classified == _ANSWER_FINAL_NOT_SENT:
                     if result.budget_exhausted_before_send:
+                        if record.get("may_have_landed"):
+                            return self._answer_uncertain_for_turn(
+                                chat_id,
+                                buf,
+                                turn,
+                                record,
+                                stream_id=stream_id,
+                                context="stream outbound budget exhausted",
+                                chunk_segment_ids=chunk_segment_ids,
+                            )
                         stream = self._keepalive_stream(buf)
                         if not stream.get("closed_by"):
                             stream["closed_by"] = f"turn:{record['turn_key']}"
