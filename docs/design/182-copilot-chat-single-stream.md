@@ -222,6 +222,8 @@ If the turn has **no** marked-answer segment, unscoped sends stay `answer` (lone
 
 When an informative stream is already open (`keepalive.stream_id` set), new progress or commentary segments schedule a continuation POST with the latest informative text. If no stream is open yet, that text is included on the first informative opener at flush (or on the keep-alive opener once #181 fires). Personal Teams 1:1 does not use the turn buffer; this split applies only to Copilot Chat / non-personal buffered turns.
 
+[#214](https://github.com/Satscryption/Hermes-A365/issues/214) ([PR #223](https://github.com/Satscryption/Hermes-A365/pull/223)) now classifies a marked answer segment that sits at or before the last tool-progress segment as commentary via `_reclassify_marked_answer_leadin_before_tool_progress`; [#226](https://github.com/Satscryption/Hermes-A365/issues/226) is refining this.
+
 ## Test plan
 
 File: `tests/test_agent365_plugin.py`, class `TestEditMessage`. The keep-alive tests start near `test_short_buffered_turn_does_not_send_keepalive`.

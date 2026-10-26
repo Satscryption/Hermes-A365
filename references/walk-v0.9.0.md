@@ -1,5 +1,12 @@
 # v0.9.0 focused hardening walk
 
+> **Historical record.** This file captures the 2026-10-05 v0.9.0 walk checkpoint.
+> [#123](https://github.com/Satscryption/Hermes-A365/issues/123) and
+> [#148](https://github.com/Satscryption/Hermes-A365/issues/148) are closed;
+> v0.9.0 has shipped (latest release is v0.9.4). Current Hermes compatibility
+> is documented in
+> [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md).
+
 Status date: 2026-10-05.
 
 Governing contract: [issue #123](https://github.com/Satscryption/Hermes-A365/issues/123),
@@ -142,7 +149,7 @@ Record expected/observed results and sanitized evidence for each row.
 
 | Row | Required observation | State |
 |---|---|---|
-| 1a | Security controls match #125 and every active alert has a supported disposition | Controls verified; zero open dependency alerts; package-floor PR integration pending |
+| 1a | Security controls match #125 and every active alert has a supported disposition | Controls verified; zero open dependency alerts; package floors merged in #147 |
 | 1b | Publish approval/rejection evidence remains applicable; rejection creates no package or release | Prior evidence carried forward after workflow/configuration comparison |
 | 2a | Copilot Chat receives two coalesced segments promptly, once, in order | Not run |
 | 2b | Uninstall/eviction clears active stream and coalescing state; no delayed doomed POST | Not run |
@@ -152,17 +159,112 @@ Record expected/observed results and sanitized evidence for each row.
 | 3b | Configured agentic user's real Entra exchange succeeds | Not run |
 | 3c | Known tenant user without the required FIC relationship is rejected before token issuance | Not run |
 | 3d | Authenticated local harness rejects identity/dedupe negatives before minting; logs contain no credentials | Regression selection passed; final mapping/log review pending |
-| 4a | Explicit subscription provisioning lands only in the chosen subscription | Not run |
-| 4b | Tenant/subscription mismatch is refused before mutation | Not run |
-| 4c | Partial cleanup preserves credentials and sidecars for live resource kinds | Not run |
-| 4d | Unrelated sentinel blocks RG purge and is enumerated | Not run |
-| 4e | Mismatched sidecar/confirmation target is refused | Not run |
+| 4a | Explicit subscription provisioning lands only in the chosen subscription | Passed: Bot Service ARM ID and configuration read back in Hermes-A365 |
+| 4b | Tenant/subscription mismatch is refused before mutation | Live wrong-tenant refusal passed; selected-subscription mismatch remains harness-covered |
+| 4c | Partial cleanup preserves credentials and sidecars for live resource kinds | Partial: Path B app and pending-purge sidecar survived; live credential/Path A cases still required |
+| 4d | Unrelated sentinel blocks RG purge and is enumerated | Passed: sentinel retained and explicitly named after bot deletion |
+| 4e | Mismatched sidecar/confirmation target is refused | Passed: wrong ARM target and wrong agent name both refused; bot read back unchanged |
 | 4f | Unrelated orphan instance deletion requires verified ownership | Not run |
-| 4g | All disposable Azure resources are removed and absence is read back | Not run |
+| 4g | All disposable Azure resources are removed and absence is read back | Passed for this Azure phase; repeat for later live phases |
 | 5a | Shipped provider stores both Path A and B credentials | Not run |
 | 5b | Restart retrieves both credentials and both real messaging paths reply | Not run |
 | 5c | Deliberately selected `.env` fallback works | Not run |
 | 5d | Evidence/log review finds no secrets, bearer tokens or broad environment dumps | Not run |
+
+## Live evidence: wrong-tenant refusal
+
+Candidate: `ec6c67274fd33ee2d4a77df9419aae8581fe2875`.
+The selected subscription was read back as Hermes-A365, enabled, in the
+expected tenant before the probe. The shell default remained Satscrip.
+
+Sanitized command (the subscription placeholder was the explicitly selected
+Hermes-A365 UUID; the all-zero-shaped IDs below were deliberately synthetic):
+
+```sh
+hermes-a365 bot-service create \
+  --agent-name 'Hermes v090 Walk' \
+  --resource-group hermes-v090-walk-rg \
+  --endpoint https://walk-123.invalid/api/messages \
+  --subscription-id <Hermes-A365-subscription> \
+  --tenant-id 00000000-0000-0000-0000-000000000001 \
+  --appid 00000000-0000-0000-0000-000000000002 \
+  --sidecar a365.bot-service.config.json --apply
+```
+
+Expected: refuse before provider registration, resource-group/bot creation or
+sidecar persistence. Observed: exit 1, `belongs to tenant <actual-tenant>,
+not the resolved tenant 00000000-0000-0000-0000-000000000001; refusing before
+mutation`. Output enumerated the plan but contained no apply-success entries.
+The isolated working directory contained no generated Bot Service sidecar.
+
+After the probe, `az group exists --name hermes-v090-walk-rg --subscription
+<Hermes-A365-subscription>` returned `false`. This establishes the live
+wrong-tenant refusal and resource-group absence, not the other create/cleanup
+acceptance cases. No Microsoft inbound traffic was synthesized.
+
+## Live evidence: Azure provisioning and cleanup
+
+All commands in this phase used candidate
+`ec6c67274fd33ee2d4a77df9419aae8581fe2875`. The default Azure subscription
+remained Satscrip; every ARM command explicitly selected Hermes-A365.
+The selected tenant/subscription were read back before mutation phases.
+
+Created a dedicated single-tenant app, `Hermes v090 Walk Path B`, and its
+service principal. No password or role grant was created. Provisioned with:
+
+```sh
+hermes-a365 bot-service create --agent-name 'Hermes v090 Walk' \
+  --resource-group hermes-v090-walk-rg \
+  --endpoint https://walk-123.invalid/api/messages \
+  --subscription-id <Hermes-A365-subscription> --tenant-id <expected-tenant> \
+  --appid <walk-app-id> --sku F0 --region westeurope \
+  --sidecar a365.bot-service.config.json --apply
+```
+
+Exit 0. Readback confirmed F0, the expected tenant and app binding, the bot
+ARM ID in the chosen subscription, and Teams channel enabled. The endpoint
+was deliberately non-routable; this was a provisioning test, not messaging.
+The created app ID was `<walk-app-id>`; the app object was
+`<walk-app-object-id>`, and its service principal was
+`<walk-service-principal-id>`. All were removed at phase exit.
+
+Two cleanup negative controls returned exit 1:
+
+- Correct agent name with `--confirm-bot-target` ending in `wrong-bot`:
+  `cleanup requires exact target acknowledgement before any Azure read or mutation`.
+- Correct ARM target with agent and confirmation `Hermes v090 Wrong Agent`:
+  `sidecar belongs to agent 'Hermes v090 Walk', not 'Hermes v090 Wrong Agent'`.
+
+A subsequent `az bot show` returned the original bot ID and app binding.
+
+Added a disposable, role-free user-assigned identity named
+`hermes-v090-walk-sentinel` to the dedicated group. Backed up the sidecar,
+then ran cleanup with the correct agent, exact bot ARM ID,
+`--purge-resource-group --apply`. Expected and observed exit 1 (purge pending):
+
+```text
+deleted Microsoft Teams channel
+deleted bot resource hermes-v090-walk-bot
+resource group purge remains pending ... it holds 1 non-Hermes-managed or
+unverified resource(s) [Microsoft.ManagedIdentity/userAssignedIdentities/hermes-v090-walk-sentinel]
+preserved a365.bot-service.config.json until ... purge is read back as complete
+```
+
+Readback listed only the sentinel. The separate Path B app still existed
+with zero password credentials. This proves preservation of that app, not
+preservation of real Path A credentials, which remains untested.
+
+Removed the sentinel, verified the group inventory was empty, and manually
+deleted that dedicated group with explicit subscription selection. Removed
+the dedicated app by its exact object ID. Final readback:
+
+- `az group exists` for the dedicated group: `false`.
+- App query filtered by the exact walkthrough app ID: `[]`.
+- Service principal query filtered by that app ID: `[]`.
+- Repeated wrapper cleanup: exit 0, bot absent, managed group absent,
+  sidecar backed up and retained as post-cleanup provenance as designed.
+
+No temporary runtime secret, gateway process or public tunnel was created.
 
 ## Live execution constraints
 
