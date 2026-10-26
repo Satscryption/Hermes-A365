@@ -7573,6 +7573,21 @@ class TestEditMessage:
         monkeypatch.setattr("asyncio.sleep", sleep_mock)
         return sleep_mock
 
+    @staticmethod
+    def _advance_monotonic_sleep(
+        monkeypatch: pytest.MonkeyPatch, start: float = 1000.0
+    ) -> tuple[AsyncMock, dict[str, float]]:
+        """Fake monotonic clock advanced by each asyncio.sleep (#235)."""
+        clock = {"t": start}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+        async def sleep(delay: float) -> None:
+            clock["t"] += float(delay)
+
+        sleep_mock = AsyncMock(side_effect=sleep)
+        monkeypatch.setattr("asyncio.sleep", sleep_mock)
+        return sleep_mock, clock
+
     def test_class_sets_requires_edit_finalize(self) -> None:
         # endStream() is mandatory in BF streaming-ux; the flag tells
         # Hermes' stream consumer to route the final edit through even
@@ -8576,7 +8591,7 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         post_mock = self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
@@ -8629,10 +8644,10 @@ class TestEditMessage:
             AsyncMock(return_value=("bearer-test", "B")),
         )
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 3.0)
-        monkeypatch.setattr(adapter_mod, "_COPILOT_SHORT_TURN_MAX_DURATION_SEC", 3.0)
+        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_short_turn_max_duration_sec = 3.0
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
-        sleep_mock = self._no_sleep(monkeypatch)
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
         a._copilot_member_added_pending[chat] = time.monotonic()
         event = _StubMessageEvent(
             text="hi",
@@ -8676,10 +8691,10 @@ class TestEditMessage:
             AsyncMock(return_value=("bearer-test", "B")),
         )
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 2.5)
-        monkeypatch.setattr(adapter_mod, "_COPILOT_SHORT_TURN_MAX_DURATION_SEC", 3.0)
+        a._copilot_min_stream_age_before_final_sec = 2.5
+        a._copilot_short_turn_max_duration_sec = 3.0
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
-        sleep_mock = self._no_sleep(monkeypatch)
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
         event = _StubMessageEvent(
             text="hi",
             source=_StubSessionSource(platform=None, chat_id=chat),
@@ -8717,10 +8732,10 @@ class TestEditMessage:
             AsyncMock(return_value=("bearer-test", "B")),
         )
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        monkeypatch.setattr(adapter_mod, "_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", 3.0)
-        monkeypatch.setattr(adapter_mod, "_COPILOT_SHORT_TURN_MAX_DURATION_SEC", 3.0)
+        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_short_turn_max_duration_sec = 3.0
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
-        sleep_mock = self._no_sleep(monkeypatch)
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
         event = _StubMessageEvent(
             text="hi",
             source=_StubSessionSource(platform=None, chat_id=chat),
@@ -8728,7 +8743,7 @@ class TestEditMessage:
         )
         await a.on_processing_start(event)
         turn = a._turn_buffers[chat]["turns"][0]
-        turn["started_mono"] = time.monotonic() - 10.0
+        turn["started_mono"] = clock["t"] - 10.0
         assert turn.get("validated_path") == "B"
         await a.send(chat_id=chat, content="Later answer.", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
@@ -8763,6 +8778,187 @@ class TestEditMessage:
         await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         ensure_mock.assert_not_awaited()
+
+    def test_copilot_stream_timing_rejects_non_finite(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", "inf")
+        assert adapter_mod._copilot_stream_timing_sec(
+            "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC"
+        ) == adapter_mod._COPILOT_STREAM_TIMING_DEFAULT_SEC
+        monkeypatch.setenv("HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", "nan")
+        assert adapter_mod._copilot_stream_timing_sec(
+            "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC"
+        ) == adapter_mod._COPILOT_STREAM_TIMING_DEFAULT_SEC
+        monkeypatch.setenv("HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", "25")
+        assert adapter_mod._copilot_stream_timing_sec(
+            "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC"
+        ) == adapter_mod._COPILOT_STREAM_TIMING_MAX_SEC
+
+    @pytest.mark.asyncio
+    async def test_late_member_added_picked_up_before_min_stream_age_wait(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-late-member"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "B")),
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 2.5
+        a._copilot_short_turn_max_duration_sec = 3.0
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        turn = a._turn_buffers[chat]["turns"][0]
+        assert not turn.get("copilot_post_member_added")
+        a._note_copilot_member_added_pending(
+            chat,
+            {
+                "type": "conversationUpdate",
+                "conversation": {"id": chat, "conversationType": "groupChat"},
+            },
+            "B",
+        )
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 2.0
+        ]
+        assert waits
+        assert post_mock.await_count == 2
+
+    @pytest.mark.asyncio
+    async def test_copilot_member_added_pending_expires_after_ttl(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-member-ttl"
+        clock = {"t": 5000.0}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+        a._copilot_member_added_pending[chat] = clock["t"] - (
+            adapter_mod._COPILOT_MEMBER_ADDED_PENDING_TTL_SEC + 1.0
+        )
+        turn: dict[str, Any] = {}
+        a._apply_copilot_member_added_to_turn(chat, turn)
+        assert "copilot_post_member_added" not in turn
+        assert chat not in a._copilot_member_added_pending
+
+    def test_text_merged_into_unmarked_final_does_not_mutate_live_segments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-partition-copy"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        buf = a._turn_buffers.get(chat) or {
+            "turns": [{"seq": "1", "open": True, "inbound": inbound}],
+            "segments": [],
+        }
+        turn = buf["turns"][0]
+        buf["segments"] = [
+            {
+                "id": "s1",
+                "turn": "1",
+                "text": "💻 Running noop",
+                "kind": "progress",
+            },
+            {
+                "id": "s2",
+                "turn": "1",
+                "text": "Found 3 issues",
+                "kind": "commentary",
+                "informative_update": True,
+            },
+            {
+                "id": "s3",
+                "turn": "1",
+                "text": "Done.",
+                "kind": "answer",
+            },
+        ]
+        kinds_before = [segment["kind"] for segment in buf["segments"]]
+        merged = a._text_merged_into_unmarked_final(buf, turn, "Found 3 issues")
+        assert merged is True
+        assert [segment["kind"] for segment in buf["segments"]] == kinds_before
+
+    @pytest.mark.asyncio
+    async def test_keepalive_tool_progress_then_commentary_uses_heartbeat(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-ka-tool-commentary"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-tc")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running noop", reply_to=None)
+        await a.send(
+            chat_id=chat,
+            content="Found 3 issues",
+            reply_to=None,
+            metadata={"informative_update": True},
+        )
+        commentary = next(
+            s for s in a._turn_buffers[chat]["segments"] if s.get("text") == "Found 3 issues"
+        )
+        assert commentary.get("kind") == "commentary"
+        buf = a._turn_buffers[chat]
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        buf["keepalive"] = {
+            "stream_id": "ka-tc",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a._emit_turn_buffer_keepalive(chat)
+        assert commentary.get("kind") == "commentary"
+        informative_found = [
+            body.get("text")
+            for body in posts
+            if body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+            and body.get("text") == "Found 3 issues"
+        ]
+        assert not informative_found
 
     @pytest.mark.asyncio
     async def test_long_turn_keepalive_final_precedes_one_reply(
@@ -10737,7 +10933,7 @@ class TestEditMessage:
                 return self._http_result(201, "ka-sleeper-429")
             if (
                 entity.get("streamType") == "informative"
-                and body.get("text") == "Part one"
+                and body.get("text") == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
             ):
                 return MagicMock(status_code=429, text="throttled", json=lambda: {})
             if entity.get("streamType") == "final":

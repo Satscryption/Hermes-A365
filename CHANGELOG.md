@@ -8,6 +8,21 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **#212 — Copilot keepalive commentary edge cases.** Keepalive merge checks
+  partition segments on a copy so live kinds are not promoted during
+  informative posts; informative updates abort after the answer final has
+  settled when a stream-gap wait races delivery; keepalive sleeper 429 tests
+  target heartbeat text. Refs
+  [#212](https://github.com/Satscryption/Hermes-A365/issues/212).
+
+- **#235 — #217 follow-ups (first-turn flag, config bounds, tests).** Clear
+  ``copilot_post_member_added`` / pending state on uncertain, plain-fallback,
+  and buffer teardown paths; expire stale pending entries; re-apply pending
+  ``membersAdded`` at final delivery time; clamp non-finite Copilot stream-timing
+  env values to defaults (max 10s) per adapter instance; min-stream-age tests
+  advance a fake monotonic clock instead of busy-looping on mocked sleep. Refs
+  [#235](https://github.com/Satscryption/Hermes-A365/issues/235).
+
 - **#217 — Copilot Chat first-turn live render.** Path B turn-buffer delivery
   waits until the informative stream reaches a configurable minimum age before
   posting the answer final on the first turn after ``membersAdded`` / install
