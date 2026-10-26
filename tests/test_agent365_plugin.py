@@ -6544,6 +6544,456 @@ class TestAdapterPersistsRegistry:
         assert ref.chat_name == "across-restart"
 
 
+_HERMES_PROGRESS_LINE = "💻 Running sleep 40"
+
+
+def _design_turn_segment(
+    text: str,
+    *,
+    seg_id: str,
+    reply_to: str = "",
+    notify: bool = False,
+    expect_edits: bool = False,
+    kind: str = "answer",
+) -> dict[str, Any]:
+    return {
+        "id": seg_id,
+        "turn": "1",
+        "text": text,
+        "kind": kind,
+        "reply_to": reply_to,
+        "notify": notify,
+        "expect_edits": expect_edits,
+    }
+
+
+class Test226PreambleVsAnswerDesign:
+    """Rows from docs/design/226-preamble-vs-answer.md (#226)."""
+
+    @staticmethod
+    def _adapter(monkeypatch: pytest.MonkeyPatch) -> Any:
+        a = _make_adapter(monkeypatch)
+        return a
+
+    @classmethod
+    def _final_body(cls, adapter: Any, segments: list[dict[str, Any]]) -> str:
+        buf_segments = [dict(segment) for segment in segments]
+        kept, _drop = adapter._partition_turn_flush_segments(buf_segments, "1")
+        return "\n\n".join(str(segment.get("text") or "") for segment in kept)
+
+    @classmethod
+    def _rotation_allowed(cls, adapter: Any, segments: list[dict[str, Any]]) -> bool:
+        buf_segments = [dict(segment) for segment in segments]
+        adapter_mod._reconcile_turn_buffer_kinds_for_flush(buf_segments, "1")
+        return not adapter._buffer_has_kept_answer_segments({"segments": buf_segments})
+
+    def test_design_p1_fact_before_tool_stays_in_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "The capital of France is Paris.",
+                seg_id="turnbuf:1",
+                reply_to="act-1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+            _design_turn_segment("Checked.", seg_id="turnbuf:3", reply_to="act-1"),
+        ]
+        assert (
+            self._final_body(a, segments)
+            == "The capital of France is Paris.\n\nChecked."
+        )
+        assert self._rotation_allowed(a, segments[:2])
+
+    def test_design_p2_notify_fact_before_tool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "The time is 3pm.", seg_id="turnbuf:1", notify=True
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+            _design_turn_segment("Also UTC.", seg_id="turnbuf:3", reply_to="act-1"),
+        ]
+        assert self._final_body(a, segments) == "The time is 3pm.\n\nAlso UTC."
+        assert self._rotation_allowed(a, segments[:2])
+
+    def test_design_p3_marked_answer_between_progress_lines(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:1", kind="progress"
+            ),
+            _design_turn_segment(
+                "Found 3 files.", seg_id="turnbuf:2", expect_edits=True
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:3", kind="progress"
+            ),
+            _design_turn_segment("All done.", seg_id="turnbuf:4", reply_to="act-1"),
+        ]
+        assert self._final_body(a, segments) == "Found 3 files.\n\nAll done."
+        assert self._rotation_allowed(a, segments[:3])
+        assert not self._rotation_allowed(a, segments)
+
+    def test_design_l1_intent_leadin_drops_from_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "I'll run the sleep, then reply.",
+                seg_id="turnbuf:1",
+                reply_to="act-1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+            _design_turn_segment(
+                "Done after sleep.", seg_id="turnbuf:3", reply_to="act-1"
+            ),
+        ]
+        assert self._final_body(a, segments) == "Done after sleep."
+        assert self._rotation_allowed(a, segments[:2])
+
+    def test_design_l2_two_intent_leadins_before_progress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "I'll run the sleep, then reply.",
+                seg_id="turnbuf:1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                "I'm about to sleep 30 seconds…",
+                seg_id="turnbuf:2",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:3", kind="progress"
+            ),
+            _design_turn_segment("Done after sleep.", seg_id="turnbuf:4", reply_to="act-1"),
+        ]
+        assert self._final_body(a, segments) == "Done after sleep."
+        assert self._rotation_allowed(a, segments[:3])
+
+    def test_design_l4_no_progress_merges_marked_segments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "Opening line.", seg_id="turnbuf:1", expect_edits=True
+            ),
+            _design_turn_segment(
+                "Closing line.", seg_id="turnbuf:2", expect_edits=True
+            ),
+        ]
+        assert self._final_body(a, segments) == "Opening line.\n\nClosing line."
+        assert not self._rotation_allowed(a, segments)
+
+    def test_design_l5_partition_fallback_for_sole_leadin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "I'll run the sleep, then reply.",
+                seg_id="turnbuf:1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+        ]
+        assert self._final_body(a, segments) == "I'll run the sleep, then reply."
+        assert self._rotation_allowed(a, segments)
+
+    def test_design_l6_partition_fallback_for_sole_fact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "The capital of France is Paris.",
+                seg_id="turnbuf:1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+        ]
+        assert self._final_body(a, segments) == "The capital of France is Paris."
+        assert self._rotation_allowed(a, segments)
+
+    def test_design_m1_mixed_sentence_stays_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "The capital of France is Paris. I'll verify it.",
+                seg_id="turnbuf:1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+            _design_turn_segment("Checked.", seg_id="turnbuf:3", reply_to="act-1"),
+        ]
+        assert (
+            self._final_body(a, segments)
+            == "The capital of France is Paris. I'll verify it.\n\nChecked."
+        )
+        assert self._rotation_allowed(a, segments[:2])
+
+    def test_design_f1_let_me_send_drop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "I'll send the report to finance.",
+                seg_id="turnbuf:1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+            _design_turn_segment("Sent.", seg_id="turnbuf:3", reply_to="act-1"),
+        ]
+        assert self._final_body(a, segments) == "Sent."
+        assert self._rotation_allowed(a, segments[:2])
+
+    def test_design_f2_non_english_leadin_kept(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "Je vais lancer la veille, puis je réponds.",
+                seg_id="turnbuf:1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+            _design_turn_segment("Fait.", seg_id="turnbuf:3", reply_to="act-1"),
+        ]
+        assert (
+            self._final_body(a, segments)
+            == "Je vais lancer la veille, puis je réponds.\n\nFait."
+        )
+        assert self._rotation_allowed(a, segments[:2])
+
+    def test_design_f3_let_me_know_drop(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        a = self._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                "Let me know which file you meant.",
+                seg_id="turnbuf:1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(
+                _HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"
+            ),
+            _design_turn_segment("Done.", seg_id="turnbuf:3", reply_to="act-1"),
+        ]
+        assert self._final_body(a, segments) == "Done."
+        assert self._rotation_allowed(a, segments[:2])
+
+    def test_segment_is_intent_preamble_strips_edit_suffix(self) -> None:
+        assert adapter_mod._segment_is_intent_preamble(
+            "I'll run the sleep, then reply. (edited)"
+        )
+        assert not adapter_mod._segment_is_intent_preamble(
+            "The capital of France is Paris."
+        )
+        assert not adapter_mod._segment_is_intent_preamble(
+            "Sure, the capital is Paris."
+        )
+        assert adapter_mod._segment_is_intent_preamble("Sure, I'll check.")
+
+    def test_segment_is_intent_preamble_200_char_boundary(self) -> None:
+        at_cap = "I'll " + ("a" * (200 - len("I'll ")))
+        assert len(at_cap) == 200
+        assert adapter_mod._segment_is_intent_preamble(at_cap)
+        over_cap = at_cap + "a"
+        assert len(over_cap) == 201
+        assert not adapter_mod._segment_is_intent_preamble(over_cap)
+
+    @pytest.mark.asyncio
+    async def test_design_l3_edited_leadin_stays_commentary(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        edit_helpers = TestEditMessage()
+        a = self._adapter(monkeypatch)
+        chat = "conv-G-226-l3"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        edit_helpers._wire_adapter(a, inbound=inbound)
+        edit_helpers._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        lead = await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.edit_message(
+            chat,
+            str(lead.message_id),
+            "I'll run the sleep, then reply. (edited)",
+        )
+        lead_segment = next(
+            segment
+            for segment in a._turn_buffers[chat]["segments"]
+            if segment["id"] == lead.message_id
+        )
+        assert lead_segment["kind"] == "commentary"
+        await a.send(chat_id=chat, content="Done after sleep.", reply_to="act-1")
+        segments = list(a._turn_buffers[chat]["segments"])
+        assert self._final_body(a, segments) == "Done after sleep."
+        assert self._rotation_allowed(a, segments[:2])
+
+    @pytest.mark.asyncio
+    async def test_design_l7_edit_leadin_to_fact_before_post_tool_answer(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        edit_helpers = TestEditMessage()
+        a = self._adapter(monkeypatch)
+        chat = "conv-G-226-l7"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        edit_helpers._wire_adapter(a, inbound=inbound)
+        edit_helpers._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return edit_helpers._http_result(201, "ka-l7")
+            return edit_helpers._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="fact",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        lead = await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.edit_message(
+            chat,
+            str(lead.message_id),
+            "The capital of France is Paris.",
+        )
+        segments = list(a._turn_buffers[chat]["segments"])
+        assert self._rotation_allowed(a, segments)
+        await a.send(chat_id=chat, content="Checked.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == "The capital of France is Paris.\n\nChecked."
+
+    @pytest.mark.asyncio
+    async def test_228_edited_preamble_clears_informative_displayed_and_reposts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Edited demoted lead-in must show live on the informative stream (#228)."""
+        edit_helpers = TestEditMessage()
+        a = self._adapter(monkeypatch)
+        chat = "conv-G-228-edited-preamble"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        edit_helpers._wire_adapter(a, inbound=inbound)
+        edit_helpers._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return edit_helpers._http_result(201, "ka-228")
+            return edit_helpers._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        lead = await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await edit_helpers._spin_until(
+            lambda: any(
+                p.get("type") == "typing"
+                and p.get("text") == "I'll run the sleep, then reply."
+                and (p.get("entities") or [{}])[0].get("streamType") == "informative"
+                for p in posts
+            )
+        )
+        edited = "I'll run the sleep, then reply. (edited)"
+        await a.edit_message(chat, str(lead.message_id), edited)
+        lead_segment = next(
+            segment
+            for segment in a._turn_buffers[chat]["segments"]
+            if segment["id"] == lead.message_id
+        )
+        assert lead_segment["kind"] == "commentary"
+        assert not lead_segment.get("informative_displayed")
+        segment_task = a._turn_buffers[chat].get("segment_informative_task")
+        if isinstance(segment_task, asyncio.Task):
+            await segment_task
+        await edit_helpers._spin_until(
+            lambda: any(
+                p.get("type") == "typing"
+                and p.get("text") == edited
+                and (p.get("entities") or [{}])[0].get("streamType") == "informative"
+                for p in posts
+            )
+        )
+        edited_informative = [
+            post
+            for post in posts
+            if post.get("type") == "typing"
+            and post.get("text") == edited
+            and (post.get("entities") or [{}])[0].get("streamType") == "informative"
+        ]
+        assert len(edited_informative) == 1
+
+
 # ---------------------------------------------------------------------------
 # Slice 19o — send_typing + send_image
 # ---------------------------------------------------------------------------

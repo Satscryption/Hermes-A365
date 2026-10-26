@@ -34,6 +34,22 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   the installed version is below the floor. The v1 support matrix documents az
   and .NET prerelease warn behaviour.
 
+### Changed
+
+- **#226 — Copilot pre-tool answers vs intent lead-ins.** Marked segments before
+  the last Hermes tool-progress line on a turn stay in the answer final unless
+  the text is a short, intent-shaped preamble (English “I'll …” / “Let me …”
+  cues, at most 200 characters). Genuine declarative facts before a tool are
+  joined into the final with later marked answers; walk094-style lead-ins
+  remain commentary. Pre-tool answer-like segments no longer block keep-alive
+  stream rotation past 120s. Refs
+  [#226](https://github.com/Satscryption/Hermes-A365/issues/226).
+
+- **#228 — Edited preamble on the informative stream.** After
+  ``edit_message`` changes commentary text, ``informative_displayed`` is cleared
+  so an edited demoted lead-in can post again under ``expect_edits``. Refs
+  [#228](https://github.com/Satscryption/Hermes-A365/issues/228).
+
 ## [0.9.4] — 2026-10-26
 
 Inbound webhook JWKS fail-closed and admission hardening (#86, #205, #206),

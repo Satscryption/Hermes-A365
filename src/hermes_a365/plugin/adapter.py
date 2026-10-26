@@ -875,25 +875,79 @@ def _turn_segments_for_seq(
     ]
 
 
-def _reclassify_marked_answer_leadin_before_tool_progress(
-    segments: list[dict[str, Any]], turn_seq: str
-) -> None:
-    """Marked-answer sends before tool progress are lead-in commentary (#214)."""
-    turn_segments = _turn_segments_for_seq(segments, turn_seq)
+_INTENT_PREAMBLE_MAX_CHARS = 200
+_INTENT_PREAMBLE_SENTENCE_SPLIT = re.compile(r"(?<=[.!?…])\s+")
+_INTENT_PREAMBLE_TRAILING_PAREN = re.compile(r"\s*\([^)]{0,80}\)$")
+_INTENT_PREAMBLE_SENTENCE_CUE = re.compile(
+    r"^(?:(?:ok|okay|sure|alright|right)(?:[,\u2014\u2013-]\s+|\s+))?"
+    r"(?:i['\u2019]ll|i will|i['\u2019]m going to|i am going to|"
+    r"i['\u2019]m about to|i am about to|let me|allow me to)\b",
+    re.IGNORECASE,
+)
+
+
+def _normalize_intent_preamble_text(text: str) -> str:
+    collapsed = " ".join(_strip_streaming_cursor(text).split())
+    while True:
+        match = _INTENT_PREAMBLE_TRAILING_PAREN.search(collapsed)
+        if not match:
+            break
+        collapsed = collapsed[: match.start()].rstrip()
+    return collapsed
+
+
+def _segment_is_intent_preamble(text: str) -> bool:
+    """True when marked text is a short, intent-shaped lead-in (#226)."""
+    normalized = _normalize_intent_preamble_text(text)
+    if not normalized or len(normalized) > _INTENT_PREAMBLE_MAX_CHARS:
+        return False
+    sentences = _INTENT_PREAMBLE_SENTENCE_SPLIT.split(normalized)
+    if not sentences:
+        return False
+    return all(
+        bool(_INTENT_PREAMBLE_SENTENCE_CUE.match(sentence.strip()))
+        for sentence in sentences
+        if sentence.strip()
+    )
+
+
+def _last_tool_progress_index(turn_segments: list[dict[str, Any]]) -> int | None:
     progress_indexes = [
         index
         for index, segment in enumerate(turn_segments)
         if _is_hermes_tool_progress_segment(str(segment.get("text") or ""))
     ]
     if not progress_indexes:
+        return None
+    return progress_indexes[-1]
+
+
+def _segment_is_answer_like_for_rotation(segment: dict[str, Any]) -> bool:
+    text = str(segment.get("text") or "")
+    if not text:
+        return False
+    kind = segment.get("kind")
+    if kind:
+        return str(kind) == "answer"
+    return not _is_hermes_tool_progress_segment(text)
+
+
+def _reclassify_marked_answer_leadin_before_tool_progress(
+    segments: list[dict[str, Any]], turn_seq: str
+) -> None:
+    """Demote intent-shaped marked lead-ins before tool progress (#214, #226)."""
+    turn_segments = _turn_segments_for_seq(segments, turn_seq)
+    last_progress_idx = _last_tool_progress_index(turn_segments)
+    if last_progress_idx is None:
         return
-    last_progress_idx = progress_indexes[-1]
     for index, segment in enumerate(turn_segments):
         if not _segment_is_marked_answer(segment):
             continue
         if _is_hermes_tool_progress_segment(str(segment.get("text") or "")):
             continue
-        if index <= last_progress_idx:
+        if index <= last_progress_idx and _segment_is_intent_preamble(
+            str(segment.get("text") or "")
+        ):
             segment["kind"] = "commentary"
 
 
@@ -7126,17 +7180,20 @@ class Agent365Adapter(BasePlatformAdapter):
 
     @staticmethod
     def _buffer_has_kept_answer_segments(buf: dict[str, Any]) -> bool:
-        for segment in buf.get("segments") or []:
-            text = str(segment.get("text") or "")
-            if not text:
+        segments = buf.get("segments") or []
+        turns: dict[str, list[dict[str, Any]]] = {}
+        for segment in segments:
+            if not isinstance(segment, dict):
                 continue
-            kind = segment.get("kind")
-            if kind:
-                if kind == "answer":
+            turn_seq = str(segment.get("turn") or "")
+            turns.setdefault(turn_seq, []).append(segment)
+        for turn_segments in turns.values():
+            last_progress_idx = _last_tool_progress_index(turn_segments)
+            for index, segment in enumerate(turn_segments):
+                if not _segment_is_answer_like_for_rotation(segment):
+                    continue
+                if last_progress_idx is None or index > last_progress_idx:
                     return True
-                continue
-            if not _is_hermes_tool_progress_segment(text):
-                return True
         return False
 
     def _keepalive_stream(self, buf: dict[str, Any]) -> dict[str, Any]:
@@ -8062,6 +8119,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if own is not None:
             for segment in own["segments"]:
                 if segment["id"] == message_id:
+                    prior_text = str(segment.get("text") or "")
                     segment["text"] = text
                     _refresh_turn_buffer_segment_kind_after_edit(segment)
                     turn_seq = str(segment.get("turn") or "")
@@ -8070,6 +8128,8 @@ class Agent365Adapter(BasePlatformAdapter):
                             own["segments"], turn_seq
                         )
                     kind = str(segment.get("kind") or "")
+                    if text != prior_text and kind == "commentary":
+                        segment["informative_displayed"] = False
                     if kind in ("progress", "commentary"):
                         self._schedule_informative_segment_refresh(chat_id)
                     return SendResult(success=True, message_id=message_id)
