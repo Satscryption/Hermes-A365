@@ -3437,6 +3437,7 @@ async def send_reply(
         validated_path=validated_path,
     )
     from hermes_a365.outbound_retry import (
+        OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
         OUTBOUND_DEFAULT_MAX_ATTEMPTS,
         request_with_outbound_retry,
     )
@@ -3454,7 +3455,7 @@ async def send_reply(
             _post_once,
             call_site="activity_bridge.send_reply",
             max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
-            allow_transient_5xx=True,
+            total_budget_sec=OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
         )
     except Exception as exc:
         # Only this POST can have stored the activity. A ReadTimeout or

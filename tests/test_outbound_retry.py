@@ -9,9 +9,11 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from hermes_a365.outbound_retry import (
+    OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
     OUTBOUND_DEFAULT_MAX_ATTEMPTS,
     OUTBOUND_RETRY_AFTER_CAP_SEC,
     OUTBOUND_TYPING_MAX_ATTEMPTS,
+    clamp_retry_delay_sec,
     compute_backoff_delay_sec,
     is_retryable_http_status,
     parse_retry_after_seconds,
@@ -38,12 +40,24 @@ class TestParseRetryAfter:
         assert 4.0 <= delay <= 6.0
 
     def test_cap_applied(self) -> None:
-        assert (
-            parse_retry_after_seconds(_resp(429, "120"), cap_sec=30.0) == 30.0
-        )
+        assert parse_retry_after_seconds(_resp(429, "120"), cap_sec=30.0) == 30.0
+
+    def test_keepalive_cap_at_sixty(self) -> None:
+        assert parse_retry_after_seconds(_resp(429, "120"), cap_sec=60.0) == 60.0
 
     def test_missing_header_returns_zero(self) -> None:
         assert parse_retry_after_seconds(_resp(429), cap_sec=30.0) == 0.0
+
+    def test_negative_delta_seconds(self) -> None:
+        assert parse_retry_after_seconds(_resp(429, "-5"), cap_sec=30.0) == 0.0
+
+    def test_past_http_date(self) -> None:
+        past = datetime.now(UTC) - timedelta(seconds=30)
+        raw = format_datetime(past, usegmt=True)
+        assert parse_retry_after_seconds(_resp(429, raw), cap_sec=30.0) == 0.0
+
+    def test_garbage_value(self) -> None:
+        assert parse_retry_after_seconds(_resp(429, "not-a-date"), cap_sec=30.0) == 0.0
 
 
 class TestIsRetryable:
@@ -56,6 +70,14 @@ class TestIsRetryable:
 
     def test_400_not_retryable(self) -> None:
         assert not is_retryable_http_status(400, allow_transient_5xx=True)
+
+
+class TestClampRetryDelay:
+    def test_clamps_to_remaining_budget(self) -> None:
+        assert clamp_retry_delay_sec(10.0, 3.0) == 3.0
+
+    def test_zero_budget_returns_zero(self) -> None:
+        assert clamp_retry_delay_sec(2.0, 0.0) == 0.0
 
 
 @pytest.mark.asyncio
@@ -119,6 +141,23 @@ class TestRequestWithOutboundRetry:
         assert result.status_code == 400
         assert calls == 1
 
+    async def test_no_retry_on_503_by_default(self) -> None:
+        calls = 0
+
+        async def send_once() -> MagicMock:
+            nonlocal calls
+            calls += 1
+            return _resp(503)
+
+        result = await request_with_outbound_retry(
+            send_once,
+            call_site="test",
+            max_attempts=3,
+            sleep=AsyncMock(),
+        )
+        assert result.status_code == 503
+        assert calls == 1
+
     async def test_transient_5xx_when_enabled(self) -> None:
         calls = 0
 
@@ -138,6 +177,40 @@ class TestRequestWithOutboundRetry:
         )
         assert result.status_code == 201
         assert calls == 2
+
+    async def test_total_sleep_stays_within_budget(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sleeps: list[float] = []
+        clock = 0.0
+
+        def monotonic() -> float:
+            return clock
+
+        monkeypatch.setattr("hermes_a365.outbound_retry.time.monotonic", monotonic)
+
+        async def sleep(delay: float) -> None:
+            nonlocal clock
+            sleeps.append(delay)
+            clock += delay
+
+        calls = 0
+
+        async def send_once() -> MagicMock:
+            nonlocal calls
+            calls += 1
+            return _resp(429, "20")
+
+        result = await request_with_outbound_retry(
+            send_once,
+            call_site="test",
+            max_attempts=5,
+            total_budget_sec=10.0,
+            sleep=sleep,
+        )
+        assert result.status_code == 429
+        assert sum(sleeps) <= 10.0
+        assert all(s <= 10.0 for s in sleeps)
 
 
 class TestComputeBackoff:
@@ -205,6 +278,37 @@ class TestCallSiteFamilies:
         )
         assert client.post.await_count == 2
         assert sleeps == [1.0]
+        assert sum(sleeps) <= OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+
+    async def test_activity_bridge_send_reply_does_not_retry_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365 import activity_bridge as bridge
+        from hermes_a365.activity_bridge import ReplyPostError
+
+        client = MagicMock()
+        client.post = AsyncMock(return_value=MagicMock(status_code=503, headers={}, text=""))
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("tok", "A")),
+        )
+        inbound = {
+            "serviceUrl": "https://smba.trafficmanager.net/amer/",
+            "conversation": {"id": "c1"},
+            "id": "a1",
+        }
+        with pytest.raises(ReplyPostError):
+            await bridge.send_reply(
+                inbound=inbound,
+                reply={"type": "message", "text": "hi"},
+                cfg=MagicMock(),
+                client=client,
+                fmi_cache=MagicMock(),
+                user_cache=MagicMock(),
+                validated_path="A",
+            )
+        assert client.post.await_count == 1
 
     async def test_adapter_post_activity_typing_at_most_one_retry(
         self, monkeypatch: pytest.MonkeyPatch
@@ -215,7 +319,7 @@ class TestCallSiteFamilies:
         inbound = _make_inbound(conv_id="conv-typing")
         posts = [
             MagicMock(status_code=429, headers={"Retry-After": "1"}, text=""),
-            MagicMock(status_code=200, headers={}, text=""),
+            MagicMock(status_code=429, headers={"Retry-After": "1"}, text=""),
         ]
         post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=posts)
         TestEditMessage._patch_token_mint(monkeypatch)
@@ -223,31 +327,34 @@ class TestCallSiteFamilies:
         sleep_mock = AsyncMock()
         monkeypatch.setattr("hermes_a365.outbound_retry.asyncio.sleep", sleep_mock)
 
-        await a._post_activity(
-            inbound=inbound,
-            activity={"type": "typing"},
-        )
+        with pytest.raises(RuntimeError, match="_post_activity"):
+            await a._post_activity(
+                inbound=inbound,
+                activity={"type": "typing"},
+            )
         assert post_mock.await_count == OUTBOUND_TYPING_MAX_ATTEMPTS
+        assert sleep_mock.await_count == 1
 
-    async def test_proactive_send_retries_503(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_proactive_send_does_not_retry_503(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
         from hermes_a365.plugin.conversations import ConversationRef
         from tests.test_agent365_plugin import TestEditMessage, _make_adapter, _make_inbound
 
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-pro")
         a._conversations.upsert(ConversationRef.from_activity(inbound), now=100.0)
-        posts = [
-            MagicMock(status_code=503, headers={}, text=""),
-            MagicMock(status_code=200, headers={}, text="", json=lambda: {"id": "new"}),
-        ]
-        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound, post_responses=posts)
+        post_mock = TestEditMessage._wire_adapter(
+            a,
+            inbound=inbound,
+            post_responses=[MagicMock(status_code=503, headers={}, text="")],
+        )
         TestEditMessage._patch_token_mint(monkeypatch)
         monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
-        monkeypatch.setattr("hermes_a365.outbound_retry.asyncio.sleep", AsyncMock())
 
         result = await a._send_proactive("conv-pro", "hello")
-        assert result.success is True
-        assert post_mock.await_count == 2
+        assert result.success is False
+        assert post_mock.await_count == 1
 
     async def test_file_consent_upload_retries_429(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from tests.test_agent365_plugin import _make_adapter, _make_inbound
@@ -314,7 +421,10 @@ class TestCallSiteFamilies:
         assert resp.status == 200
         assert client.put.await_count == 2
 
-    async def test_stream_edit_honours_retry_after(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    async def test_stream_edit_honours_retry_after_floor(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.plugin.adapter as adapter_mod
         from tests.test_agent365_plugin import TestEditMessage, _make_adapter, _make_inbound
 
         a = _make_adapter(monkeypatch)
@@ -323,7 +433,7 @@ class TestCallSiteFamilies:
         rate = MagicMock(
             status_code=429,
             text="",
-            headers={"Retry-After": "2"},
+            headers={"Retry-After": "0"},
             json=lambda: {"error": {"code": "TooManyRequests", "message": "wait"}},
         )
         ok = MagicMock(status_code=202, text="", json=lambda: {})
@@ -335,4 +445,4 @@ class TestCallSiteFamilies:
         await a.edit_message("conv-stream", "m1", "A")
         result = await a.edit_message("conv-stream", "m1", "A B")
         assert result.success is True
-        assert sleep_mock.await_args_list[-1].args[0] == 2.0
+        assert sleep_mock.await_args_list[-1].args[0] == adapter_mod._STREAMING_MIN_GAP_SEC

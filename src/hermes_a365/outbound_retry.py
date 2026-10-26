@@ -1,22 +1,23 @@
 """Shared outbound HTTP retry for Bot Framework and Graph uploads (#190).
 
 Retries are safe only when the connector rejected the request before accepting
-the activity or upload (HTTP 429 or transient 5xx). A non-idempotent POST is
-not retried on 502/503/504 unless ``allow_transient_5xx`` is set for call
-sites where a duplicate visible message is unlikely (stream edits on an open
-stream, idempotent OneDrive range PUTs).
+the activity or upload. Non-idempotent activity **creates** (BF reply POST,
+proactive ``sendToConversation`` POST) retry **HTTP 429 only** — a 502/503/504
+may already have stored the activity, matching existing ReadTimeout handling.
+
+Idempotent or safe-to-repeat calls may opt into transient 5xx retries (full-range
+OneDrive upload PUT; stream edits on an open stream with the legacy edit rules).
 
 Call sites wired through :func:`request_with_outbound_retry`:
 
-- ``activity_bridge.send_reply`` — BF reply POST (429 + transient 5xx).
-- ``adapter._post_activity`` — typing and other fresh activities (429 only,
-  at most one retry).
-- ``adapter._send_proactive`` — proactive ``sendToConversation`` POST (429 +
-  transient 5xx).
+- ``activity_bridge.send_reply`` — BF reply POST (**429 only**; total budget
+  fits the #214 keepalive interval).
+- ``adapter._post_activity`` — typing (**429 only**, at most one retry).
+- ``adapter._send_proactive`` — proactive POST (**429 only**).
 - ``adapter._send_reply_activity`` — via ``send_reply``.
-- ``adapter.edit_message`` stream POST loop — 429/500/502/503/504 with
-  stream-edit attempt budget; honours ``Retry-After`` when present, else the
-  legacy streaming gap.
+- ``adapter.edit_message`` stream POST loop — 429/500/502/503/504 with the
+  stream-edit attempt budget; ``Retry-After`` is floored at the streaming gap
+  and capped by remaining stream lifetime.
 - ``adapter._handle_file_consent`` — OneDrive upload PUT (429 + transient 5xx).
 """
 
@@ -25,6 +26,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
@@ -36,6 +38,9 @@ logger = logging.getLogger(__name__)
 OUTBOUND_RETRY_AFTER_CAP_SEC = 30.0
 OUTBOUND_DEFAULT_MAX_ATTEMPTS = 4
 OUTBOUND_TYPING_MAX_ATTEMPTS = 2  # initial try + at most one retry
+# Keep total retry wait within adapter._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC (#214).
+OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC = 25.0
+OUTBOUND_FILE_UPLOAD_TOTAL_BUDGET_SEC = 60.0
 
 RETRYABLE_THROTTLE = frozenset({429})
 RETRYABLE_TRANSIENT_5XX = frozenset({502, 503, 504})
@@ -122,15 +127,25 @@ def compute_backoff_delay_sec(
     return min(jittered, max_exponential_sec)
 
 
+def clamp_retry_delay_sec(delay: float, remaining_budget_sec: float | None) -> float:
+    """Clamp a computed delay to the remaining cumulative retry budget."""
+    if remaining_budget_sec is None:
+        return max(0.0, delay)
+    if remaining_budget_sec <= 0.0:
+        return 0.0
+    return min(max(0.0, delay), remaining_budget_sec)
+
+
 async def request_with_outbound_retry(
     send_once: Callable[[], Awaitable[Any]],
     *,
     call_site: str,
     max_attempts: int = OUTBOUND_DEFAULT_MAX_ATTEMPTS,
-    allow_transient_5xx: bool = True,
+    allow_transient_5xx: bool = False,
     allow_500: bool = False,
     retry_after_cap: float = OUTBOUND_RETRY_AFTER_CAP_SEC,
     fallback_delay_sec: float = 0.0,
+    total_budget_sec: float | None = None,
     sleep: SleepFn | None = None,
     before_retry: Callable[[int, int, Any], Awaitable[bool]] | None = None,
 ) -> Any:
@@ -138,10 +153,22 @@ async def request_with_outbound_retry(
 
     ``send_once`` must perform one HTTP round-trip and return a response-like object
     with ``status_code``. Exceptions propagate immediately (not retried here).
+
+    When ``total_budget_sec`` is set, cumulative sleep between attempts is clamped so
+    the helper does not exceed that wall-clock budget (monotonic clock).
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be >= 1")
     sleep_fn: SleepFn = sleep if sleep is not None else asyncio.sleep
+    deadline: float | None = None
+    if total_budget_sec is not None and total_budget_sec > 0.0:
+        deadline = time.monotonic() + total_budget_sec
+
+    def remaining_budget() -> float | None:
+        if deadline is None:
+            return None
+        return max(0.0, deadline - time.monotonic())
+
     last_response: Any = None
     for attempt in range(1, max_attempts + 1):
         last_response = await send_once()
@@ -170,6 +197,14 @@ async def request_with_outbound_retry(
             retry_after_cap=retry_after_cap,
             fallback_delay_sec=fallback_delay_sec,
         )
+        delay = clamp_retry_delay_sec(delay, remaining_budget())
+        if delay <= 0.0:
+            logger.warning(
+                "outbound send gave up: call_site=%s status=%s reason=retry_budget_exhausted",
+                call_site,
+                status,
+            )
+            return last_response
         logger.info(
             "outbound send retry: call_site=%s status=%s attempt=%s/%s delay_sec=%.2f",
             call_site,

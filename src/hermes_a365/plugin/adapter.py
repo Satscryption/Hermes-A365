@@ -9464,6 +9464,7 @@ class Agent365Adapter(BasePlatformAdapter):
         url = _conversations_activities_url(service_url, target["conversation_id"])
 
         from hermes_a365.outbound_retry import (
+            OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
             OUTBOUND_DEFAULT_MAX_ATTEMPTS,
             request_with_outbound_retry,
         )
@@ -9480,7 +9481,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     ),
                     call_site="adapter._send_proactive",
                     max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
-                    allow_transient_5xx=True,
+                    total_budget_sec=OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
                 ),
             )
         except Exception as e:
@@ -10456,6 +10457,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.InvokeResponse(status=200, body={})
         from hermes_a365.outbound_retry import (
             OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+            OUTBOUND_FILE_UPLOAD_TOTAL_BUDGET_SEC,
             request_with_outbound_retry,
         )
 
@@ -10476,6 +10478,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     call_site="adapter._handle_file_consent.upload",
                     max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
                     allow_transient_5xx=True,
+                    total_budget_sec=OUTBOUND_FILE_UPLOAD_TOTAL_BUDGET_SEC,
                 ),
             )
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
@@ -11927,15 +11930,34 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_id, chat_generation
         )
 
-    @staticmethod
-    def _stream_edit_retry_delay_sec(attempt: int, response: Any | None) -> float:
+    def _stream_edit_retry_delay_sec(
+        self,
+        attempt: int,
+        response: Any | None,
+        state: dict[str, Any],
+        loop_now: float,
+    ) -> float:
         from hermes_a365.outbound_retry import compute_backoff_delay_sec
 
-        return compute_backoff_delay_sec(
+        delay = compute_backoff_delay_sec(
             attempt,
             response,
             fallback_delay_sec=_STREAMING_MIN_GAP_SEC,
         )
+        delay = max(delay, _STREAMING_MIN_GAP_SEC)
+        opened_ts = state.get("opened_ts")
+        age = (
+            loop_now - float(opened_ts)
+            if isinstance(opened_ts, (int, float))
+            else 0.0
+        )
+        remaining = max(
+            0.0,
+            _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+            - _ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+            - age,
+        )
+        return min(delay, remaining)
 
     @staticmethod
     def _personal_reply_anchor(reply_to: Any, inbound: dict[str, Any] | None) -> str:
@@ -12509,7 +12531,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     attempt=attempt,
                 )
                 if self._stream_edit_should_retry(state, http_status=None, attempt=attempt):
-                    delay = self._stream_edit_retry_delay_sec(attempt, None)
+                    delay = self._stream_edit_retry_delay_sec(
+                        attempt, None, state, loop_now
+                    )
                     logger.info(
                         "outbound send retry: call_site=adapter.edit_message "
                         "status=none attempt=%s/%s delay_sec=%.2f",
@@ -12682,7 +12706,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # is the pre-#64 failure mode, and a plain send while this
             # stream is open is suppressed.
             if self._stream_edit_should_retry(state, http_status=resp.status_code, attempt=attempt):
-                delay = self._stream_edit_retry_delay_sec(attempt, resp)
+                delay = self._stream_edit_retry_delay_sec(attempt, resp, state, loop_now)
                 logger.info(
                     "outbound send retry: call_site=adapter.edit_message "
                     "status=%s attempt=%s/%s delay_sec=%.2f",
