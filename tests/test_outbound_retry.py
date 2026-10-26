@@ -4,9 +4,11 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 from email.utils import format_datetime
+from typing import Any
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+import test_agent365_plugin as plugin_tests
 
 from hermes_a365.outbound_retry import (
     OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
@@ -446,3 +448,100 @@ class TestCallSiteFamilies:
         result = await a.edit_message("conv-stream", "m1", "A B")
         assert result.success is True
         assert sleep_mock.await_args_list[-1].args[0] == adapter_mod._STREAMING_MIN_GAP_SEC
+
+
+class TestStreamEditRetryCap:
+    def test_delay_cap_shrinks_as_loop_clock_advances(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        state = {"opened_ts": 100.0}
+        clock = 100.0
+        loop = MagicMock()
+        loop.time = lambda: clock
+        monkeypatch.setattr(asyncio, "get_event_loop", lambda: loop)
+
+        first = a._stream_edit_retry_delay_sec(1, _resp(429, "30"), state)
+        assert first is not None
+        clock += 110.0
+        second = a._stream_edit_retry_delay_sec(1, _resp(429, "30"), state)
+        assert second is not None
+        assert second < first
+
+    def test_no_retry_when_remaining_below_streaming_gap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        import hermes_a365.plugin.adapter as adapter_mod
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        state = {"opened_ts": 0.0}
+        clock = cap - margin - 0.25
+        loop = MagicMock()
+        loop.time = lambda: clock
+        monkeypatch.setattr(asyncio, "get_event_loop", lambda: loop)
+
+        assert a._stream_edit_retry_delay_sec(1, _resp(429, "2"), state) is None
+
+
+@pytest.mark.asyncio
+class TestWebhookReplyBudget:
+    async def test_send_reply_uses_webhook_budget_when_requested(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365 import activity_bridge as bridge
+
+        seen: dict[str, float | None] = {}
+
+        async def capture_retry(
+            send_once: Any,
+            *,
+            call_site: str,
+            max_attempts: int = 4,
+            allow_transient_5xx: bool = False,
+            allow_500: bool = False,
+            retry_after_cap: float = 30.0,
+            fallback_delay_sec: float = 0.0,
+            total_budget_sec: float | None = None,
+            sleep: Any = None,
+            before_retry: Any = None,
+        ) -> Any:
+            seen["budget"] = total_budget_sec
+            return await send_once()
+
+        monkeypatch.setattr(
+            "hermes_a365.outbound_retry.request_with_outbound_retry",
+            capture_retry,
+        )
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("tok", "A")),
+        )
+        client = MagicMock()
+        client.post = AsyncMock(
+            return_value=MagicMock(status_code=200, headers={}, text="", json=lambda: {})
+        )
+        inbound = {
+            "serviceUrl": "https://smba.trafficmanager.net/amer/",
+            "conversation": {"id": "c1"},
+            "id": "a1",
+        }
+        await bridge.send_reply(
+            inbound=inbound,
+            reply={"type": "message", "text": "hi"},
+            cfg=MagicMock(),
+            client=client,
+            fmi_cache=MagicMock(),
+            user_cache=MagicMock(),
+            validated_path="A",
+            retry_total_budget_sec=OUTBOUND_WEBHOOK_REPLY_TOTAL_BUDGET_SEC,
+        )
+        assert seen["budget"] == OUTBOUND_WEBHOOK_REPLY_TOTAL_BUDGET_SEC
+        assert OUTBOUND_WEBHOOK_REPLY_TOTAL_BUDGET_SEC < OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
