@@ -8469,6 +8469,68 @@ class TestEditMessage:
         assert text != ""
         assert len(text) <= adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
 
+    def test_classify_answer_final_budget_exhausted_is_not_sent(self) -> None:
+        result = adapter_mod._KeepalivePost(
+            None,
+            "",
+            "",
+            False,
+            False,
+            0.0,
+            False,
+            False,
+            True,
+        )
+        assert adapter_mod._classify_answer_final_post(result) == adapter_mod._ANSWER_FINAL_NOT_SENT
+
+    @pytest.mark.asyncio
+    async def test_answer_final_near_cap_budget_exhausted_plain_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-cap-budget-plain"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 0.5
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                raise AssertionError("answer final must not POST when cap budget < 1s")
+            return self._http_result(201, "ka-cap-budget")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-cap-budget",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
+        }
+        await a.send(chat_id=chat, content="Plain after cap budget", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 0
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain after cap budget"
+        assert chat not in a._turn_buffers
+
     def test_keepalive_stream_outbound_deadline_uses_shared_cap(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

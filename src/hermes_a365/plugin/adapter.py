@@ -1075,6 +1075,7 @@ class _KeepalivePost(NamedTuple):
     retry_after_sec: float = 0.0
     connect_before_send: bool = False
     during_mint: bool = False
+    budget_exhausted_before_send: bool = False
 
 
 def _keepalive_rotation_due(age: float) -> bool:
@@ -1157,6 +1158,8 @@ def _classify_answer_final_post(result: _KeepalivePost) -> str:
     if status in _ANSWER_FINAL_RETRY_STATUSES:
         return _ANSWER_FINAL_RETRYABLE
     if status is None:
+        if result.budget_exhausted_before_send:
+            return _ANSWER_FINAL_NOT_SENT
         if result.timeout_after_send:
             return _ANSWER_FINAL_MAY_HAVE_LANDED
         if result.connect_before_send:
@@ -7110,10 +7113,16 @@ class Agent365Adapter(BasePlatformAdapter):
         except Exception as exc:
             return self._keepalive_post_exception(chat_id, exc, opening=opening)
         if resp is None:
-            return self._keepalive_post_exception(
-                chat_id,
-                RuntimeError("keep-alive POST outbound budget exhausted"),
-                opening=opening,
+            return _KeepalivePost(
+                None,
+                "",
+                "",
+                False,
+                False,
+                0.0,
+                False,
+                False,
+                True,
             )
         status_after = getattr(resp, "status_code", None)
         logger.debug(
@@ -7579,6 +7588,18 @@ class Agent365Adapter(BasePlatformAdapter):
             while self._turn_buffers.get(chat_id) is buf:
                 classified = _classify_answer_final_post(result)
                 if classified == _ANSWER_FINAL_NOT_SENT:
+                    if result.budget_exhausted_before_send:
+                        stream = self._keepalive_stream(buf)
+                        if not stream.get("closed_by"):
+                            stream["closed_by"] = f"turn:{record['turn_key']}"
+                        stream["stream_id"] = ""
+                        buf["keepalive"] = stream
+                        logger.warning(
+                            "agent365 turn buffer answer plain fallback: chat_id=%s "
+                            "reason=stream outbound budget exhausted",
+                            chat_id,
+                        )
+                        return ("fallback", "stream outbound budget exhausted")
                     if result.status is None and int(record.get("not_sent_probes_left") or 0) > 0:
                         record["not_sent_probes_left"] = int(record["not_sent_probes_left"]) - 1
                         result = await self._post_answer_final(
@@ -9500,6 +9521,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 proactive send: adapter lifecycle changed",
             )
+        if resp is None:
+            return SendResult(
+                success=False,
+                error="proactive POST: outbound budget exhausted",
+            )
 
         # httpx raises on .raise_for_status; do the same shape but avoid
         # hard-coupling to httpx specifics (the tests use MagicMock).
@@ -10600,6 +10626,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     attempt_timeout_sec=OUTBOUND_ONEDRIVE_UPLOAD_ATTEMPT_TIMEOUT_SEC,
                 ),
             )
+            if put_resp is None:
+                logger.error("agent365 fileConsent upload: outbound budget exhausted")
+                await remove_consent_card()
+                return
             status_code = int(getattr(put_resp, "status_code", 0) or 0)
             if status_code < 200 or status_code >= 300:
                 logger.error("agent365 fileConsent upload HTTP %s", status_code)

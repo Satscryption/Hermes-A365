@@ -37,7 +37,9 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   proactive, typing, Copilot turn-buffer keep-alive POST) share a separate
   25s retry budget clamped to the Copilot stream soft cap; answer-final outer
   429 retries reuse one absolute outbound deadline so a fresh 25s window
-  cannot start a POST after the stream expires. Refs
+  cannot start a POST after the stream expires. When the shared cap leaves
+  too little time for an attempt, answer-final delivery plain-falls back
+  instead of treating the skipped POST as maybe-landed. Refs
   [#190](https://github.com/Satscryption/Hermes-A365/issues/190).
 
 - **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a
