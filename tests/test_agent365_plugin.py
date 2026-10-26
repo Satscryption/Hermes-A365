@@ -9206,6 +9206,293 @@ class TestEditMessage:
         assert any("routing summary" in r.message for r in caplog.records)
         assert any("commentary_informative=1" in r.message for r in caplog.records)
 
+    def test_reclassify_marked_answer_leadin_before_tool_progress(self) -> None:
+        segments = [
+            {
+                "turn": "1",
+                "text": "I'll run the sleep, then reply.",
+                "reply_to": "act-1",
+                "expect_edits": True,
+                "kind": "answer",
+            },
+            {
+                "turn": "1",
+                "text": "💻 Running sleep 40",
+                "reply_to": "",
+                "expect_edits": False,
+                "kind": "progress",
+            },
+            {
+                "turn": "1",
+                "text": "slept",
+                "reply_to": "act-1",
+                "expect_edits": False,
+                "kind": "answer",
+            },
+        ]
+        adapter_mod._reclassify_marked_answer_leadin_before_tool_progress(segments, "1")
+        assert segments[0]["kind"] == "commentary"
+        assert segments[2]["kind"] == "answer"
+
+    @pytest.mark.asyncio
+    async def test_walk094_marked_leadin_expect_edits_before_tool_progress(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """walk094 K/M rows: reply_to+expect_edits lead-in is commentary, not final (#214)."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-walk094-leadin"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            assert str(body.get("text") or "").strip()
+            entity = body["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-w094")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        lead = await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        assert lead.success is True
+        lead_segment = next(
+            s for s in a._turn_buffers[chat]["segments"] if s["id"] == lead.message_id
+        )
+        assert lead_segment["kind"] == "answer"
+        await a.send(
+            chat_id=chat,
+            content="I'm about to sleep 30 seconds…",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content="💻 Running sleep 40", reply_to=None)
+        for segment in a._turn_buffers[chat]["segments"]:
+            if str(segment.get("text") or "").startswith("I'll run"):
+                assert segment["kind"] == "commentary"
+        second_leadin = "I'm about to sleep 30 seconds…"
+        await self._spin_until(
+            lambda: any(
+                p.get("text") == "I'll run the sleep, then reply." and p.get("type") == "typing"
+                for p in posts
+            )
+        )
+        await a.send(chat_id=chat, content="Done after sleep.", reply_to="act-1")
+        import logging
+
+        with caplog.at_level(logging.INFO):
+            await a.on_processing_complete(event, outcome="success")
+        informative_with_second = [
+            p
+            for p in posts
+            if p.get("type") == "typing"
+            and (p.get("entities") or [{}])[0].get("streamType") == "informative"
+            and str(p.get("text") or "").count(second_leadin) == 1
+        ]
+        assert len(informative_with_second) == 1
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == "Done after sleep."
+        assert "I'll run the sleep" not in final["text"]
+        assert "I'm about to sleep" not in final["text"]
+        assert any("commentary_informative=" in r.message for r in caplog.records)
+
+    @pytest.mark.asyncio
+    async def test_edited_leadin_stays_commentary_and_rotation_survives_edit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """edit_message must not re-promote demoted lead-in to answer (#214)."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-walk094-edit-leadin"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        kinds: list[str] = []
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = body["entities"][0]
+            label = str(entity["streamType"])
+            if "streamId" in entity:
+                label = f"{label}:{entity['streamId']}"
+            kinds.append(label)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-edit-leadin")
+            if entity["streamType"] == "final":
+                return self._http_result(202)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        lead = await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content="💻 Running sleep 130", reply_to=None)
+        edited = await a.edit_message(
+            chat,
+            str(lead.message_id),
+            "I'll run the sleep, then reply. (edited)",
+        )
+        assert edited.success is True
+        lead_segment = next(
+            s for s in a._turn_buffers[chat]["segments"] if s["id"] == lead.message_id
+        )
+        assert lead_segment["kind"] == "commentary"
+        buf = a._turn_buffers[chat]
+        assert not a._buffer_has_kept_answer_segments(buf)
+        stream_age_sec = 121.0
+        assert adapter_mod._keepalive_rotation_due(stream_age_sec)
+        buf["keepalive"] = {
+            "stream_id": "old-stream-edit",
+            "sequence": 4,
+            "opened_mono": time.monotonic() - stream_age_sec,
+        }
+        mono_before_rotate = time.monotonic()
+        await a._emit_turn_buffer_keepalive(chat)
+        assert kinds == ["final:old-stream-edit", "informative"]
+        opened_after = float(buf["keepalive"]["opened_mono"])
+        assert opened_after >= mono_before_rotate - 0.05
+        assert time.monotonic() - opened_after < 2.0
+        await a.send(chat_id=chat, content="Done after sleep.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        answer_finals = [
+            body
+            for body in posts
+            if body.get("type") == "message"
+            and body.get("text") != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        ]
+        assert answer_finals[-1]["text"] == "Done after sleep."
+        assert "I'll run the sleep" not in answer_finals[-1]["text"]
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_expect_edits_without_tool_progress_merges_both_into_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-expect-edits-merge"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-merge")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="Opening line.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(
+            chat_id=chat,
+            content="Closing line.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == "Opening line.\n\nClosing line."
+
+    @pytest.mark.asyncio
+    async def test_walk094_k4_keepalive_rotates_past_two_minute_stream_age_with_leadin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """K4 walk row: stream age past 120s rotates after streamed lead-in (#214)."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-walk094-k4"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        kinds: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            label = str(entity["streamType"])
+            if "streamId" in entity:
+                label = f"{label}:{entity['streamId']}"
+            kinds.append(label)
+            if entity["streamType"] == "final":
+                return self._http_result(202)
+            assert "streamId" not in entity
+            return self._http_result(201, "new-stream-k4")
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content="💻 Running sleep 130", reply_to=None)
+        buf = a._turn_buffers[chat]
+        assert not a._buffer_has_kept_answer_segments(buf)
+        stream_age_sec = 121.0
+        assert adapter_mod._keepalive_rotation_due(stream_age_sec)
+        buf["keepalive"] = {
+            "stream_id": "old-stream-k4",
+            "sequence": 4,
+            "opened_mono": time.monotonic() - stream_age_sec,
+        }
+        mono_before_rotate = time.monotonic()
+        await a._emit_turn_buffer_keepalive(chat)
+        assert kinds == ["final:old-stream-k4", "informative"]
+        assert buf["keepalive"]["stream_id"] == "new-stream-k4"
+        opened_after = float(buf["keepalive"]["opened_mono"])
+        assert opened_after >= mono_before_rotate - 0.05
+        assert time.monotonic() - opened_after < 2.0
+        await a._drop_turn_buffer(chat)
+
     @pytest.mark.asyncio
     async def test_turn_buffer_never_posts_empty_text_activities(
         self, monkeypatch: pytest.MonkeyPatch
