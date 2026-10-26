@@ -808,11 +808,7 @@ def _segment_is_marked_answer(segment: dict[str, Any]) -> bool:
 
 def _reconcile_turn_buffer_kinds_for_flush(segments: list[dict[str, Any]], seq: str) -> None:
     """Apply #186 flush rules using the send shape Hermes actually uses."""
-    turn_segments = [
-        segment
-        for segment in segments
-        if str(segment.get("turn") or "") == seq and isinstance(segment, dict)
-    ]
+    turn_segments = _turn_segments_for_seq(segments, seq)
     has_marked_answer = any(_segment_is_marked_answer(segment) for segment in turn_segments)
     for segment in turn_segments:
         text = str(segment.get("text") or "")
@@ -830,6 +826,7 @@ def _reconcile_turn_buffer_kinds_for_flush(segments: list[dict[str, Any]], seq: 
                 segment["kind"] = "answer"
                 continue
             segment["kind"] = "commentary"
+        _reclassify_marked_answer_leadin_before_tool_progress(segments, seq)
         return
     prose = [
         segment
@@ -866,6 +863,38 @@ def _classify_turn_buffer_segment_kind(
     if any(_segment_is_marked_answer(segment) for segment in prior):
         return "commentary"
     return "answer"
+
+
+def _turn_segments_for_seq(
+    segments: list[dict[str, Any]], turn_seq: str
+) -> list[dict[str, Any]]:
+    return [
+        segment
+        for segment in segments
+        if str(segment.get("turn") or "") == turn_seq and isinstance(segment, dict)
+    ]
+
+
+def _reclassify_marked_answer_leadin_before_tool_progress(
+    segments: list[dict[str, Any]], turn_seq: str
+) -> None:
+    """Marked-answer sends before tool progress are lead-in commentary (#214)."""
+    turn_segments = _turn_segments_for_seq(segments, turn_seq)
+    progress_indexes = [
+        index
+        for index, segment in enumerate(turn_segments)
+        if _is_hermes_tool_progress_segment(str(segment.get("text") or ""))
+    ]
+    if not progress_indexes:
+        return
+    last_progress_idx = progress_indexes[-1]
+    for index, segment in enumerate(turn_segments):
+        if not _segment_is_marked_answer(segment):
+            continue
+        if _is_hermes_tool_progress_segment(str(segment.get("text") or "")):
+            continue
+        if index <= last_progress_idx:
+            segment["kind"] = "commentary"
 
 
 def _reclassify_interim_segments_before_marked_answer(
@@ -7833,6 +7862,7 @@ class Agent365Adapter(BasePlatformAdapter):
             }
         )
         _reclassify_interim_segments_before_marked_answer(segments, turn_seq)
+        _reclassify_marked_answer_leadin_before_tool_progress(segments, turn_seq)
         kind = str(segments[-1].get("kind") or kind)
         last_segment = segments[-1]
         if (

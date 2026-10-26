@@ -8,6 +8,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- **#214 — Copilot streamed lead-in before tool progress.** Marked-answer
+  segments (`reply_to` / `expect_edits`) that precede Hermes tool-progress on
+  the same turn are reclassified as commentary: they post on the informative
+  stream, drop from the answer final, and no longer block keep-alive stream
+  rotation. Refs
+  [#214](https://github.com/Satscryption/Hermes-A365/issues/214).
+
 - **#209 — #126 review follow-ups.** CI Hermes source smoke adds the plugin
   floor tag `v2026.4.30`. `doctor` parses only the `azure-cli` field from
   `az version -o json` (no extension-field false greens) and **warns** when a
