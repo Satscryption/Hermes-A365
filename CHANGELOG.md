@@ -10,9 +10,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - **#212 — Copilot keepalive commentary edge cases.** Keepalive merge checks
   partition segments on a copy so live kinds are not promoted during
-  informative posts; informative updates abort after the answer final has
-  settled when a stream-gap wait races delivery; keepalive sleeper 429 tests
-  target heartbeat text. Refs
+  informative posts; a buffer-level answer-delivered epoch (and stream-id
+  change) aborts informative posts that wake from a stream-gap sleep after an
+  inner ``streamType=final`` on a nested turn buffer; keepalive sleeper 429
+  tests exercise heartbeat continuation throttling. Refs
   [#212](https://github.com/Satscryption/Hermes-A365/issues/212).
 
 - **#235 — #217 follow-ups (first-turn flag, config bounds, tests).** Clear
