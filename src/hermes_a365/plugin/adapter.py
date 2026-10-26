@@ -7949,6 +7949,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 if segment["id"] == message_id:
                     segment["text"] = text
                     _refresh_turn_buffer_segment_kind_after_edit(segment)
+                    turn_seq = str(segment.get("turn") or "")
+                    if turn_seq:
+                        _reclassify_marked_answer_leadin_before_tool_progress(
+                            own["segments"], turn_seq
+                        )
                     kind = str(segment.get("kind") or "")
                     if kind in ("progress", "commentary"):
                         self._schedule_informative_segment_refresh(chat_id)
