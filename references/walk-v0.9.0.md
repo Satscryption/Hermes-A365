@@ -1,5 +1,12 @@
 # v0.9.0 focused hardening walk
 
+> **Historical record.** This file captures the 2026-10-05 v0.9.0 walk checkpoint.
+> [#123](https://github.com/Satscryption/Hermes-A365/issues/123) and
+> [#148](https://github.com/Satscryption/Hermes-A365/issues/148) are closed;
+> v0.9.0 has shipped (latest release is v0.9.4). Current Hermes compatibility
+> is documented in
+> [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md).
+
 Status date: 2026-10-05.
 
 Governing contract: [issue #123](https://github.com/Satscryption/Hermes-A365/issues/123),
@@ -9,44 +16,26 @@ its dated commands against the current CLI before execution.
 
 ## Current checkpoint
 
-- Live walk source: `ec6c67274fd33ee2d4a77df9419aae8581fe2875` on `main`,
-  including merged PRs #145, #146 and #147. Main test and both CodeQL
-  analysis jobs passed on this exact revision.
+- Initial preflight source: `0f566cb7ef3134ece5dec2faee387e19c302f24f`.
+  Dependency PRs #145 and #146 are now merged on `main` at
+  `d6a5294f33dfc92c087344d9b7986219d3c5f27c` and integrated into this branch.
 - PR #144 is merged. CodeQL and secret scanning report zero open alerts.
 - Prerequisites #19, #100, #118, #121 and #125 are closed. #102 and #105
   remain open; their remaining live acceptance must be reconciled here.
   #107 explicitly requires the positive and negative Entra exchange below.
-- State: live walk started; Azure provisioning, wrong-tenant/target refusals
-  and sentinel protection passed. Runtime admission is blocked by
-  [#148](https://github.com/Satscryption/Hermes-A365/issues/148), a verified
-  Hermes dependency conflict. The unauthenticated Agent 365 prerequisite
-  process was cancelled; obtain a fresh device code when resuming.
+- State: dependency alerts resolved on main; published dependency floors and
+  startup-order remediation verified on this branch, pending PR integration.
+  Freeze a new merged candidate before live execution. No live acceptance
+  row is marked passed.
 - User requested starting #123. Preparation, readback and local checks have
   begun. The user approved dependency remediation and merging #145/#146;
-  both merges and the subsequently approved #147 merge are complete.
-  The user then requested starting the live walk. The disposable Azure
-  phase below was provisioned and cleaned up. No release was published,
-  issue closed, gateway started or tunnel opened.
+  both merges are complete. No release publication,
+  issue closure, cloud provisioning or destructive operation has occurred.
 - Local gateway port 3978 had no listener at preflight. This is a snapshot,
   not permission to start a tunnel later without checking again.
 - Azure read access succeeds. The shell's default subscription is Satscrip,
   not Hermes-A365. Use an explicit Hermes-A365 subscription for every walk
   command; do not change the shared default or touch other workloads.
-- Dedicated resource names: agent `Hermes v090 Walk`, slug
-  `hermes-v090-walk`, resource group `hermes-v090-walk-rg`. The app-name
-  inventory returned no existing matching registration; ARM inventory in
-  Hermes-A365 returned no resources. Local config is owner-only and ignored.
-- Installed tooling: Hermes v0.20.0 (2026.8.3), source
-  `f60f6d534375ccd6ec78d47ff1b5a97371cd8d60`; Agent 365 CLI
-  `1.1.181+9a1be7ddd7`; PowerShell 7.6.1. Doctor returns WARN for the
-  already-documented CLI secret-persistence issue, with other probes OK.
-- The macOS keychain write backend requires explicit insecure-CLI opt-in.
-  The operator decision is pending; no write opt-in has been enabled.
-- Cleanup readback: resource group absent; dedicated Path B app and service
-  principal queries return empty lists. Only ignored local configuration and
-  sidecar provenance/backups remain. The sentinel's resource provider
-  `Microsoft.ManagedIdentity` was registered by Azure CLI and remains
-  registered; no managed identity or role grant remains from this phase.
 
 ## Evidence already available
 
@@ -60,7 +49,7 @@ its dated commands against the current CLI before execution.
 | Dependency security controls | Vulnerability-alert endpoint returns 204; automatic security updates enabled | Current configuration |
 | Secret controls | Secret scanning and push protection enabled; zero open secret alerts | Current configuration |
 | Private reporting | Enabled; tracked `SECURITY.md` exists | Current configuration |
-| CodeQL | Both analyses passed on the merged walk candidate; initial preflight found zero open alerts | Current source analysis |
+| CodeQL | Latest main analyses on 2026-09-30 match inspected SHA and report no analysis errors; zero open alerts | Current source analysis |
 | Latest GitHub Release | `v0.8.5` | Current release readback |
 
 Issue #121's approval-boundary evidence remains historical evidence:
@@ -111,21 +100,23 @@ or process-restart evidence. Total for these two disjoint selections: 322 tests.
    `pyjwt[crypto]>=2.15.0` independently in both `bridge` and `dev` extras,
    with regenerated lock metadata. Wheel and sdist metadata enforce both
    floors; base requirements, the crypto extra and Python >=3.11 are
-   preserved. PR #147 is merged; the change needs a future release to protect new
+   preserved. The change needs merge and a future release to protect new
    public installations; it cannot update already-installed environments.
 3. The tenant runbook previously started its tunnel before the bridge in
    section 9c. This branch requires free-port checks, foreground responder
    and bridge startup, listener-ownership verification and `/healthz`
    success before starting the tunnel. No tunnel was launched for validation.
-4. **Open, #148:** Hermes Agent 0.20.0 pins `PyJWT[crypto]==2.13.0`, while
-   this candidate requires `PyJWT[crypto]>=2.15.0`. Combined local-source
-   `uv pip compile --offline --python-version 3.11 --no-header -` returns
-   `No solution found` and explicitly identifies those incompatible pins.
-   The installed Hermes runtime contains AnyIO 4.12.1, PyJWT 2.13.0 and
-   FastAPI 0.133.1, and no A365 distribution. The optional Hermes `web`
-   extra also pins the older FastAPI. Its checkout has unrelated local
-   changes; none were modified. Prepare and verify a compatible isolated
-   runtime before the live gateway cases. Do not weaken the patched floors.
+4. #148 re-checked on 2026-10-16 against Hermes `main`
+   `e6899c8090da3bd48c829893e4103ce989d3482d`. The supported Python 3.14
+   runtime still pins `PyJWT[crypto]==2.13.0`, which does not satisfy
+   `pyjwt[crypto]>=2.15.0`.
+   [NousResearch/hermes-agent#134394](https://github.com/NousResearch/hermes-agent/issues/134394)
+   tracks the PyJWT pin only and is not the FastAPI exit. Separately,
+   `hermes-agent[web]` pins `fastapi==0.133.1`, which does not meet
+   `fastapi>=0.141.1`. The floors stay. The 0.9.0 gateway install uses the
+   documented `overrides.txt` (`pyjwt[crypto]>=2.15.0` and `fastapi>=0.143`)
+   until each pin moves. refs #148. The contract is
+   [`hermes-runtime-compatibility.md`](hermes-runtime-compatibility.md).
 
 Remediation verification on the branch integrating the merged dependencies:
 
