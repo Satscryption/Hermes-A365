@@ -5972,9 +5972,44 @@ class Agent365Adapter(BasePlatformAdapter):
 
     @staticmethod
     def _placeholder_informative_opener_allowed(buf: dict[str, Any], *, for_answer: bool) -> bool:
-        if for_answer:
-            return True
         return bool(buf.get("keepalive_first_interval_elapsed"))
+
+    def _answer_plain_before_keepalive_interval(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> bool:
+        """Answer ready before the first keep-alive post: use one plain reply (#227)."""
+        if buf.get("keepalive_first_interval_elapsed"):
+            return False
+        if str(self._keepalive_stream(buf).get("stream_id") or ""):
+            return False
+        if self._informative_segments_pending_display(buf, turn):
+            return False
+        if self._turn_has_marked_answer(buf, turn):
+            return False
+        return True
+
+    def _sanitize_informative_stream_text(
+        self,
+        buf: dict[str, Any],
+        turn: dict[str, Any],
+        text: str,
+        *,
+        for_answer: bool,
+    ) -> str:
+        """Keep answer bodies off informative stream updates (#227 / walk095 L1)."""
+        posted = str(text or "").strip()
+        if for_answer or not posted or self._is_placeholder_informative_text(posted):
+            return posted
+        seq = str(turn.get("seq") or "")
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            if self._turn_buffer_segment_kind(segment) != "answer":
+                continue
+            if str(segment.get("text") or "").strip() != posted:
+                continue
+            return _TURN_BUFFER_KEEPALIVE_TEXT
+        return posted
 
     def _informative_segments_pending_display(
         self, buf: dict[str, Any], turn: dict[str, Any]
@@ -6680,6 +6715,9 @@ class Agent365Adapter(BasePlatformAdapter):
             str(text_override).strip()
             if text_override is not None
             else self._informative_text_for_turn(buf, turn, answer_preview=answer_preview)
+        )
+        informative_text = self._sanitize_informative_stream_text(
+            buf, turn, informative_text, for_answer=for_answer
         )
         if not for_answer and self._text_merged_into_unmarked_final(buf, turn, informative_text):
             if text_override is not None:
@@ -7574,6 +7612,13 @@ class Agent365Adapter(BasePlatformAdapter):
 
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
+        if not stream_id and self._answer_plain_before_keepalive_interval(buf, turn):
+            logger.debug(
+                "agent365 turn buffer answer plain fast path: chat_id=%s "
+                "reason=answer ready before keep-alive interval",
+                chat_id,
+            )
+            return ("fallback", "fast answer before keep-alive")
         if not stream_id:
             opener_text = self._informative_text_for_turn(
                 buf,
