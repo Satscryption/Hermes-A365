@@ -5971,22 +5971,55 @@ class Agent365Adapter(BasePlatformAdapter):
         return str(text or "").strip() == _TURN_BUFFER_KEEPALIVE_TEXT
 
     @staticmethod
-    def _placeholder_informative_opener_allowed(buf: dict[str, Any], *, for_answer: bool) -> bool:
+    def _placeholder_informative_opener_allowed(
+        buf: dict[str, Any], *, for_answer: bool = False
+    ) -> bool:
+        if for_answer:
+            return True
         return bool(buf.get("keepalive_first_interval_elapsed"))
 
-    def _answer_plain_before_keepalive_interval(
+    def _answer_segment_texts_for_turn(
         self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> list[str]:
+        seq = str(turn.get("seq") or "")
+        parts: list[str] = []
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            if self._turn_buffer_segment_kind(segment) != "answer":
+                continue
+            text = str(segment.get("text") or "").strip()
+            if text:
+                parts.append(text)
+        return parts
+
+    def _informative_text_is_answer_body_leak(
+        self, buf: dict[str, Any], turn: dict[str, Any], posted: str
     ) -> bool:
-        """Answer ready before the first keep-alive post: use one plain reply (#227)."""
-        if buf.get("keepalive_first_interval_elapsed"):
+        """True when informative/typing text would duplicate final answer body (#227)."""
+        posted = str(posted or "").strip()
+        if not posted:
             return False
-        if str(self._keepalive_stream(buf).get("stream_id") or ""):
+        parts = self._answer_segment_texts_for_turn(buf, turn)
+        if not parts:
             return False
-        if self._informative_segments_pending_display(buf, turn):
-            return False
-        if self._turn_has_marked_answer(buf, turn):
-            return False
-        return True
+        merged = "\n\n".join(parts)
+        bodies = list(parts)
+        if merged:
+            bodies.append(merged)
+        for body in bodies:
+            if posted == body:
+                return True
+            clipped = body[:_INFORMATIVE_TEXT_MAX_CHARS]
+            if posted == clipped:
+                return True
+            if body.startswith(posted) and posted in parts:
+                return True
+            if merged.startswith(posted) and posted != merged:
+                tail = merged[len(posted) :]
+                if not tail or tail.startswith("\n\n"):
+                    return True
+        return False
 
     def _sanitize_informative_stream_text(
         self,
@@ -5996,18 +6029,11 @@ class Agent365Adapter(BasePlatformAdapter):
         *,
         for_answer: bool,
     ) -> str:
-        """Keep answer bodies off informative stream updates (#227 / walk095 L1)."""
+        """Keep answer bodies off informative stream updates (#227 / walk095)."""
         posted = str(text or "").strip()
-        if for_answer or not posted or self._is_placeholder_informative_text(posted):
+        if not posted or self._is_placeholder_informative_text(posted):
             return posted
-        seq = str(turn.get("seq") or "")
-        for segment in buf.get("segments") or []:
-            if str(segment.get("turn") or "") != seq:
-                continue
-            if self._turn_buffer_segment_kind(segment) != "answer":
-                continue
-            if str(segment.get("text") or "").strip() != posted:
-                continue
+        if self._informative_text_is_answer_body_leak(buf, turn, posted):
             return _TURN_BUFFER_KEEPALIVE_TEXT
         return posted
 
@@ -6732,7 +6758,7 @@ class Agent365Adapter(BasePlatformAdapter):
             not for_answer
             and not stream_id
             and self._is_placeholder_informative_text(informative_text)
-            and not self._placeholder_informative_opener_allowed(buf, for_answer=False)
+            and not self._placeholder_informative_opener_allowed(buf, for_answer=for_answer)
         ):
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s "
@@ -6752,6 +6778,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 sequence=sequence,
                 final=False,
                 text=informative_text,
+                for_answer=for_answer,
             )
         finally:
             if segment is not None:
@@ -6954,6 +6981,7 @@ class Agent365Adapter(BasePlatformAdapter):
         text: str | None = None,
         message_chrome: bool = False,
         outbound_deadline: float | None = None,
+        for_answer: bool = False,
     ) -> _KeepalivePost:
         """POST one informative update or a stream final.
 
@@ -6982,7 +7010,9 @@ class Agent365Adapter(BasePlatformAdapter):
             and Agent365Adapter._is_placeholder_informative_text(body_text)
         ):
             buf = self._turn_buffers.get(chat_id)
-            allowed = Agent365Adapter._placeholder_informative_opener_allowed(buf, for_answer=False)
+            allowed = Agent365Adapter._placeholder_informative_opener_allowed(
+                buf, for_answer=for_answer
+            )
             if isinstance(buf, dict) and not allowed:
                 logger.debug(
                     "agent365 turn buffer keep-alive skip post: chat_id=%s "
@@ -7612,13 +7642,6 @@ class Agent365Adapter(BasePlatformAdapter):
 
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
-        if not stream_id and self._answer_plain_before_keepalive_interval(buf, turn):
-            logger.debug(
-                "agent365 turn buffer answer plain fast path: chat_id=%s "
-                "reason=answer ready before keep-alive interval",
-                chat_id,
-            )
-            return ("fallback", "fast answer before keep-alive")
         if not stream_id:
             opener_text = self._informative_text_for_turn(
                 buf,

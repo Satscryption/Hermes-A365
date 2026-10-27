@@ -2,26 +2,31 @@
 
 ## Head SHA
 
-Verified: `git ls-remote origin cursor/walk095-copilot-fast-reply-0782` → `b0ed0ec51caf8aed1e93ade936f8c412a6782fe8`.
+Update after push: `git ls-remote origin cursor/walk095-copilot-fast-reply-0782`.
 
-## Root cause
+## Root cause (what fixed live on ac7e7463)
 
-Two related bugs in Path B (`groupChat`) turn-buffer delivery on `dd036fc3`:
+Live walk gateway evidence (S0b/S0c/L1/G1/L3) on `ac7e7463` used the **production stream path** for marked turns:
 
-1. **Fast turns (S0b/S0c)** — When the model answer is ready before `keepalive_first_interval_elapsed` (25s) and no keep-alive stream exists yet, `_deliver_turn_answer_locked` still opened a `streamType=informative` activity (`for_answer=True` bypassed the deferred placeholder rule). Copilot rendered that opener as an empty shell, then either a second bubble with the answer (turn 1) or a stuck empty bubble and client timeout (turn 2).
+1. `type=typing` / `streamType=informative` opener (HTTP 201, new `stream_id`)
+2. One `turn buffer answer final` on the same `stream_id` (after `#217` min-stream-age wait where applicable)
 
-2. **Slow turns (L1/L3)** — Informative stream updates could carry **answer body text** as `type=typing` / `streamType=informative` (sequence ≥ 2) when an answer segment was already buffered. That violates the #182 contract (progress/commentary/heartbeat only on informative; answer only on `streamType=final`) and matches live logs: posts succeed with `final_chars>0` while the UI shows a single empty “agent said” bubble.
+The **`_answer_plain_before_keepalive_interval` → `send_reply` branch did not run** in production: Hermes marks answers (`reply_to` set), so that gate is always false.
 
-## Payload diff vs `f612899e` (v0.9.4)
+Compared to `dd036fc3`, the live-relevant delta on `ac7e7463` was:
 
-Captured K1-shaped and slow-turn activities via unit harness (`scripts/compare_payloads_k1.py`, real pytest wiring — not fixtures):
+| Change | Ran in live marked stream path? | Effect |
+|--------|----------------------------------|--------|
+| Plain fast `fallback` before opener | No (marked answer) | None live |
+| `_placeholder_informative_opener_allowed` (`for_answer` removed) | Only on `for_answer=False` keep-alive posts | No direct opener effect |
+| **`_sanitize_informative_stream_text` on keep-alive informative posts** | Yes (seq ≥ 2 when interval elapses) | Stops answer segment text on informative updates (L1/L3/G1) |
+| Delivery opener still used `answer_preview` with `for_answer=True` sanitizer bypass | Yes (fast S0b/S0c opener) | Opener could still echo answer until sanitizer applied to `for_answer` (this fix round) |
 
-| Scenario | `f612899e` vs `dd036fc3` (pre-fix) | After this fix |
-|----------|--------------------------------------|----------------|
-| K1 marked slow stream (opener + seq=2 + final) | **Identical JSON** (md5 match) | Unchanged final shape; seq=2 informative text forced to heartbeat when it would equal an answer segment |
-| Fast unmarked `reply_to=None` (walk095 S0b) | Pre-fix: informative open + final (2 POSTs) | **One plain `send_reply`** (no `streaminfo` POSTs) |
+**Conclusion (a):** Live turns rendered because the adapter kept **stream opener + one stream final** (with min-stream-age), while **`_sanitize_informative_stream_text` prevented answer bodies on mid-turn informative posts**. The plain-reply path was not involved. This PR round removes the dead plain branch and extends sanitization to **all** informative/typing bodies (including the delivery opener), using heartbeat text when the body would leak answer text, while still allowing a placeholder opener when `for_answer=True` opens the stream.
 
-Pre-fix `dd036fc3` already matched v0.9.4 on the wire for the slow marked path; the regression is **routing text into the wrong stream phase**, not a missing field on the final activity. Finals remain:
+## Payload shape (unchanged)
+
+Final activities remain:
 
 ```json
 {
@@ -34,24 +39,22 @@ Pre-fix `dd036fc3` already matched v0.9.4 on the wire for the slow marked path; 
 }
 ```
 
-## Code changes
+Informative/typing activities must not carry final answer bodies (including joined, truncated preview, or marked answer segments); pre-tool facts that are classified as answer segments are sanitized off informative and kept for the final.
 
-- `_answer_plain_before_keepalive_interval` + early `fallback` in `_deliver_turn_answer_locked` for unmarked fast turns.
-- `_placeholder_informative_opener_allowed(for_answer=…)` respects `keepalive_first_interval_elapsed` (no special case for answer openers).
-- `_sanitize_informative_stream_text` blocks answer segment text on informative POSTs.
+## Code changes (fix round 1)
+
+- Removed `_answer_plain_before_keepalive_interval` and the early `fallback` in `_deliver_turn_answer_locked`.
+- `_informative_text_is_answer_body_leak` + expanded `_sanitize_informative_stream_text` (applies to `for_answer=True` openers too).
+- `_placeholder_informative_opener_allowed(for_answer=True)` so a heartbeat opener can open the stream before the first keep-alive interval.
+- `for_answer` passed into `_post_keepalive_activity` for placeholder deferral on delivery openers.
 
 ## Tests (real runs)
 
-- `pytest tests/test_agent365_plugin.py -k walk095` — pass on fix; **fail on `dd036fc3` adapter** for `walk095_fast` / `walk095_second` (mutation check: informative opens present pre-fix).
-- `pytest tests/test_agent365_plugin.py` — pass (full plugin module).
+- `pytest tests/test_agent365_plugin.py -k walk095` — marked `reply_to='act-1'`, typing bodies exclude answer text, one final per turn, min-stream-age wait on fast path, G1 fact + closing on final only, direct sanitizer mutation guard.
+- `pytest tests/test_agent365_plugin.py` — full plugin module.
 - `ruff check src tests` — pass.
-- `tests/test_release_integrity.py` — **4 failures pre-existing on `dd036fc3`** (version metadata drift); not introduced here.
+- `tests/test_release_integrity.py` — **4 failures pre-existing on `dd036fc3`** (version metadata); not introduced here.
 
 ## Relaxed checks
 
 None.
-
-## Open questions
-
-- Whether Copilot will accept plain `send_reply` for all fast unmarked turns long-term, or we should add a single `streamType=final` without a prior informative when latency budget allows.
-- Live re-walk of L1/L3 after deploy to confirm UI renders once plain-fast and sanitized slow paths are live.
