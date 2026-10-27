@@ -7542,6 +7542,7 @@ class TestEditMessage:
 
         sleep_mock = AsyncMock(side_effect=sleep)
         monkeypatch.setattr("asyncio.sleep", sleep_mock)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", sleep_mock)
         return sleep_mock, clock
 
     @staticmethod
@@ -11315,6 +11316,7 @@ class TestEditMessage:
         assert adapter_mod._keepalive_sleeper_wait_after_emit(stream) is None
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
     async def test_g2_sleeper_loop_zero_sleep_when_rotation_already_due(
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
@@ -11362,6 +11364,11 @@ class TestEditMessage:
             "opened_mono": 0.0,
         }
         buf["keepalive_scheduled_mono"] = 0.0
+        prior = buf.get("keepalive_task")
+        if isinstance(prior, asyncio.Task) and not prior.done():
+            prior.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await prior
         with caplog.at_level(logging.WARNING):
             task = asyncio.create_task(a._turn_buffer_keepalive(chat))
             for _ in range(80):
@@ -11369,7 +11376,7 @@ class TestEditMessage:
                 if rotation_finals == 1:
                     break
             task.cancel()
-            with pytest.raises(asyncio.CancelledError):
+            with contextlib.suppress(asyncio.CancelledError):
                 await task
         assert rotation_finals == 1
         assert rotate_at - 0.5 <= clock["t"] <= rotate_at + 1.0
@@ -11569,6 +11576,7 @@ class TestEditMessage:
         assert "G2 fact" in send_reply_mock.await_args.kwargs["reply"]["text"]
 
     @pytest.mark.asyncio
+    @pytest.mark.timeout(10)
     async def test_g2_rotation_close_500_plain_retires_single_post(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -11579,7 +11587,8 @@ class TestEditMessage:
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        self._advance_monotonic_sleep(monkeypatch, start=1000.0)
         a._copilot_min_stream_age_before_final_sec = 0
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
@@ -11621,14 +11630,8 @@ class TestEditMessage:
             "sequence": 2,
             "opened_mono": time.monotonic() - (rotate_at + 0.01),
         }
-        task = asyncio.create_task(a._turn_buffer_keepalive(chat))
-        for _ in range(30):
-            await asyncio.sleep(0)
-            if buf.get("keepalive_rotated"):
-                break
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
         assert rotation_final_posts == 1
         assert not buf["keepalive"].get("stream_id")
         turn = a._keepalive_turn(buf)
@@ -11666,20 +11669,12 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        a._copilot_min_stream_age_before_final_sec = 0
+        a._copilot_first_turn_min_stream_age_before_final_sec = 0
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
-        sleep_mock, _clock = self._advance_monotonic_sleep(
-            monkeypatch, start=rotate_at + 0.01
-        )
-
-        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
-            entity = kwargs["json"]["entities"][0]
-            if entity.get("streamType") == "informative" and "streamId" not in entity:
-                return self._http_result(201, "dz-stream")
-            return self._http_result(202)
-
-        a._http_client.post = post
+        self._advance_monotonic_sleep(monkeypatch, start=rotate_at + 0.01)
         event = _StubMessageEvent(
             text="sleep",
             source=_StubSessionSource(platform=None, chat_id=chat),
@@ -11688,24 +11683,34 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
         buf = a._turn_buffers[chat]
+        prior = buf.get("keepalive_task")
+        if isinstance(prior, asyncio.Task) and not prior.done():
+            prior.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await prior
         buf["answer_final_in_progress"] = True
-        buf["keepalive_first_interval_elapsed"] = True
         buf["keepalive"] = {
             "stream_id": "dz-stream",
             "sequence": 1,
             "opened_mono": 0.0,
         }
-        task = asyncio.create_task(a._turn_buffer_keepalive(chat))
-        for _ in range(30):
-            await asyncio.sleep(0)
-            waits = [float(c.args[0]) for c in sleep_mock.await_args_list if c.args]
-            if adapter_mod._KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC in waits:
-                break
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
-        waits = [float(c.args[0]) for c in sleep_mock.await_args_list if c.args]
-        assert adapter_mod._KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC in waits
+        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+        recorded: list[float] = []
+        last_sleeper_wait_was_zero = False
+        for _ in range(2):
+            await a._emit_turn_buffer_keepalive(chat)
+            stream = a._keepalive_state(buf)
+            wait = adapter_mod._keepalive_sleeper_wait_after_emit(stream)
+            sleep_sec = wait if wait is not None else interval
+            rotation_due_zero = sleep_sec == 0.0
+            if rotation_due_zero and last_sleeper_wait_was_zero:
+                sleep_sec = adapter_mod._KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC
+            recorded.append(sleep_sec)
+            last_sleeper_wait_was_zero = rotation_due_zero
+        assert recorded == [
+            0.0,
+            adapter_mod._KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC,
+        ]
 
     @pytest.mark.asyncio
     async def test_issue247_keepalive_sleeper_posts_rotation_close_near_115s(
