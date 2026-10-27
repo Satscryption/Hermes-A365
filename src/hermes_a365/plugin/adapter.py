@@ -6285,6 +6285,9 @@ class Agent365Adapter(BasePlatformAdapter):
 
     def _rotation_stream_close_text(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
         """Final body when retiring an informative stream at the rotation age (#247)."""
+        preview = self._marked_answer_preview_for_turn(buf, turn).strip()
+        if preview:
+            return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
         text = self._informative_text_for_turn(buf, turn).strip()
         if text and text != _TURN_BUFFER_KEEPALIVE_TEXT:
             return text[:_INFORMATIVE_TEXT_MAX_CHARS]
@@ -6580,6 +6583,11 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         close_text = self._rotation_stream_close_text(buf, turn)
         deadline = float(opened) + _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        now = time.monotonic()
+        if deadline < now:
+            from hermes_a365.outbound_retry import OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+
+            deadline = now + OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
         closed = await self._post_keepalive_final_locked(
             chat_id,
             buf,
@@ -6614,14 +6622,6 @@ class Agent365Adapter(BasePlatformAdapter):
         if buf.get("keepalive_rotated"):
             await self._post_turn_buffer_typing_if_plain_keepalive(chat_id, buf)
             return
-        stream_pre = self._keepalive_state(buf)
-        stream_id_pre = str(stream_pre.get("stream_id") or "")
-        opened_pre = stream_pre.get("opened_mono")
-        if stream_id_pre and isinstance(opened_pre, (int, float)):
-            age_pre = time.monotonic() - float(opened_pre)
-            wait_pre = _keepalive_rotation_wait_sec(age_pre)
-            if wait_pre > 0:
-                await asyncio.sleep(wait_pre)
         rotated = False
         async with self._turn_buffer_lock(buf):
             if self._turn_buffers.get(chat_id) is not buf:
@@ -6668,11 +6668,13 @@ class Agent365Adapter(BasePlatformAdapter):
             if (
                 stream_id
                 and isinstance(opened, (int, float))
-                and _keepalive_rotation_due(time.monotonic() - float(opened))
                 and not self._buffer_has_kept_answer_segments(buf)
             ):
-                if self._turn_buffer_live_for_keepalive(buf):
+                age = time.monotonic() - float(opened)
+                if _keepalive_rotation_due(age) and self._turn_buffer_live_for_keepalive(buf):
                     rotated = await self._post_keepalive_rotation_final_locked(chat_id, buf)
+                elif not _keepalive_rotation_due(age):
+                    pass
                 else:
                     logger.debug(
                         "agent365 turn buffer keep-alive skip rotation final: "
@@ -7654,6 +7656,16 @@ class Agent365Adapter(BasePlatformAdapter):
         age = _keepalive_stream_age_sec(stream) if stream_id else 0.0
         plain = bool(record.get("plain_due") or buf.get("keepalive_rotated"))
         if not plain and stream_id and age > _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC:
+            if record.get("may_have_landed"):
+                return self._answer_uncertain_for_turn(
+                    chat_id,
+                    buf,
+                    turn,
+                    record,
+                    stream_id=stream_id,
+                    context="stream outbound budget exhausted",
+                    chunk_segment_ids=chunk_segment_ids,
+                )
             plain = True
             record["plain_due"] = True
         if not plain:
