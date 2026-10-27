@@ -321,6 +321,10 @@ class TestParseAzCliVersion:
             ("2.55.0rc1", (2, 55, 0), True),
             ("2.60.0rc1", (2, 60, 0), True),
             ("2.54.0rc1", (2, 54, 0), True),
+            ("2.55.0a1", (2, 55, 0), True),
+            ("2.55.0-b.1", (2, 55, 0), True),
+            ("2.55.0~b.1", (2, 55, 0), True),
+            ("2.55.0-developer", (2, 55, 0), False),
         ],
     )
     def test_parse_az_cli_release_prerelease_flags(
@@ -339,6 +343,10 @@ class TestParseAzCliVersion:
             ("2.60.0rc1", False),
             ("2.55.0rc1", True),
             ("2.54.0rc1", True),
+            ("2.55.0a1", True),
+            ("2.55.0-b.1", True),
+            ("2.55.0~b.1", True),
+            ("2.55.0-developer", False),
         ],
     )
     def test_signed_in_prerelease_rc_floor_probe(
