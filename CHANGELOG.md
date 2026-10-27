@@ -86,8 +86,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a
   live ``--directline-probe`` conversation starts, **WARN** only when the
   activity response body explicitly carries ``unauthorized-end-user`` or
-  ``end user is not authorized`` (including HTTP **502** bodies that embed that
-  gateway signal). Other **403** / connector failures stay **ERROR**.
+  ``end user is not authorized``. When the Connector relays a bot **403** as
+  HTTP **502** with ``BotError`` / ``Failed to send activity: bot returned an
+  error`` and ``httpStatusCode`` **403** (walk095: detail text is not relayed;
+  same envelope for JWT and allowlist failures), ``runtime_auth`` stays
+  **ERROR** with remediation to read the gateway inbound log line. Direct Line
+  **401**, connector **403**, and token failures stay **ERROR**.
   ``path_endpoint_parity`` **warns** when the generated config has no
   ``messagingEndpoint``, with remediation that does not recommend ``a365
   publish``.

@@ -151,9 +151,7 @@ class FakeRunner:
             return CommandResult(argv, 0, stdout=f"{self.default_location}\n")
         if argv[:3] == ["az", "account", "show"]:
             selected = (
-                self._arg(argv, "--subscription")
-                if "--subscription" in argv
-                else SUBSCRIPTION_ID
+                self._arg(argv, "--subscription") if "--subscription" in argv else SUBSCRIPTION_ID
             )
             return self._ok({"id": selected, "tenantId": self.account_tenant_id}, argv)
         if argv[:3] == ["az", "provider", "register"]:
@@ -633,14 +631,10 @@ def test_cleanup_calls_az_bot_delete_without_yes_flag(tmp_path: Path) -> None:
 
     apply_cleanup_plan(plan, runner=runner)
 
-    bot_delete_calls = [
-        call for call in runner.calls if call[:3] == ["az", "bot", "delete"]
-    ]
+    bot_delete_calls = [call for call in runner.calls if call[:3] == ["az", "bot", "delete"]]
     assert bot_delete_calls, "az bot delete was never invoked"
     for call in bot_delete_calls:
-        assert "--yes" not in call, (
-            f"az bot delete must not be invoked with --yes; got {call}"
-        )
+        assert "--yes" not in call, f"az bot delete must not be invoked with --yes; got {call}"
 
 
 def test_verify_generated_config_help_documents_cwd_default(
@@ -745,9 +739,7 @@ def test_cleanup_purge_resource_group_deletes_when_managed(tmp_path: Path) -> No
 
     assert result.resource_group_deleted is False
     assert not any(call[:3] == ["az", "group", "delete"] for call in runner.calls)
-    assert "cannot make the inventory check and group deletion atomic" in "\n".join(
-        result.messages
-    )
+    assert "cannot make the inventory check and group deletion atomic" in "\n".join(result.messages)
 
 
 def test_cleanup_completes_requested_purge_after_group_absence_readback(
@@ -975,9 +967,7 @@ def test_cleanup_purge_fails_closed_when_listing_fails(tmp_path: Path) -> None:
     # M5 (#102): unknown contents == do not delete. A failed listing skips the
     # purge rather than treating the group as empty.
     sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
-    runner = FakeRunner(
-        bot=FakeRunner._bot(), teams=FakeRunner._teams(), resource_list_fails=True
-    )
+    runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams(), resource_list_fails=True)
     plan = build_cleanup_plan(
         BotServiceCleanupInputs(
             agent_name="Hermes Inbox Helper",
@@ -1062,9 +1052,7 @@ def test_cleanup_plan_makes_no_az_calls_without_purge(tmp_path: Path) -> None:
     sidecar = _write_sidecar(tmp_path, resource_group_managed=True)
     runner = FakeRunner()
     build_cleanup_plan(
-        BotServiceCleanupInputs(
-            agent_name="Hermes Inbox Helper", sidecar_path=sidecar
-        ),
+        BotServiceCleanupInputs(agent_name="Hermes Inbox Helper", sidecar_path=sidecar),
         runner=runner,
     )
     assert runner.calls == []
@@ -1078,9 +1066,7 @@ def test_cleanup_plan_makes_no_az_calls_without_purge(tmp_path: Path) -> None:
 def test_cleanup_refuses_sidecar_bound_to_other_agent(tmp_path: Path) -> None:
     # M6 (#102): running cleanup for agent X against agent Y's sidecar must
     # refuse BEFORE any deletion, naming the sidecar's real targets.
-    sidecar = _write_sidecar(
-        tmp_path, resource_group_managed=True, agent_name="Other Agent"
-    )
+    sidecar = _write_sidecar(tmp_path, resource_group_managed=True, agent_name="Other Agent")
     runner = FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams())
     plan = build_cleanup_plan(
         BotServiceCleanupInputs(
@@ -1221,9 +1207,7 @@ def test_cleanup_preserves_new_sidecar_published_after_final_binding(
             path.write_bytes(snapshot_b)
         return binding
 
-    monkeypatch.setattr(
-        bot_service_module, "_sidecar_file_binding", publish_after_binding
-    )
+    monkeypatch.setattr(bot_service_module, "_sidecar_file_binding", publish_after_binding)
     result = apply_cleanup_plan(
         plan,
         runner=FakeRunner(bot=FakeRunner._bot(), teams=FakeRunner._teams()),
@@ -1612,7 +1596,7 @@ _AZ_DIRECTLINE_REAL_SHAPE: dict[str, Any] = {
     "name": None,
     "properties": {
         "channelName": "DirectLineChannel",
-        "etag": "W/\"x\"",
+        "etag": 'W/"x"',
         "location": "global",
         "properties": {
             "directLineEmbedCode": None,
@@ -1636,7 +1620,7 @@ _AZ_DIRECTLINE_REAL_SHAPE: dict[str, Any] = {
     },
     "resource": {
         "channelName": "DirectLineChannel",
-        "etag": "W/\"x\"",
+        "etag": 'W/"x"',
         "location": "global",
         "properties": {
             "isEnabled": True,
@@ -1661,10 +1645,7 @@ def test_extract_directline_secret_walks_real_az_double_nested_shape() -> None:
     # `data.properties.properties.sites[]`. Regression: pre-fix code only
     # checked the single-nested `data.properties.sites[]` and failed against
     # real az output during the v0.7.0 release walk.
-    assert (
-        _extract_directline_secret(_AZ_DIRECTLINE_REAL_SHAPE)
-        == "PRIMARY_SITE_KEY_PLACEHOLDER"
-    )
+    assert _extract_directline_secret(_AZ_DIRECTLINE_REAL_SHAPE) == "PRIMARY_SITE_KEY_PLACEHOLDER"
 
 
 def test_extract_directline_secret_handles_single_nested_legacy_shape() -> None:
@@ -1689,9 +1670,7 @@ def test_extract_directline_secret_falls_back_to_resource_properties() -> None:
             },
         },
     }
-    assert (
-        _extract_directline_secret(resource_only) == "RESOURCE_KEY_PLACEHOLDER"
-    )
+    assert _extract_directline_secret(resource_only) == "RESOURCE_KEY_PLACEHOLDER"
 
 
 def test_extract_directline_secret_raises_when_no_secret_anywhere() -> None:
@@ -1714,8 +1693,7 @@ def test_directline_probe_percent_encodes_conversation_id(
         resourceGroup="hermes-a365-bots",
         botName="hermes-inbox-helper-bot",
         armResourceId=(
-            "/subscriptions/sub/resourceGroups/rg/providers/"
-            "Microsoft.BotService/botServices/bot"
+            "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot"
         ),
         msaAppId=BF_APP_ID,
         tenantId=TENANT_ID,
@@ -1727,9 +1705,7 @@ def test_directline_probe_percent_encodes_conversation_id(
 
     class _SecretRunner:
         def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
-            return CommandResult(
-                argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}})
-            )
+            return CommandResult(argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}}))
 
     urls: list[str] = []
 
@@ -1769,8 +1745,7 @@ def test_directline_403_after_token_check_names_the_allowlist(
         resourceGroup="hermes-a365-bots",
         botName="hermes-inbox-helper-bot",
         armResourceId=(
-            "/subscriptions/sub/resourceGroups/rg/providers/"
-            "Microsoft.BotService/botServices/bot"
+            "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot"
         ),
         msaAppId=BF_APP_ID,
         tenantId=TENANT_ID,
@@ -1782,9 +1757,7 @@ def test_directline_403_after_token_check_names_the_allowlist(
 
     class _SecretRunner:
         def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
-            return CommandResult(
-                argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}})
-            )
+            return CommandResult(argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}}))
 
     def _allowlisted_403(
         url: str,
@@ -1841,6 +1814,121 @@ class TestDirectlineActivityFailureClassification:
         assert result.status == "WARN"
         assert "not allowlisted" in result.detail
 
+    def test_502_stripped_connector_bot_403_walk095_shape_is_error_with_log_hint(self) -> None:
+        """walk095: stripped envelope is ambiguous; ERROR + gateway-log remediation."""
+        from hermes_a365 import bot_service
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        walk095_body = {
+            "error": {
+                "code": "BotError",
+                "message": "Failed to send activity: bot returned an error",
+            },
+            "httpStatusCode": 403,
+        }
+        result = _directline_activity_failure(502, walk095_body)
+        assert result.status == "ERROR"
+        assert "Connector-stripped bot 403 envelope" in result.detail
+        assert "gateway log" in result.detail.lower()
+        assert bot_service._GATEWAY_LOG_INBOUND_403_UNAUTHORIZED_END_USER in result.detail
+        assert "auth OK" not in result.detail
+        assert "reachable;" not in result.detail
+        assert "(A365_ALLOWED_USERS; HTTP" not in result.detail
+
+    def test_502_stripped_envelope_negative_http_status_codes_use_generic_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        base = {
+            "error": {
+                "code": "BotError",
+                "message": "Failed to send activity: bot returned an error",
+            },
+        }
+        for code in (401, 500):
+            result = _directline_activity_failure(502, {**base, "httpStatusCode": code})
+            assert result.status == "ERROR"
+            assert "Connector-stripped bot 403 envelope" not in result.detail
+            assert "BF Connector token" in result.detail
+
+    def test_502_stripped_envelope_requires_boterror_code(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {
+                    "code": "ServiceError",
+                    "message": "Failed to send activity: bot returned an error",
+                },
+                "httpStatusCode": 403,
+            },
+        )
+        assert result.status == "ERROR"
+        assert "Connector-stripped bot 403 envelope" not in result.detail
+
+    def test_502_stripped_envelope_requires_bot_returned_an_error_phrase(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {"code": "BotError", "message": "Failed to send activity: upstream"},
+                "httpStatusCode": 403,
+            },
+        )
+        assert result.status == "ERROR"
+        assert "Connector-stripped bot 403 envelope" not in result.detail
+
+    def test_502_stripped_envelope_requires_failed_to_send_activity_phrase(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {"code": "BotError", "message": "bot returned an error"},
+                "httpStatusCode": 403,
+            },
+        )
+        assert result.status == "ERROR"
+        assert "Connector-stripped bot 403 envelope" not in result.detail
+        assert "BF Connector token" in result.detail
+
+    def test_stripped_envelope_must_not_classify_as_allowlist_warn(self) -> None:
+        """Mutation guard: re-introducing WARN for the stripped envelope must fail."""
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {
+                    "code": "BotError",
+                    "message": "Failed to send activity: bot returned an error",
+                },
+                "httpStatusCode": 403,
+            },
+        )
+        assert result.status != "WARN"
+
+    def test_stripped_envelope_error_must_include_gateway_log_remediation(self) -> None:
+        """Mutation guard: removing the stripped-envelope ERROR branch must fail."""
+        from hermes_a365 import bot_service
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {
+                    "code": "BotError",
+                    "message": "Failed to send activity: bot returned an error",
+                },
+                "httpStatusCode": 403,
+            },
+        )
+        assert bot_service._GATEWAY_LOG_INBOUND_403_UNAUTHORIZED_END_USER in result.detail
+        assert bot_service._GATEWAY_LOG_INBOUND_403_PATH_B_REASON_PREFIX in result.detail
+        assert bot_service._GATEWAY_LOG_INBOUND_403_UNTRUSTED_SERVICE_URL in result.detail
+        assert "invalid bearer token" not in result.detail
+
     def test_502_body_with_only_failed_to_send_activity_is_error(self) -> None:
         from hermes_a365.bot_service import _directline_activity_failure
 
@@ -1858,6 +1946,65 @@ class TestDirectlineActivityFailureClassification:
         assert result.status == "ERROR"
         assert "BF Connector token" in result.detail
 
+    def test_directline_401_activity_is_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(401, {"error": "Unauthorized"})
+        assert result.status == "ERROR"
+        assert "BF Connector token" in result.detail
+
+
+def test_directline_walk095_stripped_envelope_end_to_end_is_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from hermes_a365 import bot_service
+    from hermes_a365.bot_service import BotServiceConfig, directline_runtime_probe
+
+    cfg = BotServiceConfig(
+        schemaVersion=1,
+        subscriptionId=SUBSCRIPTION_ID,
+        resourceGroup="hermes-a365-bots",
+        botName="hermes-inbox-helper-bot",
+        armResourceId=(
+            "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot"
+        ),
+        msaAppId=BF_APP_ID,
+        tenantId=TENANT_ID,
+        messagingEndpoint="https://example.test/api/messages",
+        channelsEnabled=["webchat", "directline"],
+        createdAt="2026-05-18T12:30:00Z",
+        resourceGroupManaged=False,
+    )
+
+    class _SecretRunner:
+        def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
+            return CommandResult(argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}}))
+
+    def _walk095_502(
+        url: str,
+        *,
+        token: str,
+        body: dict[str, Any] | None = None,
+        timeout: float = 20.0,
+    ) -> tuple[int, dict[str, Any]]:
+        if url.endswith("/v3/directline/conversations"):
+            return 201, {"conversationId": "conv-probe", "token": "conv-token"}
+        return 502, {
+            "error": {
+                "code": "BotError",
+                "message": "Failed to send activity: bot returned an error",
+            },
+            "httpStatusCode": 403,
+        }
+
+    monkeypatch.setattr(bot_service, "_http_json", _walk095_502)
+    result = directline_runtime_probe(cfg, _SecretRunner())
+
+    assert result.status == "ERROR"
+    assert "Connector-stripped bot 403 envelope" in result.detail
+    assert "gateway log" in result.detail.lower()
+    assert "auth OK" not in result.detail
+
 
 def test_directline_403_with_token_failure_stays_a_credential_error(
     monkeypatch: pytest.MonkeyPatch,
@@ -1870,8 +2017,7 @@ def test_directline_403_with_token_failure_stays_a_credential_error(
         resourceGroup="hermes-a365-bots",
         botName="hermes-inbox-helper-bot",
         armResourceId=(
-            "/subscriptions/sub/resourceGroups/rg/providers/"
-            "Microsoft.BotService/botServices/bot"
+            "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot"
         ),
         msaAppId=BF_APP_ID,
         tenantId=TENANT_ID,
@@ -1883,9 +2029,7 @@ def test_directline_403_with_token_failure_stays_a_credential_error(
 
     class _SecretRunner:
         def run(self, argv: list[str], *, timeout: float = 120.0) -> CommandResult:
-            return CommandResult(
-                argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}})
-            )
+            return CommandResult(argv, 0, stdout=json.dumps({"properties": {"key": "DL_SECRET"}}))
 
     def _token_403(
         url: str,

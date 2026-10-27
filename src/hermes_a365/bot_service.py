@@ -141,9 +141,7 @@ def _normalize_endpoint(raw: str, *, allow_local: bool = False) -> str:
     # this ONLY for loopback hosts (the http://localhost dev-tunnel case);
     # a remote http:// URL is always refused.
     if parsed.scheme != "https" and not is_loopback:
-        raise BotServiceError(
-            f"endpoint must be HTTPS ({value}); BF Bot Service requires TLS"
-        )
+        raise BotServiceError(f"endpoint must be HTTPS ({value}); BF Bot Service requires TLS")
     trimmed = value.rstrip("/")
     if trimmed.endswith("/api/messages"):
         return trimmed
@@ -288,17 +286,13 @@ class BotServiceConfig:
         ):
             if not isinstance(raw.get(key), str) or not raw[key].strip():
                 if key == "subscriptionId":
-                    raise BotServiceError(
-                        f"{source} has a blank subscriptionId; refusing to load"
-                    )
+                    raise BotServiceError(f"{source} has a blank subscriptionId; refusing to load")
                 raise BotServiceError(f"{source} requires a non-empty string {key}")
         channels = raw.get("channelsEnabled")
         if not isinstance(channels, list) or any(
             not isinstance(channel, str) or not channel.strip() for channel in channels
         ):
-            raise BotServiceError(
-                f"{source} channelsEnabled must be a list of non-empty strings"
-            )
+            raise BotServiceError(f"{source} channelsEnabled must be a list of non-empty strings")
         known = {f.name for f in fields(cls)}
         return cls(**{k: v for k, v in raw.items() if k in known})
 
@@ -375,8 +369,7 @@ class BotServiceEnableChannelPlan:
             if self.config.schemaVersion == SIDECAR_SCHEMA_VERSION
             else [
                 "  legacy binding:",
-                "    - apply requires "
-                f"--confirm-legacy-binding={self.inputs.agent_name!r}",
+                f"    - apply requires --confirm-legacy-binding={self.inputs.agent_name!r}",
             ]
         )
         return "\n".join(
@@ -433,8 +426,7 @@ class BotServiceUpdateEndpointPlan:
             if self.config.schemaVersion == SIDECAR_SCHEMA_VERSION
             else [
                 "  legacy binding:",
-                "    - apply requires "
-                f"--confirm-legacy-binding={self.inputs.agent_name!r}",
+                f"    - apply requires --confirm-legacy-binding={self.inputs.agent_name!r}",
             ]
         )
         return "\n".join(
@@ -651,9 +643,7 @@ def build_cleanup_plan(
         raise BotServiceError(f"{inputs.sidecar_path} changed while the cleanup plan was read")
     contents: list[str] | None = None
     if runner is not None and inputs.purge_resource_group and config.resourceGroupManaged:
-        listed = _resource_list(
-            runner, config.resourceGroup, subscription_id=config.subscriptionId
-        )
+        listed = _resource_list(runner, config.resourceGroup, subscription_id=config.subscriptionId)
         if listed is not None:
             contents = [
                 f"{item.get('type') or '(unknown type)'}/{item.get('name') or '(unnamed)'}"
@@ -759,7 +749,14 @@ def _bot_show(
 ) -> dict[str, Any] | None:
     result = runner.run(
         [
-            "az", "bot", "show", "--resource-group", resource_group, "--name", bot_name, "-o",
+            "az",
+            "bot",
+            "show",
+            "--resource-group",
+            resource_group,
+            "--name",
+            bot_name,
+            "-o",
             "json",
             *_sub_args(subscription_id),
         ]
@@ -805,7 +802,13 @@ def _resource_list(
     try:
         result = runner.run(
             [
-                "az", "resource", "list", "--resource-group", resource_group, "-o", "json",
+                "az",
+                "resource",
+                "list",
+                "--resource-group",
+                resource_group,
+                "-o",
+                "json",
                 *_sub_args(subscription_id),
             ]
         )
@@ -826,9 +829,7 @@ def _resource_list(
     return parsed
 
 
-def _foreign_resources(
-    resources: list[dict[str, Any]], config: BotServiceConfig
-) -> list[str]:
+def _foreign_resources(resources: list[dict[str, Any]], config: BotServiceConfig) -> list[str]:
     """#102 M5: which of a managed group's resources are NOT ours.
 
     Provisioning puts exactly ONE top-level resource in a managed group — the
@@ -860,8 +861,16 @@ def _msteams_show(
 ) -> dict[str, Any] | None:
     result = runner.run(
         [
-            "az", "bot", "msteams", "show", "--resource-group", resource_group, "--name", bot_name,
-            "-o", "json",
+            "az",
+            "bot",
+            "msteams",
+            "show",
+            "--resource-group",
+            resource_group,
+            "--name",
+            bot_name,
+            "-o",
+            "json",
             *_sub_args(subscription_id),
         ]
     )
@@ -881,7 +890,13 @@ def _msteams_delete(
 ) -> bool:
     result = runner.run(
         [
-            "az", "bot", "msteams", "delete", "--resource-group", resource_group, "--name",
+            "az",
+            "bot",
+            "msteams",
+            "delete",
+            "--resource-group",
+            resource_group,
+            "--name",
             bot_name,
             *_sub_args(subscription_id),
         ]
@@ -940,8 +955,7 @@ def _verify_sidecar_target(
     selected_subscription = str(account.get("id") or "").strip().lower()
     if selected_subscription != config.subscriptionId.strip().lower():
         raise BotServiceError(
-            "Azure returned a different subscription than the sidecar binding; "
-            "refusing mutation"
+            "Azure returned a different subscription than the sidecar binding; refusing mutation"
         )
     active_tenant = str(account.get("tenantId") or "").strip().lower()
     if not active_tenant or active_tenant != config.tenantId.strip().lower():
@@ -962,9 +976,7 @@ def _verify_sidecar_target(
         return None
     live_id = str(bot.get("id") or "").strip()
     if not live_id:
-        raise BotServiceError(
-            "live bot response omitted its ARM resource id; refusing mutation"
-        )
+        raise BotServiceError("live bot response omitted its ARM resource id; refusing mutation")
     if live_id.lower() != config.armResourceId.strip().lower():
         raise BotServiceError("live bot ARM resource id does not match the sidecar binding")
     if _bot_app_id(bot).lower() != config.msaAppId.strip().lower():
@@ -996,13 +1008,9 @@ def _teams_terms_accepted(channel: dict[str, Any] | None) -> bool:
     return bool(props.get("acceptedTerms") and props.get("isEnabled", True))
 
 
-def _account_show(
-    runner: CommandRunner, *, subscription_id: str | None = None
-) -> dict[str, Any]:
+def _account_show(runner: CommandRunner, *, subscription_id: str | None = None) -> dict[str, Any]:
     return _json_from_result(
-        runner.run(
-            ["az", "account", "show", "-o", "json", *_sub_args(subscription_id)]
-        ),
+        runner.run(["az", "account", "show", "-o", "json", *_sub_args(subscription_id)]),
         "az account show",
     )
 
@@ -1023,10 +1031,7 @@ def _resolve_tenant_id(
     account: dict[str, Any],
 ) -> str:
     tenant_id = (
-        inputs.tenant_id
-        or operator_env.get("A365_TENANT_ID")
-        or account.get("tenantId")
-        or ""
+        inputs.tenant_id or operator_env.get("A365_TENANT_ID") or account.get("tenantId") or ""
     )
     tenant_id = str(tenant_id).strip()
     if not tenant_id:
@@ -1093,12 +1098,24 @@ def _app_id_drift_recovery_commands(
         # operator pasting these is exactly the person whose ambient az
         # default may point elsewhere.
         [
-            "az", "bot", "msteams", "delete", "--resource-group", inputs.resource_group, "--name",
+            "az",
+            "bot",
+            "msteams",
+            "delete",
+            "--resource-group",
+            inputs.resource_group,
+            "--name",
             bot_name,
             *_sub_args(subscription_id),
         ],
         [
-            "az", "bot", "delete", "--resource-group", inputs.resource_group, "--name", bot_name,
+            "az",
+            "bot",
+            "delete",
+            "--resource-group",
+            inputs.resource_group,
+            "--name",
+            bot_name,
             *_sub_args(subscription_id),
         ],
         create_argv,
@@ -1199,9 +1216,7 @@ def _bind_legacy_sidecar(
     """Upgrade verified v1 state immediately before its first successful rewrite."""
     if config.schemaVersion == SIDECAR_SCHEMA_VERSION:
         return config
-    _validate_legacy_binding_confirmation(
-        config, agent_name=agent_name, confirmation=confirmation
-    )
+    _validate_legacy_binding_confirmation(config, agent_name=agent_name, confirmation=confirmation)
     backup = _backup_sidecar_path(path, now=datetime.now(UTC))
     _write_text_atomic(backup, snapshot.decode("utf-8"), mode=0o600)
     messages.append(f"[apply] backed up legacy sidecar to {backup}")
@@ -1280,9 +1295,7 @@ def apply_create_plan(
     now: Callable[[], datetime] | None = None,
 ) -> BotServiceCreateResult:
     with _exclusive_sidecar_lock(plan.inputs.sidecar_path):
-        return _apply_create_plan_locked(
-            plan, runner=runner, operator_env=operator_env, now=now
-        )
+        return _apply_create_plan_locked(plan, runner=runner, operator_env=operator_env, now=now)
 
 
 def _apply_create_plan_locked(
@@ -1297,6 +1310,7 @@ def _apply_create_plan_locked(
     if operator_env is None:
         operator_env = _load_operator_env()
     if now is None:
+
         def now() -> datetime:
             return datetime.now(UTC)
 
@@ -1333,7 +1347,12 @@ def _apply_create_plan_locked(
     _require_success(
         runner.run(
             [
-                "az", "provider", "register", "--namespace", _BOT_SERVICE_NAMESPACE, "--wait",
+                "az",
+                "provider",
+                "register",
+                "--namespace",
+                _BOT_SERVICE_NAMESPACE,
+                "--wait",
                 *_sub_args(subscription_id),
             ],
             timeout=300.0,
@@ -1342,15 +1361,20 @@ def _apply_create_plan_locked(
     )
     messages.append(f"[apply] registered provider {_BOT_SERVICE_NAMESPACE}")
 
-    existing_group = _group_show(
-        runner, inputs.resource_group, subscription_id=subscription_id
-    )
+    existing_group = _group_show(runner, inputs.resource_group, subscription_id=subscription_id)
     resource_group_managed = existing_group is None
     _require_success(
         runner.run(
             [
-                "az", "group", "create", "--name", inputs.resource_group, "--location",
-                inputs.region, "-o", "json",
+                "az",
+                "group",
+                "create",
+                "--name",
+                inputs.resource_group,
+                "--location",
+                inputs.region,
+                "-o",
+                "json",
                 *_sub_args(subscription_id),
             ]
         ),
@@ -1367,10 +1391,27 @@ def _apply_create_plan_locked(
         bot = _json_from_result(
             runner.run(
                 [
-                    "az", "bot", "create", "--resource-group", inputs.resource_group, "--name",
-                    bot_name, "--app-type", "SingleTenant", "--appid", app_id, "--tenant-id",
-                    tenant_id, "--endpoint", inputs.endpoint, "--sku", inputs.sku, "--location",
-                    "global", "-o", "json",
+                    "az",
+                    "bot",
+                    "create",
+                    "--resource-group",
+                    inputs.resource_group,
+                    "--name",
+                    bot_name,
+                    "--app-type",
+                    "SingleTenant",
+                    "--appid",
+                    app_id,
+                    "--tenant-id",
+                    tenant_id,
+                    "--endpoint",
+                    inputs.endpoint,
+                    "--sku",
+                    inputs.sku,
+                    "--location",
+                    "global",
+                    "-o",
+                    "json",
                     *_sub_args(subscription_id),
                 ],
                 timeout=300.0,
@@ -1399,8 +1440,17 @@ def _apply_create_plan_locked(
             bot = _json_from_result(
                 runner.run(
                     [
-                        "az", "bot", "update", "--resource-group", inputs.resource_group, "--name",
-                        bot_name, "--endpoint", inputs.endpoint, "-o", "json",
+                        "az",
+                        "bot",
+                        "update",
+                        "--resource-group",
+                        inputs.resource_group,
+                        "--name",
+                        bot_name,
+                        "--endpoint",
+                        inputs.endpoint,
+                        "-o",
+                        "json",
                         *_sub_args(subscription_id),
                     ]
                 ),
@@ -1416,8 +1466,14 @@ def _apply_create_plan_locked(
         _require_success(
             runner.run(
                 [
-                    "az", "bot", "msteams", "create", "--resource-group", inputs.resource_group,
-                    "--name", bot_name,
+                    "az",
+                    "bot",
+                    "msteams",
+                    "create",
+                    "--resource-group",
+                    inputs.resource_group,
+                    "--name",
+                    bot_name,
                     *_sub_args(subscription_id),
                 ]
             ),
@@ -1504,9 +1560,7 @@ def _apply_enable_channel_plan_locked(
         sidecar_path=inputs.sidecar_path,
         sidecar_binding=plan.sidecar_binding,
     )
-    _verify_sidecar_target(
-        runner, config, agent_name=inputs.agent_name, require_live=True
-    )
+    _verify_sidecar_target(runner, config, agent_name=inputs.agent_name, require_live=True)
 
     teams = _msteams_show(
         runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
@@ -1515,8 +1569,14 @@ def _apply_enable_channel_plan_locked(
         _require_success(
             runner.run(
                 [
-                    "az", "bot", "msteams", "create", "--resource-group", config.resourceGroup,
-                    "--name", config.botName,
+                    "az",
+                    "bot",
+                    "msteams",
+                    "create",
+                    "--resource-group",
+                    config.resourceGroup,
+                    "--name",
+                    config.botName,
                     *_sub_args(config.subscriptionId),
                 ]
             ),
@@ -1599,9 +1659,7 @@ def _apply_update_endpoint_plan_locked(
         sidecar_path=inputs.sidecar_path,
         sidecar_binding=plan.sidecar_binding,
     )
-    bot = _verify_sidecar_target(
-        runner, config, agent_name=inputs.agent_name, require_live=True
-    )
+    bot = _verify_sidecar_target(runner, config, agent_name=inputs.agent_name, require_live=True)
     assert bot is not None
 
     current = _bot_endpoint(bot)
@@ -1610,8 +1668,17 @@ def _apply_update_endpoint_plan_locked(
         bot = _json_from_result(
             runner.run(
                 [
-                    "az", "bot", "update", "--resource-group", config.resourceGroup, "--name",
-                    config.botName, "--endpoint", inputs.url, "-o", "json",
+                    "az",
+                    "bot",
+                    "update",
+                    "--resource-group",
+                    config.resourceGroup,
+                    "--name",
+                    config.botName,
+                    "--endpoint",
+                    inputs.url,
+                    "-o",
+                    "json",
                     *_sub_args(config.subscriptionId),
                 ]
             ),
@@ -1671,6 +1738,7 @@ def _apply_cleanup_plan_locked(
     if runner is None:
         runner = SubprocessRunner()
     if now is None:
+
         def now() -> datetime:
             return datetime.now(UTC)
 
@@ -1679,8 +1747,7 @@ def _apply_cleanup_plan_locked(
 
     def record_blueprint_preserved() -> None:
         message = (
-            "[apply] Blueprint Entra app + service principal preserved — "
-            "Path A still depends on it"
+            "[apply] Blueprint Entra app + service principal preserved — Path A still depends on it"
         )
         result.blueprint_preserved = True
         result.blueprint_preserved_message = message
@@ -1709,9 +1776,7 @@ def _apply_cleanup_plan_locked(
     if plan.sidecar_binding is None:
         raise BotServiceError("cleanup plan is missing its sidecar file binding")
     if _sidecar_file_binding(inputs.sidecar_path) != plan.sidecar_binding:
-        raise BotServiceError(
-            f"{inputs.sidecar_path} changed after planning; refusing cleanup"
-        )
+        raise BotServiceError(f"{inputs.sidecar_path} changed after planning; refusing cleanup")
 
     # Refuse BEFORE any deletion when the sidecar is legacy or belongs to
     # another agent. The classic footgun is running cleanup for agent X from a
@@ -1741,7 +1806,12 @@ def _apply_cleanup_plan_locked(
         _require_success(
             runner.run(
                 [
-                    "az", "bot", "delete", "--resource-group", config.resourceGroup, "--name",
+                    "az",
+                    "bot",
+                    "delete",
+                    "--resource-group",
+                    config.resourceGroup,
+                    "--name",
                     config.botName,
                     *_sub_args(subscription_id),
                 ]
@@ -1753,9 +1823,7 @@ def _apply_cleanup_plan_locked(
 
     if inputs.purge_resource_group:
         if config.resourceGroupManaged:
-            group = _group_show(
-                runner, config.resourceGroup, subscription_id=subscription_id
-            )
+            group = _group_show(runner, config.resourceGroup, subscription_id=subscription_id)
             if group is None:
                 result.messages.append(
                     f"[apply] managed resource group {config.resourceGroup} is already absent"
@@ -1770,9 +1838,7 @@ def _apply_cleanup_plan_locked(
                 leftovers = _resource_list(
                     runner, config.resourceGroup, subscription_id=subscription_id
                 )
-                foreign = (
-                    None if leftovers is None else _foreign_resources(leftovers, config)
-                )
+                foreign = None if leftovers is None else _foreign_resources(leftovers, config)
                 result.resource_group_purge_pending = True
                 if leftovers is None:
                     result.messages.append(
@@ -1840,13 +1906,18 @@ def _apply_cleanup_plan_locked(
 RuntimeProbe = Callable[[BotServiceConfig, CommandRunner], ProbeResult]
 
 
-def _provider_probe(
-    runner: CommandRunner, *, subscription_id: str | None = None
-) -> ProbeResult:
+def _provider_probe(runner: CommandRunner, *, subscription_id: str | None = None) -> ProbeResult:
     result = runner.run(
         [
-            "az", "provider", "show", "--namespace", _BOT_SERVICE_NAMESPACE, "--query",
-            "registrationState", "-o", "tsv",
+            "az",
+            "provider",
+            "show",
+            "--namespace",
+            _BOT_SERVICE_NAMESPACE,
+            "--query",
+            "registrationState",
+            "-o",
+            "tsv",
             *_sub_args(subscription_id),
         ]
     )
@@ -1926,8 +1997,18 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
     secret_data = _json_from_result(
         runner.run(
             [
-                "az", "bot", "directline", "show", "--resource-group", config.resourceGroup,
-                "--name", config.botName, "--with-secrets", "true", "-o", "json",
+                "az",
+                "bot",
+                "directline",
+                "show",
+                "--resource-group",
+                config.resourceGroup,
+                "--name",
+                config.botName,
+                "--with-secrets",
+                "true",
+                "-o",
+                "json",
                 *_sub_args(config.subscriptionId),
             ]
         ),
@@ -1998,6 +2079,48 @@ def _response_is_allowlist_rejection(lowered: str) -> bool:
     return any(marker in lowered for marker in _ALLOWLIST_MARKERS)
 
 
+def _response_is_stripped_connector_bot_403_envelope(response: dict[str, Any]) -> bool:
+    """Direct Line HTTP 502 relay of a bot HTTP 403 (walk095 / live-tenant-test).
+
+    The Connector drops gateway detail (allowlist, JWT, untrusted serviceUrl) and
+    returns this single JSON shape for every bot-side 403.
+    """
+    if response.get("httpStatusCode") != 403:
+        return False
+    err = response.get("error")
+    if not isinstance(err, dict):
+        return False
+    if err.get("code") != "BotError":
+        return False
+    message = str(err.get("message") or "").lower()
+    return "failed to send activity" in message and "bot returned an error" in message
+
+
+# Log format strings — keep aligned with plugin/adapter.py gateway warnings.
+_GATEWAY_LOG_INBOUND_403_UNAUTHORIZED_END_USER = "inbound 403 reason=unauthorized-end-user"
+_GATEWAY_LOG_INBOUND_403_PATH_B_REASON_PREFIX = "inbound 403 path=B reason="
+_GATEWAY_LOG_INBOUND_403_UNTRUSTED_SERVICE_URL = "inbound 403 reason=untrusted-service-url"
+
+_STRIPPED_CONNECTOR_BOT_403_REMEDIATION = (
+    "The Connector stripped the bot's 403 reason (body above). Check the gateway log: "
+    f"`{_GATEWAY_LOG_INBOUND_403_UNAUTHORIZED_END_USER}` means the allowlist rejected "
+    "the sender (add the probe id to A365_ALLOWED_USERS or ignore if expected); "
+    f"`{_GATEWAY_LOG_INBOUND_403_PATH_B_REASON_PREFIX}` with a BF signature/aud/iss or "
+    "serviceUrl mismatch means a real Path B auth failure; "
+    f"`{_GATEWAY_LOG_INBOUND_403_UNTRUSTED_SERVICE_URL}` means the activity serviceUrl "
+    "failed the trusted-suffix check."
+)
+
+
+def _directline_stripped_bot_403_error(status: int, detail: str) -> ProbeResult:
+    return ProbeResult(
+        "runtime_auth",
+        "ERROR",
+        f"Direct Line returned HTTP {status} with the Connector-stripped bot 403 "
+        f"envelope: {detail}. {_STRIPPED_CONNECTOR_BOT_403_REMEDIATION}",
+    )
+
+
 def _directline_allowlist_warn(status: int, detail: str) -> ProbeResult:
     return ProbeResult(
         "runtime_auth",
@@ -2014,15 +2137,28 @@ def _directline_allowlist_warn(status: int, detail: str) -> ProbeResult:
 def _directline_activity_failure(status: int, response: dict[str, Any]) -> ProbeResult:
     """Classify a Direct Line activity POST that the bot endpoint rejected.
 
-    Conversation start has already succeeded, so the Direct Line secret and
-    bot token check passed. The gateway allowlist (``unauthorized-end-user`` /
-    ``end user is not authorized``) is not a Bot Framework credential failure.
+    Conversation start has already succeeded, so the Direct Line secret was
+    accepted. **WARN** only when the response body still carries
+    explicit allowlist markers. The Connector's stripped bot-403 envelope stays
+    **ERROR** with gateway-log remediation (same JSON for allowlist and JWT).
     """
     detail = json.dumps(response, sort_keys=True)
     lowered = detail.lower()
     token_failed = any(marker in lowered for marker in _TOKEN_FAILURE_MARKERS)
     if not token_failed and _response_is_allowlist_rejection(lowered):
         return _directline_allowlist_warn(status, detail)
+    if (
+        not token_failed
+        and status == 502
+        and _response_is_stripped_connector_bot_403_envelope(response)
+    ):
+        return _directline_stripped_bot_403_error(status, detail)
+    if status == 401:
+        return ProbeResult(
+            "runtime_auth",
+            "ERROR",
+            f"configured endpoint rejected a Path B BF Connector token (HTTP {status}): {detail}",
+        )
     if (
         status == 403
         or "403" in detail
@@ -2032,8 +2168,7 @@ def _directline_activity_failure(status: int, response: dict[str, Any]) -> Probe
         return ProbeResult(
             "runtime_auth",
             "ERROR",
-            "configured endpoint rejected a Path B BF Connector token "
-            f"(HTTP {status}): {detail}",
+            f"configured endpoint rejected a Path B BF Connector token (HTTP {status}): {detail}",
         )
     return ProbeResult(
         "runtime_auth",
@@ -2105,9 +2240,7 @@ def verify_bot_service(
     # #102 H3/L5: verify reads pin the sidecar's subscription too — probing
     # the ambient subscription would report bogus missing/OK for the wrong
     # target.
-    results: list[ProbeResult] = [
-        _provider_probe(runner, subscription_id=config.subscriptionId)
-    ]
+    results: list[ProbeResult] = [_provider_probe(runner, subscription_id=config.subscriptionId)]
 
     bot = _bot_show(
         runner, config.resourceGroup, config.botName, subscription_id=config.subscriptionId
@@ -2224,8 +2357,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     create.add_argument(
         "--region",
         help=(
-            "resource group region (default: az config defaults.location, "
-            f"then {_DEFAULT_REGION})"
+            f"resource group region (default: az config defaults.location, then {_DEFAULT_REGION})"
         ),
     )
     create.add_argument(
@@ -2409,8 +2541,7 @@ def _run_enable_channel(args: argparse.Namespace) -> int:
         if plan.config.agentName is None:
             apply_args.append(f"--confirm-legacy-binding={args.agent_name}")
         sys.stdout.write(
-            f"\nNo mutations. Re-run with {shlex.join(apply_args)} "
-            "to enable the channel.\n"
+            f"\nNo mutations. Re-run with {shlex.join(apply_args)} to enable the channel.\n"
         )
         return 0
 
@@ -2444,8 +2575,7 @@ def _run_update_endpoint(args: argparse.Namespace) -> int:
         if plan.config.agentName is None:
             apply_args.append(f"--confirm-legacy-binding={args.agent_name}")
         sys.stdout.write(
-            f"\nNo mutations. Re-run with {shlex.join(apply_args)} "
-            "to update Azure Bot Service.\n"
+            f"\nNo mutations. Re-run with {shlex.join(apply_args)} to update Azure Bot Service.\n"
         )
         return 0
 
@@ -2560,8 +2690,7 @@ def run(args: argparse.Namespace) -> int:
     if sub == "verify":
         return _run_verify(args)
     print(
-        "usage: hermes-a365 bot-service "
-        "{create,enable-channel,update-endpoint,cleanup,verify}",
+        "usage: hermes-a365 bot-service {create,enable-channel,update-endpoint,cleanup,verify}",
         file=sys.stderr,
     )
     return 2
