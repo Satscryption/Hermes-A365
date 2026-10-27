@@ -11245,34 +11245,28 @@ class TestEditMessage:
     async def test_g2_under_threshold_wake_closes_on_next_emit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        stream = {"stream_id": "g2-under", "opened_mono": 0.0}
+        monkeypatch.setattr(time, "monotonic", lambda: rotate_at - 1e-4)
+        tiny = adapter_mod._keepalive_sleeper_wait_after_emit(stream)
+        assert 0.0 < tiny < 0.01
+        monkeypatch.setattr(time, "monotonic", lambda: rotate_at - 1e-4)
         a = _make_adapter(monkeypatch)
         chat = "conv-G2-under-threshold"
         inbound = _make_inbound(conv_id=chat, activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        rotate_at = adapter_mod._keepalive_rotation_age_sec()
-        age_before_short = rotate_at - 100.0
-        clock = {"t": age_before_short}
-        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
-        sleep_calls: list[float] = []
-
-        async def sleep(delay: float) -> None:
-            sleep_calls.append(float(delay))
-            clock["t"] += float(delay)
-
-        monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=sleep))
         finals: list[float] = []
+        clock = {"t": rotate_at - 1e-4}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
             if entity.get("streamType") == "final":
                 finals.append(clock["t"])
                 return self._http_result(202)
-            if entity.get("streamType") == "informative" and "streamId" not in entity:
-                return self._http_result(201, "g2-under")
             return self._http_result(202)
 
         a._http_client.post = post
@@ -11283,28 +11277,19 @@ class TestEditMessage:
         )
         await a.on_processing_start(event)
         await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
-        await a.send(
-            chat_id=chat,
-            content="G2 fact",
-            reply_to="act-1",
-            metadata={"expect_edits": True},
-        )
         buf = a._turn_buffers[chat]
         buf["keepalive"] = {
             "stream_id": "g2-under",
-            "sequence": 1,
+            "sequence": 3,
             "opened_mono": 0.0,
         }
-        buf["keepalive_scheduled_mono"] = 0.0
-        short_wait = rotate_at - age_before_short - 1e-4
-        assert abs(short_wait - 15.0) < 0.02
-        clock["t"] = age_before_short
         await a._emit_turn_buffer_keepalive(chat)
-        clock["t"] = rotate_at - 1e-4
+        assert finals == []
+        clock["t"] = rotate_at
         await a._emit_turn_buffer_keepalive(chat)
         assert finals
-        assert abs(finals[0] - rotate_at) < 0.05
-        assert not any(abs(w - 25.0) < 0.01 for w in sleep_calls)
+        assert abs(finals[0] - rotate_at) < 0.01
+        assert adapter_mod._keepalive_sleeper_wait_after_emit(stream) == 0.0
 
     @pytest.mark.asyncio
     async def test_g2_stream_expired_403_retires_without_new_informative_open(
@@ -11317,7 +11302,6 @@ class TestEditMessage:
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        rotate_at = adapter_mod._keepalive_rotation_age_sec()
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         monkeypatch.setattr(time, "monotonic", lambda: cap + 5.0)
         opens = 0
@@ -11332,7 +11316,13 @@ class TestEditMessage:
                 return MagicMock(
                     status_code=403,
                     text="Content stream finished due to exceeded streaming time",
-                    json=lambda: {},
+                    json=lambda: {
+                        "error": {
+                            "message": (
+                                "Content stream finished due to exceeded streaming time"
+                            )
+                        }
+                    },
                 )
             return self._http_result(202)
 

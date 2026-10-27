@@ -11,9 +11,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 Copilot Chat streaming and keep-alive hardening (#214, #217, #212, #235, #247),
 outbound 429 / Retry-After handling (#190), and Direct Line verify diagnostics (#215).
 Ships from ``main`` (2026-10-27) via PRs #223, #231, #232, #233, #234, #236,
-#240, #243, #245, #246, #248, #252 (release bump), and #253.
+#240, #243, #245, #246, #248, #252 (release bump), #253, and #254.
 
 ### Fixed
+
+- **G2 keep-alive rotation with kept pre-tool answer.** At the ~115s rotation
+  age, post the rotation final and plain-route the answer even when a marked
+  answer segment is already in the buffer; fix sleeper zero-sleep collapse and
+  retire streams on terminal exceeded-streaming-time 403 instead of opening a
+  second informative sequence.
 
 - **#217 — Copilot first-turn min stream age (live walk follow-up).** First turn
   after ``membersAdded`` waits until stream age reaches
