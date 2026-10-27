@@ -1012,12 +1012,12 @@ _POST_SEND_TIMEOUT_MARKER = "timeout after the request was sent"
 # mint. Later updates use the same gap, which is under 45s. A stream
 # must be completed within two minutes or Bot Framework returns 403
 # ``Content stream finished due to exceeded streaming time``;
-# informative updates do not extend that cap. Rotate when another
-# sample interval would leave the closing final (one token mint plus
-# the 15s activity POST) outside that cap, so the phase of the sample
-# cannot push the final past two minutes. Informative text is at most
-# 1000 characters. Teardown sends one final for a stream that already
-# returned an id, and gives up after a short bound.
+# informative updates do not extend that cap. Rotate when the next
+# sample interval would exceed that cap (not earlier: a 30s answer-final
+# budget applies only to answer delivery, not keep-alive rotation).
+# Informative text is at most 1000 characters. Teardown sends one final
+# for a stream that already returned an id, and gives up after a short
+# bound.
 _TURN_BUFFER_KEEPALIVE_FIRST_SEC = 25.0
 _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC = 25.0
 # Test-only: when True, do not spawn the automatic keep-alive sleeper (manual emit).
@@ -1076,19 +1076,19 @@ class _KeepalivePost(NamedTuple):
 
 
 def _keepalive_rotation_due(age: float) -> bool:
-    """True when another interval would start the final too late.
+    """True when another informative would exceed the two-minute stream cap.
 
-    The sample that lands just under ``STREAM_MAX_AGE`` still rotates:
-    waiting the interval and then posting the final would finish at or
-    past the two-minute cap. An interval that is already longer than
-    that age is not a sample period (the loop is pinned so it does not
-    fire); rotation then follows age alone, which is still inside the
-    two-minute cap.
+    Uses the full ``_TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC`` (120s), not the
+    shorter answer-final budget window. The sample that lands just under the
+    cap still rotates: waiting the interval and then posting would exceed the
+    cap. An interval longer than the cap is not a sample period; rotation
+    then follows age alone.
     """
     interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
-    if interval <= 0 or interval >= _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC:
-        return age >= _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
-    return age + interval >= _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+    cap = _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+    if interval <= 0 or interval >= cap:
+        return age >= cap
+    return age + interval >= cap
 
 
 def _keepalive_user_cancelled(detail: str) -> bool:
@@ -6534,6 +6534,8 @@ class Agent365Adapter(BasePlatformAdapter):
             ):
                 if self._turn_buffer_live_for_keepalive(buf):
                     rotated = await self._post_keepalive_final_locked(chat_id, buf)
+                    if rotated:
+                        buf["keepalive_rotated"] = True
                 else:
                     logger.debug(
                         "agent365 turn buffer keep-alive skip rotation final: "
@@ -6818,7 +6820,13 @@ class Agent365Adapter(BasePlatformAdapter):
             self._remember_keepalive(chat_id, buf, failed)
         return False
 
-    async def _post_keepalive_final_locked(self, chat_id: str, buf: dict[str, Any] | None) -> bool:
+    async def _post_keepalive_final_locked(
+        self,
+        chat_id: str,
+        buf: dict[str, Any] | None,
+        *,
+        for_answer_delivery: bool = False,
+    ) -> bool:
         """POST ``streamType=final``. True only when the stream is closed.
 
         The id is removed after a 2xx final, or a 403 whose body says the
@@ -6830,7 +6838,7 @@ class Agent365Adapter(BasePlatformAdapter):
             buf = live if isinstance(live, dict) else None
         if not isinstance(buf, dict) or live is not buf:
             return False
-        if self._turn_buffer_delivery_blocks_keepalive(buf):
+        if not for_answer_delivery and self._turn_buffer_delivery_blocks_keepalive(buf):
             return False
         stream = self._keepalive_state(buf)
         if stream.get("stopped"):
@@ -7574,6 +7582,19 @@ class Agent365Adapter(BasePlatformAdapter):
 
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
+        if buf.get("keepalive_rotated") and stream_id:
+            closed = await self._post_keepalive_final_locked(
+                chat_id, buf, for_answer_delivery=True
+            )
+            buf.pop("keepalive_rotated", None)
+            if not closed:
+                return ("retry", None)
+            logger.warning(
+                "agent365 turn buffer answer plain fallback: chat_id=%s "
+                "reason=keepalive stream rotated",
+                chat_id,
+            )
+            return ("fallback", "keepalive stream rotated")
         if not stream_id:
             opener_text = self._informative_text_for_turn(
                 buf,

@@ -8518,12 +8518,10 @@ class TestEditMessage:
         max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
         assert cap <= 120
         assert max_age + budget <= cap
-        # A sample just under the max age still rotates: waiting another
-        # interval would start the final too late to finish inside the cap.
-        assert adapter_mod._keepalive_rotation_due(max_age - 0.01)
-        assert not adapter_mod._keepalive_rotation_due(
-            max_age - adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC - 0.01
-        )
+        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+        # Rotation tracks the full stream cap, not the shorter max-age budget.
+        assert adapter_mod._keepalive_rotation_due(cap - interval + 0.01)
+        assert not adapter_mod._keepalive_rotation_due(cap - interval - 0.01)
         text = adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         assert text.strip() == text
         assert text != ""
@@ -10593,6 +10591,129 @@ class TestEditMessage:
         await a._drop_turn_buffer(chat)
 
     @pytest.mark.asyncio
+    async def test_issue247_rotation_not_due_before_stream_cap_minus_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+        early_age = 70.0
+        assert early_age + interval < cap
+        assert not adapter_mod._keepalive_rotation_due(early_age)
+        late_age = cap - interval + 0.01
+        assert adapter_mod._keepalive_rotation_due(late_age)
+
+    @pytest.mark.asyncio
+    async def test_issue247_answer_plain_after_keepalive_rotation_with_reply_to(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """After rotation, close the informative stream and plain-post the answer (#247)."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-rotate-plain"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        stream_finals: list[dict[str, Any]] = []
+        answer_stream_finals: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            entity = body["entities"][0]
+            if entity.get("streamType") == "final":
+                if body.get("text") == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT:
+                    stream_finals.append(entity)
+                else:
+                    answer_stream_finals.append(entity)
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "rotated-247")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run the sleep, then reply.",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content="💻 Running sleep 150", reply_to=None)
+        buf = a._turn_buffers[chat]
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+        buf["keepalive"] = {
+            "stream_id": "pre-rotate",
+            "sequence": 3,
+            "opened_mono": time.monotonic() - (cap - interval + 0.01),
+        }
+        await a._emit_turn_buffer_keepalive(chat)
+        assert buf.get("keepalive_rotated") is True
+        assert buf["keepalive"]["stream_id"] == "rotated-247"
+        await a.send(chat_id=chat, content="Done after long sleep.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        assert len(stream_finals) == 2
+        assert stream_finals[-1]["streamId"] == "rotated-247"
+        assert answer_stream_finals == []
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Done after long sleep."
+        assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_issue247_short_turn_under_cap_never_rotates(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-no-rotate"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        finals: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals.append(str(entity.get("streamId") or ""))
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-104")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 104", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-104",
+            "sequence": 2,
+            "opened_mono": time.monotonic() - 70.0,
+        }
+        await a._emit_turn_buffer_keepalive(chat)
+        assert finals == []
+        await a.send(chat_id=chat, content="Done.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        assert finals == ["ka-104"]
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
     async def test_turn_buffer_never_posts_empty_text_activities(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -12250,11 +12371,12 @@ class TestEditMessage:
             reply_to=None,
         )
         buf = a._turn_buffers["conv-G-rotate-early"]
-        max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
         buf["keepalive"] = {
             "stream_id": "aging-stream",
             "sequence": 2,
-            "opened_mono": time.monotonic() - (max_age - 0.01),
+            "opened_mono": time.monotonic() - (cap - interval + 0.01),
         }
         await a._emit_turn_buffer_keepalive("conv-G-rotate-early")
         assert kinds == ["final:aging-stream", "informative"]
@@ -14245,12 +14367,13 @@ class TestEditMessage:
         )
         await a.on_processing_start(event)
         buf = a._turn_buffers["conv-G-ka-seg"]
-        max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
         await a.send(chat_id="conv-G-ka-seg", content="Pending answer", reply_to=None)
         buf["keepalive"] = {
             "stream_id": "aging",
             "sequence": 1,
-            "opened_mono": time.monotonic() - (max_age - 0.01),
+            "opened_mono": time.monotonic() - 70.0,
         }
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals == []
@@ -14270,8 +14393,12 @@ class TestEditMessage:
         closed_by_snap: list[str] = []
         original_final = a._post_keepalive_final_locked
 
-        async def capture_final(chat_id: str, buf_arg: dict[str, Any] | None = None) -> bool:
-            result = await original_final(chat_id, buf_arg)
+        async def capture_final(
+            chat_id: str,
+            buf_arg: dict[str, Any] | None = None,
+            **kwargs: Any,
+        ) -> bool:
+            result = await original_final(chat_id, buf_arg, **kwargs)
             live = a._turn_buffers.get(chat_id)
             if isinstance(live, dict):
                 stream = live.get("keepalive")
@@ -14280,6 +14407,7 @@ class TestEditMessage:
             return result
 
         monkeypatch.setattr(a, "_post_keepalive_final_locked", capture_final)
+        buf["keepalive"]["opened_mono"] = time.monotonic() - (cap - interval + 0.01)
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals == [adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT]
         assert "keepalive" in closed_by_snap
