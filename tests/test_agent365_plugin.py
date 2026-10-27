@@ -9254,6 +9254,7 @@ class TestEditMessage:
             if call.args and float(call.args[0]) >= 2.5
         ]
         assert waits, "expected a min-stream-age wait before the final"
+        assert max(waits) < 9.0, "first-turn override must not use the 10s default"
         assert post_mock.await_count == 1
         final = post_mock.await_args.kwargs["json"]
         assert final["entities"][0]["streamType"] == "final"
@@ -9307,6 +9308,10 @@ class TestEditMessage:
         ]
         assert waits, "expected default 10s first-turn min stream age wait"
         assert post_mock.await_count == 1
+        final = post_mock.await_args.kwargs["json"]
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][0]["streamId"] == "ka-default-age"
+        assert chat not in a._copilot_member_added_pending
 
     @pytest.mark.asyncio
     async def test_copilot_short_turn_waits_min_stream_age(
@@ -9353,6 +9358,7 @@ class TestEditMessage:
             if call.args and float(call.args[0]) >= 2.0
         ]
         assert waits
+        assert max(waits) < 9.0, "short turn must not use the 10s first-turn min age"
         assert post_mock.await_count == 1
         final = post_mock.await_args.kwargs["json"]
         assert final["entities"][0]["streamType"] == "final"
