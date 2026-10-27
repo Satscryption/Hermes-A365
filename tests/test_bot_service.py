@@ -1814,8 +1814,72 @@ class TestDirectlineActivityFailureClassification:
         assert result.status == "WARN"
         assert "not allowlisted" in result.detail
 
-    def test_502_bot_wrapped_http_403_walk095_shape_is_warn(self) -> None:
-        """walk095 live: Connector relays gateway allowlist 403 without detail text."""
+    def test_502_stripped_connector_bot_403_walk095_shape_is_error_with_log_hint(self) -> None:
+        """walk095: stripped envelope is ambiguous; ERROR + gateway-log remediation."""
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        walk095_body = {
+            "error": {
+                "code": "BotError",
+                "message": "Failed to send activity: bot returned an error",
+            },
+            "httpStatusCode": 403,
+        }
+        result = _directline_activity_failure(502, walk095_body)
+        assert result.status == "ERROR"
+        assert "Connector-stripped bot 403 envelope" in result.detail
+        assert "gateway log" in result.detail.lower()
+        assert "unauthorized-end-user" in result.detail
+        assert "auth OK" not in result.detail
+        assert "reachable;" not in result.detail
+        assert "(A365_ALLOWED_USERS; HTTP" not in result.detail
+
+    def test_502_stripped_envelope_negative_http_status_codes_use_generic_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        base = {
+            "error": {
+                "code": "BotError",
+                "message": "Failed to send activity: bot returned an error",
+            },
+        }
+        for code in (401, 500):
+            result = _directline_activity_failure(502, {**base, "httpStatusCode": code})
+            assert result.status == "ERROR"
+            assert "Connector-stripped bot 403 envelope" not in result.detail
+            assert "BF Connector token" in result.detail
+
+    def test_502_stripped_envelope_requires_boterror_code(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {
+                    "code": "ServiceError",
+                    "message": "Failed to send activity: bot returned an error",
+                },
+                "httpStatusCode": 403,
+            },
+        )
+        assert result.status == "ERROR"
+        assert "Connector-stripped bot 403 envelope" not in result.detail
+
+    def test_502_stripped_envelope_requires_bot_returned_an_error_phrase(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {"code": "BotError", "message": "Failed to send activity: upstream"},
+                "httpStatusCode": 403,
+            },
+        )
+        assert result.status == "ERROR"
+        assert "Connector-stripped bot 403 envelope" not in result.detail
+
+    def test_stripped_envelope_must_not_classify_as_allowlist_warn(self) -> None:
+        """Mutation guard: re-introducing WARN for the stripped envelope must fail."""
         from hermes_a365.bot_service import _directline_activity_failure
 
         result = _directline_activity_failure(
@@ -1828,10 +1892,24 @@ class TestDirectlineActivityFailureClassification:
                 "httpStatusCode": 403,
             },
         )
-        assert result.status == "WARN"
-        assert "not allowlisted" in result.detail
-        assert "auth OK" in result.detail
-        assert "BF Connector token" not in result.detail
+        assert result.status != "WARN"
+
+    def test_stripped_envelope_error_must_include_gateway_log_remediation(self) -> None:
+        """Mutation guard: removing the stripped-envelope ERROR branch must fail."""
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            502,
+            {
+                "error": {
+                    "code": "BotError",
+                    "message": "Failed to send activity: bot returned an error",
+                },
+                "httpStatusCode": 403,
+            },
+        )
+        assert "invalid bearer token" in result.detail
+        assert "untrusted-service-url" in result.detail
 
     def test_502_body_with_only_failed_to_send_activity_is_error(self) -> None:
         from hermes_a365.bot_service import _directline_activity_failure
@@ -1858,7 +1936,7 @@ class TestDirectlineActivityFailureClassification:
         assert "BF Connector token" in result.detail
 
 
-def test_directline_walk095_allowlist_shape_end_to_end(
+def test_directline_walk095_stripped_envelope_end_to_end_is_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from hermes_a365 import bot_service
@@ -1904,8 +1982,10 @@ def test_directline_walk095_allowlist_shape_end_to_end(
     monkeypatch.setattr(bot_service, "_http_json", _walk095_502)
     result = directline_runtime_probe(cfg, _SecretRunner())
 
-    assert result.status == "WARN"
-    assert "not allowlisted" in result.detail
+    assert result.status == "ERROR"
+    assert "Connector-stripped bot 403 envelope" in result.detail
+    assert "gateway log" in result.detail.lower()
+    assert "auth OK" not in result.detail
 
 
 def test_directline_403_with_token_failure_stays_a_credential_error(

@@ -2079,12 +2079,11 @@ def _response_is_allowlist_rejection(lowered: str) -> bool:
     return any(marker in lowered for marker in _ALLOWLIST_MARKERS)
 
 
-def _response_is_bot_wrapped_http_403(response: dict[str, Any]) -> bool:
-    """True when Direct Line relays a bot HTTP 403 as HTTP 502 (walk095 / #215).
+def _response_is_stripped_connector_bot_403_envelope(response: dict[str, Any]) -> bool:
+    """Direct Line HTTP 502 relay of a bot HTTP 403 (walk095 / live-tenant-test).
 
-    Live shape: ``{"error": {"code": "BotError", "message": "Failed to send
-    activity: bot returned an error"}, "httpStatusCode": 403}``. The Connector
-    does not relay gateway allowlist detail strings.
+    The Connector drops gateway detail (allowlist, JWT, untrusted serviceUrl) and
+    returns this single JSON shape for every bot-side 403.
     """
     if response.get("httpStatusCode") != 403:
         return False
@@ -2095,6 +2094,25 @@ def _response_is_bot_wrapped_http_403(response: dict[str, Any]) -> bool:
         return False
     message = str(err.get("message") or "").lower()
     return "failed to send activity" in message and "bot returned an error" in message
+
+
+_STRIPPED_CONNECTOR_BOT_403_REMEDIATION = (
+    "The Connector stripped the bot's 403 reason (body above). Check the gateway "
+    f"log for probe user {_PROBE_USER_ID!r} on the inbound activity line: "
+    "`inbound 403 reason=unauthorized-end-user` means the probe identity is not "
+    "allowlisted (add to A365_ALLOWED_USERS or ignore if expected); "
+    "`invalid bearer token`, JWT/audience failures, or `untrusted-service-url` "
+    "mean a real auth misconfiguration to fix."
+)
+
+
+def _directline_stripped_bot_403_error(status: int, detail: str) -> ProbeResult:
+    return ProbeResult(
+        "runtime_auth",
+        "ERROR",
+        f"Direct Line returned HTTP {status} with the Connector-stripped bot 403 "
+        f"envelope: {detail}. {_STRIPPED_CONNECTOR_BOT_403_REMEDIATION}",
+    )
 
 
 def _directline_allowlist_warn(status: int, detail: str) -> ProbeResult:
@@ -2114,17 +2132,21 @@ def _directline_activity_failure(status: int, response: dict[str, Any]) -> Probe
     """Classify a Direct Line activity POST that the bot endpoint rejected.
 
     Conversation start has already succeeded, so the Direct Line secret and
-    bot token check passed. Gateway allowlist rejections — including the
-    Connector's HTTP **502** relay of a bot **403** — are not credential
-    failures. Direct **401** / connector **403** responses remain errors.
+    bot token check passed. **WARN** only when the response body still carries
+    explicit allowlist markers. The Connector's stripped bot-403 envelope stays
+    **ERROR** with gateway-log remediation (same JSON for allowlist and JWT).
     """
     detail = json.dumps(response, sort_keys=True)
     lowered = detail.lower()
     token_failed = any(marker in lowered for marker in _TOKEN_FAILURE_MARKERS)
     if not token_failed and _response_is_allowlist_rejection(lowered):
         return _directline_allowlist_warn(status, detail)
-    if not token_failed and status == 502 and _response_is_bot_wrapped_http_403(response):
-        return _directline_allowlist_warn(status, detail)
+    if (
+        not token_failed
+        and status == 502
+        and _response_is_stripped_connector_bot_403_envelope(response)
+    ):
+        return _directline_stripped_bot_403_error(status, detail)
     if status == 401:
         return ProbeResult(
             "runtime_auth",
