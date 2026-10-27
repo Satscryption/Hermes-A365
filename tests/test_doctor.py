@@ -346,6 +346,7 @@ class TestParseAzCliVersion:
             ("2.55.0a1", True),
             ("2.55.0-b.1", True),
             ("2.55.0~b.1", True),
+            ("2.55.0-developer", False),
         ],
     )
     def test_signed_in_prerelease_rc_floor_probe(

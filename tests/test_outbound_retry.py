@@ -781,3 +781,153 @@ class TestAckPathTiming:
         result = await a.edit_message("conv-none-delay", "m1", "A B")
         assert result.success is False
         assert post_mock.await_count == 1
+
+
+@pytest.mark.asyncio
+class TestTurnBufferPlainFlushRetry:
+    async def test_concurrent_flush_skipped_during_plain_reply_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        import hermes_a365.plugin.adapter as adapter_mod
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        chat = "conv-plain-flush-race"
+        inbound = plugin_tests._make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        rate = MagicMock(
+            status_code=429,
+            text="",
+            headers={"Retry-After": "0"},
+            json=lambda: {"error": {"code": "TooManyRequests"}},
+        )
+        ok = MagicMock(status_code=200, text="", json=lambda: {"id": "reply-1"})
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=[rate, ok]
+        )
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
+        retry_entered = asyncio.Event()
+        release_retry = asyncio.Event()
+        orig_sleep = adapter_mod.Agent365Adapter._sleep_turn_buffer_locked
+
+        async def gated_sleep(
+            self: adapter_mod.Agent365Adapter,
+            chat_id: str,
+            buf: dict[str, Any],
+            delay: float,
+        ) -> None:
+            retry_entered.set()
+            await orig_sleep(self, chat_id, buf, 0.0)
+            await a._flush_turn_buffer(chat_id)
+            await release_retry.wait()
+            await orig_sleep(self, chat_id, buf, 0.0)
+
+        monkeypatch.setattr(adapter_mod.Agent365Adapter, "_sleep_turn_buffer_locked", gated_sleep)
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "open": False,
+                    "validated_path": "A",
+                    "activity_id": "act-1",
+                }
+            ],
+            "segments": [{"id": "turnbuf:1", "text": "hello", "turn": "1"}],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+        }
+        buf = a._turn_buffers[chat]
+        send_task = asyncio.create_task(
+            a._send_reply_activity(
+                inbound=inbound,
+                content="hello",
+                log_context="turn buffer",
+                turn_buffer_flush=(chat, buf, ("turnbuf:1",)),
+            )
+        )
+        await asyncio.wait_for(retry_entered.wait(), timeout=2.0)
+        release_retry.set()
+        result = await asyncio.wait_for(send_task, timeout=2.0)
+        assert result.success is True
+        assert post_mock.await_count == 2
+
+    async def test_keepalive_blocked_during_plain_reply_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        import hermes_a365.plugin.adapter as adapter_mod
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        chat = "conv-plain-keepalive-block"
+        inbound = plugin_tests._make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        rate = MagicMock(
+            status_code=429,
+            text="",
+            headers={"Retry-After": "0"},
+            json=lambda: {"error": {"code": "TooManyRequests"}},
+        )
+        ok = MagicMock(status_code=200, text="", json=lambda: {"id": "reply-1"})
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=[rate, ok]
+        )
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        retry_entered = asyncio.Event()
+        release_retry = asyncio.Event()
+        orig_sleep = adapter_mod.Agent365Adapter._sleep_turn_buffer_locked
+
+        async def gated_sleep(
+            self: adapter_mod.Agent365Adapter,
+            chat_id: str,
+            buf: dict[str, Any],
+            delay: float,
+        ) -> None:
+            retry_entered.set()
+            await orig_sleep(self, chat_id, buf, 0.0)
+            await a._emit_turn_buffer_keepalive(chat)
+            await release_retry.wait()
+            await orig_sleep(self, chat_id, buf, 0.0)
+
+        monkeypatch.setattr(adapter_mod.Agent365Adapter, "_sleep_turn_buffer_locked", gated_sleep)
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "open": True,
+                    "validated_path": "A",
+                    "activity_id": "act-1",
+                    "started_mono": __import__("time").monotonic(),
+                }
+            ],
+            "segments": [{"id": "turnbuf:1", "text": "hello", "turn": "1"}],
+            "depth": 1,
+            "lock": asyncio.Lock(),
+            "keepalive": {
+                "stream_id": "ka-plain-block",
+                "sequence": 1,
+                "opened_mono": __import__("time").monotonic(),
+                "last_emit_mono": __import__("time").monotonic(),
+            },
+        }
+        buf = a._turn_buffers[chat]
+        before = post_mock.await_count
+        send_task = asyncio.create_task(
+            a._send_reply_activity(
+                inbound=inbound,
+                content="hello",
+                log_context="turn buffer",
+                turn_buffer_flush=(chat, buf, ("turnbuf:1",)),
+            )
+        )
+        await asyncio.wait_for(retry_entered.wait(), timeout=2.0)
+        release_retry.set()
+        result = await asyncio.wait_for(send_task, timeout=2.0)
+        assert result.success is True
+        assert post_mock.await_count - before == 2

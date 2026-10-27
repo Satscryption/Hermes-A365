@@ -5248,12 +5248,23 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._feedback_enabled:
             webhook_response["feedback"] = True
         reply = bridge.render_reply_activity(inbound, webhook_response)
+        flush_guard: tuple[str, dict[str, Any], tuple[str, ...]] | None = None
         retry_sleep = None
         if turn_buffer_flush is not None:
-            flush_chat_id, flush_buf = turn_buffer_flush
+            flush_chat_id = str(turn_buffer_flush[0])
+            flush_buf = turn_buffer_flush[1]
+            flush_segment_ids = tuple(turn_buffer_flush[2]) if len(turn_buffer_flush) > 2 else ()
+            flush_guard = (flush_chat_id, flush_buf, flush_segment_ids)
+            flush_buf["plain_reply_flush_in_progress"] = True
 
             async def retry_sleep(delay: float) -> None:
                 await self._sleep_turn_buffer_locked(flush_chat_id, flush_buf, delay)
+                if not self._plain_flush_retry_still_valid(
+                    flush_chat_id, flush_buf, flush_segment_ids
+                ):
+                    raise RuntimeError(
+                        "agent365 turn buffer plain flush superseded during retry"
+                    )
 
             retry_sleep = retry_sleep
         try:
@@ -5277,6 +5288,9 @@ class Agent365Adapter(BasePlatformAdapter):
         except Exception as e:
             logger.error("agent365 %s send_reply failed: %s", log_context, e)
             return SendResult(success=False, error=str(e))
+        finally:
+            if flush_guard is not None:
+                flush_guard[1].pop("plain_reply_flush_in_progress", None)
         if not self._lifecycle_is_current(
             generation, client
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
@@ -6146,7 +6160,9 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> None:
         """Post every undisplayed segment in order. Caller holds the buffer lock."""
         while self._turn_buffers.get(chat_id) is buf:
-            if buf.get("answer_final_in_progress") and not during_answer_delivery:
+            if (
+                self._turn_buffer_delivery_blocks_keepalive(buf) and not during_answer_delivery
+            ):
                 return
             pending = self._undisplayed_informative_segments(buf, turn)
             if not pending:
@@ -6219,7 +6235,7 @@ class Agent365Adapter(BasePlatformAdapter):
     def _schedule_prompt_keepalive_emit(self, chat_id: str) -> None:
         """Open or refresh the informative stream without waiting for the idle window."""
         buf = self._turn_buffers.get(chat_id)
-        if not isinstance(buf, dict) or buf.get("answer_final_in_progress"):
+        if not isinstance(buf, dict) or self._turn_buffer_delivery_blocks_keepalive(buf):
             return
         if not self._turn_buffer_live_for_keepalive(buf):
             return
@@ -6251,7 +6267,7 @@ class Agent365Adapter(BasePlatformAdapter):
     def _schedule_informative_segment_refresh(self, chat_id: str) -> None:
         """Push progress/commentary into an open informative stream when possible."""
         buf = self._turn_buffers.get(chat_id)
-        if not isinstance(buf, dict) or buf.get("answer_final_in_progress"):
+        if not isinstance(buf, dict) or self._turn_buffer_delivery_blocks_keepalive(buf):
             return
         stream = self._keepalive_state(buf)
         if stream.get("stopped") or stream.get("untracked"):
@@ -6271,14 +6287,14 @@ class Agent365Adapter(BasePlatformAdapter):
     async def _push_informative_segment_text(self, chat_id: str) -> None:
         try:
             buf = self._turn_buffers.get(chat_id)
-            if isinstance(buf, dict) and buf.get("answer_final_in_progress"):
+            if isinstance(buf, dict) and self._turn_buffer_delivery_blocks_keepalive(buf):
                 return
             turn = self._keepalive_turn(buf) if isinstance(buf, dict) else None
             if isinstance(buf, dict) and isinstance(turn, dict):
                 async with self._turn_buffer_lock(buf):
                     if self._turn_buffers.get(chat_id) is not buf:
                         return
-                    if buf.get("answer_final_in_progress"):
+                    if self._turn_buffer_delivery_blocks_keepalive(buf):
                         return
                     await self._flush_undisplayed_informative_for_turn_locked(chat_id, buf, turn)
             else:
@@ -6328,7 +6344,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 will_post = (
                     self._turn_buffer_keepalive_needed(chat_id)
                     and self._turn_buffer_live_for_keepalive(buf_after_sleep)
-                    and not buf_after_sleep.get("answer_final_in_progress")
+                    and not self._turn_buffer_delivery_blocks_keepalive(buf_after_sleep)
                     and not stream_after.get("stopped")
                     and not stream_after.get("untracked")
                 )
@@ -6402,6 +6418,30 @@ class Agent365Adapter(BasePlatformAdapter):
             )
 
     @staticmethod
+    def _turn_buffer_delivery_blocks_keepalive(buf: dict[str, Any]) -> bool:
+        return bool(
+            buf.get("answer_final_in_progress") or buf.get("plain_reply_flush_in_progress")
+        )
+
+    def _plain_flush_retry_still_valid(
+        self,
+        chat_id: str,
+        buf: dict[str, Any],
+        segment_ids: tuple[str, ...],
+    ) -> bool:
+        live = self._turn_buffers.get(chat_id)
+        if live is not buf or not buf.get("plain_reply_flush_in_progress"):
+            return False
+        if not segment_ids:
+            return True
+        present = {
+            str(segment.get("id") or "")
+            for segment in buf.get("segments") or []
+            if isinstance(segment, dict)
+        }
+        return all(seg_id in present for seg_id in segment_ids if seg_id)
+
+    @staticmethod
     def _turn_buffer_lock(buf: dict[str, Any]) -> asyncio.Lock:
         lock = buf.get("lock")
         if not isinstance(lock, asyncio.Lock):
@@ -6452,10 +6492,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     "needed=false (depth 0 or buffer gone)",
                 )
                 return
-            if buf.get("answer_final_in_progress"):
+            if self._turn_buffer_delivery_blocks_keepalive(buf):
                 logger.debug(
                     "agent365 turn buffer keep-alive skip emit: "
-                    "chat_id=%s reason=answer_final_in_progress",
+                    "chat_id=%s reason=delivery_in_progress",
                     chat_id,
                 )
                 return
@@ -6581,7 +6621,11 @@ class Agent365Adapter(BasePlatformAdapter):
         """Return True when a 403 should be followed by one new sequence."""
         if self._turn_buffers.get(chat_id) is not buf:
             return False
-        if not for_answer and buf.get("answer_final_in_progress") and not during_answer_delivery:
+        if (
+            not for_answer
+            and self._turn_buffer_delivery_blocks_keepalive(buf)
+            and not during_answer_delivery
+        ):
             return False
         if not for_answer and not self._turn_buffer_keepalive_needed(chat_id):
             return False
@@ -6617,7 +6661,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 return False
             stream = self._keepalive_state(buf)
             stream_id = str(stream.get("stream_id") or "")
-        if not for_answer and buf.get("answer_final_in_progress") and not during_answer_delivery:
+        if (
+            not for_answer
+            and self._turn_buffer_delivery_blocks_keepalive(buf)
+            and not during_answer_delivery
+        ):
             return False
         turn = turn_for_text if isinstance(turn_for_text, dict) else self._keepalive_turn(buf)
         if turn is None:
@@ -6782,7 +6830,7 @@ class Agent365Adapter(BasePlatformAdapter):
             buf = live if isinstance(live, dict) else None
         if not isinstance(buf, dict) or live is not buf:
             return False
-        if buf.get("answer_final_in_progress"):
+        if self._turn_buffer_delivery_blocks_keepalive(buf):
             return False
         stream = self._keepalive_state(buf)
         if stream.get("stopped"):
@@ -8430,6 +8478,8 @@ class Agent365Adapter(BasePlatformAdapter):
         buf = self._turn_buffers.get(chat_id)
         if not buf or self._disconnecting:
             return
+        if buf.get("plain_reply_flush_in_progress"):
+            return
         turns: list[dict[str, Any]] = list(buf.get("turns") or [])
         include_handoff = not any(turn.get("open") for turn in turns)
         plan: list[tuple[dict[str, Any], list[dict[str, str]], list[str]]] = []
@@ -8525,7 +8575,14 @@ class Agent365Adapter(BasePlatformAdapter):
                             content=content,
                             log_context="turn buffer",
                             validated_path=path,
-                            turn_buffer_flush=(chat_id, buf),
+                            turn_buffer_flush=(
+                                chat_id,
+                                buf,
+                                tuple(
+                                    str(segment.get("id") or "")
+                                    for segment in chunk_segments
+                                ),
+                            ),
                         )
                         if not result.success:
                             error = str(result.error or "")
@@ -8590,7 +8647,11 @@ class Agent365Adapter(BasePlatformAdapter):
                     content=content,
                     log_context="turn buffer",
                     validated_path=path,
-                    turn_buffer_flush=(chat_id, buf),
+                    turn_buffer_flush=(
+                        chat_id,
+                        buf,
+                        tuple(str(segment.get("id") or "") for segment in chunk_segments),
+                    ),
                 )
                 if not result.success:
                     error = str(result.error or "")
@@ -8648,7 +8709,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     content=suffix.strip(),
                     log_context="turn buffer",
                     validated_path=path,
-                    turn_buffer_flush=(chat_id, buf),
+                    turn_buffer_flush=(chat_id, buf, ()),
                 )
                 if not link_result.success:
                     logger.warning(

@@ -14,8 +14,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   [#237](https://github.com/Satscryption/Hermes-A365/issues/237).
 
 - **#238 — Outbound retry timing (#190 follow-up).** Turn-buffer plain ``send_reply``
-  retries release the per-chat buffer lock across backoff sleeps (same pattern as
-  Copilot min-stream-age waits). Refs
+  retries release the buffer lock across backoff but hold
+  ``plain_reply_flush_in_progress``, re-validate buffer ownership and segment ids
+  before the next attempt, and block concurrent flush/keepalive until the retry
+  finishes (items 1, 3, 4 were already on main). Refs
   [#238](https://github.com/Satscryption/Hermes-A365/issues/238).
 
 - **#239 — `TokenFactory.for_graph` error wording (#225 follow-up).** Docstring and
@@ -23,10 +25,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   classification. Refs
   [#239](https://github.com/Satscryption/Hermes-A365/issues/239).
 
-- **#241 — Copilot pending release and informative gap test (#212/#235 follow-up).**
-  ``_release_copilot_member_added_for_turn`` only clears pending when the stamped
-  time belongs to the finishing turn; informative gap retry test exercises the
-  epoch guard during a gated stream-gap sleep. Refs
+- **#241 — Copilot pending release and informative gap tests (#212/#235 follow-up).**
+  ``_release_copilot_member_added_for_turn`` only clears pending when the consumed
+  stamp still matches; gap-sleep tests fail if the epoch leg or
+  ``_informative_stream_gap_raced`` is removed. Refs
   [#241](https://github.com/Satscryption/Hermes-A365/issues/241).
 
 - **#212 — Copilot keepalive commentary edge cases.** Keepalive merge checks

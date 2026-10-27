@@ -11045,24 +11045,16 @@ class TestEditMessage:
             for call in after_final
         )
 
-    @pytest.mark.asyncio
-    async def test_informative_gap_retry_aborts_after_nested_inner_final(
-        self, monkeypatch: pytest.MonkeyPatch
+    def _gated_stream_gap_once(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        gap_entered: asyncio.Event,
+        gap_release: asyncio.Event,
     ) -> None:
-        a = _make_adapter(monkeypatch)
-        chat = "conv-G-nest-gap-retry"
-        inbound = _make_inbound(conv_id=chat, activity_id="act-outer")
-        inbound["conversation"]["conversationType"] = "groupChat"
-        post_mock = self._wire_adapter(a, inbound=inbound)
-        self._patch_token_mint(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0.3)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
-        gap_entered = asyncio.Event()
-        gap_release = asyncio.Event()
         gap_blocks = {"n": 0}
 
         async def gated_gap(
-            self: adapter_mod.Agent365Adapter, chat_id: str, buf: dict[str, Any]
+            adapter_self: adapter_mod.Agent365Adapter, chat_id: str, buf: dict[str, Any]
         ) -> None:
             gap_blocks["n"] += 1
             if gap_blocks["n"] > 1:
@@ -11082,68 +11074,141 @@ class TestEditMessage:
             "_sleep_turn_buffer_stream_gap_locked",
             gated_gap,
         )
-        outer_event = _StubMessageEvent(
-            text="outer",
+
+    def _informative_posts(self, post_mock: MagicMock) -> list[dict[str, Any]]:
+        posts: list[dict[str, Any]] = []
+        for call in post_mock.await_args_list:
+            body = call.kwargs.get("json") or {}
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative":
+                posts.append(body)
+        return posts
+
+    @pytest.mark.asyncio
+    async def test_informative_gap_epoch_guard_aborts_with_stable_stream_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-gap-epoch"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0.3)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        gap_entered = asyncio.Event()
+        gap_release = asyncio.Event()
+        self._gated_stream_gap_once(monkeypatch, gap_entered, gap_release)
+        event = _StubMessageEvent(
+            text="hi",
             source=_StubSessionSource(platform=None, chat_id=chat),
-            message_id="act-outer",
+            message_id="act-1",
         )
-        await a.on_processing_start(outer_event)
-        inbound["id"] = "act-inner"
-        inner_event = _StubMessageEvent(
-            text="inner",
-            source=_StubSessionSource(platform=None, chat_id=chat),
-            message_id="act-inner",
-        )
-        await a.on_processing_start(inner_event)
+        await a.on_processing_start(event)
         buf = a._turn_buffers[chat]
-        outer_turn = buf["turns"][0]
+        turn = buf["turns"][0]
+        turn_seq = str(turn.get("seq") or "")
+        buf["segments"] = [
+            {
+                "id": "turnbuf:live",
+                "text": "Live commentary",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+                "informative_displayed": True,
+            }
+        ]
         buf["keepalive"] = {
-            "stream_id": "ka-nest-retry",
+            "stream_id": "ka-epoch-guard",
             "sequence": 2,
             "opened_mono": time.monotonic(),
             "last_emit_mono": time.monotonic() - 0.01,
         }
-        informative_done = asyncio.Event()
+        before_gap = len(self._informative_posts(post_mock))
         informative_result: list[bool] = []
 
-        async def outer_informative() -> None:
+        async def post_informative() -> None:
             informative_result.append(
                 await a._post_informative_locked(
-                    chat,
-                    buf,
-                    allow_restart=True,
-                    turn_for_text=outer_turn,
+                    chat, buf, allow_restart=False, turn_for_text=turn
                 )
             )
-            informative_done.set()
 
-        informative_task = asyncio.create_task(outer_informative())
+        task = asyncio.create_task(post_informative())
         await asyncio.wait_for(gap_entered.wait(), timeout=5.0)
-        await a.send(chat_id=chat, content="Inner answer.", reply_to="act-inner")
-        await a.on_processing_complete(inner_event, outcome="success")
+        a._bump_answer_delivered_epoch(buf)
         gap_release.set()
-        await asyncio.wait_for(informative_done.wait(), timeout=5.0)
-        await informative_task
+        await asyncio.wait_for(task, timeout=5.0)
         assert informative_result == [False]
-        finals = [
-            call.kwargs["json"]
-            for call in post_mock.await_args_list
-            if (call.kwargs["json"].get("entities") or [{}])[0].get("streamType") == "final"
-        ]
-        assert finals
-        assert finals[-1]["text"] == "Inner answer."
-        after_final = post_mock.await_args_list[
-            next(
-                i
-                for i, call in enumerate(post_mock.await_args_list)
-                if (call.kwargs["json"].get("entities") or [{}])[0].get("streamType") == "final"
-            )
-            + 1 :
-        ]
-        assert not any(
-            call.kwargs["json"].get("text") == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
-            for call in after_final
+        assert len(self._informative_posts(post_mock)) == before_gap
+
+    @pytest.mark.asyncio
+    async def test_informative_gap_stream_id_guard_aborts_without_epoch_bump(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-gap-stream"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0.3)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        gap_entered = asyncio.Event()
+        gap_release = asyncio.Event()
+        self._gated_stream_gap_once(monkeypatch, gap_entered, gap_release)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
         )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = buf["turns"][0]
+        turn_seq = str(turn.get("seq") or "")
+        buf["segments"] = [
+            {
+                "id": "turnbuf:live2",
+                "text": "More commentary",
+                "turn": turn_seq,
+                "kind": "commentary",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": True,
+                "informative_displayed": True,
+            }
+        ]
+        buf["keepalive"] = {
+            "stream_id": "ka-stream-guard",
+            "sequence": 2,
+            "opened_mono": time.monotonic(),
+            "last_emit_mono": time.monotonic() - 0.01,
+        }
+        epoch_before = a._answer_delivered_epoch(buf)
+        before_gap = len(self._informative_posts(post_mock))
+        informative_result: list[bool] = []
+
+        async def post_informative() -> None:
+            informative_result.append(
+                await a._post_informative_locked(
+                    chat, buf, allow_restart=False, turn_for_text=turn
+                )
+            )
+
+        task = asyncio.create_task(post_informative())
+        await asyncio.wait_for(gap_entered.wait(), timeout=5.0)
+        stream = a._keepalive_state(buf)
+        stream["stream_id"] = "ka-stream-guard-replaced"
+        buf["keepalive"] = stream
+        assert a._answer_delivered_epoch(buf) == epoch_before
+        gap_release.set()
+        await asyncio.wait_for(task, timeout=5.0)
+        assert informative_result == [False]
+        assert len(self._informative_posts(post_mock)) == before_gap
 
     @pytest.mark.asyncio
     async def test_unmarked_merged_commentary_not_duplicated_on_informative(
