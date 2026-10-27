@@ -8794,18 +8794,386 @@ class TestEditMessage:
         opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
         assert opener["type"] == "typing"
         assert opener["text"] == "Short answer"
-        assert opener["entities"][0] == {
-            "type": "streaminfo",
-            "streamType": "informative",
-            "streamSequence": 1,
-        }
+        assert opener["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         assert final["type"] == "message"
         assert final["text"] == "Short answer"
         assert final["entities"][0]["streamType"] == "final"
-        assert final["entities"][0]["streamId"] == "stream-default"
-        assert "streamSequence" not in final["entities"][0]
         assert task.cancelled()
         assert "conv-G-short" not in a._turn_buffers
+
+    @staticmethod
+    def _walk095_typing_posts(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [
+            post
+            for post in posts
+            if post.get("type") == "typing"
+            and (post.get("entities") or [{}])[0].get("streamType") == "informative"
+        ]
+
+    @classmethod
+    def _walk095_assert_typing_excludes_answer(
+        cls, posts: list[dict[str, Any]], *forbidden: str
+    ) -> None:
+        for post in cls._walk095_typing_posts(posts):
+            text = str(post.get("text") or "")
+            for snippet in forbidden:
+                assert snippet not in text
+                assert text.strip() != snippet.strip()
+
+    @pytest.mark.asyncio
+    async def test_walk095_fast_groupchat_stream_opener_then_one_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """walk095 S0b: marked fast turn — typing opener + one stream final (#227)."""
+        a = _make_adapter(monkeypatch)
+        chat = "19:walk095@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 2.5
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        posts: list[dict[str, Any]] = []
+        stream_id = "ka-walk095-fast"
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, stream_id)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        answer = "Hello. Smoke check received."
+        event = _StubMessageEvent(
+            text="walk095 smoke: reply with a short hello",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=answer, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        typing = self._walk095_typing_posts(posts)
+        finals = [p for p in posts if p.get("type") == "message"]
+        assert len(typing) == 1
+        assert len(finals) == 1
+        assert send_reply_mock.await_count == 0
+        assert typing[0]["text"] == answer
+        assert typing[0]["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert finals[0]["text"] == answer
+        assert finals[0]["entities"][0]["streamType"] == "final"
+        assert finals[0]["entities"][0]["streamId"] == stream_id
+        waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 2.0
+        ]
+        assert waits, "expected min-stream-age wait before final (#217)"
+        assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_walk095_opened_stream_final_stays_on_same_stream_id(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-walk095-stream"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0
+        finals: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "final":
+                finals.append(entity)
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-walk095")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive_first_interval_elapsed"] = True
+        buf["keepalive"] = {
+            "stream_id": "ka-walk095",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id=chat, content="Answer on stream.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        assert len(finals) == 1
+        assert finals[0]["streamId"] == "ka-walk095"
+        assert finals[0]["streamType"] == "final"
+        assert "streamSequence" not in finals[0]
+
+    @pytest.mark.asyncio
+    async def test_walk095_second_turn_matches_fast_stream_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """walk095 S0c: second marked turn uses the same stream opener + final path."""
+        a = _make_adapter(monkeypatch)
+        chat = "19:walk095-second@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        posts: list[dict[str, Any]] = []
+        stream_ids = iter(["ka-w095-t1", "ka-w095-t2"])
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, next(stream_ids))
+            return self._http_result(202)
+
+        a._http_client.post.side_effect = post
+
+        async def one_turn(activity_id: str, prompt: str, answer: str) -> None:
+            inbound["id"] = activity_id
+            event = _StubMessageEvent(
+                text=prompt,
+                source=_StubSessionSource(platform=None, chat_id=chat),
+                message_id=activity_id,
+            )
+            await a.on_processing_start(event)
+            await a.send(chat_id=chat, content=answer, reply_to=activity_id)
+            await a.on_processing_complete(event, outcome="success")
+
+        await one_turn("act-1", "walk095 smoke", "Hello. Smoke check received.")
+        await one_turn("act-2", "walk095 smoke 2", "two")
+        typing = self._walk095_typing_posts(posts)
+        finals = [p for p in posts if p.get("type") == "message"]
+        assert len(typing) == 2
+        assert len(finals) == 2
+        assert send_reply_mock.await_count == 0
+        assert typing[0]["text"] == "Hello. Smoke check received."
+        assert typing[1]["text"] == "two"
+        assert all(
+            t["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in typing
+        )
+        assert finals[0]["text"] == "Hello. Smoke check received."
+        assert finals[1]["text"] == "two"
+
+    @pytest.mark.asyncio
+    async def test_walk095_slow_turn_informative_never_carries_answer_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """L1/L3: keep-alive informative updates must not post the answer text (#227)."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-walk095-slow"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-slow")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "B")),
+        )
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content="I'll run that sleep, then reply.",
+            metadata={"thread_id": "29:copilot"},
+        )
+        for _ in range(40):
+            if posts:
+                break
+            await asyncio.sleep(0)
+        await a.send(chat_id=chat, content="💻 Running sleep 40", reply_to="act-1")
+        await a._emit_turn_buffer_keepalive(chat)
+        await a.send(chat_id=chat, content="slept", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        informative = self._walk095_typing_posts(posts)
+        assert informative
+        self._walk095_assert_typing_excludes_answer(posts, "slept")
+        finals = [p for p in posts if p.get("type") == "message"]
+        assert len(finals) == 1
+        final = finals[0]
+        assert final["text"] == "slept"
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamId": "ka-slow",
+            "streamType": "final",
+        }
+
+    @pytest.mark.asyncio
+    async def test_walk095_g1_fact_and_tool_result_only_on_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """walk095 G1: pre-tool fact on stream; answer body only on final (#226 / #227)."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-walk095-g1"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        posts: list[dict[str, Any]] = []
+        fact = "The capital of France is Paris."
+        closing = "Checked on 2026-10-27."
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-g1")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "B")),
+        )
+        event = _StubMessageEvent(
+            text="capital",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=fact, reply_to="act-1")
+        await a.send(chat_id=chat, content="💻 Running lookup", reply_to="act-1")
+        await a._emit_turn_buffer_keepalive(chat)
+        await a.send(chat_id=chat, content=closing, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        self._walk095_assert_typing_excludes_answer(posts, closing)
+        finals = [p for p in posts if p.get("type") == "message"]
+        assert len(finals) == 1
+        assert fact in finals[0]["text"]
+        assert closing in finals[0]["text"]
+
+    def test_walk095_sanitize_informative_answer_leak_detection(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Mutation guard: sanitizer must replace answer bodies after interval."""
+        a = _make_adapter(monkeypatch)
+        turn = {"seq": "1"}
+        buf_fast = {
+            "keepalive_first_interval_elapsed": False,
+            "segments": [
+                {
+                    "turn": "1",
+                    "text": "Hello.",
+                    "kind": "answer",
+                    "reply_to": "act-1",
+                }
+            ],
+        }
+        assert (
+            a._sanitize_informative_stream_text(
+                buf_fast, turn, "Hello.", for_answer=True
+            )
+            == "Hello."
+        )
+        buf_slow = {
+            "keepalive_first_interval_elapsed": True,
+            "segments": [
+                {
+                    "turn": "1",
+                    "text": "slept",
+                    "kind": "answer",
+                    "reply_to": "act-1",
+                }
+            ],
+        }
+        assert a._sanitize_informative_stream_text(
+            buf_slow, turn, "slept", for_answer=False
+        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        clipped = "x" * adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
+        long_answer = clipped + "tail"
+        buf_long = {
+            "keepalive_first_interval_elapsed": True,
+            "segments": [{"turn": "1", "text": long_answer, "kind": "answer"}],
+        }
+        assert a._sanitize_informative_stream_text(
+            buf_long, turn, clipped, for_answer=False
+        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+
+    def test_walk095_sanitize_joined_and_prefix_answer_leaks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        turn = {"seq": "1"}
+        buf = {
+            "keepalive_first_interval_elapsed": True,
+            "segments": [
+                {"turn": "1", "text": "Line one.", "kind": "answer"},
+                {"turn": "1", "text": "Line two.", "kind": "answer"},
+            ],
+        }
+        joined = "Line one.\n\nLine two."
+        assert a._sanitize_informative_stream_text(
+            buf, turn, joined, for_answer=False
+        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        prefix = "Line one.\n\nLine tw"
+        assert a._sanitize_informative_stream_text(
+            buf, turn, prefix, for_answer=False
+        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
     @pytest.mark.asyncio
     async def test_copilot_first_turn_after_member_added_waits_min_stream_age(
@@ -8840,6 +9208,12 @@ class TestEditMessage:
         turn = a._turn_buffers[chat]["turns"][0]
         assert turn.get("copilot_post_member_added") is True
         assert turn.get("validated_path") == "B"
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-member",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - 0.05,
+        }
         await a.send(chat_id=chat, content="Hello. Smoke check OK.", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         await asyncio.sleep(0)
@@ -8849,9 +9223,10 @@ class TestEditMessage:
             if call.args and float(call.args[0]) >= 2.5
         ]
         assert waits, "expected a min-stream-age wait before the final"
-        assert post_mock.await_count == 2
-        final = post_mock.await_args_list[-1].kwargs["json"]
+        assert post_mock.await_count == 1
+        final = post_mock.await_args.kwargs["json"]
         assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][0]["streamId"] == "ka-member"
         assert chat not in a._copilot_member_added_pending
 
     @pytest.mark.asyncio
@@ -8884,6 +9259,12 @@ class TestEditMessage:
         )
         await a.on_processing_start(event)
         assert a._turn_buffers[chat]["turns"][0].get("validated_path") == "B"
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-short-age",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - 0.05,
+        }
         await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         await asyncio.sleep(0)
@@ -8893,7 +9274,10 @@ class TestEditMessage:
             if call.args and float(call.args[0]) >= 2.0
         ]
         assert waits
-        assert post_mock.await_count == 2
+        assert post_mock.await_count == 1
+        final = post_mock.await_args.kwargs["json"]
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][0]["streamId"] == "ka-short-age"
 
     @pytest.mark.asyncio
     async def test_copilot_later_long_turn_skips_extra_min_stream_age_wait(
@@ -9023,6 +9407,12 @@ class TestEditMessage:
             "B",
         )
         assert chat in a._copilot_member_added_pending
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-late-member",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - 0.05,
+        }
         await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         await asyncio.sleep(0)
@@ -9032,7 +9422,8 @@ class TestEditMessage:
             if call.args and float(call.args[0]) >= 2.0
         ]
         assert waits
-        assert post_mock.await_count == 2
+        assert post_mock.await_count == 1
+        assert post_mock.await_args.kwargs["json"]["entities"][0]["streamId"] == "ka-late-member"
         assert chat not in a._copilot_member_added_pending
 
     @pytest.mark.asyncio
@@ -10102,6 +10493,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        a._turn_buffers[chat]["keepalive_first_interval_elapsed"] = True
         await a.send(chat_id=chat, content="Answer text only.", reply_to=None)
         flush_task = asyncio.create_task(a.on_processing_complete(event, outcome="success"))
         await self._spin_until(opener_entered.is_set)
@@ -12925,14 +13317,19 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
-        await a.send(chat_id="conv-G-chrome", content="Hello", reply_to=None)
+        buf = a._turn_buffers["conv-G-chrome"]
+        buf["keepalive_first_interval_elapsed"] = True
+        buf["keepalive"] = {
+            "stream_id": "ka-chrome",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id="conv-G-chrome", content="Hello", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 0
-        opener, final = [c.kwargs["json"] for c in post_mock.await_args_list]
-        assert opener["entities"] == [
-            {"type": "streaminfo", "streamType": "informative", "streamSequence": 1}
-        ]
-        assert "channelData" not in opener
+        assert post_mock.await_count == 1
+        final = post_mock.await_args.kwargs["json"]
+        assert final["text"] == "Hello"
         assert len(final["entities"]) == 2
         assert final["entities"][0]["streamType"] == "final"
         assert final["entities"][1] == dict(bridge.AI_GENERATED_CONTENT_ENTITY)
@@ -13015,6 +13412,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        a._turn_buffers["conv-G-gap"]["keepalive_first_interval_elapsed"] = True
         await a.send(chat_id="conv-G-gap", content="Gap answer", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
         assert sleep_mock.await_count == 1
@@ -13085,6 +13483,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        a._turn_buffers["conv-G-503"]["keepalive_first_interval_elapsed"] = True
         await a.send(chat_id="conv-G-503", content="Recovered", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
         assert finals["n"] == 2
@@ -13126,6 +13525,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        a._turn_buffers["conv-G-503-all"]["keepalive_first_interval_elapsed"] = True
         await a.send(chat_id="conv-G-503-all", content="Plain once", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
         assert finals["n"] == adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
@@ -13511,6 +13911,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        a._turn_buffers["conv-G-dup-final"]["keepalive_first_interval_elapsed"] = True
         await a.send(chat_id="conv-G-dup-final", content="Once only", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
         assert finals["n"] == 2
@@ -15613,6 +16014,7 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        a._turn_buffers["conv-G-bounds"]["keepalive_first_interval_elapsed"] = True
         await a.send(chat_id="conv-G-bounds", content="Cap", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
         assert finals["n"] == adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
