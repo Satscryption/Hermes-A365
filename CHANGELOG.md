@@ -10,10 +10,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 Copilot Chat streaming and keep-alive hardening (#214, #217, #212, #235, #247),
 outbound 429 / Retry-After handling (#190), and Direct Line verify diagnostics (#215).
-Ships merged work on `main@92a56f35` (2026-10-27) via PRs #223, #231, #232, #233,
-#234, #236, #240, #243, #245, #246, and #248.
+Ships from ``main`` (2026-10-27) via PRs #223, #231, #232, #233, #234, #236,
+#240, #243, #245, #246, #248, #252 (release bump), and #253.
 
 ### Fixed
+
+- **#217 — Copilot first-turn min stream age (live walk follow-up).** First turn
+  after ``membersAdded`` waits until stream age reaches
+  ``HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC`` (default 10s, max 10s);
+  short non-first turns still use ``HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC``
+  (default 3s). Refs
+  [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
 
 - **#237 — `doctor` az CLI version parser edge cases (#222 follow-up).** Treat PEP 440
   ``aN`` alphas and dotted ``-b.1`` / ``~b.1`` betas as prereleases at the floor;
@@ -56,12 +63,13 @@ Ships merged work on `main@92a56f35` (2026-10-27) via PRs #223, #231, #232, #233
 
 - **#217 — Copilot Chat first-turn live render.** Path B turn-buffer delivery
   waits until the informative stream reaches a configurable minimum age before
-  posting the answer final on the first turn after ``membersAdded`` / install
-  and on short turns (default ≤3s). Preserves informative lead-in and keep-alive
-  rotation (#214); Teams 1:1 personal streaming is unchanged. Tunables:
-  ``HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC``,
-  ``HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC``. Refs
-  [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
+  posting the answer final. First turns after ``membersAdded`` / install use
+  ``HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC`` (default 10s, cap 10s;
+  ``0`` disables the hold). Short later turns (default duration ≤3s) keep
+  ``HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC`` (default 3s).
+  Preserves informative lead-in and keep-alive rotation (#214); Teams 1:1
+  personal streaming is unchanged. Also: ``HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC``.
+  Refs [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
 
 - **#190 — Outbound 429 / Retry-After handling.** Shared
   ``hermes_a365.outbound_retry`` helper retries Bot Framework replies and

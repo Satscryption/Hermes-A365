@@ -9225,7 +9225,7 @@ class TestEditMessage:
             AsyncMock(return_value=("bearer-test", "B")),
         )
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_first_turn_min_stream_age_before_final_sec = 3.0
         a._copilot_short_turn_max_duration_sec = 3.0
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
         sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
@@ -9254,10 +9254,63 @@ class TestEditMessage:
             if call.args and float(call.args[0]) >= 2.5
         ]
         assert waits, "expected a min-stream-age wait before the final"
+        assert max(waits) < 9.0, "first-turn override must not use the 10s default"
         assert post_mock.await_count == 1
         final = post_mock.await_args.kwargs["json"]
         assert final["entities"][0]["streamType"] == "final"
         assert final["entities"][0]["streamId"] == "ka-member"
+        assert chat not in a._copilot_member_added_pending
+
+    @pytest.mark.asyncio
+    async def test_copilot_first_turn_default_ten_second_min_stream_age(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-default-age@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-test", "B")),
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        assert a._copilot_first_turn_min_stream_age_before_final_sec == (
+            adapter_mod._COPILOT_FIRST_TURN_STREAM_TIMING_DEFAULT_SEC
+        )
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
+        a._copilot_member_added_pending[chat] = time.monotonic()
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-default-age",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - 0.05,
+        }
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 9.5
+        ]
+        assert waits, "expected default 10s first-turn min stream age wait"
+        assert post_mock.await_count == 1
+        final = post_mock.await_args.kwargs["json"]
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][0]["streamId"] == "ka-default-age"
         assert chat not in a._copilot_member_added_pending
 
     @pytest.mark.asyncio
@@ -9305,6 +9358,7 @@ class TestEditMessage:
             if call.args and float(call.args[0]) >= 2.0
         ]
         assert waits
+        assert max(waits) < 9.0, "short turn must not use the 10s first-turn min age"
         assert post_mock.await_count == 1
         final = post_mock.await_args.kwargs["json"]
         assert final["entities"][0]["streamType"] == "final"
@@ -9380,21 +9434,32 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", "inf")
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC", "nan")
         monkeypatch.setenv("HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC", "-4")
         a = _make_adapter(monkeypatch)
         assert a._copilot_min_stream_age_before_final_sec == (
             adapter_mod._COPILOT_STREAM_TIMING_DEFAULT_SEC
         )
+        assert a._copilot_first_turn_min_stream_age_before_final_sec == (
+            adapter_mod._COPILOT_FIRST_TURN_STREAM_TIMING_DEFAULT_SEC
+        )
         assert a._copilot_short_turn_max_duration_sec == (
             adapter_mod._COPILOT_STREAM_TIMING_DEFAULT_SEC
         )
         monkeypatch.setenv("HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", "7")
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC", "25")
         monkeypatch.setenv("HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC", "25")
         b = _make_adapter(monkeypatch)
         assert b._copilot_min_stream_age_before_final_sec == 7.0
+        assert b._copilot_first_turn_min_stream_age_before_final_sec == (
+            adapter_mod._COPILOT_STREAM_TIMING_MAX_SEC
+        )
         assert b._copilot_short_turn_max_duration_sec == (
             adapter_mod._COPILOT_STREAM_TIMING_MAX_SEC
         )
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC", "6")
+        c = _make_adapter(monkeypatch)
+        assert c._copilot_first_turn_min_stream_age_before_final_sec == 6.0
 
     @pytest.mark.asyncio
     async def test_late_member_added_picked_up_before_min_stream_age_wait(
@@ -9415,7 +9480,7 @@ class TestEditMessage:
             AsyncMock(return_value=("bearer-test", "B")),
         )
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        a._copilot_min_stream_age_before_final_sec = 2.5
+        a._copilot_first_turn_min_stream_age_before_final_sec = 2.5
         a._copilot_short_turn_max_duration_sec = 3.0
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
         sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
@@ -9476,7 +9541,7 @@ class TestEditMessage:
             AsyncMock(return_value=("bearer-test", "B")),
         )
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        a._copilot_min_stream_age_before_final_sec = 2.5
+        a._copilot_first_turn_min_stream_age_before_final_sec = 2.5
         a._copilot_short_turn_max_duration_sec = 3.0
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
         sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
