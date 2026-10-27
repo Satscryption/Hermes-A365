@@ -2,7 +2,7 @@
 
 ## Head SHA
 
-Verified after push with `git ls-remote origin cursor/walk095-copilot-fast-reply-0782`.
+Verified: `git ls-remote origin cursor/walk095-copilot-fast-reply-0782` → `b0ed0ec51caf8aed1e93ade936f8c412a6782fe8`.
 
 ## Root cause
 
