@@ -17,6 +17,33 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   ``HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC``. Refs
   [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
 
+- **#190 — Outbound 429 / Retry-After handling.** Shared
+  ``hermes_a365.outbound_retry`` helper retries Bot Framework replies and
+  proactive sends on HTTP 429 only (no 5xx replay on non-idempotent
+  creates), typing on 429 only (at most one retry), stream edits with
+  capped ``Retry-After`` (no retry when the remaining stream lifetime is
+  below the streaming minimum gap), and OneDrive upload PUTs on 429 and
+  transient 5xx off the invoke ack path. Serve ``/api/messages`` shares one
+  absolute ~14s ack deadline across operator webhook forward, token mint,
+  and BF reply; each outbound attempt clamps its HTTP timeout to the
+  remaining budget with a per-call ceiling (15s Bot Framework by default,
+  60s for OneDrive upload PUT) and skips starting a new attempt when too
+  little time remains.   A 429 whose ``Retry-After`` exceeds the remainder, or whose backoff sleep
+  would leave too little time for another attempt, fails fast instead of
+  sleeping; an exhausted serve deadline surfaces as a clean webhook error
+  instead of an internal failure. Plugin file-consent invoke handling returns
+  the HTTP ack immediately and runs card removal, decline notices, and upload
+  follow-up in retained background tasks. Post-ack adapter sends (send,
+  proactive, typing, Copilot turn-buffer keep-alive POST) share a separate
+  25s retry budget clamped to the Copilot stream soft cap; answer-final outer
+  429 retries reuse one absolute outbound deadline so a fresh 25s window
+  cannot start a POST after the stream expires. When the shared cap leaves
+  too little time for an attempt, answer-final delivery plain-falls back
+  when no prior attempt may have landed, otherwise stays uncertain
+  instead of duplicating a bubble; skipped POSTs are not treated as
+  maybe-landed. Refs
+  [#190](https://github.com/Satscryption/Hermes-A365/issues/190).
+
 - **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a
   live ``--directline-probe`` conversation starts, **WARN** only when the
   activity response body explicitly carries ``unauthorized-end-user`` or
