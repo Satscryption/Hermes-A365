@@ -388,10 +388,11 @@ def test_live_0_9_5_section_still_parses() -> None:
         "and Direct Line verify diagnostics (#215)."
     )
     assert len(notes.title) <= mod.TITLE_LIMIT
-    assert "main@92a56f35" in notes.body
+    assert (
+        "Ships from ``main`` (2026-10-27) via PRs #223, #231, #232, #233, #234, #236,\n"
+        "#240, #243, #245, #246, #248, #252 (release bump), and #253."
+    ) in notes.body
     assert "2026-10-27" in notes.body
-    assert "#248" in notes.body
-    assert "#245" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:
