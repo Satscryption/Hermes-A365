@@ -11082,6 +11082,282 @@ class TestEditMessage:
         assert not adapter_mod._keepalive_rotation_due(100.0)
         assert adapter_mod._keepalive_rotation_due(rotate_at + 0.01)
 
+    async def _g2_rotation_close_at_cap_emit(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        fact_before_progress: bool,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G2-rotate-{'before' if fact_before_progress else 'after'}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        fact = "G2 fact"
+        progress = "💻 Running sleep 140"
+        posts: list[tuple[str, str | None]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            stream_id = entity.get("streamId")
+            posts.append((str(entity["streamType"]), stream_id))
+            if entity.get("streamType") == "final":
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "g2-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        if fact_before_progress:
+            await a.send(
+                chat_id=chat,
+                content=fact,
+                reply_to="act-1",
+                metadata={"expect_edits": True},
+            )
+            await a.send(chat_id=chat, content=progress, reply_to=None)
+        else:
+            await a.send(chat_id=chat, content=progress, reply_to=None)
+            await a.send(
+                chat_id=chat,
+                content=fact,
+                reply_to="act-1",
+                metadata={"expect_edits": True},
+            )
+        buf = a._turn_buffers[chat]
+        assert a._buffer_has_kept_answer_segments(buf) == (not fact_before_progress)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        stream_age_sec = rotate_at + 0.001
+        buf["keepalive"] = {
+            "stream_id": "g2-stream",
+            "sequence": 4,
+            "opened_mono": time.monotonic() - stream_age_sec,
+        }
+        await a._emit_turn_buffer_keepalive(chat)
+        assert posts == [("final", "g2-stream")]
+        assert buf.get("keepalive_rotated") is True
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        assert a._delivery_record(buf, turn).get("plain_due") is True
+        assert not buf["keepalive"].get("stream_id")
+
+    @pytest.mark.asyncio
+    async def test_g2_rotation_close_with_fact_after_progress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await self._g2_rotation_close_at_cap_emit(monkeypatch, fact_before_progress=False)
+
+    @pytest.mark.asyncio
+    async def test_g2_rotation_close_with_fact_before_progress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await self._g2_rotation_close_at_cap_emit(monkeypatch, fact_before_progress=True)
+
+    def test_g2_sleeper_wait_distinguishes_rotation_due_from_full_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        stream = {"stream_id": "sid", "opened_mono": 0.0}
+        monkeypatch.setattr(time, "monotonic", lambda: rotate_at)
+        assert adapter_mod._keepalive_sleeper_wait_after_emit(stream) == 0.0
+        monkeypatch.setattr(time, "monotonic", lambda: rotate_at - 1.0)
+        assert abs(adapter_mod._keepalive_sleeper_wait_after_emit(stream) - 1.0) < 0.01
+        monkeypatch.setattr(time, "monotonic", lambda: rotate_at - 30.0)
+        assert adapter_mod._keepalive_sleeper_wait_after_emit(stream) == 25.0
+
+    @pytest.mark.asyncio
+    async def test_g2_sleeper_closes_at_rotation_with_kept_answer_no_extra_25s(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G2-sleeper-kept"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch, start=0.0)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        close_times: list[float] = []
+        informative_after_close: list[dict[str, Any]] = []
+        saw_final = False
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            nonlocal saw_final
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                saw_final = True
+                close_times.append(clock["t"])
+                return self._http_result(202)
+            if saw_final:
+                informative_after_close.append(kwargs["json"])
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "g2-sleep-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        await a.send(
+            chat_id=chat,
+            content="G2 fact",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "g2-sleep-stream",
+            "sequence": 1,
+            "opened_mono": 0.0,
+        }
+        buf["keepalive_scheduled_mono"] = 0.0
+        task = asyncio.create_task(a._turn_buffer_keepalive(chat))
+        for _ in range(60):
+            await asyncio.sleep(0)
+            if close_times:
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert close_times
+        assert rotate_at - 0.5 <= close_times[0] <= rotate_at + 1.0
+        waits = [float(c.args[0]) for c in sleep_mock.await_args_list if c.args]
+        assert waits
+        assert waits[-1] < 20.0
+        assert informative_after_close == []
+
+    @pytest.mark.asyncio
+    async def test_g2_under_threshold_wake_closes_on_next_emit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G2-under-threshold"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        age_before_short = rotate_at - 100.0
+        clock = {"t": age_before_short}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+        sleep_calls: list[float] = []
+
+        async def sleep(delay: float) -> None:
+            sleep_calls.append(float(delay))
+            clock["t"] += float(delay)
+
+        monkeypatch.setattr("asyncio.sleep", AsyncMock(side_effect=sleep))
+        finals: list[float] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals.append(clock["t"])
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "g2-under")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        await a.send(
+            chat_id=chat,
+            content="G2 fact",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "g2-under",
+            "sequence": 1,
+            "opened_mono": 0.0,
+        }
+        buf["keepalive_scheduled_mono"] = 0.0
+        short_wait = rotate_at - age_before_short - 1e-4
+        assert abs(short_wait - 15.0) < 0.02
+        clock["t"] = age_before_short
+        await a._emit_turn_buffer_keepalive(chat)
+        clock["t"] = rotate_at - 1e-4
+        await a._emit_turn_buffer_keepalive(chat)
+        assert finals
+        assert abs(finals[0] - rotate_at) < 0.05
+        assert not any(abs(w - 25.0) < 0.01 for w in sleep_calls)
+
+    @pytest.mark.asyncio
+    async def test_g2_stream_expired_403_retires_without_new_informative_open(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G2-expired-403"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        monkeypatch.setattr(time, "monotonic", lambda: cap + 5.0)
+        opens = 0
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            nonlocal opens
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                opens += 1
+                return self._http_result(201, "should-not-open")
+            if entity.get("streamType") == "informative" and entity.get("streamId"):
+                return MagicMock(
+                    status_code=403,
+                    text="Content stream finished due to exceeded streaming time",
+                    json=lambda: {},
+                )
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "expired-stream",
+            "sequence": 3,
+            "opened_mono": 0.0,
+        }
+        await a._post_informative_under_lock(chat, allow_restart=True)
+        assert opens == 0
+        assert buf.get("keepalive_rotated") is True
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        assert a._delivery_record(buf, turn).get("plain_due") is True
+        assert not buf["keepalive"].get("stream_id")
+
     @pytest.mark.asyncio
     async def test_issue247_keepalive_sleeper_posts_rotation_close_near_115s(
         self, monkeypatch: pytest.MonkeyPatch

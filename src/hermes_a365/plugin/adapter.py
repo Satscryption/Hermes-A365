@@ -1108,6 +1108,9 @@ def _keepalive_sleeper_wait_after_emit(stream: dict[str, Any]) -> float:
     if not stream_id or not isinstance(opened, (int, float)):
         return interval
     age = time.monotonic() - float(opened)
+    target = _keepalive_rotation_age_sec()
+    if age >= target:
+        return 0.0
     rotation_wait = _keepalive_rotation_wait_sec(age)
     return rotation_wait if rotation_wait > 0 else interval
 
@@ -6670,6 +6673,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if buf.get("keepalive_rotated"):
             return
         rotated = False
+        rotation_due_no_informative = False
         async with self._turn_buffer_lock(buf):
             if self._turn_buffers.get(chat_id) is not buf:
                 logger.debug(
@@ -6712,24 +6716,21 @@ class Agent365Adapter(BasePlatformAdapter):
             # ``time.monotonic()`` can be below the age we subtract in
             # tests on a freshly booted runner, so the stamp may be
             # negative. Zero is a real stamp; a missing key is not.
-            if (
-                stream_id
-                and isinstance(opened, (int, float))
-                and not self._buffer_has_kept_answer_segments(buf)
-            ):
+            if stream_id and isinstance(opened, (int, float)):
                 age = time.monotonic() - float(opened)
-                if _keepalive_rotation_due(age) and self._turn_buffer_live_for_keepalive(buf):
-                    rotated = await self._post_keepalive_rotation_final_locked(chat_id, buf)
-                elif not _keepalive_rotation_due(age):
-                    pass
-                else:
-                    logger.debug(
-                        "agent365 turn buffer keep-alive skip rotation final: "
-                        "chat_id=%s reason=turn ended",
-                        chat_id,
-                    )
-                    rotated = False
+                if _keepalive_rotation_due(age):
+                    rotation_due_no_informative = True
+                    if self._turn_buffer_live_for_keepalive(buf):
+                        rotated = await self._post_keepalive_rotation_final_locked(chat_id, buf)
+                    else:
+                        logger.debug(
+                            "agent365 turn buffer keep-alive skip rotation final: "
+                            "chat_id=%s reason=turn ended",
+                            chat_id,
+                        )
         if rotated:
+            return
+        if rotation_due_no_informative:
             return
         restart = await self._post_informative_under_lock(chat_id, allow_restart=True)
         if not restart:
@@ -6974,6 +6975,33 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return False
         if status == 403 and stream_id and allow_restart:
+            opened_mono = stream.get("opened_mono")
+            stream_age = (
+                time.monotonic() - float(opened_mono)
+                if isinstance(opened_mono, (int, float))
+                else 0.0
+            )
+            if (
+                _answer_final_terminal_403(result.detail)
+                and "exceeded streaming time" in result.detail.casefold()
+                and stream_age >= _keepalive_rotation_age_sec()
+            ):
+                logger.warning(
+                    "agent365 turn buffer keep-alive stream expired; "
+                    "retiring without a new sequence: chat_id=%s status=%s",
+                    chat_id,
+                    status,
+                )
+                stream_state = self._keepalive_state(buf)
+                stream_state["stream_id"] = ""
+                stream_state["closed_by"] = "keepalive"
+                buf["keepalive"] = stream_state
+                buf["keepalive_rotated"] = True
+                buf["skip_stream_open"] = True
+                record = self._delivery_record(buf, turn)
+                record["plain_due"] = True
+                self._cancel_turn_buffer_keepalive(buf)
+                return False
             logger.warning(
                 "agent365 turn buffer keep-alive rejected; opening a new "
                 "sequence: chat_id=%s status=%s",
