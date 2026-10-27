@@ -1032,6 +1032,7 @@ _TURN_BUFFER_KEEPALIVE_TEXT = "Working on it."
 _KEEPALIVE_ROTATION_STATUS_TEXT = (
     "Still working on this. I'll send the answer as a new message."
 )
+_KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC = 1.0
 _INFORMATIVE_TEXT_MAX_CHARS = 1000
 
 
@@ -1100,16 +1101,41 @@ def _keepalive_rotation_wait_sec(age: float) -> float:
     return min(interval, target - age)
 
 
-def _keepalive_sleeper_wait_after_emit(stream: dict[str, Any]) -> float:
-    """Seconds to sleep before the next keep-alive emit (#247)."""
-    interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+def _rotation_close_failure_plain_retire(result: _KeepalivePost) -> bool:
+    """True when a failed rotation final should plain-retire instead of spinning."""
+    status = result.status
+    if status is None:
+        return bool(result.budget_exhausted_before_send or result.connect_before_send)
+    if status is not None and 200 <= status < 300:
+        return False
+    if status == 429:
+        return False
+    if status is not None and status >= 500:
+        return True
+    bucket = _classify_answer_final_post(result)
+    return bucket not in (
+        _ANSWER_FINAL_MAY_HAVE_LANDED,
+        _ANSWER_FINAL_DEFER,
+        _ANSWER_FINAL_DELIVERED,
+    )
+
+
+def _keepalive_sleeper_wait_after_emit(stream: dict[str, Any]) -> float | None:
+    """Seconds to sleep before the next keep-alive emit (#247).
+
+    ``None`` means use the normal keep-alive interval. ``0.0`` means rotation
+    is already due and the loop should re-enter emit immediately.
+    """
     stream_id = str(stream.get("stream_id") or "")
     opened = stream.get("opened_mono")
     if not stream_id or not isinstance(opened, (int, float)):
-        return interval
+        return None
     age = time.monotonic() - float(opened)
+    target = _keepalive_rotation_age_sec()
+    if age >= target:
+        return 0.0
     rotation_wait = _keepalive_rotation_wait_sec(age)
-    return rotation_wait if rotation_wait > 0 else interval
+    return rotation_wait if rotation_wait > 0 else None
 
 
 def _keepalive_user_cancelled(detail: str) -> bool:
@@ -6495,6 +6521,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 f"{elapsed_first:.3f}" if elapsed_first is not None else "n/a",
                 will_post,
             )
+            last_sleeper_wait_was_zero = False
             while self._turn_buffer_keepalive_needed(chat_id):
                 buf = self._turn_buffers.get(chat_id)
                 stream = self._keepalive_state(buf)
@@ -6524,7 +6551,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 stream = self._keepalive_state(buf)
                 wait = _keepalive_sleeper_wait_after_emit(stream)
                 interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
-                await asyncio.sleep(wait if wait > 0 else interval)
+                sleep_sec = wait if wait is not None else interval
+                rotation_due_zero = sleep_sec == 0.0
+                if rotation_due_zero and last_sleeper_wait_was_zero:
+                    sleep_sec = _KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC
+                await asyncio.sleep(sleep_sec)
+                last_sleeper_wait_was_zero = rotation_due_zero
             logger.debug(
                 "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
                 chat_id,
@@ -6636,13 +6668,23 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return _mark_plain_retired()
+        post_result: list[_KeepalivePost] = []
         closed = await self._post_keepalive_final_locked(
             chat_id,
             buf,
             final_text=close_text,
             outbound_deadline=cap_deadline,
+            post_result=post_result,
         )
         if not closed:
+            if post_result and _rotation_close_failure_plain_retire(post_result[0]):
+                logger.warning(
+                    "agent365 turn buffer keep-alive rotation close failed; "
+                    "plain-retiring stream: chat_id=%s status=%s",
+                    chat_id,
+                    post_result[0].status,
+                )
+                return _mark_plain_retired()
             return False
         buf["keepalive_rotated"] = True
         buf["skip_stream_open"] = True
@@ -6670,6 +6712,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if buf.get("keepalive_rotated"):
             return
         rotated = False
+        rotation_due_no_informative = False
         async with self._turn_buffer_lock(buf):
             if self._turn_buffers.get(chat_id) is not buf:
                 logger.debug(
@@ -6712,24 +6755,14 @@ class Agent365Adapter(BasePlatformAdapter):
             # ``time.monotonic()`` can be below the age we subtract in
             # tests on a freshly booted runner, so the stamp may be
             # negative. Zero is a real stamp; a missing key is not.
-            if (
-                stream_id
-                and isinstance(opened, (int, float))
-                and not self._buffer_has_kept_answer_segments(buf)
-            ):
+            if stream_id and isinstance(opened, (int, float)):
                 age = time.monotonic() - float(opened)
-                if _keepalive_rotation_due(age) and self._turn_buffer_live_for_keepalive(buf):
+                if _keepalive_rotation_due(age):
+                    rotation_due_no_informative = True
                     rotated = await self._post_keepalive_rotation_final_locked(chat_id, buf)
-                elif not _keepalive_rotation_due(age):
-                    pass
-                else:
-                    logger.debug(
-                        "agent365 turn buffer keep-alive skip rotation final: "
-                        "chat_id=%s reason=turn ended",
-                        chat_id,
-                    )
-                    rotated = False
         if rotated:
+            return
+        if rotation_due_no_informative:
             return
         restart = await self._post_informative_under_lock(chat_id, allow_restart=True)
         if not restart:
@@ -6974,6 +7007,33 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return False
         if status == 403 and stream_id and allow_restart:
+            opened_mono = stream.get("opened_mono")
+            stream_age = (
+                time.monotonic() - float(opened_mono)
+                if isinstance(opened_mono, (int, float))
+                else 0.0
+            )
+            if (
+                _answer_final_terminal_403(result.detail)
+                and "exceeded streaming time" in result.detail.casefold()
+                and stream_age >= _keepalive_rotation_age_sec()
+            ):
+                logger.warning(
+                    "agent365 turn buffer keep-alive stream expired; "
+                    "retiring without a new sequence: chat_id=%s status=%s",
+                    chat_id,
+                    status,
+                )
+                stream_state = self._keepalive_state(buf)
+                stream_state["stream_id"] = ""
+                stream_state["closed_by"] = "keepalive"
+                buf["keepalive"] = stream_state
+                buf["keepalive_rotated"] = True
+                buf["skip_stream_open"] = True
+                record = self._delivery_record(buf, turn)
+                record["plain_due"] = True
+                self._cancel_turn_buffer_keepalive(buf)
+                return False
             logger.warning(
                 "agent365 turn buffer keep-alive rejected; opening a new "
                 "sequence: chat_id=%s status=%s",
@@ -7019,6 +7079,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for_answer_delivery: bool = False,
         final_text: str | None = None,
         outbound_deadline: float | None = None,
+        post_result: list[_KeepalivePost] | None = None,
     ) -> bool:
         """POST ``streamType=final``. True only when the stream is closed.
 
@@ -7057,6 +7118,8 @@ class Agent365Adapter(BasePlatformAdapter):
             text=final_text,
             outbound_deadline=outbound_deadline,
         )
+        if post_result is not None:
+            post_result.append(result)
         if self._turn_buffers.get(chat_id) is not buf:
             self._remember_keepalive(chat_id, buf, stream)
             return False
