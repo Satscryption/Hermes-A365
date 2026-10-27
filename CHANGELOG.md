@@ -15,6 +15,13 @@ Ships merged work on `main@92a56f35` (2026-10-27) via PRs #223, #231, #232, #233
 
 ### Fixed
 
+- **#217 — Copilot first-turn min stream age (live walk follow-up).** First turn
+  after ``membersAdded`` waits until stream age reaches
+  ``HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC`` (default 10s, max 10s);
+  short non-first turns still use ``HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC``
+  (default 3s). Refs
+  [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
+
 - **#237 — `doctor` az CLI version parser edge cases (#222 follow-up).** Treat PEP 440
   ``aN`` alphas and dotted ``-b.1`` / ``~b.1`` betas as prereleases at the floor;
   match ``dev`` only when followed by optional digits (not ``developer``). Refs

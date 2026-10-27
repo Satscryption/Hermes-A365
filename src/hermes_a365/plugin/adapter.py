@@ -1036,6 +1036,7 @@ _INFORMATIVE_TEXT_MAX_CHARS = 1000
 
 
 _COPILOT_STREAM_TIMING_DEFAULT_SEC = 3.0
+_COPILOT_FIRST_TURN_STREAM_TIMING_DEFAULT_SEC = 10.0
 _COPILOT_STREAM_TIMING_MAX_SEC = 10.0
 _COPILOT_MEMBER_ADDED_PENDING_TTL_SEC = 600.0
 
@@ -1998,6 +1999,10 @@ class Agent365Adapter(BasePlatformAdapter):
         self._copilot_member_added_pending: dict[str, float] = {}
         self._copilot_min_stream_age_before_final_sec = _copilot_stream_timing_sec(
             "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC",
+        )
+        self._copilot_first_turn_min_stream_age_before_final_sec = _copilot_stream_timing_sec(
+            "HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC",
+            default=_COPILOT_FIRST_TURN_STREAM_TIMING_DEFAULT_SEC,
         )
         self._copilot_short_turn_max_duration_sec = _copilot_stream_timing_sec(
             "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC",
@@ -8289,9 +8294,14 @@ class Agent365Adapter(BasePlatformAdapter):
         if not self._copilot_needs_min_stream_age_before_final(chat_id, turn):
             turn["copilot_member_added_decided"] = True
             return
-        min_age = self._copilot_min_stream_age_before_final_sec
-        if not math.isfinite(min_age) or min_age < 0:
-            min_age = _COPILOT_STREAM_TIMING_DEFAULT_SEC
+        if turn.get("copilot_post_member_added"):
+            min_age = self._copilot_first_turn_min_stream_age_before_final_sec
+            if not math.isfinite(min_age) or min_age < 0:
+                min_age = _COPILOT_FIRST_TURN_STREAM_TIMING_DEFAULT_SEC
+        else:
+            min_age = self._copilot_min_stream_age_before_final_sec
+            if not math.isfinite(min_age) or min_age < 0:
+                min_age = _COPILOT_STREAM_TIMING_DEFAULT_SEC
         min_age = min(min_age, _COPILOT_STREAM_TIMING_MAX_SEC)
         if min_age <= 0:
             turn["copilot_member_added_decided"] = True
