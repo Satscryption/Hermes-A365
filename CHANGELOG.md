@@ -6,6 +6,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.5] — 2026-10-27
+
+Copilot Chat streaming and keep-alive hardening (#214, #217, #212, #235, #247),
+outbound 429 / Retry-After handling (#190), and Direct Line verify diagnostics (#215).
+Ships merged work on `main@92a56f35` (2026-10-27) via PRs #223, #231, #232, #233,
+#234, #236, #240, #243, #245, #246, and #248.
+
 ### Fixed
 
 - **#237 — `doctor` az CLI version parser edge cases (#222 follow-up).** Treat PEP 440
@@ -110,7 +117,31 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   same rule plugin invoke already uses. Refs
   [#225](https://github.com/Satscryption/Hermes-A365/issues/225).
 
+- **Copilot fast-reply and informative sanitization (walk095).** Fast marked
+  turns post the answer preview on the delivery informative opener again (no
+  heartbeat before the keep-alive interval). Sanitize informative posts so
+  answer body text cannot appear on ``streamType=informative`` updates; apply
+  sanitization only after ``keepalive_first_interval_elapsed``. Refs
+  [#246](https://github.com/Satscryption/Hermes-A365/pull/246).
+
+- **#247 — Keep-alive rotation timing and plain answer after rotation.** Use a
+  rotation-aware keep-alive sleeper (~115s close before the 120s cap), stop
+  keep-alive after rotation with neutral status text (no bare typing), deliver
+  the answer on the plain path after rotation, and post non-empty informative
+  progress/status when the stream outlives the first interval. Refs
+  [#247](https://github.com/Satscryption/Hermes-A365/issues/247),
+  [#248](https://github.com/Satscryption/Hermes-A365/pull/248).
+
 ### Changed
+
+- **#214 — Copilot streamed lead-in before tool progress.** Marked-answer
+  segments (``reply_to`` / ``expect_edits``) that precede Hermes tool-progress on
+  the same turn are reclassified as commentary: they post on the informative
+  stream, drop from the answer final, and no longer block keep-alive stream
+  rotation; the same rule is re-applied after ``edit_message`` refreshes
+  segment kind. Refs
+  [#214](https://github.com/Satscryption/Hermes-A365/issues/214),
+  [#223](https://github.com/Satscryption/Hermes-A365/pull/223).
 
 - **#226 — Copilot pre-tool answers vs intent lead-ins.** Marked segments before
   the last Hermes tool-progress line on a turn stay in the answer final unless
@@ -134,14 +165,6 @@ Ships merged work on `main@50e32745` (2026-10-26) via PRs #208, #219, and
 #221.
 
 ### Changed
-
-- **#214 — Copilot streamed lead-in before tool progress.** Marked-answer
-  segments (`reply_to` / `expect_edits`) that precede Hermes tool-progress on
-  the same turn are reclassified as commentary: they post on the informative
-  stream, drop from the answer final, and no longer block keep-alive stream
-  rotation; the same rule is re-applied after ``edit_message`` refreshes
-  segment kind. Refs
-  [#214](https://github.com/Satscryption/Hermes-A365/issues/214).
 
 - **#209 — #126 review follow-ups.** CI Hermes source smoke adds the plugin
   floor tag `v2026.4.30`. `doctor` parses only the `azure-cli` field from
@@ -2803,6 +2826,7 @@ Microsoft.Agents.A365.DevTools.Cli **1.1.171** (round-5 walkthrough,
   operators (only "blocked" via the M365 Admin Centre). Microsoft
   platform limitation; not a wrapper bug.
 
-[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.4...HEAD
+[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.5...HEAD
+[0.9.5]: https://github.com/satscryption/Hermes-A365/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/satscryption/Hermes-A365/compare/v0.9.3...v0.9.4
 [0.1.0]: https://github.com/satscryption/Hermes-A365/releases/tag/v0.1.0
