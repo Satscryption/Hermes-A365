@@ -2096,13 +2096,19 @@ def _response_is_stripped_connector_bot_403_envelope(response: dict[str, Any]) -
     return "failed to send activity" in message and "bot returned an error" in message
 
 
+# Log format strings — keep aligned with plugin/adapter.py gateway warnings.
+_GATEWAY_LOG_INBOUND_403_UNAUTHORIZED_END_USER = "inbound 403 reason=unauthorized-end-user"
+_GATEWAY_LOG_INBOUND_403_PATH_B_REASON_PREFIX = "inbound 403 path=B reason="
+_GATEWAY_LOG_INBOUND_403_UNTRUSTED_SERVICE_URL = "inbound 403 reason=untrusted-service-url"
+
 _STRIPPED_CONNECTOR_BOT_403_REMEDIATION = (
-    "The Connector stripped the bot's 403 reason (body above). Check the gateway "
-    f"log for probe user {_PROBE_USER_ID!r} on the inbound activity line: "
-    "`inbound 403 reason=unauthorized-end-user` means the probe identity is not "
-    "allowlisted (add to A365_ALLOWED_USERS or ignore if expected); "
-    "`invalid bearer token`, JWT/audience failures, or `untrusted-service-url` "
-    "mean a real auth misconfiguration to fix."
+    "The Connector stripped the bot's 403 reason (body above). Check the gateway log: "
+    f"`{_GATEWAY_LOG_INBOUND_403_UNAUTHORIZED_END_USER}` means the allowlist rejected "
+    "the sender (add the probe id to A365_ALLOWED_USERS or ignore if expected); "
+    f"`{_GATEWAY_LOG_INBOUND_403_PATH_B_REASON_PREFIX}` with a BF signature/aud/iss or "
+    "serviceUrl mismatch means a real Path B auth failure; "
+    f"`{_GATEWAY_LOG_INBOUND_403_UNTRUSTED_SERVICE_URL}` means the activity serviceUrl "
+    "failed the trusted-suffix check."
 )
 
 
@@ -2131,8 +2137,8 @@ def _directline_allowlist_warn(status: int, detail: str) -> ProbeResult:
 def _directline_activity_failure(status: int, response: dict[str, Any]) -> ProbeResult:
     """Classify a Direct Line activity POST that the bot endpoint rejected.
 
-    Conversation start has already succeeded, so the Direct Line secret and
-    bot token check passed. **WARN** only when the response body still carries
+    Conversation start has already succeeded, so the Direct Line secret was
+    accepted. **WARN** only when the response body still carries
     explicit allowlist markers. The Connector's stripped bot-403 envelope stays
     **ERROR** with gateway-log remediation (same JSON for allowlist and JWT).
     """
