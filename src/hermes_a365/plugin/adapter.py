@@ -5971,11 +5971,7 @@ class Agent365Adapter(BasePlatformAdapter):
         return str(text or "").strip() == _TURN_BUFFER_KEEPALIVE_TEXT
 
     @staticmethod
-    def _placeholder_informative_opener_allowed(
-        buf: dict[str, Any], *, for_answer: bool = False
-    ) -> bool:
-        if for_answer:
-            return True
+    def _placeholder_informative_opener_allowed(buf: dict[str, Any]) -> bool:
         return bool(buf.get("keepalive_first_interval_elapsed"))
 
     def _answer_segment_texts_for_turn(
@@ -6016,9 +6012,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if body.startswith(posted) and posted in parts:
                 return True
             if merged.startswith(posted) and posted != merged:
-                tail = merged[len(posted) :]
-                if not tail or tail.startswith("\n\n"):
-                    return True
+                return True
         return False
 
     def _sanitize_informative_stream_text(
@@ -6029,9 +6023,11 @@ class Agent365Adapter(BasePlatformAdapter):
         *,
         for_answer: bool,
     ) -> str:
-        """Keep answer bodies off informative stream updates (#227 / walk095)."""
+        """Keep answer bodies off post-interval informative updates (#227 / walk095)."""
         posted = str(text or "").strip()
         if not posted or self._is_placeholder_informative_text(posted):
+            return posted
+        if not buf.get("keepalive_first_interval_elapsed"):
             return posted
         if self._informative_text_is_answer_body_leak(buf, turn, posted):
             return _TURN_BUFFER_KEEPALIVE_TEXT
@@ -6758,7 +6754,7 @@ class Agent365Adapter(BasePlatformAdapter):
             not for_answer
             and not stream_id
             and self._is_placeholder_informative_text(informative_text)
-            and not self._placeholder_informative_opener_allowed(buf, for_answer=for_answer)
+            and not self._placeholder_informative_opener_allowed(buf)
         ):
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s "
@@ -6778,7 +6774,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 sequence=sequence,
                 final=False,
                 text=informative_text,
-                for_answer=for_answer,
             )
         finally:
             if segment is not None:
@@ -6981,7 +6976,6 @@ class Agent365Adapter(BasePlatformAdapter):
         text: str | None = None,
         message_chrome: bool = False,
         outbound_deadline: float | None = None,
-        for_answer: bool = False,
     ) -> _KeepalivePost:
         """POST one informative update or a stream final.
 
@@ -7010,9 +7004,7 @@ class Agent365Adapter(BasePlatformAdapter):
             and Agent365Adapter._is_placeholder_informative_text(body_text)
         ):
             buf = self._turn_buffers.get(chat_id)
-            allowed = Agent365Adapter._placeholder_informative_opener_allowed(
-                buf, for_answer=for_answer
-            )
+            allowed = Agent365Adapter._placeholder_informative_opener_allowed(buf)
             if isinstance(buf, dict) and not allowed:
                 logger.debug(
                     "agent365 turn buffer keep-alive skip post: chat_id=%s "

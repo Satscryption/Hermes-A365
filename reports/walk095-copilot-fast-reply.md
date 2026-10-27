@@ -2,58 +2,38 @@
 
 ## Head SHA
 
-Verified: `git ls-remote origin cursor/walk095-copilot-fast-reply-0782` → `aab7e09b09147b6689c1f40073a491b325a96b28`.
+Update after push: `git ls-remote origin cursor/walk095-copilot-fast-reply-0782`.
 
-## Root cause (what fixed live on ac7e7463)
+## Behavior
 
-Live walk gateway evidence (S0b/S0c/L1/G1/L3) on `ac7e7463` used the **production stream path** for marked turns:
+### Fast turns (answer ready before `keepalive_first_interval_elapsed`)
 
-1. `type=typing` / `streamType=informative` opener (HTTP 201, new `stream_id`)
-2. One `turn buffer answer final` on the same `stream_id` (after `#217` min-stream-age wait where applicable)
+Marked Hermes turns (`reply_to='act-1'`) use **stream delivery** like `ac7e7463`:
 
-The **`_answer_plain_before_keepalive_interval` → `send_reply` branch did not run** in production: Hermes marks answers (`reply_to` set), so that gate is always false.
+1. `type=typing` / `streamType=informative` opener with the **answer preview** text (not `Working on it.`)
+2. One `streamType=final` on the same `stream_id` (after `#217` min-stream-age when configured)
 
-Compared to `dd036fc3`, the live-relevant delta on `ac7e7463` was:
+The sanitizer **does not** rewrite this opener. Placeholder/heartbeat openers stay deferred until the first keep-alive interval.
 
-| Change | Ran in live marked stream path? | Effect |
-|--------|----------------------------------|--------|
-| Plain fast `fallback` before opener | No (marked answer) | None live |
-| `_placeholder_informative_opener_allowed` (`for_answer` removed) | Only on `for_answer=False` keep-alive posts | No direct opener effect |
-| **`_sanitize_informative_stream_text` on keep-alive informative posts** | Yes (seq ≥ 2 when interval elapses) | Stops answer segment text on informative updates (L1/L3/G1) |
-| Delivery opener still used `answer_preview` with `for_answer=True` sanitizer bypass | Yes (fast S0b/S0c opener) | Opener could still echo answer until sanitizer applied to `for_answer` (this fix round) |
+### Slow turns (after first keep-alive interval)
 
-**Conclusion (a):** Live turns rendered because the adapter kept **stream opener + one stream final** (with min-stream-age), while **`_sanitize_informative_stream_text` prevented answer bodies on mid-turn informative posts**. The plain-reply path was not involved. This PR round removes the dead plain branch and extends sanitization to **all** informative/typing bodies (including the delivery opener), using heartbeat text when the body would leak answer text, while still allowing a placeholder opener when `for_answer=True` opens the stream.
+Informative updates (heartbeat, seq ≥ 2) must not carry answer bodies (exact, joined, truncated, or prefix of merged answer segments). `_sanitize_informative_stream_text` runs only when `keepalive_first_interval_elapsed` is true.
 
-## Payload shape (unchanged)
+## Root cause summary
 
-Final activities remain:
+| Issue | Cause |
+|-------|--------|
+| `dd036fc3` empty / double bubbles | Answer text on mid-turn informative posts |
+| `858e62c8` fast turn regression | Sanitizer + `for_answer` placeholder bypass forced heartbeat opener before interval |
+| Fix round 2 | Restore answer-preview delivery opener on fast turns; sanitize only post-interval informative posts |
 
-```json
-{
-  "type": "message",
-  "text": "<answer>",
-  "entities": [
-    {"type": "streaminfo", "streamId": "<id>", "streamType": "final"},
-    {"type": "https://schema.org/Message", ...}
-  ]
-}
-```
+Plain `send_reply` fast path remains removed (never ran for marked turns in production).
 
-Informative/typing activities must not carry final answer bodies (including joined, truncated preview, or marked answer segments); pre-tool facts that are classified as answer segments are sanitized off informative and kept for the final.
+## Tests
 
-## Code changes (fix round 1)
-
-- Removed `_answer_plain_before_keepalive_interval` and the early `fallback` in `_deliver_turn_answer_locked`.
-- `_informative_text_is_answer_body_leak` + expanded `_sanitize_informative_stream_text` (applies to `for_answer=True` openers too).
-- `_placeholder_informative_opener_allowed(for_answer=True)` so a heartbeat opener can open the stream before the first keep-alive interval.
-- `for_answer` passed into `_post_keepalive_activity` for placeholder deferral on delivery openers.
-
-## Tests (real runs)
-
-- `pytest tests/test_agent365_plugin.py -k walk095` — marked `reply_to='act-1'`, typing bodies exclude answer text, one final per turn, min-stream-age wait on fast path, G1 fact + closing on final only, direct sanitizer mutation guard.
-- `pytest tests/test_agent365_plugin.py` — full plugin module.
-- `ruff check src tests` — pass.
-- `tests/test_release_integrity.py` — **4 failures pre-existing on `dd036fc3`** (version metadata); not introduced here.
+- `pytest tests/test_agent365_plugin.py -k walk095`
+- `pytest tests/test_agent365_plugin.py`
+- `ruff check src tests`
 
 ## Relaxed checks
 

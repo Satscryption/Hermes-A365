@@ -8794,8 +8794,8 @@ class TestEditMessage:
         assert post_mock.await_count == 2
         opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
         assert opener["type"] == "typing"
-        assert opener["text"] == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
-        assert opener["text"] != "Short answer"
+        assert opener["text"] == "Short answer"
+        assert opener["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         assert final["type"] == "message"
         assert final["text"] == "Short answer"
         assert final["entities"][0]["streamType"] == "final"
@@ -8863,10 +8863,13 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await a.send(chat_id=chat, content=answer, reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
+        typing = self._walk095_typing_posts(posts)
         finals = [p for p in posts if p.get("type") == "message"]
+        assert len(typing) == 1
         assert len(finals) == 1
         assert send_reply_mock.await_count == 0
-        self._walk095_assert_typing_excludes_answer(posts, answer, "Hello.")
+        assert typing[0]["text"] == answer
+        assert typing[0]["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         assert finals[0]["text"] == answer
         assert finals[0]["entities"][0]["streamType"] == "final"
         assert finals[0]["entities"][0]["streamId"] == stream_id
@@ -8974,11 +8977,15 @@ class TestEditMessage:
 
         await one_turn("act-1", "walk095 smoke", "Hello. Smoke check received.")
         await one_turn("act-2", "walk095 smoke 2", "two")
+        typing = self._walk095_typing_posts(posts)
         finals = [p for p in posts if p.get("type") == "message"]
+        assert len(typing) == 2
         assert len(finals) == 2
         assert send_reply_mock.await_count == 0
-        self._walk095_assert_typing_excludes_answer(
-            posts, "Hello. Smoke check received.", "two"
+        assert typing[0]["text"] == "Hello. Smoke check received."
+        assert typing[1]["text"] == "two"
+        assert all(
+            t["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in typing
         )
         assert finals[0]["text"] == "Hello. Smoke check received."
         assert finals[1]["text"] == "two"
@@ -9103,10 +9110,28 @@ class TestEditMessage:
     def test_walk095_sanitize_informative_answer_leak_detection(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """Mutation guard: sanitizer must replace answer bodies on informative posts."""
+        """Mutation guard: sanitizer must replace answer bodies after interval."""
         a = _make_adapter(monkeypatch)
         turn = {"seq": "1"}
-        buf = {
+        buf_fast = {
+            "keepalive_first_interval_elapsed": False,
+            "segments": [
+                {
+                    "turn": "1",
+                    "text": "Hello.",
+                    "kind": "answer",
+                    "reply_to": "act-1",
+                }
+            ],
+        }
+        assert (
+            a._sanitize_informative_stream_text(
+                buf_fast, turn, "Hello.", for_answer=True
+            )
+            == "Hello."
+        )
+        buf_slow = {
+            "keepalive_first_interval_elapsed": True,
             "segments": [
                 {
                     "turn": "1",
@@ -9114,20 +9139,42 @@ class TestEditMessage:
                     "kind": "answer",
                     "reply_to": "act-1",
                 }
-            ]
+            ],
         }
-        sanitized = a._sanitize_informative_stream_text(
-            buf, turn, "slept", for_answer=True
-        )
-        assert sanitized == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert a._sanitize_informative_stream_text(
+            buf_slow, turn, "slept", for_answer=False
+        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         clipped = "x" * adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
         long_answer = clipped + "tail"
         buf_long = {
-            "segments": [{"turn": "1", "text": long_answer, "kind": "answer"}]
+            "keepalive_first_interval_elapsed": True,
+            "segments": [{"turn": "1", "text": long_answer, "kind": "answer"}],
         }
         assert a._sanitize_informative_stream_text(
             buf_long, turn, clipped, for_answer=False
         ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+
+    def test_walk095_sanitize_joined_and_prefix_answer_leaks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        turn = {"seq": "1"}
+        buf = {
+            "keepalive_first_interval_elapsed": True,
+            "segments": [
+                {"turn": "1", "text": "Line one.", "kind": "answer"},
+                {"turn": "1", "text": "Line two.", "kind": "answer"},
+            ],
+        }
+        joined = "Line one.\n\nLine two."
+        assert a._sanitize_informative_stream_text(
+            buf, turn, joined, for_answer=False
+        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        prefix = "Line one.\n\nLine tw"
+        assert a._sanitize_informative_stream_text(
+            buf, turn, prefix, for_answer=False
+        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
     @pytest.mark.asyncio
     async def test_copilot_first_turn_after_member_added_waits_min_stream_age(
