@@ -8518,10 +8518,11 @@ class TestEditMessage:
         max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
         assert cap <= 120
         assert max_age + budget <= cap
-        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
-        # Rotation tracks the full stream cap, not the shorter max-age budget.
-        assert adapter_mod._keepalive_rotation_due(cap - interval + 0.01)
-        assert not adapter_mod._keepalive_rotation_due(cap - interval - 0.01)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        assert rotate_at == cap - adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        assert adapter_mod._keepalive_rotation_due(rotate_at + 0.01)
+        assert not adapter_mod._keepalive_rotation_due(rotate_at - 0.01)
+        assert not adapter_mod._keepalive_rotation_due(100.0)
         text = adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         assert text.strip() == text
         assert text != ""
@@ -10581,34 +10582,28 @@ class TestEditMessage:
             "sequence": 4,
             "opened_mono": time.monotonic() - stream_age_sec,
         }
-        mono_before_rotate = time.monotonic()
         await a._emit_turn_buffer_keepalive(chat)
-        assert kinds == ["final:old-stream-k4", "informative"]
-        assert buf["keepalive"]["stream_id"] == "new-stream-k4"
-        opened_after = float(buf["keepalive"]["opened_mono"])
-        assert opened_after >= mono_before_rotate - 0.05
-        assert time.monotonic() - opened_after < 2.0
+        assert kinds == ["final:old-stream-k4"]
+        assert buf.get("keepalive_rotated") is True
+        assert not buf["keepalive"].get("stream_id")
         await a._drop_turn_buffer(chat)
 
     @pytest.mark.asyncio
     async def test_issue247_rotation_not_due_before_stream_cap_minus_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
-        early_age = 70.0
-        assert early_age + interval < cap
-        assert not adapter_mod._keepalive_rotation_due(early_age)
-        late_age = cap - interval + 0.01
-        assert adapter_mod._keepalive_rotation_due(late_age)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        assert not adapter_mod._keepalive_rotation_due(100.0)
+        assert adapter_mod._keepalive_rotation_due(rotate_at + 0.01)
 
     @pytest.mark.asyncio
     async def test_issue247_answer_plain_after_keepalive_rotation_with_reply_to(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        """After rotation, close the informative stream and plain-post the answer (#247)."""
+        """Rotate at 115s with lead-in final text; one plain answer bubble (#247)."""
         a = _make_adapter(monkeypatch)
         chat = "conv-G-247-rotate-plain"
+        user_reply = "act-user-reply-247"
         inbound = _make_inbound(conv_id=chat, activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
@@ -10619,20 +10614,18 @@ class TestEditMessage:
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
-        stream_finals: list[dict[str, Any]] = []
-        answer_stream_finals: list[dict[str, Any]] = []
+        final_posts: list[dict[str, Any]] = []
+        informative_openers = {"n": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             body = kwargs["json"]
             entity = body["entities"][0]
             if entity.get("streamType") == "final":
-                if body.get("text") == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT:
-                    stream_finals.append(entity)
-                else:
-                    answer_stream_finals.append(entity)
+                final_posts.append(body)
                 return self._http_result(202)
             if entity.get("streamType") == "informative" and "streamId" not in entity:
-                return self._http_result(201, "rotated-247")
+                informative_openers["n"] += 1
+                return self._http_result(201, "stream-247")
             return self._http_result(202)
 
         a._http_client.post = post
@@ -10642,31 +10635,39 @@ class TestEditMessage:
             message_id="act-1",
         )
         await a.on_processing_start(event)
+        fact = "The capital of France is Paris."
         await a.send(
             chat_id=chat,
-            content="I'll run the sleep, then reply.",
-            reply_to="act-1",
+            content=fact,
+            reply_to=user_reply,
             metadata={"expect_edits": True},
         )
         await a.send(chat_id=chat, content="💻 Running sleep 150", reply_to=None)
         buf = a._turn_buffers[chat]
-        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
         buf["keepalive"] = {
             "stream_id": "pre-rotate",
             "sequence": 3,
-            "opened_mono": time.monotonic() - (cap - interval + 0.01),
+            "opened_mono": time.monotonic() - (rotate_at + 0.01),
         }
         await a._emit_turn_buffer_keepalive(chat)
         assert buf.get("keepalive_rotated") is True
-        assert buf["keepalive"]["stream_id"] == "rotated-247"
-        await a.send(chat_id=chat, content="Done after long sleep.", reply_to="act-1")
+        assert not buf["keepalive"].get("stream_id")
+        assert informative_openers["n"] == 1
+        assert len(final_posts) == 1
+        assert final_posts[0]["text"] == fact
+        assert final_posts[0]["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        await a.send(
+            chat_id=chat,
+            content="Confirmed after sleep.",
+            reply_to=user_reply,
+        )
         await a.on_processing_complete(event, outcome="success")
-        assert len(stream_finals) == 2
-        assert stream_finals[-1]["streamId"] == "rotated-247"
-        assert answer_stream_finals == []
+        assert len(final_posts) == 1
         assert send_reply_mock.await_count == 1
-        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Done after long sleep."
+        plain = send_reply_mock.await_args.kwargs["reply"]["text"]
+        assert fact in plain
+        assert "Confirmed after sleep." in plain
         assert chat not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -10704,13 +10705,71 @@ class TestEditMessage:
         buf["keepalive"] = {
             "stream_id": "ka-104",
             "sequence": 2,
-            "opened_mono": time.monotonic() - 70.0,
+            "opened_mono": time.monotonic() - 100.0,
         }
         await a._emit_turn_buffer_keepalive(chat)
         assert finals == []
-        await a.send(chat_id=chat, content="Done.", reply_to="act-1")
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        await a.send(chat_id=chat, content="Done.", reply_to="act-user-104")
         await a.on_processing_complete(event, outcome="success")
-        assert finals == ["ka-104"]
+        assert all(t != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in finals) or finals == []
+        assert send_reply_mock.await_count == 1
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue247_failed_rotation_close_stays_plain_no_answer_stream_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-close-fail"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        answer_stream_finals = 0
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            entity = body["entities"][0]
+            if entity.get("streamType") == "final":
+                nonlocal answer_stream_finals
+                if body.get("text") != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT:
+                    answer_stream_finals += 1
+                if body.get("text") == "Done.":
+                    return self._http_result(500)
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-fail")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running noop", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-fail",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - 100.0,
+        }
+        buf["keepalive_rotated"] = True
+        record = a._delivery_record(buf, buf["turns"][0])
+        record["plain_due"] = True
+        await a.send(chat_id=chat, content="Done.", reply_to="act-user-fail")
+        await a.on_processing_complete(event, outcome="success")
+        assert buf.get("keepalive_rotated") is True
+        assert answer_stream_finals == 0
+        assert send_reply_mock.await_count == 0
         await a._drop_turn_buffer(chat)
 
     @pytest.mark.asyncio
@@ -12063,15 +12122,16 @@ class TestEditMessage:
             reply_to=None,
         )
         buf = a._turn_buffers["conv-G-rotate"]
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
         buf["keepalive"] = {
             "stream_id": "old-stream",
             "sequence": 4,
-            "opened_mono": time.monotonic() - 100,
+            "opened_mono": time.monotonic() - (rotate_at + 0.01),
         }
         await a._emit_turn_buffer_keepalive("conv-G-rotate")
-        assert kinds == ["final:old-stream", "informative"]
-        assert buf["keepalive"]["stream_id"] == "new-stream"
-        assert buf["keepalive"]["sequence"] == 1
+        assert kinds == ["final:old-stream"]
+        assert buf.get("keepalive_rotated") is True
+        assert not buf["keepalive"].get("stream_id")
         await a._drop_turn_buffer("conv-G-rotate")
 
     @pytest.mark.asyncio
@@ -12371,16 +12431,18 @@ class TestEditMessage:
             reply_to=None,
         )
         buf = a._turn_buffers["conv-G-rotate-early"]
-        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
         buf["keepalive"] = {
             "stream_id": "aging-stream",
             "sequence": 2,
-            "opened_mono": time.monotonic() - (cap - interval + 0.01),
+            "opened_mono": time.monotonic() - (rotate_at - 0.01),
         }
         await a._emit_turn_buffer_keepalive("conv-G-rotate-early")
-        assert kinds == ["final:aging-stream", "informative"]
-        assert buf["keepalive"]["stream_id"] == "rotated-stream"
+        assert kinds == ["informative:aging-stream"]
+        buf["keepalive"]["opened_mono"] = time.monotonic() - (rotate_at + 0.01)
+        await a._emit_turn_buffer_keepalive("conv-G-rotate-early")
+        assert kinds[-1] == "final:aging-stream"
+        assert buf.get("keepalive_rotated") is True
         await a._drop_turn_buffer("conv-G-rotate-early")
 
     @pytest.mark.asyncio
@@ -14407,11 +14469,13 @@ class TestEditMessage:
             return result
 
         monkeypatch.setattr(a, "_post_keepalive_final_locked", capture_final)
-        buf["keepalive"]["opened_mono"] = time.monotonic() - (cap - interval + 0.01)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        buf["keepalive"]["opened_mono"] = time.monotonic() - (rotate_at + 0.01)
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
-        assert finals == [adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT]
+        assert finals
+        assert finals[0] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         assert "keepalive" in closed_by_snap
-        assert buf["keepalive"]["stream_id"] == "ka-seg"
+        assert not buf["keepalive"].get("stream_id")
         await a._drop_turn_buffer("conv-G-ka-seg")
 
     @pytest.mark.asyncio
