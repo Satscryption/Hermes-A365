@@ -1100,19 +1100,22 @@ def _keepalive_rotation_wait_sec(age: float) -> float:
     return min(interval, target - age)
 
 
-def _keepalive_sleeper_wait_after_emit(stream: dict[str, Any]) -> float:
-    """Seconds to sleep before the next keep-alive emit (#247)."""
-    interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+def _keepalive_sleeper_wait_after_emit(stream: dict[str, Any]) -> float | None:
+    """Seconds to sleep before the next keep-alive emit (#247).
+
+    ``None`` means use the normal keep-alive interval. ``0.0`` means rotation
+    is already due and the loop should re-enter emit immediately.
+    """
     stream_id = str(stream.get("stream_id") or "")
     opened = stream.get("opened_mono")
     if not stream_id or not isinstance(opened, (int, float)):
-        return interval
+        return None
     age = time.monotonic() - float(opened)
     target = _keepalive_rotation_age_sec()
     if age >= target:
         return 0.0
     rotation_wait = _keepalive_rotation_wait_sec(age)
-    return rotation_wait if rotation_wait > 0 else interval
+    return rotation_wait if rotation_wait > 0 else None
 
 
 def _keepalive_user_cancelled(detail: str) -> bool:
@@ -6527,7 +6530,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 stream = self._keepalive_state(buf)
                 wait = _keepalive_sleeper_wait_after_emit(stream)
                 interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
-                await asyncio.sleep(wait if wait > 0 else interval)
+                await asyncio.sleep(wait if wait is not None else interval)
             logger.debug(
                 "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
                 chat_id,
@@ -6720,14 +6723,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 age = time.monotonic() - float(opened)
                 if _keepalive_rotation_due(age):
                     rotation_due_no_informative = True
-                    if self._turn_buffer_live_for_keepalive(buf):
-                        rotated = await self._post_keepalive_rotation_final_locked(chat_id, buf)
-                    else:
-                        logger.debug(
-                            "agent365 turn buffer keep-alive skip rotation final: "
-                            "chat_id=%s reason=turn ended",
-                            chat_id,
-                        )
+                    rotated = await self._post_keepalive_rotation_final_locked(chat_id, buf)
         if rotated:
             return
         if rotation_due_no_informative:

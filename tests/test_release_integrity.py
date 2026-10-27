@@ -390,7 +390,7 @@ def test_live_0_9_5_section_still_parses() -> None:
     assert len(notes.title) <= mod.TITLE_LIMIT
     assert (
         "Ships from ``main`` (2026-10-27) via PRs #223, #231, #232, #233, #234, #236,\n"
-        "#240, #243, #245, #246, #248, #252 (release bump), and #253."
+        "#240, #243, #245, #246, #248, #252 (release bump), #253, and #254."
     ) in notes.body
     assert "2026-10-27" in notes.body
 

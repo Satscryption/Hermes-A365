@@ -15,6 +15,7 @@ import contextlib
 import hashlib
 import importlib
 import json
+import logging
 import os
 import sys
 import time
@@ -11150,6 +11151,77 @@ class TestEditMessage:
         assert a._delivery_record(buf, turn).get("plain_due") is True
         assert not buf["keepalive"].get("stream_id")
 
+    async def _g2_plain_answer_after_rotation_flush(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        fact_before_progress: bool,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G2-plain-{'before' if fact_before_progress else 'after'}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        fact = "G2 fact"
+        progress = "💻 Running sleep 140"
+        rotation_finals: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final" and entity.get("streamId"):
+                rotation_finals.append(str(kwargs["json"].get("text") or ""))
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "g2-plain-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        if fact_before_progress:
+            await a.send(
+                chat_id=chat,
+                content=fact,
+                reply_to="act-1",
+                metadata={"expect_edits": True},
+            )
+            await a.send(chat_id=chat, content=progress, reply_to=None)
+        else:
+            await a.send(chat_id=chat, content=progress, reply_to=None)
+            await a.send(
+                chat_id=chat,
+                content=fact,
+                reply_to="act-1",
+                metadata={"expect_edits": True},
+            )
+        buf = a._turn_buffers[chat]
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        buf["keepalive"] = {
+            "stream_id": "g2-plain-stream",
+            "sequence": 3,
+            "opened_mono": time.monotonic() - (rotate_at + 0.01),
+        }
+        await a._emit_turn_buffer_keepalive(chat)
+        assert len(rotation_finals) == 1
+        assert rotation_finals[0] == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        await a.send(chat_id=chat, content="slept", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        plain = send_reply_mock.await_args.kwargs["reply"]["text"]
+        assert fact in plain
+        assert "slept" in plain
+
     @pytest.mark.asyncio
     async def test_g2_rotation_close_with_fact_after_progress(
         self, monkeypatch: pytest.MonkeyPatch
@@ -11162,6 +11234,74 @@ class TestEditMessage:
     ) -> None:
         await self._g2_rotation_close_at_cap_emit(monkeypatch, fact_before_progress=True)
 
+    @pytest.mark.asyncio
+    async def test_g2_plain_answer_after_rotation_fact_after_progress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await self._g2_plain_answer_after_rotation_flush(
+            monkeypatch, fact_before_progress=False
+        )
+
+    @pytest.mark.asyncio
+    async def test_g2_plain_answer_after_rotation_fact_before_progress(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await self._g2_plain_answer_after_rotation_flush(
+            monkeypatch, fact_before_progress=True
+        )
+
+    @pytest.mark.asyncio
+    async def test_g2_rotation_due_when_turn_not_live_still_closes_not_busy_loop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G2-not-live"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        sleep_mock, _clock = self._advance_monotonic_sleep(
+            monkeypatch, start=rotate_at + 0.01
+        )
+        finals = 0
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            nonlocal finals
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals += 1
+                return self._http_result(202)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        await a.send(
+            chat_id=chat,
+            content="G2 fact",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        buf = a._turn_buffers[chat]
+        buf["depth"] = 0
+        buf["processing_active"] = False
+        buf["keepalive"] = {
+            "stream_id": "not-live-stream",
+            "sequence": 2,
+            "opened_mono": 0.0,
+        }
+        await a._emit_turn_buffer_keepalive(chat)
+        assert finals == 1
+        assert buf.get("keepalive_rotated") is True
+        assert sleep_mock.await_count == 0
+
     def test_g2_sleeper_wait_distinguishes_rotation_due_from_full_interval(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -11172,7 +11312,79 @@ class TestEditMessage:
         monkeypatch.setattr(time, "monotonic", lambda: rotate_at - 1.0)
         assert abs(adapter_mod._keepalive_sleeper_wait_after_emit(stream) - 1.0) < 0.01
         monkeypatch.setattr(time, "monotonic", lambda: rotate_at - 30.0)
-        assert adapter_mod._keepalive_sleeper_wait_after_emit(stream) == 25.0
+        assert adapter_mod._keepalive_sleeper_wait_after_emit(stream) is None
+
+    @pytest.mark.asyncio
+    async def test_g2_sleeper_loop_zero_sleep_when_rotation_already_due(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G2-loop-due"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch, start=0.0)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        rotation_finals = 0
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            nonlocal rotation_finals
+            if entity.get("streamType") == "final" and entity.get("streamId"):
+                rotation_finals += 1
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "loop-due-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        await a.send(
+            chat_id=chat,
+            content="G2 fact",
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "loop-due-stream",
+            "sequence": 1,
+            "opened_mono": 0.0,
+        }
+        buf["keepalive_scheduled_mono"] = 0.0
+        with caplog.at_level(logging.WARNING):
+            task = asyncio.create_task(a._turn_buffer_keepalive(chat))
+            for _ in range(80):
+                await asyncio.sleep(0)
+                if rotation_finals == 1:
+                    break
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        assert rotation_finals == 1
+        assert rotate_at - 0.5 <= clock["t"] <= rotate_at + 1.0
+        assert clock["t"] < cap - 1.0
+        waits = [float(c.args[0]) for c in sleep_mock.await_args_list if c.args]
+        assert waits
+        short_idx = max(i for i, w in enumerate(waits) if 0 < w < 20.0)
+        assert not any(abs(w - 25.0) < 0.01 for w in waits[short_idx + 1 :])
+        skip_logs = [
+            r.message
+            for r in caplog.records
+            if r.name == "hermes_a365.plugin.adapter"
+            and "rotation skipped past cap" in r.message
+        ]
+        assert skip_logs == []
 
     @pytest.mark.asyncio
     async def test_g2_sleeper_closes_at_rotation_with_kept_answer_no_extra_25s(
@@ -11340,6 +11552,10 @@ class TestEditMessage:
             "sequence": 3,
             "opened_mono": 0.0,
         }
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        a._copilot_min_stream_age_before_final_sec = 0
         await a._post_informative_under_lock(chat, allow_restart=True)
         assert opens == 0
         assert buf.get("keepalive_rotated") is True
@@ -11347,6 +11563,10 @@ class TestEditMessage:
         assert turn is not None
         assert a._delivery_record(buf, turn).get("plain_due") is True
         assert not buf["keepalive"].get("stream_id")
+        await a.send(chat_id=chat, content="G2 fact", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 1
+        assert "G2 fact" in send_reply_mock.await_args.kwargs["reply"]["text"]
 
     @pytest.mark.asyncio
     async def test_issue247_keepalive_sleeper_posts_rotation_close_near_115s(
