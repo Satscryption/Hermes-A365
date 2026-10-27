@@ -1032,6 +1032,7 @@ _TURN_BUFFER_KEEPALIVE_TEXT = "Working on it."
 _KEEPALIVE_ROTATION_STATUS_TEXT = (
     "Still working on this. I'll send the answer as a new message."
 )
+_KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC = 1.0
 _INFORMATIVE_TEXT_MAX_CHARS = 1000
 
 
@@ -1098,6 +1099,25 @@ def _keepalive_rotation_wait_sec(age: float) -> float:
     if interval <= 0 or age + interval < target:
         return 0.0
     return min(interval, target - age)
+
+
+def _rotation_close_failure_plain_retire(result: _KeepalivePost) -> bool:
+    """True when a failed rotation final should plain-retire instead of spinning."""
+    status = result.status
+    if status is None:
+        return bool(result.budget_exhausted_before_send or result.connect_before_send)
+    if status is not None and 200 <= status < 300:
+        return False
+    if status == 429:
+        return False
+    if status is not None and status >= 500:
+        return True
+    bucket = _classify_answer_final_post(result)
+    return bucket not in (
+        _ANSWER_FINAL_MAY_HAVE_LANDED,
+        _ANSWER_FINAL_DEFER,
+        _ANSWER_FINAL_DELIVERED,
+    )
 
 
 def _keepalive_sleeper_wait_after_emit(stream: dict[str, Any]) -> float | None:
@@ -6501,6 +6521,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 f"{elapsed_first:.3f}" if elapsed_first is not None else "n/a",
                 will_post,
             )
+            last_sleeper_wait_was_zero = False
             while self._turn_buffer_keepalive_needed(chat_id):
                 buf = self._turn_buffers.get(chat_id)
                 stream = self._keepalive_state(buf)
@@ -6530,7 +6551,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 stream = self._keepalive_state(buf)
                 wait = _keepalive_sleeper_wait_after_emit(stream)
                 interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
-                await asyncio.sleep(wait if wait is not None else interval)
+                sleep_sec = wait if wait is not None else interval
+                rotation_due_zero = sleep_sec == 0.0
+                if rotation_due_zero and last_sleeper_wait_was_zero:
+                    sleep_sec = _KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC
+                await asyncio.sleep(sleep_sec)
+                last_sleeper_wait_was_zero = rotation_due_zero
             logger.debug(
                 "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
                 chat_id,
@@ -6642,13 +6668,23 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return _mark_plain_retired()
+        post_result: list[_KeepalivePost] = []
         closed = await self._post_keepalive_final_locked(
             chat_id,
             buf,
             final_text=close_text,
             outbound_deadline=cap_deadline,
+            post_result=post_result,
         )
         if not closed:
+            if post_result and _rotation_close_failure_plain_retire(post_result[0]):
+                logger.warning(
+                    "agent365 turn buffer keep-alive rotation close failed; "
+                    "plain-retiring stream: chat_id=%s status=%s",
+                    chat_id,
+                    post_result[0].status,
+                )
+                return _mark_plain_retired()
             return False
         buf["keepalive_rotated"] = True
         buf["skip_stream_open"] = True
@@ -7043,6 +7079,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for_answer_delivery: bool = False,
         final_text: str | None = None,
         outbound_deadline: float | None = None,
+        post_result: list[_KeepalivePost] | None = None,
     ) -> bool:
         """POST ``streamType=final``. True only when the stream is closed.
 
@@ -7081,6 +7118,8 @@ class Agent365Adapter(BasePlatformAdapter):
             text=final_text,
             outbound_deadline=outbound_deadline,
         )
+        if post_result is not None:
+            post_result.append(result)
         if self._turn_buffers.get(chat_id) is not buf:
             self._remember_keepalive(chat_id, buf, stream)
             return False
