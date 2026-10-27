@@ -74,6 +74,7 @@ import hashlib
 import ipaddress
 import json
 import logging
+import math
 import mimetypes
 import os
 import re
@@ -1031,7 +1032,15 @@ _TURN_BUFFER_KEEPALIVE_TEXT = "Working on it."
 _INFORMATIVE_TEXT_MAX_CHARS = 1000
 
 
-def _turn_buffer_env_float(name: str, default: float) -> float:
+_COPILOT_STREAM_TIMING_DEFAULT_SEC = 3.0
+_COPILOT_STREAM_TIMING_MAX_SEC = 10.0
+_COPILOT_MEMBER_ADDED_PENDING_TTL_SEC = 600.0
+
+
+def _copilot_stream_timing_sec(
+    name: str, default: float = _COPILOT_STREAM_TIMING_DEFAULT_SEC
+) -> float:
+    """Parse a Copilot stream-timing env var with sane finite bounds (#235)."""
     raw = _profile_env(name)
     if raw is None or not str(raw).strip():
         return default
@@ -1039,21 +1048,9 @@ def _turn_buffer_env_float(name: str, default: float) -> float:
         parsed = float(raw)
     except (TypeError, ValueError):
         return default
-    return max(0.0, parsed)
-
-
-# #217 — Copilot Chat first-turn / short-turn live render: wait until the
-# informative stream has been open long enough before posting the final so
-# informative→final pairs that land too close together do not leave an empty
-# bubble until reload. Scoped to Path B turn-buffer delivery only.
-_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC = _turn_buffer_env_float(
-    "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC",
-    3.0,
-)
-_COPILOT_SHORT_TURN_MAX_DURATION_SEC = _turn_buffer_env_float(
-    "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC",
-    3.0,
-)
+    if not math.isfinite(parsed) or parsed < 0.0:
+        return default
+    return min(parsed, _COPILOT_STREAM_TIMING_MAX_SEC)
 
 
 class _KeepalivePost(NamedTuple):
@@ -1979,6 +1976,12 @@ class Agent365Adapter(BasePlatformAdapter):
         self._turn_buffers: dict[str, dict[str, Any]] = {}
         # #217 — first user turn after membersAdded / install on Copilot Chat.
         self._copilot_member_added_pending: dict[str, float] = {}
+        self._copilot_min_stream_age_before_final_sec = _copilot_stream_timing_sec(
+            "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC",
+        )
+        self._copilot_short_turn_max_duration_sec = _copilot_stream_timing_sec(
+            "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC",
+        )
         self._orphan_keepalive: dict[str, dict[str, Any]] = {}
         # Incremented when a turn buffer is dropped; late openers from an older
         # epoch must be finalized, even after a new turn starts (#203).
@@ -5351,8 +5354,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "open": True,
             "started_mono": time.monotonic(),
         }
-        if str(chat_id) in self._copilot_member_added_pending:
-            turn["copilot_post_member_added"] = True
+        self._apply_copilot_member_added_to_turn(chat_id, turn)
         if buf is None:
             self._turn_buffers[chat_id] = {
                 "turns": [turn],
@@ -5363,6 +5365,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 "processing_active": True,
                 "buf_identity": str(uuid.uuid4()),
                 "keepalive_drop_epoch": int(self._keepalive_drop_epoch.get(str(chat_id), 0)),
+                "answer_delivered_epoch": 0,
             }
         else:
             self._ensure_turn_buffer_identity(buf)
@@ -6045,8 +6048,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 and str(segment.get("text") or "").strip() == posted
             ):
                 return True
+        segments_copy = copy.deepcopy(list(buf.get("segments") or []))
         kept, _drop_ids = self._partition_turn_flush_segments(
-            list(buf.get("segments") or []),
+            segments_copy,
             seq,
             chat_id=None,
         )
@@ -6587,9 +6591,19 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return False
+        epoch_before = 0
+        stream_id_before = ""
         if not for_answer and stream_id:
+            epoch_before = self._answer_delivered_epoch(buf)
+            stream_id_before = stream_id
             await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
             if self._turn_buffers.get(chat_id) is not buf:
+                return False
+            if self._informative_stream_gap_raced(
+                buf,
+                epoch_before=epoch_before,
+                stream_id_before=stream_id_before,
+            ):
                 return False
             stream = self._keepalive_state(buf)
             stream_id = str(stream.get("stream_id") or "")
@@ -7236,8 +7250,10 @@ class Agent365Adapter(BasePlatformAdapter):
             stream["closed_by"] = f"turn:{record['turn_key']}"
         stream["stream_id"] = ""
         buf["keepalive"] = stream
+        self._bump_answer_delivered_epoch(buf)
         self._remove_turn_segments(buf, chunk_segment_ids)
         self._purge_turn_delivery_records(buf)
+        self._release_copilot_member_added_for_turn(chat_id, turn)
         return ("uncertain", None)
 
     def _apply_user_cancel(
@@ -7276,6 +7292,8 @@ class Agent365Adapter(BasePlatformAdapter):
             record["answer_final_settled"] = True
             self._remove_turn_segments(buf, chunk_segment_ids)
             self._purge_turn_delivery_records(buf)
+            self._bump_answer_delivered_epoch(buf)
+            self._release_copilot_member_added_for_turn(chat_id, turn)
             return ("delivered", None)
         stream["stream_id"] = ""
         if not stream.get("closed_by"):
@@ -7417,6 +7435,7 @@ class Agent365Adapter(BasePlatformAdapter):
         stream["closed_by"] = f"turn:{record['turn_key']}"
         stream["stream_id"] = ""
         buf["keepalive"] = stream
+        self._bump_answer_delivered_epoch(buf)
         self._touch_keepalive_emit(chat_id, buf)
         if activity_id:
             self._remember_bot_reply(activity_id, conversation_id=str(chat_id))
@@ -7819,12 +7838,81 @@ class Agent365Adapter(BasePlatformAdapter):
             return float("inf")
         return time.monotonic() - float(started)
 
-    def _copilot_needs_min_stream_age_before_final(self, turn: dict[str, Any]) -> bool:
+    def _expire_stale_copilot_member_added_pending(self, chat_id: str) -> None:
+        noted = self._copilot_member_added_pending.get(str(chat_id))
+        if noted is None:
+            return
+        if time.monotonic() - float(noted) > _COPILOT_MEMBER_ADDED_PENDING_TTL_SEC:
+            self._copilot_member_added_pending.pop(str(chat_id), None)
+
+    def _apply_copilot_member_added_to_turn(self, chat_id: str, turn: dict[str, Any]) -> None:
+        self._expire_stale_copilot_member_added_pending(chat_id)
+        noted = self._copilot_member_added_pending.get(str(chat_id))
+        if noted is None:
+            return
+        started = turn.get("started_mono")
+        if isinstance(started, (int, float)) and float(noted) > float(started):
+            return
+        turn["copilot_post_member_added"] = True
+
+    def _release_copilot_member_added_for_turn(
+        self, chat_id: str, turn: dict[str, Any] | None
+    ) -> None:
+        if not isinstance(turn, dict):
+            return
+        had_flag = bool(turn.get("copilot_post_member_added"))
+        turn.pop("copilot_post_member_added", None)
+        noted = self._copilot_member_added_pending.get(str(chat_id))
+        if noted is None:
+            return
+        if had_flag:
+            self._copilot_member_added_pending.pop(str(chat_id), None)
+            return
+        started = turn.get("started_mono")
+        if isinstance(started, (int, float)) and float(noted) <= float(started):
+            self._copilot_member_added_pending.pop(str(chat_id), None)
+
+    @staticmethod
+    def _answer_delivered_epoch(buf: dict[str, Any]) -> int:
+        return int(buf.get("answer_delivered_epoch") or 0)
+
+    @staticmethod
+    def _bump_answer_delivered_epoch(buf: dict[str, Any]) -> None:
+        buf["answer_delivered_epoch"] = int(buf.get("answer_delivered_epoch") or 0) + 1
+
+    @staticmethod
+    def _informative_stream_gap_raced(
+        buf: dict[str, Any],
+        *,
+        epoch_before: int,
+        stream_id_before: str,
+    ) -> bool:
+        """True when an answer final landed while an informative gap sleep was in flight."""
+        if Agent365Adapter._answer_delivered_epoch(buf) != epoch_before:
+            return True
+        if stream_id_before:
+            stream_id_now = str(Agent365Adapter._keepalive_state(buf).get("stream_id") or "")
+            if stream_id_now != stream_id_before:
+                return True
+        return False
+
+    def _copilot_needs_min_stream_age_before_final(
+        self, chat_id: str, turn: dict[str, Any]
+    ) -> bool:
         if not self._is_copilot_turn_buffer_turn(turn):
             return False
+        self._apply_copilot_member_added_to_turn(chat_id, turn)
+        if (
+            not turn.get("copilot_post_member_added")
+            and str(chat_id) in self._copilot_member_added_pending
+            and not turn.get("copilot_member_added_decided")
+        ):
+            turn["copilot_post_member_added"] = True
         if turn.get("copilot_post_member_added"):
             return True
-        return self._turn_buffer_turn_duration_sec(turn) <= _COPILOT_SHORT_TURN_MAX_DURATION_SEC
+        return (
+            self._turn_buffer_turn_duration_sec(turn) <= self._copilot_short_turn_max_duration_sec
+        )
 
     async def _ensure_copilot_min_stream_age_before_final_locked(
         self,
@@ -7833,26 +7921,32 @@ class Agent365Adapter(BasePlatformAdapter):
         turn: dict[str, Any],
     ) -> None:
         """Hold the final until the Copilot informative stream meets minimum age (#217)."""
-        if not self._copilot_needs_min_stream_age_before_final(turn):
+        if not self._copilot_needs_min_stream_age_before_final(chat_id, turn):
+            turn["copilot_member_added_decided"] = True
             return
-        min_age = _COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC
+        min_age = self._copilot_min_stream_age_before_final_sec
+        if not math.isfinite(min_age) or min_age < 0:
+            min_age = _COPILOT_STREAM_TIMING_DEFAULT_SEC
+        min_age = min(min_age, _COPILOT_STREAM_TIMING_MAX_SEC)
         if min_age <= 0:
+            turn["copilot_member_added_decided"] = True
             return
         while self._turn_buffers.get(chat_id) is buf:
             stream = self._keepalive_stream(buf)
             if not str(stream.get("stream_id") or ""):
+                turn["copilot_member_added_decided"] = True
                 return
             age = _keepalive_stream_age_sec(stream)
             if age >= min_age:
+                turn["copilot_member_added_decided"] = True
                 return
             await self._sleep_turn_buffer_locked(chat_id, buf, min_age - age)
             if self._turn_buffers.get(chat_id) is not buf:
                 return
+        turn["copilot_member_added_decided"] = True
 
     def _clear_copilot_post_member_added(self, chat_id: str, turn: dict[str, Any]) -> None:
-        if turn.get("copilot_post_member_added"):
-            turn.pop("copilot_post_member_added", None)
-            self._copilot_member_added_pending.pop(str(chat_id), None)
+        self._release_copilot_member_added_for_turn(chat_id, turn)
 
     async def _sleep_turn_buffer_stream_gap_locked(self, chat_id: str, buf: dict[str, Any]) -> None:
         """Pace informative→final pairs without blocking the keep-alive task."""
@@ -8433,6 +8527,8 @@ class Agent365Adapter(BasePlatformAdapter):
                                     [str(segment.get("id") or "") for segment in chunk_segments],
                                 )
                                 self._purge_turn_delivery_records(buf)
+                                self._bump_answer_delivered_epoch(buf)
+                                self._release_copilot_member_added_for_turn(chat_id, turn)
                                 first_chunk_on_stream = False
                                 continue
                             logger.warning(
@@ -8463,6 +8559,8 @@ class Agent365Adapter(BasePlatformAdapter):
                             [str(segment.get("id") or "") for segment in chunk_segments],
                         )
                         self._purge_turn_delivery_records(buf)
+                        self._bump_answer_delivered_epoch(buf)
+                        self._release_copilot_member_added_for_turn(chat_id, turn)
                         first_chunk_on_stream = False
                         continue
                 result = await self._send_reply_activity(
@@ -8493,6 +8591,8 @@ class Agent365Adapter(BasePlatformAdapter):
                             [str(segment.get("id") or "") for segment in chunk_segments],
                         )
                         self._purge_turn_delivery_records(buf)
+                        self._bump_answer_delivered_epoch(buf)
+                        self._release_copilot_member_added_for_turn(chat_id, turn)
                         continue
                     logger.warning(
                         "agent365 turn buffer flush failed: chat_id=%s error=%s",
@@ -13686,6 +13786,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for turn_key in target_order:
             self._drop_coalesced_turn_target(turn_key)
         self._coalesced_turn_target_count_by_chat.pop(chat_id, None)
+        self._copilot_member_added_pending.pop(str(chat_id), None)
         await self._drop_turn_buffer(chat_id)
         for key in list(self._recently_finalized):
             if key[0] == chat_id:
