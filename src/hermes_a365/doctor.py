@@ -230,13 +230,17 @@ def _az_cli_suffix_is_prerelease(suffix: str) -> bool:
     lowered = suffix.lower().strip()
     if not lowered:
         return False
+    if re.match(r"^a\d+", lowered):
+        return True
     if re.match(r"^(?:b|rc)\d+", lowered):
         return True
-    if re.search(r"(?:^|[.~-])(?:dev|rc|preview|alpha|beta)", lowered):
+    if re.match(r"^[~.-]*b(?:\d+|\.\d+)", lowered):
         return True
-    if re.match(r"^[~.-]*b\d+", lowered):
+    if re.match(r"^~(?:b|rc)(?:\d+|\.\d+)", lowered):
         return True
-    return bool(re.match(r"^~(?:b|rc)\d+", lowered))
+    return bool(
+        re.search(r"(?:^|[.~-])(?:dev(?:\d+)?(?=$|[.+~-])|rc|preview|alpha|beta)", lowered)
+    )
 
 
 def parse_az_cli_release(raw: str) -> tuple[tuple[int, int, int] | None, bool]:

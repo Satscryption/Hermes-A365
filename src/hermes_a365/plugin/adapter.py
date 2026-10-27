@@ -5220,6 +5220,7 @@ class Agent365Adapter(BasePlatformAdapter):
         log_context: str,
         citations: Any = None,
         validated_path: str | None = None,
+        turn_buffer_flush: tuple[str, dict[str, Any]] | None = None,
     ) -> SendResult:
         bridge = _import_bridge()
         generation = self._lifecycle_generation
@@ -5247,6 +5248,14 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._feedback_enabled:
             webhook_response["feedback"] = True
         reply = bridge.render_reply_activity(inbound, webhook_response)
+        retry_sleep = None
+        if turn_buffer_flush is not None:
+            flush_chat_id, flush_buf = turn_buffer_flush
+
+            async def retry_sleep(delay: float) -> None:
+                await self._sleep_turn_buffer_locked(flush_chat_id, flush_buf, delay)
+
+            retry_sleep = retry_sleep
         try:
             response = await self._await_outbound(
                 chat_id,
@@ -5262,6 +5271,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         if validated_path is not None
                         else self._validated_path_for_inbound(inbound)
                     ),  # L4 (#100)
+                    sleep=retry_sleep,
                 ),
             )
         except Exception as e:
@@ -7853,7 +7863,13 @@ class Agent365Adapter(BasePlatformAdapter):
         started = turn.get("started_mono")
         if isinstance(started, (int, float)) and float(noted) > float(started):
             return
+        self._remember_copilot_post_member_added(chat_id, turn)
+
+    def _remember_copilot_post_member_added(self, chat_id: str, turn: dict[str, Any]) -> None:
         turn["copilot_post_member_added"] = True
+        pending = self._copilot_member_added_pending.get(str(chat_id))
+        if pending is not None:
+            turn["copilot_member_added_consumed_mono"] = float(pending)
 
     def _release_copilot_member_added_for_turn(
         self, chat_id: str, turn: dict[str, Any] | None
@@ -7861,14 +7877,19 @@ class Agent365Adapter(BasePlatformAdapter):
         if not isinstance(turn, dict):
             return
         had_flag = bool(turn.get("copilot_post_member_added"))
+        consumed = turn.pop("copilot_member_added_consumed_mono", None)
         turn.pop("copilot_post_member_added", None)
         noted = self._copilot_member_added_pending.get(str(chat_id))
         if noted is None:
             return
-        if had_flag:
-            self._copilot_member_added_pending.pop(str(chat_id), None)
-            return
         started = turn.get("started_mono")
+        if had_flag:
+            if consumed is not None:
+                if float(noted) == float(consumed):
+                    self._copilot_member_added_pending.pop(str(chat_id), None)
+            elif isinstance(started, (int, float)) and float(noted) <= float(started):
+                self._copilot_member_added_pending.pop(str(chat_id), None)
+            return
         if isinstance(started, (int, float)) and float(noted) <= float(started):
             self._copilot_member_added_pending.pop(str(chat_id), None)
 
@@ -7907,7 +7928,7 @@ class Agent365Adapter(BasePlatformAdapter):
             and str(chat_id) in self._copilot_member_added_pending
             and not turn.get("copilot_member_added_decided")
         ):
-            turn["copilot_post_member_added"] = True
+            self._remember_copilot_post_member_added(chat_id, turn)
         if turn.get("copilot_post_member_added"):
             return True
         return (
@@ -8504,6 +8525,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             content=content,
                             log_context="turn buffer",
                             validated_path=path,
+                            turn_buffer_flush=(chat_id, buf),
                         )
                         if not result.success:
                             error = str(result.error or "")
@@ -8568,6 +8590,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     content=content,
                     log_context="turn buffer",
                     validated_path=path,
+                    turn_buffer_flush=(chat_id, buf),
                 )
                 if not result.success:
                     error = str(result.error or "")
@@ -8625,6 +8648,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     content=suffix.strip(),
                     log_context="turn buffer",
                     validated_path=path,
+                    turn_buffer_flush=(chat_id, buf),
                 )
                 if not link_result.success:
                     logger.warning(

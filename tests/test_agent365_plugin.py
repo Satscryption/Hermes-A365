@@ -9099,6 +9099,23 @@ class TestEditMessage:
         assert chat not in a._copilot_member_added_pending
 
     @pytest.mark.asyncio
+    async def test_copilot_release_keeps_newer_pending_after_flagged_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-pending-stamp"
+        turn = {
+            "started_mono": 100.0,
+            "copilot_post_member_added": True,
+            "copilot_member_added_consumed_mono": 50.0,
+        }
+        a._copilot_member_added_pending[chat] = 200.0
+        a._release_copilot_member_added_for_turn(chat, turn)
+        assert chat in a._copilot_member_added_pending
+        assert a._copilot_member_added_pending[chat] == 200.0
+        assert "copilot_post_member_added" not in turn
+
+    @pytest.mark.asyncio
     async def test_copilot_member_added_pending_survives_turn_buffer_drop(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -11036,10 +11053,35 @@ class TestEditMessage:
         chat = "conv-G-nest-gap-retry"
         inbound = _make_inbound(conv_id=chat, activity_id="act-outer")
         inbound["conversation"]["conversationType"] = "groupChat"
-        self._wire_adapter(a, inbound=inbound)
+        post_mock = self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0.3)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        gap_entered = asyncio.Event()
+        gap_release = asyncio.Event()
+        gap_blocks = {"n": 0}
+
+        async def gated_gap(
+            self: adapter_mod.Agent365Adapter, chat_id: str, buf: dict[str, Any]
+        ) -> None:
+            gap_blocks["n"] += 1
+            if gap_blocks["n"] > 1:
+                return
+            gap_entered.set()
+            lock = adapter_mod.Agent365Adapter._turn_buffer_lock(buf)
+            released = False
+            if lock.locked():
+                lock.release()
+                released = True
+            await gap_release.wait()
+            if released:
+                await lock.acquire()
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_sleep_turn_buffer_stream_gap_locked",
+            gated_gap,
+        )
         outer_event = _StubMessageEvent(
             text="outer",
             source=_StubSessionSource(platform=None, chat_id=chat),
@@ -11059,19 +11101,49 @@ class TestEditMessage:
             "stream_id": "ka-nest-retry",
             "sequence": 2,
             "opened_mono": time.monotonic(),
-            "last_emit_mono": time.monotonic(),
+            "last_emit_mono": time.monotonic() - 0.01,
         }
-        await a.send(chat_id=chat, content="Inner.", reply_to="act-inner")
+        informative_done = asyncio.Event()
+        informative_result: list[bool] = []
+
+        async def outer_informative() -> None:
+            informative_result.append(
+                await a._post_informative_locked(
+                    chat,
+                    buf,
+                    allow_restart=True,
+                    turn_for_text=outer_turn,
+                )
+            )
+            informative_done.set()
+
+        informative_task = asyncio.create_task(outer_informative())
+        await asyncio.wait_for(gap_entered.wait(), timeout=5.0)
+        await a.send(chat_id=chat, content="Inner answer.", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
-        assert a._answer_delivered_epoch(buf) >= 1
-        first = await a._post_informative_locked(
-            chat, buf, allow_restart=False, turn_for_text=outer_turn
+        gap_release.set()
+        await asyncio.wait_for(informative_done.wait(), timeout=5.0)
+        await informative_task
+        assert informative_result == [False]
+        finals = [
+            call.kwargs["json"]
+            for call in post_mock.await_args_list
+            if (call.kwargs["json"].get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert finals
+        assert finals[-1]["text"] == "Inner answer."
+        after_final = post_mock.await_args_list[
+            next(
+                i
+                for i, call in enumerate(post_mock.await_args_list)
+                if (call.kwargs["json"].get("entities") or [{}])[0].get("streamType") == "final"
+            )
+            + 1 :
+        ]
+        assert not any(
+            call.kwargs["json"].get("text") == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+            for call in after_final
         )
-        second = await a._post_informative_locked(
-            chat, buf, allow_restart=False, turn_for_text=outer_turn
-        )
-        assert first is False
-        assert second is False
 
     @pytest.mark.asyncio
     async def test_unmarked_merged_commentary_not_duplicated_on_informative(

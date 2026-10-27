@@ -4151,7 +4151,7 @@ class TestTokenFactory:
 
     @pytest.mark.asyncio
     async def test_for_graph_unknown_path_raises(self) -> None:
-        with pytest.raises(RuntimeError, match="Path A or Path B"):
+        with pytest.raises(RuntimeError, match="validated_path must be A or B"):
             await self._factory().for_graph(
                 {"recipient": {}, "conversation": {}, "serviceUrl": "https://x.example/y"},
                 validated_path=None,
@@ -4177,7 +4177,7 @@ class TestTokenFactory:
             "conversation": {},
         }
         for activity in (path_a_activity, path_b_activity):
-            with pytest.raises(RuntimeError, match="Path A or Path B"):
+            with pytest.raises(RuntimeError, match="validated_path must be A or B"):
                 await self._factory().for_graph(activity, validated_path=None)
         path_a_mint.assert_not_called()
         path_b_mint.assert_not_called()
@@ -4194,7 +4194,7 @@ class TestTokenFactory:
             "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
             "conversation": {"tenantId": "t"},
         }
-        with pytest.raises(RuntimeError, match="Path A or Path B"):
+        with pytest.raises(RuntimeError, match="validated_path must be A or B"):
             await self._factory().for_graph(activity, validated_path="unknown")
         mint.assert_not_called()
 

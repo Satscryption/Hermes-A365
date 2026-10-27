@@ -3102,7 +3102,8 @@ class TokenFactory:
         Path A → the three-stage user-FIC chain (delegated, user-context) at
         the Graph scope. Path B → an app-only ``client_credentials`` token
         (Graph is exempt from AADSTS82001, so the Path B identity mints it
-        directly). Raises for an unclassifiable activity rather than guessing.
+        directly). Raises when ``validated_path`` is missing or not ``A``/``B``
+        rather than inferring from the activity body.
         """
         path_tag = validated_path if validated_path in ("A", "B") else "unknown"
         if path_tag == "A":
@@ -3124,9 +3125,8 @@ class TokenFactory:
             )
             return str(payload["access_token"])
         raise RuntimeError(
-            "cannot classify inbound activity as Path A or Path B for a Graph "
-            f"token: recipient={activity.get('recipient')!r} "
-            f"serviceUrl={activity.get('serviceUrl')!r}"
+            "validated_path must be A or B for a Graph token; "
+            f"got validated_path={validated_path!r}"
         )
 
     async def for_app(
@@ -3392,6 +3392,7 @@ async def send_reply(
     validated_path: str | None,
     deadline: float | None = None,
     retry_total_budget_sec: float | None = None,
+    sleep: Any | None = None,
 ) -> Any:
     """POST a reply Activity to the inbound's serviceUrl.
 
@@ -3467,6 +3468,7 @@ async def send_reply(
             _post_once,
             call_site="activity_bridge.send_reply",
             max_attempts=OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+            sleep=sleep,
             **retry_kwargs,
         )
     except Exception as exc:

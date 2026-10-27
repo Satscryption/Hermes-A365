@@ -8,6 +8,27 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **#237 — `doctor` az CLI version parser edge cases (#222 follow-up).** Treat PEP 440
+  ``aN`` alphas and dotted ``-b.1`` / ``~b.1`` betas as prereleases at the floor;
+  match ``dev`` only when followed by optional digits (not ``developer``). Refs
+  [#237](https://github.com/Satscryption/Hermes-A365/issues/237).
+
+- **#238 — Outbound retry timing (#190 follow-up).** Turn-buffer plain ``send_reply``
+  retries release the per-chat buffer lock across backoff sleeps (same pattern as
+  Copilot min-stream-age waits). Refs
+  [#238](https://github.com/Satscryption/Hermes-A365/issues/238).
+
+- **#239 — `TokenFactory.for_graph` error wording (#225 follow-up).** Docstring and
+  ``RuntimeError`` name ``validated_path`` instead of implying body-based
+  classification. Refs
+  [#239](https://github.com/Satscryption/Hermes-A365/issues/239).
+
+- **#241 — Copilot pending release and informative gap test (#212/#235 follow-up).**
+  ``_release_copilot_member_added_for_turn`` only clears pending when the stamped
+  time belongs to the finishing turn; informative gap retry test exercises the
+  epoch guard during a gated stream-gap sleep. Refs
+  [#241](https://github.com/Satscryption/Hermes-A365/issues/241).
+
 - **#212 — Copilot keepalive commentary edge cases.** Keepalive merge checks
   partition segments on a copy so live kinds are not promoted during
   informative posts; a buffer-level answer-delivered epoch (and stream-id
