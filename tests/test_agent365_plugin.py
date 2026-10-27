@@ -9052,6 +9052,10 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         informative = self._walk095_typing_posts(posts)
         assert informative
+        for item in informative:
+            text = str(item.get("text") or "").strip()
+            assert text, "informative stream post must carry visible text"
+            assert text != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         self._walk095_assert_typing_excludes_answer(posts, "slept")
         finals = [p for p in posts if p.get("type") == "message"]
         assert len(finals) == 1
@@ -9151,7 +9155,7 @@ class TestEditMessage:
         }
         assert a._sanitize_informative_stream_text(
             buf_slow, turn, "slept", for_answer=False
-        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
         clipped = "x" * adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
         long_answer = clipped + "tail"
         buf_long = {
@@ -9160,7 +9164,25 @@ class TestEditMessage:
         }
         assert a._sanitize_informative_stream_text(
             buf_long, turn, clipped, for_answer=False
-        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+
+    def test_walk095_sanitize_uses_progress_fallback_after_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        turn = {"seq": "1"}
+        progress = "💻 Running sleep 40"
+        buf = {
+            "keepalive_first_interval_elapsed": True,
+            "segments": [
+                {"turn": "1", "text": "slept", "kind": "answer", "reply_to": "act-1"},
+                {"turn": "1", "text": progress, "kind": "progress"},
+            ],
+        }
+        assert (
+            a._sanitize_informative_stream_text(buf, turn, "slept", for_answer=False)
+            == progress
+        )
 
     def test_walk095_sanitize_joined_and_prefix_answer_leaks(
         self, monkeypatch: pytest.MonkeyPatch
@@ -9177,11 +9199,11 @@ class TestEditMessage:
         joined = "Line one.\n\nLine two."
         assert a._sanitize_informative_stream_text(
             buf, turn, joined, for_answer=False
-        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
         prefix = "Line one.\n\nLine tw"
         assert a._sanitize_informative_stream_text(
             buf, turn, prefix, for_answer=False
-        ) == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
     @pytest.mark.asyncio
@@ -10996,6 +11018,164 @@ class TestEditMessage:
         assert adapter_mod._keepalive_rotation_due(rotate_at + 0.01)
 
     @pytest.mark.asyncio
+    async def test_issue247_keepalive_sleeper_posts_rotation_close_near_115s(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-sleeper"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch, start=0.0)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        close_times: list[float] = []
+        outbound_deadlines: list[float] = []
+        orig_post = adapter_mod.Agent365Adapter._post_keepalive_activity
+
+        async def capture_post(
+            self: Any,
+            chat_id: str,
+            turn: dict[str, Any],
+            *,
+            stream_id: str,
+            sequence: int,
+            final: bool,
+            for_teardown: bool = False,
+            text: str | None = None,
+            message_chrome: bool = False,
+            outbound_deadline: float | None = None,
+        ) -> Any:
+            if final and stream_id:
+                close_times.append(clock["t"])
+                if outbound_deadline is not None:
+                    outbound_deadlines.append(float(outbound_deadline))
+            return await orig_post(
+                self,
+                chat_id,
+                turn,
+                stream_id=stream_id,
+                sequence=sequence,
+                final=final,
+                for_teardown=for_teardown,
+                text=text,
+                message_chrome=message_chrome,
+                outbound_deadline=outbound_deadline,
+            )
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_post_keepalive_activity",
+            capture_post,
+        )
+
+        async def http_post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "sleeper-stream")
+            return self._http_result(202)
+
+        a._http_client.post = http_post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 200", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "sleeper-stream",
+            "sequence": 1,
+            "opened_mono": 0.0,
+        }
+        buf["keepalive_scheduled_mono"] = 0.0
+        task = asyncio.create_task(a._turn_buffer_keepalive(chat))
+        for _ in range(40):
+            await asyncio.sleep(0)
+            if close_times:
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert close_times, "expected rotation close final"
+        assert rotate_at - 0.5 <= close_times[0] <= rotate_at + 1.0
+        assert outbound_deadlines
+        assert outbound_deadlines[0] <= cap + 0.01
+        waits = [float(c.args[0]) for c in sleep_mock.await_args_list if c.args]
+        assert any(
+            abs(w - (rotate_at - 100.0)) < 0.01 or abs(w - 15.0) < 0.01 for w in waits
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue247_slow_turn_keepalive_informative_posts_visible_text(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Post-interval heartbeats must not post empty/placeholder informative bodies."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-visible"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch, start=0.0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        fact = "G2 fact."
+        progress = "💻 Running sleep 150"
+        informative_posts: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            entity = body["entities"][0]
+            if entity.get("streamType") == "informative":
+                informative_posts.append(str(body.get("text") or ""))
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "vis-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content=fact,
+            reply_to="act-1",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content=progress, reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "vis-stream",
+            "sequence": 1,
+            "opened_mono": 0.0,
+        }
+        buf["keepalive_scheduled_mono"] = 0.0
+        task = asyncio.create_task(a._turn_buffer_keepalive(chat))
+        for _ in range(30):
+            await asyncio.sleep(0)
+            if len(informative_posts) >= 2:
+                break
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert len(informative_posts) >= 2
+        for text in informative_posts:
+            visible = str(text or "").strip()
+            assert visible
+            assert fact not in visible
+            assert visible != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert any(progress in text for text in informative_posts[1:])
+
+    @pytest.mark.asyncio
     async def test_issue247_answer_plain_after_keepalive_rotation_with_reply_to(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -11014,16 +11194,21 @@ class TestEditMessage:
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
         final_posts: list[dict[str, Any]] = []
-        informative_openers = {"n": 0}
+        progress_line = "💻 Running sleep 150"
+        posts_after_rotation: list[dict[str, Any]] = []
+        saw_rotation_final = False
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             body = kwargs["json"]
             entity = body["entities"][0]
+            nonlocal saw_rotation_final
             if entity.get("streamType") == "final":
                 final_posts.append(body)
+                saw_rotation_final = True
                 return self._http_result(202)
+            if saw_rotation_final:
+                posts_after_rotation.append(body)
             if entity.get("streamType") == "informative" and "streamId" not in entity:
-                informative_openers["n"] += 1
                 return self._http_result(201, "stream-247")
             return self._http_result(202)
 
@@ -11041,7 +11226,7 @@ class TestEditMessage:
             reply_to=user_reply,
             metadata={"expect_edits": True},
         )
-        await a.send(chat_id=chat, content="💻 Running sleep 150", reply_to=None)
+        await a.send(chat_id=chat, content=progress_line, reply_to=None)
         buf = a._turn_buffers[chat]
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
         buf["keepalive"] = {
@@ -11053,7 +11238,8 @@ class TestEditMessage:
         assert buf.get("keepalive_rotated") is True
         assert not buf["keepalive"].get("stream_id")
         assert len(final_posts) == 1
-        assert final_posts[0]["text"] == fact
+        assert progress_line in final_posts[0]["text"]
+        assert fact not in final_posts[0]["text"]
         assert final_posts[0]["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         await a.send(
             chat_id=chat,
@@ -11062,6 +11248,7 @@ class TestEditMessage:
         )
         await a.on_processing_complete(event, outcome="success")
         assert len(final_posts) == 1
+        assert posts_after_rotation == []
         assert send_reply_mock.await_count == 1
         plain = send_reply_mock.await_args.kwargs["reply"]["text"]
         assert fact in plain
@@ -12029,7 +12216,11 @@ class TestEditMessage:
         await a.send(chat_id=chat, content="Part two of the answer.", reply_to=None)
         await self._spin_until(
             lambda: any(
-                body.get("text") == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+                body.get("text")
+                in (
+                    adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
+                    adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
+                )
                 and body.get("type") == "typing"
                 for body in posts
             )
@@ -12146,14 +12337,21 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await self._spin_until(
             lambda: any(
-                body.get("text") == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+                body.get("text")
+                in (
+                    adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
+                    adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
+                )
                 and body.get("type") == "typing"
                 for body in posts
             )
         )
         await a.send(chat_id=chat, content="Done.", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
-        assert posts[0]["text"] == adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert posts[0]["text"] in (
+            adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
+            adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
+        )
         assert not any(
             body.get("type") == "typing" and not str(body.get("text") or "").strip()
             for body in posts

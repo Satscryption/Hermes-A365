@@ -1099,6 +1099,18 @@ def _keepalive_rotation_wait_sec(age: float) -> float:
     return min(interval, target - age)
 
 
+def _keepalive_sleeper_wait_after_emit(stream: dict[str, Any]) -> float:
+    """Seconds to sleep before the next keep-alive emit (#247)."""
+    interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+    stream_id = str(stream.get("stream_id") or "")
+    opened = stream.get("opened_mono")
+    if not stream_id or not isinstance(opened, (int, float)):
+        return interval
+    age = time.monotonic() - float(opened)
+    rotation_wait = _keepalive_rotation_wait_sec(age)
+    return rotation_wait if rotation_wait > 0 else interval
+
+
 def _keepalive_user_cancelled(detail: str) -> bool:
     low = detail.casefold()
     return "canceled by user" in low or "cancelled by user" in low
@@ -5923,6 +5935,8 @@ class Agent365Adapter(BasePlatformAdapter):
         buf = self._turn_buffers.get(chat_id)
         if not isinstance(buf, dict):
             return False
+        if buf.get("keepalive_rotated"):
+            return False
         if buf.get("processing_active"):
             return True
         if int(buf.get("depth") or 0) > 0:
@@ -6023,6 +6037,42 @@ class Agent365Adapter(BasePlatformAdapter):
                 return True
         return False
 
+    def _visible_informative_fallback_text(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> str:
+        """Non-empty informative body for slow-turn heartbeats (#247 / walk095).
+
+        Copilot Chat can render bare ``Working on it.`` on informative streams as
+        an empty chrome shell; prefer the latest tool progress or commentary.
+        """
+        seq = str(turn.get("seq") or "")
+        commentary = ""
+        marked_turn = self._turn_has_marked_answer(buf, turn)
+        for segment in reversed(buf.get("segments") or []):
+            if str(segment.get("turn") or "") != seq:
+                continue
+            if segment.get("defer_to_final_merge"):
+                continue
+            if not marked_turn and segment.get("informative_update"):
+                continue
+            if _segment_is_marked_answer(segment):
+                continue
+            kind = self._turn_buffer_segment_kind(segment)
+            if kind == "answer":
+                continue
+            if kind not in ("progress", "commentary"):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if not text or text == _TURN_BUFFER_KEEPALIVE_TEXT:
+                continue
+            if kind == "progress" or _is_hermes_tool_progress_segment(text):
+                return text[:_INFORMATIVE_TEXT_MAX_CHARS]
+            if not commentary:
+                commentary = text
+        if commentary:
+            return commentary[:_INFORMATIVE_TEXT_MAX_CHARS]
+        return _KEEPALIVE_ROTATION_STATUS_TEXT
+
     def _sanitize_informative_stream_text(
         self,
         buf: dict[str, Any],
@@ -6034,11 +6084,13 @@ class Agent365Adapter(BasePlatformAdapter):
         """Keep answer bodies off post-interval informative updates (#227 / walk095)."""
         posted = str(text or "").strip()
         if not posted or self._is_placeholder_informative_text(posted):
-            return posted
+            if posted or not buf.get("keepalive_first_interval_elapsed"):
+                return posted
+            return self._visible_informative_fallback_text(buf, turn)
         if not buf.get("keepalive_first_interval_elapsed"):
             return posted
         if self._informative_text_is_answer_body_leak(buf, turn, posted):
-            return _TURN_BUFFER_KEEPALIVE_TEXT
+            return self._visible_informative_fallback_text(buf, turn)
         return posted
 
     def _informative_segments_pending_display(
@@ -6281,16 +6333,25 @@ class Agent365Adapter(BasePlatformAdapter):
             preview = ""
         if preview:
             return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
+        if buf.get("keepalive_first_interval_elapsed"):
+            return self._visible_informative_fallback_text(buf, turn)
         return _TURN_BUFFER_KEEPALIVE_TEXT
 
     def _rotation_stream_close_text(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
-        """Final body when retiring an informative stream at the rotation age (#247)."""
-        preview = self._marked_answer_preview_for_turn(buf, turn).strip()
-        if preview:
-            return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
-        text = self._informative_text_for_turn(buf, turn).strip()
-        if text and text != _TURN_BUFFER_KEEPALIVE_TEXT:
-            return text[:_INFORMATIVE_TEXT_MAX_CHARS]
+        """Final body when retiring an informative stream at the rotation age (#247).
+
+        Marked answers and facts belong only in the plain reply, not this close.
+        """
+        seq = str(turn.get("seq") or "")
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            kind = self._turn_buffer_segment_kind(segment)
+            if kind not in ("progress", "commentary"):
+                continue
+            text = str(segment.get("text") or "").strip()
+            if text and text != _TURN_BUFFER_KEEPALIVE_TEXT:
+                return text[:_INFORMATIVE_TEXT_MAX_CHARS]
         return _KEEPALIVE_ROTATION_STATUS_TEXT
 
     def _marked_answer_preview_for_turn(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
@@ -6463,7 +6524,13 @@ class Agent365Adapter(BasePlatformAdapter):
                         self._turn_buffer_keepalive_skip_reason(chat_id),
                     )
                     return
-                await asyncio.sleep(_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC)
+                buf = self._turn_buffers.get(chat_id)
+                if not isinstance(buf, dict):
+                    return
+                stream = self._keepalive_state(buf)
+                wait = _keepalive_sleeper_wait_after_emit(stream)
+                interval = _TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
+                await asyncio.sleep(wait if wait > 0 else interval)
             logger.debug(
                 "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
                 chat_id,
@@ -6541,36 +6608,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 return turn
         return None
 
-    async def _post_turn_buffer_typing_if_plain_keepalive(
-        self, chat_id: str, buf: dict[str, Any]
-    ) -> None:
-        """Plain BF typing pulse after stream retirement (no streaminfo)."""
-        if not buf.get("keepalive_rotated"):
-            return
-        stream = self._keepalive_state(buf)
-        if str(stream.get("stream_id") or ""):
-            return
-        turn = self._keepalive_turn(buf)
-        if not isinstance(turn, dict):
-            return
-        inbound = turn.get("inbound")
-        if not isinstance(inbound, dict):
-            return
-        activity = {
-            "type": "typing",
-            "from": inbound.get("recipient") or {},
-            "recipient": inbound.get("from") or {},
-            "conversation": inbound.get("conversation") or {},
-        }
-        try:
-            await self._post_activity(inbound=inbound, activity=activity)
-        except Exception as exc:
-            logger.debug(
-                "agent365 turn buffer plain keep-alive typing failed: chat_id=%s error=%s",
-                chat_id,
-                exc,
-            )
-
     async def _post_keepalive_rotation_final_locked(self, chat_id: str, buf: dict[str, Any]) -> bool:
         """Close an aging informative stream with real text; no second stream (#247)."""
         turn = self._keepalive_turn(buf)
@@ -6582,24 +6619,39 @@ class Agent365Adapter(BasePlatformAdapter):
         if not stream_id or not isinstance(opened, (int, float)):
             return False
         close_text = self._rotation_stream_close_text(buf, turn)
-        deadline = float(opened) + _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        cap_deadline = float(opened) + _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         now = time.monotonic()
-        if deadline < now:
-            from hermes_a365.outbound_retry import OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+        record = self._delivery_record(buf, turn)
 
-            deadline = now + OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+        def _mark_plain_retired() -> bool:
+            stream_state = self._keepalive_state(buf)
+            stream_state["stream_id"] = ""
+            stream_state["closed_by"] = "keepalive"
+            buf["keepalive"] = stream_state
+            buf["keepalive_rotated"] = True
+            buf["skip_stream_open"] = True
+            record["plain_due"] = True
+            self._cancel_turn_buffer_keepalive(buf)
+            return True
+
+        if cap_deadline <= now:
+            logger.warning(
+                "agent365 turn buffer keep-alive rotation skipped past cap: chat_id=%s",
+                chat_id,
+            )
+            return _mark_plain_retired()
         closed = await self._post_keepalive_final_locked(
             chat_id,
             buf,
             final_text=close_text,
-            outbound_deadline=deadline,
+            outbound_deadline=cap_deadline,
         )
         if not closed:
             return False
         buf["keepalive_rotated"] = True
         buf["skip_stream_open"] = True
-        record = self._delivery_record(buf, turn)
         record["plain_due"] = True
+        self._cancel_turn_buffer_keepalive(buf)
         return True
 
     async def _emit_turn_buffer_keepalive(self, chat_id: str) -> None:
@@ -6620,7 +6672,6 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             return
         if buf.get("keepalive_rotated"):
-            await self._post_turn_buffer_typing_if_plain_keepalive(chat_id, buf)
             return
         rotated = False
         async with self._turn_buffer_lock(buf):
@@ -6825,6 +6876,8 @@ class Agent365Adapter(BasePlatformAdapter):
         informative_text = self._sanitize_informative_stream_text(
             buf, turn, informative_text, for_answer=for_answer
         )
+        if not str(informative_text or "").strip() and buf.get("keepalive_first_interval_elapsed"):
+            informative_text = self._visible_informative_fallback_text(buf, turn)
         if not for_answer and self._text_merged_into_unmarked_final(buf, turn, informative_text):
             if text_override is not None:
                 logger.debug(
@@ -7086,6 +7139,17 @@ class Agent365Adapter(BasePlatformAdapter):
         if final and not stream_id:
             return empty
         body_text = (text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT).strip()
+        buf = self._turn_buffers.get(chat_id)
+        if (
+            not final
+            and isinstance(buf, dict)
+            and buf.get("keepalive_first_interval_elapsed")
+            and (
+                not body_text
+                or Agent365Adapter._is_placeholder_informative_text(body_text)
+            )
+        ):
+            body_text = self._visible_informative_fallback_text(buf, turn).strip()
         if not body_text:
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s reason=empty text",
@@ -7097,7 +7161,6 @@ class Agent365Adapter(BasePlatformAdapter):
             and not stream_id
             and Agent365Adapter._is_placeholder_informative_text(body_text)
         ):
-            buf = self._turn_buffers.get(chat_id)
             allowed = Agent365Adapter._placeholder_informative_opener_allowed(buf)
             if isinstance(buf, dict) and not allowed:
                 logger.debug(
@@ -7676,19 +7739,26 @@ class Agent365Adapter(BasePlatformAdapter):
                 return ("retry", None)
             close_text = self._rotation_stream_close_text(buf, turn)
             opened = stream.get("opened_mono")
-            deadline = None
             if isinstance(opened, (int, float)):
-                deadline = float(opened) + _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-            closed = await self._post_keepalive_final_locked(
-                chat_id,
-                buf,
-                for_answer_delivery=True,
-                final_text=close_text,
-                outbound_deadline=deadline,
-            )
-            if not closed:
-                record["plain_due"] = True
-                return ("retry", None)
+                cap_deadline = float(opened) + _TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+                if cap_deadline <= time.monotonic():
+                    stream["stream_id"] = ""
+                    stream["closed_by"] = "keepalive"
+                    buf["keepalive"] = stream
+                else:
+                    closed = await self._post_keepalive_final_locked(
+                        chat_id,
+                        buf,
+                        for_answer_delivery=True,
+                        final_text=close_text,
+                        outbound_deadline=cap_deadline,
+                    )
+                    if not closed:
+                        record["plain_due"] = True
+                        return ("retry", None)
+            else:
+                stream["stream_id"] = ""
+                buf["keepalive"] = stream
         reason = (
             "keepalive stream rotated"
             if buf.get("keepalive_rotated") or record.get("plain_due")
