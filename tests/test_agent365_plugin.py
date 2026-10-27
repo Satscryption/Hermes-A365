@@ -7546,6 +7546,14 @@ class TestEditMessage:
         return sleep_mock, clock
 
     @staticmethod
+    async def _cancel_scheduled_turn_buffer_keepalive(buf: dict[str, Any]) -> None:
+        task = buf.get("keepalive_task")
+        if isinstance(task, asyncio.Task) and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+    @staticmethod
     def _fast_turn_buffer_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
         """Avoid real wall-clock waits in defer/retry paths (#242)."""
 
@@ -11144,6 +11152,7 @@ class TestEditMessage:
             "sequence": 4,
             "opened_mono": time.monotonic() - stream_age_sec,
         }
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
         await a._emit_turn_buffer_keepalive(chat)
         assert posts == [("final", "g2-stream")]
         assert buf.get("keepalive_rotated") is True
@@ -11213,6 +11222,7 @@ class TestEditMessage:
             "sequence": 3,
             "opened_mono": time.monotonic() - (rotate_at + 0.01),
         }
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
         await a._emit_turn_buffer_keepalive(chat)
         assert len(rotation_finals) == 1
         assert rotation_finals[0] == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
@@ -11576,7 +11586,6 @@ class TestEditMessage:
         assert "G2 fact" in send_reply_mock.await_args.kwargs["reply"]["text"]
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(10)
     async def test_g2_rotation_close_500_plain_retires_single_post(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -11587,25 +11596,33 @@ class TestEditMessage:
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
-        self._advance_monotonic_sleep(monkeypatch, start=1000.0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
         a._copilot_min_stream_age_before_final_sec = 0
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
         rotation_final_posts = 0
+        informative_opens_after_manual = 0
+        manual_emit = False
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
-            nonlocal rotation_final_posts
+            nonlocal rotation_final_posts, informative_opens_after_manual
             entity = kwargs["json"]["entities"][0]
-            if entity.get("streamType") == "final" and entity.get("streamId"):
+            if manual_emit and entity.get("streamType") == "final" and entity.get("streamId"):
                 rotation_final_posts += 1
                 return MagicMock(
                     status_code=500,
                     text="server error",
                     json=lambda: {"error": {"message": "server error"}},
                 )
+            if (
+                manual_emit
+                and entity.get("streamType") == "informative"
+                and "streamId" not in entity
+            ):
+                informative_opens_after_manual += 1
+                return self._http_result(201, "g2-500-stream")
             if entity.get("streamType") == "informative" and "streamId" not in entity:
                 return self._http_result(201, "g2-500-stream")
             return self._http_result(202)
@@ -11630,9 +11647,11 @@ class TestEditMessage:
             "sequence": 2,
             "opened_mono": time.monotonic() - (rotate_at + 0.01),
         }
-        buf["keepalive_first_interval_elapsed"] = True
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        manual_emit = True
         await a._emit_turn_buffer_keepalive(chat)
         assert rotation_final_posts == 1
+        assert informative_opens_after_manual == 0
         assert not buf["keepalive"].get("stream_id")
         turn = a._keepalive_turn(buf)
         assert turn is not None
