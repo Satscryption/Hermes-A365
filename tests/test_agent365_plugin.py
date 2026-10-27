@@ -11123,7 +11123,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch, start=0.0)
+        self._advance_monotonic_sleep(monkeypatch, start=0.0)
         a._copilot_min_stream_age_before_final_sec = 0
         fact = "G2 fact."
         progress = "💻 Running sleep 150"
@@ -11238,9 +11238,9 @@ class TestEditMessage:
         assert buf.get("keepalive_rotated") is True
         assert not buf["keepalive"].get("stream_id")
         assert len(final_posts) == 1
-        assert progress_line in final_posts[0]["text"]
+        assert final_posts[0]["text"] == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert progress_line not in final_posts[0]["text"]
         assert fact not in final_posts[0]["text"]
-        assert final_posts[0]["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
         await a.send(
             chat_id=chat,
             content="Confirmed after sleep.",
@@ -13818,9 +13818,6 @@ class TestEditMessage:
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
-        cap_left = 2.0
         finals = {"n": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -15034,8 +15031,6 @@ class TestEditMessage:
         )
         await a.on_processing_start(event)
         buf = a._turn_buffers["conv-G-ka-seg"]
-        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
-        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
         await a.send(chat_id="conv-G-ka-seg", content="Pending answer", reply_to=None)
         buf["keepalive"] = {
             "stream_id": "aging",
@@ -15078,7 +15073,7 @@ class TestEditMessage:
         buf["keepalive"]["opened_mono"] = time.monotonic() - (rotate_at + 0.01)
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals
-        assert finals[0] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert finals[0] == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
         assert "keepalive" in closed_by_snap
         assert not buf["keepalive"].get("stream_id")
         await a._drop_turn_buffer("conv-G-ka-seg")

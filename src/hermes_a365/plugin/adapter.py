@@ -6337,21 +6337,10 @@ class Agent365Adapter(BasePlatformAdapter):
             return self._visible_informative_fallback_text(buf, turn)
         return _TURN_BUFFER_KEEPALIVE_TEXT
 
-    def _rotation_stream_close_text(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
-        """Final body when retiring an informative stream at the rotation age (#247).
-
-        Marked answers and facts belong only in the plain reply, not this close.
-        """
-        seq = str(turn.get("seq") or "")
-        for segment in buf.get("segments") or []:
-            if str(segment.get("turn") or "") != seq:
-                continue
-            kind = self._turn_buffer_segment_kind(segment)
-            if kind not in ("progress", "commentary"):
-                continue
-            text = str(segment.get("text") or "").strip()
-            if text and text != _TURN_BUFFER_KEEPALIVE_TEXT:
-                return text[:_INFORMATIVE_TEXT_MAX_CHARS]
+    def _rotation_stream_close_text(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> str:
+        """Neutral final body when retiring an informative stream at rotation age (#247)."""
         return _KEEPALIVE_ROTATION_STATUS_TEXT
 
     def _marked_answer_preview_for_turn(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
@@ -6608,7 +6597,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 return turn
         return None
 
-    async def _post_keepalive_rotation_final_locked(self, chat_id: str, buf: dict[str, Any]) -> bool:
+    async def _post_keepalive_rotation_final_locked(
+        self, chat_id: str, buf: dict[str, Any]
+    ) -> bool:
         """Close an aging informative stream with real text; no second stream (#247)."""
         turn = self._keepalive_turn(buf)
         if not isinstance(turn, dict):
