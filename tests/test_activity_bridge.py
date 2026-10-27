@@ -3010,6 +3010,107 @@ class TestServeApp:
         assert "/v3/conversations/conv-1/activities/1234" in reply_url
         assert capture["reply"][0]["body"]["text"] == "hi back"
 
+    def test_serve_webhook_ack_deadline_on_slow_429(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import time
+
+        import hermes_a365.outbound_retry as outbound_retry
+
+        capture: dict[str, Any] = {
+            "webhook": [],
+            "reply": [],
+            "token": [],
+            "reply_timeouts": [],
+        }
+        clock = 1000.0
+        deadline = clock + outbound_retry.OUTBOUND_WEBHOOK_ACK_DEADLINE_SEC
+
+        def monotonic() -> float:
+            return clock
+
+        monkeypatch.setattr(outbound_retry.time, "monotonic", monotonic)
+        monkeypatch.setattr(
+            outbound_retry,
+            "new_webhook_ack_deadline",
+            lambda: deadline,
+        )
+
+        real_timeout = outbound_retry.outbound_attempt_timeout_sec
+
+        def recording_timeout(
+            eff_deadline: float | None,
+            *,
+            attempt_cap_sec: float = outbound_retry.OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC,
+        ) -> float:
+            timeout = real_timeout(
+                eff_deadline,
+                attempt_cap_sec=attempt_cap_sec,
+            )
+            capture.setdefault("attempt_timeouts", []).append(timeout)
+            return timeout
+
+        monkeypatch.setattr(
+            outbound_retry,
+            "outbound_attempt_timeout_sec",
+            recording_timeout,
+        )
+
+        def handler(req: httpx.Request) -> httpx.Response:
+            nonlocal clock
+            url = str(req.url)
+            if "/oauth2/v2.0/token" in url:
+                clock += 2.0
+                body = req.content.decode()
+                params: dict[str, str] = {}
+                for kv in body.split("&"):
+                    k, _, v = kv.partition("=")
+                    params[k] = urllib.parse.unquote_plus(v)
+                capture["token"].append(params)
+                grant = params.get("grant_type", "")
+                if params.get("fmi_path"):
+                    return httpx.Response(
+                        200, json={"access_token": "T1", "expires_in": 3600}
+                    )
+                if grant == "user_fic":
+                    return httpx.Response(
+                        200, json={"access_token": "FINAL", "expires_in": 3600}
+                    )
+                return httpx.Response(
+                    200, json={"access_token": "T2", "expires_in": 3600}
+                )
+            if url.startswith("https://hook.test/responder"):
+                clock += 2.0
+                capture["webhook"].append(clock)
+                return httpx.Response(
+                    429,
+                    headers={"Retry-After": "3600"},
+                    text="throttled",
+                )
+            if "/v3/conversations/" in url:
+                capture["reply"].append(
+                    {"url": url, "body": json.loads(req.content)}
+                )
+                return httpx.Response(200, json={})
+            return httpx.Response(404, text=f"unhandled {url}")
+
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        http_client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        app = make_app(cfg, http_client=http_client)
+        wall_start = time.monotonic()
+        with TestClient(app) as client:
+            r = client.post("/api/messages", json=_inbound_message_activity())
+        wall_elapsed = time.monotonic() - wall_start
+        assert r.status_code == 200
+        assert wall_elapsed <= 15.0
+        assert capture["webhook"]
+        assert capture["token"]
+        assert len(capture["reply"]) == 1
+        reply_timeout = capture["attempt_timeouts"][-1]
+        assert reply_timeout <= outbound_retry.remaining_until_deadline(deadline) + 0.01
+        assert reply_timeout < outbound_retry.OUTBOUND_HTTP_TIMEOUT_DEFAULT_SEC
+
     def test_reply_url_percent_encodes_inbound_ids(self) -> None:
         # #103/M4: conv id / activity id come from the inbound webhook body and
         # are interpolated into the outbound BF URL. A Teams-shaped conv id and
@@ -4055,6 +4156,47 @@ class TestTokenFactory:
                 {"recipient": {}, "conversation": {}, "serviceUrl": "https://x.example/y"},
                 validated_path=None,
             )
+
+    @pytest.mark.asyncio
+    async def test_for_graph_fail_closed_without_validated_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        path_a_mint = AsyncMock(return_value="tokenA")
+        path_b_mint = MagicMock(return_value={"access_token": "tokenB"})
+        monkeypatch.setattr(ab, "acquire_outbound_token", path_a_mint)
+        monkeypatch.setattr(ab, "acquire_token", path_b_mint)
+        path_a_activity = {
+            "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
+            "conversation": {"tenantId": "t"},
+        }
+        path_b_activity = {
+            "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
+            "recipient": {},
+            "conversation": {},
+        }
+        for activity in (path_a_activity, path_b_activity):
+            with pytest.raises(RuntimeError, match="Path A or Path B"):
+                await self._factory().for_graph(activity, validated_path=None)
+        path_a_mint.assert_not_called()
+        path_b_mint.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_for_graph_fail_closed_on_non_ab_validated_path(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hermes_a365.activity_bridge as ab
+
+        mint = AsyncMock(return_value="tokenA")
+        monkeypatch.setattr(ab, "acquire_outbound_token", mint)
+        activity = {
+            "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
+            "conversation": {"tenantId": "t"},
+        }
+        with pytest.raises(RuntimeError, match="Path A or Path B"):
+            await self._factory().for_graph(activity, validated_path="unknown")
+        mint.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_for_app_and_for_workiq_not_implemented(self) -> None:

@@ -33,6 +33,33 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   ``HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC``. Refs
   [#217](https://github.com/Satscryption/Hermes-A365/issues/217).
 
+- **#190 — Outbound 429 / Retry-After handling.** Shared
+  ``hermes_a365.outbound_retry`` helper retries Bot Framework replies and
+  proactive sends on HTTP 429 only (no 5xx replay on non-idempotent
+  creates), typing on 429 only (at most one retry), stream edits with
+  capped ``Retry-After`` (no retry when the remaining stream lifetime is
+  below the streaming minimum gap), and OneDrive upload PUTs on 429 and
+  transient 5xx off the invoke ack path. Serve ``/api/messages`` shares one
+  absolute ~14s ack deadline across operator webhook forward, token mint,
+  and BF reply; each outbound attempt clamps its HTTP timeout to the
+  remaining budget with a per-call ceiling (15s Bot Framework by default,
+  60s for OneDrive upload PUT) and skips starting a new attempt when too
+  little time remains.   A 429 whose ``Retry-After`` exceeds the remainder, or whose backoff sleep
+  would leave too little time for another attempt, fails fast instead of
+  sleeping; an exhausted serve deadline surfaces as a clean webhook error
+  instead of an internal failure. Plugin file-consent invoke handling returns
+  the HTTP ack immediately and runs card removal, decline notices, and upload
+  follow-up in retained background tasks. Post-ack adapter sends (send,
+  proactive, typing, Copilot turn-buffer keep-alive POST) share a separate
+  25s retry budget clamped to the Copilot stream soft cap; answer-final outer
+  429 retries reuse one absolute outbound deadline so a fresh 25s window
+  cannot start a POST after the stream expires. When the shared cap leaves
+  too little time for an attempt, answer-final delivery plain-falls back
+  when no prior attempt may have landed, otherwise stays uncertain
+  instead of duplicating a bubble; skipped POSTs are not treated as
+  maybe-landed. Refs
+  [#190](https://github.com/Satscryption/Hermes-A365/issues/190).
+
 - **#215 — Direct Line verify allowlist rejection is WARN, not ERROR.** After a
   live ``--directline-probe`` conversation starts, **WARN** only when the
   activity response body explicitly carries ``unauthorized-end-user`` or
@@ -49,6 +76,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   ``az account show`` timeout / OSError detail adds the floor sentence only when
   the installed version is below the floor. The v1 support matrix documents az
   and .NET prerelease warn behaviour.
+
+- **#225 — `TokenFactory.for_graph` JWT path binding.** When
+  ``validated_path`` is not ``A`` or ``B``, fail closed to ``unknown`` (raise)
+  instead of re-deriving the path from the unauthenticated activity body — the
+  same rule plugin invoke already uses. Refs
+  [#225](https://github.com/Satscryption/Hermes-A365/issues/225).
 
 ### Changed
 
@@ -101,7 +134,8 @@ Ships merged work on `main@50e32745` (2026-10-26) via PRs #208, #219, and
   Hermes >= v0.22.3 can omit `overrides.txt`. `overrides.txt` keeps
   `pyjwt[crypto]>=2.15.0` (required for older supported refs; no-op on
   v0.22.3+) and `fastapi>=0.143` for `hermes-agent[web]`. Document PyPI has no
-  0.22.x release. CI Hermes source smoke includes tag `v0.22.5`. Refs
+  0.22.x release. CI Hermes source smoke includes tag `v0.22.5` (dropped
+  `v0.22.2` from `.github/workflows/test.yml`). Refs
   [#148](https://github.com/Satscryption/Hermes-A365/issues/148).
 
 ### Fixed
@@ -114,8 +148,8 @@ Ships merged work on `main@50e32745` (2026-10-26) via PRs #208, #219, and
   on `activity-bridge serve` alongside existing body/size limits; reverse-proxy
   guidance updated. `BoundedRequestBodyMiddleware` pre-parses `/api/messages`
   bodies via `parse_inbound_activity_payload` so deep nesting returns 400
-  instead of 500. Plugin invoke context and `TokenFactory.for_graph` require
-  the JWT-validated path (`validated_path` on handoff). README records
+  instead of 500. Plugin invoke context requires the JWT-validated path
+  (``validated_path`` on handoff; otherwise ``unknown``). README records
   accepted M3 dedupe, BF JWKS endorsement, and per-process dedupe residuals.
   Refs [#86](https://github.com/Satscryption/Hermes-A365/issues/86),
   [#205](https://github.com/Satscryption/Hermes-A365/issues/205),
@@ -827,9 +861,10 @@ down afterwards).
   agentic user. The mint-site documentation and tests now characterize the body-
   driven `user_fic` request and verify token-endpoint rejection fails closed.
   Live positive/negative Entra validation remains required by #107/#123.
-  **#100 M3** (dedupe pre-seed) remains unresolved and is explicitly owned by #86
-  (v0.9.3); a signed-token route test records the current suppress-on-pre-seed
-  behavior. Also corrected a stale module docstring that still advertised the
+  **#100 M3** (dedupe pre-seed) was recorded as an accepted residual in v0.9.4
+  ([#208](https://github.com/Satscryption/Hermes-A365/issues/208)); a signed-token
+  route test records the current suppress-on-pre-seed behavior. Also corrected a
+  stale module docstring that still advertised the
   pre-M2 `serviceUrl` allowlist.
 
 ### Destructive-CLI hardening (#102, WP1–WP3)

@@ -4424,6 +4424,12 @@ class TestLifecycleCapture:
         # coalesced-status slots for the chat AND cancel their watchdog tasks,
         # so no debounce later fires a doomed POST into the evicted chat. An
         # unrelated chat's state must survive.
+        async def _instant_sleep(_delay: float = 0.0, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
         seed = _make_inbound(path="B", conv_id="conv-rm")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(seed))
@@ -7519,6 +7525,7 @@ class TestEditMessage:
         observe the requested duration without actually waiting."""
         sleep_mock = AsyncMock()
         monkeypatch.setattr("asyncio.sleep", sleep_mock)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", sleep_mock)
         return sleep_mock
 
     @staticmethod
@@ -7535,6 +7542,44 @@ class TestEditMessage:
         sleep_mock = AsyncMock(side_effect=sleep)
         monkeypatch.setattr("asyncio.sleep", sleep_mock)
         return sleep_mock, clock
+
+    @staticmethod
+    def _fast_turn_buffer_clocks(monkeypatch: pytest.MonkeyPatch) -> None:
+        """Avoid real wall-clock waits in defer/retry paths (#242)."""
+
+        async def _instant_sleep(_delay: float = 0.0, *_args: Any, **_kwargs: Any) -> None:
+            return None
+
+        monkeypatch.setattr(asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", _instant_sleep)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0.0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setenv("HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC", "0")
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0.0)
+
+        async def _noop_wait_out_untracked_keepalive(_self: Any, _buf: dict[str, Any]) -> None:
+            return None
+
+        async def _noop_deferred_turn_buffer_retry(_self: Any, _chat_id: str) -> None:
+            return None
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_wait_out_untracked_keepalive",
+            _noop_wait_out_untracked_keepalive,
+        )
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_deferred_turn_buffer_retry",
+            _noop_deferred_turn_buffer_retry,
+        )
+
+    @staticmethod
+    async def _cancel_turn_buffer_retry_task(buf: dict[str, Any]) -> None:
+        task = buf.get("retry_task")
+        if isinstance(task, asyncio.Task):
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
 
     def test_class_sets_requires_edit_finalize(self) -> None:
         # endStream() is mandatory in BF streaming-ux; the flag tells
@@ -8483,6 +8528,198 @@ class TestEditMessage:
         assert text.strip() == text
         assert text != ""
         assert len(text) <= adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
+
+    def test_classify_answer_final_budget_exhausted_is_not_sent(self) -> None:
+        result = adapter_mod._KeepalivePost(
+            None,
+            "",
+            "",
+            False,
+            False,
+            0.0,
+            False,
+            False,
+            True,
+        )
+        assert adapter_mod._classify_answer_final_post(result) == adapter_mod._ANSWER_FINAL_NOT_SENT
+
+    @pytest.mark.asyncio
+    async def test_answer_final_near_cap_budget_exhausted_plain_fallback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-cap-budget-plain"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 0.5
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                raise AssertionError("answer final must not POST when cap budget < 1s")
+            return self._http_result(201, "ka-cap-budget")
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-cap-budget",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
+        }
+        await a.send(chat_id=chat, content="Plain after cap budget", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 0
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain after cap budget"
+        assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_answer_final_budget_exhausted_uncertain_when_may_have_landed(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        from hermes_a365.plugin.turn_buffer_answer_delivery import set_may_have_landed
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-cap-budget-mhl"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 0.5
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        self._no_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-cap-mhl",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
+        }
+        await a.send(chat_id=chat, content="Maybe landed", reply_to=None)
+        turn = buf["turns"][0]
+        record = a._delivery_record(buf, turn)
+        set_may_have_landed(record)
+        with caplog.at_level(logging.WARNING):
+            await a.on_processing_complete(event, outcome="success")
+        assert send_reply_mock.await_count == 0
+        assert chat not in a._turn_buffers
+        assert any(
+            "stream outbound budget exhausted" in record.message for record in caplog.records
+        )
+
+    def test_keepalive_stream_outbound_deadline_uses_shared_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.outbound_retry import OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
+
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-G-out-deadline"
+        t0 = time.monotonic()
+        deadline = a._keepalive_stream_outbound_deadline(chat_id)
+        assert deadline == pytest.approx(t0 + OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC, abs=0.05)
+        shared = t0 + 3.0
+        bounded = a._keepalive_stream_outbound_deadline(chat_id, shared_deadline=shared)
+        assert bounded == pytest.approx(shared, abs=0.001)
+        again = a._keepalive_stream_outbound_deadline(chat_id, shared_deadline=shared)
+        assert again == bounded
+
+    @pytest.mark.asyncio
+    async def test_answer_final_429_shares_stream_bounded_outbound_deadline(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-G-429-deadline", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 12.0
+        finals = {"n": 0}
+        answer_outbound_deadlines: list[float | None] = []
+        orig_post_final = adapter_mod.Agent365Adapter._post_answer_final
+
+        async def capture_post_final(self: Any, *args: Any, **kwargs: Any) -> Any:
+            answer_outbound_deadlines.append(kwargs.get("outbound_deadline"))
+            return await orig_post_final(self, *args, **kwargs)
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_post_answer_final",
+            capture_post_final,
+        )
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                if finals["n"] <= 4:
+                    return MagicMock(
+                        status_code=429,
+                        text="",
+                        headers={"Retry-After": "0.5"},
+                        json=lambda: {},
+                    )
+                return self._http_result(202)
+            return self._http_result(201, "ka-429-dl")
+
+        a._http_client.post = post
+        self._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-G-429-deadline"),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers["conv-G-429-deadline"]
+        loop_start = time.monotonic()
+        buf["keepalive"] = {
+            "stream_id": "ka-429-dl",
+            "sequence": 1,
+            "opened_mono": loop_start - (cap - margin - cap_left),
+        }
+        await a.send(chat_id="conv-G-429-deadline", content="Shared deadline", reply_to=None)
+        await a.on_processing_complete(event, outcome="success")
+        assert finals["n"] == 5
+        passed = [d for d in answer_outbound_deadlines if d is not None]
+        assert len(passed) >= 2
+        assert passed[0] == passed[1]
+        assert passed[0] <= loop_start + cap_left + 0.1
+        assert "conv-G-429-deadline" not in a._turn_buffers
 
     @staticmethod
     async def _spin_until(predicate) -> None:
@@ -12588,6 +12825,7 @@ class TestEditMessage:
         finals = {"n": 0}
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 2.0
         real_sleep = asyncio.sleep
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -12630,7 +12868,7 @@ class TestEditMessage:
         buf["keepalive"] = {
             "stream_id": "ka-ra",
             "sequence": 1,
-            "opened_mono": time.monotonic() - (cap - margin - 0.5),
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
         }
         await a.send(chat_id="conv-G-ra-cap", content="Before cap", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
@@ -12643,7 +12881,7 @@ class TestEditMessage:
             if delay <= adapter_mod._ANSWER_FINAL_RETRY_AFTER_CAP_SEC
         ]
         assert retry_sleeps
-        assert max(retry_sleeps) <= 1.0
+        assert max(retry_sleeps) <= cap_left + 0.1
         assert "conv-G-ra-cap" not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -12657,6 +12895,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
+        cap_left = 2.0
         finals = {"n": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -12686,11 +12925,11 @@ class TestEditMessage:
         buf["keepalive"] = {
             "stream_id": "ka-cap",
             "sequence": 1,
-            "opened_mono": time.monotonic() - (cap - margin + 1.0),
+            "opened_mono": time.monotonic() - (cap - margin - cap_left),
         }
         await a.send(chat_id="conv-G-cap-mid", content="Cap fallback", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
-        assert finals["n"] == 1
+        assert finals["n"] >= 1
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Cap fallback"
         assert "conv-G-cap-mid" not in a._turn_buffers
@@ -13387,13 +13626,12 @@ class TestEditMessage:
     ) -> None:
         import httpx
 
+        self._fast_turn_buffer_clocks(monkeypatch)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-mhl-defer", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        self._no_sleep(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
         finals = {"n": 0}
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -13423,14 +13661,11 @@ class TestEditMessage:
         }
         await a.send(chat_id="conv-G-mhl-defer", content="Stay", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
+        await self._cancel_turn_buffer_retry_task(buf)
         assert finals["n"] == 2
         assert send_reply_mock.await_count == 0
         assert buf["keepalive"]["stream_id"] == "ka-md"
         assert [s["text"] for s in buf["segments"]] == ["Stay"]
-        task = buf.get("retry_task")
-        if isinstance(task, asyncio.Task):
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_already_completed_without_landing_plain_posts(
@@ -13615,13 +13850,12 @@ class TestEditMessage:
     async def test_unknown_403_defers_without_plain_post(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        self._fast_turn_buffer_clocks(monkeypatch)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-unk403", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        self._no_sleep(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
@@ -13651,25 +13885,21 @@ class TestEditMessage:
         }
         await a.send(chat_id="conv-G-unk403", content="Defer me", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
+        await self._cancel_turn_buffer_retry_task(buf)
         assert send_reply_mock.await_count == 0
         assert buf["keepalive"]["stream_id"] == "ka-u403"
         assert [s["text"] for s in buf["segments"]] == ["Defer me"]
-        task = buf.get("retry_task")
-        if isinstance(task, asyncio.Task):
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_other_4xx_defers_without_plain_post(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        self._fast_turn_buffer_clocks(monkeypatch)
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-400", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
-        self._no_sleep(monkeypatch)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
@@ -13695,12 +13925,9 @@ class TestEditMessage:
         }
         await a.send(chat_id="conv-G-400", content="Wait", reply_to=None)
         await a.on_processing_complete(event, outcome="success")
+        await self._cancel_turn_buffer_retry_task(buf)
         assert send_reply_mock.await_count == 0
         assert buf["keepalive"]["stream_id"] == "ka-400"
-        task = buf.get("retry_task")
-        if isinstance(task, asyncio.Task):
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
 
     @pytest.mark.asyncio
     async def test_deferral_cap_is_three_then_force_plain(
@@ -22085,6 +22312,7 @@ class TestOutboundFiles:
         )
 
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         # Bytes PUT to the pre-authenticated OneDrive session with the range header.
         assert a._http_client.put.await_count == 1
         assert a._http_client.put.await_args.args[0] == upload_info["uploadUrl"]
@@ -22142,6 +22370,7 @@ class TestOutboundFiles:
 
         release_put.set()
         response = await asyncio.wait_for(acceptance, timeout=0.5)
+        await a._drain_file_consent_upload_tasks()
 
         assert response.status == 200
         assert old_client.put.await_count == 1
@@ -22172,6 +22401,7 @@ class TestOutboundFiles:
             self._consent_activity(action="decline"), validated_path="A"
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         assert a._http_client.put.await_count == 0
         assert a._http_client.delete.await_count == 1
         assert send_reply.await_count == 1
@@ -22204,6 +22434,7 @@ class TestOutboundFiles:
         for _ in range(2):
             resp = await a._handle_file_consent(activity, validated_path="A")
             assert resp.status == 200
+            await a._drain_file_consent_upload_tasks()
         assert send_reply.await_count == 1
 
     @pytest.mark.asyncio
@@ -22228,6 +22459,7 @@ class TestOutboundFiles:
             self._consent_activity(action="decline"), validated_path="A"
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         assert send_reply.await_count == 1
 
     @pytest.mark.asyncio
@@ -22253,6 +22485,7 @@ class TestOutboundFiles:
             validated_path="A",
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         assert a._http_client.delete.await_count == 1
 
     @pytest.mark.asyncio
@@ -22311,13 +22544,15 @@ class TestOutboundFiles:
             validated_path="A",
         )
         assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
         # Upload failed → no confirmation card, pending consumed (no retry loop).
         assert send_reply.await_count == 0
         assert "c1" not in a._pending_file_uploads
 
     # ── route: fileConsent/invoke reaches the handler ─────────────────────
 
-    def test_route_file_consent_invoke_dispatches_handler(
+    @pytest.mark.asyncio
+    async def test_route_file_consent_invoke_dispatches_handler(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         from fastapi.testclient import TestClient
@@ -22357,6 +22592,7 @@ class TestOutboundFiles:
         assert r.status_code == 200, r.text
         # Handled inline — never dispatched to the fire-and-forget agent loop.
         assert a._handled_events == []
+        await a._drain_file_consent_upload_tasks()
         assert a._http_client.put.await_count == 1
         assert "c1" not in a._pending_file_uploads
 
@@ -22894,6 +23130,10 @@ class TestInteractiveCards:
         )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
+        for _ in range(50):
+            if send_reply.await_count:
+                break
+            await asyncio.sleep(0)
         # The resolver's follow-up text is posted as a reply.
         assert send_reply.await_args.kwargs["reply"]["text"] == "Command ran."
 
