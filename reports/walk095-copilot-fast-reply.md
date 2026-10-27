@@ -2,7 +2,7 @@
 
 ## Head SHA
 
-Update after push: `git ls-remote origin cursor/walk095-copilot-fast-reply-0782`.
+Verified: `git ls-remote origin cursor/walk095-copilot-fast-reply-0782` → `aab7e09b09147b6689c1f40073a491b325a96b28`.
 
 ## Root cause (what fixed live on ac7e7463)
 
