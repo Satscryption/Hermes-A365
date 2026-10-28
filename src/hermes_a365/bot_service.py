@@ -2047,7 +2047,12 @@ def directline_runtime_probe(config: BotServiceConfig, runner: CommandRunner) ->
         },
     )
     if status >= 400:
-        return _directline_activity_failure(status, response)
+        return _directline_activity_failure(
+            status,
+            response,
+            resource_group=config.resourceGroup,
+            bot_name=config.botName,
+        )
     return ProbeResult("runtime_auth", "OK", "Direct Line activity accepted by Bot Service")
 
 
@@ -2077,6 +2082,41 @@ _PATH_A_MISSING_MESSAGING_ENDPOINT_HINT = (
 
 def _response_is_allowlist_rejection(lowered: str) -> bool:
     return any(marker in lowered for marker in _ALLOWLIST_MARKERS)
+
+
+def _json_contains_exact_string(obj: Any, target: str) -> bool:
+    if isinstance(obj, str):
+        return obj == target
+    if isinstance(obj, dict):
+        return any(_json_contains_exact_string(value, target) for value in obj.values())
+    if isinstance(obj, list):
+        return any(_json_contains_exact_string(value, target) for value in obj)
+    return False
+
+
+# Keep aligned with plugin/adapter.py inbound 401 HTTPException detail strings.
+_BOT_ENDPOINT_401_DETAILS = frozenset({"invalid bearer token", "missing bearer token"})
+
+
+def _response_is_bot_endpoint_401_rejection(response: dict[str, Any]) -> bool:
+    return any(
+        _json_contains_exact_string(response, detail) for detail in _BOT_ENDPOINT_401_DETAILS
+    )
+
+
+def _directline_client_auth_remediation(
+    *,
+    resource_group: str | None = None,
+    bot_name: str | None = None,
+) -> str:
+    if resource_group and bot_name:
+        az_cmd = f"`az bot directline show -g {resource_group} -n {bot_name} --with-secrets`"
+    else:
+        az_cmd = "`az bot directline show -g <rg> -n <bot> --with-secrets`"
+    return (
+        f"Check the Direct Line channel secret ({az_cmd}) "
+        "or the conversation token from start-conversation."
+    )
 
 
 def _response_is_stripped_connector_bot_403_envelope(response: dict[str, Any]) -> bool:
@@ -2134,13 +2174,50 @@ def _directline_allowlist_warn(status: int, detail: str) -> ProbeResult:
     )
 
 
-def _directline_activity_failure(status: int, response: dict[str, Any]) -> ProbeResult:
-    """Classify a Direct Line activity POST that the bot endpoint rejected.
+_DIRECTLINE_CLIENT_AUTH_FAILURE_REMEDIATION = _directline_client_auth_remediation()
 
-    Conversation start has already succeeded, so the Direct Line secret was
-    accepted. **WARN** only when the response body still carries
-    explicit allowlist markers. The Connector's stripped bot-403 envelope stays
-    **ERROR** with gateway-log remediation (same JSON for allowlist and JWT).
+
+def _directline_client_auth_failure(
+    status: int,
+    detail: str,
+    *,
+    resource_group: str | None = None,
+    bot_name: str | None = None,
+) -> ProbeResult:
+    remediation = _directline_client_auth_remediation(
+        resource_group=resource_group,
+        bot_name=bot_name,
+    )
+    return ProbeResult(
+        "runtime_auth",
+        "ERROR",
+        f"Direct Line client authentication failed (HTTP {status}): {detail}. {remediation}",
+    )
+
+
+def _directline_connector_token_rejection(status: int, detail: str) -> ProbeResult:
+    return ProbeResult(
+        "runtime_auth",
+        "ERROR",
+        f"configured endpoint rejected a Path B BF Connector token (HTTP {status}): {detail}",
+    )
+
+
+def _directline_activity_failure(
+    status: int,
+    response: dict[str, Any],
+    *,
+    resource_group: str | None = None,
+    bot_name: str | None = None,
+) -> ProbeResult:
+    """Classify a Direct Line activity POST failure after conversation start.
+
+    Conversation start succeeding only proves the channel secret was accepted
+    for that call; a later **401** may still be Direct Line client auth
+    (secret or conversation token) before the bot is reached. **WARN** only when
+    the response body still carries explicit allowlist markers. The Connector's
+    stripped bot-403 envelope stays **ERROR** with gateway-log remediation
+    (same JSON for allowlist and JWT).
     """
     detail = json.dumps(response, sort_keys=True)
     lowered = detail.lower()
@@ -2154,10 +2231,13 @@ def _directline_activity_failure(status: int, response: dict[str, Any]) -> Probe
     ):
         return _directline_stripped_bot_403_error(status, detail)
     if status == 401:
-        return ProbeResult(
-            "runtime_auth",
-            "ERROR",
-            f"configured endpoint rejected a Path B BF Connector token (HTTP {status}): {detail}",
+        if _response_is_bot_endpoint_401_rejection(response):
+            return _directline_connector_token_rejection(status, detail)
+        return _directline_client_auth_failure(
+            status,
+            detail,
+            resource_group=resource_group,
+            bot_name=bot_name,
         )
     if (
         status == 403
@@ -2165,11 +2245,7 @@ def _directline_activity_failure(status: int, response: dict[str, Any]) -> Probe
         or "Failed to send activity" in detail
         or "BotError" in detail
     ):
-        return ProbeResult(
-            "runtime_auth",
-            "ERROR",
-            f"configured endpoint rejected a Path B BF Connector token (HTTP {status}): {detail}",
-        )
+        return _directline_connector_token_rejection(status, detail)
     return ProbeResult(
         "runtime_auth",
         "ERROR",
