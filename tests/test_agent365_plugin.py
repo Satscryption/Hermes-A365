@@ -11594,41 +11594,55 @@ class TestEditMessage:
     ) -> dict[str, float]:
         clock = {"t": start}
         monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+        loop_holder: list[asyncio.AbstractEventLoop] = []
 
         async def fake_sleep(delay: float) -> None:
+            if not loop_holder:
+                loop_holder.append(asyncio.get_running_loop())
             recorded.append(float(delay))
             clock["t"] += float(delay)
+            loop = loop_holder[0]
+            fut = loop.create_future()
+            loop.call_soon(fut.set_result, None)
+            await fut
 
         monkeypatch.setattr(asyncio, "sleep", fake_sleep)
         monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
         return clock
 
     @staticmethod
+    def _sleeper_waits_summary(waits: list[float], *, head: int = 8) -> str:
+        if len(waits) <= head:
+            return repr(waits)
+        return f"{waits[:head]!r}…(+{len(waits) - head} more)"
+
+    @staticmethod
     async def _wait_for_sleeper_backoff_pattern(
         recorded: list[float],
         task: asyncio.Task[Any],
         *,
-        timeout_sec: float = 2.0,
+        max_spins: int = 500,
+        max_sleeps: int = 40,
     ) -> bool:
         loop = asyncio.get_running_loop()
-
-        async def monitor() -> None:
-            while True:
-                try:
-                    TestEditMessage._assert_sleeper_zero_then_rotation_backoff(recorded)
-                    return
-                except AssertionError:
-                    if task.done():
-                        raise
-                    future = loop.create_future()
-                    loop.call_soon(future.set_result, None)
-                    await future
-
-        try:
-            await asyncio.wait_for(monitor(), timeout=timeout_sec)
-        except (TimeoutError, AssertionError):
-            return False
-        return True
+        for _ in range(max_spins):
+            try:
+                TestEditMessage._assert_sleeper_zero_then_rotation_backoff(recorded)
+            except AssertionError:
+                if len(recorded) > max_sleeps or task.done():
+                    break
+                fut = loop.create_future()
+                loop.call_soon(fut.set_result, None)
+                await fut
+                continue
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+            return True
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+        return False
 
     @staticmethod
     async def _yield_until(
@@ -11651,7 +11665,8 @@ class TestEditMessage:
         for idx in range(len(waits) - 1):
             if waits[idx] == 0.0 and waits[idx + 1] == retry:
                 return
-        raise AssertionError(f"expected 0.0 then {retry} in sleeper waits {waits!r}")
+        summary = TestEditMessage._sleeper_waits_summary(waits)
+        raise AssertionError(f"expected 0.0 then {retry}; waits={summary}")
 
     @staticmethod
     def _assert_sleeper_never_double_zero(waits: list[float]) -> None:
@@ -11850,6 +11865,12 @@ class TestEditMessage:
     def test_informative_text_before_first_interval_uses_progress_fallback(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Direct ``_informative_text_for_turn`` check when a progress segment exists.
+
+        Not a guard on the pre-interval *fallback* path (no segments); that
+        behaviour is covered by
+        ``test_informative_text_before_first_interval_uses_status_without_segments``.
+        """
         a = _make_adapter(monkeypatch)
         turn = {"seq": "1"}
         progress = "💻 Running lookup"
@@ -11955,6 +11976,7 @@ class TestEditMessage:
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
         finals = 0
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -11973,27 +11995,32 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await a.send(chat_id=chat, content="Answer body", reply_to="act-1")
         buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
         turn = a._keepalive_turn(buf)
         assert turn is not None
         record = a._delivery_record(buf, turn)
         record["plain_due"] = True
-        buf["keepalive"] = {
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+        pre_gap_keepalive = {
             "stream_id": "gap-stream",
             "sequence": 1,
-            "opened_mono": time.monotonic(),
+            "opened_mono": time.monotonic() - (cap + 1.0),
         }
+        buf["keepalive"] = pre_gap_keepalive
         buf["keepalive_rotated"] = True
+        retired_during_gap = {
+            "stream_id": "",
+            "closed_by": "keepalive",
+            "sequence": 1,
+        }
 
-        async def gap_then_retire(_chat_id: str, live_buf: dict[str, Any]) -> None:
-            stream = a._keepalive_stream(live_buf)
-            stream["stream_id"] = ""
-            stream["closed_by"] = "keepalive"
-            live_buf["keepalive"] = stream
+        async def gap_then_swap(_chat_id: str, live_buf: dict[str, Any]) -> None:
+            live_buf["keepalive"] = dict(retired_during_gap)
 
         monkeypatch.setattr(
             a,
             "_sleep_turn_buffer_stream_gap_locked",
-            gap_then_retire,
+            gap_then_swap,
         )
         route = await a._maybe_route_plain_turn_answer(
             chat,
@@ -12004,6 +12031,9 @@ class TestEditMessage:
         )
         assert route == ("fallback", "keepalive stream rotated")
         assert finals == 0
+        assert pre_gap_keepalive["stream_id"] == "gap-stream"
+        assert buf["keepalive"] is not pre_gap_keepalive
+        assert buf["keepalive"]["stream_id"] == ""
 
     @pytest.mark.asyncio
     async def test_g2_sleeper_backoff_never_double_rotation_due_zero(
@@ -12021,10 +12051,6 @@ class TestEditMessage:
             "hermes_a365.outbound_retry.OUTBOUND_DEFAULT_MAX_ATTEMPTS", 1
         )
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
-        recorded: list[float] = []
-        self._install_fake_monotonic_sleep(
-            monkeypatch, start=rotate_at - 25.0, recorded=recorded
-        )
         rotation_close_attempts = 0
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -12046,21 +12072,25 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
         buf = a._turn_buffers[chat]
+        buf["keepalive_revive_used"] = True
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        recorded: list[float] = []
+        self._install_fake_monotonic_sleep(
+            monkeypatch, start=rotate_at - 25.0, recorded=recorded
+        )
         buf["keepalive"] = {
             "stream_id": "backoff-stream",
             "sequence": 1,
             "opened_mono": 0.0,
         }
         buf["keepalive_scheduled_mono"] = rotate_at - 25.0
-        buf["keepalive_revive_used"] = True
-        prior = buf.get("keepalive_task")
-        if isinstance(prior, asyncio.Task) and not prior.done():
-            prior.cancel()
         task = asyncio.create_task(a._turn_buffer_keepalive(chat))
         saw_backoff = await self._wait_for_sleeper_backoff_pattern(recorded, task)
-        task.cancel()
         buf["keepalive_task"] = None
-        assert saw_backoff, f"recorded sleeper waits={recorded!r}"
+        assert saw_backoff, (
+            "expected 0.0 then rotation backoff in keepalive loop; "
+            f"waits={self._sleeper_waits_summary(recorded)}"
+        )
         assert rotation_close_attempts >= 2
         self._assert_sleeper_never_double_zero(recorded)
 
@@ -12153,10 +12183,6 @@ class TestEditMessage:
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
-        recorded: list[float] = []
-        self._install_fake_monotonic_sleep(
-            monkeypatch, start=rotate_at - 25.0, recorded=recorded
-        )
         rotation_finals = 0
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -12177,9 +12203,12 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
         buf = a._turn_buffers[chat]
-        prior = buf.get("keepalive_task")
-        if isinstance(prior, asyncio.Task) and not prior.done():
-            prior.cancel()
+        buf["keepalive_revive_used"] = True
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        recorded: list[float] = []
+        self._install_fake_monotonic_sleep(
+            monkeypatch, start=rotate_at - 25.0, recorded=recorded
+        )
         buf["answer_final_in_progress"] = True
         buf["keepalive"] = {
             "stream_id": "dz-stream",
@@ -12187,12 +12216,13 @@ class TestEditMessage:
             "opened_mono": 0.0,
         }
         buf["keepalive_scheduled_mono"] = rotate_at - 25.0
-        buf["keepalive_revive_used"] = True
         task = asyncio.create_task(a._turn_buffer_keepalive(chat))
         saw_backoff = await self._wait_for_sleeper_backoff_pattern(recorded, task)
-        task.cancel()
         buf["keepalive_task"] = None
-        assert saw_backoff, f"recorded sleeper waits={recorded!r}"
+        assert saw_backoff, (
+            "expected 0.0 then rotation backoff in keepalive loop; "
+            f"waits={self._sleeper_waits_summary(recorded)}"
+        )
         assert rotation_finals == 0
         self._assert_sleeper_never_double_zero(recorded)
 
