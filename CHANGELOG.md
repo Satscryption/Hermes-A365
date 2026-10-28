@@ -6,6 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **#250 — Direct Line probe HTTP 401 attribution.** ``runtime_auth`` **ERROR**
+  on a live ``--directline-probe`` activity **401** reports a configured
+  endpoint Path B BF Connector token rejection only when some JSON value is
+  exactly ``invalid bearer token`` or ``missing bearer token`` (matching the
+  gateway adapter); any other **401** body is Direct Line client authentication
+  (channel secret or conversation token). Connector **502**/403 walk095 handling
+  is unchanged. Refs
+  [#250](https://github.com/Satscryption/Hermes-A365/issues/250).
+
 ## [0.9.5] — 2026-10-27
 
 Copilot Chat streaming and keep-alive hardening (#214, #217, #212, #235, #247),
