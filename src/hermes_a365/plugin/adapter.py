@@ -1112,6 +1112,10 @@ def _rotation_close_failure_plain_retire(result: _KeepalivePost) -> bool:
         return False
     if status is not None and status >= 500:
         return True
+    if status in (400, 401, 404):
+        return True
+    if status == 403 and not _answer_final_terminal_403(result.detail):
+        return True
     bucket = _classify_answer_final_post(result)
     return bucket not in (
         _ANSWER_FINAL_MAY_HAVE_LANDED,
@@ -6364,15 +6368,13 @@ class Agent365Adapter(BasePlatformAdapter):
             preview = ""
         if preview:
             return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
-        if buf.get("keepalive_first_interval_elapsed"):
-            return self._visible_informative_fallback_text(buf, turn)
-        return _TURN_BUFFER_KEEPALIVE_TEXT
+        return self._visible_informative_fallback_text(buf, turn)
 
     def _rotation_stream_close_text(
         self, buf: dict[str, Any], turn: dict[str, Any]
     ) -> str:
-        """Neutral final body when retiring an informative stream at rotation age (#247)."""
-        return _KEEPALIVE_ROTATION_STATUS_TEXT
+        """Final body when retiring an informative stream at rotation age (#247)."""
+        return self._visible_informative_fallback_text(buf, turn)
 
     def _marked_answer_preview_for_turn(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
         seq = str(turn.get("seq") or "")
@@ -6905,7 +6907,7 @@ class Agent365Adapter(BasePlatformAdapter):
         informative_text = self._sanitize_informative_stream_text(
             buf, turn, informative_text, for_answer=for_answer
         )
-        if not str(informative_text or "").strip() and buf.get("keepalive_first_interval_elapsed"):
+        if not str(informative_text or "").strip():
             informative_text = self._visible_informative_fallback_text(buf, turn)
         if not for_answer and self._text_merged_into_unmarked_final(buf, turn, informative_text):
             if text_override is not None:
@@ -7796,6 +7798,20 @@ class Agent365Adapter(BasePlatformAdapter):
             await self._sleep_turn_buffer_stream_gap_locked(chat_id, buf)
             if self._turn_buffers.get(chat_id) is not buf:
                 return ("retry", None)
+            stream = self._keepalive_stream(buf)
+            stream_id = str(stream.get("stream_id") or "")
+            if not stream_id:
+                reason = (
+                    "keepalive stream rotated"
+                    if buf.get("keepalive_rotated") or record.get("plain_due")
+                    else "stream age past budget"
+                )
+                logger.warning(
+                    "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
+                    chat_id,
+                    reason,
+                )
+                return ("fallback", reason)
             close_text = self._rotation_stream_close_text(buf, turn)
             opened = stream.get("opened_mono")
             if isinstance(opened, (int, float)):
