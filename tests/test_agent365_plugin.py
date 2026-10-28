@@ -11585,6 +11585,79 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 1
         assert "G2 fact" in send_reply_mock.await_args.kwargs["reply"]["text"]
 
+    @staticmethod
+    def _install_fake_monotonic_sleep(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        start: float,
+        recorded: list[float],
+    ) -> dict[str, float]:
+        clock = {"t": start}
+        monkeypatch.setattr(time, "monotonic", lambda: clock["t"])
+
+        async def fake_sleep(delay: float) -> None:
+            recorded.append(float(delay))
+            clock["t"] += float(delay)
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+        return clock
+
+    @staticmethod
+    async def _wait_for_sleeper_backoff_pattern(
+        recorded: list[float],
+        task: asyncio.Task[Any],
+        *,
+        timeout_sec: float = 2.0,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+
+        async def monitor() -> None:
+            while True:
+                try:
+                    TestEditMessage._assert_sleeper_zero_then_rotation_backoff(recorded)
+                    return
+                except AssertionError:
+                    if task.done():
+                        raise
+                    future = loop.create_future()
+                    loop.call_soon(future.set_result, None)
+                    await future
+
+        try:
+            await asyncio.wait_for(monitor(), timeout=timeout_sec)
+        except (TimeoutError, AssertionError):
+            return False
+        return True
+
+    @staticmethod
+    async def _yield_until(
+        predicate: Any,
+        *,
+        max_spins: int = 2000,
+    ) -> bool:
+        loop = asyncio.get_running_loop()
+        for _ in range(max_spins):
+            if predicate():
+                return True
+            future = loop.create_future()
+            loop.call_soon(future.set_result, None)
+            await future
+        return False
+
+    @staticmethod
+    def _assert_sleeper_zero_then_rotation_backoff(waits: list[float]) -> None:
+        retry = adapter_mod._KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC
+        for idx in range(len(waits) - 1):
+            if waits[idx] == 0.0 and waits[idx + 1] == retry:
+                return
+        raise AssertionError(f"expected 0.0 then {retry} in sleeper waits {waits!r}")
+
+    @staticmethod
+    def _assert_sleeper_never_double_zero(waits: list[float]) -> None:
+        for idx in range(len(waits) - 1):
+            assert not (waits[idx] == 0.0 and waits[idx + 1] == 0.0)
+
     @pytest.mark.parametrize("status_code", [400, 401, 404])
     @pytest.mark.asyncio
     async def test_g2_rotation_close_client_error_plain_retires_single_post(
@@ -11646,6 +11719,116 @@ class TestEditMessage:
         assert not buf["keepalive"].get("stream_id")
         assert buf.get("keepalive_rotated") is True
 
+    @pytest.mark.asyncio
+    async def test_g2_rotation_close_non_terminal_403_plain_retires_single_post(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G2-rot-403"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        rotation_final_posts = 0
+        informative_opens_after_manual = 0
+        manual_emit = False
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            nonlocal rotation_final_posts, informative_opens_after_manual
+            entity = kwargs["json"]["entities"][0]
+            if manual_emit and entity.get("streamType") == "final" and entity.get("streamId"):
+                rotation_final_posts += 1
+                return MagicMock(
+                    status_code=403,
+                    text="forbidden",
+                    json=lambda: {"error": {"message": "forbidden"}},
+                )
+            if (
+                manual_emit
+                and entity.get("streamType") == "informative"
+                and "streamId" not in entity
+            ):
+                informative_opens_after_manual += 1
+                return self._http_result(201, "g2-403-stream")
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "g2-403-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "g2-403-stream",
+            "sequence": 2,
+            "opened_mono": time.monotonic() - (rotate_at + 0.01),
+        }
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        manual_emit = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert rotation_final_posts == 1
+        assert informative_opens_after_manual == 0
+        assert not buf["keepalive"].get("stream_id")
+        assert buf.get("keepalive_rotated") is True
+
+    @pytest.mark.asyncio
+    async def test_g2_rotation_close_429_defers_without_plain_retire(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G2-rot-429"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(
+            "hermes_a365.outbound_retry.OUTBOUND_DEFAULT_MAX_ATTEMPTS", 1
+        )
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        rotation_final_posts = 0
+        manual_emit = False
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            nonlocal rotation_final_posts
+            entity = kwargs["json"]["entities"][0]
+            if manual_emit and entity.get("streamType") == "final" and entity.get("streamId"):
+                rotation_final_posts += 1
+                return MagicMock(status_code=429, text="slow", json=lambda: {})
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "g2-429-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "g2-429-stream",
+            "sequence": 2,
+            "opened_mono": time.monotonic() - (rotate_at + 0.01),
+        }
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        manual_emit = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert rotation_final_posts >= 1
+        assert buf["keepalive"].get("stream_id") == "g2-429-stream"
+        assert not buf.get("keepalive_rotated")
+
     def test_rotation_close_failure_plain_retires_client_errors(self) -> None:
         for status in (400, 401, 404):
             assert adapter_mod._rotation_close_failure_plain_retire(
@@ -11653,6 +11836,11 @@ class TestEditMessage:
                     status=status, stream_id="s", detail="bad", untracked=False
                 )
             )
+        assert adapter_mod._rotation_close_failure_plain_retire(
+            adapter_mod._KeepalivePost(
+                status=403, stream_id="s", detail="forbidden", untracked=False
+            )
+        )
         assert not adapter_mod._rotation_close_failure_plain_retire(
             adapter_mod._KeepalivePost(
                 status=429, stream_id="s", detail="slow", untracked=False
@@ -11672,6 +11860,20 @@ class TestEditMessage:
         text = a._informative_text_for_turn(buf, turn)
         assert text == progress
         assert text != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+
+    def test_informative_text_before_first_interval_uses_status_without_segments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        turn = {"seq": "1"}
+        buf: dict[str, Any] = {
+            "keepalive_first_interval_elapsed": False,
+            "segments": [],
+        }
+        text = a._informative_text_for_turn(buf, turn)
+        assert text == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert text != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert text.strip()
 
     def test_rotation_close_text_prefers_progress_over_leadin(
         self, monkeypatch: pytest.MonkeyPatch
@@ -11804,7 +12006,6 @@ class TestEditMessage:
         assert finals == 0
 
     @pytest.mark.asyncio
-    @pytest.mark.timeout(15)
     async def test_g2_sleeper_backoff_never_double_rotation_due_zero(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -11816,18 +12017,22 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        rotate_at = adapter_mod._keepalive_rotation_age_sec()
-        sleep_mock, clock = self._advance_monotonic_sleep(
-            monkeypatch, start=rotate_at - 25.0
+        monkeypatch.setattr(
+            "hermes_a365.outbound_retry.OUTBOUND_DEFAULT_MAX_ATTEMPTS", 1
         )
-        rotation_finals = 0
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        recorded: list[float] = []
+        self._install_fake_monotonic_sleep(
+            monkeypatch, start=rotate_at - 25.0, recorded=recorded
+        )
+        rotation_close_attempts = 0
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
-            nonlocal rotation_finals
+            nonlocal rotation_close_attempts
             if entity.get("streamType") == "final" and entity.get("streamId"):
-                rotation_finals += 1
-                return self._http_result(202)
+                rotation_close_attempts += 1
+                return MagicMock(status_code=429, text="slow", json=lambda: {})
             if entity.get("streamType") == "informative" and "streamId" not in entity:
                 return self._http_result(201, "backoff-stream")
             return self._http_result(202)
@@ -11847,31 +12052,17 @@ class TestEditMessage:
             "opened_mono": 0.0,
         }
         buf["keepalive_scheduled_mono"] = rotate_at - 25.0
+        buf["keepalive_revive_used"] = True
         prior = buf.get("keepalive_task")
         if isinstance(prior, asyncio.Task) and not prior.done():
             prior.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await prior
         task = asyncio.create_task(a._turn_buffer_keepalive(chat))
-        yield_event = asyncio.Event()
-        yield_event.set()
-        for _ in range(500):
-            if rotation_finals == 1:
-                break
-            await yield_event.wait()
-            yield_event.set()
-        if rotation_finals != 1:
-            task.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await task
-        else:
-            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
-                await asyncio.wait_for(task, timeout=2.0)
-        assert rotation_finals == 1
-        assert rotate_at - 0.5 <= clock["t"] <= rotate_at + 1.0
-        waits = [float(c.args[0]) for c in sleep_mock.await_args_list if c.args]
-        for idx in range(len(waits) - 1):
-            assert not (waits[idx] == 0.0 and waits[idx + 1] == 0.0)
+        saw_backoff = await self._wait_for_sleeper_backoff_pattern(recorded, task)
+        task.cancel()
+        buf["keepalive_task"] = None
+        assert saw_backoff, f"recorded sleeper waits={recorded!r}"
+        assert rotation_close_attempts >= 2
+        self._assert_sleeper_never_double_zero(recorded)
 
     @pytest.mark.asyncio
     async def test_g2_rotation_close_500_plain_retires_single_post(
@@ -11960,11 +12151,24 @@ class TestEditMessage:
         self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
-        a._copilot_min_stream_age_before_final_sec = 0
-        a._copilot_first_turn_min_stream_age_before_final_sec = 0
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
-        self._advance_monotonic_sleep(monkeypatch, start=rotate_at + 0.01)
+        recorded: list[float] = []
+        self._install_fake_monotonic_sleep(
+            monkeypatch, start=rotate_at - 25.0, recorded=recorded
+        )
+        rotation_finals = 0
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            nonlocal rotation_finals
+            if entity.get("streamType") == "final" and entity.get("streamId"):
+                rotation_finals += 1
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "dz-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
         event = _StubMessageEvent(
             text="sleep",
             source=_StubSessionSource(platform=None, chat_id=chat),
@@ -11976,31 +12180,21 @@ class TestEditMessage:
         prior = buf.get("keepalive_task")
         if isinstance(prior, asyncio.Task) and not prior.done():
             prior.cancel()
-            with contextlib.suppress(asyncio.CancelledError):
-                await prior
         buf["answer_final_in_progress"] = True
         buf["keepalive"] = {
             "stream_id": "dz-stream",
             "sequence": 1,
             "opened_mono": 0.0,
         }
-        interval = adapter_mod._TURN_BUFFER_KEEPALIVE_INTERVAL_SEC
-        recorded: list[float] = []
-        last_sleeper_wait_was_zero = False
-        for _ in range(2):
-            await a._emit_turn_buffer_keepalive(chat)
-            stream = a._keepalive_state(buf)
-            wait = adapter_mod._keepalive_sleeper_wait_after_emit(stream)
-            sleep_sec = wait if wait is not None else interval
-            rotation_due_zero = sleep_sec == 0.0
-            if rotation_due_zero and last_sleeper_wait_was_zero:
-                sleep_sec = adapter_mod._KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC
-            recorded.append(sleep_sec)
-            last_sleeper_wait_was_zero = rotation_due_zero
-        assert recorded == [
-            0.0,
-            adapter_mod._KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC,
-        ]
+        buf["keepalive_scheduled_mono"] = rotate_at - 25.0
+        buf["keepalive_revive_used"] = True
+        task = asyncio.create_task(a._turn_buffer_keepalive(chat))
+        saw_backoff = await self._wait_for_sleeper_backoff_pattern(recorded, task)
+        task.cancel()
+        buf["keepalive_task"] = None
+        assert saw_backoff, f"recorded sleeper waits={recorded!r}"
+        assert rotation_finals == 0
+        self._assert_sleeper_never_double_zero(recorded)
 
     @pytest.mark.asyncio
     async def test_issue247_keepalive_sleeper_posts_rotation_close_near_115s(

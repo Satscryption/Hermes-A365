@@ -37,3 +37,9 @@ None.
 ## Open questions
 
 - Run full suite on Python 3.11 in CI or a local 3.11 venv to satisfy the matrix item not covered here.
+
+## Grok review round 1 (PR #258)
+
+- P2: `test_g2_sleeper_backoff_never_double_rotation_due_zero` uses rotation-close 429 defer, fake `asyncio.sleep` recorder, asserts `0.0` then `1.0` in the real `_turn_buffer_keepalive` loop; `test_g2_answer_final_in_progress_uses_rotation_backoff_sleep` rewritten to the same real-loop harness (delivery blocked, no finals).
+- P3: `test_informative_text_before_first_interval_uses_status_without_segments` covers empty-segment status fallback; `test_g2_rotation_close_non_terminal_403_plain_retires_single_post` and `test_g2_rotation_close_429_defers_without_plain_retire` added beside 400/401/404.
+- Production code unchanged (review agreed it was correct).
