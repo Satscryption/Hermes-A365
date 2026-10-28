@@ -1946,26 +1946,51 @@ class TestDirectlineActivityFailureClassification:
         assert result.status == "ERROR"
         assert "BF Connector token" in result.detail
 
-    def test_directline_401_activity_is_error(self) -> None:
-        from hermes_a365 import bot_service
+    def test_directline_401_without_bot_gateway_detail_is_directline_auth_error(self) -> None:
         from hermes_a365.bot_service import _directline_activity_failure
 
-        result = _directline_activity_failure(401, {"error": "Unauthorized"})
-        assert result.status == "ERROR"
-        assert "Direct Line client authentication failed" in result.detail
-        assert bot_service._DIRECTLINE_CLIENT_AUTH_FAILURE_REMEDIATION in result.detail
-        assert "BF Connector token" not in result.detail
-
-    def test_directline_401_with_bot_token_markers_stays_connector_error(self) -> None:
-        from hermes_a365.bot_service import _directline_activity_failure
-
-        result = _directline_activity_failure(
-            401,
-            {"error": {"message": "invalid jwt signature"}},
+        probe_rg = "hermes-a365-bots"
+        probe_bot = "hermes-inbox-helper-bot"
+        remediation = (
+            "Check the Direct Line channel secret "
+            f"(`az bot directline show -g {probe_rg} -n {probe_bot} --with-secrets`) "
+            "or the conversation token from start-conversation."
         )
-        assert result.status == "ERROR"
-        assert "BF Connector token" in result.detail
-        assert "Direct Line client authentication failed" not in result.detail
+        for body in (
+            {"error": "Unauthorized"},
+            {"error": "Authorization has been denied for this request."},
+            {"error": "Invalid token or secret"},
+            {"error": {"message": "invalid jwt signature"}},
+        ):
+            detail_json = json.dumps(body, sort_keys=True)
+            result = _directline_activity_failure(
+                401,
+                body,
+                resource_group=probe_rg,
+                bot_name=probe_bot,
+            )
+            assert result.status == "ERROR"
+            assert result.detail == (
+                f"Direct Line client authentication failed (HTTP 401): {detail_json}. "
+                f"{remediation}"
+            )
+            assert "BF Connector token" not in result.detail
+
+    def test_directline_401_with_bot_gateway_detail_is_connector_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        for body in (
+            {"detail": "invalid bearer token"},
+            {"detail": "missing bearer token"},
+        ):
+            detail_json = json.dumps(body, sort_keys=True)
+            result = _directline_activity_failure(401, body)
+            assert result.status == "ERROR"
+            assert result.detail == (
+                "configured endpoint rejected a Path B BF Connector token "
+                f"(HTTP 401): {detail_json}"
+            )
+            assert "Direct Line client authentication failed" not in result.detail
 
 
 def test_directline_walk095_stripped_envelope_end_to_end_is_error(
