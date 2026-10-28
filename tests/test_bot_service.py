@@ -1947,11 +1947,25 @@ class TestDirectlineActivityFailureClassification:
         assert "BF Connector token" in result.detail
 
     def test_directline_401_activity_is_error(self) -> None:
+        from hermes_a365 import bot_service
         from hermes_a365.bot_service import _directline_activity_failure
 
         result = _directline_activity_failure(401, {"error": "Unauthorized"})
         assert result.status == "ERROR"
+        assert "Direct Line client authentication failed" in result.detail
+        assert bot_service._DIRECTLINE_CLIENT_AUTH_FAILURE_REMEDIATION in result.detail
+        assert "BF Connector token" not in result.detail
+
+    def test_directline_401_with_bot_token_markers_stays_connector_error(self) -> None:
+        from hermes_a365.bot_service import _directline_activity_failure
+
+        result = _directline_activity_failure(
+            401,
+            {"error": {"message": "invalid jwt signature"}},
+        )
+        assert result.status == "ERROR"
         assert "BF Connector token" in result.detail
+        assert "Direct Line client authentication failed" not in result.detail
 
 
 def test_directline_walk095_stripped_envelope_end_to_end_is_error(
