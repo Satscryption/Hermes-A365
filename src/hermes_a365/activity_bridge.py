@@ -2082,7 +2082,9 @@ async def _refresh_jwks(
 
             if force:
                 if unknown_kid and _forced_refresh_negative_kid_blocks(cache, unknown_kid, now):
-                    return cache.keys_by_kid
+                    return _forced_refresh_shared_outcome(
+                        cache, now, fetched_at_before_wait=fetched_at_before_wait
+                    )
                 if cache.keys_by_kid and now < cache.fetched_at:
                     return _forced_refresh_shared_outcome(
                         cache, now, fetched_at_before_wait=fetched_at_before_wait

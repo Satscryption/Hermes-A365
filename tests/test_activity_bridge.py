@@ -1593,6 +1593,23 @@ class TestJwksRefreshTaskCoordination:
         assert "kid-a" in cache.forced_refresh_negative_kids
         assert "kid-b" in cache.forced_refresh_negative_kids
 
+    async def test_per_kid_negative_cache_hit_raises_after_failed_forced_refresh(
+        self, jwks_mono_clock: tuple[dict[str, float], Any]
+    ) -> None:
+        from hermes_a365.activity_bridge import _refresh_jwks
+
+        _, _advance = jwks_mono_clock
+        cache = _JwksCache()
+        cache.keys_by_kid = {}
+
+        async def fail_fetch() -> dict[str, Any]:
+            raise RuntimeError("outage")
+
+        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+            await _refresh_jwks(cache, fail_fetch, now=1_000.0, force=True, unknown_kid="kid-same")
+        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+            await _refresh_jwks(cache, fail_fetch, now=1_001.0, force=True, unknown_kid="kid-same")
+
     async def test_forced_caller_on_failing_non_force_fetch_raises(
         self, jwks_mono_clock: tuple[dict[str, float], Any]
     ) -> None:
@@ -1603,24 +1620,34 @@ class TestJwksRefreshTaskCoordination:
         _, _advance = jwks_mono_clock
         cache = _JwksCache()
         gate = asyncio.Event()
+        attempts = {"n": 0}
 
         async def fail_fetch() -> dict[str, Any]:
+            attempts["n"] += 1
             await gate.wait()
             raise RuntimeError("outage")
 
         ttl_task = asyncio.create_task(_refresh_jwks(cache, fail_fetch, now=2_000.0))
         await asyncio.sleep(0.02)
-        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
-            await _refresh_jwks(
+        forced_task = asyncio.create_task(
+            _refresh_jwks(
                 cache,
                 fail_fetch,
                 now=2_000.0,
                 force=True,
                 unknown_kid="kid-x",
             )
+        )
         gate.set()
-        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
-            await ttl_task
+
+        async def await_both() -> None:
+            with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+                await ttl_task
+            with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+                await forced_task
+
+        await asyncio.wait_for(await_both(), timeout=2.0)
+        assert attempts["n"] == 1
 
     async def test_shutdown_jwks_cache_refresh_cancels_in_flight(
         self, jwks_mono_clock: tuple[dict[str, float], Any]
