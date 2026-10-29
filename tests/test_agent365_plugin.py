@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
 import hashlib
 import importlib
 import json
@@ -8903,6 +8904,207 @@ class TestEditMessage:
     def _issue249_non_stream_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
         return [entity for entity in entities if entity.get("type") != "streaminfo"]
 
+    @staticmethod
+    def _issue249_ai_entity_count(activity: dict[str, Any]) -> int:
+        bridge = adapter_mod._import_bridge()
+        ai_type = bridge.AI_GENERATED_CONTENT_ENTITY.get("type")
+        return sum(
+            1 for entity in (activity.get("entities") or []) if entity.get("type") == ai_type
+        )
+
+    @classmethod
+    def _issue249_assert_final_clones_preview(
+        cls, preview: dict[str, Any], final: dict[str, Any], *, stream_id: str
+    ) -> None:
+        assert final["text"] == preview["text"]
+        final_extra = cls._issue249_non_stream_entities(final["entities"])
+        preview_extra = cls._issue249_non_stream_entities(preview["entities"])
+        assert final_extra == preview_extra
+        assert final.get("channelData") == preview.get("channelData")
+        assert final.get("attachments") == preview.get("attachments")
+        preview_stream = preview["entities"][0]
+        final_stream = final["entities"][0]
+        assert final_stream.get("streamId") == stream_id
+        assert preview_stream.get("streamType") == "informative"
+        assert final_stream.get("streamType") == "final"
+        assert "streamSequence" not in final_stream
+
+    @pytest.mark.asyncio
+    async def test_issue249_opener_adoption_keeps_snapshot_and_final_clones_visible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#249: real opener adoption must retain last_visible_post for the final clone."""
+        a = _make_adapter(monkeypatch)
+        chat = "19:issue249-adopt@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 2.5
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        posts: list[dict[str, Any]] = []
+        stream_id = "ka-issue249-adopt"
+        clone_calls: list[dict[str, Any]] = []
+        orig_clone = adapter_mod.Agent365Adapter._keepalive_final_activity_from_visible_post
+
+        def track_clone(
+            last_visible: dict[str, Any],
+            *,
+            stream_id: str,
+            inbound: dict[str, Any],
+            conv: dict[str, Any],
+        ) -> dict[str, Any]:
+            clone_calls.append(copy.deepcopy(last_visible))
+            return orig_clone(
+                last_visible,
+                stream_id=stream_id,
+                inbound=inbound,
+                conv=conv,
+            )
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_keepalive_final_activity_from_visible_post",
+            staticmethod(track_clone),
+        )
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, stream_id)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        answer = "Hello."
+        event = _StubMessageEvent(
+            text="quick hello",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=answer, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        preview, final = posts[0], posts[-1]
+        assert preview["type"] == "typing"
+        assert final["type"] == "message"
+        assert len(clone_calls) == 1, "final must clone last_visible_post, not rebuild fresh"
+        assert clone_calls[0]["text"] == answer
+        self._issue249_assert_final_clones_preview(preview, final, stream_id=stream_id)
+        assert self._issue249_ai_entity_count(final) == 1
+        assert final.get("channelData") == bridge.FEEDBACK_LOOP_CHANNEL_DATA
+        visible = [post for post in posts if str(post.get("text") or "").strip()]
+        first_visible_idx = posts.index(visible[0])
+        for later in posts[first_visible_idx:]:
+            assert str(later.get("text") or "").strip()
+        waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 2.0
+        ]
+        assert waits, "expected min-stream-age wait before final (#217)"
+        assert send_reply_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_issue249_mismatched_final_text_built_fresh_with_chrome(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:issue249-fresh@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        clone_calls: list[dict[str, Any]] = []
+        orig_clone = adapter_mod.Agent365Adapter._keepalive_final_activity_from_visible_post
+
+        def track_clone(
+            last_visible: dict[str, Any],
+            *,
+            stream_id: str,
+            inbound: dict[str, Any],
+            conv: dict[str, Any],
+        ) -> dict[str, Any]:
+            clone_calls.append(copy.deepcopy(last_visible))
+            return orig_clone(
+                last_visible,
+                stream_id=stream_id,
+                inbound=inbound,
+                conv=conv,
+            )
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_keepalive_final_activity_from_visible_post",
+            staticmethod(track_clone),
+        )
+        stream_id = "ka-issue249-fresh"
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, stream_id)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": stream_id,
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+            "last_visible_post": {
+                "text": adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
+                "entities": [
+                    {
+                        "type": "streaminfo",
+                        "streamType": "informative",
+                        "streamId": stream_id,
+                        "streamSequence": 1,
+                    }
+                ],
+                "channelData": None,
+            },
+        }
+        answer = "Hello."
+        await a.send(chat_id=chat, content=answer, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        final = posts[-1]
+        assert final["text"] == answer
+        assert final["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert not clone_calls, "text mismatch must not use visible-post clone path"
+        assert self._issue249_ai_entity_count(final) == 1
+        assert final.get("channelData") == bridge.FEEDBACK_LOOP_CHANNEL_DATA
+        assert send_reply_mock.await_count == 0
+
     @pytest.mark.asyncio
     async def test_issue249_fast_turn_no_empty_post_after_preview_and_final_matches_visible(
         self, monkeypatch: pytest.MonkeyPatch
@@ -8953,21 +9155,9 @@ class TestEditMessage:
             assert str(later.get("text") or "").strip(), "no empty/whitespace text after preview"
         last_visible = visible[-2]
         final = visible[-1]
-        assert final["type"] == "message"
-        assert final["entities"][0]["streamType"] == "final"
-        assert final["text"] == last_visible["text"]
-        final_extra = self._issue249_non_stream_entities(final["entities"])
-        preview_extra = self._issue249_non_stream_entities(last_visible["entities"])
-        assert final_extra == preview_extra
-        final_stream = final["entities"][0]
-        preview_stream = last_visible["entities"][0]
-        assert final_stream.get("streamId") == stream_id
-        if preview_stream.get("streamId"):
-            assert preview_stream.get("streamId") == final_stream.get("streamId")
-        assert preview_stream.get("streamType") == "informative"
-        assert final_stream.get("streamType") == "final"
-        assert "streamSequence" not in final_stream
-        assert final.get("channelData") == last_visible.get("channelData")
+        self._issue249_assert_final_clones_preview(last_visible, final, stream_id=stream_id)
+        assert self._issue249_ai_entity_count(final) == 1
+        assert final.get("channelData") == bridge.FEEDBACK_LOOP_CHANNEL_DATA
         waits = [
             float(call.args[0])
             for call in sleep_mock.await_args_list
@@ -9080,9 +9270,7 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 0
         assert typing[0]["text"] == "Hello. Smoke check received."
         assert typing[1]["text"] == "two"
-        assert all(
-            t["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in typing
-        )
+        assert all(t["text"] != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in typing)
         assert finals[0]["text"] == "Hello. Smoke check received."
         assert finals[1]["text"] == "two"
 
@@ -9225,9 +9413,7 @@ class TestEditMessage:
             ],
         }
         assert (
-            a._sanitize_informative_stream_text(
-                buf_fast, turn, "Hello.", for_answer=True
-            )
+            a._sanitize_informative_stream_text(buf_fast, turn, "Hello.", for_answer=True)
             == "Hello."
         )
         buf_slow = {
@@ -9241,18 +9427,20 @@ class TestEditMessage:
                 }
             ],
         }
-        assert a._sanitize_informative_stream_text(
-            buf_slow, turn, "slept", for_answer=False
-        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert (
+            a._sanitize_informative_stream_text(buf_slow, turn, "slept", for_answer=False)
+            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        )
         clipped = "x" * adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
         long_answer = clipped + "tail"
         buf_long = {
             "keepalive_first_interval_elapsed": True,
             "segments": [{"turn": "1", "text": long_answer, "kind": "answer"}],
         }
-        assert a._sanitize_informative_stream_text(
-            buf_long, turn, clipped, for_answer=False
-        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert (
+            a._sanitize_informative_stream_text(buf_long, turn, clipped, for_answer=False)
+            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        )
 
     def test_walk095_sanitize_uses_progress_fallback_after_interval(
         self, monkeypatch: pytest.MonkeyPatch
@@ -9267,10 +9455,7 @@ class TestEditMessage:
                 {"turn": "1", "text": progress, "kind": "progress"},
             ],
         }
-        assert (
-            a._sanitize_informative_stream_text(buf, turn, "slept", for_answer=False)
-            == progress
-        )
+        assert a._sanitize_informative_stream_text(buf, turn, "slept", for_answer=False) == progress
 
     def test_walk095_sanitize_joined_and_prefix_answer_leaks(
         self, monkeypatch: pytest.MonkeyPatch
@@ -9285,13 +9470,15 @@ class TestEditMessage:
             ],
         }
         joined = "Line one.\n\nLine two."
-        assert a._sanitize_informative_stream_text(
-            buf, turn, joined, for_answer=False
-        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert (
+            a._sanitize_informative_stream_text(buf, turn, joined, for_answer=False)
+            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        )
         prefix = "Line one.\n\nLine tw"
-        assert a._sanitize_informative_stream_text(
-            buf, turn, prefix, for_answer=False
-        ) == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert (
+            a._sanitize_informative_stream_text(buf, turn, prefix, for_answer=False)
+            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        )
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
     @pytest.mark.asyncio
@@ -11327,17 +11514,13 @@ class TestEditMessage:
     async def test_g2_plain_answer_after_rotation_fact_after_progress(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        await self._g2_plain_answer_after_rotation_flush(
-            monkeypatch, fact_before_progress=False
-        )
+        await self._g2_plain_answer_after_rotation_flush(monkeypatch, fact_before_progress=False)
 
     @pytest.mark.asyncio
     async def test_g2_plain_answer_after_rotation_fact_before_progress(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        await self._g2_plain_answer_after_rotation_flush(
-            monkeypatch, fact_before_progress=True
-        )
+        await self._g2_plain_answer_after_rotation_flush(monkeypatch, fact_before_progress=True)
 
     @pytest.mark.asyncio
     async def test_g2_rotation_due_when_turn_not_live_still_closes_not_busy_loop(
@@ -11351,9 +11534,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
-        sleep_mock, _clock = self._advance_monotonic_sleep(
-            monkeypatch, start=rotate_at + 0.01
-        )
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch, start=rotate_at + 0.01)
         finals = 0
 
         async def post(*_args: Any, **kwargs: Any) -> MagicMock:
@@ -11476,8 +11657,7 @@ class TestEditMessage:
         skip_logs = [
             r.message
             for r in caplog.records
-            if r.name == "hermes_a365.plugin.adapter"
-            and "rotation skipped past cap" in r.message
+            if r.name == "hermes_a365.plugin.adapter" and "rotation skipped past cap" in r.message
         ]
         assert skip_logs == []
 
@@ -11625,9 +11805,7 @@ class TestEditMessage:
                     text="Content stream finished due to exceeded streaming time",
                     json=lambda: {
                         "error": {
-                            "message": (
-                                "Content stream finished due to exceeded streaming time"
-                            )
+                            "message": ("Content stream finished due to exceeded streaming time")
                         }
                     },
                 )
@@ -11884,9 +12062,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
-        monkeypatch.setattr(
-            "hermes_a365.outbound_retry.OUTBOUND_DEFAULT_MAX_ATTEMPTS", 1
-        )
+        monkeypatch.setattr("hermes_a365.outbound_retry.OUTBOUND_DEFAULT_MAX_ATTEMPTS", 1)
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
         rotation_final_posts = 0
         manual_emit = False
@@ -11935,9 +12111,7 @@ class TestEditMessage:
             )
         )
         assert not adapter_mod._rotation_close_failure_plain_retire(
-            adapter_mod._KeepalivePost(
-                status=429, stream_id="s", detail="slow", untracked=False
-            )
+            adapter_mod._KeepalivePost(status=429, stream_id="s", detail="slow", untracked=False)
         )
 
     def test_informative_text_before_first_interval_uses_progress_fallback(
@@ -12038,8 +12212,7 @@ class TestEditMessage:
         skip_logs = [
             r.message
             for r in caplog.records
-            if r.name == "hermes_a365.plugin.adapter"
-            and "rotation skipped past cap" in r.message
+            if r.name == "hermes_a365.plugin.adapter" and "rotation skipped past cap" in r.message
         ]
         assert len(skip_logs) == 1
 
@@ -12125,9 +12298,7 @@ class TestEditMessage:
         self._patch_token_mint(monkeypatch)
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 25.0)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
-        monkeypatch.setattr(
-            "hermes_a365.outbound_retry.OUTBOUND_DEFAULT_MAX_ATTEMPTS", 1
-        )
+        monkeypatch.setattr("hermes_a365.outbound_retry.OUTBOUND_DEFAULT_MAX_ATTEMPTS", 1)
         rotate_at = adapter_mod._keepalive_rotation_age_sec()
         rotation_close_attempts = 0
 
@@ -12153,9 +12324,7 @@ class TestEditMessage:
         buf["keepalive_revive_used"] = True
         await self._cancel_scheduled_turn_buffer_keepalive(buf)
         recorded: list[float] = []
-        self._install_fake_monotonic_sleep(
-            monkeypatch, start=rotate_at - 25.0, recorded=recorded
-        )
+        self._install_fake_monotonic_sleep(monkeypatch, start=rotate_at - 25.0, recorded=recorded)
         buf["keepalive"] = {
             "stream_id": "backoff-stream",
             "sequence": 1,
@@ -12284,9 +12453,7 @@ class TestEditMessage:
         buf["keepalive_revive_used"] = True
         await self._cancel_scheduled_turn_buffer_keepalive(buf)
         recorded: list[float] = []
-        self._install_fake_monotonic_sleep(
-            monkeypatch, start=rotate_at - 25.0, recorded=recorded
-        )
+        self._install_fake_monotonic_sleep(monkeypatch, start=rotate_at - 25.0, recorded=recorded)
         buf["answer_final_in_progress"] = True
         buf["keepalive"] = {
             "stream_id": "dz-stream",
@@ -12393,9 +12560,7 @@ class TestEditMessage:
         assert outbound_deadlines
         assert outbound_deadlines[0] <= cap + 0.01
         waits = [float(c.args[0]) for c in sleep_mock.await_args_list if c.args]
-        assert any(
-            abs(w - (rotate_at - 100.0)) < 0.01 or abs(w - 15.0) < 0.01 for w in waits
-        )
+        assert any(abs(w - (rotate_at - 100.0)) < 0.01 or abs(w - 15.0) < 0.01 for w in waits)
 
     @pytest.mark.asyncio
     async def test_issue247_slow_turn_keepalive_informative_posts_visible_text(
@@ -13189,9 +13354,7 @@ class TestEditMessage:
 
         async def post_informative() -> None:
             informative_result.append(
-                await a._post_informative_locked(
-                    chat, buf, allow_restart=False, turn_for_text=turn
-                )
+                await a._post_informative_locked(chat, buf, allow_restart=False, turn_for_text=turn)
             )
 
         task = asyncio.create_task(post_informative())
@@ -13251,9 +13414,7 @@ class TestEditMessage:
 
         async def post_informative() -> None:
             informative_result.append(
-                await a._post_informative_locked(
-                    chat, buf, allow_restart=False, turn_for_text=turn
-                )
+                await a._post_informative_locked(chat, buf, allow_restart=False, turn_for_text=turn)
             )
 
         task = asyncio.create_task(post_informative())
