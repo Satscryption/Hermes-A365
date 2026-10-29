@@ -1029,9 +1029,7 @@ _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC = (
 )
 _TURN_BUFFER_KEEPALIVE_TEARDOWN_FINAL_SEC = 5.0
 _TURN_BUFFER_KEEPALIVE_TEXT = "Working on it."
-_KEEPALIVE_ROTATION_STATUS_TEXT = (
-    "Still working on this. I'll send the answer as a new message."
-)
+_KEEPALIVE_ROTATION_STATUS_TEXT = "Still working on this. I'll send the answer as a new message."
 _KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC = 1.0
 _INFORMATIVE_TEXT_MAX_CHARS = 1000
 
@@ -5275,7 +5273,7 @@ class Agent365Adapter(BasePlatformAdapter):
         log_context: str,
         citations: Any = None,
         validated_path: str | None = None,
-        turn_buffer_flush: tuple[str, dict[str, Any]] | None = None,
+        turn_buffer_flush: tuple[str, dict[str, Any], tuple[str, ...]] | None = None,
     ) -> SendResult:
         bridge = _import_bridge()
         generation = self._lifecycle_generation
@@ -5311,15 +5309,14 @@ class Agent365Adapter(BasePlatformAdapter):
             flush_segment_ids = tuple(turn_buffer_flush[2]) if len(turn_buffer_flush) > 2 else ()
             flush_guard = (flush_chat_id, flush_buf, flush_segment_ids)
             flush_buf["plain_reply_flush_in_progress"] = True
+            flush_buf["plain_reply_flush_segment_ids"] = flush_segment_ids
 
             async def retry_sleep(delay: float) -> None:
                 await self._sleep_turn_buffer_locked(flush_chat_id, flush_buf, delay)
                 if not self._plain_flush_retry_still_valid(
                     flush_chat_id, flush_buf, flush_segment_ids
                 ):
-                    raise RuntimeError(
-                        "agent365 turn buffer plain flush superseded during retry"
-                    )
+                    raise RuntimeError("agent365 turn buffer plain flush superseded during retry")
 
             retry_sleep = retry_sleep
         try:
@@ -5345,7 +5342,15 @@ class Agent365Adapter(BasePlatformAdapter):
             return SendResult(success=False, error=str(e))
         finally:
             if flush_guard is not None:
-                flush_guard[1].pop("plain_reply_flush_in_progress", None)
+                flush_chat_id, flush_buf, _flush_segment_ids = flush_guard
+                flush_buf.pop("plain_reply_flush_in_progress", None)
+                flush_buf.pop("plain_reply_flush_segment_ids", None)
+                if flush_buf.pop("plain_flush_followup", False):
+                    followup = flush_buf.get("plain_flush_followup_task")
+                    if not (isinstance(followup, asyncio.Task) and not followup.done()):
+                        flush_buf["plain_flush_followup_task"] = asyncio.create_task(
+                            self._flush_turn_buffer(flush_chat_id)
+                        )
         if not self._lifecycle_is_current(
             generation, client
         ) or not self._chat_lifecycle_is_current(chat_id, chat_generation):
@@ -6072,9 +6077,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _visible_informative_fallback_text(
-        self, buf: dict[str, Any], turn: dict[str, Any]
-    ) -> str:
+    def _visible_informative_fallback_text(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
         """Non-empty informative body for slow-turn heartbeats (#247 / walk095).
 
         Copilot Chat can render bare ``Working on it.`` on informative streams as
@@ -6312,9 +6315,7 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> None:
         """Post every undisplayed segment in order. Caller holds the buffer lock."""
         while self._turn_buffers.get(chat_id) is buf:
-            if (
-                self._turn_buffer_delivery_blocks_keepalive(buf) and not during_answer_delivery
-            ):
+            if self._turn_buffer_delivery_blocks_keepalive(buf) and not during_answer_delivery:
                 return
             pending = self._undisplayed_informative_segments(buf, turn)
             if not pending:
@@ -6370,9 +6371,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
         return self._visible_informative_fallback_text(buf, turn)
 
-    def _rotation_stream_close_text(
-        self, buf: dict[str, Any], turn: dict[str, Any]
-    ) -> str:
+    def _rotation_stream_close_text(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
         """Final body when retiring an informative stream at rotation age (#247)."""
         return self._visible_informative_fallback_text(buf, turn)
 
@@ -6589,9 +6588,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
     @staticmethod
     def _turn_buffer_delivery_blocks_keepalive(buf: dict[str, Any]) -> bool:
-        return bool(
-            buf.get("answer_final_in_progress") or buf.get("plain_reply_flush_in_progress")
-        )
+        return bool(buf.get("answer_final_in_progress") or buf.get("plain_reply_flush_in_progress"))
 
     def _plain_flush_retry_still_valid(
         self,
@@ -7205,10 +7202,7 @@ class Agent365Adapter(BasePlatformAdapter):
             not final
             and isinstance(buf, dict)
             and buf.get("keepalive_first_interval_elapsed")
-            and (
-                not body_text
-                or Agent365Adapter._is_placeholder_informative_text(body_text)
-            )
+            and (not body_text or Agent365Adapter._is_placeholder_informative_text(body_text))
         ):
             body_text = self._visible_informative_fallback_text(buf, turn).strip()
         if not body_text:
@@ -8859,11 +8853,30 @@ class Agent365Adapter(BasePlatformAdapter):
         async with lock:
             await self._flush_closed_turns(chat_id)
 
+    def _plain_flush_followup_needed(self, chat_id: str, buf: dict[str, Any]) -> bool:
+        in_flight = {
+            str(segment_id)
+            for segment_id in (buf.get("plain_reply_flush_segment_ids") or ())
+            if str(segment_id)
+        }
+        pending_ids = {
+            str(segment.get("id") or "")
+            for segment in buf.get("segments") or []
+            if isinstance(segment, dict) and str(segment.get("id") or "")
+        }
+        if not pending_ids:
+            return False
+        if not in_flight:
+            return True
+        return not pending_ids <= in_flight
+
     async def _flush_closed_turns(self, chat_id: str) -> None:
         buf = self._turn_buffers.get(chat_id)
         if not buf or self._disconnecting:
             return
         if buf.get("plain_reply_flush_in_progress"):
+            if self._plain_flush_followup_needed(chat_id, buf):
+                buf["plain_flush_followup"] = True
             return
         turns: list[dict[str, Any]] = list(buf.get("turns") or [])
         include_handoff = not any(turn.get("open") for turn in turns)
@@ -8963,10 +8976,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             turn_buffer_flush=(
                                 chat_id,
                                 buf,
-                                tuple(
-                                    str(segment.get("id") or "")
-                                    for segment in chunk_segments
-                                ),
+                                tuple(str(segment.get("id") or "") for segment in chunk_segments),
                             ),
                         )
                         if not result.success:
@@ -9097,7 +9107,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     content=suffix.strip(),
                     log_context="turn buffer",
                     validated_path=path,
-                    turn_buffer_flush=(chat_id, buf, ()),
+                    turn_buffer_flush=(chat_id, buf, tuple(drop_ids)),
                 )
                 if not link_result.success:
                     logger.warning(

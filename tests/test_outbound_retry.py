@@ -931,3 +931,162 @@ class TestTurnBufferPlainFlushRetry:
         result = await asyncio.wait_for(send_task, timeout=2.0)
         assert result.success is True
         assert post_mock.await_count - before == 2
+
+    async def test_handoff_link_flush_retry_rechecks_drop_segment_ids(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        import hermes_a365.plugin.adapter as adapter_mod
+        from hermes_a365.plugin.conversations import ConversationRef
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        chat = "conv-handoff-drop-recheck"
+        inbound = plugin_tests._make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        a._handoff_link_enabled = True
+        a._conversations.upsert(
+            ConversationRef(conversation_id=chat, service_url="https://s/", chat_type="groupChat")
+        )
+        ok = MagicMock(status_code=200, text="", json=lambda: {"id": "reply-body"})
+        rate = MagicMock(
+            status_code=429,
+            text="",
+            headers={"Retry-After": "0"},
+            json=lambda: {"error": {"code": "TooManyRequests"}},
+        )
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(
+            a, inbound=inbound, post_responses=[ok, rate, ok]
+        )
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
+        handoff_suffix = "\n\n[Continue in Teams](https://teams.microsoft.com/l/chat/0/0?users=bot)"
+        monkeypatch.setattr(a, "_turn_buffer_handoff_suffix", lambda _cid: handoff_suffix)
+
+        async def force_plain_fallback(*_a: Any, **_k: Any) -> tuple[str, None]:
+            return "fallback", None
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", force_plain_fallback)
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", AsyncMock(return_value=True))
+        drop_id = "turnbuf:informative"
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "open": False,
+                    "validated_path": "A",
+                    "activity_id": "act-1",
+                }
+            ],
+            "segments": [
+                {
+                    "id": "turnbuf:1",
+                    "text": "A" * 3950,
+                    "turn": "1",
+                    "reply_to": "act-1",
+                },
+                {
+                    "id": drop_id,
+                    "text": "Using the tool.",
+                    "turn": "1",
+                    "kind": "commentary",
+                    "informative_displayed": True,
+                },
+            ],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+        }
+        retry_entered = asyncio.Event()
+        release_retry = asyncio.Event()
+        orig_sleep = adapter_mod.Agent365Adapter._sleep_turn_buffer_locked
+
+        async def gated_sleep(
+            self: adapter_mod.Agent365Adapter,
+            chat_id: str,
+            buf: dict[str, Any],
+            delay: float,
+        ) -> None:
+            retry_entered.set()
+            await orig_sleep(self, chat_id, buf, 0.0)
+            a._remove_turn_segments(buf, [drop_id])
+            await release_retry.wait()
+            await orig_sleep(self, chat_id, buf, 0.0)
+
+        monkeypatch.setattr(adapter_mod.Agent365Adapter, "_sleep_turn_buffer_locked", gated_sleep)
+        flush_task = asyncio.create_task(a._flush_closed_turns(chat))
+        await asyncio.wait_for(retry_entered.wait(), timeout=2.0)
+        release_retry.set()
+        await asyncio.wait_for(flush_task, timeout=2.0)
+        assert post_mock.await_count == 2
+
+    async def test_plain_flush_busy_arms_followup_flush_for_later_segments(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        import hermes_a365.plugin.adapter as adapter_mod
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        chat = "conv-plain-followup-arm"
+        inbound = plugin_tests._make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(a, inbound=inbound)
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        real_send = bridge.send_reply
+        in_flight = asyncio.Event()
+        hold = asyncio.Event()
+        send_calls = {"n": 0}
+
+        async def gated_send(**kwargs: Any) -> None:
+            send_calls["n"] += 1
+            if send_calls["n"] == 1:
+                in_flight.set()
+                await hold.wait()
+            return await real_send(**kwargs)
+
+        monkeypatch.setattr(bridge, "send_reply", gated_send)
+        monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
+
+        async def force_plain_fallback(*_a: Any, **_k: Any) -> tuple[str, None]:
+            return "fallback", None
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", force_plain_fallback)
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "open": False,
+                    "validated_path": "A",
+                    "activity_id": "act-1",
+                }
+            ],
+            "segments": [{"id": "turnbuf:1", "text": "hello", "turn": "1"}],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+        }
+        buf = a._turn_buffers[chat]
+        plain_send = asyncio.create_task(
+            a._send_reply_activity(
+                inbound=inbound,
+                content="hello",
+                log_context="turn buffer",
+                turn_buffer_flush=(chat, buf, ("turnbuf:1",)),
+            )
+        )
+        await asyncio.wait_for(in_flight.wait(), timeout=2.0)
+        buf["segments"].append({"id": "turnbuf:2", "text": "also", "turn": "1"})
+        await a._flush_turn_buffer(chat)
+        assert buf.get("plain_flush_followup") is True
+        plain_send.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await plain_send
+        followup = buf.get("plain_flush_followup_task")
+        assert isinstance(followup, asyncio.Task)
+        hold.set()
+        await asyncio.wait_for(followup, timeout=2.0)
+        assert send_calls["n"] == 2
+        assert post_mock.await_count == 1
+        assert chat not in a._turn_buffers or not a._turn_buffers[chat].get("segments")
