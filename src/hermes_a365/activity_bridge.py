@@ -102,6 +102,7 @@ import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+from collections import OrderedDict
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
@@ -1004,9 +1005,16 @@ JWKS_CACHE_TTL_SECONDS = 24 * 3600
 # After TTL, a failed refresh may still use last-known-good keys only within this
 # grace window (#86 F1). Beyond TTL + grace the process fails closed.
 JWKS_CACHE_GRACE_SECONDS = 300.0
-# Minimum wall time between JWKS fetches triggered by an unknown signing ``kid``
-# (#208 review). Prevents unverified-header ``kid`` spam from holding admission.
+# Per-unknown-``kid`` negative cache: do not refetch JWKS for the same ``kid`` within
+# this window after a forced refresh attempt (#218 / #208 review).
 JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS = 60.0
+# LRU cap on negative ``kid`` entries (bounds memory and cycling attacks).
+JWKS_FORCED_REFRESH_NEGATIVE_KID_MAX_ENTRIES = 128
+# Minimum wall time between *any* two forced JWKS fetches on one cache. With the
+# per-``kid`` window above, a single ``kid`` still triggers at most one fetch per
+# 60s; distinct ``kid`` values can each fetch, but this floor caps the aggregate
+# rate at roughly one forced fetch per second (~60/min) per cache.
+JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS = 1.0
 MAX_ACTIVITY_BODY_BYTES = 1024 * 1024
 MAX_JWT_BYTES = 16 * 1024
 MAX_ACTIVITY_JSON_DEPTH = 24
@@ -1863,6 +1871,9 @@ class _JwksCache:
     failure_count: int = 0
     retry_after: float = 0.0
     last_forced_refresh_at: float = 0.0
+    forced_refresh_negative_kids: OrderedDict[str, float] = field(
+        default_factory=OrderedDict, repr=False
+    )
 
 
 def _validate_jwt_shape(token: str) -> None:
@@ -1895,12 +1906,31 @@ def _jwks_last_known_good_allowed(cache: _JwksCache, now: float) -> bool:
     return age < cache.ttl_seconds + JWKS_CACHE_GRACE_SECONDS
 
 
+def _forced_refresh_negative_kid_blocks(cache: _JwksCache, kid: str, now: float) -> bool:
+    attempted_at = cache.forced_refresh_negative_kids.get(kid)
+    if attempted_at is None:
+        return False
+    if now - attempted_at >= JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS:
+        del cache.forced_refresh_negative_kids[kid]
+        return False
+    cache.forced_refresh_negative_kids.move_to_end(kid)
+    return True
+
+
+def _note_forced_refresh_attempt_for_kid(cache: _JwksCache, kid: str, now: float) -> None:
+    cache.forced_refresh_negative_kids[kid] = now
+    cache.forced_refresh_negative_kids.move_to_end(kid)
+    while len(cache.forced_refresh_negative_kids) > JWKS_FORCED_REFRESH_NEGATIVE_KID_MAX_ENTRIES:
+        cache.forced_refresh_negative_kids.popitem(last=False)
+
+
 async def _refresh_jwks(
     cache: _JwksCache,
     fetch: Any,
     *,
     now: float,
     force: bool = False,
+    unknown_kid: str | None = None,
 ) -> dict[str, Any]:
     """Single-flight JWKS refresh with failure backoff and bounded staleness."""
     fetched_at_before_wait = cache.fetched_at
@@ -1915,17 +1945,23 @@ async def _refresh_jwks(
             return cache.keys_by_kid
         if not force and cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
             return cache.keys_by_kid
-        if (
-            force
-            and (now - cache.last_forced_refresh_at) < JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS
-        ):
-            return cache.keys_by_kid
+        if force:
+            if unknown_kid and _forced_refresh_negative_kid_blocks(cache, unknown_kid, now):
+                return cache.keys_by_kid
+            if (
+                cache.last_forced_refresh_at
+                and (now - cache.last_forced_refresh_at)
+                < JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS
+            ):
+                return cache.keys_by_kid
         if not force and now < cache.retry_after:
             if _jwks_last_known_good_allowed(cache, now):
                 return cache.keys_by_kid
             raise JwtValidationError("JWKS refresh temporarily unavailable")
         if force:
             cache.last_forced_refresh_at = now
+            if unknown_kid:
+                _note_forced_refresh_attempt_for_kid(cache, unknown_kid, now)
         try:
             keys = await fetch()
             if not keys:
@@ -2234,6 +2270,7 @@ async def validate_inbound_jwt(
             lambda: _fetch_aad_v2_keys(client, tenant_id=tenant_id),
             now=cur,
             force=True,
+            unknown_kid=kid,
         )
     if kid not in keys:
         raise JwtValidationError(f"signing key (kid={kid!r}) not in JWKS")
@@ -2407,6 +2444,7 @@ async def validate_inbound_jwt_bf(
             lambda: _fetch_bf_jwks_keys(client),
             now=cur,
             force=True,
+            unknown_kid=kid,
         )
     if kid not in keys:
         raise JwtValidationError(f"signing key (kid={kid!r}) not in BF JWKS")
