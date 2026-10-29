@@ -370,6 +370,52 @@ class TestAdversarialSensitiveSubprocess:
         assert "PARTIAL" not in out + err
         assert "To sign in, open" not in out + err
 
+    _DELAYED_LINE_PREFIX = (
+        "To sign in, use a web browser to open https://login.microsoft.com/device "
+        "and enter the code ABCD1234"
+    )
+
+    def test_delayed_stdout_continuation_rejects_premature_eof_emit(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        """Child exits while a descendant still holds stdout and extends the line."""
+        if not hasattr(os, "fork"):
+            pytest.skip("POSIX fork required")
+        script = (
+            "import os, sys, time\n"
+            f"prefix = {self._DELAYED_LINE_PREFIX!r}\n"
+            "if os.fork() == 0:\n"
+            "    time.sleep(0.4)\n"
+            "    os.write(sys.stdout.fileno(), b'EXTRA\\n')\n"
+            "    os._exit(0)\n"
+            "os.write(sys.stdout.fileno(), prefix.encode())\n"
+            "os._exit(0)\n"
+        )
+        _, out, _ = self._run_cap(script, capfd, timeout=5.0)
+        assert "To sign in, open" not in out
+        assert self._CODE not in out
+
+    def test_delayed_stderr_continuation_rejects_premature_eof_emit(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        """Same as stdout, but the partial prompt is written to stderr."""
+        if not hasattr(os, "fork"):
+            pytest.skip("POSIX fork required")
+        script = (
+            "import os, sys, time\n"
+            f"prefix = {self._DELAYED_LINE_PREFIX!r}\n"
+            "if os.fork() == 0:\n"
+            "    time.sleep(0.4)\n"
+            "    os.write(sys.stderr.fileno(), b'EXTRA\\n')\n"
+            "    os._exit(0)\n"
+            "os.write(sys.stderr.fileno(), prefix.encode())\n"
+            "os._exit(0)\n"
+        )
+        _, out, err = self._run_cap(script, capfd, timeout=5.0)
+        merged = out + err
+        assert "To sign in, open" not in merged
+        assert self._CODE not in merged
+
     def test_chunk_split_mid_code_emits_only_after_full_line(
         self, capfd: pytest.CaptureFixture[str]
     ) -> None:

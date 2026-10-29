@@ -980,6 +980,30 @@ def _assert_no_secret_in_exception_chain(exc: BaseException, marker: str) -> Non
 
 
 class TestSensitiveGraphViaMutator:
+    def test_authorization_denied_surfaces_read_permission_hint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from hermes_a365.mutator import A365CliMutator
+
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "Authorization_RequestDenied",
+                    "message": "Insufficient privileges to complete the operation.",
+                }
+            }
+        )
+        _install_az_rest_shim(tmp_path, monkeypatch, response_body=body)
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        mutator = A365CliMutator()
+        mutator.available = True
+        getter = graph_get_from_mutator(mutator)
+        with pytest.raises(EntraStateError, match=r"Application\.Read\.All") as excinfo:
+            _app_by_id(getter, APP)
+        assert GRAPH_READ_PERMISSION_HINT.split(".")[0] in str(excinfo.value)
+
     def test_not_found_returns_none_without_raw_body(
         self,
         tmp_path: Path,

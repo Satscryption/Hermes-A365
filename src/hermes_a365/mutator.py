@@ -455,16 +455,13 @@ def _run_pumped_output(
         try:
             name, payload = out_q.get(timeout=min(0.05, max(remaining, 0.0)))
         except queue.Empty:
-            if proc.poll() is not None:
+            if proc.poll() is not None and all(eof_seen[s] for s in streams):
                 while True:
                     try:
                         name, payload = out_q.get_nowait()
                     except queue.Empty:
                         break
                     _process_queue_item(name, payload)
-                for stream in streams:
-                    if not eof_seen[stream]:
-                        _flush_eof_tail(stream)
                 break
             continue
         _process_queue_item(name, payload)
