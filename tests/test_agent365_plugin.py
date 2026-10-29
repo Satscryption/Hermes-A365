@@ -25313,13 +25313,9 @@ class TestInteractiveCards:
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
-        bridge = adapter_mod._import_bridge()
-        a._turn_origins[session_key] = {
-            "user_id": bridge._canonical_activity_user(inbound),
-            "conversation_id": str(inbound["conversation"]["id"]),
-            "tenant_id": a.tenant_id.lower(),
-            "session_key": session_key,
-        }
+        origin = a._turn_origin_from_activity(inbound, session_key)
+        assert origin is not None
+        adapter_mod._AGENT_TURN_ORIGIN.set(origin)
 
     @pytest.mark.asyncio
     async def test_send_exec_approval_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -25679,9 +25675,7 @@ class TestCardCapabilityTurnOrigin:
         inbound["from"] = {"id": user_id, "name": user_id, "aadObjectId": user_aad}
         return inbound
 
-    def _wire_client(self, adapter: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
-        from fastapi.testclient import TestClient
-
+    def _wire_adapter(self, adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(
             bridge,
@@ -25694,7 +25688,130 @@ class TestCardCapabilityTurnOrigin:
         adapter._fmi_cache = MagicMock()
         adapter._user_cache = MagicMock()
         adapter._bf_token_cache = MagicMock()
-        return TestClient(adapter.build_app())
+
+    async def _run_exec_approval_with_b_posted_during_a_turn(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        group_sessions_per_user: bool,
+        session_key_unavailable: bool,
+    ) -> None:
+        import httpx
+
+        adapter = _make_adapter(
+            monkeypatch,
+            group_sessions_per_user=group_sessions_per_user,
+        )
+        self._wire_adapter(adapter, monkeypatch)
+        if session_key_unavailable:
+            monkeypatch.setattr(adapter, "_session_key_for", lambda _event: None)
+        bridge = adapter_mod._import_bridge()
+        a_inbound = self._group_inbound(
+            activity_id="act-a",
+            text="from-a",
+            user_aad=self._USER_A,
+            user_id="user-a",
+        )
+        b_inbound = self._group_inbound(
+            activity_id="act-b",
+            text="from-b",
+            user_aad=self._USER_B,
+            user_id="user-b",
+        )
+        a_ready = asyncio.Event()
+        b_posted = asyncio.Event()
+        a_done = asyncio.Event()
+        outcomes: dict[str, Any] = {}
+
+        async def handle_message(event: Any) -> None:
+            if str(getattr(event, "message_id", "") or "") != "act-a":
+                return
+            session_key = adapter._session_key_for(event) or f"agent365:{self._GROUP_CONV}"
+            outcomes["session_key"] = session_key
+            a_ready.set()
+            await b_posted.wait()
+            resolver = MagicMock(return_value=1)
+            monkeypatch.setattr(adapter, "_gw_resolve_approval", resolver)
+            outcomes["result"] = await adapter.send_exec_approval(
+                self._GROUP_CONV,
+                "danger",
+                session_key,
+            )
+            outcomes["resolver"] = resolver
+            a_done.set()
+
+        adapter.handle_message = handle_message
+        transport = httpx.ASGITransport(app=adapter.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+
+            async def post_a() -> None:
+                response = await client.post(
+                    "/api/messages",
+                    json=a_inbound,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+                assert response.status_code == 200
+                outcomes["a_status"] = response.json()["status"]
+
+            a_task = asyncio.create_task(post_a())
+            await asyncio.wait_for(a_ready.wait(), timeout=2.0)
+            b_response = await client.post(
+                "/api/messages",
+                json=b_inbound,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+            assert b_response.status_code == 200
+            assert b_response.json()["status"] == "dispatched"
+            cached = adapter._cached_inbound_for(self._GROUP_CONV)
+            assert bridge._canonical_activity_user(cached) == bridge._canonical_activity_user(
+                b_inbound
+            )
+            b_posted.set()
+            await asyncio.wait_for(a_done.wait(), timeout=2.0)
+            await a_task
+
+        assert outcomes["a_status"] == "dispatched"
+        assert outcomes["result"].success is True
+        capability = next(iter(adapter._card_capabilities.values()))
+        assert capability["user_id"] == bridge._canonical_activity_user(a_inbound)
+        card_value = bridge.send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
+            "actions"
+        ][0]["data"]
+        b_activity = self._group_inbound(
+            activity_id="act-b-submit",
+            text="",
+            user_aad=self._USER_B,
+            user_id="user-b",
+        )
+        rejected = await adapter._handle_card_action(b_activity, card_value)
+        assert rejected.status_code == 403
+        outcomes["resolver"].assert_not_called()
+        accepted = await adapter._handle_card_action(a_inbound, card_value)
+        assert accepted.status_code == 200
+        assert outcomes["resolver"].call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_sessions_per_user", [True, False])
+    async def test_real_b_post_during_a_turn_exec_approval(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        group_sessions_per_user: bool,
+    ) -> None:
+        await self._run_exec_approval_with_b_posted_during_a_turn(
+            monkeypatch,
+            group_sessions_per_user=group_sessions_per_user,
+            session_key_unavailable=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_b_post_during_a_turn_when_session_key_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await self._run_exec_approval_with_b_posted_during_a_turn(
+            monkeypatch,
+            group_sessions_per_user=False,
+            session_key_unavailable=True,
+        )
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(
@@ -25713,25 +25830,17 @@ class TestCardCapabilityTurnOrigin:
         resolver_is_async: bool,
         card_kind: str,
     ) -> None:
-        adapter = _make_adapter(monkeypatch)
-        client = self._wire_client(adapter, monkeypatch)
+        adapter = _make_adapter(monkeypatch, group_sessions_per_user=True)
+        self._wire_adapter(adapter, monkeypatch)
+        from fastapi.testclient import TestClient
+
+        client = TestClient(adapter.build_app())
         bridge = adapter_mod._import_bridge()
         outcomes: dict[str, Any] = {}
 
         async def handle_message(event: Any) -> None:
             session_key = adapter._session_key_for(event)
             assert session_key is not None
-            b_inbound = self._group_inbound(
-                activity_id="act-b",
-                text="from-b",
-                user_aad=self._USER_B,
-                user_id="user-b",
-            )
-            adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(b_inbound))
-            cached = adapter._cached_inbound_for(self._GROUP_CONV)
-            assert bridge._canonical_activity_user(cached) == bridge._canonical_activity_user(
-                b_inbound
-            )
             if resolver_is_async:
                 resolver = AsyncMock(return_value="ok" if card_kind == "slash_confirm" else True)
             else:
@@ -25797,7 +25906,10 @@ class TestCardCapabilityTurnOrigin:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         adapter = _make_adapter(monkeypatch)
-        client = self._wire_client(adapter, monkeypatch)
+        self._wire_adapter(adapter, monkeypatch)
+        from fastapi.testclient import TestClient
+
+        client = TestClient(adapter.build_app())
         bridge = adapter_mod._import_bridge()
         conv = "conv-personal-1"
         outcomes: dict[str, Any] = {}
@@ -25805,9 +25917,6 @@ class TestCardCapabilityTurnOrigin:
         async def handle_message(event: Any) -> None:
             session_key = adapter._session_key_for(event)
             assert session_key is not None
-            other = _make_inbound(conv_id=conv, activity_id="act-other", text="other")
-            other["from"] = {"id": "other-user", "aadObjectId": self._USER_B}
-            adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(other))
             outcomes["result"] = await adapter.send_exec_approval(
                 conv,
                 "danger",
@@ -25847,6 +25956,46 @@ class TestCardCapabilityTurnOrigin:
         assert result.success is False
         assert adapter._card_capabilities == {}
         send_reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_card_mint_rejects_empty_turn_origin_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _make_adapter(monkeypatch)
+        self._wire_adapter(adapter, monkeypatch)
+        inbound = _make_inbound(conv_id="conv-1")
+        inbound["from"] = {}
+        adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        token = adapter_mod._AGENT_TURN_ORIGIN.set(
+            adapter._turn_origin_from_activity(inbound, "sess-1")
+        )
+        try:
+            result = await adapter.send_exec_approval("conv-1", "danger", "sess-1")
+        finally:
+            adapter_mod._AGENT_TURN_ORIGIN.reset(token)
+        assert result.success is False
+        assert adapter._card_capabilities == {}
+
+    @pytest.mark.asyncio
+    async def test_card_resolve_rejects_empty_submitter_and_empty_capability_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _make_adapter(monkeypatch)
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(adapter, "_gw_resolve_approval", resolver)
+        activity = _make_inbound(conv_id="conv-1")
+        activity["from"] = {}
+        value = _seed_card_capability(
+            adapter,
+            activity,
+            kind="exec_approval",
+            choice="once",
+            resolver={"session_key": "sess-1"},
+        )
+        adapter._card_capabilities["test-capability"]["user_id"] = ""
+        response = await adapter._handle_card_action(activity, value)
+        assert response.status_code == 403
+        resolver.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
