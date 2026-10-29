@@ -26,6 +26,7 @@ from .entra_state import (
     GraphGet,
     _is_denied,
     _is_not_found,
+    _parse_strict_graph_json_object,
     application_client_secret_expiry_url,
     assert_client_secret_expiry_read_url,
     graph_error_code,
@@ -116,21 +117,26 @@ def select_latest_active_credential_end(
     windows: list[tuple[datetime, datetime]],
     *,
     now: datetime,
-) -> tuple[datetime | None, datetime | None, str | None]:
-    """Return ``(active_end, latest_past_end, failure_reason)``.
-
-    Active credentials satisfy ``start <= now < end``. When any exist, return
-    ``max(end)`` (latest still-valid password). When none are active but past
-    credentials exist, ``active_end`` is ``None`` and ``latest_past_end`` is
-    ``max(end)`` among expired rows.
-    """
-    active_ends = [end for start, end in windows if start <= now < end]
-    if active_ends:
-        return max(active_ends), None, None
+) -> tuple[datetime | None, datetime | None, str | None, int]:
+    """Return ``(active_end, latest_past_end, failure_reason, active_count)``."""
+    active = [(start, end) for start, end in windows if start <= now < end]
+    if active:
+        return max(end for _start, end in active), None, None, len(active)
+    if any(end > now for _start, end in windows):
+        return None, None, "no_active_yet", 0
     past_ends = [end for start, end in windows if end <= now]
     if past_ends:
-        return None, max(past_ends), "all client secrets expired"
-    return None, None, "no client secret in its active window"
+        return None, max(past_ends), "all client secrets expired", 0
+    return None, None, "no client secret in its active window", 0
+
+
+def _healthy_detail(*, end_z: str, days: int, active_count: int) -> str:
+    count_label = f" ({active_count} active passwords)" if active_count > 1 else ""
+    return (
+        f"latest active client secret{count_label} expires on {end_z} "
+        f"({days} day(s) remaining); does not confirm which credential the "
+        "deployment uses; older active secrets may expire sooner"
+    )
 
 
 def classify_client_secret_expiry(
@@ -138,32 +144,35 @@ def classify_client_secret_expiry(
     end: datetime,
     now: datetime,
     warn_days: int,
+    active_count: int = 1,
 ) -> tuple[CheckState, str, dict[str, Any]]:
     data: dict[str, Any] = {
         "warn_days": warn_days,
         "end_date_time": _format_end_z(end),
     }
+    if active_count > 1:
+        data["active_password_count"] = active_count
     days = _days_remaining(end=end, now=now)
     data["days_remaining"] = days
+    end_z = data["end_date_time"]
     if end <= now:
         data["check"] = "expired"
         return (
             "error",
-            f"last active client secret expired on {data['end_date_time']} ({days} days remaining)",
+            f"last active client secret expired on {end_z} ({days} days remaining)",
             data,
         )
     if days <= warn_days:
         data["check"] = "expiring"
         return (
             "warn",
-            f"last active client secret expires on {data['end_date_time']} "
-            f"({days} day(s) remaining)",
+            _healthy_detail(end_z=end_z, days=days, active_count=active_count),
             data,
         )
     data["check"] = "healthy"
     return (
         "ok",
-        f"last active client secret expires on {data['end_date_time']} ({days} day(s) remaining)",
+        _healthy_detail(end_z=end_z, days=days, active_count=active_count),
         data,
     )
 
@@ -195,11 +204,8 @@ def _az_rest_graph_get(url: str) -> dict[str, Any] | None:
         return None
     if proc.returncode != 0:
         return None
-    try:
-        payload = json.loads(proc.stdout)
-    except json.JSONDecodeError:
-        return None
-    return payload if isinstance(payload, dict) else None
+    parsed = _parse_strict_graph_json_object(proc.stdout or "")
+    return parsed
 
 
 def graph_get_from_az_rest() -> GraphGet:
@@ -290,14 +296,24 @@ def check_app_client_secret_expiry(
             f"no client secret to monitor for {role} application",
             {"role": role, "check": "no_password_secret"},
         )
-    active_end, latest_past, failure = select_latest_active_credential_end(windows, now=now)
+    active_end, latest_past, failure, active_count = select_latest_active_credential_end(
+        windows, now=now
+    )
     if active_end is not None:
         state, detail, data = classify_client_secret_expiry(
             end=active_end,
             now=now,
             warn_days=warn_days,
+            active_count=active_count,
         )
         return state, detail, {**data, "role": role}
+    if failure == "no_active_yet":
+        state: CheckState = "skipped" if for_status else "warn"
+        return (
+            state,
+            f"no active client secret yet for {role} application",
+            {"role": role, "check": "no_active_yet"},
+        )
     if latest_past is not None:
         data = {
             "warn_days": warn_days,
@@ -436,13 +452,13 @@ def resolve_secret_expiry_targets(
         agent_name=agent_name,
         generated_config_path=generated_config_path,
     )
-    bf_configured = sidecar_path.is_file()
     bf, unreadable = resolve_bf_app_id(
         hermes_home=hermes_home,
         sidecar_path=sidecar_path,
         agent_name=agent_name,
         operator_env=operator_env,
     )
+    bf_configured = bool(bf) or sidecar_path.is_file()
     return ClientSecretExpiryTargets(
         blueprint_app_id=blueprint,
         bf_app_id=bf,
@@ -528,7 +544,7 @@ def gather_client_secret_expiry_checks(
         )
 
     if not targets.bf_configured:
-        skip_row("bf_client_secret", "skipped; Path B sidecar absent")
+        skip_row("bf_client_secret", "skipped; Bot Framework app not configured")
     elif targets.bf_sidecar_unreadable or not targets.bf_app_id:
         state = _unavailable_state(for_status=for_status)
         rows.append(
@@ -559,3 +575,27 @@ def worst_check_state(states: list[CheckState]) -> CheckState:
     if any(state == "warn" for state in actionable):
         return "warn"
     return "ok"
+
+
+def status_component_state(
+    rows: list[tuple[str, CheckState, str, dict[str, Any]]],
+) -> CheckState:
+    """Map per-app rows to one status component state (exit code unchanged on skip)."""
+    overall = worst_check_state([state for _, state, _, _ in rows])
+    if overall == "error":
+        return "error"
+    if overall == "warn":
+        return "warn"
+    if any(payload.get("check") == "unavailable" for _, _, _, payload in rows):
+        return "skipped"
+    if all(
+        state == "skipped" and payload.get("check") == "skipped" for _, state, _, payload in rows
+    ):
+        return "skipped"
+    return "ok"
+
+
+def status_component_detail(
+    rows: list[tuple[str, CheckState, str, dict[str, Any]]],
+) -> str:
+    return "; ".join(f"{name}: {detail}" for name, _, detail, _ in rows)

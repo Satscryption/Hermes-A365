@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -14,7 +15,10 @@ import pytest
 from hermes_a365 import doctor
 from hermes_a365.client_secret_expiry import (
     check_app_client_secret_expiry,
+    gather_client_secret_expiry_checks,
     select_latest_active_credential_end,
+    status_component_detail,
+    status_component_state,
 )
 from hermes_a365.doctor import (
     ProbeResult,
@@ -25,11 +29,14 @@ from hermes_a365.doctor import (
 )
 from hermes_a365.entra_state import (
     EntraStateError,
+    _parse_strict_graph_json_object,
     application_client_secret_expiry_url,
     assert_client_secret_expiry_read_url,
     assert_registration_read_url,
+    graph_get_from_mutator_for_secret_expiry,
     redact,
 )
+from hermes_a365.mutator import A365CliMutator, RunResult
 from hermes_a365.status import _UnavailableQuerySource, collect_status
 from hermes_a365.status import overall_to_exit_code as status_exit
 
@@ -75,9 +82,10 @@ class TestSelectLatestActive:
             (_NOW - timedelta(days=1), _NOW + timedelta(days=10)),
             (_NOW - timedelta(days=1), _NOW + timedelta(days=400)),
         ]
-        end, past, failure = select_latest_active_credential_end(windows, now=_NOW)
+        end, past, failure, count = select_latest_active_credential_end(windows, now=_NOW)
         assert failure is None and past is None
         assert end == _NOW + timedelta(days=400)
+        assert count == 2
 
     def test_ten_day_window_still_expiring_when_latest_is_400(self) -> None:
         payload = {
@@ -177,6 +185,145 @@ class TestCheckApp:
         assert state == "warn"
         assert data["check"] == "unavailable"
 
+    def test_future_start_is_not_expired(self) -> None:
+        payload = {
+            "passwordCredentials": [
+                _cred(start=_NOW + timedelta(days=5), end=_NOW + timedelta(days=400)),
+            ],
+        }
+        doc_state, doc_detail, data = check_app_client_secret_expiry(
+            _BLUEPRINT,
+            graph_get=_graph_get(payload),
+            now=_NOW,
+            for_status=False,
+        )
+        stat_state, _, _ = check_app_client_secret_expiry(
+            _BLUEPRINT,
+            graph_get=_graph_get(payload),
+            now=_NOW,
+            for_status=True,
+        )
+        assert doc_state == "warn"
+        assert stat_state == "skipped"
+        assert "no active client secret yet" in doc_detail
+        assert data["check"] == "no_active_yet"
+
+
+class TestStrictJson:
+    def test_rejects_trailing_garbage(self) -> None:
+        body = '{"passwordCredentials": []} trailing'
+        assert _parse_strict_graph_json_object(body) is None
+
+    def test_rejects_array_body(self) -> None:
+        assert _parse_strict_graph_json_object("[{}]") is None
+
+    def test_mutator_adapter_rejects_non_object(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", True)
+
+        def fake_run(argv, **kwargs):
+            return RunResult(
+                argv=list(argv), returncode=0, stdout='{"passwordCredentials":[]} x', stderr=""
+            )
+
+        monkeypatch.setattr(mut, "run", fake_run)
+        getter = graph_get_from_mutator_for_secret_expiry(mut)
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload is None
+
+
+class TestMutatorTimeout:
+    _MARKER = "timeoutPartialLeakMarker9"
+
+    def test_timeout_returns_sanitized_without_marker(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", True)
+
+        def boom(argv, **kwargs):
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=1, output=self._MARKER)
+
+        monkeypatch.setattr(mut, "run", boom)
+        getter = graph_get_from_mutator_for_secret_expiry(mut)
+        try:
+            payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        except subprocess.TimeoutExpired as exc:
+            pytest.fail(f"timeout leaked to caller: {exc!r}")
+        assert payload is not None
+        assert self._MARKER not in json.dumps(payload)
+        state, detail, data = check_app_client_secret_expiry(
+            _BLUEPRINT,
+            graph_get=getter,
+            now=_NOW,
+        )
+        assert state == "warn"
+        assert data["check"] == "unavailable"
+        _assert_no_leaks(detail)
+
+
+class TestBfConfiguredWithoutSidecar:
+    def test_bf_env_without_sidecar_runs_check(self, tmp_path: Path) -> None:
+        home = tmp_path / "hermes"
+        home.mkdir()
+        bf = "22222222-2222-2222-2222-222222222222"
+        (home / ".env").write_text(f"A365_APP_ID={_BLUEPRINT}\nA365_BF_APP_ID={bf}\n")
+        sidecar = tmp_path / "absent-sidecar.json"
+
+        def router(url: str) -> dict[str, Any]:
+            if bf in url:
+                return {
+                    "passwordCredentials": [
+                        _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=400)),
+                    ],
+                }
+            return {"passwordCredentials": []}
+
+        rows = gather_client_secret_expiry_checks(
+            hermes_home=home,
+            agent_name=None,
+            sidecar_path=sidecar,
+            generated_config_path=tmp_path / "missing.json",
+            graph_get=router,
+            now=lambda: _NOW,
+        )
+        by_name = {name: state for name, state, _, _ in rows}
+        assert by_name["bf_client_secret"] == "ok"
+
+
+class TestStatusRollup:
+    def test_healthy_plus_denied_skipped_with_both_details(self, tmp_path: Path) -> None:
+        home = tmp_path / "hermes"
+        home.mkdir()
+        bf = "22222222-2222-2222-2222-222222222222"
+        (home / ".env").write_text(
+            f"A365_APP_ID={_BLUEPRINT}\nA365_BF_APP_ID={bf}\n",
+        )
+
+        def router(url: str) -> dict[str, Any]:
+            if _BLUEPRINT in url:
+                return {
+                    "passwordCredentials": [
+                        _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=400)),
+                    ],
+                }
+            return {"error": {"code": "Authorization_RequestDenied", "message": _GRAPH_MSG}}
+
+        rows = gather_client_secret_expiry_checks(
+            hermes_home=home,
+            agent_name=None,
+            sidecar_path=tmp_path / "missing-sidecar.json",
+            generated_config_path=tmp_path / "missing.json",
+            graph_get=router,
+            now=lambda: _NOW,
+            for_status=True,
+        )
+        assert status_component_state(rows) == "skipped"
+        detail = status_component_detail(rows)
+        assert "could not check Bot Framework" in detail
+        assert "older active secrets may expire sooner" in detail
+        _assert_no_leaks(detail)
+
 
 class TestEntraUrl:
     def test_expiry_url_allowlisted(self) -> None:
@@ -254,7 +401,7 @@ class TestDoctorStatusIntegration:
 
         with _minimal_doctor_patches():
             report = run_all_probes(
-                no_network=True,
+                no_network=False,
                 graph_get=_graph_get(payload),
                 secret_expiry_now=lambda: _NOW,
                 bot_service_sidecar_path=tmp_path / "missing.json",
@@ -277,7 +424,7 @@ class TestDoctorStatusIntegration:
         }
         with _minimal_doctor_patches():
             report = run_all_probes(
-                no_network=True,
+                no_network=False,
                 graph_get=_graph_get(payload),
                 secret_expiry_now=lambda: _NOW,
                 bot_service_sidecar_path=tmp_path / "missing.json",
@@ -299,8 +446,21 @@ class TestDoctorStatusIntegration:
             bot_service_sidecar_path=tmp_path / "missing-sidecar.json",
         )
         comp = next(c for c in report.components if c.name == "client_secret_expiry")
-        assert comp.state == "ok"
+        assert comp.state == "skipped"
+        assert "could not check blueprint" in comp.detail
         assert status_exit(report.overall) == 0
+
+    def test_no_network_skips_expiry_without_subprocess(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = _seed_home(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with _minimal_doctor_patches(), patch("subprocess.run") as proc_run:
+            report = run_all_probes(no_network=True, bot_service_sidecar_path=tmp_path / "x.json")
+        proc_run.assert_not_called()
+        bp = next(p for p in report.probes if p.name == "blueprint_client_secret")
+        assert bp.state == "skipped"
+        assert "--no-network" in bp.detail
 
     def test_negative_warn_days_argparse_exit_2(self) -> None:
         with pytest.raises(SystemExit) as exc:
@@ -309,10 +469,10 @@ class TestDoctorStatusIntegration:
 
 
 # Mutation table (revert guard locally → named test fails):
+# no_network skip_reason → test_no_network_skips_expiry_without_subprocess
+# status unavailable rollup → test_healthy_plus_denied_skipped_with_both_details
+# future-start handling → test_future_start_is_not_expired
+# mutator TimeoutExpired → test_timeout_returns_sanitized_without_marker
+# strict json.loads → test_rejects_trailing_garbage / test_rejects_array_body
+# bf env configured → test_bf_env_without_sidecar_runs_check
 # max(end) selection → test_picks_latest_end_among_overlapping_active
-# empty password list → test_no_password_credentials_skips
-# for_status unavailable → test_graph_denied_doctor_warns_status_skips
-# naive datetime → test_malformed_date_makes_check_unavailable
-# query key allowlist → test_rejects_extra_query_keys
-# status exit on unavailable → test_status_could_not_check_keeps_exit_ok
-# warn-days argparse → test_negative_warn_days_argparse_exit_2

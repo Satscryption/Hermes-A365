@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -545,6 +546,18 @@ def _is_guid(value: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _parse_strict_graph_json_object(text: str) -> dict[str, Any] | None:
+    """Parse a Graph body as one complete top-level JSON object."""
+    stripped = text.strip()
+    if not stripped:
+        return None
+    try:
+        data = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _parse_graph_json(text: str) -> dict[str, Any] | None:
     start = text.find("{")
     if start < 0:
@@ -639,9 +652,16 @@ def graph_get_from_mutator_for_secret_expiry(
                 sensitive=True,
                 timeout=timeout,
             )
+        except subprocess.TimeoutExpired:
+            return {
+                "error": {
+                    "code": "UnreadableGraphResponse",
+                    "message": "Graph read timed out",
+                }
+            }
         except CliInvocationError as exc:
             raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
-            parsed = _parse_graph_json(raw)
+            parsed = _parse_strict_graph_json_object(raw)
             if parsed is not None:
                 return parsed
             return {
@@ -652,7 +672,7 @@ def graph_get_from_mutator_for_secret_expiry(
             }
         except (AADSTSError, OSError):
             return None
-        return _parse_graph_json(result.stdout or "")
+        return _parse_strict_graph_json_object(result.stdout or "")
 
     return graph_get
 

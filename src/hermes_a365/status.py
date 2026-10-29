@@ -55,7 +55,8 @@ from ._common import parse_env, safe_run, slugify, validate_slug
 from .client_secret_expiry import (
     DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
     gather_client_secret_expiry_checks,
-    worst_check_state,
+    status_component_detail,
+    status_component_state,
 )
 from .entra_state import GraphGet
 
@@ -613,23 +614,14 @@ def gather_client_secret_expiry(
         operator_env=operator_env,
         for_status=True,
     )
-    states = [row[1] for row in rows]
-    overall = worst_check_state(states)
-    component_state: ComponentState
-    if overall == "error":
-        component_state = _ERROR
-    elif overall == "warn":
-        component_state = _WARN
-    elif all(
-        state == "skipped" and payload.get("check") == "skipped" for _, state, _, payload in rows
-    ):
-        component_state = _SKIPPED
-    else:
-        component_state = _OK
-    active_rows = [row for row in rows if row[1] != "skipped"]
-    details = "; ".join(f"{name}: {detail}" for name, _, detail, _ in active_rows)
-    if not details:
-        details = "; ".join(f"{name}: {detail}" for name, _, detail, _ in rows)
+    roll = status_component_state(rows)
+    component_state = {
+        "ok": _OK,
+        "warn": _WARN,
+        "error": _ERROR,
+        "skipped": _SKIPPED,
+    }[roll]
+    details = status_component_detail(rows)
     data = {
         "warn_days": warn_days,
         "apps": {

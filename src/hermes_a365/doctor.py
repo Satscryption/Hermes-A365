@@ -1390,7 +1390,7 @@ def run_all_probes(
     )
     probes.append(probe_hermes_harness())
     home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
-    expiry_skip = None
+    expiry_skip = "--no-network" if no_network else None
     for name, state, detail, data in gather_client_secret_expiry_checks(
         hermes_home=home,
         agent_name=agent_name,
