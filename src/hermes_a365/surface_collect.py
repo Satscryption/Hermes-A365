@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any
 
 _SRC_ROOT = Path(__file__).resolve().parent
+_SKIP_ENV_SCAN = frozenset({"surface_collect.py", "surface.py"})
 
 _ENV_LITERAL_RE = re.compile(r"^([A-Z][A-Z0-9_]+)$")
 
@@ -20,7 +21,7 @@ _ENV_LITERAL_RE = re.compile(r"^([A-Z][A-Z0-9_]+)$")
 def scan_env_literals() -> set[str]:
     names: set[str] = set()
     for path in _SRC_ROOT.rglob("*.py"):
-        if path.name == "surface_collect.py":
+        if path.name in _SKIP_ENV_SCAN:
             continue
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -101,15 +102,22 @@ def install_gateway_stubs() -> None:
     sys.modules["gateway.session"] = session
 
 
-def _serialize_action(action: Any) -> dict[str, Any]:
+def _serialize_action(action: Any) -> dict[str, Any] | None:
+    import argparse
+
+    if isinstance(action, argparse._SubParsersAction):
+        return None
+    if action.dest == "help":
+        return None
     option_strings = list(action.option_strings)
-    if not option_strings and action.dest not in ("help", "a365_command", "instance_command"):
-        option_strings = [action.dest]
     payload: dict[str, Any] = {
         "dest": action.dest,
         "option_strings": sorted(option_strings),
         "required": bool(action.required),
     }
+    if action.nargs is not None:
+        nargs = action.nargs
+        payload["nargs"] = nargs if isinstance(nargs, int) else str(nargs)
     if action.choices is not None:
         payload["choices"] = sorted(str(c) for c in action.choices)
     return payload
@@ -118,9 +126,9 @@ def _serialize_action(action: Any) -> dict[str, Any]:
 def _serialize_parser(parser: Any) -> dict[str, Any]:
     import argparse
 
-    actions = [_serialize_action(a) for a in parser._actions if a.dest not in ("help",)]
+    actions = [item for a in parser._actions if (item := _serialize_action(a)) is not None]
     actions.sort(key=lambda x: (x["dest"], tuple(x["option_strings"])))
-    node: dict[str, Any] = {"prog": parser.prog, "actions": actions, "subparsers": {}}
+    node: dict[str, Any] = {"actions": actions, "subparsers": {}}
     for action in parser._actions:
         if not isinstance(action, argparse._SubParsersAction):
             continue
@@ -208,3 +216,138 @@ def collect_product_http_routes() -> list[dict[str, str]]:
             out.append({"method": method, "path": path})
     out.sort(key=lambda r: (r["path"], r["method"]))
     return _filter_product_routes(out)
+
+
+def collect_main_guard_modules() -> list[str]:
+    modules: list[str] = []
+    for path in sorted(_SRC_ROOT.rglob("*.py")):
+        text = path.read_text(encoding="utf-8")
+        if 'if __name__ == "__main__"' not in text:
+            continue
+        rel = path.relative_to(_SRC_ROOT.parent)
+        modules.append(str(rel.with_suffix("")).replace("/", "."))
+    return modules
+
+
+def collect_python_module_surface() -> dict[str, list[str]]:
+    main_modules = collect_main_guard_modules()
+    public_cli = ["hermes_a365.keychain"]
+    reference_only = ["hermes_a365.hermes_responder"]
+    internal = sorted(m for m in main_modules if m not in public_cli and m not in reference_only)
+    return {
+        "public_cli": public_cli,
+        "reference_only": reference_only,
+        "internal": internal,
+    }
+
+
+def collect_plugin_requires_env() -> tuple[str, ...]:
+    import yaml
+
+    plugin_yaml = _SRC_ROOT / "plugin" / "plugin.yaml"
+    data = yaml.safe_load(plugin_yaml.read_text(encoding="utf-8"))
+    requires = data.get("requires_env") or []
+    return tuple(str(x) for x in requires)
+
+
+def collect_keychain_cli_surface() -> dict[str, Any]:
+    from hermes_a365.keychain import _build_parser
+
+    parser = _build_parser()
+    tree = _serialize_parser(parser)
+    subcommands = [name for name in ("store", "get", "delete") if name in tree["subparsers"]]
+    options: set[str] = set()
+    for sub_name in subcommands:
+        for action in tree["subparsers"][sub_name]["actions"]:
+            options.update(action["option_strings"])
+    return {
+        "module": "hermes_a365.keychain",
+        "subcommands": subcommands,
+        "options": sorted(options),
+    }
+
+
+def _adapter_extra_key_present(text: str, key: str) -> bool:
+    return (
+        f'extra.get("{key}"' in text
+        or f'extra, "{key}"' in text
+        or f'setdefault("{key}"' in text
+        or f'extra["{key}"]' in text
+    )
+
+
+def collect_gateway_extra_keys_from_adapter(keys: tuple[str, ...]) -> tuple[str, ...]:
+    text = (_SRC_ROOT / "plugin" / "adapter.py").read_text(encoding="utf-8")
+    missing = [key for key in keys if not _adapter_extra_key_present(text, key)]
+    if missing:
+        msg = f"gateway extra keys not referenced in adapter.py: {missing}"
+        raise ValueError(msg)
+    return keys
+
+
+def collect_sidecar_inventory_from_code() -> tuple[dict[str, Any], ...]:
+    from hermes_a365 import bot_service as bs
+    from hermes_a365 import publish as pub
+    from hermes_a365.plugin import conversations as conv
+
+    return (
+        {
+            "path": "a365.bot-service.config.json",
+            "location": "cwd",
+            "schema_version_write": bs.SIDECAR_SCHEMA_VERSION,
+            "schema_version_read": tuple(sorted(bs._SUPPORTED_SIDECAR_SCHEMA_VERSIONS)),
+        },
+        {
+            "path": "~/.hermes/agents/<slug>/copilot-chat-publish.json",
+            "schema_version_write": pub._COPILOT_CHAT_PUBLISH_STATE_SCHEMA,
+            "schema_version_read": (
+                pub._COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1,
+                pub._COPILOT_CHAT_PUBLISH_STATE_SCHEMA,
+            ),
+        },
+        {
+            "path": "~/.hermes/agents/<slug>/conversations.json",
+            "schema_version_write": conv.ConversationRegistry.SCHEMA_VERSION,
+            "schema_version_read": (conv.ConversationRegistry.SCHEMA_VERSION,),
+            "missing_version_means": conv.ConversationRegistry.SCHEMA_VERSION,
+            "on_disk_version_field": "schema",
+        },
+    )
+
+
+async def collect_task_fetch_card_from_invoke() -> dict[str, Any]:
+    from hermes_a365.invoke import InvokeContext, _handle_task_fetch
+
+    ctx = InvokeContext(
+        name="task/fetch",
+        activity={},
+        value={},
+        user_oid="",
+        user_upn="",
+        tenant_id="",
+        service_url="",
+        conv={},
+        chat_type="dm",
+        path_tag="A",
+    )
+    resp = await _handle_task_fetch(ctx)
+    assert resp.body is not None
+    task_value = resp.body["task"]["value"]
+    card = task_value["card"]["content"]
+    return {
+        "adaptive_card_version": card["version"],
+        "title": task_value.get("title", ""),
+        "body_text": card["body"][0]["text"],
+    }
+
+
+def collect_invoke_adapter_handler_names() -> tuple[str, ...]:
+    from unittest.mock import MagicMock
+
+    from hermes_a365 import invoke as invoke_mod
+
+    install_gateway_stubs()
+    adapter_mod = importlib.import_module("hermes_a365.plugin.adapter")
+    adapter = adapter_mod.Agent365Adapter(MagicMock(extra={}))
+    names = sorted(k for k in adapter._invoke_registry if k not in invoke_mod.INVOKE_REGISTRY)
+    return tuple(names)

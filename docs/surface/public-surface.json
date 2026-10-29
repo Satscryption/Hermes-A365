@@ -66,43 +66,10 @@
   ],
   "cli": {
     "plugin": {
-      "actions": [
-        {
-          "choices": [
-            "activity-bridge",
-            "bot-service",
-            "cleanup",
-            "consent",
-            "doctor",
-            "instance",
-            "license",
-            "publish",
-            "register",
-            "status"
-          ],
-          "dest": "a365_command",
-          "option_strings": [],
-          "required": false
-        }
-      ],
-      "prog": "hermes a365",
+      "actions": [],
       "subparsers": {
         "activity-bridge": {
-          "actions": [
-            {
-              "choices": [
-                "serve",
-                "update-endpoint",
-                "verify"
-              ],
-              "dest": "cmd",
-              "option_strings": [
-                "cmd"
-              ],
-              "required": true
-            }
-          ],
-          "prog": "hermes a365 activity-bridge",
+          "actions": [],
           "subparsers": {
             "serve": {
               "actions": [
@@ -122,6 +89,7 @@
                 },
                 {
                   "dest": "no_jwt_validation",
+                  "nargs": 0,
                   "option_strings": [
                     "--no-jwt-validation"
                   ],
@@ -149,7 +117,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes a365 activity-bridge serve",
               "subparsers": {}
             },
             "update-endpoint": {
@@ -163,6 +130,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -170,6 +138,7 @@
                 },
                 {
                   "dest": "no_m365",
+                  "nargs": 0,
                   "option_strings": [
                     "--no-m365"
                   ],
@@ -190,7 +159,6 @@
                   "required": true
                 }
               ],
-              "prog": "hermes a365 activity-bridge update-endpoint",
               "subparsers": {}
             },
             "verify": {
@@ -204,6 +172,7 @@
                 },
                 {
                   "dest": "human",
+                  "nargs": 0,
                   "option_strings": [
                     "--human"
                   ],
@@ -217,29 +186,12 @@
                   "required": true
                 }
               ],
-              "prog": "hermes a365 activity-bridge verify",
               "subparsers": {}
             }
           }
         },
         "bot-service": {
-          "actions": [
-            {
-              "choices": [
-                "cleanup",
-                "create",
-                "enable-channel",
-                "update-endpoint",
-                "verify"
-              ],
-              "dest": "bot_service_command",
-              "option_strings": [
-                "bot_service_command"
-              ],
-              "required": false
-            }
-          ],
-          "prog": "hermes a365 bot-service",
+          "actions": [],
           "subparsers": {
             "cleanup": {
               "actions": [
@@ -252,6 +204,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -280,6 +233,7 @@
                 },
                 {
                   "dest": "purge_resource_group",
+                  "nargs": 0,
                   "option_strings": [
                     "--purge-resource-group"
                   ],
@@ -293,7 +247,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes a365 bot-service cleanup",
               "subparsers": {}
             },
             "create": {
@@ -307,6 +260,7 @@
                 },
                 {
                   "dest": "allow_local",
+                  "nargs": 0,
                   "option_strings": [
                     "--allow-local"
                   ],
@@ -322,6 +276,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -384,7 +339,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes a365 bot-service create",
               "subparsers": {}
             },
             "enable-channel": {
@@ -398,6 +352,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -435,7 +390,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes a365 bot-service enable-channel",
               "subparsers": {}
             },
             "update-endpoint": {
@@ -449,6 +403,7 @@
                 },
                 {
                   "dest": "allow_local",
+                  "nargs": 0,
                   "option_strings": [
                     "--allow-local"
                   ],
@@ -456,6 +411,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -490,7 +446,6 @@
                   "required": true
                 }
               ],
-              "prog": "hermes a365 bot-service update-endpoint",
               "subparsers": {}
             },
             "verify": {
@@ -504,6 +459,7 @@
                 },
                 {
                   "dest": "directline_probe",
+                  "nargs": 0,
                   "option_strings": [
                     "--directline-probe"
                   ],
@@ -524,7 +480,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes a365 bot-service verify",
               "subparsers": {}
             }
           }
@@ -540,6 +495,7 @@
             },
             {
               "dest": "apply",
+              "nargs": 0,
               "option_strings": [
                 "--apply"
               ],
@@ -603,6 +559,7 @@
             },
             {
               "dest": "purge_orphans",
+              "nargs": 0,
               "option_strings": [
                 "--purge-orphans"
               ],
@@ -623,16 +580,14 @@
               "required": false
             }
           ],
-          "prog": "hermes a365 cleanup",
           "subparsers": {}
         },
         "consent": {
           "actions": [
             {
               "dest": "agent_name",
-              "option_strings": [
-                "agent_name"
-              ],
+              "nargs": "?",
+              "option_strings": [],
               "required": false
             },
             {
@@ -644,6 +599,7 @@
             },
             {
               "dest": "no_open",
+              "nargs": 0,
               "option_strings": [
                 "--no-open"
               ],
@@ -651,6 +607,7 @@
             },
             {
               "dest": "print_url_only",
+              "nargs": 0,
               "option_strings": [
                 "--print-url-only"
               ],
@@ -671,13 +628,13 @@
               "required": false
             }
           ],
-          "prog": "hermes a365 consent",
           "subparsers": {}
         },
         "doctor": {
           "actions": [
             {
               "dest": "human",
+              "nargs": 0,
               "option_strings": [
                 "--human"
               ],
@@ -685,32 +642,23 @@
             },
             {
               "dest": "no_network",
+              "nargs": 0,
               "option_strings": [
                 "--no-network"
               ],
               "required": false
             }
           ],
-          "prog": "hermes a365 doctor",
           "subparsers": {}
         },
         "instance": {
-          "actions": [
-            {
-              "choices": [
-                "create"
-              ],
-              "dest": "instance_command",
-              "option_strings": [],
-              "required": false
-            }
-          ],
-          "prog": "hermes a365 instance",
+          "actions": [],
           "subparsers": {
             "create": {
               "actions": [
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -760,13 +708,10 @@
                 },
                 {
                   "dest": "slug",
-                  "option_strings": [
-                    "slug"
-                  ],
+                  "option_strings": [],
                   "required": true
                 }
               ],
-              "prog": "hermes a365 instance create",
               "subparsers": {}
             }
           }
@@ -782,6 +727,7 @@
             },
             {
               "dest": "bundled_security",
+              "nargs": 0,
               "option_strings": [
                 "--bundled-security"
               ],
@@ -807,7 +753,6 @@
               "required": true
             }
           ],
-          "prog": "hermes a365 license",
           "subparsers": {}
         },
         "publish": {
@@ -821,6 +766,7 @@
             },
             {
               "dest": "aiteammate",
+              "nargs": 0,
               "option_strings": [
                 "--aiteammate"
               ],
@@ -835,6 +781,7 @@
             },
             {
               "dest": "apply",
+              "nargs": 0,
               "option_strings": [
                 "--apply"
               ],
@@ -849,6 +796,7 @@
             },
             {
               "dest": "copilot_chat",
+              "nargs": 0,
               "option_strings": [
                 "--copilot-chat"
               ],
@@ -891,6 +839,7 @@
             },
             {
               "dest": "use_blueprint",
+              "nargs": 0,
               "option_strings": [
                 "--use-blueprint"
               ],
@@ -898,13 +847,13 @@
             },
             {
               "dest": "verbose",
+              "nargs": 0,
               "option_strings": [
                 "--verbose"
               ],
               "required": false
             }
           ],
-          "prog": "hermes a365 publish",
           "subparsers": {}
         },
         "register": {
@@ -918,6 +867,7 @@
             },
             {
               "dest": "aiteammate",
+              "nargs": 0,
               "option_strings": [
                 "--aiteammate"
               ],
@@ -925,6 +875,7 @@
             },
             {
               "dest": "apply",
+              "nargs": 0,
               "option_strings": [
                 "--apply"
               ],
@@ -944,6 +895,7 @@
             },
             {
               "dest": "auto_recover_secret",
+              "nargs": 0,
               "option_strings": [
                 "--auto-recover-secret"
               ],
@@ -965,6 +917,7 @@
             },
             {
               "dest": "m365",
+              "nargs": 0,
               "option_strings": [
                 "--m365"
               ],
@@ -972,6 +925,7 @@
             },
             {
               "dest": "no_endpoint",
+              "nargs": 0,
               "option_strings": [
                 "--no-endpoint"
               ],
@@ -986,6 +940,7 @@
             },
             {
               "dest": "skip_requirements",
+              "nargs": 0,
               "option_strings": [
                 "--skip-requirements"
               ],
@@ -1000,26 +955,26 @@
             },
             {
               "dest": "update_permissions",
+              "nargs": 0,
               "option_strings": [
                 "--update-permissions"
               ],
               "required": false
             }
           ],
-          "prog": "hermes a365 register",
           "subparsers": {}
         },
         "status": {
           "actions": [
             {
               "dest": "agent_name",
-              "option_strings": [
-                "agent_name"
-              ],
+              "nargs": "?",
+              "option_strings": [],
               "required": false
             },
             {
               "dest": "human",
+              "nargs": 0,
               "option_strings": [
                 "--human"
               ],
@@ -1033,49 +988,15 @@
               "required": false
             }
           ],
-          "prog": "hermes a365 status",
           "subparsers": {}
         }
       }
     },
     "standalone": {
-      "actions": [
-        {
-          "choices": [
-            "activity-bridge",
-            "bot-service",
-            "cleanup",
-            "consent",
-            "doctor",
-            "instance",
-            "license",
-            "publish",
-            "register",
-            "status"
-          ],
-          "dest": "a365_command",
-          "option_strings": [],
-          "required": false
-        }
-      ],
-      "prog": "hermes-a365",
+      "actions": [],
       "subparsers": {
         "activity-bridge": {
-          "actions": [
-            {
-              "choices": [
-                "serve",
-                "update-endpoint",
-                "verify"
-              ],
-              "dest": "cmd",
-              "option_strings": [
-                "cmd"
-              ],
-              "required": true
-            }
-          ],
-          "prog": "hermes-a365 activity-bridge",
+          "actions": [],
           "subparsers": {
             "serve": {
               "actions": [
@@ -1095,6 +1016,7 @@
                 },
                 {
                   "dest": "no_jwt_validation",
+                  "nargs": 0,
                   "option_strings": [
                     "--no-jwt-validation"
                   ],
@@ -1122,7 +1044,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes-a365 activity-bridge serve",
               "subparsers": {}
             },
             "update-endpoint": {
@@ -1136,6 +1057,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -1143,6 +1065,7 @@
                 },
                 {
                   "dest": "no_m365",
+                  "nargs": 0,
                   "option_strings": [
                     "--no-m365"
                   ],
@@ -1163,7 +1086,6 @@
                   "required": true
                 }
               ],
-              "prog": "hermes-a365 activity-bridge update-endpoint",
               "subparsers": {}
             },
             "verify": {
@@ -1177,6 +1099,7 @@
                 },
                 {
                   "dest": "human",
+                  "nargs": 0,
                   "option_strings": [
                     "--human"
                   ],
@@ -1190,29 +1113,12 @@
                   "required": true
                 }
               ],
-              "prog": "hermes-a365 activity-bridge verify",
               "subparsers": {}
             }
           }
         },
         "bot-service": {
-          "actions": [
-            {
-              "choices": [
-                "cleanup",
-                "create",
-                "enable-channel",
-                "update-endpoint",
-                "verify"
-              ],
-              "dest": "bot_service_command",
-              "option_strings": [
-                "bot_service_command"
-              ],
-              "required": false
-            }
-          ],
-          "prog": "hermes-a365 bot-service",
+          "actions": [],
           "subparsers": {
             "cleanup": {
               "actions": [
@@ -1225,6 +1131,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -1253,6 +1160,7 @@
                 },
                 {
                   "dest": "purge_resource_group",
+                  "nargs": 0,
                   "option_strings": [
                     "--purge-resource-group"
                   ],
@@ -1266,7 +1174,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes-a365 bot-service cleanup",
               "subparsers": {}
             },
             "create": {
@@ -1280,6 +1187,7 @@
                 },
                 {
                   "dest": "allow_local",
+                  "nargs": 0,
                   "option_strings": [
                     "--allow-local"
                   ],
@@ -1295,6 +1203,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -1357,7 +1266,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes-a365 bot-service create",
               "subparsers": {}
             },
             "enable-channel": {
@@ -1371,6 +1279,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -1408,7 +1317,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes-a365 bot-service enable-channel",
               "subparsers": {}
             },
             "update-endpoint": {
@@ -1422,6 +1330,7 @@
                 },
                 {
                   "dest": "allow_local",
+                  "nargs": 0,
                   "option_strings": [
                     "--allow-local"
                   ],
@@ -1429,6 +1338,7 @@
                 },
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -1463,7 +1373,6 @@
                   "required": true
                 }
               ],
-              "prog": "hermes-a365 bot-service update-endpoint",
               "subparsers": {}
             },
             "verify": {
@@ -1477,6 +1386,7 @@
                 },
                 {
                   "dest": "directline_probe",
+                  "nargs": 0,
                   "option_strings": [
                     "--directline-probe"
                   ],
@@ -1497,7 +1407,6 @@
                   "required": false
                 }
               ],
-              "prog": "hermes-a365 bot-service verify",
               "subparsers": {}
             }
           }
@@ -1513,6 +1422,7 @@
             },
             {
               "dest": "apply",
+              "nargs": 0,
               "option_strings": [
                 "--apply"
               ],
@@ -1576,6 +1486,7 @@
             },
             {
               "dest": "purge_orphans",
+              "nargs": 0,
               "option_strings": [
                 "--purge-orphans"
               ],
@@ -1596,16 +1507,14 @@
               "required": false
             }
           ],
-          "prog": "hermes-a365 cleanup",
           "subparsers": {}
         },
         "consent": {
           "actions": [
             {
               "dest": "agent_name",
-              "option_strings": [
-                "agent_name"
-              ],
+              "nargs": "?",
+              "option_strings": [],
               "required": false
             },
             {
@@ -1617,6 +1526,7 @@
             },
             {
               "dest": "no_open",
+              "nargs": 0,
               "option_strings": [
                 "--no-open"
               ],
@@ -1624,6 +1534,7 @@
             },
             {
               "dest": "print_url_only",
+              "nargs": 0,
               "option_strings": [
                 "--print-url-only"
               ],
@@ -1644,13 +1555,13 @@
               "required": false
             }
           ],
-          "prog": "hermes-a365 consent",
           "subparsers": {}
         },
         "doctor": {
           "actions": [
             {
               "dest": "human",
+              "nargs": 0,
               "option_strings": [
                 "--human"
               ],
@@ -1658,32 +1569,23 @@
             },
             {
               "dest": "no_network",
+              "nargs": 0,
               "option_strings": [
                 "--no-network"
               ],
               "required": false
             }
           ],
-          "prog": "hermes-a365 doctor",
           "subparsers": {}
         },
         "instance": {
-          "actions": [
-            {
-              "choices": [
-                "create"
-              ],
-              "dest": "instance_command",
-              "option_strings": [],
-              "required": false
-            }
-          ],
-          "prog": "hermes-a365 instance",
+          "actions": [],
           "subparsers": {
             "create": {
               "actions": [
                 {
                   "dest": "apply",
+                  "nargs": 0,
                   "option_strings": [
                     "--apply"
                   ],
@@ -1733,13 +1635,10 @@
                 },
                 {
                   "dest": "slug",
-                  "option_strings": [
-                    "slug"
-                  ],
+                  "option_strings": [],
                   "required": true
                 }
               ],
-              "prog": "hermes-a365 instance create",
               "subparsers": {}
             }
           }
@@ -1755,6 +1654,7 @@
             },
             {
               "dest": "bundled_security",
+              "nargs": 0,
               "option_strings": [
                 "--bundled-security"
               ],
@@ -1780,7 +1680,6 @@
               "required": true
             }
           ],
-          "prog": "hermes-a365 license",
           "subparsers": {}
         },
         "publish": {
@@ -1794,6 +1693,7 @@
             },
             {
               "dest": "aiteammate",
+              "nargs": 0,
               "option_strings": [
                 "--aiteammate"
               ],
@@ -1808,6 +1708,7 @@
             },
             {
               "dest": "apply",
+              "nargs": 0,
               "option_strings": [
                 "--apply"
               ],
@@ -1822,6 +1723,7 @@
             },
             {
               "dest": "copilot_chat",
+              "nargs": 0,
               "option_strings": [
                 "--copilot-chat"
               ],
@@ -1864,6 +1766,7 @@
             },
             {
               "dest": "use_blueprint",
+              "nargs": 0,
               "option_strings": [
                 "--use-blueprint"
               ],
@@ -1871,13 +1774,13 @@
             },
             {
               "dest": "verbose",
+              "nargs": 0,
               "option_strings": [
                 "--verbose"
               ],
               "required": false
             }
           ],
-          "prog": "hermes-a365 publish",
           "subparsers": {}
         },
         "register": {
@@ -1891,6 +1794,7 @@
             },
             {
               "dest": "aiteammate",
+              "nargs": 0,
               "option_strings": [
                 "--aiteammate"
               ],
@@ -1898,6 +1802,7 @@
             },
             {
               "dest": "apply",
+              "nargs": 0,
               "option_strings": [
                 "--apply"
               ],
@@ -1917,6 +1822,7 @@
             },
             {
               "dest": "auto_recover_secret",
+              "nargs": 0,
               "option_strings": [
                 "--auto-recover-secret"
               ],
@@ -1938,6 +1844,7 @@
             },
             {
               "dest": "m365",
+              "nargs": 0,
               "option_strings": [
                 "--m365"
               ],
@@ -1945,6 +1852,7 @@
             },
             {
               "dest": "no_endpoint",
+              "nargs": 0,
               "option_strings": [
                 "--no-endpoint"
               ],
@@ -1959,6 +1867,7 @@
             },
             {
               "dest": "skip_requirements",
+              "nargs": 0,
               "option_strings": [
                 "--skip-requirements"
               ],
@@ -1973,26 +1882,26 @@
             },
             {
               "dest": "update_permissions",
+              "nargs": 0,
               "option_strings": [
                 "--update-permissions"
               ],
               "required": false
             }
           ],
-          "prog": "hermes-a365 register",
           "subparsers": {}
         },
         "status": {
           "actions": [
             {
               "dest": "agent_name",
-              "option_strings": [
-                "agent_name"
-              ],
+              "nargs": "?",
+              "option_strings": [],
               "required": false
             },
             {
               "dest": "human",
+              "nargs": 0,
               "option_strings": [
                 "--human"
               ],
@@ -2006,7 +1915,6 @@
               "required": false
             }
           ],
-          "prog": "hermes-a365 status",
           "subparsers": {}
         }
       }
@@ -2079,7 +1987,8 @@
     },
     "bot_service_verify": [
       0,
-      1
+      1,
+      2
     ],
     "cleanup": {
       "failed_or_partial": 1,
@@ -2162,6 +2071,7 @@
     },
     {
       "missing_version_means": 1,
+      "on_disk_version_field": "schema",
       "path": "~/.hermes/agents/<slug>/conversations.json",
       "schema_version_read": [
         1
@@ -2180,25 +2090,24 @@
     }
   ],
   "instance_env_public_keys": [
-    "AGENT_IDENTITY",
-    "OWNER",
-    "OWNER_AAD_ID",
     "A365_APP_ID",
-    "A365_TENANT_ID",
-    "AA_INSTANCE_ID",
     "A365_BF_APP_ID",
     "A365_BF_CLIENT_SECRET",
-    "BUSINESS_HOURS_TZ",
-    "BUSINESS_HOURS_START",
+    "A365_TENANT_ID",
+    "AA_INSTANCE_ID",
+    "AGENT_IDENTITY",
     "BUSINESS_HOURS_END",
-    "HERMES_BRIDGE_PORT",
-    "HERMES_OTLP_ENDPOINT"
+    "BUSINESS_HOURS_START",
+    "BUSINESS_HOURS_TZ",
+    "HERMES_OTLP_ENDPOINT",
+    "OWNER",
+    "OWNER_AAD_ID"
   ],
   "invoke": {
     "adapter_handlers": [
-      "message/submitAction",
+      "handoff/action",
       "message/fetchTask",
-      "handoff/action"
+      "message/submitAction"
     ],
     "registry": [
       "task/fetch"
@@ -2212,10 +2121,10 @@
   "keychain_cli": {
     "module": "hermes_a365.keychain",
     "options": [
-      "--tenant",
       "--app-id",
+      "--output-fd",
       "--secret",
-      "--output-fd"
+      "--tenant"
     ],
     "subcommands": [
       "store",
@@ -2314,10 +2223,22 @@
   ],
   "python_modules": {
     "internal": [
-      "hermes_a365.render_instance_env",
+      "hermes_a365.activity_bridge",
+      "hermes_a365.bot_service",
+      "hermes_a365.cleanup",
+      "hermes_a365.cli",
+      "hermes_a365.consent",
+      "hermes_a365.doctor",
       "hermes_a365.emit_card",
+      "hermes_a365.instance_create",
+      "hermes_a365.license",
+      "hermes_a365.publish",
       "hermes_a365.reconcile_app",
-      "hermes_a365.reconcile_blueprint"
+      "hermes_a365.reconcile_blueprint",
+      "hermes_a365.register",
+      "hermes_a365.render_instance_env",
+      "hermes_a365.status",
+      "hermes_a365.surface_collect"
     ],
     "public_cli": [
       "hermes_a365.keychain"
@@ -2329,7 +2250,7 @@
   "register_aiteammate_refusal": "`register --aiteammate` is unsupported. Register only runs `a365 setup blueprint` plus MCP/Bot permission setup; the AI Teammate agentic user is created/activated after `publish --aiteammate` via M365 Admin Centre upload and per-user activation.",
   "schema_version": 1,
   "security_support_after_v1": "After v1.0, security fixes are provided for the latest 1.x minor release only. Earlier 1.x minors and all 0.x releases are unsupported.",
-  "sidecar_migration_policy": "Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive stamps run on the owning writer, once, under an exclusive lock, and are idempotent. The original bytes are copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file does not write another backup. Identity-binding changes stay explicit: bot-service v1\u2192v2 still requires `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1\u2192v2 still requires `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than this build is an error. The file is left untouched. 1.x does not claim to read 2.x sidecars. Downgrade is restore-the-backup, not an automatic rewrite to 0.9.x.",
+  "sidecar_migration_policy": "Planned for slice 2 (target 0.9.6.1): within 1.x, Hermes-A365 will read every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, and be idempotent. The original bytes will be copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file will not write another backup. Identity-binding changes will stay explicit: bot-service v1\u2192v2 will still require `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1\u2192v2 will still require `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than that build will be an error and the file will be left untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2.",
   "upstream_sidecars": [
     "a365.config.json",
     "a365.generated.config.json"

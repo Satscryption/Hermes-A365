@@ -93,19 +93,18 @@ ENV_CLASSIFICATION: dict[str, EnvClass] = {
 
 # Per-agent .env keys written by instance create (not matched by the A365_/HERMES_ scanner).
 INSTANCE_ENV_PUBLIC_KEYS: Final[tuple[str, ...]] = (
-    "AGENT_IDENTITY",
-    "OWNER",
-    "OWNER_AAD_ID",
     "A365_APP_ID",
-    "A365_TENANT_ID",
-    "AA_INSTANCE_ID",
     "A365_BF_APP_ID",
     "A365_BF_CLIENT_SECRET",
-    "BUSINESS_HOURS_TZ",
-    "BUSINESS_HOURS_START",
+    "A365_TENANT_ID",
+    "AA_INSTANCE_ID",
+    "AGENT_IDENTITY",
     "BUSINESS_HOURS_END",
-    "HERMES_BRIDGE_PORT",
+    "BUSINESS_HOURS_START",
+    "BUSINESS_HOURS_TZ",
     "HERMES_OTLP_ENDPOINT",
+    "OWNER",
+    "OWNER_AAD_ID",
 )
 
 # ---------------------------------------------------------------------------
@@ -165,6 +164,7 @@ HERMES_OWNED_SIDECARS: Final[tuple[dict[str, Any], ...]] = (
         "schema_version_write": 1,
         "schema_version_read": (1,),
         "missing_version_means": 1,
+        "on_disk_version_field": "schema",
     },
 )
 
@@ -213,10 +213,10 @@ ADAPTER_PUBLIC_MEMBERS: Final[frozenset[str]] = frozenset(
 
 KEYCHAIN_CLI_SUBCOMMANDS: Final[tuple[str, ...]] = ("store", "get", "delete")
 KEYCHAIN_CLI_OPTIONS: Final[tuple[str, ...]] = (
-    "--tenant",
     "--app-id",
-    "--secret",
     "--output-fd",
+    "--secret",
+    "--tenant",
 )
 
 # ---------------------------------------------------------------------------
@@ -235,9 +235,9 @@ PRODUCT_HTTP_ROUTES: Final[tuple[dict[str, str], ...]] = (
 INVOKE_REGISTRY_PUBLIC: Final[tuple[str, ...]] = ("task/fetch",)
 
 INVOKE_ADAPTER_PUBLIC: Final[tuple[str, ...]] = (
-    "message/submitAction",
-    "message/fetchTask",
     "handoff/action",
+    "message/fetchTask",
+    "message/submitAction",
 )
 
 TASK_FETCH_CARD: Final[dict[str, Any]] = {
@@ -262,7 +262,7 @@ EXIT_CODES: Final[dict[str, Any]] = {
     "register": {"success": 0, "failed_or_partial": 1, "refusal": 2},
     "cleanup": {"success": 0, "failed_or_partial": 1, "refusal": 2},
     "bot_service": {"success": 0, "failed_or_partial": 1, "refusal": 2},
-    "bot_service_verify": (0, 1),
+    "bot_service_verify": (0, 1, 2),
     "publish_run": (0, 2),
 }
 
@@ -271,18 +271,19 @@ EXIT_CODES: Final[dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 SIDECAR_MIGRATION_POLICY: Final[str] = (
-    "Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any "
-    "1.x release and every 0.9.x shape listed in SURFACE. Additive stamps run "
-    "on the owning writer, once, under an exclusive lock, and are idempotent. "
-    "The original bytes are copied to a sibling `*.backup-<UTC-timestamp>.json` "
-    "mode `0600` before the first rewrite. A second run against an already-current "
-    "file does not write another backup. Identity-binding changes stay explicit: "
-    "bot-service v1→v2 still requires `--confirm-legacy-binding` equal to "
-    "`--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 "
-    "still requires `--app-version` strictly above the Admin Center version. A "
-    "`schemaVersion` newer than this build is an error. The file is left untouched. "
-    "1.x does not claim to read 2.x sidecars. Downgrade is restore-the-backup, not "
-    "an automatic rewrite to 0.9.x."
+    "Planned for slice 2 (target 0.9.6.1): within 1.x, Hermes-A365 will read every "
+    "Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in "
+    "SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under "
+    "an exclusive lock, and be idempotent. The original bytes will be copied to a sibling "
+    "`*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run "
+    "against an already-current file will not write another backup. Identity-binding changes "
+    "will stay explicit: bot-service v1→v2 will still require `--confirm-legacy-binding` "
+    "equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 "
+    "will still require `--app-version` strictly above the Admin Center version. A "
+    "`schemaVersion` newer than that build will be an error and the file will be left "
+    "untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, "
+    "not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted "
+    "with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2."
 )
 
 SECURITY_SUPPORT_AFTER_V1: Final[str] = (

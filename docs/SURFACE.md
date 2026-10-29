@@ -43,7 +43,8 @@ Verbs: `doctor`, `license`, `register`, `consent`, `instance create`, `publish`,
   },
   "bot_service_verify": [
     0,
-    1
+    1,
+    2
   ],
   "cleanup": {
     "failed_or_partial": 1,
@@ -92,9 +93,13 @@ Verbs: `doctor`, `license`, `register`, `consent`, `instance create`, `publish`,
 
 Scanner classifies every `A365_*` / `HERMES_*` string literal in `src/hermes_a365`. Per-agent `.env` keys from `instance create` are listed separately.
 
-### Public env (operator-facing)
+### Public env literals (scanner)
 
-A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_OTLP_ENDPOINT, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN, AGENT_IDENTITY, OWNER, OWNER_AAD_ID, A365_APP_ID, A365_TENANT_ID, AA_INSTANCE_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, BUSINESS_HOURS_TZ, BUSINESS_HOURS_START, BUSINESS_HOURS_END, HERMES_BRIDGE_PORT, HERMES_OTLP_ENDPOINT
+A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_OTLP_ENDPOINT, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN
+
+### Instance create `.env` keys
+
+A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_TENANT_ID, AA_INSTANCE_ID, AGENT_IDENTITY, BUSINESS_HOURS_END, BUSINESS_HOURS_START, BUSINESS_HOURS_TZ, HERMES_OTLP_ENDPOINT, OWNER, OWNER_AAD_ID
 
 ### Internal env literals
 
@@ -110,7 +115,7 @@ A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_APP_ID, 
 
 ## Sidecars
 
-Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive stamps run on the owning writer, once, under an exclusive lock, and are idempotent. The original bytes are copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file does not write another backup. Identity-binding changes stay explicit: bot-service v1→v2 still requires `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 still requires `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than this build is an error. The file is left untouched. 1.x does not claim to read 2.x sidecars. Downgrade is restore-the-backup, not an automatic rewrite to 0.9.x.
+Planned for slice 2 (target 0.9.6.1): within 1.x, Hermes-A365 will read every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, and be idempotent. The original bytes will be copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file will not write another backup. Identity-binding changes will stay explicit: bot-service v1→v2 will still require `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 will still require `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than that build will be an error and the file will be left untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2.
 
 ## Python API
 
@@ -131,7 +136,7 @@ Gateway `build_app` and `activity-bridge serve`:
 ## Invoke wire names
 
 - Registry: task/fetch.
-- Adapter handlers: message/submitAction, message/fetchTask, handoff/action.
+- Adapter handlers: handoff/action, message/fetchTask, message/submitAction.
 - `task/fetch` card (D3): Adaptive Card 1.5, title `Hermes`, text `Request received.`.
 
 ## Packaging (snapshot; slice 3 may change metadata)

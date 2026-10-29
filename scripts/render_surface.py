@@ -13,7 +13,10 @@ from typing import Any
 from hermes_a365.surface_collect import (
     collect_adapter_public_members,
     collect_cli_trees,
+    collect_keychain_cli_surface,
     collect_product_http_routes,
+    collect_python_module_surface,
+    collect_task_fetch_card_from_invoke,
     scan_env_literals,
 )
 
@@ -68,21 +71,8 @@ def _load_surface_constants() -> dict[str, Any]:
         "upstream_sidecars": list(s.UPSTREAM_SIDECARS),
         "not_schema_artifacts": list(s.NOT_SCHEMA_ARTIFACTS),
         "adapter_public_members": sorted(s.ADAPTER_PUBLIC_MEMBERS),
-        "keychain_cli": {
-            "module": "hermes_a365.keychain",
-            "subcommands": list(s.KEYCHAIN_CLI_SUBCOMMANDS),
-            "options": list(s.KEYCHAIN_CLI_OPTIONS),
-        },
-        "python_modules": {
-            "public_cli": ["hermes_a365.keychain"],
-            "reference_only": ["hermes_a365.hermes_responder"],
-            "internal": [
-                "hermes_a365.render_instance_env",
-                "hermes_a365.emit_card",
-                "hermes_a365.reconcile_app",
-                "hermes_a365.reconcile_blueprint",
-            ],
-        },
+        "keychain_cli": None,
+        "python_modules": None,
         "product_http_routes_frozen": [dict(r) for r in s.PRODUCT_HTTP_ROUTES],
         "invoke": {
             "registry": list(s.INVOKE_REGISTRY_PUBLIC),
@@ -98,12 +88,17 @@ def _load_surface_constants() -> dict[str, Any]:
 
 
 def build_snapshot() -> dict[str, Any]:
+    import asyncio
+
     from hermes_a365 import __version__
     from hermes_a365.register import AITEAMMATE_REGISTER_UNSUPPORTED
 
     scanned_env = scan_env_literals()
     constants = _load_surface_constants()
     constants["register_aiteammate_refusal"] = AITEAMMATE_REGISTER_UNSUPPORTED
+    constants["python_modules"] = collect_python_module_surface()
+    constants["keychain_cli"] = collect_keychain_cli_surface()
+    constants["invoke"]["task_fetch_card"] = asyncio.run(collect_task_fetch_card_from_invoke())
 
     return {
         "schema_version": 1,
@@ -135,75 +130,76 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
         lines.append(f"- **{key}** {od['accepted'][key]}")
     lines.extend(
         [
-        "",
-        f"- **D1 constant** `D1_SERVE_SUPPORTED={od['D1_serve_supported']}`.",
-        f"- **D2 constant** `D2_CEA_SCOPES={tuple(od['D2_cea_default_scopes'])}`.",
-        f"- **D3 constant** `D3_TASK_FETCH_CARD_FROZEN={od['D3_task_fetch_card_frozen']}`.",
-        f"- **D4 constant** `D4_SECURITY_LATEST_1X_MINOR_ONLY={od['D4_security_latest_1x_minor_only']}`.",
-        f"- **D6 constant** `D6_AUTO_MIGRATE_ADDITIVE_ONLY={od['D6_auto_migrate_additive_only']}`.",
-        f"- **D7 constant** `D7_SHIP_PY_TYPED={od['D7_ship_py_typed']}`.",
-        f"- **D8 constants** `D8_KEYCHAIN_PUBLIC={od['D8_keychain_public']}`, "
-        f"`D8_RESPONDER_REFERENCE_ONLY={od['D8_responder_reference_only']}`.",
-        "",
-        "## CLI",
-        "",
-        "Verbs: `doctor`, `license`, `register`, `consent`, `instance create`, `publish`, "
-        "`status`, `cleanup`, `activity-bridge` (`verify` / `serve` / `update-endpoint`), "
-        "`bot-service` (`create` / `enable-channel` / `update-endpoint` / `cleanup` / `verify`). "
-        "Both `hermes-a365` and `hermes a365` share identical argparse trees (see JSON). "
-        "Help strings are not frozen except `register --aiteammate` refusal (exit 2).",
-        "",
-        "### Exit codes",
-        "",
-        "```json",
-        json.dumps(snapshot["exit_codes"], indent=2, sort_keys=True),
-        "```",
-        "",
-        "## Environment",
-        "",
-        "Scanner classifies every `A365_*` / `HERMES_*` string literal in `src/hermes_a365`. "
-        "Per-agent `.env` keys from `instance create` are listed separately.",
-        "",
-        "### Public env (operator-facing)",
-        "",
-        ", ".join(
-            sorted(
-                k for k, v in snapshot["env_classification"].items() if v == "public"
+            "",
+            f"- **D1 constant** `D1_SERVE_SUPPORTED={od['D1_serve_supported']}`.",
+            f"- **D2 constant** `D2_CEA_SCOPES={tuple(od['D2_cea_default_scopes'])}`.",
+            f"- **D3 constant** `D3_TASK_FETCH_CARD_FROZEN={od['D3_task_fetch_card_frozen']}`.",
+            f"- **D4 constant** `D4_SECURITY_LATEST_1X_MINOR_ONLY={od['D4_security_latest_1x_minor_only']}`.",
+            f"- **D6 constant** `D6_AUTO_MIGRATE_ADDITIVE_ONLY={od['D6_auto_migrate_additive_only']}`.",
+            f"- **D7 constant** `D7_SHIP_PY_TYPED={od['D7_ship_py_typed']}`.",
+            f"- **D8 constants** `D8_KEYCHAIN_PUBLIC={od['D8_keychain_public']}`, "
+            f"`D8_RESPONDER_REFERENCE_ONLY={od['D8_responder_reference_only']}`.",
+            "",
+            "## CLI",
+            "",
+            "Verbs: `doctor`, `license`, `register`, `consent`, `instance create`, `publish`, "
+            "`status`, `cleanup`, `activity-bridge` (`verify` / `serve` / `update-endpoint`), "
+            "`bot-service` (`create` / `enable-channel` / `update-endpoint` / `cleanup` / `verify`). "
+            "Both `hermes-a365` and `hermes a365` share identical argparse trees (see JSON). "
+            "Help strings are not frozen except `register --aiteammate` refusal (exit 2).",
+            "",
+            "### Exit codes",
+            "",
+            "```json",
+            json.dumps(snapshot["exit_codes"], indent=2, sort_keys=True),
+            "```",
+            "",
+            "## Environment",
+            "",
+            "Scanner classifies every `A365_*` / `HERMES_*` string literal in `src/hermes_a365`. "
+            "Per-agent `.env` keys from `instance create` are listed separately.",
+            "",
+            "### Public env literals (scanner)",
+            "",
+            ", ".join(
+                sorted(k for k, v in snapshot["env_classification"].items() if v == "public")
+            ),
+            "",
+            "### Instance create `.env` keys",
+            "",
+            ", ".join(snapshot["instance_env_public_keys"]),
+            "",
+            "### Internal env literals",
+            "",
+            ", ".join(
+                sorted(k for k, v in snapshot["env_classification"].items() if v == "internal")
             )
-            + snapshot["instance_env_public_keys"]
-        ),
-        "",
-        "### Internal env literals",
-        "",
-        ", ".join(
-            sorted(k for k, v in snapshot["env_classification"].items() if v == "internal")
-        )
-        or "(none)",
-        "",
-        "## Gateway config",
-        "",
-        f"`platforms.agent365.extra` keys: {', '.join(snapshot['gateway_extra_keys'])}.",
-        "",
-        f"`A365Config` fields: {', '.join(snapshot['a365_config_fields'])} (upstream `a365.config.json`; no `schemaVersion`).",
-        "",
-        f"`plugin.yaml` `requires_env`: {', '.join(snapshot['plugin_requires_env'])}.",
-        "",
-        "## Sidecars",
-        "",
-        snapshot["sidecar_migration_policy"],
-        "",
-        "## Python API",
-        "",
-        "- Console script `hermes-a365`; entry point `hermes_agent.plugins` / `agent365` → `hermes_a365.plugin:register`.",
-        f"- `hermes_a365.__version__` → `{snapshot['package_version']}`.",
-        f"- `Agent365Adapter` public members: {', '.join(snapshot['adapter_public_members'])}.",
-        f"- Public `python -m`: `{snapshot['keychain_cli']['module']}` subcommands "
-        f"{', '.join(snapshot['keychain_cli']['subcommands'])}.",
-        "",
-        "## HTTP (product)",
-        "",
-        "Gateway `build_app` and `activity-bridge serve`:",
-        "",
+            or "(none)",
+            "",
+            "## Gateway config",
+            "",
+            f"`platforms.agent365.extra` keys: {', '.join(snapshot['gateway_extra_keys'])}.",
+            "",
+            f"`A365Config` fields: {', '.join(snapshot['a365_config_fields'])} (upstream `a365.config.json`; no `schemaVersion`).",
+            "",
+            f"`plugin.yaml` `requires_env`: {', '.join(snapshot['plugin_requires_env'])}.",
+            "",
+            "## Sidecars",
+            "",
+            snapshot["sidecar_migration_policy"],
+            "",
+            "## Python API",
+            "",
+            "- Console script `hermes-a365`; entry point `hermes_agent.plugins` / `agent365` → `hermes_a365.plugin:register`.",
+            f"- `hermes_a365.__version__` → `{snapshot['package_version']}`.",
+            f"- `Agent365Adapter` public members: {', '.join(snapshot['adapter_public_members'])}.",
+            f"- Public `python -m`: `{snapshot['keychain_cli']['module']}` subcommands "
+            f"{', '.join(snapshot['keychain_cli']['subcommands'])}.",
+            "",
+            "## HTTP (product)",
+            "",
+            "Gateway `build_app` and `activity-bridge serve`:",
+            "",
         ]
     )
     for route in snapshot["product_http_routes_frozen"]:
@@ -214,7 +210,7 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
             "`GET /healthz` → 200 `{ok, slug, blueprint_client_id}` (id truncated to 8 chars). "
             "`POST /api/messages`: 400 bad activity; 401 bearer; 403 serviceUrl / allowlist / user; "
             "200 ack bodies; plugin-only 503 while connect failed. "
-            "`serve` speaks operator webhook contract version `\"1\"` (`references/webhook-contract.md`).",
+            '`serve` speaks operator webhook contract version `"1"` (`references/webhook-contract.md`).',
             "",
             "## Invoke wire names",
             "",
