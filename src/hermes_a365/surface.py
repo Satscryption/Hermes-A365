@@ -24,9 +24,8 @@ ACCEPTED_OWNER_DECISIONS: Final[dict[str, str]] = {
     "D3": "A — freeze the task/fetch placeholder card (Hermes / Request received.)",
     "D4": "A — security fixes for the latest 1.x minor only",
     "D5": (
-        "Settled by #189 (#267): remove HERMES_OTLP_ENDPOINT from instance create "
-        "and drop the activity-bridge verify probe; not part of the 1.0 public env "
-        "once #267 is on the branch"
+        "Removed by #267: HERMES_OTLP_ENDPOINT is not part of the 1.0 public env "
+        "(deprecated literals may remain in source for migration warnings only)"
     ),
     "D6": "B — additive auto-stamps only; keep bot-service and publish confirm gates",
     "D7": "B — do not ship py.typed / Typing :: Typed",
@@ -45,7 +44,7 @@ D3_TASK_FETCH_CARD_FROZEN: Final[bool] = True  # A=True keep card; B=False remov
 # D4 — 1.x security support window (accepted A; SECURITY.md + SURFACE.md)
 D4_SECURITY_LATEST_1X_MINOR_ONLY: Final[bool] = True  # A=True; B=False latest two minors
 
-# D5 — accepted via #189 (#267); env scanner/snapshot follow this branch until #267 merges.
+# D5 — removed from public env by #267 (merged on this branch).
 
 # D6 — sidecar auto-migration vs confirm gates (accepted B; slice 2 implements)
 D6_AUTO_MIGRATE_ADDITIVE_ONLY: Final[bool] = True  # B=True additive-only + confirm gates
@@ -86,7 +85,7 @@ ENV_CLASSIFICATION: dict[str, EnvClass] = {
     "HERMES_BRIDGE_WEBHOOK": "public",
     "HERMES_GATEWAY_PROFILE": "public",
     "HERMES_HOME": "public",
-    "HERMES_OTLP_ENDPOINT": "public",
+    "HERMES_OTLP_ENDPOINT": "internal",
     "HERMES_PROFILE": "public",
     "HERMES_RESPONDER_HISTORY_TOKEN": "public",
 }
@@ -102,7 +101,6 @@ INSTANCE_ENV_PUBLIC_KEYS: Final[tuple[str, ...]] = (
     "BUSINESS_HOURS_END",
     "BUSINESS_HOURS_START",
     "BUSINESS_HOURS_TZ",
-    "HERMES_OTLP_ENDPOINT",
     "OWNER",
     "OWNER_AAD_ID",
 )
@@ -270,11 +268,16 @@ EXIT_CODES: Final[dict[str, Any]] = {
 # Sidecar migration policy (verbatim for SURFACE.md — slice 2 implements)
 # ---------------------------------------------------------------------------
 
+SIDECAR_MIGRATION_TODAY: Final[str] = (
+    "Today (slice 1) `conversations.json` is persisted with a `schema` field only "
+    "(`conversations.py`); the dual-key stamp lands in slice 2."
+)
+
 SIDECAR_MIGRATION_POLICY: Final[str] = (
-    "Planned for slice 2 (target 0.9.6.1): within 1.x, Hermes-A365 will read every "
-    "Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in "
-    "SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under "
-    "an exclusive lock, and be idempotent. The original bytes will be copied to a sibling "
+    "Planned for slice 2: within 1.x, Hermes-A365 will read every Hermes-owned sidecar "
+    "written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive "
+    "`schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, "
+    "and be idempotent. The original bytes will be copied to a sibling "
     "`*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run "
     "against an already-current file will not write another backup. Identity-binding changes "
     "will stay explicit: bot-service v1→v2 will still require `--confirm-legacy-binding` "
@@ -282,8 +285,7 @@ SIDECAR_MIGRATION_POLICY: Final[str] = (
     "will still require `--app-version` strictly above the Admin Center version. A "
     "`schemaVersion` newer than that build will be an error and the file will be left "
     "untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, "
-    "not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted "
-    "with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2."
+    "not an automatic rewrite to 0.9.x. " + SIDECAR_MIGRATION_TODAY
 )
 
 SECURITY_SUPPORT_AFTER_V1: Final[str] = (

@@ -10,7 +10,7 @@ Status: **accepted** (recorded in `src/hermes_a365/surface.py`).
 - **D2** A — default CEA publish scopes remain copilot, personal, team
 - **D3** A — freeze the task/fetch placeholder card (Hermes / Request received.)
 - **D4** A — security fixes for the latest 1.x minor only
-- **D5** Settled by #189 (#267): remove HERMES_OTLP_ENDPOINT from instance create and drop the activity-bridge verify probe; not part of the 1.0 public env once #267 is on the branch
+- **D5** Removed by #267: HERMES_OTLP_ENDPOINT is not part of the 1.0 public env (deprecated literals may remain in source for migration warnings only)
 - **D6** B — additive auto-stamps only; keep bot-service and publish confirm gates
 - **D7** B — do not ship py.typed / Typing :: Typed
 - **D8** B — public python -m hermes_a365.keychain; hermes_responder reference-only
@@ -95,15 +95,15 @@ Scanner classifies every `A365_*` / `HERMES_*` string literal in `src/hermes_a36
 
 ### Public env literals (scanner)
 
-A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_OTLP_ENDPOINT, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN
+A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN
 
 ### Instance create `.env` keys
 
-A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_TENANT_ID, AA_INSTANCE_ID, AGENT_IDENTITY, BUSINESS_HOURS_END, BUSINESS_HOURS_START, BUSINESS_HOURS_TZ, HERMES_OTLP_ENDPOINT, OWNER, OWNER_AAD_ID
+A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_TENANT_ID, AA_INSTANCE_ID, AGENT_IDENTITY, BUSINESS_HOURS_END, BUSINESS_HOURS_START, BUSINESS_HOURS_TZ, OWNER, OWNER_AAD_ID
 
 ### Internal env literals
 
-(none)
+HERMES_OTLP_ENDPOINT
 
 ## Gateway config
 
@@ -115,7 +115,7 @@ A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_TENANT_ID, AA_INSTANCE_
 
 ## Sidecars
 
-Planned for slice 2 (target 0.9.6.1): within 1.x, Hermes-A365 will read every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, and be idempotent. The original bytes will be copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file will not write another backup. Identity-binding changes will stay explicit: bot-service v1→v2 will still require `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 will still require `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than that build will be an error and the file will be left untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2.
+Planned for slice 2: within 1.x, Hermes-A365 will read every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, and be idempotent. The original bytes will be copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file will not write another backup. Identity-binding changes will stay explicit: bot-service v1→v2 will still require `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 will still require `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than that build will be an error and the file will be left untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2.
 
 ## Python API
 

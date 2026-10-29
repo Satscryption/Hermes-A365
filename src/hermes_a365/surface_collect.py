@@ -132,6 +132,7 @@ def _serialize_parser(parser: Any) -> dict[str, Any]:
     for action in parser._actions:
         if not isinstance(action, argparse._SubParsersAction):
             continue
+        node["subparsers_required"] = bool(action.required)
         for name, sub in sorted(action.choices.items()):
             node["subparsers"][name] = _serialize_parser(sub)
     return node
@@ -218,11 +219,30 @@ def collect_product_http_routes() -> list[dict[str, str]]:
     return _filter_product_routes(out)
 
 
+def _module_has_main_guard(tree: ast.Module) -> bool:
+    for node in tree.body:
+        if not isinstance(node, ast.If):
+            continue
+        test = node.test
+        if not isinstance(test, ast.Compare) or len(test.ops) != 1:
+            continue
+        if not isinstance(test.ops[0], ast.Eq):
+            continue
+        if not isinstance(test.left, ast.Name) or test.left.id != "__name__":
+            continue
+        if len(test.comparators) != 1:
+            continue
+        comparator = test.comparators[0]
+        if isinstance(comparator, ast.Constant) and comparator.value == "__main__":
+            return True
+    return False
+
+
 def collect_main_guard_modules() -> list[str]:
     modules: list[str] = []
     for path in sorted(_SRC_ROOT.rglob("*.py")):
-        text = path.read_text(encoding="utf-8")
-        if 'if __name__ == "__main__"' not in text:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        if not _module_has_main_guard(tree):
             continue
         rel = path.relative_to(_SRC_ROOT.parent)
         modules.append(str(rel.with_suffix("")).replace("/", "."))
@@ -251,11 +271,17 @@ def collect_plugin_requires_env() -> tuple[str, ...]:
 
 
 def collect_keychain_cli_surface() -> dict[str, Any]:
+    from hermes_a365 import surface as surface_mod
     from hermes_a365.keychain import _build_parser
 
     parser = _build_parser()
     tree = _serialize_parser(parser)
-    subcommands = [name for name in ("store", "get", "delete") if name in tree["subparsers"]]
+    subcommand_set = set(tree["subparsers"])
+    expected = set(surface_mod.KEYCHAIN_CLI_SUBCOMMANDS)
+    if subcommand_set != expected:
+        msg = f"keychain subcommands {sorted(subcommand_set)!r} != {sorted(expected)!r}"
+        raise ValueError(msg)
+    subcommands = [name for name in surface_mod.KEYCHAIN_CLI_SUBCOMMANDS if name in subcommand_set]
     options: set[str] = set()
     for sub_name in subcommands:
         for action in tree["subparsers"][sub_name]["actions"]:

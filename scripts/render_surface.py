@@ -81,6 +81,7 @@ def _load_surface_constants() -> dict[str, Any]:
         },
         "exit_codes": s.EXIT_CODES,
         "sidecar_migration_policy": s.SIDECAR_MIGRATION_POLICY,
+        "sidecar_migration_today": s.SIDECAR_MIGRATION_TODAY,
         "security_support_after_v1": s.SECURITY_SUPPORT_AFTER_V1,
         "register_aiteammate_refusal": None,
         "publish_default_scopes": list(s.D2_CEA_SCOPES),
