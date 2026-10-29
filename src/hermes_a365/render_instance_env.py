@@ -20,7 +20,6 @@ Programmatic use::
         a365_app_id="00000000-0000-0000-0000-00000000aaa1",
         a365_tenant_id="contoso.onmicrosoft.com",
         aa_instance_id="550e8400-e29b-41d4-a716-446655440000",
-        hermes_otlp_endpoint="https://contoso.otel.agent365.microsoft.com",
     ))
 
 CLI use::
@@ -30,8 +29,7 @@ CLI use::
         --owner sadiq@contoso.com \\
         --owner-aad-id <oid> \\
         --a365-app-id <appId> \\
-        --a365-tenant-id contoso.onmicrosoft.com \\
-        --hermes-otlp-endpoint <url>
+        --a365-tenant-id contoso.onmicrosoft.com
 """
 
 from __future__ import annotations
@@ -43,7 +41,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 
-from ._common import jinja_env
+from ._common import OTLP_DEPRECATED_MESSAGE, jinja_env
 
 _ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -62,8 +60,8 @@ class InstanceEnvInputs:
     owner_aad_id: str
     a365_app_id: str
     a365_tenant_id: str
-    hermes_otlp_endpoint: str
     aa_instance_id: str | None = None  # generated if None
+    hermes_otlp_endpoint: str | None = None  # deprecated; never rendered
     business_hours_tz: str | None = None
     business_hours_start: str | None = None
     business_hours_end: str | None = None
@@ -80,6 +78,8 @@ class InstanceEnvInputs:
 
 def render_instance_env(inputs: InstanceEnvInputs) -> str:
     """Render the per-agent .env content as a string (with trailing newline)."""
+    if inputs.hermes_otlp_endpoint and str(inputs.hermes_otlp_endpoint).strip():
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
     preserved: dict[str, str] = {}
     for key, value in (inputs.preserved_env or {}).items():
         if not _ENV_KEY_RE.fullmatch(key):
@@ -94,25 +94,18 @@ def render_instance_env(inputs: InstanceEnvInputs) -> str:
         a365_app_id=_shell_env_value(inputs.a365_app_id),
         a365_tenant_id=_shell_env_value(inputs.a365_tenant_id),
         aa_instance_id=_shell_env_value(inputs.aa_instance_id),
-        hermes_otlp_endpoint=_shell_env_value(inputs.hermes_otlp_endpoint),
         business_hours_tz=(
             _shell_env_value(inputs.business_hours_tz) if inputs.business_hours_tz else None
         ),
         business_hours_start=(
-            _shell_env_value(inputs.business_hours_start)
-            if inputs.business_hours_start
-            else None
+            _shell_env_value(inputs.business_hours_start) if inputs.business_hours_start else None
         ),
         business_hours_end=(
             _shell_env_value(inputs.business_hours_end) if inputs.business_hours_end else None
         ),
-        a365_bf_app_id=(
-            _shell_env_value(inputs.a365_bf_app_id) if inputs.a365_bf_app_id else None
-        ),
+        a365_bf_app_id=(_shell_env_value(inputs.a365_bf_app_id) if inputs.a365_bf_app_id else None),
         a365_bf_client_secret=(
-            _shell_env_value(inputs.a365_bf_client_secret)
-            if inputs.a365_bf_client_secret
-            else None
+            _shell_env_value(inputs.a365_bf_client_secret) if inputs.a365_bf_client_secret else None
         ),
         preserved_env=preserved,
     )
@@ -127,7 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--owner-aad-id", required=True)
     parser.add_argument("--a365-app-id", required=True)
     parser.add_argument("--a365-tenant-id", required=True)
-    parser.add_argument("--hermes-otlp-endpoint", required=True)
+    parser.add_argument("--hermes-otlp-endpoint", help=argparse.SUPPRESS)
     parser.add_argument("--aa-instance-id", help="UUID; generated if omitted")
     parser.add_argument("--business-hours-tz")
     parser.add_argument("--business-hours-start")

@@ -3,14 +3,13 @@
 Pure local config-file writer. No cloud step. The server-side agent
 identity is created by ``a365 setup blueprint`` (driven by
 ``hermes a365 register``); this command only produces the ``.env``
-file that runtime consumers (the activity bridge, telemetry pipeline,
-etc.) read for slug / owner / OTLP endpoint / business-hours metadata.
+file that runtime consumers (the activity bridge, etc.) read for slug /
+owner / business-hours metadata.
 
-Inherits required values (``A365_APP_ID``, ``A365_TENANT_ID``,
-``HERMES_OTLP_ENDPOINT``) from ``~/.hermes/.env``. An existing
-``AA_INSTANCE_ID`` in the agent .env is preserved across re-runs;
-business-hours fields from a prior run are also preserved unless
-explicitly overridden on the command line.
+Inherits required values (``A365_APP_ID``, ``A365_TENANT_ID``) from
+``~/.hermes/.env``. An existing ``AA_INSTANCE_ID`` in the agent .env is
+preserved across re-runs; business-hours fields from a prior run are also
+preserved unless explicitly overridden on the command line.
 
 Secrets policy: this file never contains the *blueprint* (T2) client
 secret — runtime consumers read that from ``a365.generated.config.json``,
@@ -32,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ._common import (
+    OTLP_DEPRECATED_MESSAGE,
     ensure_contained,
     parse_env,
     validate_slug,
@@ -43,6 +43,7 @@ _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
 
 _REQUIRED_PARENT_KEYS = ("A365_APP_ID", "A365_TENANT_ID")
+_DEPRECATED_OTLP_ENV_KEY = "HERMES_OTLP_ENDPOINT"
 _MANAGED_AGENT_ENV_KEYS = frozenset(
     {
         "AGENT_IDENTITY",
@@ -51,7 +52,7 @@ _MANAGED_AGENT_ENV_KEYS = frozenset(
         "A365_APP_ID",
         "A365_TENANT_ID",
         "AA_INSTANCE_ID",
-        "HERMES_OTLP_ENDPOINT",
+        _DEPRECATED_OTLP_ENV_KEY,
         "BUSINESS_HOURS_TZ",
         "BUSINESS_HOURS_START",
         "BUSINESS_HOURS_END",
@@ -106,11 +107,28 @@ def _load_existing_agent_env(hermes_home: Path, slug: str) -> dict[str, str]:
     return parse_env(path.read_text())
 
 
+def warn_if_deprecated_otlp_config(
+    *,
+    parent_env: dict[str, str],
+    cli_otlp_endpoint: str | None = None,
+    agent_env: dict[str, str] | None = None,
+) -> None:
+    """Emit a one-line stderr warning when legacy OTLP keys are still set."""
+    if cli_otlp_endpoint and cli_otlp_endpoint.strip():
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
+        return
+    if parent_env.get(_DEPRECATED_OTLP_ENV_KEY, "").strip():
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
+        return
+    if agent_env and agent_env.get(_DEPRECATED_OTLP_ENV_KEY, "").strip():
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
+
+
 def write_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
     """Write ``text`` to ``path`` owner-only via O_EXCL temp + rename.
 
     ``mode`` defaults to 0o600 (owner-only). The agent ``.env`` carries
-    operator metadata (email, AAD object id, instance id, OTLP endpoint)
+    operator metadata (email, AAD object id, instance id)
     **and, under Path B, the live ``A365_BF_CLIENT_SECRET``** — so the
     secret-safe O_EXCL-first ordering (#112 / CS-004) matters here: the
     temp is created at ``mode`` before any bytes are written, closing the
@@ -132,7 +150,6 @@ class InstanceCreateInputs:
     slug: str
     owner: str
     owner_aad_id: str
-    otlp_endpoint: str | None = None  # falls back to parent .env
     business_hours_tz: str | None = None
     business_hours_start: str | None = None
     business_hours_end: str | None = None
@@ -198,27 +215,10 @@ class InstancePlan:
         )
 
 
-def _resolve_otlp_endpoint(
-    inputs: InstanceCreateInputs,
-    parent_env: dict[str, str],
-) -> str:
-    if inputs.otlp_endpoint:
-        return inputs.otlp_endpoint
-    inherited = parent_env.get("HERMES_OTLP_ENDPOINT", "").strip()
-    if inherited:
-        return inherited
-    raise InstanceCreateError(
-        "HERMES_OTLP_ENDPOINT is not set in ~/.hermes/.env and --otlp-endpoint was not given. "
-        "Either set the parent env or pass --otlp-endpoint."
-    )
-
-
 def _preserved_agent_env(existing_agent: dict[str, str]) -> dict[str, str]:
     """Return user-managed env keys that instance create should carry forward."""
     return {
-        key: value
-        for key, value in existing_agent.items()
-        if key not in _MANAGED_AGENT_ENV_KEYS
+        key: value for key, value in existing_agent.items() if key not in _MANAGED_AGENT_ENV_KEYS
     }
 
 
@@ -226,6 +226,7 @@ def build_instance_plan(
     inputs: InstanceCreateInputs,
     *,
     hermes_home: Path | None = None,
+    cli_otlp_endpoint: str | None = None,
 ) -> InstancePlan:
     """Resolve identifiers, gather inherited values, return the file-write plan.
 
@@ -238,6 +239,11 @@ def build_instance_plan(
 
     parent_env = _load_skill_env(hermes_home)
     existing_agent = _load_existing_agent_env(hermes_home, inputs.slug)
+    warn_if_deprecated_otlp_config(
+        parent_env=parent_env,
+        cli_otlp_endpoint=cli_otlp_endpoint,
+        agent_env=existing_agent,
+    )
     env_path = _agent_env_path(hermes_home, inputs.slug)
 
     existing_id = existing_agent.get("AA_INSTANCE_ID", "").strip() or None
@@ -248,7 +254,6 @@ def build_instance_plan(
         owner_aad_id=inputs.owner_aad_id,
         a365_app_id=parent_env["A365_APP_ID"],
         a365_tenant_id=parent_env["A365_TENANT_ID"],
-        hermes_otlp_endpoint=_resolve_otlp_endpoint(inputs, parent_env),
         # When existing_id is None, InstanceEnvInputs.__post_init__ mints a
         # fresh UUID — but we won't materialise that until apply time.
         aa_instance_id=existing_id,
@@ -332,7 +337,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     parser.add_argument("--owner-aad-id", required=True, help="owner Entra (AAD) object id")
     parser.add_argument(
         "--otlp-endpoint",
-        help="override HERMES_OTLP_ENDPOINT; defaults to value from ~/.hermes/.env",
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--business-hours-tz")
     parser.add_argument("--business-hours-start")
@@ -349,7 +354,6 @@ def run(args: argparse.Namespace) -> int:
             slug=args.slug,
             owner=args.owner,
             owner_aad_id=args.owner_aad_id,
-            otlp_endpoint=args.otlp_endpoint,
             business_hours_tz=args.business_hours_tz,
             business_hours_start=args.business_hours_start,
             business_hours_end=args.business_hours_end,
@@ -359,7 +363,10 @@ def run(args: argparse.Namespace) -> int:
         return 2
 
     try:
-        plan = build_instance_plan(inputs)
+        plan = build_instance_plan(
+            inputs,
+            cli_otlp_endpoint=getattr(args, "otlp_endpoint", None),
+        )
     except InstanceCreateError as e:
         print(f"ERROR: {e}", file=sys.stderr)
         return 2

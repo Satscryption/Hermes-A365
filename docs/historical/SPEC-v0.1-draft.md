@@ -836,6 +836,8 @@ $ hermes a365 activity-bridge start inbox-helper
 ### 6.8 OpenTelemetry (`hermes a365 telemetry`)
 
 > **v0.2 update (2026-05-07).** Aspirational. No `telemetry verify` subcommand was built; no OTLP wiring shipped. The wrapper does not inject Hermes spans into A365 traces. Revisit if/when an operator needs end-to-end observability in admin centre.
+>
+> **v0.9.6.1 update (2026-10-29, #189).** Option 2 chosen: `HERMES_OTLP_ENDPOINT`, the verify probe, and admin-centre span claims were removed from shipped code and docs. See `references/opentelemetry-config.md`.
 
 - A365 auto-instruments registered agents: spans, metrics, and a small canonical event vocabulary (agent.received, agent.responded, agent.tool_invoked, agent.error).
 - This skill's job:
@@ -1103,7 +1105,7 @@ This subsection captures the failure modes that survive normal operation, the di
 | `AADSTS70043` "refresh token expired" | User-FIC past its tenant-configured TTL (default 90 days). | `hermes a365 status <slug>` → fic row. | `hermes a365 fic rotate <slug>` then restart bridge. |
 | Bridge starts then disconnects after seconds | T2 secret in keychain is stale (e.g., after secret rotation). | Check `~/.hermes/agents/<slug>/bridge.log` for `401`. | Re-fetch / re-store the T2 secret; the simplest path is a fresh `hermes a365 register --apply` (it's idempotent) or a `fic rotate`. |
 | `400 Bad Request` on `a365 setup blueprint` | Blueprint property unknown to current A365 schema. | Compare the rendered JSON with `references/entra-blueprint-properties.md`. | Remove or correct the property; `--allow-unknown` lets you push through if you know better than the cached property list. |
-| OTLP traces never appear in admin center | `HERMES_OTLP_ENDPOINT` unset, sampler dropping spans, or telemetry export disabled at tenant. | `hermes a365 telemetry verify <slug>` | Set the endpoint in `~/.hermes/agents/<slug>/.env`; check tenant policy under "Agent observability". |
+| ~~OTLP traces never appear in admin center~~ | **Historical (#189):** Hermes-A365 no longer provisions `HERMES_OTLP_ENDPOINT` or ships `telemetry verify`. | — | See `references/opentelemetry-config.md`. |
 | Channel binding succeeds but no messages reach the agent | Activity bridge not running, or DLP policy blocking the channel for the user. | `hermes a365 status <slug>` → activity-bridge + channels rows. | Restart bridge; review DLP policy on blueprint. |
 | `429 Too Many Requests` from Graph or A365 endpoints | Per-tenant / per-app throttling. | Inspect `Retry-After` header in the bridge log. | The skill respects `Retry-After` automatically. If you're hitting it during bootstrap, batch operations less aggressively. |
 | `403 Forbidden` from Work IQ MCP | Scope toggled in blueprint but user has not been re-consented. | `hermes a365 status <slug>` will flag scope drift. | `hermes a365 workiq <slug> --enable <tool>` re-runs consent for the deltas. |

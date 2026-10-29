@@ -8,6 +8,7 @@ from typing import Any
 
 import pytest
 
+from hermes_a365._common import OTLP_DEPRECATED_MESSAGE
 from hermes_a365.instance_create import (
     InstanceCreateError,
     InstanceCreateInputs,
@@ -28,7 +29,6 @@ def _seed_skill_env(hermes_home: Path, **overrides: str) -> None:
     base = {
         "A365_APP_ID": "00000000-0000-0000-0000-00000000aaa1",
         "A365_TENANT_ID": "contoso.onmicrosoft.com",
-        "HERMES_OTLP_ENDPOINT": "https://contoso.otel.agent365.microsoft.com",
     }
     base.update(overrides)
     text = "".join(f"{k}={v}\n" for k, v in sorted(base.items()))
@@ -54,7 +54,6 @@ class TestInstanceCreateInputs:
     def test_minimal_valid(self) -> None:
         inp = _inputs()
         assert inp.slug == "inbox-helper"
-        assert inp.otlp_endpoint is None
 
     @pytest.mark.parametrize("field_name", ["slug", "owner", "owner_aad_id"])
     def test_required_fields_must_be_nonempty(self, field_name: str) -> None:
@@ -97,22 +96,37 @@ class TestSkillEnvPreconditions:
             build_instance_plan(_inputs(), hermes_home=tmp_path)
 
     def test_skill_env_missing_required_keys_fails_clean(self, tmp_path: Path) -> None:
-        (tmp_path / ".env").write_text("HERMES_OTLP_ENDPOINT=x\n")
+        (tmp_path / ".env").write_text("OWNER=ignored\n")
         with pytest.raises(InstanceCreateError, match="missing required keys"):
             build_instance_plan(_inputs(), hermes_home=tmp_path)
 
-    def test_missing_otlp_endpoint_with_no_override_fails(self, tmp_path: Path) -> None:
-        _seed_skill_env(tmp_path, HERMES_OTLP_ENDPOINT="")
-        with pytest.raises(InstanceCreateError, match="HERMES_OTLP_ENDPOINT"):
-            build_instance_plan(_inputs(), hermes_home=tmp_path)
-
-    def test_otlp_endpoint_override_accepted(self, tmp_path: Path) -> None:
-        _seed_skill_env(tmp_path, HERMES_OTLP_ENDPOINT="")
-        plan = build_instance_plan(
-            _inputs(otlp_endpoint="https://override"),
-            hermes_home=tmp_path,
+    def test_legacy_parent_otlp_emits_deprecation_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _seed_skill_env(
+            tmp_path,
+            HERMES_OTLP_ENDPOINT="https://contoso.otel.agent365.microsoft.com",
         )
-        assert plan.desired_env_inputs.hermes_otlp_endpoint == "https://override"
+        build_instance_plan(_inputs(), hermes_home=tmp_path)
+        assert OTLP_DEPRECATED_MESSAGE in capsys.readouterr().err
+
+    def test_legacy_cli_otlp_endpoint_emits_deprecation_warning(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        _seed_skill_env(tmp_path)
+        build_instance_plan(
+            _inputs(),
+            hermes_home=tmp_path,
+            cli_otlp_endpoint="https://override",
+        )
+        assert OTLP_DEPRECATED_MESSAGE in capsys.readouterr().err
+
+    def test_instance_create_succeeds_without_otlp_endpoint(self, tmp_path: Path) -> None:
+        _seed_skill_env(tmp_path)
+        plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
+        result = apply_instance_plan(plan)
+        text = result.env_path.read_text()
+        assert "HERMES_OTLP_ENDPOINT" not in text
 
 
 # ---------------------------------------------------------------------------
@@ -186,9 +200,7 @@ class TestBuildInstancePlan:
             A365_BF_CLIENT_SECRET="bf-secret",
         )
         plan = build_instance_plan(_inputs(), hermes_home=tmp_path)
-        assert plan.desired_env_inputs.a365_bf_app_id == (
-            "11111111-1111-1111-1111-111111111111"
-        )
+        assert plan.desired_env_inputs.a365_bf_app_id == ("11111111-1111-1111-1111-111111111111")
         assert plan.desired_env_inputs.a365_bf_client_secret == "bf-secret"
 
     def test_path_b_identity_absent_when_parent_env_absent(self, tmp_path: Path) -> None:
@@ -352,6 +364,7 @@ class TestApplyInstance:
         # to the .env. The result's id is the source of truth.
         assert f"AA_INSTANCE_ID={result.aa_instance_id}" in text
         assert "A365_APP_ID=00000000-0000-0000-0000-00000000aaa1" in text
+        assert "HERMES_OTLP_ENDPOINT" not in text
         # Secrets policy: never write the blueprint client secret to disk.
         assert "A365_APP_PASSWORD" not in text
         # Bug #9: no v0.1 leftover field.
