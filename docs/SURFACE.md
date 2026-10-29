@@ -2,16 +2,26 @@
 
 Package version **0.9.5**. Machine-readable snapshot: [`docs/surface/public-surface.json`](surface/public-surface.json). Regenerate with `scripts/render_surface.py --write`; CI runs `--check`.
 
-## Owner decisions (flip in `src/hermes_a365/surface.py`)
+## Owner decisions (accepted)
 
-- **D1** activity-bridge `serve`: supported secondary runtime (`D1_SERVE_SUPPORTED`).
-- **D2** default CEA publish scopes: `copilot, personal, team` (`D2_CEA_SCOPES`).
-- **D3** `task/fetch` placeholder card frozen: True (`D3_TASK_FETCH_CARD_FROZEN`).
-- **D4** security fixes: After v1.0, security fixes are provided for the latest 1.x minor release only. Earlier 1.x minors and all 0.x releases are unsupported. (`D4_SECURITY_LATEST_1X_MINOR_ONLY`).
-- **D5** `HERMES_OTLP_ENDPOINT`: documented as required by `instance create` and probed by `activity-bridge verify` on main until #189 lands.
-- **D6** migrations: additive auto-stamp only; confirm gates remain (`D6_AUTO_MIGRATE_ADDITIVE_ONLY=True`).
-- **D7** `py.typed`: omitted (`D7_SHIP_PY_TYPED`).
-- **D8** `python -m`: keychain public CLI; `hermes_responder` reference-only (`D8_*`).
+Status: **accepted** (recorded in `src/hermes_a365/surface.py`).
+
+- **D1** A — activity-bridge serve is a supported secondary runtime at 1.0
+- **D2** A — default CEA publish scopes remain copilot, personal, team
+- **D3** A — freeze the task/fetch placeholder card (Hermes / Request received.)
+- **D4** A — security fixes for the latest 1.x minor only
+- **D5** Settled by #189 (#267): remove HERMES_OTLP_ENDPOINT from instance create and drop the activity-bridge verify probe; not part of the 1.0 public env once #267 is on the branch
+- **D6** B — additive auto-stamps only; keep bot-service and publish confirm gates
+- **D7** B — do not ship py.typed / Typing :: Typed
+- **D8** B — public python -m hermes_a365.keychain; hermes_responder reference-only
+
+- **D1 constant** `D1_SERVE_SUPPORTED=True`.
+- **D2 constant** `D2_CEA_SCOPES=('copilot', 'personal', 'team')`.
+- **D3 constant** `D3_TASK_FETCH_CARD_FROZEN=True`.
+- **D4 constant** `D4_SECURITY_LATEST_1X_MINOR_ONLY=True`.
+- **D6 constant** `D6_AUTO_MIGRATE_ADDITIVE_ONLY=True`.
+- **D7 constant** `D7_SHIP_PY_TYPED=False`.
+- **D8 constants** `D8_KEYCHAIN_PUBLIC=True`, `D8_RESPONDER_REFERENCE_ONLY=True`.
 
 ## CLI
 

@@ -1,8 +1,8 @@
 """Hand-maintained public-surface metadata for the v1.0 freeze (#193).
 
 Values here are merged with live extraction in ``scripts/render_surface.py``.
-Owner decisions D1-D8 are single flip points: change the ``SELECTED`` constant
-in each block below (and re-run ``render_surface.py --write``).
+Owner decisions D1-D8 were accepted on 2026-10-29 (see ``ACCEPTED_OWNER_DECISIONS``).
+The D1-D8 constants below remain the single flip points if an decision is reopened.
 """
 
 from __future__ import annotations
@@ -13,31 +13,47 @@ from typing import Any, Final, Literal
 from hermes_a365.a365_config import A365Config
 
 # ---------------------------------------------------------------------------
-# Owner decisions (pending explicit acceptance — recommended option pre-selected)
+# Owner decisions (accepted 2026-10-29 — constants match the accepted option)
 # ---------------------------------------------------------------------------
 
-# D1 — activity-bridge serve at 1.0
+OWNER_DECISIONS_STATUS: Final[str] = "accepted"
+
+ACCEPTED_OWNER_DECISIONS: Final[dict[str, str]] = {
+    "D1": "A — activity-bridge serve is a supported secondary runtime at 1.0",
+    "D2": "A — default CEA publish scopes remain copilot, personal, team",
+    "D3": "A — freeze the task/fetch placeholder card (Hermes / Request received.)",
+    "D4": "A — security fixes for the latest 1.x minor only",
+    "D5": (
+        "Settled by #189 (#267): remove HERMES_OTLP_ENDPOINT from instance create "
+        "and drop the activity-bridge verify probe; not part of the 1.0 public env "
+        "once #267 is on the branch"
+    ),
+    "D6": "B — additive auto-stamps only; keep bot-service and publish confirm gates",
+    "D7": "B — do not ship py.typed / Typing :: Typed",
+    "D8": "B — public python -m hermes_a365.keychain; hermes_responder reference-only",
+}
+
+# D1 — activity-bridge serve at 1.0 (accepted A)
 D1_SERVE_SUPPORTED: Final[bool] = True  # A=True supported; B=False present-but-unsupported
 
-# D2 — default CEA publish scopes include team
+# D2 — default CEA publish scopes include team (accepted A)
 D2_CEA_SCOPES: Final[tuple[str, ...]] = ("copilot", "personal", "team")  # A; B drops team
 
-# D3 — task/fetch placeholder card
+# D3 — task/fetch placeholder card (accepted A)
 D3_TASK_FETCH_CARD_FROZEN: Final[bool] = True  # A=True keep card; B=False remove before snapshot
 
-# D4 — 1.x security support window (also reflected in SECURITY.md + SURFACE.md)
+# D4 — 1.x security support window (accepted A; SECURITY.md + SURFACE.md)
 D4_SECURITY_LATEST_1X_MINOR_ONLY: Final[bool] = True  # A=True; B=False latest two minors
 
-# D5 — #189 OTLP: snapshot documents current main behaviour until #189 lands.
-# Do not implement #189 here; PR #267 updates the snapshot when merged.
+# D5 — accepted via #189 (#267); env scanner/snapshot follow this branch until #267 merges.
 
-# D6 — sidecar auto-migration vs confirm gates (policy prose only in slice 1)
+# D6 — sidecar auto-migration vs confirm gates (accepted B; slice 2 implements)
 D6_AUTO_MIGRATE_ADDITIVE_ONLY: Final[bool] = True  # B=True additive-only + confirm gates
 
-# D7 — PEP 561 py.typed marker
+# D7 — PEP 561 py.typed marker (accepted B)
 D7_SHIP_PY_TYPED: Final[bool] = False  # B=False omit; A=True add py.typed
 
-# D8 — python -m entry modules
+# D8 — python -m entry modules (accepted B)
 D8_KEYCHAIN_PUBLIC: Final[bool] = True  # B=True public CLI
 D8_RESPONDER_REFERENCE_ONLY: Final[bool] = True  # B=True reference, not product runtime
 

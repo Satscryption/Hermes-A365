@@ -38,6 +38,12 @@ def test_snapshot_matches_renderer() -> None:
     assert proc.returncode == 0, proc.stderr or proc.stdout
 
 
+def test_owner_decisions_accepted(snapshot: dict) -> None:
+    od = snapshot["owner_decisions"]
+    assert od["status"] == surface_mod.OWNER_DECISIONS_STATUS == "accepted"
+    assert od["accepted"] == surface_mod.ACCEPTED_OWNER_DECISIONS
+
+
 def test_cli_parser_parity(snapshot: dict) -> None:
     live = collect_cli_trees()
     assert live["standalone"] == snapshot["cli"]["standalone"]

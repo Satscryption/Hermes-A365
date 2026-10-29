@@ -2242,7 +2242,18 @@
     "D6_auto_migrate_additive_only": true,
     "D7_ship_py_typed": false,
     "D8_keychain_public": true,
-    "D8_responder_reference_only": true
+    "D8_responder_reference_only": true,
+    "accepted": {
+      "D1": "A \u2014 activity-bridge serve is a supported secondary runtime at 1.0",
+      "D2": "A \u2014 default CEA publish scopes remain copilot, personal, team",
+      "D3": "A \u2014 freeze the task/fetch placeholder card (Hermes / Request received.)",
+      "D4": "A \u2014 security fixes for the latest 1.x minor only",
+      "D5": "Settled by #189 (#267): remove HERMES_OTLP_ENDPOINT from instance create and drop the activity-bridge verify probe; not part of the 1.0 public env once #267 is on the branch",
+      "D6": "B \u2014 additive auto-stamps only; keep bot-service and publish confirm gates",
+      "D7": "B \u2014 do not ship py.typed / Typing :: Typed",
+      "D8": "B \u2014 public python -m hermes_a365.keychain; hermes_responder reference-only"
+    },
+    "status": "accepted"
   },
   "package_version": "0.9.5",
   "packaging": {

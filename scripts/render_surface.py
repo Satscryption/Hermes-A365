@@ -48,6 +48,8 @@ def _load_surface_constants() -> dict[str, Any]:
 
     return {
         "owner_decisions": {
+            "status": s.OWNER_DECISIONS_STATUS,
+            "accepted": dict(s.ACCEPTED_OWNER_DECISIONS),
             "D1_serve_supported": s.D1_SERVE_SUPPORTED,
             "D2_cea_default_scopes": list(s.D2_CEA_SCOPES),
             "D3_task_fetch_card_frozen": s.D3_TASK_FETCH_CARD_FROZEN,
@@ -124,16 +126,24 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
         "Machine-readable snapshot: [`docs/surface/public-surface.json`](surface/public-surface.json). "
         "Regenerate with `scripts/render_surface.py --write`; CI runs `--check`.",
         "",
-        "## Owner decisions (flip in `src/hermes_a365/surface.py`)",
+        "## Owner decisions (accepted)",
         "",
-        f"- **D1** activity-bridge `serve`: {'supported secondary runtime' if od['D1_serve_supported'] else 'present but unsupported'} (`D1_SERVE_SUPPORTED`).",
-        f"- **D2** default CEA publish scopes: `{', '.join(od['D2_cea_default_scopes'])}` (`D2_CEA_SCOPES`).",
-        f"- **D3** `task/fetch` placeholder card frozen: {od['D3_task_fetch_card_frozen']} (`D3_TASK_FETCH_CARD_FROZEN`).",
-        f"- **D4** security fixes: {snapshot['security_support_after_v1']} (`D4_SECURITY_LATEST_1X_MINOR_ONLY`).",
-        "- **D5** `HERMES_OTLP_ENDPOINT`: documented as required by `instance create` and probed by `activity-bridge verify` on main until #189 lands.",
-        f"- **D6** migrations: additive auto-stamp only; confirm gates remain (`D6_AUTO_MIGRATE_ADDITIVE_ONLY={od['D6_auto_migrate_additive_only']}`).",
-        f"- **D7** `py.typed`: {'shipped' if od['D7_ship_py_typed'] else 'omitted'} (`D7_SHIP_PY_TYPED`).",
-        "- **D8** `python -m`: keychain public CLI; `hermes_responder` reference-only (`D8_*`).",
+        f"Status: **{od['status']}** (recorded in `src/hermes_a365/surface.py`).",
+        "",
+    ]
+    for key in ("D1", "D2", "D3", "D4", "D5", "D6", "D7", "D8"):
+        lines.append(f"- **{key}** {od['accepted'][key]}")
+    lines.extend(
+        [
+        "",
+        f"- **D1 constant** `D1_SERVE_SUPPORTED={od['D1_serve_supported']}`.",
+        f"- **D2 constant** `D2_CEA_SCOPES={tuple(od['D2_cea_default_scopes'])}`.",
+        f"- **D3 constant** `D3_TASK_FETCH_CARD_FROZEN={od['D3_task_fetch_card_frozen']}`.",
+        f"- **D4 constant** `D4_SECURITY_LATEST_1X_MINOR_ONLY={od['D4_security_latest_1x_minor_only']}`.",
+        f"- **D6 constant** `D6_AUTO_MIGRATE_ADDITIVE_ONLY={od['D6_auto_migrate_additive_only']}`.",
+        f"- **D7 constant** `D7_SHIP_PY_TYPED={od['D7_ship_py_typed']}`.",
+        f"- **D8 constants** `D8_KEYCHAIN_PUBLIC={od['D8_keychain_public']}`, "
+        f"`D8_RESPONDER_REFERENCE_ONLY={od['D8_responder_reference_only']}`.",
         "",
         "## CLI",
         "",
@@ -194,7 +204,8 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
         "",
         "Gateway `build_app` and `activity-bridge serve`:",
         "",
-    ]
+        ]
+    )
     for route in snapshot["product_http_routes_frozen"]:
         lines.append(f"- `{route['method']} {route['path']}`")
     lines.extend(
