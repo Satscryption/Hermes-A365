@@ -5347,7 +5347,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 flush_buf.pop("plain_reply_flush_segment_ids", None)
                 if flush_buf.pop("plain_flush_followup", False):
                     followup = flush_buf.get("plain_flush_followup_task")
-                    if not (isinstance(followup, asyncio.Task) and not followup.done()):
+                    current = asyncio.current_task()
+                    if not (
+                        isinstance(followup, asyncio.Task)
+                        and not followup.done()
+                        and followup is not current
+                    ):
                         flush_buf["plain_flush_followup_task"] = asyncio.create_task(
                             self._flush_turn_buffer(flush_chat_id)
                         )
@@ -5753,6 +5758,31 @@ class Agent365Adapter(BasePlatformAdapter):
 
         record = delivery_map(buf).get(turn_key)
         return record if isinstance(record, dict) else None
+
+    @staticmethod
+    def _plain_flush_followup_blocks_deferred_retry(buf: dict[str, Any]) -> bool:
+        task = buf.get("plain_flush_followup_task")
+        current = asyncio.current_task()
+        return isinstance(task, asyncio.Task) and not task.done() and task is not current
+
+    def _schedule_turn_buffer_retry_if_allowed(
+        self, chat_id: str, turn_key: str | None = None
+    ) -> None:
+        buf = self._turn_buffers.get(chat_id)
+        if buf is not None and self._plain_flush_followup_blocks_deferred_retry(buf):
+            return
+        self._schedule_turn_buffer_retry(chat_id, turn_key)
+
+    @staticmethod
+    def _handoff_link_plain_flush_segment_ids(
+        kept: list[dict[str, str]], drop_ids: list[str]
+    ) -> tuple[str, ...]:
+        kept_ids = {
+            str(segment.get("id") or "") for segment in kept if str(segment.get("id") or "")
+        }
+        return tuple(
+            segment_id for segment_id in drop_ids if segment_id and segment_id not in kept_ids
+        )
 
     def _schedule_turn_buffer_retry(self, chat_id: str, turn_key: str | None = None) -> None:
         """Schedule a deferred flush for one turn's delivery record."""
@@ -9019,7 +9049,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             else:
                                 record["state"] = "DEFERRED"
                             buf["retry_turn_key"] = record["turn_key"]
-                            self._schedule_turn_buffer_retry(chat_id, record["turn_key"])
+                            self._schedule_turn_buffer_retry_if_allowed(chat_id, record["turn_key"])
                             return
                         live = self._turn_buffers.get(chat_id)
                         if live is None:
@@ -9083,7 +9113,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     turn_key = self._delivery_record(buf, turn)["turn_key"]
                     buf["retry_turn_key"] = turn_key
-                    self._schedule_turn_buffer_retry(chat_id, turn_key)
+                    self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
                     return
                 live = self._turn_buffers.get(chat_id)
                 if live is None:
@@ -9100,14 +9130,18 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not link_closed:
                     turn_key = self._delivery_record(buf, turn)["turn_key"]
                     buf["retry_turn_key"] = turn_key
-                    self._schedule_turn_buffer_retry(chat_id, turn_key)
+                    self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
                     return
                 link_result = await self._send_reply_activity(
                     inbound=inbound,
                     content=suffix.strip(),
                     log_context="turn buffer",
                     validated_path=path,
-                    turn_buffer_flush=(chat_id, buf, tuple(drop_ids)),
+                    turn_buffer_flush=(
+                        chat_id,
+                        buf,
+                        self._handoff_link_plain_flush_segment_ids(kept, drop_ids),
+                    ),
                 )
                 if not link_result.success:
                     logger.warning(
@@ -9138,7 +9172,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 turn_key = self._retry_turn_key_for_buffer(buf)
                 if turn_key:
                     buf["retry_turn_key"] = turn_key
-                    self._schedule_turn_buffer_retry(chat_id, turn_key)
+                    self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
                 return
         if int(buf.get("depth") or 0) == 0 and not buf.get("segments"):
             await self._drop_turn_buffer(chat_id)
@@ -9147,7 +9181,7 @@ class Agent365Adapter(BasePlatformAdapter):
             turn_key = self._retry_turn_key_for_buffer(buf)
             if turn_key:
                 buf["retry_turn_key"] = turn_key
-                self._schedule_turn_buffer_retry(chat_id, turn_key)
+                self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
 
     @staticmethod
     def _remove_turn_segments(buf: dict[str, Any], ids: list[str]) -> None:
