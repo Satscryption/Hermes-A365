@@ -9057,7 +9057,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
                 turn_key = self._delivery_record(buf, turn)["turn_key"]
                 buf["retry_turn_key"] = turn_key
-                self._schedule_turn_buffer_retry(chat_id, turn_key)
+                self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
                 return
             chunks: list[tuple[list[dict[str, str]], str]] = []
             for chunk in self._chunk_turn_segments(kept):
@@ -9100,14 +9100,16 @@ class Agent365Adapter(BasePlatformAdapter):
                     if outcome == "blocked":
                         if not self._turn_reply_blocked(chat_id):
                             buf["retry_turn_key"] = record["turn_key"]
-                            self._schedule_turn_buffer_retry(chat_id, record["turn_key"])
+                            self._schedule_turn_buffer_retry_if_allowed(chat_id, record["turn_key"])
                         return
                     if outcome == "retry":
                         if not self._turn_reply_blocked(chat_id):
                             record = self._delivery_record(buf, turn)
                             if not record.get("force_plain_exhausted"):
                                 buf["retry_turn_key"] = record["turn_key"]
-                                self._schedule_turn_buffer_retry(chat_id, record["turn_key"])
+                                self._schedule_turn_buffer_retry_if_allowed(
+                                    chat_id, record["turn_key"]
+                                )
                         return
                     if outcome == "uncertain":
                         first_chunk_on_stream = False

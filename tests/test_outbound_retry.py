@@ -1100,10 +1100,10 @@ class TestTurnBufferPlainFlushRetry:
 
         a = plugin_tests._make_adapter(monkeypatch)
         chat = "conv-followup-nested-successor"
-        inbound_outer = plugin_tests._make_inbound(conv_id=chat, activity_id="act-outer")
         inbound_inner = plugin_tests._make_inbound(conv_id=chat, activity_id="act-inner")
-        inbound_outer["conversation"]["conversationType"] = "groupChat"
+        inbound_outer = plugin_tests._make_inbound(conv_id=chat, activity_id="act-outer")
         inbound_inner["conversation"]["conversationType"] = "groupChat"
+        inbound_outer["conversation"]["conversationType"] = "groupChat"
         rate = MagicMock(
             status_code=429,
             text="",
@@ -1112,7 +1112,7 @@ class TestTurnBufferPlainFlushRetry:
         )
         ok = MagicMock(status_code=200, text="", json=lambda: {"id": "reply-1"})
         post_mock = plugin_tests.TestEditMessage._wire_adapter(
-            a, inbound=inbound_outer, post_responses=[rate, ok, ok]
+            a, inbound=inbound_inner, post_responses=[rate, ok, rate, ok, ok]
         )
         plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
         monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
@@ -1143,8 +1143,7 @@ class TestTurnBufferPlainFlushRetry:
             "lock": asyncio.Lock(),
         }
         a._turn_buffers[chat] = buf
-        retry_entered = asyncio.Event()
-        release_retry = asyncio.Event()
+        release_turn2 = asyncio.Event()
         orig_sleep = adapter_mod.Agent365Adapter._sleep_turn_buffer_locked
 
         async def gated_sleep(
@@ -1153,21 +1152,37 @@ class TestTurnBufferPlainFlushRetry:
             sleep_buf: dict[str, Any],
             delay: float,
         ) -> None:
-            retry_entered.set()
             await orig_sleep(self, chat_id, sleep_buf, 0.0)
-            for turn in sleep_buf["turns"]:
-                if str(turn.get("seq") or "") == "2":
-                    turn["open"] = False
-            sleep_buf["segments"].append({"id": "turnbuf:2", "text": "nested-close", "turn": "2"})
-            await a._flush_turn_buffer(chat_id)
-            await release_retry.wait()
+            followup = sleep_buf.get("plain_flush_followup_task")
+            if isinstance(followup, asyncio.Task) and asyncio.current_task() is followup:
+                assert asyncio.current_task() is followup
+                for turn in sleep_buf["turns"]:
+                    if str(turn.get("seq") or "") == "2":
+                        turn["open"] = False
+                sleep_buf["segments"].append(
+                    {"id": "turnbuf:2", "text": "nested-close", "turn": "2"}
+                )
+                sleep_buf["plain_flush_followup"] = True
+                release_turn2.set()
             await orig_sleep(self, chat_id, sleep_buf, 0.0)
 
         monkeypatch.setattr(adapter_mod.Agent365Adapter, "_sleep_turn_buffer_locked", gated_sleep)
-        flush_task = asyncio.create_task(a._flush_closed_turns(chat))
-        await asyncio.wait_for(retry_entered.wait(), timeout=2.0)
-        release_retry.set()
-        await asyncio.wait_for(flush_task, timeout=2.0)
+        await a._flush_closed_turns(chat)
+        for turn in buf["turns"]:
+            if str(turn.get("seq") or "") == "2":
+                turn["open"] = False
+        buf["segments"].append({"id": "turnbuf:2a", "text": "turn2-start", "turn": "2"})
+        followup = asyncio.create_task(a._flush_turn_buffer(chat))
+        buf["plain_flush_followup_task"] = followup
+        await asyncio.wait_for(release_turn2.wait(), timeout=2.0)
+        await asyncio.wait_for(followup, timeout=2.0)
+        successor = buf.get("plain_flush_followup_task")
+        if (
+            isinstance(successor, asyncio.Task)
+            and successor is not followup
+            and not successor.done()
+        ):
+            await asyncio.wait_for(successor, timeout=2.0)
         posted = [
             call.kwargs["json"]["text"]
             for call in post_mock.await_args_list
@@ -1175,6 +1190,94 @@ class TestTurnBufferPlainFlushRetry:
         ]
         assert "inner-done" in posted
         assert "nested-close" in posted
+
+    async def test_retry_outcome_does_not_schedule_deferred_while_followup_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        import hermes_a365.plugin.adapter as adapter_mod
+        from hermes_a365.plugin.turn_buffer_answer_delivery import get_delivery_record
+
+        a = plugin_tests._make_adapter(monkeypatch)
+        chat = "conv-followup-blocks-retry-outcome"
+        inbound1 = plugin_tests._make_inbound(conv_id=chat, activity_id="act-1")
+        inbound2 = plugin_tests._make_inbound(conv_id=chat, activity_id="act-2")
+        inbound1["conversation"]["conversationType"] = "groupChat"
+        inbound2["conversation"]["conversationType"] = "groupChat"
+        ok = MagicMock(status_code=200, text="", json=lambda: {"id": "reply-1"})
+        post_mock = plugin_tests.TestEditMessage._wire_adapter(
+            a, inbound=inbound1, post_responses=[ok, ok]
+        )
+        plugin_tests.TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(a, "_await_outbound", lambda _c, coro: coro)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0)
+        retry_mock = MagicMock()
+        monkeypatch.setattr(a, "_schedule_turn_buffer_retry", retry_mock)
+        followup_gate = asyncio.Event()
+
+        async def immediate_deferred_flush(chat_id: str) -> None:
+            await a._flush_closed_turns(chat_id)
+
+        monkeypatch.setattr(a, "_deferred_turn_buffer_retry", immediate_deferred_flush)
+
+        async def blocked_followup(_chat_id: str) -> None:
+            await followup_gate.wait()
+            await a._flush_closed_turns(_chat_id)
+
+        turn1 = {
+            "seq": "1",
+            "inbound": inbound1,
+            "open": False,
+            "validated_path": "A",
+            "activity_id": "act-1",
+        }
+        turn2 = {
+            "seq": "2",
+            "inbound": inbound2,
+            "open": False,
+            "validated_path": "A",
+            "activity_id": "act-2",
+        }
+        buf = {
+            "turns": [turn1, turn2],
+            "segments": [
+                {"id": "turnbuf:1", "text": "first", "turn": "1"},
+                {"id": "turnbuf:2", "text": "second", "turn": "2"},
+            ],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+        }
+        get_delivery_record(buf, turn1)
+        get_delivery_record(buf, turn2)
+        buf["plain_flush_followup_task"] = asyncio.create_task(blocked_followup(chat))
+        a._turn_buffers[chat] = buf
+
+        turn2_deliveries = {"n": 0}
+
+        async def deliver_by_turn(
+            _chat_id: str, turn: dict[str, Any], _content: str, _chunk_ids: list[str]
+        ) -> tuple[str, None]:
+            if str(turn.get("seq") or "") == "1":
+                return "delivered", None
+            turn2_deliveries["n"] += 1
+            if turn2_deliveries["n"] == 1:
+                return "retry", None
+            return "fallback", None
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", deliver_by_turn)
+        await a._flush_closed_turns(chat)
+        retry_mock.assert_not_called()
+        followup_gate.set()
+        await asyncio.wait_for(buf["plain_flush_followup_task"], timeout=2.0)
+        await asyncio.sleep(0.25)
+        second_posts = [
+            call.kwargs["json"]["text"]
+            for call in post_mock.await_args_list
+            if call.kwargs.get("json", {}).get("type") == "message"
+            and call.kwargs["json"]["text"] == "second"
+        ]
+        assert len(second_posts) == 1
 
     async def test_plain_flush_failure_does_not_double_post_with_pending_followup(
         self, monkeypatch: pytest.MonkeyPatch
@@ -1312,7 +1415,13 @@ class TestTurnBufferPlainFlushRetry:
 
         monkeypatch.setattr(a, "_deliver_turn_answer_locked", force_plain_fallback)
         monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", AsyncMock(return_value=True))
+        monkeypatch.setattr(
+            adapter_mod,
+            "_reconcile_turn_buffer_kinds_for_flush",
+            lambda _segments, _seq: None,
+        )
         body_text = "B" * 3950
+        revived_id = "turnbuf:commentary"
         a._turn_buffers[chat] = {
             "turns": [
                 {
@@ -1325,9 +1434,10 @@ class TestTurnBufferPlainFlushRetry:
             ],
             "segments": [
                 {
-                    "id": "turnbuf:1",
+                    "id": revived_id,
                     "text": body_text,
                     "turn": "1",
+                    "kind": "commentary",
                     "informative_displayed": True,
                 }
             ],
