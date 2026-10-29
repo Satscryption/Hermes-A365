@@ -120,7 +120,6 @@ Create `~/.hermes/.env` if it doesn't exist:
 ```
 A365_TENANT_ID=<tenant-id>
 A365_APP_ID=                                         # fill in manually after register / setup blueprint
-HERMES_OTLP_ENDPOINT=https://<tenant>.otel.agent365.microsoft.com
 ```
 
 By design, `register` and `license` don't write to `~/.hermes/.env`
@@ -384,7 +383,7 @@ hermes-a365 instance create <slug> \
 This is purely local — no cloud calls. It writes
 `~/.hermes/agents/<slug>/.env` with `AA_INSTANCE_ID` (preserved across
 re-runs), owner metadata, and inherited `A365_APP_ID` /
-`A365_TENANT_ID` / `HERMES_OTLP_ENDPOINT`.
+`A365_TENANT_ID`.
 
 Slice 18n cleaned up the rendered .env (no v0.1 `A365_CLI_VARIANT`)
 and moved UUID generation to apply-time, so dry-run shows
@@ -473,19 +472,17 @@ upload the zip:
 - [ ] (AI Teammate only) Agent visible in Teams app catalog for the
       test user.
 
-## 8. End-to-end activity — telemetry-only smoke test
+## 8. End-to-end activity — governance smoke test
 
-This step verifies the **A365 governance plane** is wired up
-(telemetry trace surfaces in admin-centre). The full Hermes runtime
-round-trip lives in §9c (standalone bridge) and §9d (Hermes plugin
-path); both shipped via slices 19a–19o and replace what was a TODO
-in earlier drafts of this runbook.
+This step verifies the **A365 governance plane** is wired up for messaging.
+The full Hermes runtime round-trip lives in §9c (standalone bridge) and §9d
+(Hermes plugin path); both shipped via slices 19a–19o and replace what was a
+TODO in earlier drafts of this runbook.
 
 Drive a test message:
 
 1. In Teams, open a 1:1 chat with the agent (search for `<display-name>`).
 2. Send a plain `hello`.
-3. Open the M365 Admin Centre → Agent 365 → Telemetry within ~5 min.
 
 Without §9c/§9d running, expect either a `default` Microsoft
 response card (governance OK, no Hermes runtime) or an empty /
@@ -493,9 +490,7 @@ loading card if the bot endpoint isn't bound — both acceptable for
 this step. With the bridge or plugin running, you'll get an actual
 agent response; that's the §9c / §9d acceptance gate, not §8's.
 
-- [ ] OTLP trace appears for the test message in the admin-centre
-      telemetry view (or in your tenant's connected backend if you've
-      configured one; the OTLP endpoint is in `~/.hermes/.env`).
+- [ ] Test message reaches the agent channel (card or default response as above).
 
 ## 9. status — sanity check against `query-entra`
 
@@ -540,31 +535,32 @@ echo "exit=$?"
 
 Ships in slice 19a as the diagnostic half of the bridge (the long-
 running `serve` mode lands in 19b once the BF webhook contract is
-documented). Five probes:
+documented). Six probes, in order:
 
-- `local_config` — `~/.hermes/agents/<slug>/.env` is parseable and
-  carries the keys the runtime needs (`A365_TENANT_ID`,
-  `A365_APP_ID`, `AA_INSTANCE_ID`).
-- `generated_config` — `a365.generated.config.json` (in cwd) has
-  the blueprint client secret + appId; warns if perms looser than
-  0600 (slice 18i / 18x policy).
-- `token_acquisition` — runs an actual `client_credentials` POST to
-  AAD against the `Agent365Observability` resource — the only S2S
-  role the GA CLI assigns by design (Microsoft confirmed at
-  microsoft/Agent365-devTools#402; Messaging Bot / Power Platform
-  use delegated OAuth2 only). On AADSTS7000218 (no role on resource)
-  it warns rather than errors: the secret works, just the scope
-  permission is missing — useful diagnostic, not a blocker.
-- `reachability` — TCP probes against
-  `login.microsoftonline.com` + `graph.microsoft.com`.
-- `otlp_endpoint` — DNS lookup on the configured OTLP endpoint.
+1. `local_config` — `~/.hermes/agents/<slug>/.env` is parseable and
+   carries the keys the runtime needs (`A365_TENANT_ID`,
+   `A365_APP_ID`, `AA_INSTANCE_ID`).
+2. `bf_secret` — optional Path B Bot Framework client secret resolves
+   from the agent `.env` or secrets provider when `A365_BF_APP_ID` is set.
+3. `generated_config` — `a365.generated.config.json` (in cwd) has
+   the blueprint client secret + appId; warns if perms looser than
+   0600 (slice 18i / 18x policy).
+4. `token_acquisition` — Graph `client_credentials` token probe;
+   reports **error** when token acquisition fails (bad secret, network,
+   or AAD error).
+5. `fmi_exchange` — step-1 FMI token exchange smoke test (slice 19e).
+6. `reachability` — TCP probes against
+   `login.microsoftonline.com` + `graph.microsoft.com`.
+
+`--json` verify output lists those six probe names only; `otlp_endpoint`
+was removed in v0.9.6.1 (#189).
 
 Exit codes match doctor: 0 = all ok, 1 = at least one warn, 2 = at
 least one error. Run as a CI gate before deploying the bridge daemon
 in 19b.
 
-- [ ] `bridge verify` returns 0 (or 1 with only the documented
-      AADSTS7000218 / OTLP-DNS warnings) against the fresh tenant.
+- [ ] `bridge verify` returns 0 against the fresh tenant (or 1/2 only
+      for probes that still warn/error today).
 
 ## 9c. activity-bridge serve + reference responder (slices 19b + 19c + 19e) — Teams round-trip
 
