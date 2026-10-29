@@ -104,9 +104,10 @@ _OBSERVABILITY_APP_IDS = frozenset(
         "a9e04047-c6a7-430b-a7ae-faf8f8eed1b7",
     }
 )
-_BOT_FIXED_APP_IDS = frozenset(
-    {_GRAPH_APP_ID, _MESSAGING_BOT_APP_ID, _POWER_PLATFORM_APP_ID}
-) | _OBSERVABILITY_APP_IDS
+_BOT_FIXED_APP_IDS = (
+    frozenset({_GRAPH_APP_ID, _MESSAGING_BOT_APP_ID, _POWER_PLATFORM_APP_ID})
+    | _OBSERVABILITY_APP_IDS
+)
 _BLUEPRINT_ODATA_CAST = "microsoft.graph.agentIdentityBlueprint"
 _MULTI_TENANT_AUDIENCE = "AzureADMultipleOrgs"
 _DESIRED_TIER = 1  # agent identity blueprint; other classes are tier 2
@@ -260,9 +261,7 @@ def load_anchor_app_id(hermes_home: Path, agent_name: str) -> str:
     try:
         ensure_contained(env_path, root)
     except ValueError as exc:
-        raise EntraStateError(
-            f"refusing to read the ownership anchor: {exc}"
-        ) from exc
+        raise EntraStateError(f"refusing to read the ownership anchor: {exc}") from exc
     try:
         text = env_path.read_text()
     except OSError as exc:
@@ -290,9 +289,7 @@ def record_ownership_anchor(hermes_home: Path, agent_name: str, app_id: str) -> 
     try:
         canonical = str(UUID(app_id))
     except ValueError as exc:
-        raise EntraStateError(
-            "refusing to record an ownership anchor that is not a GUID."
-        ) from exc
+        raise EntraStateError("refusing to record an ownership anchor that is not a GUID.") from exc
     slug = registration_slug(agent_name)
     root = hermes_home / "agents"
     env_path = root / slug / ".env"
@@ -356,20 +353,15 @@ def _select_query(fields: str) -> str:
 
 
 def applications_by_display_name_url(*display_names: str) -> str:
-    clauses = " or ".join(
-        f"displayName eq '{_odata_string(name)}'" for name in display_names
-    )
+    clauses = " or ".join(f"displayName eq '{_odata_string(name)}'" for name in display_names)
     filter_query = "$filter=" + quote(f"({clauses})", safe="")
-    return (
-        f"https://{_GRAPH_HOST}/beta/applications?{filter_query}&{_select_query(_APP_SELECT)}"
-    )
+    return f"https://{_GRAPH_HOST}/beta/applications?{filter_query}&{_select_query(_APP_SELECT)}"
 
 
 def application_by_app_id_url(app_id: str) -> str:
     canonical = str(UUID(app_id))
     return (
-        f"https://{_GRAPH_HOST}/beta/applications(appId='{canonical}')"
-        f"?{_select_query(_APP_SELECT)}"
+        f"https://{_GRAPH_HOST}/beta/applications(appId='{canonical}')?{_select_query(_APP_SELECT)}"
     )
 
 
@@ -562,6 +554,9 @@ def graph_get_from_mutator(mutator: Mutator) -> GraphGet:
                 sensitive=True,
             )
         except CliInvocationError as exc:
+            if exc.graph_error is not None:
+                code, message = exc.graph_error
+                return {"error": {"code": code, "message": message}}
             raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
             parsed = _parse_graph_json(raw)
             if parsed is not None:
@@ -585,9 +580,7 @@ def _require_guid(value: object, *, what: str) -> str:
     try:
         return str(UUID(value.strip()))
     except ValueError as exc:
-        raise EntraStateError(
-            f"Graph {what} was not a GUID; refusing to reconcile."
-        ) from exc
+        raise EntraStateError(f"Graph {what} was not a GUID; refusing to reconcile.") from exc
 
 
 def _parse_app(item: Mapping[str, Any], *, is_agent_blueprint: bool | None) -> GraphApp:
@@ -596,14 +589,14 @@ def _parse_app(item: Mapping[str, Any], *, is_agent_blueprint: bool | None) -> G
     if not isinstance(display_name, str) or not display_name:
         raise EntraStateError("Graph application is missing displayName; refusing to reconcile.")
     if not isinstance(audience, str) or not audience:
-        raise EntraStateError(
-            "Graph application is missing signInAudience; refusing to reconcile."
-        )
+        raise EntraStateError("Graph application is missing signInAudience; refusing to reconcile.")
     blueprint_slug: str | None = None
     if "uniqueName" in item and item.get("uniqueName") not in (None, ""):
         slug = item.get("uniqueName")
-        if not isinstance(slug, str) or slug.strip() == "" or any(
-            char in slug for char in ("\x00", "\r", "\n")
+        if (
+            not isinstance(slug, str)
+            or slug.strip() == ""
+            or any(char in slug for char in ("\x00", "\r", "\n"))
         ):
             raise EntraStateError(
                 "Graph uniqueName was not a usable blueprint slug; refusing to "
@@ -645,8 +638,7 @@ def _reject_partial_page(payload: Mapping[str, Any], *, what: str) -> None:
 def _collection(payload: Mapping[str, Any] | None, *, what: str) -> list[dict[str, Any]]:
     if payload is None:
         raise EntraStateError(
-            f"could not read {what} (Graph response was not trustworthy). "
-            "Refusing to provision."
+            f"could not read {what} (Graph response was not trustworthy). Refusing to provision."
         )
     if payload.get("error"):
         if _is_denied(payload):
@@ -657,15 +649,11 @@ def _collection(payload: Mapping[str, Any] | None, *, what: str) -> list[dict[st
     _reject_partial_page(payload, what=what)
     value = payload.get("value")
     if not isinstance(value, list):
-        raise EntraStateError(
-            f"Graph {what} response had no value array; refusing to reconcile."
-        )
+        raise EntraStateError(f"Graph {what} response had no value array; refusing to reconcile.")
     rows: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, dict):
-            raise EntraStateError(
-                f"Graph {what} returned a non-object row; refusing to reconcile."
-            )
+            raise EntraStateError(f"Graph {what} returned a non-object row; refusing to reconcile.")
         rows.append(item)
     return rows
 
@@ -685,9 +673,7 @@ def _read(graph_get: GraphGet, url: str) -> dict[str, Any] | None:
     return payload
 
 
-def _apps_by_name(
-    graph_get: GraphGet, *display_names: str
-) -> tuple[GraphApp, ...]:
+def _apps_by_name(graph_get: GraphGet, *display_names: str) -> tuple[GraphApp, ...]:
     payload = _read(graph_get, applications_by_display_name_url(*display_names))
     rows = _collection(payload, what="applications")
     expected = set(display_names)
@@ -778,8 +764,7 @@ def _service_principal_id(graph_get: GraphGet, app_id: str) -> tuple[str, SpStat
         row_app = _require_guid(row.get("appId"), what="service principal appId")
         if row_app != str(UUID(app_id)):
             raise EntraStateError(
-                "Graph returned a service principal for a different appId. "
-                "Refusing to reconcile."
+                "Graph returned a service principal for a different appId. Refusing to reconcile."
             )
         parsed.append(_require_guid(row.get("id"), what="service principal id"))
     if not parsed:
@@ -800,9 +785,7 @@ def _grant_rows(
     return rows, ""
 
 
-def _resource_app_id(
-    graph_get: GraphGet, object_id: str, cache: dict[str, str]
-) -> str:
+def _resource_app_id(graph_get: GraphGet, object_id: str, cache: dict[str, str]) -> str:
     cached = cache.get(object_id)
     if cached is not None:
         return cached
@@ -1235,8 +1218,7 @@ def decide_registration(
     if snapshot.service_principal_state == "ambiguous":
         return _abort(
             f"application {blueprint.app_id} has more than one service principal. "
-            "Refusing to grant permissions against an ambiguous principal."
-            + identity_note
+            "Refusing to grant permissions against an ambiguous principal." + identity_note
         )
     if snapshot.service_principal_state == "unreadable":
         detail = snapshot.grant_detail or "the service principal lookup was not trustworthy"
@@ -1251,8 +1233,7 @@ def decide_registration(
             f"owned blueprint {blueprint.app_id} has no service principal. "
             "Refusing to re-run `a365 setup blueprint` because that grants admin "
             "consent and may mint a client secret. Re-run with --update-permissions "
-            "to repair this owned blueprint."
-            + identity_note
+            "to repair this owned blueprint." + identity_note
         )
         if not update_permissions:
             return _abort(reason)
@@ -1263,8 +1244,7 @@ def decide_registration(
             messages=(
                 "entra: --update-permissions set; re-running blueprint and permission "
                 f"setup for owned app {blueprint.app_id}. This grants consent and may "
-                "mint a client secret."
-                + identity_note,
+                "mint a client secret." + identity_note,
             ),
             app_plan=app_plan,
             blueprint_plan=blueprint_plan,
@@ -1305,8 +1285,7 @@ def decide_registration(
             messages=(
                 "entra: --update-permissions set; re-running permission setup for "
                 f"owned blueprint {blueprint.app_id}. setup blueprint will not run. "
-                "This can add consent."
-                + identity_note,
+                "This can add consent." + identity_note,
             ),
             app_plan=app_plan,
             blueprint_plan=blueprint_plan,
@@ -1323,11 +1302,7 @@ def decide_registration(
         )
         if not done
     )
-    missing = [
-        label
-        for label, done in (("MCP", mcp_done), ("bot", bot_done))
-        if not done
-    ]
+    missing = [label for label, done in (("MCP", mcp_done), ("bot", bot_done)) if not done]
     joined = " and ".join(missing)
     return RegistrationDecision(
         action="repair",

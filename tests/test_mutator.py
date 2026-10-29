@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import subprocess
 import sys
 from unittest.mock import patch
@@ -450,6 +451,47 @@ class TestAdversarialSensitiveSubprocess:
         idx3 = merged.find("3stdout")
         assert -1 not in (idx1, idx2, idx3)
         assert idx1 < idx2 < idx3
+
+    def test_device_login_rejects_unicode_homoglyph_in_code(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        # U+017F (Latin small letter long s) must not match an ASCII-only code class.
+        homoglyph = "ABCD12\u017f4"
+        prompt = (
+            "To sign in, use a web browser to open https://login.microsoft.com/device "
+            f"and enter the code {homoglyph} to authenticate."
+        )
+        script = f"print({prompt!r})"
+        m = A365CliMutator()
+        m.available = True
+        m.run([sys.executable, "-c", script], sensitive=True)
+        out, _ = capfd.readouterr()
+        assert "To sign in, open" not in out
+        assert homoglyph not in out
+
+    def test_sensitive_failure_traceback_locals_drop_stream_text(self) -> None:
+        marker = "TRACE-LOCAL-SECRET-88"
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            m.run(
+                [
+                    sys.executable,
+                    "-c",
+                    f"print({marker!r}); raise SystemExit(1)",
+                ],
+                sensitive=True,
+            )
+        tb = excinfo.value.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            if frame.f_code.co_filename.endswith(f"{os.sep}mutator.py"):
+                for name, value in frame.f_locals.items():
+                    if name in ("argv",):
+                        continue
+                    if isinstance(value, str) and marker in value:
+                        pytest.fail(f"frame local {name!r} retained stream text")
+            tb = tb.tb_next
 
 
 # ---------------------------------------------------------------------------

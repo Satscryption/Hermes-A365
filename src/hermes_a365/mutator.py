@@ -30,6 +30,7 @@ exit when one is found.
 
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -82,6 +83,7 @@ class CliInvocationError(RuntimeError):
         *,
         captured_output: str | None = None,
         sensitive: bool = False,
+        graph_error: tuple[str, str] | None = None,
     ) -> None:
         super().__init__(
             f"{argv[0]} {argv[1] if len(argv) > 1 else ''} failed (rc={returncode}): {output}"
@@ -90,6 +92,7 @@ class CliInvocationError(RuntimeError):
         self.returncode = returncode
         self.output = output
         self.sensitive = sensitive
+        self.graph_error = graph_error if sensitive else None
         if sensitive:
             self.captured_output = None
         else:
@@ -199,13 +202,20 @@ class A365CliMutator:
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
             detail = _sensitive_failure_detail(stripped) if sensitive else stripped
+            graph_error = _extract_sensitive_graph_error(stripped) if sensitive else None
             if match:
-                raise AADSTSError(match.group(0), detail)
+                code = match.group(0)
+                stripped = ""
+                combined = ""
+                raise AADSTSError(code, detail)
+            stripped = ""
+            combined = ""
             raise CliInvocationError(
                 argv,
                 returncode,
                 detail,
                 sensitive=sensitive,
+                graph_error=graph_error,
             )
         return RunResult(
             argv=list(argv),
@@ -231,8 +241,22 @@ _DEVICE_LOGIN_LINE_RE = re.compile(
     r" and enter the code "
     r"(?P<code>[A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{8}|[A-Z0-9]{9})"
     r"(?: to authenticate)?\.?\s*$",
-    re.IGNORECASE,
+    re.IGNORECASE | re.ASCII,
 )
+
+_SENSITIVE_GRAPH_ERROR_CODES = frozenset(
+    {
+        "Request_ResourceNotFound",
+        "ResourceNotFound",
+        "ErrorItemNotFound",
+        "itemNotFound",
+        "Authorization_RequestDenied",
+        "AccessDenied",
+        "Forbidden",
+        "InsufficientPrivileges",
+    }
+)
+_GRAPH_ERROR_CODE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 
 _CANONICAL_URLS = {
     "https://login.microsoft.com/device": "https://login.microsoft.com/device",
@@ -297,6 +321,35 @@ def _sensitive_failure_detail(stripped: str) -> str:
     if tail:
         return f"{_SENSITIVE_OUTPUT_SUPPRESSED} ({tail})"
     return _SENSITIVE_OUTPUT_SUPPRESSED
+
+
+def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
+    """Pull an allowlisted Graph ``error.code`` and redacted message from captured text."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        data, _end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return None
+    code_raw = error.get("code")
+    if not isinstance(code_raw, str):
+        return None
+    code = code_raw.strip()
+    if code not in _SENSITIVE_GRAPH_ERROR_CODES:
+        return None
+    if not _GRAPH_ERROR_CODE_ID_RE.match(code):
+        return None
+    message_raw = error.get("message")
+    message = str(message_raw) if isinstance(message_raw, str) else ""
+    from hermes_a365.entra_state import redact
+
+    return code, redact(message)
 
 
 @dataclass

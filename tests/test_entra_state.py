@@ -7,6 +7,7 @@ re-run, and the states that must fail closed before any mutation.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, unquote
@@ -18,6 +19,8 @@ from hermes_a365.entra_state import (
     EntraStateError,
     GraphApp,
     RegistrationSnapshot,
+    _app_by_id,
+    _confirm_blueprint,
     applications_by_display_name_url,
     assert_registration_read_url,
     blueprint_display_name,
@@ -93,28 +96,31 @@ def _owned_responses(
 ) -> list[tuple[str, dict[str, Any]]]:
     blueprint = _app(blueprint_display_name(agent), audience=audience)
     rows = [blueprint, *(extra_apps or [])]
-    role_body = roles if roles is not None else {
-        "value": [{"id": ROLE, "resourceId": OBS_SP, "appRoleId": ROLE}]
-    }
-    grant_body = grants if grants is not None else {
-        "value": [{"id": MCP_SP, "resourceId": MCP_SP}]
-    }
-    resource_map = resources if resources is not None else {
-        OBS_SP: {"appId": OBS_APP},
-        MCP_SP: {"appId": MCP_APP},
-    }
+    role_body = (
+        roles
+        if roles is not None
+        else {"value": [{"id": ROLE, "resourceId": OBS_SP, "appRoleId": ROLE}]}
+    )
+    grant_body = grants if grants is not None else {"value": [{"id": MCP_SP, "resourceId": MCP_SP}]}
+    resource_map = (
+        resources
+        if resources is not None
+        else {
+            OBS_SP: {"appId": OBS_APP},
+            MCP_SP: {"appId": MCP_APP},
+        }
+    )
     pairs: list[tuple[str, dict[str, Any]]] = [
         ("/beta/applications?", {"value": rows}),
         ("applications(appId=", blueprint),
         (
             "agentIdentityBlueprint",
-            cast
-            if cast is not None
-            else {**blueprint, "uniqueName": registration_slug(agent)},
+            cast if cast is not None else {**blueprint, "uniqueName": registration_slug(agent)},
         ),
-        ("servicePrincipals?", principals if principals is not None else {
-            "value": [{"id": SP, "appId": APP}]
-        }),
+        (
+            "servicePrincipals?",
+            principals if principals is not None else {"value": [{"id": SP, "appId": APP}]},
+        ),
         ("appRoleAssignments", role_body),
         ("oauth2PermissionGrants", grant_body),
     ]
@@ -175,7 +181,7 @@ class TestLeastPrivilegeUrls:
 
     def test_redact_strips_tokens(self) -> None:
         raw = (
-            'Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature '
+            "Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.payload.signature "
             '{"access_token":"secret-token","password":"hunter2"}'
         )
         cleaned = redact(raw)
@@ -207,17 +213,13 @@ class TestReadAndDecide:
 
     def test_owned_match_without_grants_runs_permissions_only(self, tmp_path: Path) -> None:
         _write_anchor(tmp_path, "inbox-helper", APP)
-        router = Router(
-            _owned_responses(roles={"value": []}, grants={"value": []})
-        )
+        router = Router(_owned_responses(roles={"value": []}, grants={"value": []}))
         decision = decide_registration(_snapshot(tmp_path, "inbox-helper", router))
         assert decision.action == "repair"
         assert decision.step_names == ("permissions-mcp", "permissions-bot")
         assert "does not count" in decision.messages[0]
 
-    def test_graph_admin_consent_does_not_skip_permission_steps(
-        self, tmp_path: Path
-    ) -> None:
+    def test_graph_admin_consent_does_not_skip_permission_steps(self, tmp_path: Path) -> None:
         _write_anchor(tmp_path, "inbox-helper", APP)
         decision = decide_registration(
             _snapshot(
@@ -273,9 +275,7 @@ class TestReadAndDecide:
         )
         assert decision.step_names == ("permissions-mcp",)
 
-    def test_unique_name_drift_aborts_even_when_display_names_match(
-        self, tmp_path: Path
-    ) -> None:
+    def test_unique_name_drift_aborts_even_when_display_names_match(self, tmp_path: Path) -> None:
         _write_anchor(tmp_path, "inbox-helper", APP)
         cast = _app(blueprint_display_name("inbox-helper"))
         cast["uniqueName"] = "someone-else"
@@ -286,9 +286,7 @@ class TestReadAndDecide:
         assert decision.step_names == ()
         assert "slug" in (decision.reason or "")
 
-    def test_missing_unique_name_is_not_derived_from_the_display_name(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_unique_name_is_not_derived_from_the_display_name(self, tmp_path: Path) -> None:
         from hermes_a365._common import slugify
 
         _write_anchor(tmp_path, "inbox-helper", APP)
@@ -333,9 +331,7 @@ class TestReadAndDecide:
         assert "Authorization_RequestDenied" in (decision.reason or "")
         assert "will run" not in (decision.reason or "")
 
-    def test_update_permissions_regrants_without_rerunning_blueprint(
-        self, tmp_path: Path
-    ) -> None:
+    def test_update_permissions_regrants_without_rerunning_blueprint(self, tmp_path: Path) -> None:
         _write_anchor(tmp_path, "inbox-helper", APP)
         decision = decide_registration(
             _snapshot(tmp_path, "inbox-helper", Router(_owned_responses())),
@@ -547,7 +543,10 @@ class TestReadAndDecide:
             _snapshot(tmp_path, "inbox-helper", Router([("/beta/applications?", None)]))  # type: ignore[list-item]
 
     def test_paged_application_result_fails_closed(self, tmp_path: Path) -> None:
-        body = {"value": [], "@odata.nextLink": "https://graph.microsoft.com/beta/applications?$skiptoken=1"}
+        body = {
+            "value": [],
+            "@odata.nextLink": "https://graph.microsoft.com/beta/applications?$skiptoken=1",
+        }
         with pytest.raises(EntraStateError, match="paged"):
             _snapshot(tmp_path, "inbox-helper", Router([("/beta/applications?", body)]))
 
@@ -627,9 +626,7 @@ class TestAnchorRecord:
             record_ownership_anchor(tmp_path, "inbox-helper", OTHER)
         assert path.read_text() == before
 
-    def test_confirm_rejects_unverified_id_without_echoing_a_secret(
-        self, tmp_path: Path
-    ) -> None:
+    def test_confirm_rejects_unverified_id_without_echoing_a_secret(self, tmp_path: Path) -> None:
         generated = tmp_path / "a365.generated.config.json"
         generated.write_text(
             json.dumps(
@@ -745,11 +742,11 @@ class TestApplyUsesTheDecision:
                 self.calls.append(list(argv))
                 if argv[:3] == ["az", "account", "show"]:
                     return RunResult(
-                    argv=argv,
-                    returncode=0,
-                    stdout=json.dumps({"tenantId": TENANT}),
-                    stderr="",
-                )
+                        argv=argv,
+                        returncode=0,
+                        stdout=json.dumps({"tenantId": TENANT}),
+                        stderr="",
+                    )
                 raise AssertionError(argv)
 
         _write_anchor(tmp_path, "inbox-helper", APP)
@@ -780,9 +777,7 @@ class TestApplyUsesTheDecision:
         assert result.completed == ["permissions-bot"]
         assert not any(call[:3] == ["a365", "setup", "blueprint"] for call in mutator.calls)
 
-    def test_graph_admin_consent_only_resumes_both_permission_steps(
-        self, tmp_path: Path
-    ) -> None:
+    def test_graph_admin_consent_only_resumes_both_permission_steps(self, tmp_path: Path) -> None:
         _write_anchor(tmp_path, "inbox-helper", APP)
         mutator = _tenant_mutator()
         result = _apply(
@@ -875,9 +870,7 @@ class TestApplyUsesTheDecision:
         assert [call[2] for call in a365] == ["blueprint"]
         assert not (tmp_path / "agents").exists()
 
-    def test_confirmed_create_records_the_anchor_without_the_secret(
-        self, tmp_path: Path
-    ) -> None:
+    def test_confirmed_create_records_the_anchor_without_the_secret(self, tmp_path: Path) -> None:
         from hermes_a365._common import slugify
         from hermes_a365.mutator import RunResult
 
@@ -938,9 +931,10 @@ def test_graph_get_is_sensitive_and_redacts_the_error_body(
                 argv,
                 1,
                 "<output suppressed>",
-                captured_output=(
-                    '{"error":{"code":"Authorization_RequestDenied",'
-                    f'"message":"Bearer {token}"}}'
+                sensitive=True,
+                graph_error=(
+                    "Authorization_RequestDenied",
+                    redact(f"Bearer {token}"),
                 ),
             )
 
@@ -951,6 +945,120 @@ def test_graph_get_is_sensitive_and_redacts_the_error_body(
     assert "eyJ" not in str(excinfo.value)
     out, err = capfd.readouterr()
     assert token not in out + err
+
+
+def _install_az_rest_shim(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, response_body: str
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    az = bin_dir / "az"
+    az.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2 $3" = "rest --method GET" ]; then\n'
+        f"  printf '%s\\n' '{response_body}'\n"
+        "  exit 1\n"
+        "fi\n"
+        "echo unexpected az >&2\n"
+        "exit 1\n"
+    )
+    az.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+
+def _assert_no_secret_in_exception_chain(exc: BaseException, marker: str) -> None:
+    assert marker not in str(exc)
+    assert all(marker not in str(arg) for arg in exc.args)
+    for key, value in vars(exc).items():
+        if key == "argv" or value is None:
+            continue
+        assert marker not in str(value), key
+    if exc.__cause__ is not None:
+        _assert_no_secret_in_exception_chain(exc.__cause__, marker)
+    if exc.__context__ is not None and exc.__context__ is not exc.__cause__:
+        _assert_no_secret_in_exception_chain(exc.__context__, marker)
+
+
+class TestSensitiveGraphViaMutator:
+    def test_not_found_returns_none_without_raw_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from hermes_a365.mutator import A365CliMutator
+
+        marker = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.aaa.bbb"
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "Request_ResourceNotFound",
+                    "message": f"Bearer {marker}",
+                }
+            }
+        )
+        _install_az_rest_shim(tmp_path, monkeypatch, response_body=body)
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        mutator = A365CliMutator()
+        mutator.available = True
+        getter = graph_get_from_mutator(mutator)
+        assert _app_by_id(getter, APP) is None
+
+    def test_sensitive_mutator_graph_error_has_no_raw_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from hermes_a365.mutator import A365CliMutator, CliInvocationError
+
+        marker = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.aaa.bbb"
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "Request_ResourceNotFound",
+                    "message": f"Bearer {marker}",
+                }
+            }
+        )
+        _install_az_rest_shim(tmp_path, monkeypatch, response_body=body)
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        mutator = A365CliMutator()
+        mutator.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            mutator.run(
+                ["az", "rest", "--method", "GET", "--uri", "https://graph.microsoft.test/v1.0/x"],
+                sensitive=True,
+            )
+        _assert_no_secret_in_exception_chain(excinfo.value, marker)
+        assert excinfo.value.graph_error is not None
+        assert excinfo.value.graph_error[0] == "Request_ResourceNotFound"
+        assert marker not in excinfo.value.graph_error[1]
+        assert marker not in repr(excinfo.value)
+        assert excinfo.value.captured_output is None
+
+    def test_cast_not_found_records_non_blueprint(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        from hermes_a365.mutator import A365CliMutator
+
+        app = GraphApp(
+            object_id=OBJ,
+            app_id=APP,
+            display_name="n",
+            sign_in_audience="AzureADMultipleOrgs",
+            is_agent_blueprint=None,
+        )
+        body = json.dumps(
+            {"error": {"code": "Request_ResourceNotFound", "message": "not a blueprint"}}
+        )
+        _install_az_rest_shim(tmp_path, monkeypatch, response_body=body)
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        mutator = A365CliMutator()
+        mutator.available = True
+        getter = graph_get_from_mutator(mutator)
+        result = _confirm_blueprint(getter, app)
+        assert result.is_agent_blueprint is False
 
 
 def test_graph_app_shape_is_the_fields_we_read() -> None:
