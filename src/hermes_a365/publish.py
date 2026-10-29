@@ -40,6 +40,7 @@ from typing import Any
 from ._common import (
     TENANT_ID_HELP,
     UNPINNED_TENANT_PLAN_LINE,
+    SidecarBackupError,
     SidecarLockError,
     TenantResolutionError,
     active_az_tenant,
@@ -1277,6 +1278,10 @@ def _write_copilot_chat_publish_state(
         raise PublishError(
             f"another publish operation holds {path.with_name(path.name + '.lock')}; "
             "refusing before writing publish state"
+        ) from exc
+    except SidecarBackupError as exc:
+        raise PublishError(
+            f"could not create Copilot Chat publish state backup beside {path}: {exc}"
         ) from exc
 
 

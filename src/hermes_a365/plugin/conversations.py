@@ -32,6 +32,7 @@ from typing import Any, ClassVar
 from hermes_a365._common import (
     exclusive_sidecar_lock,
     sidecar_backup_path,
+    sidecar_corrupt_quarantine_path,
     write_owner_only_bytes_exclusive,
     write_owner_only_text_atomic,
 )
@@ -501,6 +502,9 @@ class ConversationRegistry:
             logger.warning("agent365 conversations: registry JSON is invalid; starting empty")
             return cls()
         if not isinstance(payload, dict):
+            logger.warning(
+                "agent365 conversations: registry JSON is not an object; starting empty"
+            )
             return cls()
         validate_conversations_sidecar_schema(payload)
         return cls.from_payload(payload)
@@ -522,14 +526,26 @@ class ConversationRegistry:
                 snapshot = path.read_bytes()
                 try:
                     parsed = json.loads(snapshot)
-                except (json.JSONDecodeError, RecursionError) as exc:
-                    raise ConversationSidecarError(
-                        "conversations.json is not valid JSON; refusing to rewrite"
-                    ) from exc
-                if not isinstance(parsed, dict):
-                    raise ConversationSidecarError(
-                        "conversations.json must be a JSON object; refusing to rewrite"
+                except (json.JSONDecodeError, RecursionError):
+                    quarantine = sidecar_corrupt_quarantine_path(path)
+                    write_owner_only_bytes_exclusive(quarantine, snapshot)
+                    logger.warning(
+                        "agent365 conversations: quarantined invalid JSON at %s to %s",
+                        path,
+                        quarantine,
                     )
+                    write_owner_only_text_atomic(path, text)
+                    return
+                if not isinstance(parsed, dict):
+                    quarantine = sidecar_corrupt_quarantine_path(path)
+                    write_owner_only_bytes_exclusive(quarantine, snapshot)
+                    logger.warning(
+                        "agent365 conversations: quarantined non-object JSON at %s to %s",
+                        path,
+                        quarantine,
+                    )
+                    write_owner_only_text_atomic(path, text)
+                    return
                 raw_on_disk = parsed
                 validate_conversations_sidecar_schema(raw_on_disk)
                 recheck = json.loads(path.read_bytes())

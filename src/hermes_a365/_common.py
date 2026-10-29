@@ -30,7 +30,11 @@ OTLP_DEPRECATED_MESSAGE = (
 
 
 class SidecarLockError(OSError):
-    """Another process or writer holds the sidecar lock, or a backup path collides."""
+    """Another process or writer holds the sidecar lock."""
+
+
+class SidecarBackupError(OSError):
+    """A sidecar backup could not be published exclusively."""
 
 
 class TenantResolutionError(ValueError):
@@ -192,7 +196,14 @@ def sidecar_backup_path(path: Path, *, at: datetime | None = None) -> Path:
     return path.with_name(f"{path.name}.backup-{stamp}")
 
 
-def _exclusive_publish_file(tmp: Path, path: Path, *, mode: int) -> Path:
+def sidecar_corrupt_quarantine_path(path: Path, *, at: datetime | None = None) -> Path:
+    """Sibling ``<name>.corrupt-<UTC>`` path for a quarantined unreadable sidecar."""
+    moment = (at or datetime.now(UTC)).astimezone(UTC)
+    stamp = moment.strftime("%Y%m%d-%H%M%S")
+    return path.with_name(f"{path.name}.corrupt-{stamp}")
+
+
+def _exclusive_publish_file(tmp: Path, path: Path) -> Path:
     """Publish completed ``tmp`` at ``path`` without overwriting an existing file."""
     target = path
     for attempt in (0, 1):
@@ -203,33 +214,20 @@ def _exclusive_publish_file(tmp: Path, path: Path, *, mode: int) -> Path:
             if attempt == 0 and target == path:
                 target = path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}")
                 continue
-            raise SidecarLockError(
-                f"could not create sidecar backup {path} exclusively: {exc}"
+            raise SidecarBackupError(
+                f"could not publish sidecar backup at {path} exclusively: {exc}"
             ) from exc
         except OSError as exc:
             link_errno = {errno.EXDEV, errno.ENOTSUP}
             enosys = getattr(errno, "ENOSYS", None)
             if enosys is not None:
                 link_errno.add(enosys)
-            if exc.errno not in link_errno:
-                raise
-            try:
-                placeholder = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
-            except FileExistsError as exists_exc:
-                if attempt == 0 and target == path:
-                    target = path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}")
-                    continue
-                raise SidecarLockError(
-                    f"could not create sidecar backup {path} exclusively: {exists_exc}"
-                ) from exists_exc
-            os.close(placeholder)
-            try:
-                os.replace(tmp, target)
-            except BaseException:
-                target.unlink(missing_ok=True)
-                raise
-            return target
-    raise SidecarLockError(f"could not create sidecar backup {path} exclusively")
+            if exc.errno in link_errno:
+                raise SidecarBackupError(
+                    f"could not publish sidecar backup at {path} via hard link ({exc})"
+                ) from exc
+            raise
+    raise SidecarBackupError(f"could not publish sidecar backup at {path} exclusively")
 
 
 def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o600) -> Path:
@@ -250,7 +248,7 @@ def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o6
         raise
     os.close(fd)
     try:
-        target = _exclusive_publish_file(tmp, path, mode=mode)
+        target = _exclusive_publish_file(tmp, path)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise

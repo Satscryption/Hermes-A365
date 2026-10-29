@@ -14,6 +14,7 @@ from typing import Any
 import pytest
 
 from hermes_a365._common import (
+    SidecarBackupError,
     _fsync_directory,
     exclusive_sidecar_lock,
     sidecar_backup_path,
@@ -408,3 +409,143 @@ def test_backup_partial_write_leaves_no_final_name(
     write_owner_only_bytes_exclusive(backup, original)
     assert backup.read_bytes() == original
     assert sidecar.read_bytes() == original
+
+
+@pytest.mark.parametrize("link_errno", [errno.EXDEV, errno.ENOTSUP, errno.ENOSYS])
+def test_backup_link_errno_fails_closed_without_final_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, link_errno: int
+) -> None:
+    sidecar = tmp_path / "conversations.json"
+    sidecar.write_bytes(b'{"schema":1,"conversations":[]}\n')
+    backup = sidecar_backup_path(sidecar)
+
+    def link_fail(src: str | os.PathLike, dst: str | os.PathLike) -> None:
+        raise OSError(link_errno, "injected link failure")
+
+    monkeypatch.setattr(os, "link", link_fail)
+    with pytest.raises(SidecarBackupError):
+        write_owner_only_bytes_exclusive(backup, b"backup-bytes\n")
+    assert sidecar.read_bytes() == b'{"schema":1,"conversations":[]}\n'
+    assert not backup.exists()
+    assert list(tmp_path.glob(".conversations.backup-*.part-*")) == []
+
+
+def test_backup_publication_keeps_competing_final_name(
+    tmp_path: Path,
+) -> None:
+    sidecar = tmp_path / "conversations.json"
+    sidecar.write_bytes(b"sidecar-original\n")
+    backup = sidecar_backup_path(sidecar)
+    competing = b"competing-backup-bytes\n"
+    backup.write_bytes(competing)
+    published = write_owner_only_bytes_exclusive(backup, b"new-backup-bytes\n")
+    assert published != backup
+    assert backup.read_bytes() == competing
+    assert sidecar.read_bytes() == b"sidecar-original\n"
+
+
+def test_conversations_corrupt_load_warns_then_save_quarantines(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "conversations.json"
+    corrupt = b"not-json-at-all\n"
+    path.write_bytes(corrupt)
+    caplog.set_level(logging.WARNING, logger="hermes_a365.plugin.conversations")
+    reg = ConversationRegistry.load(path)
+    assert reg.to_payload()["conversations"] == []
+    assert "invalid" in caplog.text.lower()
+    assert str(path) not in caplog.text
+
+    caplog.clear()
+    ConversationRegistry.write_payload(path, reg.to_payload())
+    quarantine = next(tmp_path.glob("conversations.json.corrupt-*"))
+    assert quarantine.read_bytes() == corrupt
+    json.loads(path.read_text())
+    assert str(quarantine) in caplog.text
+
+
+def test_publish_backup_collision_is_not_lock_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    manifest_id = "44444444-4444-4444-4444-444444444444"
+    state_path = _copilot_chat_publish_state_path(tmp_path, "agent")
+    state_path.parent.mkdir(parents=True)
+    original = (
+        json.dumps(
+            {
+                "schemaVersion": 1,
+                "manifestId": manifest_id,
+                "lastAppVersion": "1.1.4",
+            },
+            indent=2,
+        )
+        + "\n"
+    ).encode()
+    state_path.write_bytes(original)
+    fixed_backup = state_path.with_name("copilot-chat-publish.backup-fixed.json")
+    monkeypatch.setattr(
+        "hermes_a365.publish.sidecar_backup_path",
+        lambda _path, **_: fixed_backup,
+    )
+    pid_backup = fixed_backup.with_name(f"{fixed_backup.stem}-{os.getpid()}{fixed_backup.suffix}")
+    fixed_backup.write_bytes(b"competing-primary\n")
+    pid_backup.write_bytes(b"competing-pid\n")
+    with pytest.raises(PublishError) as exc:
+        _write_copilot_chat_publish_state(
+            state_path,
+            manifest_id=manifest_id,
+            app_version="1.1.5",
+            hermes_home=tmp_path,
+            tenant_id="22222222-2222-2222-2222-222222222222",
+            profile="default",
+            cea_catalog_id_minted=False,
+        )
+    message = str(exc.value)
+    assert "backup" in message.lower()
+    assert "another publish operation holds" not in message
+    assert state_path.read_bytes() == original
+    assert fixed_backup.read_bytes() == b"competing-primary\n"
+
+
+def test_bot_service_backup_collision_is_not_lock_conflict(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import test_bot_service as bot_tests
+
+    from hermes_a365.bot_service import (
+        BotServiceError,
+        apply_update_endpoint_plan,
+        build_update_endpoint_plan,
+    )
+
+    sidecar = bot_tests._write_sidecar(tmp_path)
+    raw = json.loads(sidecar.read_text())
+    raw["schemaVersion"] = 1
+    raw.pop("agentName", None)
+    sidecar.write_text(json.dumps(raw, indent=2, sort_keys=True) + "\n")
+    fixed_backup = tmp_path / "a365.bot-service.config.backup-fixed.json"
+    monkeypatch.setattr(
+        "hermes_a365.bot_service._backup_sidecar_path",
+        lambda _path, *, at: fixed_backup,
+    )
+    pid_backup = fixed_backup.with_name(f"{fixed_backup.stem}-{os.getpid()}{fixed_backup.suffix}")
+    fixed_backup.write_bytes(b"competing-primary\n")
+    pid_backup.write_bytes(b"competing-pid\n")
+    runner = bot_tests.FakeRunner(
+        bot=bot_tests.FakeRunner._bot(),
+        teams=bot_tests.FakeRunner._teams(),
+    )
+    plan = build_update_endpoint_plan(
+        bot_tests.BotServiceUpdateEndpointInputs(
+            agent_name="Hermes Inbox Helper",
+            url="https://new-tunnel.example/api/messages",
+            sidecar_path=sidecar,
+            legacy_binding_confirmation="Hermes Inbox Helper",
+        )
+    )
+    with pytest.raises(BotServiceError) as exc:
+        apply_update_endpoint_plan(plan, runner=runner)
+    message = str(exc.value)
+    assert "backup" in message.lower()
+    assert "another Bot Service operation holds" not in message
+    assert fixed_backup.read_bytes() == b"competing-primary\n"

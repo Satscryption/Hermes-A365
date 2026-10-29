@@ -34,6 +34,7 @@ from urllib import error, request
 from urllib.parse import quote, urlparse
 
 from ._common import (
+    SidecarBackupError,
     SidecarLockError,
     exclusive_sidecar_lock,
     parse_env,
@@ -1186,7 +1187,10 @@ def _exclusive_sidecar_lock(path: Path) -> Iterator[None]:
 
 def _write_sidecar_backup(path: Path, snapshot: bytes, *, now: datetime) -> Path:
     backup = _backup_sidecar_path(path, at=now)
-    return write_owner_only_bytes_exclusive(backup, snapshot)
+    try:
+        return write_owner_only_bytes_exclusive(backup, snapshot)
+    except SidecarBackupError as exc:
+        raise BotServiceError(f"could not create sidecar backup beside {path}: {exc}") from exc
 
 
 def _bind_legacy_sidecar(
