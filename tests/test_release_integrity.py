@@ -74,6 +74,8 @@ def _metadata(version: str, *, requires: str = ">=3.11", name: str = "hermes-a36
         f"Name: {name}\n"
         f"Version: {version}\n"
         "Summary: Integrate Hermes agents into the Microsoft 365 ecosystem.\n"
+        "License-Expression: MIT\n"
+        "License-File: LICENSE\n"
         f"Requires-Python: {requires}\n"
         "Description-Content-Type: text/markdown\n"
         "\n"
@@ -156,8 +158,7 @@ class FakeGitHub:
         headers: dict[str, str] = {}
         if index + 1 < len(pages):
             next_url = (
-                "https://api.github.com/repos/octo/repo/releases?per_page=100&page="
-                f"{page + 1}"
+                f"https://api.github.com/repos/octo/repo/releases?per_page=100&page={page + 1}"
             )
             headers["Link"] = f'<{next_url}>; rel="next"'
         return mod.HttpResult(200, headers, json.dumps(pages[index]).encode())
@@ -686,6 +687,45 @@ def test_checksum_file_cannot_escape_dist(tmp_path: Path) -> None:
 def test_smoke_accepts_the_development_install() -> None:
     version = mod.project_version(_ROOT)
     mod.smoke_installed(version)
+
+
+def test_built_wheel_and_sdist_expose_pep639_license(tmp_path: Path) -> None:
+    dist = tmp_path / "dist"
+    completed = subprocess.run(
+        [sys.executable, "-m", "build", "--no-isolation", "--outdir", str(dist)],
+        cwd=_ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0, completed.stderr or completed.stdout
+    wheels = sorted(dist.glob("*.whl"))
+    sdists = sorted(dist.glob("*.tar.gz"))
+    assert len(wheels) == 1
+    assert len(sdists) == 1
+    version = mod.project_version(_ROOT)
+    lines: list[str] = []
+    for path, reader in (
+        (wheels[0], mod._wheel_metadata),
+        (sdists[0], mod._sdist_metadata),
+    ):
+        metadata = reader(path)
+        assert "License-Expression: MIT" in metadata
+        assert "License-File: LICENSE" in metadata
+        headers = mod._metadata_headers(metadata)
+        assert headers.get("License-Expression") == "MIT"
+        assert headers.get("License-File") == "LICENSE"
+    license_src = (_ROOT / "LICENSE").read_text(encoding="utf-8")
+    assert "MIT" in license_src
+    import zipfile
+
+    with zipfile.ZipFile(wheels[0]) as archive:
+        assert archive.read("hermes_a365-0.9.5.dist-info/licenses/LICENSE").decode() == license_src
+    for path in (wheels[0], sdists[0]):
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        lines.append(f"{digest}  {path.name}")
+    (dist / "SHA256SUMS").write_text("\n".join(lines) + "\n", encoding="utf-8")
+    mod.check_distributions(dist, version)
 
 
 def test_smoke_accepts_a_normalized_prerelease_version(monkeypatch: pytest.MonkeyPatch) -> None:

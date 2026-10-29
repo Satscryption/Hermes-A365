@@ -7,12 +7,15 @@ lookup works for both editable installs and wheels.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
 import socket
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from urllib.parse import quote
@@ -24,6 +27,14 @@ OTLP_DEPRECATED_MESSAGE = (
     "WARN: HERMES_OTLP_ENDPOINT is deprecated and ignored; "
     "it is not written and is removed from the agent .env on --apply (#189)."
 )
+
+
+class SidecarLockError(OSError):
+    """Another process or writer holds the sidecar lock."""
+
+
+class SidecarBackupError(OSError):
+    """A sidecar backup could not be published exclusively."""
 
 
 class TenantResolutionError(ValueError):
@@ -76,6 +87,38 @@ def tcp_reachable(host: str, *, port: int = 443, timeout: float = 3.0) -> bool:
         return False
 
 
+def _directory_fsync_error_is_best_effort(exc: OSError) -> bool:
+    """True when the platform refuses directory fsync (not a data-path I/O fault)."""
+    if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+        return True
+    enosys = getattr(errno, "ENOSYS", None)
+    return enosys is not None and exc.errno == enosys
+
+
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync of ``path`` when it is a directory (POSIX)."""
+    if os.name == "nt":
+        return
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    try:
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if _directory_fsync_error_is_best_effort(exc):
+            return
+        raise
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if _directory_fsync_error_is_best_effort(exc):
+                return
+            raise
+    finally:
+        os.close(fd)
+
+
 def write_owner_only_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
     """Atomically write ``text`` to ``path``, owner-only (``mode``) from birth.
 
@@ -106,10 +149,112 @@ def write_owner_only_text_atomic(path: Path, text: str, *, mode: int = 0o600) ->
     try:
         with fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        _fsync_directory(path.parent)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+@contextmanager
+def exclusive_sidecar_lock(path: Path) -> Iterator[None]:
+    """Serialize Hermes-owned sidecar writers via ``<name>.lock`` (0600, O_EXCL)."""
+    lock_path = path.with_name(f"{path.name}.lock")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise SidecarLockError(
+            f"another operation holds {lock_path}; refusing before mutation. "
+            "If no operation is active, inspect and remove the stale lock deliberately."
+        ) from exc
+    except OSError as exc:
+        raise SidecarLockError(f"could not acquire sidecar lock {lock_path}: {exc}") from exc
+    locked_stat = os.fstat(fd)
+    try:
+        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+        yield
+    finally:
+        os.close(fd)
+        try:
+            current = lock_path.lstat()
+            if (current.st_dev, current.st_ino) == (locked_stat.st_dev, locked_stat.st_ino):
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def sidecar_backup_path(path: Path, *, at: datetime | None = None) -> Path:
+    """Sibling ``*.backup-<UTC>.json`` path for a Hermes-owned sidecar."""
+    moment = (at or datetime.now(UTC)).astimezone(UTC)
+    stamp = moment.strftime("%Y%m%d-%H%M%S")
+    if path.name.endswith(".json"):
+        return path.with_name(f"{path.name[:-5]}.backup-{stamp}.json")
+    return path.with_name(f"{path.name}.backup-{stamp}")
+
+
+def sidecar_corrupt_quarantine_path(path: Path, *, at: datetime | None = None) -> Path:
+    """Sibling ``<name>.corrupt-<UTC>`` path for a quarantined unreadable sidecar."""
+    moment = (at or datetime.now(UTC)).astimezone(UTC)
+    stamp = moment.strftime("%Y%m%d-%H%M%S")
+    return path.with_name(f"{path.name}.corrupt-{stamp}")
+
+
+def _exclusive_publish_file(tmp: Path, path: Path) -> Path:
+    """Publish completed ``tmp`` at ``path`` without overwriting an existing file."""
+    target = path
+    for attempt in (0, 1):
+        try:
+            os.link(tmp, target)
+            return target
+        except FileExistsError as exc:
+            if attempt == 0 and target == path:
+                target = path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}")
+                continue
+            raise SidecarBackupError(
+                f"could not publish sidecar backup at {path} exclusively: {exc}"
+            ) from exc
+        except OSError as exc:
+            link_errno = {errno.EXDEV, errno.ENOTSUP}
+            enosys = getattr(errno, "ENOSYS", None)
+            if enosys is not None:
+                link_errno.add(enosys)
+            if exc.errno in link_errno:
+                raise SidecarBackupError(
+                    f"could not publish sidecar backup at {path} via hard link ({exc})"
+                ) from exc
+            raise
+    raise SidecarBackupError(f"could not publish sidecar backup at {path} exclusively")
+
+
+def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o600) -> Path:
+    """Write a backup via a private temp, fsync, then publish exclusively at ``mode``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.part-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    try:
+        os.fchmod(fd, mode)
+        offset = 0
+        while offset < len(data):
+            offset += os.write(fd, data[offset:])
+        os.fsync(fd)
+    except BaseException:
+        os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+    os.close(fd)
+    try:
+        target = _exclusive_publish_file(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.unlink(missing_ok=True)
+    _fsync_directory(target.parent)
+    return target
 
 
 _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")
