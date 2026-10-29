@@ -7,7 +7,8 @@ name = "hermes-a365"
 version = "0.9.5"
 description = "Integrate Hermes agents into the Microsoft 365 ecosystem using Microsoft Agent 365 (A365)."
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   {name = "Sadiq Jaffer", email = "sadiq.jaffer@satscryption.io"},
 ]
@@ -22,6 +23,9 @@ classifiers = [
   "Programming Language :: Python :: 3.14",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
+  "Environment :: Console",
+  "Intended Audience :: Developers",
+  "Intended Audience :: System Administrators",
 ]
 dependencies = [
   "jinja2>=3.1",
@@ -33,6 +37,7 @@ dependencies = [
 Homepage = "https://github.com/satscryption/Hermes-A365"
 Issues = "https://github.com/satscryption/Hermes-A365/issues"
 Documentation = "https://github.com/satscryption/Hermes-A365#readme"
+Changelog = "https://github.com/satscryption/Hermes-A365/blob/main/CHANGELOG.md"
 
 [project.scripts]
 hermes-a365 = "hermes_a365.cli:main"
@@ -70,6 +75,8 @@ dev = [
   # on install), so order-dependent state is caught in CI, not just by luck.
   "pytest-randomly>=3.15",
   "ruff>=0.5",
+  "build>=1.2",
+  "hatchling>=1.25",
   # Bridge stack is installed in dev too so tests can exercise it.
   "anyio>=4.14.2",
   "cryptography>=50.0.0",

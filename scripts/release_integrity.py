@@ -46,9 +46,7 @@ _MAX_RELEASE_PAGES = 100
 _SHA = re.compile(r"^[0-9a-f]{40}$")
 _REPO = re.compile(r"^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$")
 _TOKEN_RE = re.compile(r"\b(?:gh[pousr]_|github_pat_)[A-Za-z0-9_]+\b")
-_HEADING = re.compile(
-    r"^## \[(?P<version>[^\]]+)\] \u2014 (?P<date>\d{4}-\d{2}-\d{2})[ \t]*$"
-)
+_HEADING = re.compile(r"^## \[(?P<version>[^\]]+)\] \u2014 (?P<date>\d{4}-\d{2}-\d{2})[ \t]*$")
 _VERSION_ASSIGN = re.compile(
     r"^__version__\s*=\s*(?P<quote>['\"])(?P<version>.*?)(?P=quote)\s*$",
     re.MULTILINE,
@@ -307,17 +305,14 @@ def evaluate(repo: Path, tag_ref: str) -> ReleaseNotes:
     try:
         found_project = project_version(repo)
         if found_project != version:
-            problems.append(
-                f"project.version is {found_project!r}, tag {tag} requires {version!r}"
-            )
+            problems.append(f"project.version is {found_project!r}, tag {tag} requires {version!r}")
     except ReleaseIntegrityError as exc:
         problems.extend(exc.problems)
     try:
         found_module = module_version(repo)
         if found_module != version:
             problems.append(
-                "hermes_a365.__version__ is "
-                f"{found_module!r}, tag {tag} requires {version!r}"
+                f"hermes_a365.__version__ is {found_module!r}, tag {tag} requires {version!r}"
             )
     except ReleaseIntegrityError as exc:
         problems.extend(exc.problems)
@@ -367,9 +362,7 @@ def assert_reachable(repo: Path, sha: str) -> None:
         raise ReleaseIntegrityError("release sha must be a 40-character hex commit id")
     completed = _git(repo, ["git", "merge-base", "--is-ancestor", sha, "origin/main"])
     if completed.returncode != 0:
-        raise ReleaseIntegrityError(
-            f"{sha} is not reachable from origin/main; refusing to publish"
-        )
+        raise ReleaseIntegrityError(f"{sha} is not reachable from origin/main; refusing to publish")
 
 
 def assert_worktree(repo: Path, sha: str) -> None:
@@ -385,14 +378,11 @@ def assert_worktree(repo: Path, sha: str) -> None:
     resolved = head.stdout.strip()
     if head.returncode != 0 or resolved != sha:
         raise ReleaseIntegrityError(
-            f"worktree HEAD is not {sha}; refusing to publish a tree other than "
-            "the tagged commit"
+            f"worktree HEAD is not {sha}; refusing to publish a tree other than the tagged commit"
         )
     status = _git(repo, ["git", "status", "--porcelain", "--untracked-files=no"])
     if status.returncode != 0 or status.stdout.strip():
-        raise ReleaseIntegrityError(
-            "worktree differs from the tagged commit; refusing to publish"
-        )
+        raise ReleaseIntegrityError("worktree differs from the tagged commit; refusing to publish")
 
 
 def check(repo: Path, tag_ref: str, sha: str | None = None) -> ReleaseNotes:
@@ -606,6 +596,16 @@ def check_distributions(dist: Path, expected_version: str) -> None:
             )
         if not headers.get("Summary"):
             raise ReleaseIntegrityError(f"{path.name} is missing Summary")
+        license_expression = headers.get("License-Expression")
+        if license_expression != "MIT":
+            raise ReleaseIntegrityError(
+                f"{path.name} License-Expression is {license_expression!r}, expected 'MIT'"
+            )
+        license_file = headers.get("License-File")
+        if license_file != "LICENSE":
+            raise ReleaseIntegrityError(
+                f"{path.name} License-File is {license_file!r}, expected 'LICENSE'"
+            )
         content_type = headers.get("Description-Content-Type", "")
         if not content_type.startswith("text/markdown"):
             raise ReleaseIntegrityError(
@@ -1313,8 +1313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             found_module = module_version(args.repo_root)
             if found_project != found_module:
                 raise ReleaseIntegrityError(
-                    f"project.version {found_project!r} != "
-                    f"hermes_a365.__version__ {found_module!r}"
+                    f"project.version {found_project!r} != hermes_a365.__version__ {found_module!r}"
                 )
             print(found_project)
         elif args.command == "check-dists":
