@@ -552,6 +552,7 @@ class TestCollectStatus:
             "instance_scopes",
             "bot_service",
             "activity_bridge",
+            "client_secret_expiry",
         ]
         bot_service = next(c for c in report.components if c.name == "bot_service")
         assert bot_service.state == "skipped"
@@ -634,6 +635,7 @@ class TestCollectStatus:
             "instance_scopes",
             "bot_service",
             "activity_bridge",
+            "client_secret_expiry",
         ]
         assert report.components[3].state == "ok"
 

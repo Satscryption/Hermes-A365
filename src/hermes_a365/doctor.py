@@ -41,7 +41,9 @@ import shutil
 import subprocess
 import sys
 import urllib.parse
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal
 from uuid import UUID
@@ -49,6 +51,10 @@ from uuid import UUID
 from . import bot_service, bot_service_diagnostics
 from ._common import parse_env, safe_run, tcp_reachable
 from .activity_bridge import parse_agent_identity_ids
+from .client_secret_expiry import (
+    DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
+    gather_client_secret_expiry_checks,
+)
 from .compatibility import (
     A365_CLI_LIVE_VERIFIED,
     AZURE_CLI_MIN,
@@ -70,6 +76,7 @@ from .compatibility import (
     python_in_supported_range,
     python_version_tuple,
 )
+from .entra_state import GraphGet
 
 ProbeState = Literal["ok", "warn", "error"]
 
@@ -167,8 +174,7 @@ def probe_a365_cli() -> ProbeResult:
                 **data,
                 "latest_known_affected_version": A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT,
                 "upgrade": (
-                    "dotnet tool update -g "
-                    "Microsoft.Agents.A365.DevTools.Cli --prerelease"
+                    "dotnet tool update -g Microsoft.Agents.A365.DevTools.Cli --prerelease"
                 ),
                 "nuget": A365_CLI_NUGET_URL,
             },
@@ -238,9 +244,7 @@ def _az_cli_suffix_is_prerelease(suffix: str) -> bool:
         return True
     if re.match(r"^~(?:b|rc)(?:\d+|\.\d+)", lowered):
         return True
-    return bool(
-        re.search(r"(?:^|[.~-])(?:dev(?:\d+)?(?=$|[.+~-])|rc|preview|alpha|beta)", lowered)
-    )
+    return bool(re.search(r"(?:^|[.~-])(?:dev(?:\d+)?(?=$|[.+~-])|rc|preview|alpha|beta)", lowered))
 
 
 def parse_az_cli_release(raw: str) -> tuple[tuple[int, int, int] | None, bool]:
@@ -478,20 +482,14 @@ def probe_az_cli() -> ProbeResult:
         return ProbeResult(
             "az_cli",
             _WARN,
-            (
-                f"present and signed in as {user} ({binary}); "
-                "`az version` failed or timed out"
-            ),
+            (f"present and signed in as {user} ({binary}); `az version` failed or timed out"),
             data,
         )
     if parsed_version is None:
         return ProbeResult(
             "az_cli",
             _WARN,
-            (
-                f"present and signed in as {user} ({binary}); "
-                "could not parse `az version` output"
-            ),
+            (f"present and signed in as {user} ({binary}); could not parse `az version` output"),
             data,
         )
     if _az_cli_version_below_floor(parsed_version, raw_version):
@@ -598,14 +596,11 @@ def probe_powershell() -> ProbeResult:
     version_raw = safe_run([binary, "-Command", "$PSVersionTable.PSVersion.ToString()"]) or ""
     version = version_raw.strip() or "unknown"
     major = version.split(".", 1)[0] if version != "unknown" else ""
-    if version != "unknown" and (
-        not major.isdigit() or int(major) < POWERSHELL_MIN_MAJOR
-    ):
+    if version != "unknown" and (not major.isdigit() or int(major) < POWERSHELL_MIN_MAJOR):
         return ProbeResult(
             "powershell",
             _WARN,
-            f"present at {binary}; version {version} (CLI requires "
-            f"{POWERSHELL_MIN_MAJOR}+)",
+            f"present at {binary}; version {version} (CLI requires {POWERSHELL_MIN_MAJOR}+)",
             {"path": binary, "version": version},
         )
     return ProbeResult(
@@ -703,8 +698,7 @@ def probe_python_runtime() -> ProbeResult:
         return ProbeResult(
             "python",
             _ERROR,
-            f"Python {label} is below the v1 minimum (3.11); "
-            f"supported range is {REQUIRES_PYTHON}",
+            f"Python {label} is below the v1 minimum (3.11); supported range is {REQUIRES_PYTHON}",
             {"version": label},
         )
     if not python_in_ci_matrix(ver):
@@ -807,8 +801,7 @@ def probe_local_config() -> ProbeResult:
         if not tenant_id:
             state = _ERROR
             parts.append(
-                "no canonical tenant pin was resolved; set A365_TENANT_ID "
-                "before Azure mutations"
+                "no canonical tenant pin was resolved; set A365_TENANT_ID before Azure mutations"
             )
     else:
         parts.append(".env: absent or empty")
@@ -824,9 +817,7 @@ def probe_local_config() -> ProbeResult:
             "home": str(home),
             "env_present": env_file.exists(),
             "config_yaml_present": config_file.exists(),
-            "tenant_pinned": bool(
-                env_file.exists() and parsed.get("A365_TENANT_ID", "").strip()
-            ),
+            "tenant_pinned": bool(env_file.exists() and parsed.get("A365_TENANT_ID", "").strip()),
         },
     )
 
@@ -1221,11 +1212,7 @@ def probe_agent_instance_allowlist(
     checked = 0
     lookup_failed = False
     for blueprint, allow in targets[:_MAX_AGENT_IDENTITY_BLUEPRINTS]:
-        rows = (
-            identities
-            if identities is not None
-            else _list_blueprint_agent_identities(blueprint)
-        )
+        rows = identities if identities is not None else _list_blueprint_agent_identities(blueprint)
         if rows is None:
             lookup_failed = True
             continue
@@ -1281,10 +1268,7 @@ def probe_hermes_harness() -> ProbeResult:
     plugin_in_use = _hermes_agent365_plugin_in_use()
 
     if plugin_ok is False:
-        floor = (
-            f"{format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR)} / "
-            "Hermes Agent 0.12.0+"
-        )
+        floor = f"{format_calendar_tag(HERMES_PLUGIN_MIN_CALENDAR)} / Hermes Agent 0.12.0+"
         if plugin_in_use or multiplex_cfg:
             return ProbeResult(
                 "hermes_harness",
@@ -1367,6 +1351,9 @@ def run_all_probes(
     bot_service_runner: bot_service.CommandRunner | None = None,
     bot_service_operator_env: dict[str, str] | None = None,
     bot_service_runtime_auth_probe: bot_service_diagnostics.RuntimeAuthProbe | None = None,
+    secret_expiry_warn_days: int = DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
+    graph_get: GraphGet | None = None,
+    secret_expiry_now: Callable[[], datetime] | None = None,
 ) -> DoctorReport:
     probes: list[ProbeResult] = []
     probes.append(probe_python_runtime())
@@ -1380,9 +1367,7 @@ def run_all_probes(
         probes.append(probe_network())
         probes.append(probe_agent_instance_allowlist())
     else:
-        probes.append(
-            probe_agent_instance_allowlist(skip_reason="--no-network")
-        )
+        probes.append(probe_agent_instance_allowlist(skip_reason="--no-network"))
     probes.append(probe_keychain())
     probes.append(probe_local_config())
     probes.append(probe_file_transfer())
@@ -1402,6 +1387,27 @@ def run_all_probes(
         )
     )
     probes.append(probe_hermes_harness())
+    home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
+    expiry_skip = "--no-network" if no_network else None
+    for name, state, detail, data in gather_client_secret_expiry_checks(
+        hermes_home=home,
+        agent_name=None,
+        sidecar_path=bot_service_sidecar_path or Path.cwd() / bot_service.SIDECAR_FILENAME,
+        generated_config_path=generated_config_path or Path.cwd() / "a365.generated.config.json",
+        warn_days=secret_expiry_warn_days,
+        graph_get=graph_get,
+        now=secret_expiry_now,
+        skip_reason=expiry_skip,
+        operator_env=bot_service_operator_env,
+    ):
+        probe_state: ProbeState
+        if state == "skipped":
+            probe_state = _OK
+        elif state in ("ok", "warn", "error"):
+            probe_state = state
+        else:
+            probe_state = _WARN
+        probes.append(ProbeResult(name, probe_state, detail, data))
     return DoctorReport(probes=probes)
 
 
@@ -1458,11 +1464,24 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         action="store_true",
         help="skip network reachability probes (offline diagnostic)",
     )
+    parser.add_argument(
+        "--secret-expiry-warn-days",
+        type=int,
+        default=DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
+        metavar="N",
+        help=(
+            "warn when a blueprint or Bot Framework client secret expires within "
+            f"N days (default {DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS})"
+        ),
+    )
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
-    report = run_all_probes(no_network=args.no_network)
+    report = run_all_probes(
+        no_network=args.no_network,
+        secret_expiry_warn_days=args.secret_expiry_warn_days,
+    )
     sys.stdout.write(render_human(report) if args.human else render_json(report))
     return overall_to_exit_code(report.overall)
 

@@ -34,3 +34,4 @@ which references files were refreshed.
 | [`exposing-the-bot-endpoint.md`](exposing-the-bot-endpoint.md) | Operator-side options for exposing the local bridge to Microsoft (cloudflared / devtunnels / ngrok / reverse-proxy) | — |
 | [`m365-surface-coverage.md`](m365-surface-coverage.md) | Per-surface coverage matrix for the `agent365` plugin (Teams 1:1, group/channel, Copilot Chat, Outlook) | — |
 | [`manifest-schema-currency.md`](manifest-schema-currency.md) | Teams app-manifest schema versions — 1.21 CEA pin vs 1.25/1.27 features, bump criteria | §6.2.2 |
+| [`client-secret-rotation.md`](client-secret-rotation.md) | Rotate blueprint and Path B Bot Framework client secrets; doctor/status expiry thresholds | #191 |
