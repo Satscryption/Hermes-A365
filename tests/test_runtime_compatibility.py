@@ -82,7 +82,14 @@ def test_ci_matrix_covers_supported_python_versions() -> None:
     assert "keychain-linux" in text
     assert "wheel-smoke" in text
     assert "hermes-source-smoke" in text
-    assert "pytest --timeout=300" in text
+    assert "  unit:" in text
+    assert "  test:" in text
+    assert "needs:" in text and "unit" in text
+    assert "--timeout=60" in text
+    assert "--timeout-method=thread" in text
+    assert "--randomly-seed=" in text
+    assert "--durations=15" in text
+    assert "timeout-minutes: 15" in text
     assert "v2026.6.19" in text
     assert "v0.22.5" in text
 
