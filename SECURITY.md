@@ -16,8 +16,7 @@ The `main` branch contains unreleased work and is not a supported deployment.
 | Earlier releases | No |
 | Unreleased `main` | No |
 
-This policy will be reviewed at v1.0 as part of the public-surface and upgrade
-policy freeze.
+After v1.0, security fixes are provided for the latest 1.x minor release only. Earlier 1.x minors and all 0.x releases are unsupported. The full operator surface inventory is in [`docs/SURFACE.md`](docs/SURFACE.md).
 
 ## Reporting a vulnerability
 
