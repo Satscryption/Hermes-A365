@@ -1501,6 +1501,228 @@ class TestJwksRefreshTaskCoordination:
         assert cache.fetched_at == now
         assert cache.keys_by_kid["ttl"] is ttl_obj
 
+    async def test_generation_guard_rejects_stale_fetch_result(
+        self, jwks_mono_clock: tuple[dict[str, float], Any]
+    ) -> None:
+        from hermes_a365.activity_bridge import _refresh_jwks
+
+        _, _advance = jwks_mono_clock
+        cache = _JwksCache()
+        original = {"keep": object()}
+        cache.keys_by_kid = dict(original)
+        admitted = 5_000.0
+        cache.fetched_at = admitted
+        newer = 5_001.0
+
+        async def racing_fetch() -> dict[str, Any]:
+            cache.fetched_at = newer
+            return {"lost": object()}
+
+        await _refresh_jwks(cache, racing_fetch, now=admitted, force=True, unknown_kid="kid-x")
+        assert cache.keys_by_kid == original
+        assert cache.fetched_at == newer
+        assert cache.refresh_task is None
+
+    async def test_hung_jwks_fetch_hits_total_deadline(
+        self, jwks_mono_clock: tuple[dict[str, float], Any], monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import asyncio
+
+        from hermes_a365.activity_bridge import _refresh_jwks
+
+        monkeypatch.setattr(
+            "hermes_a365.activity_bridge.JWKS_REFRESH_TOTAL_DEADLINE_SECONDS",
+            0.05,
+        )
+        _, _advance = jwks_mono_clock
+        cache = _JwksCache()
+        cache.keys_by_kid = {}
+
+        async def hang_forever() -> dict[str, Any]:
+            await asyncio.Event().wait()
+            return {"never": object()}
+
+        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+            await _refresh_jwks(
+                cache,
+                hang_forever,
+                now=1_000.0,
+                force=True,
+                unknown_kid="kid-hung",
+            )
+        assert cache.last_forced_refresh_failed is True
+        assert cache.refresh_task is None
+        assert "kid-hung" in cache.forced_refresh_negative_kids
+
+    async def test_coalesced_unknown_kids_enter_negative_cache(
+        self, jwks_mono_clock: tuple[dict[str, float], Any]
+    ) -> None:
+        import asyncio
+
+        from hermes_a365.activity_bridge import _refresh_jwks
+
+        _, _advance = jwks_mono_clock
+        cache = _JwksCache()
+        cache.keys_by_kid = {"old": object()}
+        cache.fetched_at = 900.0
+        base_now = 1_000.0
+        gate = asyncio.Event()
+        attempts = {"n": 0}
+
+        async def slow_empty() -> dict[str, Any]:
+            attempts["n"] += 1
+            await gate.wait()
+            return {"present": object()}
+
+        leader = asyncio.create_task(
+            _refresh_jwks(cache, slow_empty, now=base_now, force=True, unknown_kid="kid-a")
+        )
+        await asyncio.sleep(0.02)
+        follower = asyncio.create_task(
+            _refresh_jwks(
+                cache,
+                slow_empty,
+                now=base_now + 0.5,
+                force=True,
+                unknown_kid="kid-b",
+            )
+        )
+        gate.set()
+        await asyncio.gather(leader, follower)
+        assert attempts["n"] == 1
+        assert "kid-a" in cache.forced_refresh_negative_kids
+        assert "kid-b" in cache.forced_refresh_negative_kids
+
+    async def test_forced_caller_on_failing_non_force_fetch_raises(
+        self, jwks_mono_clock: tuple[dict[str, float], Any]
+    ) -> None:
+        import asyncio
+
+        from hermes_a365.activity_bridge import _refresh_jwks
+
+        _, _advance = jwks_mono_clock
+        cache = _JwksCache()
+        gate = asyncio.Event()
+
+        async def fail_fetch() -> dict[str, Any]:
+            await gate.wait()
+            raise RuntimeError("outage")
+
+        ttl_task = asyncio.create_task(_refresh_jwks(cache, fail_fetch, now=2_000.0))
+        await asyncio.sleep(0.02)
+        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+            await _refresh_jwks(
+                cache,
+                fail_fetch,
+                now=2_000.0,
+                force=True,
+                unknown_kid="kid-x",
+            )
+        gate.set()
+        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+            await ttl_task
+
+    async def test_shutdown_jwks_cache_refresh_cancels_in_flight(
+        self, jwks_mono_clock: tuple[dict[str, float], Any]
+    ) -> None:
+        import asyncio
+
+        from hermes_a365.activity_bridge import _refresh_jwks, shutdown_jwks_cache_refresh
+
+        _, _advance = jwks_mono_clock
+        cache = _JwksCache()
+        started = asyncio.Event()
+
+        async def slow_fetch() -> dict[str, Any]:
+            started.set()
+            await asyncio.Event().wait()
+            return {"fresh": object()}
+
+        refresh = asyncio.create_task(
+            _refresh_jwks(cache, slow_fetch, now=100.0, force=True, unknown_kid="kid-a")
+        )
+        await started.wait()
+        await shutdown_jwks_cache_refresh(cache)
+        with pytest.raises(asyncio.CancelledError):
+            await refresh
+        assert cache.refresh_task is None
+        assert cache.last_forced_refresh_failed is True
+
+    async def test_forced_refresh_after_shutdown_cancel_fails_closed(
+        self, jwks_mono_clock: tuple[dict[str, float], Any]
+    ) -> None:
+        import asyncio
+        import contextlib
+
+        from hermes_a365.activity_bridge import _refresh_jwks, shutdown_jwks_cache_refresh
+
+        _, advance = jwks_mono_clock
+        cache = _JwksCache()
+        started = asyncio.Event()
+
+        async def slow_fetch() -> dict[str, Any]:
+            started.set()
+            await asyncio.Event().wait()
+            return {"fresh": object()}
+
+        refresh = asyncio.create_task(
+            _refresh_jwks(cache, slow_fetch, now=100.0, force=True, unknown_kid="kid-a")
+        )
+        await started.wait()
+        await shutdown_jwks_cache_refresh(cache)
+        with contextlib.suppress(asyncio.CancelledError):
+            await refresh
+        with pytest.raises(JwtValidationError, match="JWKS refresh failed"):
+            await _refresh_jwks(
+                cache,
+                slow_fetch,
+                now=101.0,
+                force=True,
+                unknown_kid="kid-b",
+            )
+        advance(1.001)
+
+    async def test_make_app_lifespan_shutdown_cancels_both_jwks_caches(
+        self, jwks_mono_clock: tuple[dict[str, float], Any]
+    ) -> None:
+        import asyncio
+
+        import httpx
+
+        from hermes_a365.activity_bridge import _refresh_jwks, make_app
+
+        _, _advance = jwks_mono_clock
+        cfg = _cfg()
+        jwks_cache = _JwksCache()
+        bf_cache = _JwksCache()
+        started: list[str] = []
+
+        async def hang_a() -> dict[str, Any]:
+            started.append("a")
+            await asyncio.Event().wait()
+            return {"a": object()}
+
+        async def hang_b() -> dict[str, Any]:
+            started.append("b")
+            await asyncio.Event().wait()
+            return {"b": object()}
+
+        http_client = httpx.AsyncClient()
+        app = make_app(cfg, http_client=http_client, jwks_cache=jwks_cache, bf_jwks_cache=bf_cache)
+        async with app.router.lifespan_context(app):
+            _ = asyncio.create_task(
+                _refresh_jwks(jwks_cache, hang_a, now=1.0, force=True, unknown_kid="ka")
+            )
+            _ = asyncio.create_task(
+                _refresh_jwks(bf_cache, hang_b, now=1.0, force=True, unknown_kid="kb")
+            )
+            for _ in range(50):
+                if len(started) == 2:
+                    break
+                await asyncio.sleep(0.01)
+        assert jwks_cache.refresh_task is None
+        assert bf_cache.refresh_task is None
+
 
 # ---------------------------------------------------------------------------
 # #34 — Path B (classic Bot Framework) JWT validation

@@ -93,6 +93,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
@@ -104,6 +105,7 @@ import urllib.parse
 import urllib.request
 from collections import OrderedDict
 from collections.abc import Mapping
+from contextlib import asynccontextmanager
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Literal
@@ -1019,6 +1021,8 @@ MAX_JWT_BYTES = 16 * 1024
 MAX_ACTIVITY_JSON_DEPTH = 24
 MAX_ACTIVITY_JSON_NODES = 10_000
 JWKS_FAILURE_BACKOFF_MAX_SECONDS = 60.0
+# Wall-clock cap on a single in-flight JWKS discovery + keys fetch (both HTTP hops).
+JWKS_REFRESH_TOTAL_DEADLINE_SECONDS = 25.0
 
 
 def _jwks_monotonic() -> float:
@@ -1943,12 +1947,17 @@ def _forced_refresh_global_floor_blocks(cache: _JwksCache, lock_mono: float) -> 
     ) < JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS
 
 
-def _forced_refresh_shared_outcome(cache: _JwksCache, now: float) -> dict[str, Any]:
+def _forced_refresh_shared_outcome(
+    cache: _JwksCache,
+    now: float,
+    *,
+    fetched_at_before_wait: float,
+) -> dict[str, Any]:
+    if cache.keys_by_kid and cache.fetched_at > fetched_at_before_wait:
+        return cache.keys_by_kid
     if _jwks_last_known_good_allowed(cache, now):
         return cache.keys_by_kid
-    if cache.last_forced_refresh_failed:
-        raise JwtValidationError("JWKS refresh failed")
-    return cache.keys_by_kid
+    raise JwtValidationError("JWKS refresh failed")
 
 
 def _jwks_refresh_caller_result(
@@ -1959,13 +1968,28 @@ def _jwks_refresh_caller_result(
     unknown_kid: str | None,
     fetched_at_before_wait: float,
 ) -> dict[str, Any]:
+    if force and unknown_kid and unknown_kid not in cache.keys_by_kid:
+        _note_forced_refresh_attempt_for_kid(cache, unknown_kid, now)
     if cache.keys_by_kid and cache.fetched_at > fetched_at_before_wait:
         return cache.keys_by_kid
     if force:
-        return _forced_refresh_shared_outcome(cache, now)
+        return _forced_refresh_shared_outcome(
+            cache, now, fetched_at_before_wait=fetched_at_before_wait
+        )
     if _jwks_last_known_good_allowed(cache, now):
         return cache.keys_by_kid
     raise JwtValidationError("JWKS refresh failed")
+
+
+async def shutdown_jwks_cache_refresh(cache: _JwksCache | None) -> None:
+    """Cancel and drain an in-flight JWKS refresh task (shutdown / disconnect)."""
+    if cache is None:
+        return
+    task = cache.refresh_task
+    if task is not None and not task.done():
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 async def _jwks_refresh_task(
@@ -1977,7 +2001,7 @@ async def _jwks_refresh_task(
     force: bool,
 ) -> None:
     try:
-        keys = await fetch()
+        keys = await asyncio.wait_for(fetch(), timeout=JWKS_REFRESH_TOTAL_DEADLINE_SECONDS)
         if not keys:
             raise JwtValidationError("JWKS document contained no usable keys")
         async with cache.refresh_lock:
@@ -1988,6 +2012,11 @@ async def _jwks_refresh_task(
                 cache.retry_after = 0.0
                 if force:
                     cache.last_forced_refresh_failed = False
+    except asyncio.CancelledError:
+        async with cache.refresh_lock:
+            if force and not _jwks_last_known_good_allowed(cache, admitted_now):
+                cache.last_forced_refresh_failed = True
+        raise
     except Exception as exc:
         async with cache.refresh_lock:
             cache.failure_count += 1
@@ -2055,9 +2084,13 @@ async def _refresh_jwks(
                 if unknown_kid and _forced_refresh_negative_kid_blocks(cache, unknown_kid, now):
                     return cache.keys_by_kid
                 if cache.keys_by_kid and now < cache.fetched_at:
-                    return _forced_refresh_shared_outcome(cache, now)
+                    return _forced_refresh_shared_outcome(
+                        cache, now, fetched_at_before_wait=fetched_at_before_wait
+                    )
                 if _forced_refresh_global_floor_blocks(cache, lock_mono):
-                    return _forced_refresh_shared_outcome(cache, now)
+                    return _forced_refresh_shared_outcome(
+                        cache, now, fetched_at_before_wait=fetched_at_before_wait
+                    )
                 cache.last_forced_refresh_attempt_mono = lock_mono
                 cache.last_forced_refresh_failed = False
                 if unknown_kid:
@@ -2068,7 +2101,9 @@ async def _refresh_jwks(
                 raise JwtValidationError("JWKS refresh temporarily unavailable")
             elif cache.keys_by_kid and now < cache.fetched_at:
                 if force:
-                    return _forced_refresh_shared_outcome(cache, now)
+                    return _forced_refresh_shared_outcome(
+                        cache, now, fetched_at_before_wait=fetched_at_before_wait
+                    )
                 return cache.keys_by_kid
 
             cache.refresh_generation += 1
@@ -3699,8 +3734,17 @@ def make_app(
             max_entries=cfg.idempotency_max_entries,
         )
 
+    @asynccontextmanager
+    async def _serve_lifespan(_app: Any):
+        try:
+            yield
+        finally:
+            await shutdown_jwks_cache_refresh(jwks_cache)
+            await shutdown_jwks_cache_refresh(bf_jwks_cache)
+            await http_client.aclose()
+
     _validate_webhook_url(cfg.webhook_url, development_mode=cfg.skip_jwt_validation)
-    app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}")
+    app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}", lifespan=_serve_lifespan)
 
     pre_auth_state = _ServePreAuthState()
     app.add_middleware(

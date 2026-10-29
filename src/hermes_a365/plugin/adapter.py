@@ -3880,7 +3880,10 @@ class Agent365Adapter(BasePlatformAdapter):
             self._retiring_chats.clear()
         try:
             if http_client is not None:
+                bridge_mod = _import_bridge()
                 with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await bridge_mod.shutdown_jwks_cache_refresh(self._jwks_cache)
+                    await bridge_mod.shutdown_jwks_cache_refresh(self._bf_jwks_cache)
                     await http_client.aclose()
         finally:
             self._disconnect_cleanup_active = False
