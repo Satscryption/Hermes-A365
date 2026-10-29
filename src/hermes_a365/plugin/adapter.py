@@ -2069,6 +2069,9 @@ class Agent365Adapter(BasePlatformAdapter):
         # also keeps chats with a live card capability or an open-ended
         # clarify, independent of the session guard.
         self._session_key_to_conv: dict[str, str] = {}
+        # Immutable admission snapshot for card capabilities: user, chat,
+        # tenant, and session key at turn start — never the latest registry inbound.
+        self._turn_origins: dict[str, dict[str, str]] = {}
         self._agent_turn_guards: dict[str, asyncio.Event] = {}
         self._agent_turn_admissions: dict[str, asyncio.Task[Any]] = {}
         self._media_leases_by_session: dict[str, set[Path]] = {}
@@ -2980,6 +2983,8 @@ class Agent365Adapter(BasePlatformAdapter):
             # turn and keep the registry cap/prune from evicting its reply
             # target underneath it.
             turn_guard = asyncio.Event()
+            origin_key = sk if sk is not None else admission_key
+            self._capture_turn_origin(origin_key, activity)
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -3011,6 +3016,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 elif sk not in getattr(self, "_active_sessions", {}):
                     self._agent_turn_guards.pop(sk, None)
                     self._release_request_media_leases(sk, request_media_leases)
+                    self._clear_turn_origin(sk)
                 else:
                     self._release_request_media_leases(sk, request_media_leases)
             else:
@@ -3867,6 +3873,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._file_consent_decline_notified.clear()
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
+        self._turn_origins.clear()
         self._agent_turn_guards.clear()
         self._session_key_to_conv.clear()
         self._chat_teardown_tasks.clear()
@@ -4269,6 +4276,23 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._agent_turn_guards.get(session_key) is guard:
             self._agent_turn_guards.pop(session_key, None)
         self._release_session_media_leases(session_key)
+        self._clear_turn_origin(session_key)
+
+    def _capture_turn_origin(self, origin_key: str, activity: dict[str, Any]) -> None:
+        if not origin_key:
+            return
+        conv = activity.get("conversation")
+        conv_id = str(conv.get("id") or "") if isinstance(conv, dict) else ""
+        self._turn_origins[origin_key] = {
+            "user_id": _import_bridge()._canonical_activity_user(activity),
+            "conversation_id": conv_id,
+            "tenant_id": self.tenant_id.lower(),
+            "session_key": origin_key,
+        }
+
+    def _clear_turn_origin(self, origin_key: str) -> None:
+        if origin_key:
+            self._turn_origins.pop(origin_key, None)
 
     def _turn_reply_blocked(self, chat_id: str) -> bool:
         """True when this chat must not open a buffer or post a reply.
@@ -11718,6 +11742,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
                 continue
             turn_guard = asyncio.Event()
+            origin_key = sk if sk is not None else admission_key
+            self._capture_turn_origin(origin_key, activity)
             if sk is not None:
                 self._session_key_to_conv[sk] = conv_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -11744,6 +11770,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._watch_agent_turn_owner(sk, turn_guard, owner)
             elif sk not in getattr(self, "_active_sessions", {}):
                 self._agent_turn_guards.pop(sk, None)
+                self._clear_turn_origin(sk)
 
     def _cached_user_activity_id(self, chat_id: str) -> str:
         """Activity id of the latest cached user inbound for ``chat_id``.
@@ -12240,6 +12267,23 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 handoff pin skipped: active turns full")
             return
         turn_guard = asyncio.Event()
+        origin_key = sk if sk is not None else admission_key
+        handoff_activity: dict[str, Any] = {}
+        raw_message = getattr(event, "raw_message", None)
+        if isinstance(raw_message, dict):
+            handoff_activity = dict(raw_message)
+        source = getattr(event, "source", None)
+        if source is not None:
+            if not isinstance(handoff_activity.get("conversation"), dict):
+                handoff_activity["conversation"] = {"id": str(source.chat_id or "")}
+            sender = handoff_activity.get("from")
+            sender = dict(sender) if isinstance(sender, dict) else {}
+            if source.user_id:
+                sender.setdefault("aadObjectId", source.user_id)
+                sender.setdefault("id", source.user_id)
+            handoff_activity["from"] = sender
+        if handoff_activity:
+            self._capture_turn_origin(origin_key, handoff_activity)
         if sk is not None:
             self._session_key_to_conv[sk] = chat_id
             turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -12272,6 +12316,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return
         if session_key not in getattr(self, "_active_sessions", {}):
             self._agent_turn_guards.pop(session_key, None)
+            self._clear_turn_origin(session_key)
 
     async def _handle_handoff_action(self, ctx: invoke.InvokeContext) -> invoke.InvokeResponse:
         """#82: ``handoff/action`` — the user opened the continuation link.
@@ -12451,6 +12496,11 @@ class Agent365Adapter(BasePlatformAdapter):
             choices,
             {"session_key": session_key},
         )
+        if not actions:
+            return SendResult(
+                success=False,
+                error="agent365 exec_approval: card capability unavailable",
+            )
         return await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
         )
@@ -12481,6 +12531,11 @@ class Agent365Adapter(BasePlatformAdapter):
             choices,
             {"session_key": session_key, "confirm_id": confirm_id},
         )
+        if not actions:
+            return SendResult(
+                success=False,
+                error="agent365 slash_confirm: card capability unavailable",
+            )
         return await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="slash_confirm"
         )
@@ -12529,6 +12584,11 @@ class Agent365Adapter(BasePlatformAdapter):
             card_choices,
             {"clarify_id": clarify_id, "session_key": session_key},
         )
+        if not actions:
+            return SendResult(
+                success=False,
+                error="agent365 clarify: card capability unavailable",
+            )
         return await self._send_card(
             chat_id, self._action_submit_card(question, actions), log_context="clarify"
         )
@@ -12542,15 +12602,22 @@ class Agent365Adapter(BasePlatformAdapter):
         choices: list[tuple[str, str]],
         resolver: dict[str, str],
     ) -> list[tuple[str, dict[str, Any]]]:
-        inbound = self._cached_inbound_for(chat_id) or {}
-        bridge = _import_bridge()
+        session_key = str(resolver.get("session_key") or "")
+        origin = self._turn_origins.get(session_key)
+        if origin is None:
+            logger.warning(
+                "agent365 card capability mint rejected: no turn origin session_key=%r chat_id=%r",
+                session_key,
+                chat_id,
+            )
+            return []
         nonce = secrets.token_urlsafe(24)
         opaque_choices = {secrets.token_urlsafe(12): value for _, value in choices}
         self._card_capabilities[nonce] = {
             "kind": kind,
-            "conversation_id": chat_id,
-            "user_id": bridge._canonical_activity_user(inbound),
-            "tenant_id": self.tenant_id.lower(),
+            "conversation_id": origin.get("conversation_id") or chat_id,
+            "user_id": origin.get("user_id") or "",
+            "tenant_id": origin.get("tenant_id") or self.tenant_id.lower(),
             "lifecycle_generation": self._lifecycle_generation,
             "chat_generation": self._chat_generation(chat_id),
             "created_at": time.monotonic(),
@@ -14446,6 +14513,9 @@ class Agent365Adapter(BasePlatformAdapter):
         for nonce, capability in list(self._card_capabilities.items()):
             if str(capability.get("conversation_id") or "") == chat_id:
                 self._card_capabilities.pop(nonce, None)
+        for origin_key, origin in list(self._turn_origins.items()):
+            if str(origin.get("conversation_id") or "") == chat_id:
+                self._turn_origins.pop(origin_key, None)
         self._awaiting_text_chats.pop(chat_id, None)
         # Coalesced-status slots (keyed ``status:{chat}:{status_key}``) + their
         # watchdogs. Match on the stored chat_id, not a key prefix, since a

@@ -6,6 +6,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- Card capability binding refactored to use per-turn origin.
+
 ### Removed
 
 - **#189 — Unexported OTLP telemetry key, probe, and docs claim (v0.9.6.1).**
