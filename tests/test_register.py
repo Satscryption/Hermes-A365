@@ -373,7 +373,7 @@ class TestIssue256BlueprintSensitiveOutput:
     _SENTINEL = "SENTINEL-BP-SECRET-256"
     _DEVICE_LINE = (
         "To sign in, use a web browser to open https://login.microsoft.com/device "
-        "and enter the code FAKECODE256 to authenticate."
+        "and enter the code ABCD1234 to authenticate."
     )
 
     @staticmethod
@@ -432,7 +432,8 @@ class TestIssue256BlueprintSensitiveOutput:
         assert self._SENTINEL not in out
         assert self._SENTINEL not in err
         assert self._SENTINEL not in caplog.text
-        assert "FAKECODE256" in out
+        assert "ABCD1234" in out
+        assert "To sign in, open https://login.microsoft.com/device" in out
         assert self._SENTINEL in result.raw_outputs["blueprint"].stdout
 
     def test_apply_repair_suppresses_secret_streams_device_code(

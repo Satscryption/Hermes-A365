@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from unittest.mock import patch
 
@@ -237,13 +238,11 @@ class TestSensitiveRun:
     def test_sensitive_streams_device_code_not_secrets(
         self, capfd: pytest.CaptureFixture[str]
     ) -> None:
-        # #256: ``a365 setup blueprint`` may print the minted secret and a
-        # device-code prompt in one run; only the prompt reaches stdout.
         marker = "SENTINEL-BP-SECRET-256"
         device_line = (
             "To sign in, use a web browser to open "
             "https://login.microsoft.com/device and enter the code "
-            "FAKECODE256 to authenticate."
+            "ABCD1234 to authenticate."
         )
         script = (
             f"print({device_line!r}); "
@@ -258,8 +257,132 @@ class TestSensitiveRun:
         assert marker not in out
         assert marker not in err
         assert marker in result.stdout
-        assert "FAKECODE256" in out
-        assert "login.microsoft.com/device" in out
+        assert "To sign in, open https://login.microsoft.com/device" in out
+        assert "ABCD1234" in out
+        assert device_line not in out
+
+
+class TestAdversarialSensitiveSubprocess:
+    """Subprocess regressions for sensitive echo and timeout handling."""
+
+    _SECRET = "FAKE_SECRET"
+    _URL = "https://login.microsoft.com/device"
+    _CODE = "ABCD1234"
+    _PROMPT = (
+        "To sign in, use a web browser to open https://login.microsoft.com/device "
+        "and enter the code ABCD1234 to authenticate."
+    )
+
+    def _run_cap(
+        self, script: str, capfd: pytest.CaptureFixture[str], *, timeout: float = 10.0
+    ) -> tuple[RunResult, str, str]:
+        m = A365CliMutator()
+        m.available = True
+        result = m.run([sys.executable, "-c", script], sensitive=True, timeout=timeout)
+        out, err = capfd.readouterr()
+        assert self._SECRET not in out + err
+        return result, out, err
+
+    _ADV_URL = "https://login.microsoft.com/device enter the code ABCD1234"
+
+    @pytest.mark.parametrize(
+        "payload",
+        [
+            f"device code: secret=FAKE_SECRET {_ADV_URL}",
+            '{"password":"FAKE_SECRET","message":"device code"} ' + _ADV_URL,
+            '"clientSecret":"FAKE_SECRET" ' + _ADV_URL,
+            "Client secret created: FAKE_SECRET — " + _ADV_URL,
+            _ADV_URL + " bare-token FAKE_SECRET",
+        ],
+    )
+    def test_adversarial_stdout_lines_suppressed(
+        self,
+        payload: str,
+        capfd: pytest.CaptureFixture[str],
+    ) -> None:
+        script = f"print({payload!r})"
+        _, out, _ = self._run_cap(script, capfd)
+        assert self._SECRET not in out
+        assert self._CODE in out
+        assert payload not in out
+
+    def test_adversarial_ansi_and_cr_split(self, capfd: pytest.CaptureFixture[str]) -> None:
+        script = (
+            "import sys\n"
+            "sys.stdout.write('\\x1b[31mhttps://login.microsoft.com/device\\x1b[0m "
+            "enter the code ABCD1234\\r\\n')\n"
+            "sys.stderr.write('stderr-FAKE_SECRET\\n')\n"
+        )
+        _, out, err = self._run_cap(script, capfd)
+        assert self._SECRET not in out + err
+        assert self._CODE in out
+
+    def test_adversarial_long_line(self, capfd: pytest.CaptureFixture[str]) -> None:
+        filler = "x" * 5000
+        payload = (
+            f"{filler} https://login.microsoft.com/device enter the code ABCD1234 "
+            "secret=FAKE_SECRET"
+        )
+        script = f"print({payload!r})"
+        _, out, _ = self._run_cap(script, capfd)
+        assert self._SECRET not in out
+        assert self._CODE in out
+
+    def test_adversarial_unterminated_partial_times_out(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        script = (
+            "import sys,time\n"
+            "sys.stdout.write('https://login.microsoft.com/device enter the code PARTIALNO')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(5)\n"
+        )
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+            m.run([sys.executable, "-c", script], sensitive=True, timeout=0.4)
+        assert not excinfo.value.output
+        out, err = capfd.readouterr()
+        assert self._SECRET not in out + err
+
+    def test_banner_and_prompt_in_one_chunk_while_child_alive(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        script = (
+            "import sys,time\n"
+            "sys.stdout.write('LOADING...\\n" + self._PROMPT + "\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(0.3)\n"
+            "print('FAKE_SECRET')\n"
+        )
+        _, out, _ = self._run_cap(script, capfd)
+        assert "LOADING" not in out
+        assert self._CODE in out
+
+    def test_sensitive_failure_path(self, capfd: pytest.CaptureFixture[str]) -> None:
+        payload = "https://login.microsoft.com/device enter the code ABCD1234 secret=FAKE_SECRET"
+        script = f"print({payload!r}); raise SystemExit(2)"
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            m.run([sys.executable, "-c", script], sensitive=True)
+        assert self._SECRET not in str(excinfo.value)
+        out, err = capfd.readouterr()
+        assert self._SECRET not in out + err
+        assert self._CODE in out
+
+    def test_streaming_single_chunk_prompt_visible(self, capfd: pytest.CaptureFixture[str]) -> None:
+        script = (
+            "import sys,time\n"
+            "sys.stdout.write('LOADING...\\n" + self._PROMPT + "\\n')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(0.2)\n"
+        )
+        rc, _ = _run_streaming([sys.executable, "-c", script], timeout=5.0)
+        assert rc == 0
+        out, _ = capfd.readouterr()
+        assert "LOADING" in out
+        assert "ABCD1234" in out
 
 
 # ---------------------------------------------------------------------------

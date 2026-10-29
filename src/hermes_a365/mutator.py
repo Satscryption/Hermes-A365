@@ -31,14 +31,15 @@ exit when one is found.
 from __future__ import annotations
 
 import os
+import queue
 import re
-import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 # Verified in references/a365-cli-reference.md; only .NET ships.
 A365_CLI_BINARY = "a365"
@@ -184,16 +185,18 @@ class A365CliMutator:
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
             except subprocess.TimeoutExpired:
-                # Drop the captured partial output — it may hold the secret.
                 raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from None
         else:
-            returncode, combined = _run_streaming(argv, timeout=timeout, stdin_input=stdin_input)
+            try:
+                returncode, combined = _run_streaming(
+                    argv, timeout=timeout, stdin_input=stdin_input
+                )
+            except subprocess.TimeoutExpired:
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from None
         if returncode != 0:
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
-            # Sensitive runs never surface raw output in exceptions —
-            # callers print those messages (#111 / CS-003).
-            detail = _SENSITIVE_OUTPUT_SUPPRESSED if sensitive else stripped
+            detail = _sensitive_failure_detail(stripped) if sensitive else stripped
             if match:
                 raise AADSTSError(match.group(0), detail)
             raise CliInvocationError(
@@ -211,43 +214,223 @@ class A365CliMutator:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess helpers — streaming (default) and captured (sensitive)
+# Subprocess helpers — streaming (default) and sensitive device-login echo
 # ---------------------------------------------------------------------------
 
 _SENSITIVE_OUTPUT_SUPPRESSED = "<output suppressed: sensitive command may emit credential material>"
 
-# MSAL / Agent 365 CLI device-code prompts (slice 18j + #256). Only these
-# lines may reach the operator's terminal during a sensitive run.
-_DEVICE_CODE_PASSTHROUGH_RE = re.compile(
-    r"(?i)(?:"
-    r"login\.microsoft\.com/device|"
-    r"microsoft\.com/devicelogin|"
-    r"enter the code|"
-    r"device code"
-    r")"
+_READ_CHUNK_BYTES = 4096
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?0-9;]*[ -/]*[@-~]")
+
+_DEVICE_LOGIN_URLS: tuple[tuple[str, str], ...] = (
+    ("https://login.microsoft.com/device", "https://login.microsoft.com/device"),
+    ("https://microsoft.com/devicelogin", "https://microsoft.com/devicelogin"),
 )
 
+_DEVICE_LOGIN_CODE_RE = re.compile(r"(?i)enter the code\s+([A-Z0-9]{8}(?:-[A-Z0-9]{4})?)")
 
-def _sanitize_device_code_passthrough_line(line: str) -> str:
-    """Echo-safe view of a device-code prompt line (#256).
 
-    Strips trailing credential-shaped tokens that sometimes share a line
-    with progress text in GA CLI builds, while keeping the user code and
-    URL the operator must act on.
-    """
-    # Drop ``secret=…`` / ``password": "…`` fragments if ever co-printed.
-    scrubbed = re.sub(
-        r"(?i)(?:client[_ ]?secret|password)\s*[:=]\s*\S+",
-        "<redacted>",
-        line,
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def _parse_device_login(text: str) -> tuple[str, str] | None:
+    """Return canonical URL and user code when a complete prompt is present."""
+    clean = _strip_ansi(text)
+    url_canonical: str | None = None
+    url_pos = -1
+    for needle, canonical in _DEVICE_LOGIN_URLS:
+        idx = clean.lower().find(needle.lower())
+        if idx >= 0:
+            url_canonical = canonical
+            url_pos = idx
+            break
+    if url_canonical is None or url_pos < 0:
+        return None
+    window = clean[url_pos : url_pos + 240]
+    match = _DEVICE_LOGIN_CODE_RE.search(window)
+    if not match:
+        return None
+    code = match.group(1).upper()
+    body = code.replace("-", "")
+    if len(body) != 8 or not body.isalnum():
+        return None
+    return url_canonical, code
+
+
+def _emit_device_login(url: str, code: str, *, emitted: set[tuple[str, str]]) -> None:
+    key = (url, code)
+    if key in emitted:
+        return
+    emitted.add(key)
+    sys.stdout.write(f"To sign in, open {url} and enter the code {code}.\n")
+    sys.stdout.flush()
+
+
+def _scan_text_for_device_login(text: str, *, emitted: set[tuple[str, str]]) -> None:
+    parsed = _parse_device_login(text)
+    if parsed is not None:
+        _emit_device_login(parsed[0], parsed[1], emitted=emitted)
+
+
+def _optional_safe_failure_tail(text: str) -> str | None:
+    """Return a short operator-safe suffix, or ``None`` when unsure."""
+    _ = text
+    return None
+
+
+def _sensitive_failure_detail(stripped: str) -> str:
+    tail = _optional_safe_failure_tail(stripped)
+    if tail:
+        return f"{_SENSITIVE_OUTPUT_SUPPRESSED} ({tail})"
+    return _SENSITIVE_OUTPUT_SUPPRESSED
+
+
+@dataclass
+class _LineBuffer:
+    pending: str = ""
+
+    def feed(self, chunk: bytes) -> list[str]:
+        self.pending += chunk.decode("utf-8", errors="replace")
+        lines: list[str] = []
+        while True:
+            split_at = -1
+            split_len = 0
+            for sep in ("\r\n", "\n", "\r"):
+                idx = self.pending.find(sep)
+                if idx >= 0 and (split_at < 0 or idx < split_at):
+                    split_at = idx
+                    split_len = len(sep)
+            if split_at < 0:
+                break
+            lines.append(self.pending[: split_at + split_len])
+            self.pending = self.pending[split_at + split_len :]
+        return lines
+
+
+def _pump_stream(fd: int, name: str, out_q: queue.Queue[tuple[str, bytes | None]]) -> None:
+    try:
+        while True:
+            try:
+                chunk = os.read(fd, _READ_CHUNK_BYTES)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out_q.put((name, chunk))
+    finally:
+        out_q.put((name, None))
+
+
+def _run_child_output(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdin_input: str | None,
+    echo: Literal["all", "device_login"],
+) -> tuple[int, str]:
+    """Run ``argv`` with chunked reads, deadline enforcement, and optional echo."""
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if stdin_input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
     )
-    return scrubbed
+    assert proc.stdout is not None and proc.stderr is not None
+    out_q: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
+    stdout_fd = proc.stdout.fileno()
+    stderr_fd = proc.stderr.fileno()
+    threads = [
+        threading.Thread(target=_pump_stream, args=(stdout_fd, "stdout", out_q), daemon=True),
+        threading.Thread(target=_pump_stream, args=(stderr_fd, "stderr", out_q), daemon=True),
+    ]
+    for thread in threads:
+        thread.start()
 
+    if stdin_input is not None:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(stdin_input.encode("utf-8"))
+        finally:
+            proc.stdin.close()
 
-def _echo_if_device_code_prompt(line: str) -> None:
-    if _DEVICE_CODE_PASSTHROUGH_RE.search(line):
-        sys.stdout.write(_sanitize_device_code_passthrough_line(line))
-        sys.stdout.flush()
+    captured: list[str] = []
+    stdout_buf = _LineBuffer()
+    stderr_buf = _LineBuffer()
+    eof_seen = {"stdout": False, "stderr": False}
+    emitted_logins: set[tuple[str, str]] = set()
+    deadline = time.monotonic() + timeout
+
+    def _handle_line(line: str, stream: str) -> None:
+        captured.append(line)
+        if echo == "all":
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        elif echo == "device_login":
+            _scan_text_for_device_login(line, emitted=emitted_logins)
+
+    def _handle_pending(buffer: _LineBuffer) -> None:
+        if echo == "device_login" and buffer.pending:
+            _scan_text_for_device_login(buffer.pending, emitted=emitted_logins)
+
+    def _drain_chunk(name: str, chunk: bytes) -> None:
+        buffer = stdout_buf if name == "stdout" else stderr_buf
+        for line in buffer.feed(chunk):
+            _handle_line(line, name)
+
+    def _flush_pending(buffer: _LineBuffer, stream: str) -> None:
+        if not buffer.pending:
+            return
+        tail = buffer.pending
+        buffer.pending = ""
+        captured.append(tail)
+        if echo == "all":
+            sys.stdout.write(tail)
+            sys.stdout.flush()
+        elif echo == "device_login":
+            _scan_text_for_device_login(tail, emitted=emitted_logins)
+
+    def _process_queue_item(name: str, payload: bytes | None) -> None:
+        if payload is None:
+            eof_seen[name] = True
+            buffer = stdout_buf if name == "stdout" else stderr_buf
+            _flush_pending(buffer, name)
+            return
+        _drain_chunk(name, payload)
+        _handle_pending(stdout_buf if name == "stdout" else stderr_buf)
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            proc.kill()
+            proc.wait(timeout=5)
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+        try:
+            name, payload = out_q.get(timeout=min(0.05, max(remaining, 0.0)))
+        except queue.Empty:
+            if proc.poll() is not None:
+                while True:
+                    try:
+                        name, payload = out_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    _process_queue_item(name, payload)
+                _flush_pending(stdout_buf, "stdout")
+                _flush_pending(stderr_buf, "stderr")
+                break
+            continue
+        _process_queue_item(name, payload)
+        if eof_seen["stdout"] and eof_seen["stderr"] and out_q.empty() and proc.poll() is not None:
+            break
+
+    proc.wait(timeout=5)
+    proc.stdout.close()
+    proc.stderr.close()
+    for thread in threads:
+        thread.join(timeout=1.0)
+    return proc.returncode or 0, "".join(captured)
 
 
 def _run_sensitive_streaming(
@@ -256,64 +439,7 @@ def _run_sensitive_streaming(
     timeout: float,
     stdin_input: str | None = None,
 ) -> tuple[int, str]:
-    """Run ``argv`` with output captured and credential lines withheld (#111, #256).
-
-    Like :func:`_run_streaming`, but only device-code sign-in prompt lines
-    are written to the parent's stdout. Everything else (including blueprint
-    client secrets from ``a365 setup blueprint``) stays in the returned
-    string for parsing and AADSTS detection.
-    """
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE if stdin_input is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
-    )
-    if stdin_input is not None:
-        assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_input)
-        finally:
-            proc.stdin.close()
-    assert proc.stdout is not None
-    buf: list[str] = []
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            now = time.monotonic()
-            remaining = deadline - now
-            if remaining <= 0:
-                proc.kill()
-                proc.wait(timeout=5)
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout, output="".join(buf))
-            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
-            if ready:
-                line = proc.stdout.readline()
-                if not line:
-                    break
-                buf.append(line)
-                _echo_if_device_code_prompt(line)
-            elif proc.poll() is not None:
-                tail = proc.stdout.read()
-                if tail:
-                    buf.append(tail)
-                    if "\n" in tail:
-                        *lines, remainder = tail.split("\n")
-                        for line in lines:
-                            _echo_if_device_code_prompt(line + "\n")
-                        if remainder:
-                            _echo_if_device_code_prompt(remainder)
-                    else:
-                        _echo_if_device_code_prompt(tail)
-                break
-    finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    proc.wait(timeout=5)
-    return proc.returncode, "".join(buf)
+    return _run_child_output(argv, timeout=timeout, stdin_input=stdin_input, echo="device_login")
 
 
 def _run_streaming(
@@ -325,73 +451,21 @@ def _run_streaming(
     """Run ``argv`` to completion, streaming combined output to ``sys.stdout``.
 
     Returns ``(returncode, combined_output)``. Raises
-    :class:`subprocess.TimeoutExpired` if the wall-clock deadline is hit
-    (the partial captured output goes into ``output``).
+    :class:`subprocess.TimeoutExpired` without captured output when the
+    wall-clock deadline is hit.
 
     Behaviour:
 
-    - ``stderr=STDOUT`` so chronological order is preserved across the
-      merged stream (a CLI that prints progress on stdout and warnings
-      on stderr would otherwise interleave incoherently).
-    - Lines are written to ``sys.stdout`` as they arrive — the operator
-      sees device-code prompts and CLI progress in real time.
+    - Separate stdout/stderr pipes read in bounded chunks (threaded pumps
+      so Windows hosts behave like POSIX).
+    - Lines are written to ``sys.stdout`` as they arrive.
     - When ``stdin_input`` is provided, the subprocess gets a piped stdin
-      pre-fed with that string (then closed). Slice 18w added this so
-      ``cleanup`` can answer the GA CLI's "Continue with X cleanup?
-      (y/N):" prompts that ``-y`` on the parent doesn't actually
-      suppress for subcommands. Default is ``stdin=None`` (inherit
-      parent stdin), which preserves the device-code-prompt behaviour
-      slice 18j relied on for ``setup`` flows.
+      pre-fed with that string (then closed).
     - The captured copy is returned for AADSTS detection in :meth:`run`.
 
     Tests patch this helper directly rather than reaching into Popen.
     """
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE if stdin_input is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
-    )
-    if stdin_input is not None:
-        assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_input)
-        finally:
-            proc.stdin.close()
-    assert proc.stdout is not None  # for type checkers; guaranteed by stdout=PIPE
-    buf: list[str] = []
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            now = time.monotonic()
-            remaining = deadline - now
-            if remaining <= 0:
-                proc.kill()
-                proc.wait(timeout=5)
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout, output="".join(buf))
-            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
-            if ready:
-                line = proc.stdout.readline()
-                if not line:
-                    break  # EOF
-                buf.append(line)
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            elif proc.poll() is not None:
-                tail = proc.stdout.read()
-                if tail:
-                    buf.append(tail)
-                    sys.stdout.write(tail)
-                    sys.stdout.flush()
-                break
-    finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    proc.wait(timeout=5)
-    return proc.returncode, "".join(buf)
+    return _run_child_output(argv, timeout=timeout, stdin_input=stdin_input, echo="all")
 
 
 def get_mutator() -> Mutator:
