@@ -943,6 +943,8 @@ class TestValidateInboundJwt:
             return {"fresh": object()}
 
         start = 10_000.0
+        import asyncio
+
         await _refresh_jwks(cache, fetch, now=start, force=True, unknown_kid="kid-a")
         await _refresh_jwks(
             cache,
@@ -952,6 +954,7 @@ class TestValidateInboundJwt:
             unknown_kid="kid-a",
         )
         assert fetch_count["n"] == 1
+        await asyncio.sleep(JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS)
         await _refresh_jwks(
             cache,
             fetch,
@@ -960,6 +963,7 @@ class TestValidateInboundJwt:
             unknown_kid="kid-a",
         )
         assert fetch_count["n"] == 2
+        await asyncio.sleep(JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS)
         await _refresh_jwks(
             cache,
             fetch,
@@ -970,6 +974,78 @@ class TestValidateInboundJwt:
             unknown_kid="kid-b",
         )
         assert fetch_count["n"] == 3
+
+    async def test_distinct_kids_during_slow_failing_fetch_respect_global_floor(self) -> None:
+        import asyncio
+
+        from hermes_a365.activity_bridge import _refresh_jwks
+
+        cache = _JwksCache()
+        cache.keys_by_kid = {"old": object()}
+        cache.fetched_at = 900.0
+        attempts = {"n": 0}
+        gate = asyncio.Event()
+
+        async def slow_fail() -> dict[str, Any]:
+            attempts["n"] += 1
+            await gate.wait()
+            raise RuntimeError("boom")
+
+        leader = asyncio.create_task(
+            _refresh_jwks(cache, slow_fail, now=0.0, force=True, unknown_kid="kid-a")
+        )
+        await asyncio.sleep(0.05)
+        follower_b = asyncio.create_task(
+            _refresh_jwks(cache, slow_fail, now=2.103, force=True, unknown_kid="kid-b")
+        )
+        follower_c = asyncio.create_task(
+            _refresh_jwks(cache, slow_fail, now=2.103, force=True, unknown_kid="kid-c")
+        )
+        gate.set()
+        results = await asyncio.gather(leader, follower_b, follower_c)
+        assert attempts["n"] == 1
+        assert all(result is cache.keys_by_kid for result in results)
+
+    async def test_forced_refresh_spaced_timestamps_after_failure_share_one_fetch(
+        self,
+    ) -> None:
+        import asyncio
+
+        from hermes_a365.activity_bridge import (
+            JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS,
+            _refresh_jwks,
+        )
+
+        cache = _JwksCache()
+        cache.keys_by_kid = {"old": object()}
+        cache.fetched_at = 900.0
+        attempts = {"n": 0}
+        gate = asyncio.Event()
+
+        async def slow_fail() -> dict[str, Any]:
+            attempts["n"] += 1
+            await gate.wait()
+            raise RuntimeError("boom")
+
+        leader = asyncio.create_task(
+            _refresh_jwks(cache, slow_fail, now=0.0, force=True, unknown_kid="kid-a")
+        )
+        await asyncio.sleep(0.05)
+        follower = asyncio.create_task(
+            _refresh_jwks(cache, slow_fail, now=2.103, force=True, unknown_kid="kid-b")
+        )
+        gate.set()
+        await asyncio.gather(leader, follower)
+        assert attempts["n"] == 1
+
+        await asyncio.sleep(JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS + 0.05)
+
+        async def fetch_ok() -> dict[str, Any]:
+            attempts["n"] += 1
+            return {"fresh": object()}
+
+        await _refresh_jwks(cache, fetch_ok, now=5_000.0, force=True, unknown_kid="kid-c")
+        assert attempts["n"] == 2
 
     async def test_concurrent_unknown_kid_coalesces_to_one_fetch(
         self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
@@ -1066,6 +1142,11 @@ class TestValidateInboundJwt:
                     now=fixed_now + 1.0,
                 )
             assert request_count["n"] == 2
+            import asyncio
+
+            from hermes_a365.activity_bridge import JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS
+
+            await asyncio.sleep(JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS)
             await validate_inbound_jwt(
                 token=token,
                 tenant_id=TEST_TENANT_ID,
@@ -1136,6 +1217,11 @@ class TestValidateInboundJwt:
                 )
             assert request_count["n"] == 2
             cache.keys_by_kid = {"stale-kid": _jwt.PyJWK({**good_jwk, "kid": "stale-kid"})}
+            import asyncio
+
+            from hermes_a365.activity_bridge import JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS
+
+            await asyncio.sleep(JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS)
             await validate_inbound_jwt(
                 token=good_token,
                 tenant_id=TEST_TENANT_ID,
@@ -1171,7 +1257,8 @@ class TestValidateInboundJwt:
         assert attempts["n"] == 1
         assert results[0] is cache.keys_by_kid
         assert results[1] is cache.keys_by_kid
-        assert cache.last_forced_refresh_at == 1_000.0
+
+        await asyncio.sleep(JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS + 0.05)
 
         async def fetch_again() -> dict[str, Any]:
             attempts["n"] += 1
@@ -1180,11 +1267,11 @@ class TestValidateInboundJwt:
         await _refresh_jwks(
             cache,
             fetch_again,
-            now=1_000.0 + JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS - 0.1,
+            now=5_000.0,
             force=True,
             unknown_kid="k",
         )
-        assert attempts["n"] == 1
+        assert attempts["n"] == 2
 
     async def test_concurrent_forced_refresh_honours_prefetch_stamp_when_fetch_hangs(
         self,
@@ -1212,7 +1299,8 @@ class TestValidateInboundJwt:
             _refresh_jwks(cache, slow_fetch, now=2_000.0, force=True, unknown_kid="k")
         )
         await started.wait()
-        assert cache.last_forced_refresh_at == 2_000.0
+        assert cache.last_forced_refresh_attempt_mono == 0.0
+        assert cache.forced_refresh_inflight is not None
 
         follower = asyncio.create_task(
             _refresh_jwks(cache, slow_fetch, now=2_000.0, force=True, unknown_kid="k")
@@ -1222,6 +1310,9 @@ class TestValidateInboundJwt:
         await leader
         await follower
         assert attempts["n"] == 1
+        assert cache.last_forced_refresh_attempt_mono > 0.0
+
+        await asyncio.sleep(JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS + 0.05)
 
         async def fetch_again() -> dict[str, Any]:
             attempts["n"] += 1
@@ -1230,11 +1321,11 @@ class TestValidateInboundJwt:
         await _refresh_jwks(
             cache,
             fetch_again,
-            now=2_000.0 + JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS - 0.1,
+            now=2_000.0,
             force=True,
-            unknown_kid="k",
+            unknown_kid="k2",
         )
-        assert attempts["n"] == 1
+        assert attempts["n"] == 2
 
 
 # ---------------------------------------------------------------------------

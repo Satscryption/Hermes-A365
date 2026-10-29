@@ -1010,10 +1010,9 @@ JWKS_CACHE_GRACE_SECONDS = 300.0
 JWKS_FORCED_REFRESH_MIN_INTERVAL_SECONDS = 60.0
 # LRU cap on negative ``kid`` entries (bounds memory and cycling attacks).
 JWKS_FORCED_REFRESH_NEGATIVE_KID_MAX_ENTRIES = 128
-# Minimum wall time between *any* two forced JWKS fetches on one cache. With the
-# per-``kid`` window above, a single ``kid`` still triggers at most one fetch per
-# 60s; distinct ``kid`` values can each fetch, but this floor caps the aggregate
-# rate at roughly one forced fetch per second (~60/min) per cache.
+# Minimum monotonic time between *any* two forced JWKS fetch attempts on one cache
+# (success or failure). Distinct ``kid`` values can each attempt, but this floor
+# caps the aggregate rate at roughly one attempt per second (~60/min) per cache.
 JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS = 1.0
 MAX_ACTIVITY_BODY_BYTES = 1024 * 1024
 MAX_JWT_BYTES = 16 * 1024
@@ -1870,7 +1869,9 @@ class _JwksCache:
     refresh_lock: asyncio.Lock = field(default_factory=asyncio.Lock, repr=False)
     failure_count: int = 0
     retry_after: float = 0.0
-    last_forced_refresh_at: float = 0.0
+    last_forced_refresh_attempt_mono: float = 0.0
+    last_forced_refresh_failed: bool = field(default=False, repr=False)
+    forced_refresh_inflight: asyncio.Future[None] | None = field(default=None, repr=False)
     forced_refresh_negative_kids: OrderedDict[str, float] = field(
         default_factory=OrderedDict, repr=False
     )
@@ -1924,6 +1925,22 @@ def _note_forced_refresh_attempt_for_kid(cache: _JwksCache, kid: str, now: float
         cache.forced_refresh_negative_kids.popitem(last=False)
 
 
+def _forced_refresh_global_floor_blocks(cache: _JwksCache, lock_mono: float) -> bool:
+    if not cache.last_forced_refresh_attempt_mono:
+        return False
+    return (
+        lock_mono - cache.last_forced_refresh_attempt_mono
+    ) < JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS
+
+
+def _forced_refresh_shared_outcome(cache: _JwksCache, now: float) -> dict[str, Any]:
+    if _jwks_last_known_good_allowed(cache, now):
+        return cache.keys_by_kid
+    if cache.last_forced_refresh_failed:
+        raise JwtValidationError("JWKS refresh failed")
+    return cache.keys_by_kid
+
+
 async def _refresh_jwks(
     cache: _JwksCache,
     fetch: Any,
@@ -1933,6 +1950,8 @@ async def _refresh_jwks(
     unknown_kid: str | None = None,
 ) -> dict[str, Any]:
     """Single-flight JWKS refresh with failure backoff and bounded staleness."""
+    import time as _time
+
     fetched_at_before_wait = cache.fetched_at
     if not force and cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
         return cache.keys_by_kid
@@ -1940,48 +1959,99 @@ async def _refresh_jwks(
         if _jwks_last_known_good_allowed(cache, now):
             return cache.keys_by_kid
         raise JwtValidationError("JWKS refresh temporarily unavailable")
-    async with cache.refresh_lock:
-        if cache.keys_by_kid and cache.fetched_at > fetched_at_before_wait:
-            return cache.keys_by_kid
-        if not force and cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
-            return cache.keys_by_kid
+
+    while True:
         if force:
-            if unknown_kid and _forced_refresh_negative_kid_blocks(cache, unknown_kid, now):
+            inflight = cache.forced_refresh_inflight
+            if inflight is not None:
+                await inflight
+                return _forced_refresh_shared_outcome(cache, now)
+
+        leader = False
+        async with cache.refresh_lock:
+            lock_mono = _time.monotonic()
+            if cache.keys_by_kid and cache.fetched_at > fetched_at_before_wait:
                 return cache.keys_by_kid
-            if (
-                cache.last_forced_refresh_at
-                and (now - cache.last_forced_refresh_at)
-                < JWKS_FORCED_REFRESH_GLOBAL_MIN_INTERVAL_SECONDS
-            ):
+            if not force and cache.keys_by_kid and (now - cache.fetched_at) < cache.ttl_seconds:
                 return cache.keys_by_kid
-        if not force and now < cache.retry_after:
-            if _jwks_last_known_good_allowed(cache, now):
-                return cache.keys_by_kid
-            raise JwtValidationError("JWKS refresh temporarily unavailable")
-        if force:
-            cache.last_forced_refresh_at = now
-            if unknown_kid:
-                _note_forced_refresh_attempt_for_kid(cache, unknown_kid, now)
+            if force:
+                if unknown_kid and _forced_refresh_negative_kid_blocks(cache, unknown_kid, now):
+                    return cache.keys_by_kid
+                if _forced_refresh_global_floor_blocks(cache, lock_mono):
+                    return _forced_refresh_shared_outcome(cache, now)
+                if cache.forced_refresh_inflight is not None:
+                    continue
+                if unknown_kid:
+                    _note_forced_refresh_attempt_for_kid(cache, unknown_kid, now)
+                cache.last_forced_refresh_failed = False
+                cache.forced_refresh_inflight = asyncio.get_running_loop().create_future()
+                leader = True
+            elif now < cache.retry_after:
+                if _jwks_last_known_good_allowed(cache, now):
+                    return cache.keys_by_kid
+                raise JwtValidationError("JWKS refresh temporarily unavailable")
+            else:
+                try:
+                    keys = await fetch()
+                    if not keys:
+                        raise JwtValidationError("JWKS document contained no usable keys")
+                except Exception as exc:
+                    cache.failure_count += 1
+                    cache.retry_after = now + min(
+                        JWKS_FAILURE_BACKOFF_MAX_SECONDS,
+                        float(2 ** min(cache.failure_count, 6)),
+                    )
+                    if _jwks_last_known_good_allowed(cache, now):
+                        logger.warning("JWKS refresh failed; using last-known-good keys")
+                        return cache.keys_by_kid
+                    if isinstance(exc, JwtValidationError):
+                        raise
+                    raise JwtValidationError("JWKS refresh failed") from exc
+                cache.keys_by_kid = keys
+                cache.fetched_at = now
+                cache.failure_count = 0
+                cache.retry_after = 0.0
+                return keys
+
+        if not leader:
+            continue
+
+        inflight = cache.forced_refresh_inflight
+        assert inflight is not None
         try:
             keys = await fetch()
             if not keys:
                 raise JwtValidationError("JWKS document contained no usable keys")
+            async with cache.refresh_lock:
+                cache.keys_by_kid = keys
+                cache.fetched_at = now
+                cache.failure_count = 0
+                cache.retry_after = 0.0
+                cache.last_forced_refresh_failed = False
+                cache.last_forced_refresh_attempt_mono = _time.monotonic()
+            return keys
         except Exception as exc:
-            cache.failure_count += 1
-            cache.retry_after = now + min(
-                JWKS_FAILURE_BACKOFF_MAX_SECONDS, float(2 ** min(cache.failure_count, 6))
-            )
-            if _jwks_last_known_good_allowed(cache, now):
+            async with cache.refresh_lock:
+                cache.failure_count += 1
+                cache.retry_after = now + min(
+                    JWKS_FAILURE_BACKOFF_MAX_SECONDS,
+                    float(2 ** min(cache.failure_count, 6)),
+                )
+                cache.last_forced_refresh_attempt_mono = _time.monotonic()
+                lkg = _jwks_last_known_good_allowed(cache, now)
+                cache.last_forced_refresh_failed = not lkg
+            if lkg:
                 logger.warning("JWKS refresh failed; using last-known-good keys")
                 return cache.keys_by_kid
             if isinstance(exc, JwtValidationError):
                 raise
             raise JwtValidationError("JWKS refresh failed") from exc
-        cache.keys_by_kid = keys
-        cache.fetched_at = now
-        cache.failure_count = 0
-        cache.retry_after = 0.0
-        return keys
+        finally:
+            async with cache.refresh_lock:
+                done = cache.forced_refresh_inflight
+                if done is not None and not done.done():
+                    done.set_result(None)
+                cache.forced_refresh_inflight = None
 
 
 # Slice 19i: in-memory dedupe of inbound BF / A365 activity deliveries.
