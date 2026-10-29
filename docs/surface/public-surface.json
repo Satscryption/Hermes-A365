@@ -1,0 +1,2326 @@
+{
+  "a365_config_fields": [
+    "tenantId",
+    "clientAppId",
+    "subscriptionId",
+    "resourceGroup",
+    "location",
+    "environment",
+    "appServicePlanName",
+    "appServicePlanSku",
+    "webAppName",
+    "agentIdentityDisplayName",
+    "agentBlueprintDisplayName",
+    "agentUserPrincipalName",
+    "agentUserDisplayName",
+    "managerEmail",
+    "agentUserUsageLocation",
+    "deploymentProjectPath",
+    "agentDescription"
+  ],
+  "adapter_members_live": [
+    "build_app",
+    "connect",
+    "disconnect",
+    "edit_message",
+    "get_chat_info",
+    "message_len_fn",
+    "name",
+    "on_processing_complete",
+    "on_processing_start",
+    "prune_conversations",
+    "send",
+    "send_clarify",
+    "send_document",
+    "send_exec_approval",
+    "send_image",
+    "send_image_file",
+    "send_or_update_status",
+    "send_private_notice",
+    "send_slash_confirm",
+    "send_typing",
+    "streaming_overflow_limit"
+  ],
+  "adapter_public_members": [
+    "build_app",
+    "connect",
+    "disconnect",
+    "edit_message",
+    "get_chat_info",
+    "message_len_fn",
+    "name",
+    "on_processing_complete",
+    "on_processing_start",
+    "prune_conversations",
+    "send",
+    "send_clarify",
+    "send_document",
+    "send_exec_approval",
+    "send_image",
+    "send_image_file",
+    "send_or_update_status",
+    "send_private_notice",
+    "send_slash_confirm",
+    "send_typing",
+    "streaming_overflow_limit"
+  ],
+  "cli": {
+    "plugin": {
+      "actions": [
+        {
+          "choices": [
+            "activity-bridge",
+            "bot-service",
+            "cleanup",
+            "consent",
+            "doctor",
+            "instance",
+            "license",
+            "publish",
+            "register",
+            "status"
+          ],
+          "dest": "a365_command",
+          "option_strings": [],
+          "required": false
+        }
+      ],
+      "prog": "hermes a365",
+      "subparsers": {
+        "activity-bridge": {
+          "actions": [
+            {
+              "choices": [
+                "serve",
+                "update-endpoint",
+                "verify"
+              ],
+              "dest": "cmd",
+              "option_strings": [
+                "cmd"
+              ],
+              "required": true
+            }
+          ],
+          "prog": "hermes a365 activity-bridge",
+          "subparsers": {
+            "serve": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "host",
+                  "option_strings": [
+                    "--host"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_jwt_validation",
+                  "option_strings": [
+                    "--no-jwt-validation"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "port",
+                  "option_strings": [
+                    "--port"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "webhook",
+                  "option_strings": [
+                    "--webhook"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes a365 activity-bridge serve",
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_m365",
+                  "option_strings": [
+                    "--no-m365"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes a365 activity-bridge update-endpoint",
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "human",
+                  "option_strings": [
+                    "--human"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes a365 activity-bridge verify",
+              "subparsers": {}
+            }
+          }
+        },
+        "bot-service": {
+          "actions": [
+            {
+              "choices": [
+                "cleanup",
+                "create",
+                "enable-channel",
+                "update-endpoint",
+                "verify"
+              ],
+              "dest": "bot_service_command",
+              "option_strings": [
+                "bot_service_command"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 bot-service",
+          "subparsers": {
+            "cleanup": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm",
+                  "option_strings": [
+                    "--confirm"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "purge_resource_group",
+                  "option_strings": [
+                    "--purge-resource-group"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes a365 bot-service cleanup",
+              "subparsers": {}
+            },
+            "create": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "app_id",
+                  "option_strings": [
+                    "--appid",
+                    "--bf-app-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "bot_name",
+                  "option_strings": [
+                    "--bot-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "endpoint",
+                  "option_strings": [
+                    "--endpoint"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "region",
+                  "option_strings": [
+                    "--region"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "resource_group",
+                  "option_strings": [
+                    "--resource-group"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sku",
+                  "option_strings": [
+                    "--sku"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "subscription_id",
+                  "option_strings": [
+                    "--subscription-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes a365 bot-service create",
+              "subparsers": {}
+            },
+            "enable-channel": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "choices": [
+                    "msteams"
+                  ],
+                  "dest": "channel",
+                  "option_strings": [
+                    "--channel"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes a365 bot-service enable-channel",
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes a365 bot-service update-endpoint",
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "directline_probe",
+                  "option_strings": [
+                    "--directline-probe"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes a365 bot-service verify",
+              "subparsers": {}
+            }
+          }
+        },
+        "cleanup": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "apply",
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm",
+              "option_strings": [
+                "--confirm"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_bot_target",
+              "option_strings": [
+                "--confirm-bot-target"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_legacy_binding",
+              "option_strings": [
+                "--confirm-legacy-binding"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan",
+              "option_strings": [
+                "--confirm-orphan"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan_user",
+              "option_strings": [
+                "--confirm-orphan-user"
+              ],
+              "required": false
+            },
+            {
+              "dest": "kinds",
+              "option_strings": [
+                "--kinds"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_instance_id",
+              "option_strings": [
+                "--orphan-instance-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_user_id",
+              "option_strings": [
+                "--orphan-user-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "purge_orphans",
+              "option_strings": [
+                "--purge-orphans"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 cleanup",
+          "subparsers": {}
+        },
+        "consent": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "agent_name"
+              ],
+              "required": false
+            },
+            {
+              "dest": "interval",
+              "option_strings": [
+                "--interval"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_open",
+              "option_strings": [
+                "--no-open"
+              ],
+              "required": false
+            },
+            {
+              "dest": "print_url_only",
+              "option_strings": [
+                "--print-url-only"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "timeout",
+              "option_strings": [
+                "--timeout"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 consent",
+          "subparsers": {}
+        },
+        "doctor": {
+          "actions": [
+            {
+              "dest": "human",
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_network",
+              "option_strings": [
+                "--no-network"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 doctor",
+          "subparsers": {}
+        },
+        "instance": {
+          "actions": [
+            {
+              "choices": [
+                "create"
+              ],
+              "dest": "instance_command",
+              "option_strings": [],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 instance",
+          "subparsers": {
+            "create": {
+              "actions": [
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_end",
+                  "option_strings": [
+                    "--business-hours-end"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_start",
+                  "option_strings": [
+                    "--business-hours-start"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_tz",
+                  "option_strings": [
+                    "--business-hours-tz"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "otlp_endpoint",
+                  "option_strings": [
+                    "--otlp-endpoint"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "owner",
+                  "option_strings": [
+                    "--owner"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "owner_aad_id",
+                  "option_strings": [
+                    "--owner-aad-id"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "slug"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes a365 instance create",
+              "subparsers": {}
+            }
+          }
+        },
+        "license": {
+          "actions": [
+            {
+              "dest": "agents",
+              "option_strings": [
+                "--agents"
+              ],
+              "required": true
+            },
+            {
+              "dest": "bundled_security",
+              "option_strings": [
+                "--bundled-security"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "E3",
+                "E5",
+                "E7"
+              ],
+              "dest": "plan",
+              "option_strings": [
+                "--plan"
+              ],
+              "required": true
+            },
+            {
+              "dest": "users",
+              "option_strings": [
+                "--users"
+              ],
+              "required": true
+            }
+          ],
+          "prog": "hermes a365 license",
+          "subparsers": {}
+        },
+        "publish": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "app_version",
+              "option_strings": [
+                "--app-version"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "bot_id",
+              "option_strings": [
+                "--bot-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "copilot_chat",
+              "option_strings": [
+                "--copilot-chat"
+              ],
+              "required": false
+            },
+            {
+              "dest": "manifest_id",
+              "option_strings": [
+                "--manifest-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "profile",
+              "option_strings": [
+                "--profile"
+              ],
+              "required": false
+            },
+            {
+              "dest": "prompt_starter",
+              "option_strings": [
+                "--prompt-starter"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "use_blueprint",
+              "option_strings": [
+                "--use-blueprint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "verbose",
+              "option_strings": [
+                "--verbose"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 publish",
+          "subparsers": {}
+        },
+        "register": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "both",
+                "obo",
+                "s2s"
+              ],
+              "dest": "authmode",
+              "option_strings": [
+                "--authmode"
+              ],
+              "required": false
+            },
+            {
+              "dest": "auto_recover_secret",
+              "option_strings": [
+                "--auto-recover-secret"
+              ],
+              "required": false
+            },
+            {
+              "dest": "backoff",
+              "option_strings": [
+                "--backoff"
+              ],
+              "required": false
+            },
+            {
+              "dest": "config",
+              "option_strings": [
+                "--config"
+              ],
+              "required": false
+            },
+            {
+              "dest": "m365",
+              "option_strings": [
+                "--m365"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_endpoint",
+              "option_strings": [
+                "--no-endpoint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "retries",
+              "option_strings": [
+                "--retries"
+              ],
+              "required": false
+            },
+            {
+              "dest": "skip_requirements",
+              "option_strings": [
+                "--skip-requirements"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "update_permissions",
+              "option_strings": [
+                "--update-permissions"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 register",
+          "subparsers": {}
+        },
+        "status": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "agent_name"
+              ],
+              "required": false
+            },
+            {
+              "dest": "human",
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes a365 status",
+          "subparsers": {}
+        }
+      }
+    },
+    "standalone": {
+      "actions": [
+        {
+          "choices": [
+            "activity-bridge",
+            "bot-service",
+            "cleanup",
+            "consent",
+            "doctor",
+            "instance",
+            "license",
+            "publish",
+            "register",
+            "status"
+          ],
+          "dest": "a365_command",
+          "option_strings": [],
+          "required": false
+        }
+      ],
+      "prog": "hermes-a365",
+      "subparsers": {
+        "activity-bridge": {
+          "actions": [
+            {
+              "choices": [
+                "serve",
+                "update-endpoint",
+                "verify"
+              ],
+              "dest": "cmd",
+              "option_strings": [
+                "cmd"
+              ],
+              "required": true
+            }
+          ],
+          "prog": "hermes-a365 activity-bridge",
+          "subparsers": {
+            "serve": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "host",
+                  "option_strings": [
+                    "--host"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_jwt_validation",
+                  "option_strings": [
+                    "--no-jwt-validation"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "port",
+                  "option_strings": [
+                    "--port"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "webhook",
+                  "option_strings": [
+                    "--webhook"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes-a365 activity-bridge serve",
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_m365",
+                  "option_strings": [
+                    "--no-m365"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes-a365 activity-bridge update-endpoint",
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "human",
+                  "option_strings": [
+                    "--human"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes-a365 activity-bridge verify",
+              "subparsers": {}
+            }
+          }
+        },
+        "bot-service": {
+          "actions": [
+            {
+              "choices": [
+                "cleanup",
+                "create",
+                "enable-channel",
+                "update-endpoint",
+                "verify"
+              ],
+              "dest": "bot_service_command",
+              "option_strings": [
+                "bot_service_command"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 bot-service",
+          "subparsers": {
+            "cleanup": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm",
+                  "option_strings": [
+                    "--confirm"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "purge_resource_group",
+                  "option_strings": [
+                    "--purge-resource-group"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes-a365 bot-service cleanup",
+              "subparsers": {}
+            },
+            "create": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "app_id",
+                  "option_strings": [
+                    "--appid",
+                    "--bf-app-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "bot_name",
+                  "option_strings": [
+                    "--bot-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "endpoint",
+                  "option_strings": [
+                    "--endpoint"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "region",
+                  "option_strings": [
+                    "--region"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "resource_group",
+                  "option_strings": [
+                    "--resource-group"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sku",
+                  "option_strings": [
+                    "--sku"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "subscription_id",
+                  "option_strings": [
+                    "--subscription-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes-a365 bot-service create",
+              "subparsers": {}
+            },
+            "enable-channel": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "choices": [
+                    "msteams"
+                  ],
+                  "dest": "channel",
+                  "option_strings": [
+                    "--channel"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes-a365 bot-service enable-channel",
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes-a365 bot-service update-endpoint",
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "directline_probe",
+                  "option_strings": [
+                    "--directline-probe"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "prog": "hermes-a365 bot-service verify",
+              "subparsers": {}
+            }
+          }
+        },
+        "cleanup": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "apply",
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm",
+              "option_strings": [
+                "--confirm"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_bot_target",
+              "option_strings": [
+                "--confirm-bot-target"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_legacy_binding",
+              "option_strings": [
+                "--confirm-legacy-binding"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan",
+              "option_strings": [
+                "--confirm-orphan"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan_user",
+              "option_strings": [
+                "--confirm-orphan-user"
+              ],
+              "required": false
+            },
+            {
+              "dest": "kinds",
+              "option_strings": [
+                "--kinds"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_instance_id",
+              "option_strings": [
+                "--orphan-instance-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_user_id",
+              "option_strings": [
+                "--orphan-user-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "purge_orphans",
+              "option_strings": [
+                "--purge-orphans"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 cleanup",
+          "subparsers": {}
+        },
+        "consent": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "agent_name"
+              ],
+              "required": false
+            },
+            {
+              "dest": "interval",
+              "option_strings": [
+                "--interval"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_open",
+              "option_strings": [
+                "--no-open"
+              ],
+              "required": false
+            },
+            {
+              "dest": "print_url_only",
+              "option_strings": [
+                "--print-url-only"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "timeout",
+              "option_strings": [
+                "--timeout"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 consent",
+          "subparsers": {}
+        },
+        "doctor": {
+          "actions": [
+            {
+              "dest": "human",
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_network",
+              "option_strings": [
+                "--no-network"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 doctor",
+          "subparsers": {}
+        },
+        "instance": {
+          "actions": [
+            {
+              "choices": [
+                "create"
+              ],
+              "dest": "instance_command",
+              "option_strings": [],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 instance",
+          "subparsers": {
+            "create": {
+              "actions": [
+                {
+                  "dest": "apply",
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_end",
+                  "option_strings": [
+                    "--business-hours-end"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_start",
+                  "option_strings": [
+                    "--business-hours-start"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_tz",
+                  "option_strings": [
+                    "--business-hours-tz"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "otlp_endpoint",
+                  "option_strings": [
+                    "--otlp-endpoint"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "owner",
+                  "option_strings": [
+                    "--owner"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "owner_aad_id",
+                  "option_strings": [
+                    "--owner-aad-id"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "slug"
+                  ],
+                  "required": true
+                }
+              ],
+              "prog": "hermes-a365 instance create",
+              "subparsers": {}
+            }
+          }
+        },
+        "license": {
+          "actions": [
+            {
+              "dest": "agents",
+              "option_strings": [
+                "--agents"
+              ],
+              "required": true
+            },
+            {
+              "dest": "bundled_security",
+              "option_strings": [
+                "--bundled-security"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "E3",
+                "E5",
+                "E7"
+              ],
+              "dest": "plan",
+              "option_strings": [
+                "--plan"
+              ],
+              "required": true
+            },
+            {
+              "dest": "users",
+              "option_strings": [
+                "--users"
+              ],
+              "required": true
+            }
+          ],
+          "prog": "hermes-a365 license",
+          "subparsers": {}
+        },
+        "publish": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "app_version",
+              "option_strings": [
+                "--app-version"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "bot_id",
+              "option_strings": [
+                "--bot-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "copilot_chat",
+              "option_strings": [
+                "--copilot-chat"
+              ],
+              "required": false
+            },
+            {
+              "dest": "manifest_id",
+              "option_strings": [
+                "--manifest-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "profile",
+              "option_strings": [
+                "--profile"
+              ],
+              "required": false
+            },
+            {
+              "dest": "prompt_starter",
+              "option_strings": [
+                "--prompt-starter"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "use_blueprint",
+              "option_strings": [
+                "--use-blueprint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "verbose",
+              "option_strings": [
+                "--verbose"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 publish",
+          "subparsers": {}
+        },
+        "register": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "both",
+                "obo",
+                "s2s"
+              ],
+              "dest": "authmode",
+              "option_strings": [
+                "--authmode"
+              ],
+              "required": false
+            },
+            {
+              "dest": "auto_recover_secret",
+              "option_strings": [
+                "--auto-recover-secret"
+              ],
+              "required": false
+            },
+            {
+              "dest": "backoff",
+              "option_strings": [
+                "--backoff"
+              ],
+              "required": false
+            },
+            {
+              "dest": "config",
+              "option_strings": [
+                "--config"
+              ],
+              "required": false
+            },
+            {
+              "dest": "m365",
+              "option_strings": [
+                "--m365"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_endpoint",
+              "option_strings": [
+                "--no-endpoint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "retries",
+              "option_strings": [
+                "--retries"
+              ],
+              "required": false
+            },
+            {
+              "dest": "skip_requirements",
+              "option_strings": [
+                "--skip-requirements"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "update_permissions",
+              "option_strings": [
+                "--update-permissions"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 register",
+          "subparsers": {}
+        },
+        "status": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "agent_name"
+              ],
+              "required": false
+            },
+            {
+              "dest": "human",
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "prog": "hermes-a365 status",
+          "subparsers": {}
+        }
+      }
+    }
+  },
+  "env_classification": {
+    "A365_AGENT_IDENTITY_IDS": "public",
+    "A365_ALLOWED_USERS": "public",
+    "A365_ALLOW_ALL_USERS": "public",
+    "A365_APP_ID": "public",
+    "A365_BF_APP_ID": "public",
+    "A365_BF_CLIENT_SECRET": "public",
+    "A365_BLUEPRINT_CLIENT_SECRET": "public",
+    "A365_CLIENT_APP_NAME": "public",
+    "A365_CONVERSATIONS_PATH": "public",
+    "A365_FEEDBACK_LOOP": "public",
+    "A365_FILE_HOST_ALLOWLIST": "public",
+    "A365_GENERATED_CONFIG_PATH": "public",
+    "A365_HANDOFF_LINK": "public",
+    "A365_TENANT_ID": "public",
+    "HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI": "public",
+    "HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC": "public",
+    "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC": "public",
+    "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC": "public",
+    "HERMES_BRIDGE_PORT": "public",
+    "HERMES_BRIDGE_WEBHOOK": "public",
+    "HERMES_GATEWAY_PROFILE": "public",
+    "HERMES_HOME": "public",
+    "HERMES_OTLP_ENDPOINT": "public",
+    "HERMES_PROFILE": "public",
+    "HERMES_RESPONDER_HISTORY_TOKEN": "public"
+  },
+  "env_literals_scanned": [
+    "A365_AGENT_IDENTITY_IDS",
+    "A365_ALLOWED_USERS",
+    "A365_ALLOW_ALL_USERS",
+    "A365_APP_ID",
+    "A365_BF_APP_ID",
+    "A365_BF_CLIENT_SECRET",
+    "A365_BLUEPRINT_CLIENT_SECRET",
+    "A365_CLIENT_APP_NAME",
+    "A365_CONVERSATIONS_PATH",
+    "A365_FEEDBACK_LOOP",
+    "A365_FILE_HOST_ALLOWLIST",
+    "A365_GENERATED_CONFIG_PATH",
+    "A365_HANDOFF_LINK",
+    "A365_TENANT_ID",
+    "HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI",
+    "HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC",
+    "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC",
+    "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC",
+    "HERMES_BRIDGE_PORT",
+    "HERMES_BRIDGE_WEBHOOK",
+    "HERMES_GATEWAY_PROFILE",
+    "HERMES_HOME",
+    "HERMES_OTLP_ENDPOINT",
+    "HERMES_PROFILE",
+    "HERMES_RESPONDER_HISTORY_TOKEN"
+  ],
+  "exit_codes": {
+    "activity_bridge_verify": {
+      "error": 2,
+      "ok": 0,
+      "warn": 1
+    },
+    "bot_service": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "bot_service_verify": [
+      0,
+      1
+    ],
+    "cleanup": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "consent": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "doctor": {
+      "error": 2,
+      "ok": 0,
+      "warn": 1
+    },
+    "instance_create": [
+      0,
+      2
+    ],
+    "license": [
+      0,
+      2
+    ],
+    "missing_verb_or_usage": 2,
+    "publish_run": [
+      0,
+      2
+    ],
+    "register": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "register_aiteammate": 2,
+    "status": {
+      "broken": 2,
+      "ok": 0,
+      "partial": 1,
+      "uninitialized": 3
+    }
+  },
+  "gateway_extra_keys": [
+    "slug",
+    "port",
+    "host",
+    "tenant_id",
+    "app_id",
+    "blueprint_client_secret",
+    "bf_app_id",
+    "bf_client_secret",
+    "generated_config_path",
+    "conversations_path",
+    "conversations_prune_max_age_days",
+    "idempotency_max_entries",
+    "file_host_allowlist",
+    "agent_identity_ids",
+    "notice_delivery",
+    "reactions_dispatch_agent_turn",
+    "group_sessions_per_user",
+    "thread_sessions_per_user"
+  ],
+  "hermes_owned_sidecars": [
+    {
+      "location": "cwd",
+      "path": "a365.bot-service.config.json",
+      "schema_version_read": [
+        1,
+        2
+      ],
+      "schema_version_write": 2
+    },
+    {
+      "path": "~/.hermes/agents/<slug>/copilot-chat-publish.json",
+      "schema_version_read": [
+        1,
+        2
+      ],
+      "schema_version_write": 2
+    },
+    {
+      "missing_version_means": 1,
+      "path": "~/.hermes/agents/<slug>/conversations.json",
+      "schema_version_read": [
+        1
+      ],
+      "schema_version_write": 1
+    }
+  ],
+  "http_routes_live": [
+    {
+      "method": "POST",
+      "path": "/api/messages"
+    },
+    {
+      "method": "GET",
+      "path": "/healthz"
+    }
+  ],
+  "instance_env_public_keys": [
+    "AGENT_IDENTITY",
+    "OWNER",
+    "OWNER_AAD_ID",
+    "A365_APP_ID",
+    "A365_TENANT_ID",
+    "AA_INSTANCE_ID",
+    "A365_BF_APP_ID",
+    "A365_BF_CLIENT_SECRET",
+    "BUSINESS_HOURS_TZ",
+    "BUSINESS_HOURS_START",
+    "BUSINESS_HOURS_END",
+    "HERMES_BRIDGE_PORT",
+    "HERMES_OTLP_ENDPOINT"
+  ],
+  "invoke": {
+    "adapter_handlers": [
+      "message/submitAction",
+      "message/fetchTask",
+      "handoff/action"
+    ],
+    "registry": [
+      "task/fetch"
+    ],
+    "task_fetch_card": {
+      "adaptive_card_version": "1.5",
+      "body_text": "Request received.",
+      "title": "Hermes"
+    }
+  },
+  "keychain_cli": {
+    "module": "hermes_a365.keychain",
+    "options": [
+      "--tenant",
+      "--app-id",
+      "--secret",
+      "--output-fd"
+    ],
+    "subcommands": [
+      "store",
+      "get",
+      "delete"
+    ]
+  },
+  "not_schema_artifacts": [
+    "bridge.log",
+    "responder.log",
+    "media cache",
+    "keychain",
+    ".env"
+  ],
+  "owner_decisions": {
+    "D1_serve_supported": true,
+    "D2_cea_default_scopes": [
+      "copilot",
+      "personal",
+      "team"
+    ],
+    "D3_task_fetch_card_frozen": true,
+    "D4_security_latest_1x_minor_only": true,
+    "D6_auto_migrate_additive_only": true,
+    "D7_ship_py_typed": false,
+    "D8_keychain_public": true,
+    "D8_responder_reference_only": true
+  },
+  "package_version": "0.9.5",
+  "packaging": {
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.12",
+      "Programming Language :: Python :: 3.13",
+      "Programming Language :: Python :: 3.14",
+      "Operating System :: MacOS",
+      "Operating System :: POSIX :: Linux"
+    ],
+    "entry_points": {
+      "hermes_agent.plugins": {
+        "agent365": "hermes_a365.plugin"
+      }
+    },
+    "license": {
+      "text": "MIT"
+    },
+    "name": "hermes-a365",
+    "optional_dependencies": [
+      "bridge",
+      "dev"
+    ],
+    "py_typed": false,
+    "requires_python": ">=3.11",
+    "scripts": {
+      "hermes-a365": "hermes_a365.cli:main"
+    },
+    "urls": {
+      "Documentation": "https://github.com/satscryption/Hermes-A365#readme",
+      "Homepage": "https://github.com/satscryption/Hermes-A365",
+      "Issues": "https://github.com/satscryption/Hermes-A365/issues"
+    },
+    "version": "0.9.5"
+  },
+  "plugin_requires_env": [
+    "A365_TENANT_ID",
+    "A365_APP_ID",
+    "AA_INSTANCE_ID",
+    "HERMES_BRIDGE_PORT"
+  ],
+  "product_http_routes_frozen": [
+    {
+      "method": "POST",
+      "path": "/api/messages"
+    },
+    {
+      "method": "GET",
+      "path": "/healthz"
+    }
+  ],
+  "publish_default_scopes": [
+    "copilot",
+    "personal",
+    "team"
+  ],
+  "python_modules": {
+    "internal": [
+      "hermes_a365.render_instance_env",
+      "hermes_a365.emit_card",
+      "hermes_a365.reconcile_app",
+      "hermes_a365.reconcile_blueprint"
+    ],
+    "public_cli": [
+      "hermes_a365.keychain"
+    ],
+    "reference_only": [
+      "hermes_a365.hermes_responder"
+    ]
+  },
+  "register_aiteammate_refusal": "`register --aiteammate` is unsupported. Register only runs `a365 setup blueprint` plus MCP/Bot permission setup; the AI Teammate agentic user is created/activated after `publish --aiteammate` via M365 Admin Centre upload and per-user activation.",
+  "schema_version": 1,
+  "security_support_after_v1": "After v1.0, security fixes are provided for the latest 1.x minor release only. Earlier 1.x minors and all 0.x releases are unsupported.",
+  "sidecar_migration_policy": "Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive stamps run on the owning writer, once, under an exclusive lock, and are idempotent. The original bytes are copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file does not write another backup. Identity-binding changes stay explicit: bot-service v1\u2192v2 still requires `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1\u2192v2 still requires `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than this build is an error. The file is left untouched. 1.x does not claim to read 2.x sidecars. Downgrade is restore-the-backup, not an automatic rewrite to 0.9.x.",
+  "upstream_sidecars": [
+    "a365.config.json",
+    "a365.generated.config.json"
+  ]
+}
