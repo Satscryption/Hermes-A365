@@ -180,16 +180,14 @@ class A365CliMutator:
             raise CliInvocationError(argv, -1, f"{A365_CLI_BINARY} not on PATH")
         if sensitive:
             try:
-                returncode, combined = _run_captured(
+                returncode, combined = _run_sensitive_streaming(
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
             except subprocess.TimeoutExpired:
                 # Drop the captured partial output — it may hold the secret.
                 raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from None
         else:
-            returncode, combined = _run_streaming(
-                argv, timeout=timeout, stdin_input=stdin_input
-            )
+            returncode, combined = _run_streaming(argv, timeout=timeout, stdin_input=stdin_input)
         if returncode != 0:
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
@@ -216,39 +214,106 @@ class A365CliMutator:
 # Subprocess helpers — streaming (default) and captured (sensitive)
 # ---------------------------------------------------------------------------
 
-_SENSITIVE_OUTPUT_SUPPRESSED = (
-    "<output suppressed: sensitive command may emit credential material>"
+_SENSITIVE_OUTPUT_SUPPRESSED = "<output suppressed: sensitive command may emit credential material>"
+
+# MSAL / Agent 365 CLI device-code prompts (slice 18j + #256). Only these
+# lines may reach the operator's terminal during a sensitive run.
+_DEVICE_CODE_PASSTHROUGH_RE = re.compile(
+    r"(?i)(?:"
+    r"login\.microsoft\.com/device|"
+    r"microsoft\.com/devicelogin|"
+    r"enter the code|"
+    r"device code"
+    r")"
 )
 
 
-def _run_captured(
+def _sanitize_device_code_passthrough_line(line: str) -> str:
+    """Echo-safe view of a device-code prompt line (#256).
+
+    Strips trailing credential-shaped tokens that sometimes share a line
+    with progress text in GA CLI builds, while keeping the user code and
+    URL the operator must act on.
+    """
+    # Drop ``secret=…`` / ``password": "…`` fragments if ever co-printed.
+    scrubbed = re.sub(
+        r"(?i)(?:client[_ ]?secret|password)\s*[:=]\s*\S+",
+        "<redacted>",
+        line,
+    )
+    return scrubbed
+
+
+def _echo_if_device_code_prompt(line: str) -> None:
+    if _DEVICE_CODE_PASSTHROUGH_RE.search(line):
+        sys.stdout.write(_sanitize_device_code_passthrough_line(line))
+        sys.stdout.flush()
+
+
+def _run_sensitive_streaming(
     argv: list[str],
     *,
     timeout: float,
     stdin_input: str | None = None,
 ) -> tuple[int, str]:
-    """Run ``argv`` to completion with output captured, never echoed.
+    """Run ``argv`` with output captured and credential lines withheld (#111, #256).
 
-    Secret-aware sibling of :func:`_run_streaming` (#111 / CS-003): the
-    child's merged stdout/stderr goes only into the returned string —
-    nothing is written to the parent's stdout — so credential material
-    in the command output (e.g. ``az ad app credential reset -o json``)
-    can't land in terminals, CI logs, or session transcripts.
-
-    Trade-off: interactive prompts from the child are invisible, so this
-    path is only for non-interactive commands (the recovery path runs
-    against an already-cached ``az login``).
+    Like :func:`_run_streaming`, but only device-code sign-in prompt lines
+    are written to the parent's stdout. Everything else (including blueprint
+    client secrets from ``a365 setup blueprint``) stays in the returned
+    string for parsing and AADSTS detection.
     """
-    completed = subprocess.run(
+    proc = subprocess.Popen(
         argv,
-        input=stdin_input,
+        stdin=subprocess.PIPE if stdin_input is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
-        timeout=timeout,
+        bufsize=1,
         preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
     )
-    return completed.returncode, completed.stdout or ""
+    if stdin_input is not None:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(stdin_input)
+        finally:
+            proc.stdin.close()
+    assert proc.stdout is not None
+    buf: list[str] = []
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            now = time.monotonic()
+            remaining = deadline - now
+            if remaining <= 0:
+                proc.kill()
+                proc.wait(timeout=5)
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout, output="".join(buf))
+            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
+            if ready:
+                line = proc.stdout.readline()
+                if not line:
+                    break
+                buf.append(line)
+                _echo_if_device_code_prompt(line)
+            elif proc.poll() is not None:
+                tail = proc.stdout.read()
+                if tail:
+                    buf.append(tail)
+                    if "\n" in tail:
+                        *lines, remainder = tail.split("\n")
+                        for line in lines:
+                            _echo_if_device_code_prompt(line + "\n")
+                        if remainder:
+                            _echo_if_device_code_prompt(remainder)
+                    else:
+                        _echo_if_device_code_prompt(tail)
+                break
+    finally:
+        if proc.stdout is not None:
+            proc.stdout.close()
+    proc.wait(timeout=5)
+    return proc.returncode, "".join(buf)
 
 
 def _run_streaming(
@@ -306,9 +371,7 @@ def _run_streaming(
             if remaining <= 0:
                 proc.kill()
                 proc.wait(timeout=5)
-                raise subprocess.TimeoutExpired(
-                    cmd=argv, timeout=timeout, output="".join(buf)
-                )
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout, output="".join(buf))
             ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
             if ready:
                 line = proc.stdout.readline()

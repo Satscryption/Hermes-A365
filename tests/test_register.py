@@ -16,6 +16,7 @@ import pytest
 
 from hermes_a365._common import write_owner_only_text_atomic
 from hermes_a365.a365_config import CONFIG_FILENAME
+from hermes_a365.entra_state import RegistrationDecision
 from hermes_a365.mutator import (
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
@@ -258,9 +259,7 @@ class TestCliAiteammateUnsupported:
     def test_run_rejects_aiteammate_before_plan_or_apply(
         self, capsys: pytest.CaptureFixture[str]
     ) -> None:
-        args = build_parser().parse_args(
-            ["--agent-name", "x", "--aiteammate", "--apply"]
-        )
+        args = build_parser().parse_args(["--agent-name", "x", "--aiteammate", "--apply"])
 
         rc = run(args)
 
@@ -366,6 +365,103 @@ class TestApplyHappyPath:
         assert result.raw_outputs["blueprint"].stdout == "bp ok"
         assert result.raw_outputs["permissions-mcp"].stdout == "mcp ok"
         assert result.raw_outputs["permissions-bot"].stdout == "bot ok"
+
+
+class TestIssue256BlueprintSensitiveOutput:
+    """#256 — ``a365 setup blueprint`` output is treated as sensitive."""
+
+    _SENTINEL = "SENTINEL-BP-SECRET-256"
+    _DEVICE_LINE = (
+        "To sign in, use a web browser to open https://login.microsoft.com/device "
+        "and enter the code FAKECODE256 to authenticate."
+    )
+
+    @staticmethod
+    def _fake_blueprint_only(*_args: object, **_kwargs: object) -> RegistrationDecision:
+        return RegistrationDecision(
+            action="create",
+            step_names=("blueprint",),
+            reason=None,
+            messages=(),
+        )
+
+    @staticmethod
+    def _fake_blueprint_repair(*_args: object, **_kwargs: object) -> RegistrationDecision:
+        return RegistrationDecision(
+            action="repair",
+            step_names=("blueprint",),
+            reason=None,
+            messages=("entra: repair blueprint",),
+        )
+
+    def test_blueprint_step_uses_sensitive_flag(self) -> None:
+        plan = build_register_plan(RegisterInputs(agent_name="x"))
+        mutator = FakeMutator()
+        apply_register_plan(plan, mutator=mutator)
+        for call, sensitive in zip(mutator.calls, mutator.sensitive_flags, strict=True):
+            if call[:3] == ["a365", "setup", "blueprint"]:
+                assert sensitive is True
+            elif call[0] == "a365":
+                assert sensitive is False
+
+    def test_apply_first_run_suppresses_secret_streams_device_code(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        body = (
+            f"echo '{self._DEVICE_LINE}'\n"
+            f"echo 'Client secret created: {self._SENTINEL}'\n"
+            f"echo '{self._SENTINEL}' 1>&2"
+        )
+        _install_register_cli_shims(tmp_path, monkeypatch, a365_blueprint_body=body)
+        monkeypatch.setattr(
+            "hermes_a365.register.resolve_registration",
+            self._fake_blueprint_only,
+        )
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        plan = build_register_plan(RegisterInputs(agent_name="x"))
+        mutator = A365CliMutator()
+        mutator.available = True
+        with caplog.at_level("INFO"):
+            result = apply_register_plan(plan, mutator=mutator)
+        out, err = capfd.readouterr()
+        assert result.completed == ["blueprint"]
+        assert self._SENTINEL not in out
+        assert self._SENTINEL not in err
+        assert self._SENTINEL not in caplog.text
+        assert "FAKECODE256" in out
+        assert self._SENTINEL in result.raw_outputs["blueprint"].stdout
+
+    def test_apply_repair_suppresses_secret_streams_device_code(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        body = (
+            f"echo '{self._DEVICE_LINE}'\n"
+            f"printf '%s\\n' '{self._SENTINEL}'\n"
+            f"echo 'stderr-{self._SENTINEL}' 1>&2"
+        )
+        _install_register_cli_shims(tmp_path, monkeypatch, a365_blueprint_body=body)
+        monkeypatch.setattr(
+            "hermes_a365.register.resolve_registration",
+            self._fake_blueprint_repair,
+        )
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        plan = build_register_plan(RegisterInputs(agent_name="x"))
+        mutator = A365CliMutator()
+        mutator.available = True
+        with caplog.at_level("INFO"):
+            result = apply_register_plan(plan, mutator=mutator)
+        out, err = capfd.readouterr()
+        assert result.completed == ["blueprint"]
+        assert self._SENTINEL not in out + err + caplog.text
+        assert "login.microsoft.com/device" in out
 
 
 # ---------------------------------------------------------------------------
@@ -531,9 +627,7 @@ def _write_generated(tmp_path: Path, payload: dict[str, object]) -> Path:
     return p
 
 
-def _install_az_shim(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str
-) -> None:
+def _install_az_shim(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, script: str) -> None:
     """Put a fake ``az`` on PATH whose body is ``script`` (sh).
 
     Lets CS-003 tests drive the *real* ``A365CliMutator`` subprocess
@@ -544,14 +638,49 @@ def _install_az_shim(
     shim = bin_dir / "az"
     shim.write_text(
         "#!/bin/sh\n"
-        "if [ \"$1 $2 $3\" = \"ad app show\" ]; then\n"
-        "  printf '%s\\n' '{\"appId\":\"bp-app-id\",\"id\":\"obj-id\"}'\n"
+        'if [ "$1 $2 $3" = "ad app show" ]; then\n'
+        '  printf \'%s\\n\' \'{"appId":"bp-app-id","id":"obj-id"}\'\n'
         "  exit 0\n"
-        "fi\n"
-        + script
-        + "\n"
+        "fi\n" + script + "\n"
     )
     shim.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+
+def _install_register_cli_shims(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    a365_blueprint_body: str,
+    tenant_id: str = _TEST_TENANT,
+) -> None:
+    """Fake ``az`` + ``a365`` on PATH for real-mutator register apply tests."""
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    az = bin_dir / "az"
+    az.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "account show" ]; then\n'
+        f"  printf '%s\\n' '{{\"tenantId\":\"{tenant_id}\"}}'\n"
+        "  exit 0\n"
+        "fi\n"
+        'echo "unexpected az: $*" >&2\n'
+        "exit 1\n"
+    )
+    az.chmod(0o755)
+    a365 = bin_dir / "a365"
+    a365.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2" = "setup blueprint" ]; then\n'
+        f"{a365_blueprint_body}\n"
+        "  exit 0\n"
+        "fi\n"
+        'if [ "$1 $2" = "setup permissions" ]; then\n'
+        "  exit 0\n"
+        "fi\n"
+        "exit 0\n"
+    )
+    a365.chmod(0o755)
     monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
 
 
@@ -644,9 +773,7 @@ class TestAutoRecoverSecret:
         mutator = FakeMutator(
             scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
         )
-        auto_recover_secret(
-            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
-        )
+        auto_recover_secret(path, "bp-app-id", mutator=mutator, display_name="recovery-test")
         assert mutator.calls, "az should have been invoked"
         argv = mutator.calls[1]
         assert argv[:5] == ["az", "ad", "app", "credential", "reset"]
@@ -685,9 +812,7 @@ class TestAutoRecoverSecret:
         mutator = FakeMutator(
             scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
         )
-        auto_recover_secret(
-            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
-        )
+        auto_recover_secret(path, "bp-app-id", mutator=mutator, display_name="recovery-test")
         assert (path.stat().st_mode & 0o777) == 0o600
 
     def test_credential_reset_runs_sensitive(self, tmp_path: Path) -> None:
@@ -700,9 +825,7 @@ class TestAutoRecoverSecret:
         mutator = FakeMutator(
             scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
         )
-        auto_recover_secret(
-            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
-        )
+        auto_recover_secret(path, "bp-app-id", mutator=mutator, display_name="recovery-test")
         assert mutator.sensitive_flags == [False, True]
 
     def test_secret_never_reaches_stdout_with_real_mutator(
@@ -719,7 +842,7 @@ class TestAutoRecoverSecret:
         _install_az_shim(
             tmp_path,
             monkeypatch,
-            f"echo '{{\"appId\": \"bp-app-id\", \"password\": \"{marker}\"}}'",
+            f'echo \'{{"appId": "bp-app-id", "password": "{marker}"}}\'',
         )
         path = _write_generated(
             tmp_path,
@@ -788,13 +911,9 @@ class TestAutoRecoverSecret:
                 {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
             )
             mutator = FakeMutator(
-                scripted=[
-                    RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")
-                ]
+                scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
             )
-            auto_recover_secret(
-                path, "bp-app-id", mutator=mutator, display_name="recovery-test"
-            )
+            auto_recover_secret(path, "bp-app-id", mutator=mutator, display_name="recovery-test")
             assert seen["tmp_mode"] == 0o600
             assert (path.stat().st_mode & 0o777) == 0o600
         finally:
@@ -814,9 +933,7 @@ class TestAutoRecoverSecret:
         mutator = FakeMutator(
             scripted=[RunResult(argv=[], returncode=0, stdout=self._AZ_OK_PAYLOAD, stderr="")]
         )
-        auto_recover_secret(
-            path, "bp-app-id", mutator=mutator, display_name="recovery-test"
-        )
+        auto_recover_secret(path, "bp-app-id", mutator=mutator, display_name="recovery-test")
         on_disk = json.loads(path.read_text())
         assert on_disk["agentBlueprintObjectId"] == "obj-id"
         assert on_disk["botMsaAppId"] == "bot-app-id"
@@ -872,11 +989,11 @@ class TestAutoRecoverSecret:
             "Be sure that you do not include these credentials in your code "
             "or check the credentials into your source control. For more "
             "information, see https://aka.ms/azadsp-cli\n"
-            '{\n'
+            "{\n"
             '  "appId": "bp-app-id",\n'
             '  "password": "RV88Q~MOCK-SECRET",\n'
             '  "tenant": "tenant-id"\n'
-            '}\n'
+            "}\n"
         )
         mutator = FakeMutator(
             scripted=[RunResult(argv=[], returncode=0, stdout=live_az_output, stderr="")]
@@ -888,9 +1005,7 @@ class TestAutoRecoverSecret:
         on_disk = json.loads(path.read_text())
         assert on_disk["agentBlueprintClientSecret"] == "RV88Q~MOCK-SECRET"
 
-    def test_recovers_when_az_stdout_has_trailing_diagnostics(
-        self, tmp_path: Path
-    ) -> None:
+    def test_recovers_when_az_stdout_has_trailing_diagnostics(self, tmp_path: Path) -> None:
         """Belt-and-braces: the JSON object is consumed even when other
         diagnostic lines follow it. ``json.JSONDecoder.raw_decode`` is
         tolerant of trailing content; ``json.loads`` is not."""
@@ -902,9 +1017,7 @@ class TestAutoRecoverSecret:
             '{"appId":"bp-app-id","password":"FRESH-SECRET","tenant":"t"}\n'
             "Note: credential will be appended to existing list.\n"
         )
-        mutator = FakeMutator(
-            scripted=[RunResult(argv=[], returncode=0, stdout=out, stderr="")]
-        )
+        mutator = FakeMutator(scripted=[RunResult(argv=[], returncode=0, stdout=out, stderr="")])
         outcome = auto_recover_secret(
             path, "bp-app-id", mutator=mutator, display_name="recovery-test"
         )
@@ -917,9 +1030,7 @@ class TestAutoRecoverSecret:
             {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
         )
         mutator = FakeMutator(
-            scripted=[
-                RunResult(argv=[], returncode=0, stdout="not json at all", stderr="")
-            ]
+            scripted=[RunResult(argv=[], returncode=0, stdout="not json at all", stderr="")]
         )
         outcome = auto_recover_secret(
             path, "bp-app-id", mutator=mutator, display_name="recovery-test"
@@ -933,9 +1044,7 @@ class TestAutoRecoverSecret:
             tmp_path,
             {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
         )
-        mutator = FakeMutator(
-            scripted=[CliInvocationError(["az"], 1, "permission denied")]
-        )
+        mutator = FakeMutator(scripted=[CliInvocationError(["az"], 1, "permission denied")])
         outcome = auto_recover_secret(
             path, "bp-app-id", mutator=mutator, display_name="recovery-test"
         )
@@ -967,15 +1076,11 @@ class TestReportMissingSecretWarning:
         assert "--id bp-app-id" in msg
 
     def test_mentions_issue_14(self, tmp_path: Path) -> None:
-        msg = report_missing_secret_warning(
-            "bp-app-id", tmp_path / "a365.generated.config.json"
-        )
+        msg = report_missing_secret_warning("bp-app-id", tmp_path / "a365.generated.config.json")
         assert "#14" in msg
 
     def test_mentions_auto_recover_flag(self, tmp_path: Path) -> None:
-        msg = report_missing_secret_warning(
-            "bp-app-id", tmp_path / "a365.generated.config.json"
-        )
+        msg = report_missing_secret_warning("bp-app-id", tmp_path / "a365.generated.config.json")
         assert "--auto-recover-secret" in msg
 
     def test_includes_config_path_in_patch_hint(self, tmp_path: Path) -> None:
@@ -987,18 +1092,12 @@ class TestReportMissingSecretWarning:
         # CS-005 (#113): guidance must never tell the operator to put the
         # secret on a command line — argv lands in shell history and the
         # process list.
-        msg = report_missing_secret_warning(
-            "bp-app-id", tmp_path / "a365.generated.config.json"
-        )
+        msg = report_missing_secret_warning("bp-app-id", tmp_path / "a365.generated.config.json")
         assert "<paste-password>" not in msg
         assert "sys.argv[2]" not in msg
 
-    def test_patch_hint_uses_hidden_prompt_and_exclusive_create(
-        self, tmp_path: Path
-    ) -> None:
-        msg = report_missing_secret_warning(
-            "bp-app-id", tmp_path / "a365.generated.config.json"
-        )
+    def test_patch_hint_uses_hidden_prompt_and_exclusive_create(self, tmp_path: Path) -> None:
+        msg = report_missing_secret_warning("bp-app-id", tmp_path / "a365.generated.config.json")
         assert "getpass" in msg
         assert "O_EXCL" in msg
 
@@ -1015,9 +1114,7 @@ class TestReportMissingSecretWarning:
         return shlex.split(line)
 
     def test_patch_hint_command_is_valid_python(self, tmp_path: Path) -> None:
-        msg = report_missing_secret_warning(
-            "bp-app-id", tmp_path / "a365.generated.config.json"
-        )
+        msg = report_missing_secret_warning("bp-app-id", tmp_path / "a365.generated.config.json")
         argv = self._patch_argv(msg)
         assert argv[0] == "python3" and argv[1] == "-c"
         compile(argv[2], "<hint>", "exec")
@@ -1072,9 +1169,7 @@ class TestReportMissingSecretWarning:
             timeout=30,
         )
         assert proc.returncode == 0, proc.stderr
-        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
-            "RETRY-SECRET"
-        )
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == ("RETRY-SECRET")
         assert not stale.exists()
 
     def test_rendered_command_survives_a_real_shell(self, tmp_path: Path) -> None:
@@ -1087,10 +1182,7 @@ class TestReportMissingSecretWarning:
         cfg_dir.mkdir(parents=True)
         path = cfg_dir / "a365.generated.config.json"
         path.write_text(
-            json.dumps(
-                {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None}
-            )
-            + "\n"
+            json.dumps({"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None}) + "\n"
         )
         msg = report_missing_secret_warning("bp-app-id", path)
         line = next(ln for ln in msg.splitlines() if "python3 -c" in ln).strip()
@@ -1107,9 +1199,7 @@ class TestReportMissingSecretWarning:
             cwd=tmp_path,
         )
         assert proc.returncode == 0, proc.stderr
-        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
-            "SHELL-SECRET"
-        )
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == ("SHELL-SECRET")
         # The `; touch INJECTED` inside the path must NOT have executed.
         assert not (tmp_path / "INJECTED").exists()
         assert not (cfg_dir / "INJECTED").exists()
@@ -1199,9 +1289,7 @@ class TestRecoveryDisplayName:
         import datetime as _dt
 
         when = _dt.datetime(2026, 5, 7, 14, 30, 0)
-        assert default_recovery_display_name(when) == (
-            "hermes-bridge-recovery-20260507T143000"
-        )
+        assert default_recovery_display_name(when) == ("hermes-bridge-recovery-20260507T143000")
 
 
 # ---------------------------------------------------------------------------
@@ -1224,9 +1312,7 @@ class TestTenantPinnedProvisioning:
     _PINNED = "aaaa1111-0000-0000-0000-000000000001"
     _OTHER = "bbbb2222-0000-0000-0000-000000000002"
 
-    def test_apply_refuses_on_tenant_mismatch_before_any_step(
-        self, tmp_path: Path
-    ) -> None:
+    def test_apply_refuses_on_tenant_mismatch_before_any_step(self, tmp_path: Path) -> None:
         # M7 (#102): the a365 CLI auto-detects its tenant from the ambient az
         # session, so provisioning under a mismatched login would create the
         # blueprint/permissions in the WRONG tenant. Refuse before step one.
@@ -1241,16 +1327,12 @@ class TestTenantPinnedProvisioning:
         with pytest.raises(RegisterError, match="does not match the pinned tenant"):
             apply_register_plan(plan, mutator=mutator, config_path=config_path)
 
-        assert mutator.calls == [
-            ["az", "account", "show", "-o", "json", "--only-show-errors"]
-        ]
+        assert mutator.calls == [["az", "account", "show", "-o", "json", "--only-show-errors"]]
         assert json.loads(config_path.read_text())["tenantId"] == "original-tenant"
 
     def test_domain_alias_gets_canonical_guid_migration_error(self) -> None:
         plan = build_register_plan(
-            RegisterInputs(
-                agent_name="Inbox Helper", tenant_id="contoso.onmicrosoft.com"
-            )
+            RegisterInputs(agent_name="Inbox Helper", tenant_id="contoso.onmicrosoft.com")
         )
         mutator = FakeMutator(scripted=[_account_show_result(self._PINNED)])
 
@@ -1261,9 +1343,7 @@ class TestTenantPinnedProvisioning:
         plan = build_register_plan(
             RegisterInputs(agent_name="Inbox Helper", tenant_id=self._PINNED)
         )
-        mutator = FakeMutator(
-            scripted=[CliInvocationError(["az", "account", "show"], 1, "boom")]
-        )
+        mutator = FakeMutator(scripted=[CliInvocationError(["az", "account", "show"], 1, "boom")])
         with pytest.raises(RegisterError, match="unverifiable"):
             apply_register_plan(plan, mutator=mutator)
 
@@ -1275,9 +1355,7 @@ class TestTenantPinnedProvisioning:
 
         result = apply_register_plan(plan, mutator=mutator)
 
-        assert mutator.calls[0] == [
-            "az", "account", "show", "-o", "json", "--only-show-errors"
-        ]
+        assert mutator.calls[0] == ["az", "account", "show", "-o", "json", "--only-show-errors"]
         rest = [call for call in mutator.calls if call[:2] == ["az", "rest"]]
         a365 = [call for call in mutator.calls if call[0] == "a365"]
         assert rest, "apply must read Entra state before provisioning"
@@ -1294,9 +1372,7 @@ class TestTenantPinnedProvisioning:
         config_path = tmp_path / "a365.config.json"
         config_path.write_text('{"tenantId":"old"}\n')
 
-        result = apply_register_plan(
-            plan, mutator=mutator, config_path=config_path
-        )
+        result = apply_register_plan(plan, mutator=mutator, config_path=config_path)
 
         config = json.loads(config_path.read_text())
         assert config["tenantId"] == self._PINNED
@@ -1317,9 +1393,7 @@ class TestTenantPinnedProvisioning:
         import json as _json
 
         pinned = "aaaa1111-0000-0000-0000-000000000001"
-        plan = build_register_plan(
-            RegisterInputs(agent_name="Inbox Helper", tenant_id=pinned)
-        )
+        plan = build_register_plan(RegisterInputs(agent_name="Inbox Helper", tenant_id=pinned))
         noisy = RunResult(
             argv=["az", "account", "show", "-o", "json", "--only-show-errors"],
             returncode=0,

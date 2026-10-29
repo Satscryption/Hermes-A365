@@ -170,22 +170,16 @@ class TestSensitiveRun:
     descriptors themselves. All secret material is fake.
     """
 
-    def test_sensitive_output_not_echoed(
-        self, capfd: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_sensitive_output_not_echoed(self, capfd: pytest.CaptureFixture[str]) -> None:
         m = A365CliMutator()
         m.available = True
-        result = m.run(
-            [sys.executable, "-c", "print('SECRET-MARKER-123')"], sensitive=True
-        )
+        result = m.run([sys.executable, "-c", "print('SECRET-MARKER-123')"], sensitive=True)
         out, err = capfd.readouterr()
         assert "SECRET-MARKER-123" not in out
         assert "SECRET-MARKER-123" not in err
         assert "SECRET-MARKER-123" in result.stdout
 
-    def test_default_run_still_streams(
-        self, capfd: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_default_run_still_streams(self, capfd: pytest.CaptureFixture[str]) -> None:
         # Pin the contrast: the non-sensitive path deliberately echoes
         # in real time (device-code prompts, CLI progress — slice 18j).
         m = A365CliMutator()
@@ -194,9 +188,7 @@ class TestSensitiveRun:
         out, _ = capfd.readouterr()
         assert "VISIBLE-MARKER-456" in out
 
-    def test_sensitive_failure_detail_suppressed(
-        self, capfd: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_sensitive_failure_detail_suppressed(self, capfd: pytest.CaptureFixture[str]) -> None:
         # A failing sensitive command may have already emitted credential
         # material; the exception text callers print must not carry it.
         m = A365CliMutator()
@@ -241,6 +233,33 @@ class TestSensitiveRun:
             sensitive=True,
         )
         assert "QUIET" in result.stdout
+
+    def test_sensitive_streams_device_code_not_secrets(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        # #256: ``a365 setup blueprint`` may print the minted secret and a
+        # device-code prompt in one run; only the prompt reaches stdout.
+        marker = "SENTINEL-BP-SECRET-256"
+        device_line = (
+            "To sign in, use a web browser to open "
+            "https://login.microsoft.com/device and enter the code "
+            "FAKECODE256 to authenticate."
+        )
+        script = (
+            f"print({device_line!r}); "
+            f"print({marker!r}); "
+            "import sys; sys.stderr.write('stderr-' + "
+            f"{marker!r} + '\\n')"
+        )
+        m = A365CliMutator()
+        m.available = True
+        result = m.run([sys.executable, "-c", script], sensitive=True)
+        out, err = capfd.readouterr()
+        assert marker not in out
+        assert marker not in err
+        assert marker in result.stdout
+        assert "FAKECODE256" in out
+        assert "login.microsoft.com/device" in out
 
 
 # ---------------------------------------------------------------------------
