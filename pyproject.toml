@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling>=1.25"]
+requires = ["hatchling>=1.27"]
 build-backend = "hatchling.build"
 
 [project]
@@ -76,7 +76,7 @@ dev = [
   "pytest-randomly>=3.15",
   "ruff>=0.5",
   "build>=1.2",
-  "hatchling>=1.25",
+  "hatchling>=1.27",
   # Bridge stack is installed in dev too so tests can exercise it.
   "anyio>=4.14.2",
   "cryptography>=50.0.0",

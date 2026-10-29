@@ -35,12 +35,14 @@ from hermes_a365._common import (
     write_owner_only_bytes_exclusive,
     write_owner_only_text_atomic,
 )
+from hermes_a365.sidecar_schema import (
+    SidecarSchemaError,
+    validate_conversations_sidecar_schema,
+)
 
 logger = logging.getLogger(__name__)
 
-
-class ConversationSidecarError(ValueError):
-    """Unsupported or unreadable conversations.json sidecar."""
+ConversationSidecarError = SidecarSchemaError
 
 
 @dataclass
@@ -468,33 +470,6 @@ class ConversationRegistry:
             "conversations": [r.to_dict() for r in self._by_id.values()],
         }
 
-    @staticmethod
-    def _schema_version_from_payload(payload: dict[str, Any]) -> int:
-        """Return the on-disk schemaVersion; missing means v1."""
-        version = payload.get("schemaVersion")
-        if version is None:
-            return ConversationRegistry.SCHEMA_VERSION
-        if not isinstance(version, int) or isinstance(version, bool):
-            raise ConversationSidecarError(
-                f"conversations.json schemaVersion={version!r} is invalid; "
-                f"expected integer {ConversationRegistry.SCHEMA_VERSION}"
-            )
-        return version
-
-    @classmethod
-    def _refuse_unsupported_schema_version(cls, payload: dict[str, Any]) -> None:
-        version = cls._schema_version_from_payload(payload)
-        if version > cls.SCHEMA_VERSION:
-            raise ConversationSidecarError(
-                f"conversations.json schemaVersion={version} is newer than this "
-                f"build (supports {cls.SCHEMA_VERSION}); refusing to load or rewrite"
-            )
-        if version < cls.SCHEMA_VERSION:
-            raise ConversationSidecarError(
-                f"conversations.json schemaVersion={version} is not supported by "
-                f"this build (supports {cls.SCHEMA_VERSION})"
-            )
-
     @classmethod
     def from_payload(cls, payload: dict[str, Any]) -> ConversationRegistry:
         reg = cls()
@@ -527,7 +502,7 @@ class ConversationRegistry:
             return cls()
         if not isinstance(payload, dict):
             return cls()
-        cls._refuse_unsupported_schema_version(payload)
+        validate_conversations_sidecar_schema(payload)
         return cls.from_payload(payload)
 
     def save(self, path: Path) -> None:
@@ -537,26 +512,35 @@ class ConversationRegistry:
     @staticmethod
     def write_payload(path: Path, payload: dict[str, Any]) -> None:
         """Write ``payload`` under an exclusive lock with backup-first stamping."""
+        validate_conversations_sidecar_schema(payload)
         text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
-        supported = ConversationRegistry.SCHEMA_VERSION
         with exclusive_sidecar_lock(path):
             snapshot = b""
             raw_on_disk: dict[str, Any] | None = None
+            recheck: dict[str, Any] | None = None
             if path.is_file():
                 snapshot = path.read_bytes()
                 try:
                     parsed = json.loads(snapshot)
-                except (json.JSONDecodeError, RecursionError):
-                    parsed = None
-                if isinstance(parsed, dict):
-                    raw_on_disk = parsed
-                    version = ConversationRegistry._schema_version_from_payload(parsed)
-                    if version > supported:
-                        raise ConversationSidecarError(
-                            f"conversations.json schemaVersion={version} is newer than "
-                            f"this build (supports {supported}); refusing to rewrite"
-                        )
-            if snapshot and raw_on_disk is not None and "schemaVersion" not in raw_on_disk:
+                except (json.JSONDecodeError, RecursionError) as exc:
+                    raise ConversationSidecarError(
+                        "conversations.json is not valid JSON; refusing to rewrite"
+                    ) from exc
+                if not isinstance(parsed, dict):
+                    raise ConversationSidecarError(
+                        "conversations.json must be a JSON object; refusing to rewrite"
+                    )
+                raw_on_disk = parsed
+                validate_conversations_sidecar_schema(raw_on_disk)
+                recheck = json.loads(path.read_bytes())
+                validate_conversations_sidecar_schema(recheck)
+            if (
+                snapshot
+                and raw_on_disk is not None
+                and recheck is not None
+                and "schemaVersion" not in raw_on_disk
+                and "schemaVersion" not in recheck
+            ):
                 backup = sidecar_backup_path(path)
                 write_owner_only_bytes_exclusive(backup, snapshot)
             write_owner_only_text_atomic(path, text)

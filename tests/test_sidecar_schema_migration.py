@@ -101,11 +101,11 @@ def test_conversations_future_schema_version_refused_on_load_and_save(
     ).encode()
     path.write_bytes(original)
 
-    with pytest.raises(ConversationSidecarError, match="newer than this build"):
+    with pytest.raises(ConversationSidecarError, match="schemaVersion"):
         ConversationRegistry.load(path)
 
     reg = ConversationRegistry()
-    with pytest.raises(ConversationSidecarError, match="refusing to rewrite"):
+    with pytest.raises(ConversationSidecarError, match="schemaVersion"):
         ConversationRegistry.write_payload(path, reg.to_payload())
     assert path.read_bytes() == original
 

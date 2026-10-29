@@ -291,7 +291,7 @@ requires-dist = [
     { name = "cryptography", marker = "extra == 'dev'", specifier = ">=50.0.0" },
     { name = "fastapi", marker = "extra == 'bridge'", specifier = ">=0.141.1" },
     { name = "fastapi", marker = "extra == 'dev'", specifier = ">=0.141.1" },
-    { name = "hatchling", marker = "extra == 'dev'", specifier = ">=1.25" },
+    { name = "hatchling", marker = "extra == 'dev'", specifier = ">=1.27" },
     { name = "httpx", marker = "extra == 'bridge'", specifier = ">=0.27" },
     { name = "httpx", marker = "extra == 'dev'", specifier = ">=0.27" },
     { name = "idna", marker = "extra == 'bridge'", specifier = ">=3.15" },

@@ -82,6 +82,18 @@ def tcp_reachable(host: str, *, port: int = 443, timeout: float = 3.0) -> bool:
         return False
 
 
+def _fsync_directory(path: Path) -> None:
+    """Best-effort fsync of ``path`` when it is a directory (POSIX)."""
+    flags = os.O_RDONLY
+    if hasattr(os, "O_DIRECTORY"):
+        flags |= os.O_DIRECTORY
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def write_owner_only_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:
     """Atomically write ``text`` to ``path``, owner-only (``mode``) from birth.
 
@@ -112,7 +124,10 @@ def write_owner_only_text_atomic(path: Path, text: str, *, mode: int = 0o600) ->
     try:
         with fh:
             fh.write(text)
+            fh.flush()
+            os.fsync(fh.fileno())
         os.replace(tmp, path)
+        _fsync_directory(path.parent)
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
@@ -180,6 +195,7 @@ def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o6
         os.fsync(fd)
     finally:
         os.close(fd)
+    _fsync_directory(target.parent)
     return target
 
 

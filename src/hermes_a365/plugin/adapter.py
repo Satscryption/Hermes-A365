@@ -4805,11 +4805,10 @@ class Agent365Adapter(BasePlatformAdapter):
             state["written"] = sequence
             if cancelled:
                 raise asyncio.CancelledError()
-        except ConversationSidecarError as e:
+        except ConversationSidecarError:
             logger.warning(
-                "agent365 conversations: save refused for %s: %s",
+                "agent365 conversations: save refused for %s (invalid sidecar schema fields)",
                 path,
-                e,
             )
         except OSError as e:
             logger.warning(

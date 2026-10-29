@@ -704,6 +704,7 @@ def test_built_wheel_and_sdist_expose_pep639_license(tmp_path: Path) -> None:
     assert len(wheels) == 1
     assert len(sdists) == 1
     version = mod.project_version(_ROOT)
+    lines: list[str] = []
     for path, reader in (
         (wheels[0], mod._wheel_metadata),
         (sdists[0], mod._sdist_metadata),
@@ -714,7 +715,12 @@ def test_built_wheel_and_sdist_expose_pep639_license(tmp_path: Path) -> None:
         headers = mod._metadata_headers(metadata)
         assert headers.get("License-Expression") == "MIT"
         assert headers.get("License-File") == "LICENSE"
-    lines = []
+    license_src = (_ROOT / "LICENSE").read_text(encoding="utf-8")
+    assert "MIT" in license_src
+    import zipfile
+
+    with zipfile.ZipFile(wheels[0]) as archive:
+        assert archive.read("hermes_a365-0.9.5.dist-info/licenses/LICENSE").decode() == license_src
     for path in (wheels[0], sdists[0]):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         lines.append(f"{digest}  {path.name}")

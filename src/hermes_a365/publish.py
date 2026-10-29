@@ -54,6 +54,11 @@ from ._common import (
     write_owner_only_text_atomic,
 )
 from .mutator import AADSTSError, CliInvocationError, Mutator, RunResult, get_mutator
+from .sidecar_schema import (
+    SidecarSchemaError,
+    publish_unsupported_schema_message,
+    validate_publish_state_schema_version,
+)
 
 ADMIN_CENTRE_URL = "https://admin.microsoft.com/"
 
@@ -1005,7 +1010,16 @@ def _load_copilot_chat_publish_state_record(
             f"Copilot Chat publish state at {path} must be a JSON object; "
             "fix or remove the file before re-running publish --apply"
         )
-    schema = raw.get("schemaVersion")
+    try:
+        schema = validate_publish_state_schema_version(raw)
+    except SidecarSchemaError as exc:
+        raise PublishError(
+            publish_unsupported_schema_message(
+                path_label=str(path),
+                expected_v1=_COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1,
+                expected_v2=_COPILOT_CHAT_PUBLISH_STATE_SCHEMA,
+            )
+        ) from exc
     if schema == _COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1:
         stored_id = raw.get("manifestId")
         last = raw.get("lastAppVersion")
@@ -1026,14 +1040,7 @@ def _load_copilot_chat_publish_state_record(
                 f"Copilot Chat publish state at {path} has invalid v1 fields "
                 f"({exc}); fix or remove the file before re-running publish --apply"
             ) from exc
-    elif schema != _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
-        raise PublishError(
-            f"Copilot Chat publish state at {path} has unsupported "
-            f"schemaVersion={schema!r} (expected "
-            f"{_COPILOT_CHAT_PUBLISH_STATE_SCHEMA}); fix or remove the file "
-            "before re-running publish --apply"
-        )
-    else:
+    elif schema == _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
         stored_id = raw.get("manifestId")
         if not isinstance(stored_id, str) or not stored_id.strip():
             raise PublishError(
@@ -1232,37 +1239,39 @@ def _write_copilot_chat_publish_state(
         "ceaCatalogIdMinted": cea_catalog_id_minted,
     }
     text = json.dumps(payload, indent=2) + "\n"
-    if not path.is_file():
-        write_owner_only_text_atomic(path, text, mode=0o600)
-        return
+    unsupported = publish_unsupported_schema_message(
+        path_label=str(path),
+        expected_v1=_COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1,
+        expected_v2=_COPILOT_CHAT_PUBLISH_STATE_SCHEMA,
+    )
     try:
         with exclusive_sidecar_lock(path):
-            snapshot = path.read_bytes()
-            try:
-                raw = json.loads(snapshot)
-            except json.JSONDecodeError as exc:
-                raise PublishError(
-                    f"Copilot Chat publish state at {path} is not valid JSON ({exc}); "
-                    "fix or remove the file before re-running publish --apply"
-                ) from exc
-            if not isinstance(raw, dict):
-                raise PublishError(
-                    f"Copilot Chat publish state at {path} must be a JSON object; "
-                    "fix or remove the file before re-running publish --apply"
-                )
-            schema = raw.get("schemaVersion")
-            if schema == _COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1:
-                backup = sidecar_backup_path(path)
-                write_owner_only_bytes_exclusive(backup, snapshot)
-            elif schema == _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
-                pass
-            elif isinstance(schema, int) and schema > _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
-                raise PublishError(
-                    f"Copilot Chat publish state at {path} has unsupported "
-                    f"schemaVersion={schema!r} (expected "
-                    f"{_COPILOT_CHAT_PUBLISH_STATE_SCHEMA}); fix or remove the file "
-                    "before re-running publish --apply"
-                )
+            if path.is_file():
+                snapshot = path.read_bytes()
+                try:
+                    raw = json.loads(snapshot)
+                except json.JSONDecodeError as exc:
+                    raise PublishError(
+                        f"Copilot Chat publish state at {path} is not valid JSON ({exc}); "
+                        "fix or remove the file before re-running publish --apply"
+                    ) from exc
+                if not isinstance(raw, dict):
+                    raise PublishError(
+                        f"Copilot Chat publish state at {path} must be a JSON object; "
+                        "fix or remove the file before re-running publish --apply"
+                    )
+                try:
+                    schema = validate_publish_state_schema_version(raw)
+                except SidecarSchemaError as exc:
+                    raise PublishError(unsupported) from exc
+                recheck = json.loads(path.read_bytes())
+                try:
+                    validate_publish_state_schema_version(recheck)
+                except SidecarSchemaError as exc:
+                    raise PublishError(unsupported) from exc
+                if schema == _COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1:
+                    backup = sidecar_backup_path(path)
+                    write_owner_only_bytes_exclusive(backup, snapshot)
             write_owner_only_text_atomic(path, text, mode=0o600)
     except SidecarLockError as exc:
         raise PublishError(
