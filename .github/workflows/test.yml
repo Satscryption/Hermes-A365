@@ -5,6 +5,10 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+  # Merge queue on main requires the aggregate `test` check; GitHub sends
+  # merge_group with checks_requested for each queued merge candidate.
+  merge_group:
+    types: [checks_requested]
   # Manual trigger — used to unblock CI when the push-trigger
   # scheduler is failing for a repo (2026-05-26: account-wide bug
   # where pushes generate zero check-suites; `has_actions: null`
