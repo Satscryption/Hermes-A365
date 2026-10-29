@@ -74,7 +74,6 @@ from hermes_a365.activity_bridge import (
     probe_bf_secret,
     probe_generated_config,
     probe_local_config,
-    probe_otlp_endpoint,
     probe_token_acquisition,
     render_error_card,
     render_human,
@@ -101,7 +100,6 @@ def _seed_agent_env(home: Path, slug: str = "inbox-helper", **overrides: str) ->
         "A365_APP_ID": "8b563a20-2fac-4210-8210-df139c61e8b7",
         "A365_TENANT_ID": "2699fca3-dac6-40a2-bcea-62ce05e2ee9b",
         "AA_INSTANCE_ID": "550e8400-e29b-41d4-a716-446655440000",
-        "HERMES_OTLP_ENDPOINT": "https://contoso.otel.agent365.microsoft.com",
     }
     base.update(overrides)
     agent_dir = home / "agents" / slug
@@ -215,9 +213,7 @@ class TestAcquireToken:
             urlopen.return_value.__enter__.return_value.read.return_value = json.dumps(
                 sample
             ).encode("utf-8")
-            out = acquire_token(
-                tenant_id="t", client_id="c", client_secret="s"
-            )
+            out = acquire_token(tenant_id="t", client_id="c", client_secret="s")
         assert out["access_token"] == "eyJ0eXAi…"
         assert out["expires_in"] == 3599
 
@@ -265,31 +261,41 @@ class TestAcquireToken:
         body = {
             "error": "invalid_client",
             "error_description": (
-                "AADSTS7000222: The provided client secret keys "
-                "for app are expired"
+                "AADSTS7000222: The provided client secret keys for app are expired"
             ),
         }
-        with patch(
-            "hermes_a365.activity_bridge.urllib.request.urlopen",
-            side_effect=_aad_http_error(401, body),
-        ), pytest.raises(TokenAcquisitionError) as excinfo:
+        with (
+            patch(
+                "hermes_a365.activity_bridge.urllib.request.urlopen",
+                side_effect=_aad_http_error(401, body),
+            ),
+            pytest.raises(TokenAcquisitionError) as excinfo,
+        ):
             acquire_token(tenant_id="t", client_id="c", client_secret="s")
         assert excinfo.value.code == "AADSTS7000222"
         assert "expired" in excinfo.value.message
 
     def test_non_aadsts_error_falls_back_to_error_field(self) -> None:
-        with patch(
-            "hermes_a365.activity_bridge.urllib.request.urlopen",
-            side_effect=_aad_http_error(400, {"error": "bad_request", "error_description": "bad"}),
-        ), pytest.raises(TokenAcquisitionError) as excinfo:
+        with (
+            patch(
+                "hermes_a365.activity_bridge.urllib.request.urlopen",
+                side_effect=_aad_http_error(
+                    400, {"error": "bad_request", "error_description": "bad"}
+                ),
+            ),
+            pytest.raises(TokenAcquisitionError) as excinfo,
+        ):
             acquire_token(tenant_id="t", client_id="c", client_secret="s")
         assert excinfo.value.code == "bad_request"
 
     def test_url_error_surfaces_as_network_error(self) -> None:
-        with patch(
-            "hermes_a365.activity_bridge.urllib.request.urlopen",
-            side_effect=urllib.error.URLError("name resolution failed"),
-        ), pytest.raises(TokenAcquisitionError) as excinfo:
+        with (
+            patch(
+                "hermes_a365.activity_bridge.urllib.request.urlopen",
+                side_effect=urllib.error.URLError("name resolution failed"),
+            ),
+            pytest.raises(TokenAcquisitionError) as excinfo,
+        ):
             acquire_token(tenant_id="t", client_id="c", client_secret="s")
         assert excinfo.value.code == "network_error"
 
@@ -347,9 +353,7 @@ class TestProbeBfSecret:
         assert "not configured" in probe.detail
 
     def test_half_configured_path_b_fails(self) -> None:
-        probe = probe_bf_secret(
-            {"A365_TENANT_ID": "tenant", "A365_BF_APP_ID": "bf-app"}
-        )
+        probe = probe_bf_secret({"A365_TENANT_ID": "tenant", "A365_BF_APP_ID": "bf-app"})
         assert probe.state == "error"
         assert "no A365_BF_CLIENT_SECRET" in probe.detail
 
@@ -361,9 +365,7 @@ class TestProbeBfSecret:
             "hermes_a365.activity_bridge.probe_provider",
             lambda *_args, **_kwargs: (True, True, "fake-store"),
         )
-        probe = probe_bf_secret(
-            {"A365_TENANT_ID": "tenant", "A365_BF_APP_ID": "bf-app"}
-        )
+        probe = probe_bf_secret({"A365_TENANT_ID": "tenant", "A365_BF_APP_ID": "bf-app"})
         assert probe.state == "ok"
         assert "fake-store" in probe.detail
         assert secret not in repr(probe)
@@ -382,9 +384,7 @@ class TestProbeTokenAcquisition:
             "hermes_a365.activity_bridge.acquire_token",
             return_value={"token_type": "Bearer", "expires_in": 3599, "access_token": "x"},
         ):
-            r = probe_token_acquisition(
-                tenant_id="t", client_id="c", client_secret="s"
-            )
+            r = probe_token_acquisition(tenant_id="t", client_id="c", client_secret="s")
         assert r.state == "ok"
         assert "expires_in=3599" in r.detail
 
@@ -393,9 +393,7 @@ class TestProbeTokenAcquisition:
             "hermes_a365.activity_bridge.acquire_token",
             side_effect=TokenAcquisitionError("AADSTS7000215", "invalid secret"),
         ):
-            r = probe_token_acquisition(
-                tenant_id="t", client_id="c", client_secret="s"
-            )
+            r = probe_token_acquisition(tenant_id="t", client_id="c", client_secret="s")
         assert r.state == "error"
         assert "rotate" in r.detail
 
@@ -408,65 +406,24 @@ class TestProbeTokenAcquisition:
             "hermes_a365.activity_bridge.acquire_token",
             side_effect=TokenAcquisitionError("AADSTS90002", "tenant not found"),
         ):
-            r = probe_token_acquisition(
-                tenant_id="t", client_id="c", client_secret="s"
-            )
+            r = probe_token_acquisition(tenant_id="t", client_id="c", client_secret="s")
         assert r.state == "error"
         assert "AADSTS90002" in r.detail
 
 
-class TestProbeOtlpEndpoint:
-    def test_unset_yields_warn(self) -> None:
-        r = probe_otlp_endpoint(None)
-        assert r.state == "warn"
-
-    def test_no_host_yields_error(self) -> None:
-        # urlparse is lenient — "htp://" still yields a parseable URL
-        # with no host. The probe should report this as an error since
-        # there's nothing to DNS-resolve.
-        r = probe_otlp_endpoint("htp:///no-scheme-no-host")
-        assert r.state == "error"
-        assert "no host" in r.detail
-
-    def test_dns_lookup_failure_yields_warn(self) -> None:
-        with patch(
-            "hermes_a365.activity_bridge.socket.gethostbyname",
-            side_effect=OSError("no DNS"),
-        ):
-            r = probe_otlp_endpoint("https://otel.example.invalid/")
-        assert r.state == "warn"
-        assert "DNS" in r.detail
-
-    def test_dns_resolves_yields_ok(self) -> None:
-        with patch("hermes_a365.activity_bridge.socket.gethostbyname", return_value="1.2.3.4"):
-            r = probe_otlp_endpoint("https://otel.example.com/")
-        assert r.state == "ok"
-
-
-# ---------------------------------------------------------------------------
-# run_verify orchestration
-# ---------------------------------------------------------------------------
-
-
-class TestRunVerify:
+class TestRunVerifyNoOtlpProbe:
     def test_skips_token_when_local_config_missing(self, tmp_path: Path) -> None:
-        # No agent .env. Token probe should be skipped (not crashed).
         report = run_verify(slug="ghost", hermes_home=tmp_path)
         token_probes = [p for p in report.probes if p.name == "token_acquisition"]
         assert len(token_probes) == 1
         assert token_probes[0].state == "warn"
         assert "skipped" in token_probes[0].detail
 
-    def test_full_happy_path(self, tmp_path: Path) -> None:
-        # Slice 19e: verify orchestration now includes fmi_exchange
-        # between token_acquisition and reachability. Mock the urllib
-        # call probe_fmi_exchange makes so this test stays hermetic.
+    def test_verify_probe_list_excludes_otlp(self, tmp_path: Path) -> None:
         _seed_agent_env(tmp_path)
         gen_path = _seed_generated_config(tmp_path)
         ok_body = b'{"access_token": "T1", "token_type": "Bearer", "expires_in": 3599}'
-        urlopen_ctx = patch(
-            "hermes_a365.activity_bridge.urllib.request.urlopen"
-        ).start()
+        urlopen_ctx = patch("hermes_a365.activity_bridge.urllib.request.urlopen").start()
         urlopen_ctx.return_value.__enter__.return_value.read.return_value = ok_body
         try:
             with (
@@ -479,7 +436,6 @@ class TestRunVerify:
                     },
                 ),
                 patch("hermes_a365.activity_bridge.tcp_reachable", return_value=True),
-                patch("hermes_a365.activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
             ):
                 report = run_verify(
                     slug="inbox-helper",
@@ -488,8 +444,8 @@ class TestRunVerify:
                 )
         finally:
             patch.stopall()
-        assert report.overall == "ok"
         names = [p.name for p in report.probes]
+        assert "otlp_endpoint" not in names
         assert names == [
             "local_config",
             "bf_secret",
@@ -497,7 +453,6 @@ class TestRunVerify:
             "token_acquisition",
             "fmi_exchange",
             "reachability",
-            "otlp_endpoint",
         ]
 
 
@@ -553,7 +508,6 @@ class TestCli:
                     },
                 ),
                 patch("hermes_a365.activity_bridge.tcp_reachable", return_value=True),
-                patch("hermes_a365.activity_bridge.socket.gethostbyname", return_value="1.2.3.4"),
             ):
                 rc = main(
                     [
@@ -679,9 +633,7 @@ def _jwks_transport(jwk: dict[str, Any]) -> httpx.MockTransport:
     """httpx transport that serves a fixed JWKS at the AAD-v2 discovery URLs."""
     config = {
         "issuer": TEST_AAD_ISSUER,
-        "jwks_uri": (
-            f"https://login.microsoftonline.com/{TEST_TENANT_ID}/discovery/v2.0/keys"
-        ),
+        "jwks_uri": (f"https://login.microsoftonline.com/{TEST_TENANT_ID}/discovery/v2.0/keys"),
     }
     keys = {"keys": [jwk]}
 
@@ -1320,9 +1272,7 @@ class TestPeekUnverifiedIss:
     check, so peek must be tolerant of malformed input (return None;
     caller defaults to A365 path)."""
 
-    def test_returns_bf_issuer(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
-    ) -> None:
+    def test_returns_bf_issuer(self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]) -> None:
         priv, _jwk = rsa_keypair
         token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)
         assert peek_unverified_iss(token) == BF_ISSUER
@@ -1381,10 +1331,7 @@ def _agentic_token_handler(
         # the order of arrival is what tests assert on.
         if params.get("fmi_path") and params.get("grant_type") == "client_credentials":
             return httpx.Response(200, json={"access_token": "T1", "expires_in": 3600})
-        if (
-            params.get("grant_type") == "client_credentials"
-            and params.get("client_assertion")
-        ):
+        if params.get("grant_type") == "client_credentials" and params.get("client_assertion"):
             return httpx.Response(200, json={"access_token": "T2", "expires_in": 3600})
         if params.get("grant_type") == "user_fic":
             if allowed_user_id is not None and params.get("user_id") != allowed_user_id:
@@ -1392,9 +1339,7 @@ def _agentic_token_handler(
                     401,
                     json={"error": "unauthorized_client", "error_description": "denied"},
                 )
-            return httpx.Response(
-                200, json={"access_token": "FINAL", "expires_in": 3600}
-            )
+            return httpx.Response(200, json={"access_token": "FINAL", "expires_in": 3600})
         return httpx.Response(400, json={"error": "test_unhandled_token_request"})
 
     return handler
@@ -1441,7 +1386,7 @@ class TestAcquireOutboundToken:
         assert [c["grant_type"] for c in capture] == [
             "client_credentials",  # T1: blueprint impersonates instance via fmi_path
             "client_credentials",  # T2: instance asserts itself via client_assertion
-            "user_fic",            # Final: user-context token at messaging scope
+            "user_fic",  # Final: user-context token at messaging scope
         ]
         # First request is FMI step — fmi_path present.
         assert capture[0]["fmi_path"] == "blueprint-app-id"
@@ -1617,9 +1562,7 @@ class TestAcquireOutboundToken:
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(_agentic_token_handler(capture=capture))
         ) as client:
-            with pytest.raises(
-                RuntimeError, match="agenticAppBlueprintId does not match"
-            ):
+            with pytest.raises(RuntimeError, match="agenticAppBlueprintId does not match"):
                 await acquire_outbound_token(
                     client=client,
                     cfg=_cfg(agent_identity_ids=("instance-app-id",)),
@@ -1696,18 +1639,14 @@ class TestAcquireOutboundToken:
         capture: list[dict[str, Any]] = []
         async with httpx.AsyncClient(
             transport=httpx.MockTransport(
-                _agentic_token_handler(
-                    capture=capture, allowed_user_id="configured-agentic-user"
-                )
+                _agentic_token_handler(capture=capture, allowed_user_id="configured-agentic-user")
             )
         ) as client:
             with pytest.raises(httpx.HTTPStatusError):
                 await acquire_outbound_token(
                     client=client,
                     cfg=_cfg(),
-                    activity=_inbound_message_activity(
-                        agentic_user_id="unauthorized-agentic-user"
-                    ),
+                    activity=_inbound_message_activity(agentic_user_id="unauthorized-agentic-user"),
                     fmi_cache=_FmiCache(),
                     user_cache=_UserTokenCache(),
                 )
@@ -1749,10 +1688,7 @@ def _bf_s2s_token_handler(
                 "client_secret": params.get("client_secret"),
             }
         )
-        if (
-            params.get("grant_type") == "client_credentials"
-            and params.get("scope") == BF_S2S_SCOPE
-        ):
+        if params.get("grant_type") == "client_credentials" and params.get("scope") == BF_S2S_SCOPE:
             return httpx.Response(
                 200, json={"access_token": access_token, "expires_in": expires_in}
             )
@@ -1812,9 +1748,7 @@ class TestAcquireBfS2sToken:
         capture: list[dict[str, Any]] = []
         cache = _BfTokenCache()
         async with httpx.AsyncClient(
-            transport=httpx.MockTransport(
-                _bf_s2s_token_handler(capture=capture, expires_in=1)
-            )
+            transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture, expires_in=1))
         ) as client:
             # First call mints at now=0, expires at 1.
             await acquire_bf_s2s_token(
@@ -1859,9 +1793,7 @@ class TestAcquireBfS2sToken:
                 },
             )
 
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with pytest.raises(TokenAcquisitionError) as exc_info:
                 await acquire_bf_s2s_token(
                     client=client,
@@ -1882,13 +1814,9 @@ class TestAcquireBfS2sToken:
         we only special-case the AADSTS82001 path."""
 
         def handler(req: httpx.Request) -> httpx.Response:
-            return httpx.Response(
-                400, json={"error": "invalid_request", "error_codes": [70002]}
-            )
+            return httpx.Response(400, json={"error": "invalid_request", "error_codes": [70002]})
 
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(handler)
-        ) as client:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
             with pytest.raises(httpx.HTTPStatusError):
                 await acquire_bf_s2s_token(
                     client=client,
@@ -2251,9 +2179,7 @@ class TestEnvelope:
 
 class TestRenderReply:
     def test_text_only_response(self) -> None:
-        reply = render_reply_activity(
-            _inbound_message_activity(), {"text": "hello back"}
-        )
+        reply = render_reply_activity(_inbound_message_activity(), {"text": "hello back"})
         assert reply["type"] == "message"
         assert reply["text"] == "hello back"
         # from/recipient must swap per BF reply convention.
@@ -2274,9 +2200,7 @@ class TestRenderReply:
 
     def test_reply_carries_ai_generated_content_label(self) -> None:
         # #73(a): every outbound reply is labelled AI-generated content.
-        reply = render_reply_activity(
-            _inbound_message_activity(), {"text": "hello back"}
-        )
+        reply = render_reply_activity(_inbound_message_activity(), {"text": "hello back"})
         assert reply["entities"] == [
             {
                 "type": "https://schema.org/Message",
@@ -2334,9 +2258,7 @@ class TestRenderReply:
     # ── #73(c) feedback loop ──────────────────────────────────────────────
 
     def test_feedback_opt_in_adds_channel_data(self) -> None:
-        reply = render_reply_activity(
-            _inbound_message_activity(), {"text": "hi", "feedback": True}
-        )
+        reply = render_reply_activity(_inbound_message_activity(), {"text": "hi", "feedback": True})
         assert reply["channelData"] == {"feedbackLoop": {"type": "default"}}
 
     def test_feedback_absent_by_default(self) -> None:
@@ -2357,9 +2279,7 @@ class TestRenderReply:
 
 
 class TestLoadBridgeConfig:
-    def test_missing_secret_errors_with_actionable_hint(
-        self, tmp_path: Path
-    ) -> None:
+    def test_missing_secret_errors_with_actionable_hint(self, tmp_path: Path) -> None:
         """Slice 19e: secret missing usually means `a365 publish`
         clobbered the local config. Error should point at the fix."""
         _seed_agent_env(tmp_path)
@@ -2391,9 +2311,7 @@ class TestLoadBridgeConfig:
         _seed_agent_env(tmp_path, A365_TENANT_ID="")
         path = tmp_path / "a365.generated.config.json"
         path.write_text(
-            json.dumps(
-                {"agentBlueprintId": "bp-id", "agentBlueprintClientSecret": None}
-            )
+            json.dumps({"agentBlueprintId": "bp-id", "agentBlueprintClientSecret": None})
         )
         path.chmod(0o600)
         with pytest.raises(BridgeConfigError, match="no A365_TENANT_ID was set"):
@@ -2444,9 +2362,7 @@ class TestLoadBridgeConfig:
         assert cfg.bf_client_secret == ""
         assert cfg.agent_identity_ids == ()
 
-    def test_path_b_identity_loaded_from_agent_env(
-        self, tmp_path: Path
-    ) -> None:
+    def test_path_b_identity_loaded_from_agent_env(self, tmp_path: Path) -> None:
         """#36: ``A365_BF_APP_ID`` and ``A365_BF_CLIENT_SECRET`` in the
         per-agent .env populate the Path B identity fields. Empty/unset
         defaults to "" (Path A-only operators unaffected)."""
@@ -2477,9 +2393,7 @@ class TestLoadBridgeConfig:
         assert cfg.blueprint_client_id == "blueprint-app-id"
         assert cfg.blueprint_client_secret == "sek"
 
-    def test_agent_identity_allowlist_loaded_from_agent_env(
-        self, tmp_path: Path
-    ) -> None:
+    def test_agent_identity_allowlist_loaded_from_agent_env(self, tmp_path: Path) -> None:
         _seed_agent_env(
             tmp_path,
             A365_AGENT_IDENTITY_IDS="Inst-1, inst-1, inst-2",
@@ -2752,9 +2666,7 @@ class TestSenderAllowlist:
         generated = _seed_generated_config(tmp_path)
 
         with pytest.raises(BridgeConfigError, match="sender allowlists disagree") as unscoped:
-            resolve_runtime_sender_allowlist(
-                tmp_path, process_env=os.environ, slug=""
-            )
+            resolve_runtime_sender_allowlist(tmp_path, process_env=os.environ, slug="")
         with pytest.raises(BridgeConfigError, match="sender allowlists disagree") as scoped:
             load_bridge_config(
                 slug="inbox-helper",
@@ -2809,9 +2721,7 @@ class TestSenderAllowlist:
         assert str(absent.value) == str(empty.value)
         assert "true" not in str(absent.value)
 
-    def test_file_present_and_process_absent_uses_the_file(
-        self, tmp_path: Path
-    ) -> None:
+    def test_file_present_and_process_absent_uses_the_file(self, tmp_path: Path) -> None:
         # #160 serve: the list lives in ~/.hermes/.env and the process is silent.
         _seed_agent_env(tmp_path)
         _write_profile_env(tmp_path, A365_ALLOWED_USERS="User-A")
@@ -2916,16 +2826,10 @@ def _serve_handler_factory(
             capture["token"].append(params)
             grant = params.get("grant_type", "")
             if params.get("fmi_path"):
-                return httpx.Response(
-                    200, json={"access_token": "T1", "expires_in": 3600}
-                )
+                return httpx.Response(200, json={"access_token": "T1", "expires_in": 3600})
             if grant == "user_fic":
-                return httpx.Response(
-                    200, json={"access_token": "FINAL", "expires_in": 3600}
-                )
-            return httpx.Response(
-                200, json={"access_token": "T2", "expires_in": 3600}
-            )
+                return httpx.Response(200, json={"access_token": "FINAL", "expires_in": 3600})
+            return httpx.Response(200, json={"access_token": "T2", "expires_in": 3600})
         if url.startswith("https://hook.test/responder"):
             capture["webhook"].append(json.loads(req.content))
             if webhook_status != 200:
@@ -2943,8 +2847,7 @@ def _serve_handler_factory(
                 json={
                     "issuer": TEST_AAD_ISSUER,
                     "jwks_uri": (
-                        f"https://login.microsoftonline.com/"
-                        f"{TEST_TENANT_ID}/discovery/v2.0/keys"
+                        f"https://login.microsoftonline.com/{TEST_TENANT_ID}/discovery/v2.0/keys"
                     ),
                 },
             )
@@ -3010,9 +2913,7 @@ class TestServeApp:
         assert "/v3/conversations/conv-1/activities/1234" in reply_url
         assert capture["reply"][0]["body"]["text"] == "hi back"
 
-    def test_serve_webhook_ack_deadline_on_slow_429(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_serve_webhook_ack_deadline_on_slow_429(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import time
 
         import hermes_a365.outbound_retry as outbound_retry
@@ -3069,16 +2970,10 @@ class TestServeApp:
                 capture["token"].append(params)
                 grant = params.get("grant_type", "")
                 if params.get("fmi_path"):
-                    return httpx.Response(
-                        200, json={"access_token": "T1", "expires_in": 3600}
-                    )
+                    return httpx.Response(200, json={"access_token": "T1", "expires_in": 3600})
                 if grant == "user_fic":
-                    return httpx.Response(
-                        200, json={"access_token": "FINAL", "expires_in": 3600}
-                    )
-                return httpx.Response(
-                    200, json={"access_token": "T2", "expires_in": 3600}
-                )
+                    return httpx.Response(200, json={"access_token": "FINAL", "expires_in": 3600})
+                return httpx.Response(200, json={"access_token": "T2", "expires_in": 3600})
             if url.startswith("https://hook.test/responder"):
                 clock += 2.0
                 capture["webhook"].append(clock)
@@ -3088,9 +2983,7 @@ class TestServeApp:
                     text="throttled",
                 )
             if "/v3/conversations/" in url:
-                capture["reply"].append(
-                    {"url": url, "body": json.loads(req.content)}
-                )
+                capture["reply"].append({"url": url, "body": json.loads(req.content)})
                 return httpx.Response(200, json={})
             return httpx.Response(404, text=f"unhandled {url}")
 
@@ -3121,9 +3014,7 @@ class TestServeApp:
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         activity = _inbound_message_activity(conv_id="19:abc@thread.tacv2")
         activity["id"] = "../x?y#z"
-        with _client_for(
-            cfg, capture=capture, webhook_response={"text": "hi back"}
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_response={"text": "hi back"}) as client:
             r = client.post("/api/messages", json=activity)
         assert r.status_code == 200
         assert len(capture["reply"]) == 1
@@ -3138,9 +3029,7 @@ class TestServeApp:
         assert "#" not in after
 
     @pytest.mark.parametrize("reply_status", [401, 500])
-    def test_message_reply_post_failure_does_not_report_replied(
-        self, reply_status: int
-    ) -> None:
+    def test_message_reply_post_failure_does_not_report_replied(self, reply_status: int) -> None:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         body = "microsoft rejected the reply"
@@ -3201,9 +3090,7 @@ class TestServeApp:
         with _client_for(
             cfg,
             capture=capture,
-            webhook_response={
-                "invokeResponse": {"status": 200, "body": {"text": "thanks"}}
-            },
+            webhook_response={"invokeResponse": {"status": 200, "body": {"text": "thanks"}}},
         ) as client:
             r = client.post("/api/messages", json=invoke)
         assert r.status_code == 200
@@ -3228,9 +3115,7 @@ class TestServeApp:
         with _client_for(
             cfg,
             capture=capture,
-            webhook_response={
-                "invokeResponse": {"status": "not-a-number", "body": {"ok": True}}
-            },
+            webhook_response={"invokeResponse": {"status": "not-a-number", "body": {"ok": True}}},
         ) as client:
             r = client.post("/api/messages", json=invoke)
         assert r.status_code == 200
@@ -3247,9 +3132,7 @@ class TestServeApp:
             {"status": [500], "body": {}},  # int([500]) -> TypeError
         ],
     )
-    def test_invoke_malformed_operator_response_degrades_to_200(
-        self, invoke_response: Any
-    ) -> None:
+    def test_invoke_malformed_operator_response_degrades_to_200(self, invoke_response: Any) -> None:
         # #97 (red-team) — the operator webhook response is arbitrary operator-
         # controlled JSON. A non-dict invokeResponse envelope, or a status that
         # is Infinity / NaN / wrong-type, must degrade to a 200 ack — never an
@@ -3326,9 +3209,7 @@ class TestActivityDeliveryId:
     def test_extracts_conv_and_activity_id(self) -> None:
         a = _inbound_message_activity()
         # #103/L7: key is length-prefixed on conv ("conv-1" is 6 chars).
-        assert _activity_delivery_id(a) == (
-            "0:|0:|6:user-1|5:bot-1|6:conv-1|4:1234|7:message"
-        )
+        assert _activity_delivery_id(a) == ("0:|0:|6:user-1|5:bot-1|6:conv-1|4:1234|7:message")
 
     def test_missing_conversation_returns_none(self) -> None:
         a = _inbound_message_activity()
@@ -3481,9 +3362,7 @@ class TestIdempotencyCache:
         assert cache.is_duplicate("k", now=101.0) is False
         assert len(cache.seen) == 0
 
-    def test_oversized_cap_is_clamped_with_warning(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_oversized_cap_is_clamped_with_warning(self, caplog: pytest.LogCaptureFixture) -> None:
         # #105 review: a fat-fingered operator cap is clamped in the one place
         # both runtimes construct the cache, and the clamp is logged.
         from hermes_a365.activity_bridge import MAX_IDEMPOTENCY_MAX_ENTRIES
@@ -3493,9 +3372,7 @@ class TestIdempotencyCache:
         assert cache.max_entries == MAX_IDEMPOTENCY_MAX_ENTRIES
         assert "clamping" in caplog.text
 
-    def test_non_integer_cap_falls_back_to_default(
-        self, caplog: pytest.LogCaptureFixture
-    ) -> None:
+    def test_non_integer_cap_falls_back_to_default(self, caplog: pytest.LogCaptureFixture) -> None:
         # #105 review: a non-int cap can arrive from either config path (a
         # malformed `extra` value, or a config object whose attribute lookup
         # always succeeds). Fall back instead of raising on first comparison.
@@ -3532,9 +3409,7 @@ class TestServeAppUnroutable:
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         activity = _inbound_message_activity()
         activity["id"] = {"nested": "not-a-string"}
-        with _client_for(
-            cfg, capture=capture, webhook_response={"text": "hi back"}
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_response={"text": "hi back"}) as client:
             r1 = client.post("/api/messages", json=activity)
             r2 = client.post("/api/messages", json=activity)
         assert r1.status_code == 200
@@ -3558,9 +3433,7 @@ class TestServeAppUnroutable:
         activity = _inbound_message_activity()
         activity["type"] = "invoke"
         activity.pop("id", None)
-        with _client_for(
-            cfg, capture=capture, webhook_response={"text": "hi back"}
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_response={"text": "hi back"}) as client:
             r = client.post("/api/messages", json=activity)
         assert r.status_code == 200
         assert len(capture["webhook"]) == 1  # forwarded, not dropped
@@ -3579,9 +3452,7 @@ class TestServeAppUnroutable:
         activity = _inbound_message_activity()
         activity["type"] = "invoke"
         activity.pop("id", None)
-        with _client_for(
-            cfg, capture=capture, webhook_status=500
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_status=500) as client:
             r = client.post("/api/messages", json=activity)
         assert r.status_code == 200
         assert r.json() == {}
@@ -3597,9 +3468,7 @@ class TestServeAppUnroutable:
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         activity = _inbound_message_activity()
         activity["type"] = "invoke"
-        with _client_for(
-            cfg, capture=capture, webhook_status=500
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_status=500) as client:
             r = client.post("/api/messages", json=activity)
         assert r.status_code == 200
         assert r.json() == {}
@@ -3610,9 +3479,7 @@ class TestServeAppUnroutable:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
-        with _client_for(
-            cfg, capture=capture, webhook_response={"text": "hi back"}
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_response={"text": "hi back"}) as client:
             r = client.post("/api/messages", json=_inbound_message_activity())
         assert r.json()["status"] == "replied"
         assert len(capture["webhook"]) == 1
@@ -3623,9 +3490,7 @@ class TestServeAppDedupe:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
-        with _client_for(
-            cfg, capture=capture, webhook_response={"text": "hi back"}
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_response={"text": "hi back"}) as client:
             r1 = client.post("/api/messages", json=_inbound_message_activity())
             r2 = client.post("/api/messages", json=_inbound_message_activity())
         assert r1.status_code == 200
@@ -3648,9 +3513,7 @@ class TestServeAppDedupe:
         preseed_token = _make_token(
             priv, aud=cfg.blueprint_client_id, extra={"jti": "preseed-token"}
         )
-        victim_token = _make_token(
-            priv, aud=cfg.blueprint_client_id, extra={"jti": "victim-token"}
-        )
+        victim_token = _make_token(priv, aud=cfg.blueprint_client_id, extra={"jti": "victim-token"})
 
         preseed = _inbound_message_activity(conv_id="conv-victim")
         victim = _inbound_message_activity(
@@ -3696,12 +3559,8 @@ class TestServeAppDedupe:
         cfg = _cfg()
         cfg.tenant_id = TEST_TENANT_ID
         cfg.blueprint_client_id = "bot-app-id"
-        preseed_token = _make_token(
-            priv, aud=cfg.blueprint_client_id, extra={"jti": "preseed-jti"}
-        )
-        victim_token = _make_token(
-            priv, aud=cfg.blueprint_client_id, extra={"jti": "victim-jti"}
-        )
+        preseed_token = _make_token(priv, aud=cfg.blueprint_client_id, extra={"jti": "preseed-jti"})
+        victim_token = _make_token(priv, aud=cfg.blueprint_client_id, extra={"jti": "victim-jti"})
         activity = _inbound_message_activity(conv_id="conv-m3")
         activity["id"] = "shared-activity-id"
         activity["conversation"]["tenantId"] = TEST_TENANT_ID
@@ -3746,9 +3605,7 @@ class TestServeAppDedupe:
         with _client_for(
             cfg,
             capture=capture,
-            webhook_response={
-                "invokeResponse": {"status": 200, "body": {"text": "ok"}}
-            },
+            webhook_response={"invokeResponse": {"status": 200, "body": {"text": "ok"}}},
         ) as client:
             r1 = client.post("/api/messages", json=invoke)
             r2 = client.post("/api/messages", json=invoke)
@@ -3768,9 +3625,7 @@ class TestServeAppDedupe:
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         a1 = _inbound_message_activity()
         a2 = {**_inbound_message_activity(), "id": "5678"}
-        with _client_for(
-            cfg, capture=capture, webhook_response={"text": "echo"}
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_response={"text": "echo"}) as client:
             client.post("/api/messages", json=a1)
             client.post("/api/messages", json=a2)
         assert len(capture["webhook"]) == 2
@@ -3819,9 +3674,7 @@ class TestIsTrustedServiceUrl:
         assert not _is_trusted_service_url("", DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES)
 
     def test_empty_suffix_list_rejected(self) -> None:
-        assert not _is_trusted_service_url(
-            "https://smba.trafficmanager.net/teams/", ()
-        )
+        assert not _is_trusted_service_url("https://smba.trafficmanager.net/teams/", ())
 
     def test_suffix_match_is_dns_boundary_not_substring(self) -> None:
         # `evil-trafficmanager.net` must not slip through a naive
@@ -3855,9 +3708,7 @@ class TestIsTrustedServiceUrl:
         # The exact-host pin must not admit a registrable sibling or a suffix-
         # spoof host that merely ends with the pinned string.
         assert not _is_trusted_service_url("https://evilsmba.trafficmanager.net/", suffixes)
-        assert not _is_trusted_service_url(
-            "https://smba.trafficmanager.net.evil.com/", suffixes
-        )
+        assert not _is_trusted_service_url("https://smba.trafficmanager.net.evil.com/", suffixes)
 
     def test_m2_trailing_dot_fqdn_accepted(self) -> None:
         # #106 review — "smba.trafficmanager.net." (absolute/trailing-dot FQDN) is
@@ -3902,9 +3753,7 @@ class TestServeAppServiceUrlGate:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
-        with _client_for(
-            cfg, capture=capture, webhook_response={"text": "echo"}
-        ) as client:
+        with _client_for(cfg, capture=capture, webhook_response={"text": "echo"}) as client:
             r = client.post("/api/messages", json=_inbound_message_activity())
         assert r.status_code == 200
         assert r.json()["status"] == "replied"
@@ -3916,9 +3765,7 @@ class TestServeAppServiceUrlGate:
 
 
 class TestUpdateEndpointCli:
-    def test_dry_run_renders_argv_with_m365(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
+    def test_dry_run_renders_argv_with_m365(self, capsys: pytest.CaptureFixture[str]) -> None:
         rc = main(
             [
                 "update-endpoint",
@@ -3961,9 +3808,7 @@ class TestUpdateEndpointCli:
         assert rc == 2
         assert "must be HTTPS" in capsys.readouterr().err
 
-    def test_apply_fallback_carries_verified_tenant(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_apply_fallback_carries_verified_tenant(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from hermes_a365.mutator import CliInvocationError, RunResult
 
         tenant = "aaaaaaaa-0000-0000-0000-000000000001"
@@ -4033,9 +3878,7 @@ class TestServeDualJwtDispatch:
     """#18 finding 3 — serve now dispatches BF-issuer tokens to
     validate_inbound_jwt_bf, not only the A365/AAD-v2 validator."""
 
-    def _run(
-        self, monkeypatch: pytest.MonkeyPatch, iss: str
-    ) -> tuple[AsyncMock, AsyncMock, Any]:
+    def _run(self, monkeypatch: pytest.MonkeyPatch, iss: str) -> tuple[AsyncMock, AsyncMock, Any]:
         import hermes_a365.activity_bridge as ab
 
         cfg = _cfg()
@@ -4056,9 +3899,7 @@ class TestServeDualJwtDispatch:
         assert r.status_code == 200, r.text
         return a365, bf, activity, cfg
 
-    def test_bf_issuer_routes_to_bf_validator(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_bf_issuer_routes_to_bf_validator(self, monkeypatch: pytest.MonkeyPatch) -> None:
         import hermes_a365.activity_bridge as ab
 
         a365, bf, activity, cfg = self._run(monkeypatch, ab.BF_ISSUER)
@@ -4067,16 +3908,10 @@ class TestServeDualJwtDispatch:
         assert bf.await_args.kwargs["expected_service_url"] == activity["serviceUrl"]
         # Parity with the plugin adapter: expected_app_id falls back to the
         # blueprint id when bf_app_id is unset.
-        assert bf.await_args.kwargs["expected_app_id"] == (
-            cfg.bf_app_id or cfg.blueprint_client_id
-        )
+        assert bf.await_args.kwargs["expected_app_id"] == (cfg.bf_app_id or cfg.blueprint_client_id)
 
-    def test_aad_issuer_routes_to_aad_validator(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        a365, bf, _, _ = self._run(
-            monkeypatch, "https://login.microsoftonline.com/tid/v2.0"
-        )
+    def test_aad_issuer_routes_to_aad_validator(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        a365, bf, _, _ = self._run(monkeypatch, "https://login.microsoftonline.com/tid/v2.0")
         a365.assert_awaited_once()
         bf.assert_not_awaited()
 
@@ -4108,9 +3943,7 @@ class TestTokenFactory:
             "recipient": {"agenticAppId": "aa", "agenticUserId": "au", "tenantId": "t"},
             "conversation": {"tenantId": "t"},
         }
-        assert (
-            await self._factory().for_graph(activity, validated_path="A") == "tokenA"
-        )
+        assert await self._factory().for_graph(activity, validated_path="A") == "tokenA"
         assert mint.await_args.kwargs["scope"] == f"{ab.GRAPH_RESOURCE}/.default"
 
     @pytest.mark.asyncio
@@ -4126,9 +3959,7 @@ class TestTokenFactory:
             "recipient": {},
             "conversation": {},
         }
-        assert (
-            await self._factory().for_graph(activity, validated_path="B") == "tokenB"
-        )
+        assert await self._factory().for_graph(activity, validated_path="B") == "tokenB"
         assert mint.call_args.kwargs["resource"] == ab.GRAPH_RESOURCE
 
     @pytest.mark.asyncio
@@ -4144,9 +3975,7 @@ class TestTokenFactory:
             "conversation": {"tenantId": "t"},
             "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
         }
-        assert (
-            await self._factory().for_graph(activity, validated_path="B") == "tokenB"
-        )
+        assert await self._factory().for_graph(activity, validated_path="B") == "tokenB"
         mint.assert_called_once()
 
     @pytest.mark.asyncio
@@ -4260,9 +4089,7 @@ class TestServeSecretsProviderWiring:
         os.chmod(path, 0o600)
         return path
 
-    def test_blueprint_secret_filled_from_provider_when_config_empty(
-        self, tmp_path: Path
-    ) -> None:
+    def test_blueprint_secret_filled_from_provider_when_config_empty(self, tmp_path: Path) -> None:
         # #19 walk §5b: the generated config no longer carries the secret;
         # the provider (keychain in production) supplies it after a restart.
         _seed_agent_env(tmp_path)
@@ -4293,9 +4120,7 @@ class TestServeSecretsProviderWiring:
         assert cfg.blueprint_client_secret == "FRESH"
         assert (self._TENANT, "blueprint-app-id") not in fake.asked
 
-    def test_bf_secret_filled_from_provider_when_env_empty(
-        self, tmp_path: Path
-    ) -> None:
+    def test_bf_secret_filled_from_provider_when_env_empty(self, tmp_path: Path) -> None:
         _seed_agent_env(tmp_path, A365_BF_APP_ID="bf-app-id")  # no BF secret
         self._provider({(self._TENANT, "bf-app-id"): "bf-from-keychain"})
 
@@ -4310,9 +4135,7 @@ class TestServeSecretsProviderWiring:
 
     def test_agent_env_bf_secret_still_wins(self, tmp_path: Path) -> None:
         # #19 walk §5c: the documented .env fallback, deliberately selected.
-        _seed_agent_env(
-            tmp_path, A365_BF_APP_ID="bf-app-id", A365_BF_CLIENT_SECRET="from-env"
-        )
+        _seed_agent_env(tmp_path, A365_BF_APP_ID="bf-app-id", A365_BF_CLIENT_SECRET="from-env")
         self._provider({(self._TENANT, "bf-app-id"): "from-keychain"})
 
         cfg = load_bridge_config(
@@ -4341,9 +4164,7 @@ class TestServeSecretsProviderWiring:
         assert cfg.bf_client_secret == ""
         assert cfg.blueprint_client_secret == "sek"
 
-    def test_verify_probe_accepts_a_provider_supplied_secret(
-        self, tmp_path: Path
-    ) -> None:
+    def test_verify_probe_accepts_a_provider_supplied_secret(self, tmp_path: Path) -> None:
         # Round-1 HIGH finding: `activity-bridge verify` is the docs-designated
         # bridge preflight / CI gate, but it read the secret straight from the
         # generated config. An operator who followed the README's keychain flow
@@ -4354,17 +4175,13 @@ class TestServeSecretsProviderWiring:
         _seed_agent_env(tmp_path)
         self._provider({(self._TENANT, "blueprint-app-id"): "from-keychain"})
 
-        probe, data = probe_generated_config(
-            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
-        )
+        probe, data = probe_generated_config(self._gen(tmp_path, secret=""), tenant_id=self._TENANT)
 
         assert probe.state != "error"
         assert data["client_secret"] == "from-keychain"
         assert "provider" in probe.detail
 
-    def test_verify_probe_distinguishes_unreachable_provider(
-        self, tmp_path: Path
-    ) -> None:
+    def test_verify_probe_distinguishes_unreachable_provider(self, tmp_path: Path) -> None:
         from hermes_a365.secrets_provider import set_default_provider
 
         class Unreachable:
@@ -4386,9 +4203,7 @@ class TestServeSecretsProviderWiring:
         assert "register --apply" not in probe.detail
         assert "keychain store" not in probe.detail
 
-    def test_serve_startup_distinguishes_unreachable_provider(
-        self, tmp_path: Path
-    ) -> None:
+    def test_serve_startup_distinguishes_unreachable_provider(self, tmp_path: Path) -> None:
         from hermes_a365.secrets_provider import set_default_provider
 
         class Unreachable:
@@ -4412,9 +4227,7 @@ class TestServeSecretsProviderWiring:
         assert "credential reset" not in detail
         assert "keychain store" not in detail
 
-    def test_verify_uses_one_atomic_provider_result(
-        self, tmp_path: Path
-    ) -> None:
+    def test_verify_uses_one_atomic_provider_result(self, tmp_path: Path) -> None:
         from hermes_a365.secrets_provider import set_default_provider
 
         class Recovering:
@@ -4433,24 +4246,18 @@ class TestServeSecretsProviderWiring:
         _seed_agent_env(tmp_path)
         set_default_provider(provider)
 
-        probe, data = probe_generated_config(
-            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
-        )
+        probe, data = probe_generated_config(self._gen(tmp_path, secret=""), tenant_id=self._TENANT)
 
         assert probe.state == "error"
         assert data == {}
         assert "unreachable" in probe.detail
         assert provider.calls == 1
 
-    def test_verify_probe_still_errors_when_neither_tier_has_it(
-        self, tmp_path: Path
-    ) -> None:
+    def test_verify_probe_still_errors_when_neither_tier_has_it(self, tmp_path: Path) -> None:
         _seed_agent_env(tmp_path)
         self._provider({})
 
-        probe, data = probe_generated_config(
-            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
-        )
+        probe, data = probe_generated_config(self._gen(tmp_path, secret=""), tenant_id=self._TENANT)
 
         assert probe.state == "error"
         assert data == {}
@@ -4458,9 +4265,7 @@ class TestServeSecretsProviderWiring:
         # was consulted, not bypassed.
         assert "provider" in probe.detail
 
-    def test_verify_probe_reports_the_generated_config_tier(
-        self, tmp_path: Path
-    ) -> None:
+    def test_verify_probe_reports_the_generated_config_tier(self, tmp_path: Path) -> None:
         _seed_agent_env(tmp_path)
         fake = self._provider({(self._TENANT, "blueprint-app-id"): "STALE"})
 
@@ -4491,9 +4296,7 @@ class TestServeSecretsProviderWiring:
         _seed_agent_env(tmp_path)
         set_default_provider(ReadmeProvider())
 
-        probe, data = probe_generated_config(
-            self._gen(tmp_path, secret=""), tenant_id=self._TENANT
-        )
+        probe, data = probe_generated_config(self._gen(tmp_path, secret=""), tenant_id=self._TENANT)
 
         # Either branch must produce a probe result, never an exception.
         assert "ReadmeProvider" in probe.detail
@@ -4545,9 +4348,7 @@ class TestSecurityRequestBoundary:
         monkeypatch.setattr(ab, "MAX_PRE_AUTH_IN_FLIGHT_POSTS", 1)
         token = _make_token(priv, aud=cfg.blueprint_client_id)
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
-        http_client = httpx.AsyncClient(
-            transport=_serve_handler_factory(capture=capture, jwk=jwk)
-        )
+        http_client = httpx.AsyncClient(transport=_serve_handler_factory(capture=capture, jwk=jwk))
         app = make_app(cfg, http_client=http_client)
         asgi = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(transport=asgi, base_url="http://testserver") as client:
@@ -4630,9 +4431,7 @@ class TestSecurityRequestBoundary:
             "fooBar",
         ],
     )
-    def test_serve_does_not_forward_non_webhook_contract_types(
-        self, activity_type: str
-    ) -> None:
+    def test_serve_does_not_forward_non_webhook_contract_types(self, activity_type: str) -> None:
         capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
         cfg = _cfg()
         cfg.skip_jwt_validation = True
@@ -4697,9 +4496,7 @@ class TestSecurityRequestBoundary:
         assert _activity_chat_type(activity) == expected
 
     @pytest.mark.parametrize("header", ["Bearer", "Bearer malformed", "Basic abc"])
-    def test_malformed_authorization_never_reaches_unverified_jwt_peek(
-        self, header: str
-    ) -> None:
+    def test_malformed_authorization_never_reaches_unverified_jwt_peek(self, header: str) -> None:
         capture: dict[str, list[Any]] = {"webhook": [], "reply": [], "token": []}
         client = _client_for(_cfg(), capture=capture)
 

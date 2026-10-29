@@ -20,6 +20,11 @@ from uuid import UUID
 
 import jinja2
 
+OTLP_DEPRECATED_MESSAGE = (
+    "WARN: HERMES_OTLP_ENDPOINT is deprecated and ignored; "
+    "it is not written and is removed from the agent .env on --apply (#189)."
+)
+
 
 class TenantResolutionError(ValueError):
     """Raised when a configured tenant pin cannot be read or compared safely."""
@@ -143,9 +148,7 @@ def validate_slug(slug: str) -> str:
     if slug in (".", ".."):
         raise ValueError(f"agent slug must not be a dot component: {slug!r}")
     if "/" in slug or "\\" in slug or "\x00" in slug:
-        raise ValueError(
-            f"agent slug must not contain path separators or NUL: {slug!r}"
-        )
+        raise ValueError(f"agent slug must not contain path separators or NUL: {slug!r}")
     return slug
 
 
@@ -215,9 +218,7 @@ TENANT_ID_HELP = (
 )
 
 
-def resolve_expected_tenant(
-    hermes_home: Path, explicit: str | None
-) -> tuple[str | None, str]:
+def resolve_expected_tenant(hermes_home: Path, explicit: str | None) -> tuple[str | None, str]:
     """#102 M7: which tenant destructive/provisioning CLI runs must bind to.
 
     Precedence: an explicit ``--tenant-id`` wins; else the persisted

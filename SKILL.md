@@ -61,7 +61,7 @@ surfacing.
 Microsoft Agent 365 (A365, GA 2026-05-01) is the governance / identity
 / observability control plane Hermes-A365 plugs into: Entra-backed
 agentic identity, tenant licensing, agent blueprints, MCP-mediated
-Microsoft 365 data access ("Work IQ"), OpenTelemetry, and the
+Microsoft 365 data access ("Work IQ"), and the
 channel adapters for Teams / Outlook / M365 Copilot.
 
 The wrapper is built directly on the GA `Microsoft.Agents.A365.DevTools.Cli`
@@ -84,8 +84,7 @@ Use when the user wants any of:
   `@`-mention / side-panels in Word / Excel / PowerPoint / Outlook).
   Path B. Requires Azure subscription.
 - A Bot Framework activity bridge backed by **A365 governance**
-  (Entra-backed identity, MCP-mediated Microsoft 365 data, OTLP
-  audit trails).
+  (Entra-backed identity, MCP-mediated Microsoft 365 data).
 - Migrating an OpenClaw-on-A365 deployment to Hermes (the
   blueprint stays; only the runtime endpoint changes).
 
@@ -238,10 +237,9 @@ Idempotent; re-running after grant is a no-op.
 Pure local config-file writer. The server-side agent identity is created
 by `a365 setup blueprint` (driven by `register`); this command only
 produces the per-agent `~/.hermes/agents/<slug>/.env` that runtime
-consumers read for slug, owner, OTLP endpoint, and business-hours
-metadata.
+consumers read for slug, owner, and business-hours metadata.
 
-Inherits `A365_APP_ID`, `A365_TENANT_ID`, `HERMES_OTLP_ENDPOINT` from
+Inherits `A365_APP_ID` and `A365_TENANT_ID` from
 `~/.hermes/.env`. An existing `AA_INSTANCE_ID` is preserved across
 re-runs; business-hours fields from a prior run are also preserved
 unless explicitly overridden. The per-agent .env never contains the
@@ -443,7 +441,6 @@ the split.
       approved for the target DLP scope.
 - [ ] Test message in Teams (or other approved channel) returns an
       Adaptive Card from the agent.
-- [ ] OTLP trace visible in the A365 admin centre for the test message.
 - [ ] `hermes a365 cleanup --agent-name <name>` (dry-run) lists exactly
       the resources the operator expects to remove.
 
