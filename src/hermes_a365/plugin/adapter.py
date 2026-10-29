@@ -7152,6 +7152,72 @@ class Agent365Adapter(BasePlatformAdapter):
         stream["last_emit_mono"] = time.monotonic()
         self._remember_keepalive(chat_id, buf, stream)
 
+    @staticmethod
+    def _keepalive_visible_post_snapshot(activity: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "text": str(activity.get("text") or ""),
+            "entities": copy.deepcopy(activity.get("entities") or []),
+            "channelData": (
+                copy.deepcopy(activity.get("channelData"))
+                if activity.get("channelData") is not None
+                else None
+            ),
+        }
+
+    @staticmethod
+    def _keepalive_final_activity_from_visible_post(
+        last_visible: dict[str, Any],
+        *,
+        stream_id: str,
+        inbound: dict[str, Any],
+        conv: dict[str, Any],
+    ) -> dict[str, Any]:
+        entities = copy.deepcopy(last_visible.get("entities") or [])
+        for entity in entities:
+            if entity.get("type") == "streaminfo":
+                entity["streamType"] = "final"
+                entity.pop("streamSequence", None)
+                if stream_id:
+                    entity["streamId"] = stream_id
+        activity: dict[str, Any] = {
+            "type": "message",
+            "text": str(last_visible.get("text") or ""),
+            "from": inbound.get("recipient") or {},
+            "recipient": inbound.get("from") or {},
+            "conversation": conv,
+            "entities": entities,
+        }
+        channel_data = last_visible.get("channelData")
+        if channel_data is not None:
+            activity["channelData"] = copy.deepcopy(channel_data)
+        return activity
+
+    def _keepalive_use_message_chrome(
+        self,
+        buf: dict[str, Any] | None,
+        turn: dict[str, Any],
+        *,
+        final: bool,
+        message_chrome: bool,
+        body_text: str,
+    ) -> bool:
+        if message_chrome:
+            return True
+        if final or not isinstance(buf, dict):
+            return False
+        preview = self._marked_answer_preview_for_turn(buf, turn).strip()
+        return bool(preview and body_text.strip() == preview)
+
+    def _record_keepalive_visible_post(self, chat_id: str, activity: dict[str, Any]) -> None:
+        if not str(activity.get("text") or "").strip():
+            return
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return
+        stream = self._keepalive_state(buf)
+        stream["last_visible_post"] = self._keepalive_visible_post_snapshot(activity)
+        self._remember_keepalive(chat_id, buf, stream)
+
     def _keepalive_stream_outbound_deadline(
         self,
         chat_id: str,
@@ -7280,27 +7346,52 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return empty
-        entity: dict[str, Any] = {
-            "type": "streaminfo",
-            "streamType": "final" if final else "informative",
-        }
-        if stream_id:
-            entity["streamId"] = stream_id
-        if not final:
-            entity["streamSequence"] = sequence
-        activity: dict[str, Any] = {
-            "type": "message" if final else "typing",
-            "text": payload_text,
-            "from": inbound.get("recipient") or {},
-            "recipient": inbound.get("from") or {},
-            "conversation": conv,
-            "entities": [entity],
-        }
+        use_chrome = self._keepalive_use_message_chrome(
+            buf if isinstance(buf, dict) else None,
+            turn,
+            final=final,
+            message_chrome=message_chrome,
+            body_text=body_text,
+        )
+        stream_state = self._keepalive_state(buf) if isinstance(buf, dict) else {}
+        last_visible = (
+            stream_state.get("last_visible_post")
+            if isinstance(stream_state, dict)
+            else None
+        )
         bridge = _import_bridge()
-        if final and message_chrome:
-            activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
-            if self._feedback_enabled:
-                activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
+        if (
+            final
+            and isinstance(last_visible, dict)
+            and str(last_visible.get("text") or "") == payload_text
+        ):
+            activity = self._keepalive_final_activity_from_visible_post(
+                last_visible,
+                stream_id=stream_id,
+                inbound=inbound,
+                conv=conv if isinstance(conv, dict) else {},
+            )
+        else:
+            entity: dict[str, Any] = {
+                "type": "streaminfo",
+                "streamType": "final" if final else "informative",
+            }
+            if stream_id:
+                entity["streamId"] = stream_id
+            if not final:
+                entity["streamSequence"] = sequence
+            activity = {
+                "type": "message" if final else "typing",
+                "text": payload_text,
+                "from": inbound.get("recipient") or {},
+                "recipient": inbound.get("from") or {},
+                "conversation": conv,
+                "entities": [entity],
+            }
+            if use_chrome:
+                activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
+                if self._feedback_enabled:
+                    activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
         validated = turn.get("validated_path")
         path = validated if isinstance(validated, str) else None
         url = _conversations_activities_url(service_url, conv_id)
@@ -7508,6 +7599,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 body = None
             if isinstance(body, dict):
                 new_id = str(body.get("id") or "")
+            self._record_keepalive_visible_post(chat_id, activity)
         detail = self._extract_error_message(resp) if status == 403 else ""
         untracked = not final and not stream_id and 200 <= status < 300 and not new_id
         retry_after_sec = (

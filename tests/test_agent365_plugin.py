@@ -8899,6 +8899,84 @@ class TestEditMessage:
         assert waits, "expected min-stream-age wait before final (#217)"
         assert chat not in a._turn_buffers
 
+    @staticmethod
+    def _issue249_non_stream_entities(entities: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        return [entity for entity in entities if entity.get("type") != "streaminfo"]
+
+    @pytest.mark.asyncio
+    async def test_issue249_fast_turn_no_empty_post_after_preview_and_final_matches_visible(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#249: preview-to-final swap must not emit empty text or mismatched chrome."""
+        a = _make_adapter(monkeypatch)
+        chat = "19:issue249@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 2.5
+        sleep_mock, _clock = self._advance_monotonic_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        posts: list[dict[str, Any]] = []
+        stream_id = "ka-issue249"
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, stream_id)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        answer = "Hello."
+        event = _StubMessageEvent(
+            text="quick hello",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=answer, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        visible = [post for post in posts if str(post.get("text") or "").strip()]
+        assert len(visible) >= 2
+        first_visible_idx = posts.index(visible[0])
+        for later in posts[first_visible_idx:]:
+            assert str(later.get("text") or "").strip(), "no empty/whitespace text after preview"
+        last_visible = visible[-2]
+        final = visible[-1]
+        assert final["type"] == "message"
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["text"] == last_visible["text"]
+        final_extra = self._issue249_non_stream_entities(final["entities"])
+        preview_extra = self._issue249_non_stream_entities(last_visible["entities"])
+        assert final_extra == preview_extra
+        final_stream = final["entities"][0]
+        preview_stream = last_visible["entities"][0]
+        assert final_stream.get("streamId") == stream_id
+        if preview_stream.get("streamId"):
+            assert preview_stream.get("streamId") == final_stream.get("streamId")
+        assert preview_stream.get("streamType") == "informative"
+        assert final_stream.get("streamType") == "final"
+        assert "streamSequence" not in final_stream
+        assert final.get("channelData") == last_visible.get("channelData")
+        waits = [
+            float(call.args[0])
+            for call in sleep_mock.await_args_list
+            if call.args and float(call.args[0]) >= 2.0
+        ]
+        assert waits, "expected min-stream-age wait before final (#217)"
+        assert send_reply_mock.await_count == 0
+        assert chat not in a._turn_buffers
+
     @pytest.mark.asyncio
     async def test_walk095_opened_stream_final_stays_on_same_stream_id(
         self, monkeypatch: pytest.MonkeyPatch
