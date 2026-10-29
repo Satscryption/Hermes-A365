@@ -202,10 +202,12 @@ ADAPTER_PUBLIC_MEMBERS: Final[frozenset[str]] = frozenset(
         "send_document",
         "send_image_file",
         "send_exec_approval",
+        "invalidate_exec_approval_capabilities",
         "send_slash_confirm",
         "send_clarify",
         "edit_message",
         "get_chat_info",
+        "handle_message",
     }
 )
 

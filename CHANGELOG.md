@@ -8,7 +8,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
-- Card capability binding refactored to use per-turn origin.
+- Card capability binding refactored to use per-turn origin and per-request binding for approvals.
 
 ### Removed
 
