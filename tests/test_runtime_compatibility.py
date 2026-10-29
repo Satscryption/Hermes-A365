@@ -10,6 +10,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 
+import yaml
 from packaging.specifiers import SpecifierSet
 from packaging.version import Version
 
@@ -22,6 +23,14 @@ CHANGELOG = ROOT / "CHANGELOG.md"
 OVERRIDES = ROOT / "overrides.txt"
 TEST_WORKFLOW = ROOT / ".github" / "workflows" / "test.yml"
 
+AGGREGATE_TEST_NEEDS = (
+    "unit",
+    "windows-negative",
+    "keychain-linux",
+    "wheel-smoke",
+    "hermes-source-smoke",
+)
+
 # Packages whose published minimums are security floors. The value is a
 # version that must remain excluded, and a version that must remain allowed.
 FLOORS = {
@@ -33,10 +42,7 @@ FLOORS = {
     "idna": (Version("3.14"), Version("3.15")),
 }
 
-OVERRIDE_LINES = (
-    "pyjwt[crypto]>=2.15.0\n"
-    "fastapi>=0.143\n"
-)
+OVERRIDE_LINES = "pyjwt[crypto]>=2.15.0\nfastapi>=0.143\n"
 
 
 def _project() -> dict:
@@ -75,6 +81,19 @@ def test_requires_python_matches_v1_matrix() -> None:
 
 def test_ci_matrix_covers_supported_python_versions() -> None:
     text = TEST_WORKFLOW.read_text()
+    workflow = yaml.safe_load(text)
+    jobs = workflow["jobs"]
+    assert "unit" in jobs
+    aggregate = jobs["test"]
+    assert aggregate.get("if") == "always()"
+    needs = aggregate["needs"]
+    assert isinstance(needs, list)
+    assert needs == list(AGGREGATE_TEST_NEEDS)
+    step_run = aggregate["steps"][0]["run"]
+    assert '!= "success"' in step_run
+    for job_id in AGGREGATE_TEST_NEEDS:
+        assert f"needs.{job_id}.result" in step_run
+
     for version in ("3.11", "3.12", "3.13", "3.14"):
         assert f'python-version: "{version}"' in text
     assert "macos-latest" in text
@@ -82,7 +101,11 @@ def test_ci_matrix_covers_supported_python_versions() -> None:
     assert "keychain-linux" in text
     assert "wheel-smoke" in text
     assert "hermes-source-smoke" in text
-    assert "pytest --timeout=300" in text
+    assert "--timeout=60" in text
+    assert "--timeout-method=thread" in text
+    assert "--randomly-seed=" in text
+    assert "--durations=15" in text
+    assert jobs["unit"].get("timeout-minutes") == 15
     assert "v2026.6.19" in text
     assert "v0.22.5" in text
 
@@ -170,9 +193,7 @@ def test_docs_show_override_install_and_hermes_v0225_pyjwt() -> None:
         if "134394" not in chunk or "fastapi" not in chunk.lower():
             continue
         lowered = chunk.lower()
-        assert (
-            "is not the fastapi exit" in lowered or "does not mention fastapi" in lowered
-        ), chunk
+        assert "is not the fastapi exit" in lowered or "does not mention fastapi" in lowered, chunk
 
 
 def test_documented_hermes_pins_do_not_satisfy_our_floors() -> None:
