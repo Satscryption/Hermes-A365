@@ -920,7 +920,7 @@ def test_graph_get_is_sensitive_and_redacts_the_error_body(
 ) -> None:
     from hermes_a365.mutator import CliInvocationError
 
-    token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.aaa.bbb"
+    opaque = "SYNTHETIC~ClientCredential42"
 
     class Spy:
         available = True
@@ -934,17 +934,17 @@ def test_graph_get_is_sensitive_and_redacts_the_error_body(
                 sensitive=True,
                 graph_error=(
                     "Authorization_RequestDenied",
-                    redact(f"Bearer {token}"),
+                    "Insufficient privileges to complete the operation.",
                 ),
             )
 
     getter = graph_get_from_mutator(Spy())  # type: ignore[arg-type]
     with pytest.raises(EntraStateError) as excinfo:
         read_registration_snapshot(getter, agent_name="inbox-helper", anchor_app_id="")
-    assert token not in str(excinfo.value)
-    assert "eyJ" not in str(excinfo.value)
+    assert opaque not in str(excinfo.value)
+    assert "Application.Read.All" in str(excinfo.value)
     out, err = capfd.readouterr()
-    assert token not in out + err
+    assert opaque not in out + err
 
 
 def _install_az_rest_shim(
@@ -979,11 +979,15 @@ def _assert_no_secret_in_exception_chain(exc: BaseException, marker: str) -> Non
         _assert_no_secret_in_exception_chain(exc.__context__, marker)
 
 
+_OPAQUE_GRAPH_SECRET = "SYNTHETIC~ClientCredential42"
+
+
 class TestSensitiveGraphViaMutator:
     def test_authorization_denied_surfaces_read_permission_hint(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
     ) -> None:
         from hermes_a365.mutator import A365CliMutator
 
@@ -991,7 +995,7 @@ class TestSensitiveGraphViaMutator:
             {
                 "error": {
                     "code": "Authorization_RequestDenied",
-                    "message": "Insufficient privileges to complete the operation.",
+                    "message": f"token={_OPAQUE_GRAPH_SECRET} denied",
                 }
             }
         )
@@ -1002,7 +1006,43 @@ class TestSensitiveGraphViaMutator:
         getter = graph_get_from_mutator(mutator)
         with pytest.raises(EntraStateError, match=r"Application\.Read\.All") as excinfo:
             _app_by_id(getter, APP)
+        assert _OPAQUE_GRAPH_SECRET not in str(excinfo.value)
         assert GRAPH_READ_PERMISSION_HINT.split(".")[0] in str(excinfo.value)
+        out, err = capfd.readouterr()
+        assert _OPAQUE_GRAPH_SECRET not in out + err
+
+    def test_sensitive_mutator_graph_error_has_no_server_message_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capfd: pytest.CaptureFixture[str],
+    ) -> None:
+        from hermes_a365.mutator import A365CliMutator, CliInvocationError
+
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "Request_ResourceNotFound",
+                    "message": f"credential={_OPAQUE_GRAPH_SECRET}",
+                }
+            }
+        )
+        _install_az_rest_shim(tmp_path, monkeypatch, response_body=body)
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        mutator = A365CliMutator()
+        mutator.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            mutator.run(
+                ["az", "rest", "--method", "GET", "--uri", "https://graph.microsoft.test/v1.0/x"],
+                sensitive=True,
+            )
+        _assert_no_secret_in_exception_chain(excinfo.value, _OPAQUE_GRAPH_SECRET)
+        assert excinfo.value.graph_error is not None
+        assert excinfo.value.graph_error[0] == "Request_ResourceNotFound"
+        assert _OPAQUE_GRAPH_SECRET not in excinfo.value.graph_error[1]
+        assert excinfo.value.graph_error[1] == "The requested resource does not exist."
+        out, err = capfd.readouterr()
+        assert _OPAQUE_GRAPH_SECRET not in out + err
 
     def test_not_found_returns_none_without_raw_body(
         self,
@@ -1026,38 +1066,6 @@ class TestSensitiveGraphViaMutator:
         mutator.available = True
         getter = graph_get_from_mutator(mutator)
         assert _app_by_id(getter, APP) is None
-
-    def test_sensitive_mutator_graph_error_has_no_raw_body(
-        self,
-        tmp_path: Path,
-        monkeypatch: pytest.MonkeyPatch,
-    ) -> None:
-        from hermes_a365.mutator import A365CliMutator, CliInvocationError
-
-        marker = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.aaa.bbb"
-        body = json.dumps(
-            {
-                "error": {
-                    "code": "Request_ResourceNotFound",
-                    "message": f"Bearer {marker}",
-                }
-            }
-        )
-        _install_az_rest_shim(tmp_path, monkeypatch, response_body=body)
-        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
-        mutator = A365CliMutator()
-        mutator.available = True
-        with pytest.raises(CliInvocationError) as excinfo:
-            mutator.run(
-                ["az", "rest", "--method", "GET", "--uri", "https://graph.microsoft.test/v1.0/x"],
-                sensitive=True,
-            )
-        _assert_no_secret_in_exception_chain(excinfo.value, marker)
-        assert excinfo.value.graph_error is not None
-        assert excinfo.value.graph_error[0] == "Request_ResourceNotFound"
-        assert marker not in excinfo.value.graph_error[1]
-        assert marker not in repr(excinfo.value)
-        assert excinfo.value.captured_output is None
 
     def test_cast_not_found_records_non_blueprint(
         self,

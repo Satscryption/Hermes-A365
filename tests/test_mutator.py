@@ -3,8 +3,12 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -21,6 +25,79 @@ from hermes_a365.mutator import (
     _run_streaming,
     get_mutator,
 )
+
+_OPAQUE_GRAPH_SECRET = "SYNTHETIC~ClientCredential42"
+
+
+def _install_az_rest_shim_for_mutator_test(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, *, response_body: str
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    az = bin_dir / "az"
+    az.write_text(
+        "#!/bin/sh\n"
+        'if [ "$1 $2 $3" = "rest --method GET" ]; then\n'
+        f"  printf '%s\\n' '{response_body}'\n"
+        "  exit 1\n"
+        "fi\n"
+        "echo unexpected az >&2\n"
+        "exit 1\n"
+    )
+    az.chmod(0o755)
+    monkeypatch.setenv("PATH", f"{bin_dir}:{os.environ['PATH']}")
+
+
+def _iter_exception_chain(exc: BaseException | None) -> Iterable[BaseException]:
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
+    if value is None:
+        return
+    oid = id(value)
+    if oid in _seen:
+        return
+    if isinstance(value, (str, bytes, bytearray)):
+        text = value.decode() if isinstance(value, (bytes, bytearray)) else value
+        assert marker not in text, repr(value)[:200]
+        return
+    _seen.add(oid)
+    if isinstance(value, re.Match):
+        _scan_value_for_marker(value.string, marker, _seen=_seen)
+        return
+    if isinstance(value, dict):
+        for item in value.values():
+            _scan_value_for_marker(item, marker, _seen=_seen)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _scan_value_for_marker(item, marker, _seen=_seen)
+        return
+
+
+def _assert_marker_absent_from_failure_artifacts(exc: BaseException, marker: str) -> None:
+    for link in _iter_exception_chain(exc):
+        assert marker not in str(link)
+        assert marker not in repr(link)
+        for key, val in vars(link).items():
+            if key == "argv":
+                continue
+            _scan_value_for_marker(val, marker, _seen=set())
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        if frame.f_code.co_filename.endswith(f"{os.sep}mutator.py"):
+            for name, value in frame.f_locals.items():
+                if name in ("argv",):
+                    continue
+                _scan_value_for_marker(value, marker, _seen=set())
+        tb = tb.tb_next
 
 
 def _assert_no_marker_in_exception(exc: BaseException, marker: str) -> None:
@@ -528,16 +605,73 @@ class TestAdversarialSensitiveSubprocess:
                 ],
                 sensitive=True,
             )
-        tb = excinfo.value.__traceback__
-        while tb is not None:
-            frame = tb.tb_frame
-            if frame.f_code.co_filename.endswith(f"{os.sep}mutator.py"):
-                for name, value in frame.f_locals.items():
-                    if name in ("argv",):
-                        continue
-                    if isinstance(value, str) and marker in value:
-                        pytest.fail(f"frame local {name!r} retained stream text")
-            tb = tb.tb_next
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+
+    def test_sensitive_aadsts_failure_drops_child_output_from_artifacts(self) -> None:
+        marker = "AADSTS-CHAIN-MARKER-77"
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(AADSTSError) as excinfo:
+            m.run(
+                [
+                    sys.executable,
+                    "-c",
+                    f"print({marker!r}); print('AADSTS500011 license'); raise SystemExit(1)",
+                ],
+                sensitive=True,
+            )
+        assert excinfo.value.code == "AADSTS500011"
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+
+    def test_sensitive_timeout_drops_child_output_from_artifacts(
+        self, capfd: pytest.CaptureFixture[str], tmp_path: Path
+    ) -> None:
+        marker = "TIMEOUT-CHAIN-MARKER-66"
+        script_path = tmp_path / "hang.py"
+        script_path.write_text(
+            f"import time\nprint({marker!r})\ntime.sleep(5)\n",
+            encoding="utf-8",
+        )
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+            m.run([sys.executable, str(script_path)], sensitive=True, timeout=0.4)
+        assert excinfo.value.__context__ is None
+        assert not excinfo.value.output
+        assert marker not in str(excinfo.value)
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+        out, err = capfd.readouterr()
+        assert marker not in out + err
+
+    def test_sensitive_graph_error_uses_fixed_message_not_server_body(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        import json
+
+        body = json.dumps(
+            {
+                "error": {
+                    "code": "AccessDenied",
+                    "message": f"secret={_OPAQUE_GRAPH_SECRET} leaked",
+                }
+            }
+        )
+        _install_az_rest_shim_for_mutator_test(tmp_path, monkeypatch, response_body=body)
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            m.run(
+                ["az", "rest", "--method", "GET", "--uri", "https://graph.microsoft.test/v1.0/x"],
+                sensitive=True,
+            )
+        assert excinfo.value.graph_error is not None
+        assert excinfo.value.graph_error[0] == "AccessDenied"
+        assert _OPAQUE_GRAPH_SECRET not in excinfo.value.graph_error[1]
+        assert excinfo.value.graph_error[1] == "Access was denied."
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, _OPAQUE_GRAPH_SECRET)
 
 
 # ---------------------------------------------------------------------------

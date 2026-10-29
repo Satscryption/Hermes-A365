@@ -184,20 +184,24 @@ class A365CliMutator:
     ) -> RunResult:
         if not self.available:
             raise CliInvocationError(argv, -1, f"{A365_CLI_BINARY} not on PATH")
+        timed_out = False
+        combined = ""
         if sensitive:
             try:
                 returncode, combined = _run_sensitive_streaming(
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
             except subprocess.TimeoutExpired:
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from None
+                timed_out = True
         else:
             try:
                 returncode, combined = _run_streaming(
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
             except subprocess.TimeoutExpired:
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from None
+                timed_out = True
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
         if returncode != 0:
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
@@ -205,9 +209,11 @@ class A365CliMutator:
             graph_error = _extract_sensitive_graph_error(stripped) if sensitive else None
             if match:
                 code = match.group(0)
+                match = None
                 stripped = ""
                 combined = ""
                 raise AADSTSError(code, detail)
+            match = None
             stripped = ""
             combined = ""
             raise CliInvocationError(
@@ -256,6 +262,16 @@ _SENSITIVE_GRAPH_ERROR_CODES = frozenset(
         "InsufficientPrivileges",
     }
 )
+_SENSITIVE_GRAPH_SAFE_MESSAGES: dict[str, str] = {
+    "Request_ResourceNotFound": "The requested resource does not exist.",
+    "ResourceNotFound": "The requested resource does not exist.",
+    "ErrorItemNotFound": "The requested resource does not exist.",
+    "itemNotFound": "The requested resource does not exist.",
+    "Authorization_RequestDenied": "Insufficient privileges to complete the operation.",
+    "AccessDenied": "Access was denied.",
+    "Forbidden": "Access was denied.",
+    "InsufficientPrivileges": "Insufficient privileges to complete the operation.",
+}
 _GRAPH_ERROR_CODE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 
 _CANONICAL_URLS = {
@@ -324,7 +340,7 @@ def _sensitive_failure_detail(stripped: str) -> str:
 
 
 def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
-    """Pull an allowlisted Graph ``error.code`` and redacted message from captured text."""
+    """Pull an allowlisted Graph ``error.code`` and a fixed safe message from captured text."""
     start = text.find("{")
     if start < 0:
         return None
@@ -345,11 +361,10 @@ def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
         return None
     if not _GRAPH_ERROR_CODE_ID_RE.match(code):
         return None
-    message_raw = error.get("message")
-    message = str(message_raw) if isinstance(message_raw, str) else ""
-    from hermes_a365.entra_state import redact
-
-    return code, redact(message)
+    safe_message = _SENSITIVE_GRAPH_SAFE_MESSAGES.get(code)
+    if safe_message is None:
+        return None
+    return code, safe_message
 
 
 @dataclass
@@ -451,6 +466,10 @@ def _run_pumped_output(
         if remaining <= 0:
             proc.kill()
             proc.wait(timeout=5)
+            captured.clear()
+            for buffer in buffers.values():
+                buffer.pending = ""
+            payload = None
             raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
         try:
             name, payload = out_q.get(timeout=min(0.05, max(remaining, 0.0)))
