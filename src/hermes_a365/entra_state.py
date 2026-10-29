@@ -553,9 +553,27 @@ def _parse_strict_graph_json_object(text: str) -> dict[str, Any] | None:
         return None
     try:
         data = json.loads(stripped)
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     return data if isinstance(data, dict) else None
+
+
+def _unreadable_graph_expiry_payload() -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "UnreadableGraphResponse",
+            "message": "Graph read failed",
+        }
+    }
+
+
+def _parse_expiry_response_bytes(raw: bytes) -> dict[str, Any] | None:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _unreadable_graph_expiry_payload()
+    parsed = _parse_strict_graph_json_object(text)
+    return parsed if parsed is not None else _unreadable_graph_expiry_payload()
 
 
 def _parse_graph_json(text: str) -> dict[str, Any] | None:
@@ -662,20 +680,24 @@ def graph_get_from_mutator_for_secret_expiry(
                     "message": "Graph read timed out",
                 }
             }
+        except UnicodeDecodeError:
+            return _unreadable_graph_expiry_payload()
         except CliInvocationError as exc:
             raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
-            parsed = _parse_strict_graph_json_object(raw)
-            if parsed is not None:
-                return parsed
-            return {
-                "error": {
-                    "code": "UnreadableGraphResponse",
-                    "message": "Graph read failed",
-                }
-            }
+            if isinstance(raw, bytes):
+                return _parse_expiry_response_bytes(raw)
+            try:
+                encoded = raw.encode("utf-8")
+            except UnicodeEncodeError:
+                return _unreadable_graph_expiry_payload()
+            return _parse_expiry_response_bytes(encoded)
         except (AADSTSError, OSError):
             return None
-        return _parse_strict_graph_json_object(result.stdout or "")
+        try:
+            body = (result.stdout or "").encode("utf-8")
+        except UnicodeEncodeError:
+            return _unreadable_graph_expiry_payload()
+        return _parse_expiry_response_bytes(body)
 
     return graph_get
 

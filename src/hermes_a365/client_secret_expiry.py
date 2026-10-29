@@ -26,7 +26,7 @@ from .entra_state import (
     GraphGet,
     _is_denied,
     _is_not_found,
-    _parse_strict_graph_json_object,
+    _parse_expiry_response_bytes,
     application_client_secret_expiry_url,
     assert_client_secret_expiry_read_url,
     graph_error_code,
@@ -196,7 +196,7 @@ def _az_rest_graph_get(url: str) -> dict[str, Any] | None:
                 "ConsistencyLevel=eventual",
             ],
             capture_output=True,
-            text=True,
+            text=False,
             timeout=GRAPH_SECRET_EXPIRY_REST_TIMEOUT_SEC,
             check=False,
         )
@@ -204,7 +204,15 @@ def _az_rest_graph_get(url: str) -> dict[str, Any] | None:
         return None
     if proc.returncode != 0:
         return None
-    parsed = _parse_strict_graph_json_object(proc.stdout or "")
+    raw = proc.stdout or b""
+    parsed = _parse_expiry_response_bytes(raw)
+    if parsed is None:
+        return None
+    if isinstance(parsed.get("error"), dict):
+        code = str(parsed["error"].get("code") or "")
+        if code == "UnreadableGraphResponse":
+            return parsed
+        return None
     return parsed
 
 
@@ -349,16 +357,21 @@ def _read_env_file(path: Path) -> dict[str, str]:
         return {}
 
 
-def _agent_slug(agent_name: str) -> str:
-    slug = slugify(agent_name)
-    if not slug:
-        raise ValueError(f"agent name {agent_name!r} does not produce a slug")
-    return validate_slug(slug)
-
-
-def _agent_env(hermes_home: Path, agent_name: str) -> dict[str, str]:
-    slug = _agent_slug(agent_name)
-    return _read_env_file(hermes_home / "agents" / slug / ".env")
+def _read_agent_env(hermes_home: Path, agent_name: str) -> dict[str, str]:
+    """Match ``status`` local_config: original name first, then slugified path."""
+    candidates = [agent_name]
+    derived = slugify(agent_name)
+    if derived and derived != agent_name:
+        candidates.append(derived)
+    for candidate in candidates:
+        try:
+            validate_slug(candidate)
+        except ValueError:
+            continue
+        probe = hermes_home / "agents" / candidate / ".env"
+        if probe.is_file():
+            return _read_env_file(probe)
+    return {}
 
 
 def _generated_blueprint_id(home: Path, generated_config_path: Path) -> str:
@@ -395,7 +408,7 @@ def resolve_blueprint_app_id(
         home_env.get("A365_APP_ID") or ""
     ).strip()
     if agent_name:
-        agent_env = _agent_env(hermes_home, agent_name)
+        agent_env = _read_agent_env(hermes_home, agent_name)
         blueprint = (agent_env.get("A365_APP_ID") or "").strip() or gateway
     else:
         blueprint = gateway
@@ -414,7 +427,7 @@ def resolve_bf_app_id(
     """Return ``(app_id, sidecar_unreadable)``."""
     env = dict(operator_env or _read_env_file(hermes_home / ".env"))
     if agent_name:
-        env = {**env, **_agent_env(hermes_home, agent_name)}
+        env = {**env, **_read_agent_env(hermes_home, agent_name)}
     bf = (os.environ.get("A365_BF_APP_ID") or "").strip() or (
         env.get("A365_BF_APP_ID") or ""
     ).strip()
@@ -586,7 +599,7 @@ def status_component_state(
         return "error"
     if overall == "warn":
         return "warn"
-    if any(payload.get("check") == "unavailable" for _, _, _, payload in rows):
+    if any(payload.get("check") in ("unavailable", "no_active_yet") for _, _, _, payload in rows):
         return "skipped"
     if all(
         state == "skipped" and payload.get("check") == "skipped" for _, state, _, payload in rows

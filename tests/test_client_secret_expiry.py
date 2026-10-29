@@ -16,6 +16,7 @@ from hermes_a365 import doctor
 from hermes_a365.client_secret_expiry import (
     check_app_client_secret_expiry,
     gather_client_secret_expiry_checks,
+    graph_get_from_az_rest,
     select_latest_active_credential_end,
     status_component_detail,
     status_component_state,
@@ -229,7 +230,175 @@ class TestStrictJson:
         monkeypatch.setattr(mut, "run", fake_run)
         getter = graph_get_from_mutator_for_secret_expiry(mut)
         payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
-        assert payload is None
+        assert payload is not None
+        assert payload.get("error", {}).get("code") == "UnreadableGraphResponse"
+        state, detail, data = check_app_client_secret_expiry(
+            _BLUEPRINT,
+            graph_get=getter,
+            now=_NOW,
+        )
+        assert state == "warn"
+        assert data["check"] == "unavailable"
+        _assert_no_leaks(detail)
+
+    def test_huge_integer_unavailable_mutator(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", True)
+        huge = "1" + "0" * 10000
+
+        def fake_run(argv, **kwargs):
+            return RunResult(
+                argv=list(argv),
+                returncode=0,
+                stdout=f'{{"passwordCredentials": [], "n": {huge}}}',
+                stderr="",
+            )
+
+        monkeypatch.setattr(mut, "run", fake_run)
+        getter = graph_get_from_mutator_for_secret_expiry(mut)
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload is not None
+        assert payload.get("error", {}).get("code") == "UnreadableGraphResponse"
+        _, _, data = check_app_client_secret_expiry(_BLUEPRINT, graph_get=getter, now=_NOW)
+        assert data["check"] == "unavailable"
+
+    def test_deep_nesting_unavailable_mutator(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", True)
+        body = '{"a":' * 50000 + "null" + "}" * 50000
+
+        def fake_run(argv, **kwargs):
+            return RunResult(argv=list(argv), returncode=0, stdout=body, stderr="")
+
+        monkeypatch.setattr(mut, "run", fake_run)
+        getter = graph_get_from_mutator_for_secret_expiry(mut)
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload.get("error", {}).get("code") == "UnreadableGraphResponse"
+
+
+class TestAzAdapterStrictJson:
+    def test_huge_integer_unavailable_az(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        huge = "1" + "0" * 10000
+        body = f'{{"passwordCredentials": [], "n": {huge}}}'
+
+        def fake_run(*_a, **_k):
+            return subprocess.CompletedProcess([], 0, stdout=body.encode(), stderr=b"")
+
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        getter = graph_get_from_az_rest()
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload is not None
+        assert payload.get("error", {}).get("code") == "UnreadableGraphResponse"
+
+    def test_deep_nesting_unavailable_az(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        body = '{"a":' * 50000 + "null" + "}" * 50000
+
+        def fake_run(*_a, **_k):
+            return subprocess.CompletedProcess([], 0, stdout=body.encode(), stderr=b"")
+
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        getter = graph_get_from_az_rest()
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload.get("error", {}).get("code") == "UnreadableGraphResponse"
+
+
+class TestInvalidUtf8Capture:
+    _MARKER = b"opaqueUtf8LeakMarker9\xff\xfe"
+
+    def test_mutator_unicode_decode_error_sanitized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", True)
+
+        def bad_run(argv, **kwargs):
+            raise UnicodeDecodeError("utf-8", self._MARKER, 0, 1, "invalid")
+
+        monkeypatch.setattr(mut, "run", bad_run)
+        getter = graph_get_from_mutator_for_secret_expiry(mut)
+        try:
+            payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        except UnicodeDecodeError as exc:
+            pytest.fail(f"decode error escaped adapter: {exc!r}")
+        assert payload is not None
+        blob = json.dumps(payload)
+        assert self._MARKER.decode("latin-1") not in blob
+        assert "opaqueUtf8LeakMarker9" not in blob
+        state, detail, data = check_app_client_secret_expiry(
+            _BLUEPRINT,
+            graph_get=getter,
+            now=_NOW,
+        )
+        assert state == "warn"
+        assert data["check"] == "unavailable"
+        _assert_no_leaks(detail)
+
+    def test_az_subprocess_invalid_utf8_sanitized(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        marker = self._MARKER
+
+        def fake_run(*_a, **_k):
+            return subprocess.CompletedProcess([], 0, stdout=marker, stderr=b"")
+
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        getter = graph_get_from_az_rest()
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload is not None
+        assert payload.get("error", {}).get("code") == "UnreadableGraphResponse"
+        blob = json.dumps(payload)
+        assert "opaqueUtf8LeakMarker9" not in blob
+        state, detail, data = check_app_client_secret_expiry(
+            _BLUEPRINT,
+            graph_get=getter,
+            now=_NOW,
+        )
+        assert state == "warn"
+        assert data["check"] == "unavailable"
+        _assert_no_leaks(detail)
+
+
+class TestAgentEnvLookup:
+    _PARENT = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _AGENT = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    def test_agent_one_uses_agent_env_not_gateway(self, tmp_path: Path) -> None:
+        home = tmp_path / "hermes"
+        home.mkdir()
+        agents = home / "agents" / "Agent.One"
+        agents.mkdir(parents=True)
+        (home / ".env").write_text(f"A365_APP_ID={self._PARENT}\n")
+        (agents / ".env").write_text(f"A365_APP_ID={self._AGENT}\n")
+        seen: list[str] = []
+
+        def router(url: str) -> dict[str, Any]:
+            seen.append(url)
+            if self._AGENT in url:
+                return {
+                    "passwordCredentials": [
+                        _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=5)),
+                    ],
+                }
+            if self._PARENT in url:
+                return {
+                    "passwordCredentials": [
+                        _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=400)),
+                    ],
+                }
+            return {"passwordCredentials": []}
+
+        rows = gather_client_secret_expiry_checks(
+            hermes_home=home,
+            agent_name="Agent.One",
+            sidecar_path=tmp_path / "missing-sidecar.json",
+            generated_config_path=tmp_path / "missing.json",
+            graph_get=router,
+            now=lambda: _NOW,
+            warn_days=30,
+        )
+        bp = next(r for r in rows if r[0] == "blueprint_client_secret")
+        assert self._AGENT in "".join(seen)
+        assert bp[1] == "warn"
+        assert "day(s) remaining" in bp[2]
 
 
 class TestMutatorTimeout:
@@ -323,6 +492,43 @@ class TestStatusRollup:
         assert "could not check Bot Framework" in detail
         assert "older active secrets may expire sooner" in detail
         _assert_no_leaks(detail)
+
+    def test_no_active_yet_does_not_roll_up_ok(self, tmp_path: Path) -> None:
+        home = tmp_path / "hermes"
+        home.mkdir()
+        (home / ".env").write_text(
+            f"A365_TENANT_ID=00000000-0000-0000-0000-000000000001\nA365_APP_ID={_BLUEPRINT}\n"
+        )
+        payload = {
+            "passwordCredentials": [
+                _cred(start=_NOW - timedelta(days=400), end=_NOW - timedelta(days=1)),
+                _cred(start=_NOW + timedelta(days=2), end=_NOW + timedelta(days=400)),
+            ],
+        }
+
+        rows = gather_client_secret_expiry_checks(
+            hermes_home=home,
+            agent_name=None,
+            sidecar_path=tmp_path / "missing-sidecar.json",
+            generated_config_path=tmp_path / "missing.json",
+            graph_get=_graph_get(payload),
+            now=lambda: _NOW,
+            for_status=True,
+        )
+        bp = next(r for r in rows if r[0] == "blueprint_client_secret")
+        assert bp[3].get("check") == "no_active_yet"
+        assert status_component_state(rows) == "skipped"
+        report = collect_status(
+            None,
+            hermes_home=home,
+            query_source=_UnavailableQuerySource(),
+            graph_get=_graph_get(payload),
+            secret_expiry_now=lambda: _NOW,
+            bot_service_sidecar_path=tmp_path / "missing-sidecar.json",
+        )
+        comp = next(c for c in report.components if c.name == "client_secret_expiry")
+        assert comp.state == "skipped"
+        assert status_exit(report.overall) == 0
 
 
 class TestEntraUrl:
