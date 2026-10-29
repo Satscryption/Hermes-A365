@@ -12,7 +12,9 @@ import os
 import re
 import socket
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
 from urllib.parse import quote
@@ -24,6 +26,10 @@ OTLP_DEPRECATED_MESSAGE = (
     "WARN: HERMES_OTLP_ENDPOINT is deprecated and ignored; "
     "it is not written and is removed from the agent .env on --apply (#189)."
 )
+
+
+class SidecarLockError(OSError):
+    """Another process or writer holds the sidecar lock, or a backup path collides."""
 
 
 class TenantResolutionError(ValueError):
@@ -110,6 +116,71 @@ def write_owner_only_text_atomic(path: Path, text: str, *, mode: int = 0o600) ->
     except BaseException:
         tmp.unlink(missing_ok=True)
         raise
+
+
+@contextmanager
+def exclusive_sidecar_lock(path: Path) -> Iterator[None]:
+    """Serialize Hermes-owned sidecar writers via ``<name>.lock`` (0600, O_EXCL)."""
+    lock_path = path.with_name(f"{path.name}.lock")
+    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        fd = os.open(lock_path, flags, 0o600)
+    except FileExistsError as exc:
+        raise SidecarLockError(
+            f"another operation holds {lock_path}; refusing before mutation. "
+            "If no operation is active, inspect and remove the stale lock deliberately."
+        ) from exc
+    except OSError as exc:
+        raise SidecarLockError(f"could not acquire sidecar lock {lock_path}: {exc}") from exc
+    locked_stat = os.fstat(fd)
+    try:
+        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
+        yield
+    finally:
+        os.close(fd)
+        try:
+            current = lock_path.lstat()
+            if (current.st_dev, current.st_ino) == (locked_stat.st_dev, locked_stat.st_ino):
+                lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def sidecar_backup_path(path: Path, *, at: datetime | None = None) -> Path:
+    """Sibling ``*.backup-<UTC>.json`` path for a Hermes-owned sidecar."""
+    moment = (at or datetime.now(UTC)).astimezone(UTC)
+    stamp = moment.strftime("%Y%m%d-%H%M%S")
+    if path.name.endswith(".json"):
+        return path.with_name(f"{path.name[:-5]}.backup-{stamp}.json")
+    return path.with_name(f"{path.name}.backup-{stamp}")
+
+
+def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o600) -> Path:
+    """Create a backup file exclusively at ``mode``; append ``-<pid>`` on stamp collision."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    target = path
+    fd = -1
+    for attempt in (0, 1):
+        try:
+            fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+            break
+        except FileExistsError as exc:
+            if attempt == 0 and target == path:
+                target = path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}")
+                continue
+            raise SidecarLockError(
+                f"could not create sidecar backup {path} exclusively: {exc}"
+            ) from exc
+    try:
+        os.fchmod(fd, mode)
+        offset = 0
+        while offset < len(data):
+            offset += os.write(fd, data[offset:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return target
 
 
 _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")

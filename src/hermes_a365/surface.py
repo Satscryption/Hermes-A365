@@ -163,6 +163,7 @@ HERMES_OWNED_SIDECARS: Final[tuple[dict[str, Any], ...]] = (
         "schema_version_read": (1,),
         "missing_version_means": 1,
         "on_disk_version_field": "schema",
+        "schema_version_field": "schemaVersion",
     },
 )
 
@@ -269,23 +270,22 @@ EXIT_CODES: Final[dict[str, Any]] = {
 # ---------------------------------------------------------------------------
 
 SIDECAR_MIGRATION_TODAY: Final[str] = (
-    "Today (slice 1) `conversations.json` is persisted with a `schema` field only "
-    "(`conversations.py`); the dual-key stamp lands in slice 2."
+    "`conversations.json` is persisted with dual keys `schema` and `schemaVersion` "
+    "(same integer; missing `schemaVersion` on read means v1)."
 )
 
 SIDECAR_MIGRATION_POLICY: Final[str] = (
-    "Planned for slice 2: within 1.x, Hermes-A365 will read every Hermes-owned sidecar "
-    "written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive "
-    "`schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, "
-    "and be idempotent. The original bytes will be copied to a sibling "
-    "`*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run "
-    "against an already-current file will not write another backup. Identity-binding changes "
-    "will stay explicit: bot-service v1→v2 will still require `--confirm-legacy-binding` "
-    "equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 "
-    "will still require `--app-version` strictly above the Admin Center version. A "
-    "`schemaVersion` newer than that build will be an error and the file will be left "
-    "untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, "
-    "not an automatic rewrite to 0.9.x. " + SIDECAR_MIGRATION_TODAY
+    "Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any 1.x "
+    "release and every 0.9.x shape listed in SURFACE. Additive stamps run on the "
+    "owning writer, once, under an exclusive lock, and are idempotent. The original "
+    "bytes are copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before "
+    "the first rewrite. A second run against an already-current file does not write "
+    "another backup. Identity-binding changes stay explicit: bot-service v1→v2 still "
+    "requires `--confirm-legacy-binding` equal to `--agent-name` and "
+    "`--confirm-bot-target` equal to the ARM id; publish v1→v2 still requires "
+    "`--app-version` strictly above the Admin Center version. A `schemaVersion` newer "
+    "than this build is an error. The file is left untouched. 1.x does not claim to read "
+    "2.x sidecars. Downgrade is restore-the-backup, not an automatic rewrite to 0.9.x."
 )
 
 SECURITY_SUPPORT_AFTER_V1: Final[str] = (

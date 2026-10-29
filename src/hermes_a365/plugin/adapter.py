@@ -163,7 +163,11 @@ from hermes_a365.secrets_provider import (  # noqa: E402
 )
 
 # Plugin-local imports — these don't depend on the Hermes harness.
-from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
+from .conversations import (  # noqa: E402
+    ConversationRef,
+    ConversationRegistry,
+    ConversationSidecarError,
+)
 
 
 def _profile_env(name: str, default: str | None = None) -> str | None:
@@ -4801,6 +4805,12 @@ class Agent365Adapter(BasePlatformAdapter):
             state["written"] = sequence
             if cancelled:
                 raise asyncio.CancelledError()
+        except ConversationSidecarError as e:
+            logger.warning(
+                "agent365 conversations: save refused for %s: %s",
+                path,
+                e,
+            )
         except OSError as e:
             logger.warning(
                 "agent365 conversations: save failed for %s: %s",

@@ -40,13 +40,17 @@ from typing import Any
 from ._common import (
     TENANT_ID_HELP,
     UNPINNED_TENANT_PLAN_LINE,
+    SidecarLockError,
     TenantResolutionError,
     active_az_tenant,
     ensure_contained,
+    exclusive_sidecar_lock,
     resolve_expected_tenant,
+    sidecar_backup_path,
     slugify,
     tenant_ids_match,
     validate_slug,
+    write_owner_only_bytes_exclusive,
     write_owner_only_text_atomic,
 )
 from .mutator import AADSTSError, CliInvocationError, Mutator, RunResult, get_mutator
@@ -89,10 +93,7 @@ def _open_regular_nofollow(path: Path) -> tuple[int, os.stat_result]:
         raise OSError("path is not a regular non-symlink file") from exc
     try:
         st = os.fstat(fd)
-        if (
-            not stat.S_ISREG(st.st_mode)
-            or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
-        ):
+        if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino):
             raise OSError("path is not a stable regular non-symlink file")
         return fd, st
     except BaseException:
@@ -149,9 +150,10 @@ def _rewrite_manifest_zip(zp: Path, manifest_blob: bytes, *, drop: set[str] | No
             tmp_path = Path(tmp.name)
         with os.fdopen(source_fd, "rb") as source_file:
             source_fd = -1
-            with zipfile.ZipFile(source_file, "r") as source, zipfile.ZipFile(
-                tmp_path, "w", zipfile.ZIP_DEFLATED
-            ) as target:
+            with (
+                zipfile.ZipFile(source_file, "r") as source,
+                zipfile.ZipFile(tmp_path, "w", zipfile.ZIP_DEFLATED) as target,
+            ):
                 infos = _validated_zip_infos(source)
                 target.writestr("manifest.json", manifest_blob)
                 for info in infos:
@@ -196,6 +198,7 @@ def _copy_regular_file_atomic(source: Path, destination: Path) -> None:
     finally:
         if source_fd >= 0:
             os.close(source_fd)
+
 
 # Defensive parser: when the CLI emits a "Created package:" / "Wrote zip:" /
 # similar line, grab the path. The exact wording isn't pinned in v1.1.171 yet,
@@ -470,11 +473,10 @@ def _zip_manifest_dir(manifest_dir: str) -> str | None:
                             flags |= os.O_NOFOLLOW
                         child_fd = os.open(name, flags, dir_fd=dir_fd)
                         child_st = os.fstat(child_fd)
-                        if (
-                            not stat.S_ISDIR(child_st.st_mode)
-                            or (child_st.st_dev, child_st.st_ino)
-                            != (before.st_dev, before.st_ino)
-                        ):
+                        if not stat.S_ISDIR(child_st.st_mode) or (
+                            child_st.st_dev,
+                            child_st.st_ino,
+                        ) != (before.st_dev, before.st_ino):
                             os.close(child_fd)
                             return False
                         stack.callback(os.close, child_fd)
@@ -485,22 +487,18 @@ def _zip_manifest_dir(manifest_dir: str) -> str | None:
                         return False
                     fd = os.open(
                         name,
-                        os.O_RDONLY
-                        | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
+                        os.O_RDONLY | (os.O_NOFOLLOW if hasattr(os, "O_NOFOLLOW") else 0),
                         dir_fd=dir_fd,
                     )
                     source = stack.enter_context(os.fdopen(fd, "rb"))
                     st = os.fstat(source.fileno())
-                    if (
-                        not stat.S_ISREG(st.st_mode)
-                        or (st.st_dev, st.st_ino) != (before.st_dev, before.st_ino)
+                    if not stat.S_ISREG(st.st_mode) or (st.st_dev, st.st_ino) != (
+                        before.st_dev,
+                        before.st_ino,
                     ):
                         return False
                     total += st.st_size
-                    if (
-                        total > _ZIP_MAX_TOTAL_UNCOMPRESSED
-                        or len(sources) >= _ZIP_MAX_MEMBERS
-                    ):
+                    if total > _ZIP_MAX_TOTAL_UNCOMPRESSED or len(sources) >= _ZIP_MAX_MEMBERS:
                         return False
                     sources.append((archive_name, source, st))
                 return True
@@ -701,8 +699,7 @@ def _parse_app_version_triple(value: str) -> tuple[int, int, int]:
     match = _APP_VERSION_RE.match(value.strip())
     if not match:
         raise ValueError(
-            "app version must be three non-negative integers separated by dots "
-            "(e.g. 1.1.4)"
+            "app version must be three non-negative integers separated by dots (e.g. 1.1.4)"
         )
     return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
@@ -764,10 +761,7 @@ def _resolve_next_copilot_chat_app_version(
                 "pass --app-version to set the Teams app version explicitly"
             )
         return template_version
-    if (
-        template_version is not None
-        and _compare_app_versions(template_version, last_published) > 0
-    ):
+    if template_version is not None and _compare_app_versions(template_version, last_published) > 0:
         return template_version
     return _bump_app_version_patch(last_published)
 
@@ -881,11 +875,7 @@ def _publish_state_allows_manifest_id_change(
     resolution: _CopilotChatManifestIdResolution | None,
 ) -> bool:
     """Whether apply may replace on-disk state keyed by a different manifestId."""
-    if (
-        inputs.manifest_id
-        and inputs.manifest_id != "auto"
-        and inputs.app_version is not None
-    ):
+    if inputs.manifest_id and inputs.manifest_id != "auto" and inputs.app_version is not None:
         return True
     return bool(resolution and resolution.freshly_minted)
 
@@ -928,23 +918,21 @@ def _publish_state_manifest_id_mismatch_message(
         f"but this publish targets {catalog_manifest_id}. "
     )
     combined_or_auto_state = (
-        (inputs.aiteammate and inputs.copilot_chat) or state_cea_catalog_id_minted
-    )
+        inputs.aiteammate and inputs.copilot_chat
+    ) or state_cea_catalog_id_minted
     if (
         combined_or_auto_state
         and aiteammate_catalog_id
         and stored_id == _canonical_manifest_guid(aiteammate_catalog_id)
     ):
         return (
-            base
-            + "The stored id is the AI Teammate catalog id — do not pass "
+            base + "The stored id is the AI Teammate catalog id — do not pass "
             "--manifest-id with that value on combined publishes. Omit "
             "--manifest-id to mint a distinct CEA catalog id, remove or rename "
             "the state file, or pass a new --manifest-id with --app-version."
         )
     return (
-        base
-        + f"Pass --manifest-id {stored_id} to match the stored id, remove or "
+        base + f"Pass --manifest-id {stored_id} to match the stored id, remove or "
         "rename the state file, or pass a new --manifest-id with --app-version "
         "for a separate catalog entry."
     )
@@ -969,9 +957,9 @@ def _validate_publish_state_scope(
             f"Copilot Chat publish state at {path} is missing profile; "
             "fix or remove the file before re-running publish --apply"
         )
-    if _normalize_publish_state_tenant_id(
-        stored_tenant
-    ) != _normalize_publish_state_tenant_id(tenant_id):
+    if _normalize_publish_state_tenant_id(stored_tenant) != _normalize_publish_state_tenant_id(
+        tenant_id
+    ):
         raise PublishError(
             f"Copilot Chat publish state at {path} belongs to tenant "
             f"{stored_tenant!r}, not the current publish pin {tenant_id!r}. "
@@ -1030,9 +1018,7 @@ def _load_copilot_chat_publish_state_record(
             raw = _normalize_publish_state_v1_fields(
                 {
                     "manifestId": _canonical_manifest_guid(stored_id),
-                    "lastAppVersion": _format_app_version(
-                        _parse_app_version_triple(last)
-                    ),
+                    "lastAppVersion": _format_app_version(_parse_app_version_triple(last)),
                 }
             )
         except ValueError as exc:
@@ -1068,9 +1054,7 @@ def _load_copilot_chat_publish_state_record(
                 "lastAppVersion; fix or remove the file before re-running publish --apply"
             )
         try:
-            raw["lastAppVersion"] = _format_app_version(
-                _parse_app_version_triple(last)
-            )
+            raw["lastAppVersion"] = _format_app_version(_parse_app_version_triple(last))
         except ValueError:
             raise PublishError(
                 f"Copilot Chat publish state at {path} has invalid lastAppVersion "
@@ -1086,9 +1070,7 @@ def _load_copilot_chat_publish_state_record(
             )
         if minted is None:
             raw["ceaCatalogIdMinted"] = False
-        _validate_publish_state_scope(
-            raw, path=path, tenant_id=tenant_id, profile=profile
-        )
+        _validate_publish_state_scope(raw, path=path, tenant_id=tenant_id, profile=profile)
 
     return raw
 
@@ -1151,9 +1133,7 @@ def _cea_manifest_id_for_auto_reuse(
 def _copilot_chat_mints_catalog_id(inputs: PublishInputs) -> bool:
     """Whether this run assigns (or reuses) a generated catalog ``manifest.id``."""
     return inputs.manifest_id == "auto" or (
-        inputs.manifest_id is None
-        and inputs.aiteammate
-        and inputs.copilot_chat
+        inputs.manifest_id is None and inputs.aiteammate and inputs.copilot_chat
     )
 
 
@@ -1184,9 +1164,7 @@ def _resolve_copilot_chat_manifest_id_for_apply(
         tenant_id=tenant_id,
         profile=profile,
     )
-    stored = _cea_manifest_id_for_auto_reuse(
-        record, aiteammate_catalog_id=aiteammate_catalog_id
-    )
+    stored = _cea_manifest_id_for_auto_reuse(record, aiteammate_catalog_id=aiteammate_catalog_id)
     if stored:
         return _CopilotChatManifestIdResolution(
             manifest_id=stored,
@@ -1253,9 +1231,44 @@ def _write_copilot_chat_publish_state(
         "lastAppVersion": _format_app_version(_parse_app_version_triple(app_version)),
         "ceaCatalogIdMinted": cea_catalog_id_minted,
     }
-    write_owner_only_text_atomic(
-        path, json.dumps(payload, indent=2) + "\n", mode=0o600
-    )
+    text = json.dumps(payload, indent=2) + "\n"
+    if not path.is_file():
+        write_owner_only_text_atomic(path, text, mode=0o600)
+        return
+    try:
+        with exclusive_sidecar_lock(path):
+            snapshot = path.read_bytes()
+            try:
+                raw = json.loads(snapshot)
+            except json.JSONDecodeError as exc:
+                raise PublishError(
+                    f"Copilot Chat publish state at {path} is not valid JSON ({exc}); "
+                    "fix or remove the file before re-running publish --apply"
+                ) from exc
+            if not isinstance(raw, dict):
+                raise PublishError(
+                    f"Copilot Chat publish state at {path} must be a JSON object; "
+                    "fix or remove the file before re-running publish --apply"
+                )
+            schema = raw.get("schemaVersion")
+            if schema == _COPILOT_CHAT_PUBLISH_STATE_SCHEMA_V1:
+                backup = sidecar_backup_path(path)
+                write_owner_only_bytes_exclusive(backup, snapshot)
+            elif schema == _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
+                pass
+            elif isinstance(schema, int) and schema > _COPILOT_CHAT_PUBLISH_STATE_SCHEMA:
+                raise PublishError(
+                    f"Copilot Chat publish state at {path} has unsupported "
+                    f"schemaVersion={schema!r} (expected "
+                    f"{_COPILOT_CHAT_PUBLISH_STATE_SCHEMA}); fix or remove the file "
+                    "before re-running publish --apply"
+                )
+            write_owner_only_text_atomic(path, text, mode=0o600)
+    except SidecarLockError as exc:
+        raise PublishError(
+            f"another publish operation holds {path.with_name(path.name + '.lock')}; "
+            "refusing before writing publish state"
+        ) from exc
 
 
 def _transform_manifest_to_copilot_chat(
@@ -1479,9 +1492,7 @@ def apply_publish_plan(
     from pathlib import Path
 
     if hermes_home is None:
-        hermes_home = Path(
-            os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes")
-        )
+        hermes_home = Path(os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes"))
 
     expected_tenant = (plan.inputs.tenant_id or "").strip()
     if not expected_tenant:
@@ -1551,9 +1562,7 @@ def apply_publish_plan(
             # - AI Teammate only → no transform; keep emitted as-is.
             if plan.inputs.copilot_chat and plan.inputs.aiteammate:
                 orig = Path(emitted_zip)
-                sibling = orig.with_name(
-                    orig.stem + _COPILOT_CHAT_ZIP_INFIX + orig.suffix
-                )
+                sibling = orig.with_name(orig.stem + _COPILOT_CHAT_ZIP_INFIX + orig.suffix)
                 _copy_regular_file_atomic(orig, sibling)
                 copilot_chat_target: str | None = str(sibling)
                 package_path = emitted_zip
@@ -1567,9 +1576,7 @@ def apply_publish_plan(
             manifest_id_resolution: _CopilotChatManifestIdResolution | None = None
             if copilot_chat_target is not None:
                 source_manifest = _read_manifest_json_from_zip(copilot_chat_target) or {}
-                aiteammate_catalog_id = _catalog_manifest_id_for_copilot_chat(
-                    source_manifest, None
-                )
+                aiteammate_catalog_id = _catalog_manifest_id_for_copilot_chat(source_manifest, None)
                 manifest_id_resolution = _resolve_copilot_chat_manifest_id_for_apply(
                     plan.inputs,
                     hermes_home=hermes_home,
@@ -1585,9 +1592,7 @@ def apply_publish_plan(
                 publish_state_path: Path | None = None
                 if plan.inputs.copilot_chat:
                     slug = _require_copilot_chat_slug(plan.inputs)
-                    publish_state_path = _copilot_chat_publish_state_path(
-                        hermes_home, slug
-                    )
+                    publish_state_path = _copilot_chat_publish_state_path(hermes_home, slug)
                     publish_state_record = _load_copilot_chat_publish_state_record(
                         publish_state_path,
                         hermes_home=hermes_home,
@@ -1650,18 +1655,18 @@ def apply_publish_plan(
                     bot_id_override=plan.inputs.bot_id,
                     manifest_id=copilot_chat_manifest_id,
                     app_version=copilot_app_version,
-                    distinguish_name_short=(
-                        plan.inputs.aiteammate and plan.inputs.copilot_chat
-                    ),
+                    distinguish_name_short=(plan.inputs.aiteammate and plan.inputs.copilot_chat),
                     prompt_starters=plan.inputs.prompt_starters,
                 )
                 if cc_result is not None:
                     copilot_chat_bot_id, summary = cc_result
                     copilot_chat_manifest_id = summary.get("manifest_id")
                     copilot_chat_package_path = copilot_chat_target
-                    dropped = " (dropped agenticUserTemplates)" if summary[
-                        "dropped_agentic_user_templates"
-                    ] else ""
+                    dropped = (
+                        " (dropped agenticUserTemplates)"
+                        if summary["dropped_agentic_user_templates"]
+                        else ""
+                    )
                     messages.append(
                         f"[apply] transformed to Custom Engine Agent: "
                         f"manifestVersion={summary['manifest_version']}, "
@@ -1674,9 +1679,7 @@ def apply_publish_plan(
                         if plan.inputs.manifest_id == "auto":
                             reuse_label = "--manifest-id auto"
                         else:
-                            reuse_label = (
-                                "combined --aiteammate --copilot-chat default"
-                            )
+                            reuse_label = "combined --aiteammate --copilot-chat default"
                         messages.append(
                             "[apply] reusing catalog manifest.id from "
                             f"{publish_state_path} ({reuse_label})"
@@ -1693,9 +1696,7 @@ def apply_publish_plan(
                             and manifest_id_resolution.reused_from_state
                             and publish_state_record is not None
                         ):
-                            cea_minted = bool(
-                                publish_state_record.get("ceaCatalogIdMinted")
-                            )
+                            cea_minted = bool(publish_state_record.get("ceaCatalogIdMinted"))
                         else:
                             cea_minted = False
                         _write_copilot_chat_publish_state(
@@ -1708,8 +1709,7 @@ def apply_publish_plan(
                             cea_catalog_id_minted=cea_minted,
                         )
                         messages.append(
-                            f"[apply] recorded last published app version in "
-                            f"{publish_state_path}"
+                            f"[apply] recorded last published app version in {publish_state_path}"
                         )
                     if summary["dropped_agentic_template_files"]:
                         messages.append(
@@ -1761,9 +1761,7 @@ def apply_publish_plan(
                 f"M365 Admin Centre at {ADMIN_CENTRE_URL}"
             )
         if copilot_chat_package_path:
-            messages.append(
-                f"[apply] Copilot Chat package: {copilot_chat_package_path}"
-            )
+            messages.append(f"[apply] Copilot Chat package: {copilot_chat_package_path}")
             messages.append(
                 "[apply] Copilot Chat next: upload to Microsoft Admin Portal → "
                 "Agents → Upload custom agent"
@@ -1894,9 +1892,7 @@ def _parse_prompt_starter(spec: str) -> dict[str, str]:
     title = title.strip()
     prompt = prompt.strip() if sep else title
     if not title:
-        raise ValueError(
-            "--prompt-starter needs a non-empty title (format: 'Title|Prompt text')"
-        )
+        raise ValueError("--prompt-starter needs a non-empty title (format: 'Title|Prompt text')")
     return {"title": title[:128], "prompt": prompt[:4000]}
 
 
