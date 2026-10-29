@@ -15,11 +15,16 @@ on:
   # the tagged commit before the pypi environment. #98
   workflow_call:
 
+concurrency:
+  group: tests-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
-  test:
+  unit:
+    timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -51,7 +56,10 @@ jobs:
         run: uv run --python ${{ matrix.python-version }} ruff check .
 
       - name: pytest
-        run: uv run --python ${{ matrix.python-version }} pytest --timeout=300
+        run: >
+          uv run --python ${{ matrix.python-version }} pytest
+          --timeout=60 --timeout-method=thread
+          --randomly-seed=${{ github.run_id }} --durations=15
 
   windows-negative:
     runs-on: windows-latest
@@ -150,3 +158,32 @@ jobs:
 
       - name: Verify Hermes ref against plugin floors
         run: python scripts/hermes_compat_smoke.py --ref ${{ matrix.hermes-ref }}
+
+  test:
+    name: test
+    if: always()
+    needs:
+      - unit
+      - windows-negative
+      - keychain-linux
+      - wheel-smoke
+      - hermes-source-smoke
+    timeout-minutes: 2
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require all test jobs successful
+        run: |
+          set -euo pipefail
+          check() {
+            local name="$1" result="$2"
+            if [[ "$result" != "success" ]]; then
+              echo "$name: $result (expected success)" >&2
+              return 1
+            fi
+            echo "$name: success"
+          }
+          check unit "${{ needs.unit.result }}"
+          check windows-negative "${{ needs.windows-negative.result }}"
+          check keychain-linux "${{ needs.keychain-linux.result }}"
+          check wheel-smoke "${{ needs.wheel-smoke.result }}"
+          check hermes-source-smoke "${{ needs.hermes-source-smoke.result }}"

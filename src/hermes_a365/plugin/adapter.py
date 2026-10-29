@@ -1029,9 +1029,7 @@ _TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC = (
 )
 _TURN_BUFFER_KEEPALIVE_TEARDOWN_FINAL_SEC = 5.0
 _TURN_BUFFER_KEEPALIVE_TEXT = "Working on it."
-_KEEPALIVE_ROTATION_STATUS_TEXT = (
-    "Still working on this. I'll send the answer as a new message."
-)
+_KEEPALIVE_ROTATION_STATUS_TEXT = "Still working on this. I'll send the answer as a new message."
 _KEEPALIVE_ROTATION_DUE_RETRY_SLEEP_SEC = 1.0
 _INFORMATIVE_TEXT_MAX_CHARS = 1000
 
@@ -5317,9 +5315,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not self._plain_flush_retry_still_valid(
                     flush_chat_id, flush_buf, flush_segment_ids
                 ):
-                    raise RuntimeError(
-                        "agent365 turn buffer plain flush superseded during retry"
-                    )
+                    raise RuntimeError("agent365 turn buffer plain flush superseded during retry")
 
             retry_sleep = retry_sleep
         try:
@@ -5700,6 +5696,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 opened_state.get("stream_id"),
             )
             return None
+        prior_visible = self._keepalive_state(buf).get("last_visible_post")
+        if isinstance(prior_visible, dict):
+            opened_state = dict(opened_state)
+            opened_state["last_visible_post"] = copy.deepcopy(prior_visible)
         self._remember_keepalive(chat_id, target, opened_state)
         if posted_text and isinstance(turn_for_text, dict):
             self._mark_informative_displayed_segments(target, turn_for_text, posted_text)
@@ -6072,9 +6072,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 return True
         return False
 
-    def _visible_informative_fallback_text(
-        self, buf: dict[str, Any], turn: dict[str, Any]
-    ) -> str:
+    def _visible_informative_fallback_text(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
         """Non-empty informative body for slow-turn heartbeats (#247 / walk095).
 
         Copilot Chat can render bare ``Working on it.`` on informative streams as
@@ -6312,9 +6310,7 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> None:
         """Post every undisplayed segment in order. Caller holds the buffer lock."""
         while self._turn_buffers.get(chat_id) is buf:
-            if (
-                self._turn_buffer_delivery_blocks_keepalive(buf) and not during_answer_delivery
-            ):
+            if self._turn_buffer_delivery_blocks_keepalive(buf) and not during_answer_delivery:
                 return
             pending = self._undisplayed_informative_segments(buf, turn)
             if not pending:
@@ -6370,9 +6366,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return preview[:_INFORMATIVE_TEXT_MAX_CHARS]
         return self._visible_informative_fallback_text(buf, turn)
 
-    def _rotation_stream_close_text(
-        self, buf: dict[str, Any], turn: dict[str, Any]
-    ) -> str:
+    def _rotation_stream_close_text(self, buf: dict[str, Any], turn: dict[str, Any]) -> str:
         """Final body when retiring an informative stream at rotation age (#247)."""
         return self._visible_informative_fallback_text(buf, turn)
 
@@ -6589,9 +6583,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
     @staticmethod
     def _turn_buffer_delivery_blocks_keepalive(buf: dict[str, Any]) -> bool:
-        return bool(
-            buf.get("answer_final_in_progress") or buf.get("plain_reply_flush_in_progress")
-        )
+        return bool(buf.get("answer_final_in_progress") or buf.get("plain_reply_flush_in_progress"))
 
     def _plain_flush_retry_still_valid(
         self,
@@ -7152,6 +7144,90 @@ class Agent365Adapter(BasePlatformAdapter):
         stream["last_emit_mono"] = time.monotonic()
         self._remember_keepalive(chat_id, buf, stream)
 
+    @staticmethod
+    def _keepalive_visible_post_snapshot(activity: dict[str, Any]) -> dict[str, Any]:
+        snapshot: dict[str, Any] = {
+            "text": str(activity.get("text") or ""),
+            "entities": copy.deepcopy(activity.get("entities") or []),
+            "channelData": (
+                copy.deepcopy(activity.get("channelData"))
+                if activity.get("channelData") is not None
+                else None
+            ),
+        }
+        attachments = activity.get("attachments")
+        if attachments:
+            snapshot["attachments"] = copy.deepcopy(attachments)
+        return snapshot
+
+    @staticmethod
+    def _keepalive_final_activity_from_visible_post(
+        last_visible: dict[str, Any],
+        *,
+        stream_id: str,
+        inbound: dict[str, Any],
+        conv: dict[str, Any],
+    ) -> dict[str, Any]:
+        entities = copy.deepcopy(last_visible.get("entities") or [])
+        for entity in entities:
+            if entity.get("type") == "streaminfo":
+                entity["streamType"] = "final"
+                entity.pop("streamSequence", None)
+                if stream_id:
+                    entity["streamId"] = stream_id
+        activity: dict[str, Any] = {
+            "type": "message",
+            "text": str(last_visible.get("text") or ""),
+            "from": inbound.get("recipient") or {},
+            "recipient": inbound.get("from") or {},
+            "conversation": conv,
+            "entities": entities,
+        }
+        channel_data = last_visible.get("channelData")
+        if channel_data is not None:
+            activity["channelData"] = copy.deepcopy(channel_data)
+        attachments = last_visible.get("attachments")
+        if attachments:
+            activity["attachments"] = copy.deepcopy(attachments)
+        return activity
+
+    @staticmethod
+    def _keepalive_ensure_message_chrome(
+        activity: dict[str, Any], bridge: Any, *, feedback_enabled: bool
+    ) -> None:
+        ai_type = bridge.AI_GENERATED_CONTENT_ENTITY.get("type")
+        entities = activity.setdefault("entities", [])
+        if not any(entity.get("type") == ai_type for entity in entities):
+            entities.append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
+        if feedback_enabled:
+            activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
+
+    def _keepalive_use_message_chrome(
+        self,
+        buf: dict[str, Any] | None,
+        turn: dict[str, Any],
+        *,
+        final: bool,
+        message_chrome: bool,
+        body_text: str,
+    ) -> bool:
+        if message_chrome:
+            return True
+        if final or not isinstance(buf, dict):
+            return False
+        preview = self._marked_answer_preview_for_turn(buf, turn).strip()
+        return bool(preview and body_text.strip() == preview)
+
+    def _record_keepalive_visible_post(self, chat_id: str, activity: dict[str, Any]) -> None:
+        if not str(activity.get("text") or "").strip():
+            return
+        buf = self._turn_buffers.get(chat_id)
+        if not isinstance(buf, dict):
+            return
+        stream = self._keepalive_state(buf)
+        stream["last_visible_post"] = self._keepalive_visible_post_snapshot(activity)
+        self._remember_keepalive(chat_id, buf, stream)
+
     def _keepalive_stream_outbound_deadline(
         self,
         chat_id: str,
@@ -7205,10 +7281,7 @@ class Agent365Adapter(BasePlatformAdapter):
             not final
             and isinstance(buf, dict)
             and buf.get("keepalive_first_interval_elapsed")
-            and (
-                not body_text
-                or Agent365Adapter._is_placeholder_informative_text(body_text)
-            )
+            and (not body_text or Agent365Adapter._is_placeholder_informative_text(body_text))
         ):
             body_text = self._visible_informative_fallback_text(buf, turn).strip()
         if not body_text:
@@ -7280,27 +7353,56 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return empty
-        entity: dict[str, Any] = {
-            "type": "streaminfo",
-            "streamType": "final" if final else "informative",
-        }
-        if stream_id:
-            entity["streamId"] = stream_id
-        if not final:
-            entity["streamSequence"] = sequence
-        activity: dict[str, Any] = {
-            "type": "message" if final else "typing",
-            "text": payload_text,
-            "from": inbound.get("recipient") or {},
-            "recipient": inbound.get("from") or {},
-            "conversation": conv,
-            "entities": [entity],
-        }
+        use_chrome = self._keepalive_use_message_chrome(
+            buf if isinstance(buf, dict) else None,
+            turn,
+            final=final,
+            message_chrome=message_chrome,
+            body_text=body_text,
+        )
+        stream_state = self._keepalive_state(buf) if isinstance(buf, dict) else {}
+        last_visible = (
+            stream_state.get("last_visible_post") if isinstance(stream_state, dict) else None
+        )
         bridge = _import_bridge()
-        if final and message_chrome:
-            activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
-            if self._feedback_enabled:
-                activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
+        if (
+            final
+            and isinstance(last_visible, dict)
+            and str(last_visible.get("text") or "") == payload_text
+        ):
+            activity = self._keepalive_final_activity_from_visible_post(
+                last_visible,
+                stream_id=stream_id,
+                inbound=inbound,
+                conv=conv if isinstance(conv, dict) else {},
+            )
+            if use_chrome or message_chrome:
+                self._keepalive_ensure_message_chrome(
+                    activity,
+                    bridge,
+                    feedback_enabled=self._feedback_enabled,
+                )
+        else:
+            entity: dict[str, Any] = {
+                "type": "streaminfo",
+                "streamType": "final" if final else "informative",
+            }
+            if stream_id:
+                entity["streamId"] = stream_id
+            if not final:
+                entity["streamSequence"] = sequence
+            activity = {
+                "type": "message" if final else "typing",
+                "text": payload_text,
+                "from": inbound.get("recipient") or {},
+                "recipient": inbound.get("from") or {},
+                "conversation": conv,
+                "entities": [entity],
+            }
+            if use_chrome:
+                activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
+                if self._feedback_enabled:
+                    activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
         validated = turn.get("validated_path")
         path = validated if isinstance(validated, str) else None
         url = _conversations_activities_url(service_url, conv_id)
@@ -7508,6 +7610,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 body = None
             if isinstance(body, dict):
                 new_id = str(body.get("id") or "")
+            self._record_keepalive_visible_post(chat_id, activity)
         detail = self._extract_error_message(resp) if status == 403 else ""
         untracked = not final and not stream_id and 200 <= status < 300 and not new_id
         retry_after_sec = (
@@ -8963,10 +9066,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             turn_buffer_flush=(
                                 chat_id,
                                 buf,
-                                tuple(
-                                    str(segment.get("id") or "")
-                                    for segment in chunk_segments
-                                ),
+                                tuple(str(segment.get("id") or "") for segment in chunk_segments),
                             ),
                         )
                         if not result.success:
