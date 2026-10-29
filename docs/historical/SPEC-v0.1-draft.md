@@ -836,6 +836,8 @@ $ hermes a365 activity-bridge start inbox-helper
 ### 6.8 OpenTelemetry (`hermes a365 telemetry`)
 
 > **v0.2 update (2026-05-07).** Aspirational. No `telemetry verify` subcommand was built; no OTLP wiring shipped. The wrapper does not inject Hermes spans into A365 traces. Revisit if/when an operator needs end-to-end observability in admin centre.
+>
+> **v0.9.6.1 update (2026-10-29, #189).** Option 2 chosen: `HERMES_OTLP_ENDPOINT`, the verify probe, and admin-centre span claims were removed from shipped code and docs. See `references/opentelemetry-config.md`.
 
 - A365 auto-instruments registered agents: spans, metrics, and a small canonical event vocabulary (agent.received, agent.responded, agent.tool_invoked, agent.error).
 - This skill's job:

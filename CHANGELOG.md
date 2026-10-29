@@ -6,6 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **#189 — Unexported OTLP telemetry key, probe, and docs claim (v0.9.6.1).**
+  ``HERMES_OTLP_ENDPOINT`` is no longer written by ``instance create`` or required
+  in ``~/.hermes/.env``. ``activity-bridge verify`` no longer runs the
+  ``otlp_endpoint`` DNS probe. README / SKILL / runbook text no longer promise
+  admin-centre spans from this skill. Legacy env files or parent configs that
+  still set ``HERMES_OTLP_ENDPOINT`` (or pass the hidden ``--otlp-endpoint`` flag)
+  emit a one-line stderr deprecation warning and are otherwise ignored. Refs
+  [#189](https://github.com/Satscryption/Hermes-A365/issues/189).
+
 ### Fixed
 
 - **#250 — Direct Line probe HTTP 401 attribution.** ``runtime_auth`` **ERROR**

@@ -392,7 +392,6 @@ adds:
 - Agent blueprints, registered via `a365 setup blueprint`
 - MCP-mediated access to Microsoft 365 data ("Work IQ" tools)
 - Bot Framework Activity protocol for messaging + Adaptive Card invokes
-- OpenTelemetry observability surfaced in admin centre
 - Teams / Outlook / Microsoft 365 Copilot channel adapters
 
 `hermes-a365` is the Hermes-side skill that drives these from inside

@@ -97,7 +97,6 @@ import hashlib
 import json
 import logging
 import os
-import socket
 import sys
 import urllib.error
 import urllib.parse
@@ -691,40 +690,6 @@ def probe_reachability(hosts: tuple[str, ...] = _REACHABILITY_HOSTS) -> ProbeRes
     return ProbeResult("reachability", _OK, f"reachable: {list(hosts)}", {"hosts": list(hosts)})
 
 
-def probe_otlp_endpoint(endpoint: str | None) -> ProbeResult:
-    if not endpoint:
-        return ProbeResult(
-            "otlp_endpoint",
-            _WARN,
-            "HERMES_OTLP_ENDPOINT not set in agent .env; spans won't be exported",
-        )
-    try:
-        host = urlparse(endpoint).hostname
-    except ValueError:
-        return ProbeResult("otlp_endpoint", _ERROR, f"unparseable URL: {endpoint!r}")
-    if not host:
-        return ProbeResult(
-            "otlp_endpoint",
-            _ERROR,
-            f"no host extracted from {endpoint!r}",
-        )
-    try:
-        socket.gethostbyname(host)
-    except OSError as e:
-        return ProbeResult(
-            "otlp_endpoint",
-            _WARN,
-            f"DNS lookup failed for {host}: {e}; spans may not export at runtime",
-            {"host": host},
-        )
-    return ProbeResult(
-        "otlp_endpoint",
-        _OK,
-        f"resolves: {host} (DNS only — actual POST happens at runtime)",
-        {"host": host, "endpoint": endpoint},
-    )
-
-
 # ---------------------------------------------------------------------------
 # Verify orchestration
 # ---------------------------------------------------------------------------
@@ -794,7 +759,6 @@ def run_verify(
         )
 
     report.probes.append(probe_reachability())
-    report.probes.append(probe_otlp_endpoint(agent_env.get("HERMES_OTLP_ENDPOINT")))
 
     return report
 

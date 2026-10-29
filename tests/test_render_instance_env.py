@@ -36,7 +36,6 @@ def _base_inputs(**overrides: object) -> InstanceEnvInputs:
         owner_aad_id="00000000-0000-0000-0000-000000000001",
         a365_app_id="00000000-0000-0000-0000-00000000aaa1",
         a365_tenant_id="contoso.onmicrosoft.com",
-        hermes_otlp_endpoint="https://contoso.otel.agent365.microsoft.com",
         aa_instance_id=FIXED_INSTANCE_ID,
     )
     base.update(overrides)
@@ -122,6 +121,12 @@ def test_render_instance_env_omits_unset_business_hours() -> None:
     assert "BUSINESS_HOURS_TZ" not in text
     assert "BUSINESS_HOURS_START" not in text
     assert "BUSINESS_HOURS_END" not in text
+
+
+def test_render_instance_env_never_emits_otlp_endpoint() -> None:
+    """#189: Hermes-A365 does not provision HERMES_OTLP_ENDPOINT."""
+    text = render_instance_env(_base_inputs())
+    assert "HERMES_OTLP_ENDPOINT" not in text
 
 
 def test_render_instance_env_never_emits_app_password() -> None:
