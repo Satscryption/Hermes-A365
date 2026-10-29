@@ -8914,14 +8914,22 @@ class TestEditMessage:
 
     @classmethod
     def _issue249_assert_final_clones_preview(
-        cls, preview: dict[str, Any], final: dict[str, Any], *, stream_id: str
+        cls,
+        preview: dict[str, Any],
+        final: dict[str, Any],
+        *,
+        stream_id: str,
+        expect_attachments: bool = False,
     ) -> None:
         assert final["text"] == preview["text"]
         final_extra = cls._issue249_non_stream_entities(final["entities"])
         preview_extra = cls._issue249_non_stream_entities(preview["entities"])
         assert final_extra == preview_extra
         assert final.get("channelData") == preview.get("channelData")
-        assert final.get("attachments") == preview.get("attachments")
+        if expect_attachments:
+            assert preview.get("attachments"), "preview must carry attachments for this assertion"
+            assert final.get("attachments") == preview["attachments"]
+            assert final["attachments"] is not preview["attachments"]
         preview_stream = preview["entities"][0]
         final_stream = final["entities"][0]
         assert final_stream.get("streamId") == stream_id
@@ -8952,6 +8960,16 @@ class TestEditMessage:
         monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
         posts: list[dict[str, Any]] = []
         stream_id = "ka-issue249-adopt"
+        probe_attachment = [
+            {
+                "contentType": "application/vnd.microsoft.card.adaptive",
+                "content": {
+                    "type": "AdaptiveCard",
+                    "version": "1.0",
+                    "body": [{"type": "TextBlock", "text": "issue249-probe"}],
+                },
+            }
+        ]
         clone_calls: list[dict[str, Any]] = []
         orig_clone = adapter_mod.Agent365Adapter._keepalive_final_activity_from_visible_post
 
@@ -8981,6 +8999,7 @@ class TestEditMessage:
             posts.append(body)
             entity = (body.get("entities") or [{}])[0]
             if entity.get("streamType") == "informative" and "streamId" not in entity:
+                body["attachments"] = copy.deepcopy(probe_attachment)
                 return self._http_result(201, stream_id)
             return self._http_result(202)
 
@@ -8996,11 +9015,17 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         await asyncio.sleep(0)
         preview, final = posts[0], posts[-1]
+        assert preview.get("attachments") == probe_attachment
+        assert preview["attachments"] is not probe_attachment
         assert preview["type"] == "typing"
         assert final["type"] == "message"
         assert len(clone_calls) == 1, "final must clone last_visible_post, not rebuild fresh"
         assert clone_calls[0]["text"] == answer
-        self._issue249_assert_final_clones_preview(preview, final, stream_id=stream_id)
+        assert clone_calls[0].get("attachments") == probe_attachment
+        assert clone_calls[0]["attachments"] is not probe_attachment
+        self._issue249_assert_final_clones_preview(
+            preview, final, stream_id=stream_id, expect_attachments=True
+        )
         assert self._issue249_ai_entity_count(final) == 1
         assert final.get("channelData") == bridge.FEEDBACK_LOOP_CHANNEL_DATA
         visible = [post for post in posts if str(post.get("text") or "").strip()]
