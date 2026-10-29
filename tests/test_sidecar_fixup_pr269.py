@@ -2,17 +2,21 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import logging
 import multiprocessing
 import os
+import stat
 from pathlib import Path
 from typing import Any
 
 import pytest
 
 from hermes_a365._common import (
+    _fsync_directory,
     exclusive_sidecar_lock,
+    sidecar_backup_path,
     write_owner_only_bytes_exclusive,
     write_owner_only_text_atomic,
 )
@@ -318,3 +322,89 @@ def test_text_atomic_fsync_before_replace(monkeypatch: pytest.MonkeyPatch, tmp_p
     write_owner_only_text_atomic(target, "{}\n")
     assert order.index("replace") > 0
     assert order[order.index("replace") - 1] == "fsync"
+
+
+def test_fsync_directory_skips_before_open_on_nt(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    opened: list[str] = []
+
+    def open_stub(path: str | os.PathLike, flags: int, *args: object, **kwargs: object) -> int:
+        opened.append(str(path))
+        raise AssertionError("directory open should not run on nt")
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "open", open_stub)
+    _fsync_directory(tmp_path)
+    assert opened == []
+
+
+def test_fsync_directory_unsupported_errno_is_best_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    real_fsync = os.fsync
+
+    def fsync(fd: int) -> None:
+        if stat.S_ISDIR(os.fstat(fd).st_mode):
+            raise OSError(errno.EINVAL, "directory fsync unsupported")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    path = tmp_path / "conversations.json"
+    write_owner_only_text_atomic(path, '{"schema":1,"conversations":[]}\n')
+    assert path.is_file()
+
+
+def test_file_fsync_failure_prevents_atomic_replace(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    path = tmp_path / "conversations.json"
+    path.write_bytes(b'{"schema":1,"conversations":[]}\n')
+    real_fsync = os.fsync
+    real_replace = os.replace
+    fsync_calls = 0
+
+    def fsync(fd: int) -> None:
+        nonlocal fsync_calls
+        fsync_calls += 1
+        if fsync_calls == 1:
+            raise OSError(5, "EIO")
+        real_fsync(fd)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", real_replace)
+    with pytest.raises(OSError):
+        write_owner_only_text_atomic(path, '{"schema":2,"conversations":[]}\n')
+    assert path.read_bytes() == b'{"schema":1,"conversations":[]}\n'
+    assert list(tmp_path.glob("*.tmp")) == []
+
+
+def test_backup_partial_write_leaves_no_final_name(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    sidecar = tmp_path / "conversations.json"
+    original = b'{"schema":1,"conversations":[]}\n'
+    sidecar.write_bytes(original)
+    backup = sidecar_backup_path(sidecar)
+    real_write = os.write
+    backup_writes = 0
+
+    def write(fd: int, data: bytes | memoryview) -> int:
+        nonlocal backup_writes
+        backup_writes += 1
+        if backup_writes == 1 and len(data) > 1:
+            real_write(fd, data[:1])
+            raise OSError("injected partial backup write")
+        return real_write(fd, data)
+
+    monkeypatch.setattr(os, "write", write)
+    with pytest.raises(OSError):
+        write_owner_only_bytes_exclusive(backup, original)
+    assert sidecar.read_bytes() == original
+    assert not backup.exists()
+    assert list(tmp_path.glob("conversations.backup-*.json")) == []
+    assert list(tmp_path.glob(".conversations.backup-*.part-*")) == []
+
+    write_owner_only_bytes_exclusive(backup, original)
+    assert backup.read_bytes() == original
+    assert sidecar.read_bytes() == original

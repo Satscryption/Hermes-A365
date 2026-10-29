@@ -7,6 +7,7 @@ lookup works for both editable installs and wheels.
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import re
@@ -82,14 +83,34 @@ def tcp_reachable(host: str, *, port: int = 443, timeout: float = 3.0) -> bool:
         return False
 
 
+def _directory_fsync_error_is_best_effort(exc: OSError) -> bool:
+    """True when the platform refuses directory fsync (not a data-path I/O fault)."""
+    if exc.errno in {errno.EINVAL, errno.ENOTSUP, errno.EBADF}:
+        return True
+    enosys = getattr(errno, "ENOSYS", None)
+    return enosys is not None and exc.errno == enosys
+
+
 def _fsync_directory(path: Path) -> None:
     """Best-effort fsync of ``path`` when it is a directory (POSIX)."""
+    if os.name == "nt":
+        return
     flags = os.O_RDONLY
     if hasattr(os, "O_DIRECTORY"):
         flags |= os.O_DIRECTORY
-    fd = os.open(path, flags)
     try:
-        os.fsync(fd)
+        fd = os.open(path, flags)
+    except OSError as exc:
+        if _directory_fsync_error_is_best_effort(exc):
+            return
+        raise
+    try:
+        try:
+            os.fsync(fd)
+        except OSError as exc:
+            if _directory_fsync_error_is_best_effort(exc):
+                return
+            raise
     finally:
         os.close(fd)
 
@@ -171,15 +192,13 @@ def sidecar_backup_path(path: Path, *, at: datetime | None = None) -> Path:
     return path.with_name(f"{path.name}.backup-{stamp}")
 
 
-def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o600) -> Path:
-    """Create a backup file exclusively at ``mode``; append ``-<pid>`` on stamp collision."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+def _exclusive_publish_file(tmp: Path, path: Path, *, mode: int) -> Path:
+    """Publish completed ``tmp`` at ``path`` without overwriting an existing file."""
     target = path
-    fd = -1
     for attempt in (0, 1):
         try:
-            fd = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
-            break
+            os.link(tmp, target)
+            return target
         except FileExistsError as exc:
             if attempt == 0 and target == path:
                 target = path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}")
@@ -187,14 +206,55 @@ def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o6
             raise SidecarLockError(
                 f"could not create sidecar backup {path} exclusively: {exc}"
             ) from exc
+        except OSError as exc:
+            link_errno = {errno.EXDEV, errno.ENOTSUP}
+            enosys = getattr(errno, "ENOSYS", None)
+            if enosys is not None:
+                link_errno.add(enosys)
+            if exc.errno not in link_errno:
+                raise
+            try:
+                placeholder = os.open(target, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+            except FileExistsError as exists_exc:
+                if attempt == 0 and target == path:
+                    target = path.with_name(f"{path.stem}-{os.getpid()}{path.suffix}")
+                    continue
+                raise SidecarLockError(
+                    f"could not create sidecar backup {path} exclusively: {exists_exc}"
+                ) from exists_exc
+            os.close(placeholder)
+            try:
+                os.replace(tmp, target)
+            except BaseException:
+                target.unlink(missing_ok=True)
+                raise
+            return target
+    raise SidecarLockError(f"could not create sidecar backup {path} exclusively")
+
+
+def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o600) -> Path:
+    """Write a backup via a private temp, fsync, then publish exclusively at ``mode``."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.part-{os.getpid()}")
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
     try:
         os.fchmod(fd, mode)
         offset = 0
         while offset < len(data):
             offset += os.write(fd, data[offset:])
         os.fsync(fd)
-    finally:
+    except BaseException:
         os.close(fd)
+        tmp.unlink(missing_ok=True)
+        raise
+    os.close(fd)
+    try:
+        target = _exclusive_publish_file(tmp, path, mode=mode)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
+    tmp.unlink(missing_ok=True)
     _fsync_directory(target.parent)
     return target
 
