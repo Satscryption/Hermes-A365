@@ -78,11 +78,12 @@ from .compatibility import (
 )
 from .entra_state import GraphGet
 
-ProbeState = Literal["ok", "warn", "error"]
+ProbeState = Literal["ok", "warn", "error", "skipped"]
 
 _OK = "ok"
 _WARN = "warn"
 _ERROR = "error"
+_SKIPPED = "skipped"
 
 _DEFAULT_NETWORK_HOSTS = ("login.microsoftonline.com", "graph.microsoft.com")
 _HERMES_HOME_ENV = "HERMES_HOME"
@@ -1335,7 +1336,7 @@ class DoctorReport:
 
 
 def overall_to_exit_code(o: ProbeState) -> int:
-    return {"ok": 0, "warn": 1, "error": 2}[o]
+    return {"ok": 0, "warn": 1, "error": 2, "skipped": 0}[o]
 
 
 def _map_bot_service_probe(result: bot_service_diagnostics.DiagnosticResult) -> ProbeResult:
@@ -1354,6 +1355,7 @@ def run_all_probes(
     secret_expiry_warn_days: int = DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
     graph_get: GraphGet | None = None,
     secret_expiry_now: Callable[[], datetime] | None = None,
+    agent_name: str | None = None,
 ) -> DoctorReport:
     probes: list[ProbeResult] = []
     probes.append(probe_python_runtime())
@@ -1388,10 +1390,10 @@ def run_all_probes(
     )
     probes.append(probe_hermes_harness())
     home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
-    expiry_skip = "--no-network" if no_network else None
+    expiry_skip = None
     for name, state, detail, data in gather_client_secret_expiry_checks(
         hermes_home=home,
-        agent_name=None,
+        agent_name=agent_name,
         sidecar_path=bot_service_sidecar_path or Path.cwd() / bot_service.SIDECAR_FILENAME,
         generated_config_path=generated_config_path or Path.cwd() / "a365.generated.config.json",
         warn_days=secret_expiry_warn_days,
@@ -1399,10 +1401,10 @@ def run_all_probes(
         now=secret_expiry_now,
         skip_reason=expiry_skip,
         operator_env=bot_service_operator_env,
+        for_status=False,
     ):
-        probe_state: ProbeState
         if state == "skipped":
-            probe_state = _OK
+            probe_state = _SKIPPED
         elif state in ("ok", "warn", "error"):
             probe_state = state
         else:
@@ -1421,7 +1423,12 @@ def render_human(report: DoctorReport) -> str:
     name_w = max(name_w, len("probe"))
     lines = ["hermes a365 doctor", "-" * 30]
     for p in report.probes:
-        marker = {_OK: "[ ok ]", _WARN: "[WARN]", _ERROR: "[FAIL]"}[p.state]
+        marker = {
+            _OK: "[ ok ]",
+            _WARN: "[WARN]",
+            _ERROR: "[FAIL]",
+            _SKIPPED: "[SKIP]",
+        }[p.state]
         lines.append(f"  {marker}  {p.name:<{name_w}}  {p.detail}")
     lines.append("")
     lines.append(f"overall: {report.overall}")
@@ -1453,6 +1460,13 @@ def render_json(report: DoctorReport) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.ArgumentParser:
     if parser is None:
         parser = argparse.ArgumentParser(
@@ -1465,12 +1479,16 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         help="skip network reachability probes (offline diagnostic)",
     )
     parser.add_argument(
+        "--agent-name",
+        help="resolve A365_APP_ID / A365_BF_APP_ID from ~/.hermes/agents/<slug>/.env",
+    )
+    parser.add_argument(
         "--secret-expiry-warn-days",
-        type=int,
+        type=_non_negative_int,
         default=DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
         metavar="N",
         help=(
-            "warn when a blueprint or Bot Framework client secret expires within "
+            "warn when the last active client secret expires within "
             f"N days (default {DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS})"
         ),
     )
@@ -1481,6 +1499,7 @@ def run(args: argparse.Namespace) -> int:
     report = run_all_probes(
         no_network=args.no_network,
         secret_expiry_warn_days=args.secret_expiry_warn_days,
+        agent_name=args.agent_name,
     )
     sys.stdout.write(render_human(report) if args.human else render_json(report))
     return overall_to_exit_code(report.overall)

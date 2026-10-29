@@ -6,7 +6,6 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-<<<<<<< HEAD
 ### Added
 
 - **#191 — Client secret expiry in `doctor` / `status`.** Read
@@ -17,7 +16,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   degrade to a clear “could not check” notice on permission or parse errors.
   Rotation runbook: ``references/client-secret-rotation.md``. Refs
   [#191](https://github.com/Satscryption/Hermes-A365/issues/191).
-=======
+
 ### Removed
 
 - **#189 — Unexported OTLP telemetry key, probe, and docs claim (v0.9.6.1).**
@@ -32,7 +31,6 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   hidden ``--otlp-endpoint`` / ``--hermes-otlp-endpoint`` flags) emit a one-line
   stderr deprecation warning and are otherwise ignored. Refs
   [#189](https://github.com/Satscryption/Hermes-A365/issues/189).
->>>>>>> origin/main
 
 ### Fixed
 

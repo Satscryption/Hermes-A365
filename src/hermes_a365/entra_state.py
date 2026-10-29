@@ -140,6 +140,9 @@ _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]
 _JSON_SECRET_RE = re.compile(
     r"(?i)(\"(?:password|secret|client_secret|access_token|refresh_token|token)\"\s*:\s*\")[^\"]*\""
 )
+_JSON_CREDENTIAL_METADATA_RE = re.compile(
+    r"(?i)(\"(?:hint|secretText|customKeyIdentifier|keyId)\"\s*:\s*\")[^\"]*\""
+)
 
 GRAPH_READ_PERMISSION_HINT = (
     "Graph rejected the registration state read (insufficient privileges). "
@@ -216,6 +219,7 @@ def redact(text: str) -> str:
     redacted = _JWT_RE.sub("[redacted]", text)
     redacted = _BEARER_RE.sub("Bearer [redacted]", redacted)
     redacted = _JSON_SECRET_RE.sub(r'\1[redacted]"', redacted)
+    redacted = _JSON_CREDENTIAL_METADATA_RE.sub(r'\1[redacted]"', redacted)
     if len(redacted) > 400:
         return redacted[:400] + "…"
     return redacted
@@ -365,15 +369,18 @@ def application_by_app_id_url(app_id: str) -> str:
     )
 
 
-_SECRET_EXPIRY_SELECT = frozenset({"passwordCredentials"})
+_SECRET_EXPIRY_SELECT = frozenset(
+    {"passwordCredentials", "keyCredentials", "federatedIdentityCredentials"}
+)
+_SECRET_EXPIRY_SELECT_CSV = "passwordCredentials,keyCredentials,federatedIdentityCredentials"
 
 
 def application_client_secret_expiry_url(app_id: str) -> str:
-    """Read only ``passwordCredentials`` metadata (``endDateTime``); never secret values."""
+    """Read credential metadata (dates only); never secret values."""
     canonical = str(UUID(app_id))
     return (
         f"https://{_GRAPH_HOST}/beta/applications(appId='{canonical}')"
-        f"?{_select_query('passwordCredentials')}"
+        f"?{_select_query(_SECRET_EXPIRY_SELECT_CSV)}"
     )
 
 
@@ -384,6 +391,11 @@ def assert_client_secret_expiry_read_url(url: str) -> None:
         raise EntraStateError("refusing a non-Graph URL during client secret expiry read.")
     if parts.fragment or not parts.query:
         raise EntraStateError("refusing a Graph client secret expiry read without a query.")
+    query_keys = frozenset(parse_qs(parts.query, keep_blank_values=True))
+    if query_keys != frozenset({"$select"}):
+        raise EntraStateError(
+            "refusing a Graph client secret expiry read with query parameters other than $select."
+        )
     path = parts.path
     if not path.startswith("/beta/applications(appId='") or not path.endswith("')"):
         raise EntraStateError(
@@ -397,8 +409,8 @@ def assert_client_secret_expiry_read_url(url: str) -> None:
         raise EntraStateError("refusing a Graph client secret expiry read without $select.")
     if select != _SECRET_EXPIRY_SELECT:
         raise EntraStateError(
-            "refusing a Graph client secret expiry read whose $select is not "
-            "passwordCredentials only."
+            "refusing a Graph client secret expiry read whose $select is not exactly "
+            f"{sorted(_SECRET_EXPIRY_SELECT)}."
         )
 
 
@@ -608,7 +620,15 @@ def graph_get_from_mutator(mutator: Mutator) -> GraphGet:
     return graph_get
 
 
-def graph_get_from_mutator_for_secret_expiry(mutator: Mutator) -> GraphGet:
+def graph_error_code(payload: Mapping[str, Any] | None) -> str:
+    return _error_code(payload)
+
+
+def graph_get_from_mutator_for_secret_expiry(
+    mutator: Mutator,
+    *,
+    timeout: float = 15.0,
+) -> GraphGet:
     """GET passwordCredentials expiry metadata via ``az rest`` (no secret values)."""
 
     def graph_get(url: str) -> dict[str, Any] | None:
@@ -617,6 +637,7 @@ def graph_get_from_mutator_for_secret_expiry(mutator: Mutator) -> GraphGet:
             result = mutator.run(
                 ["az", "rest", "--method", "GET", "--uri", url],
                 sensitive=True,
+                timeout=timeout,
             )
         except CliInvocationError as exc:
             raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
@@ -626,7 +647,7 @@ def graph_get_from_mutator_for_secret_expiry(mutator: Mutator) -> GraphGet:
             return {
                 "error": {
                     "code": "UnreadableGraphResponse",
-                    "message": redact(raw or "az rest failed"),
+                    "message": "Graph read failed",
                 }
             }
         except (AADSTSError, OSError):

@@ -2,84 +2,69 @@
 
 Snapshot date: 2026-10-29
 
-Hermes-A365 reads **only** ``passwordCredentials[].endDateTime`` from Microsoft
-Graph during ``hermes-a365 doctor`` and ``hermes-a365 status``. Secret values
-are never fetched or printed. When a secret is within **30 days** of expiry
-(configurable with ``--secret-expiry-warn-days N``), those commands **warn**;
-when it is expired or missing, they **fail** the check.
+Hermes-A365 reads **only** ``passwordCredentials`` ``startDateTime`` / ``endDateTime``
+from Microsoft Graph during ``hermes-a365 doctor`` and ``hermes-a365 status``. Secret
+values, key ids, and hints are never fetched or printed. The commands monitor the
+**last still-valid** password credential (``start <= now < end`` with the latest
+``endDateTime``). **Warn** when that date is within **30 days** by default
+(``--secret-expiry-warn-days N``); **fail** only when every password credential has
+expired. Apps with no password credentials (certificate or federated only) report
+*no client secret to monitor* — not a failure.
 
 ## Blueprint (agent identity) client secret
 
-The blueprint secret is minted during ``hermes a365 register`` (default
-lifetime is two years). Rotation options:
+### Mint or rotate in Entra
 
-1. **Re-run register (preferred when the skill owns the app).**
+```bash
+az login
+az ad app credential reset \
+  --id <blueprint-app-id> \
+  --append \
+  --display-name "Hermes blueprint $(date +%Y-%m-%d)" \
+  --years 2 \
+  -o json
+```
 
-   ```bash
-   hermes a365 register --apply --agent-name <slug> --tenant-id <tenant-guid>
-   ```
+Without ``--append``, Entra **replaces** existing password credentials — plan a
+overlap window before removing old secrets.
 
-   When the blueprint is already owned and reconciled, register may no-op
-   other steps; if the stored secret is missing or rejected at runtime, a
-   fresh ``register --apply`` rotates the blueprint secret into the generated
-   config and keychain per the skill's existing register contract.
+The command prints the new password **once** on stdout. Capture it through the
+skill's hidden prompt path:
 
-2. **Manual Entra rotation (when register cannot run).**
+1. Write ``A365_BLUEPRINT_CLIENT_SECRET`` to ``~/.hermes/.env`` (this wins over
+   keychain on load).
+2. Update ``agentBlueprintClientSecret`` in ``a365.generated.config.json`` when
+   that file is your deployment anchor.
 
-   ```bash
-   az login
-   az ad app credential reset --id <blueprint-app-id> --append --years 2
-   ```
+Restart the activity bridge or Hermes gateway plugin after the secret is stored.
 
-   Or with the Agent 365 CLI wrapper:
+``register --apply --auto-recover-secret`` is only for the case where
+``agentBlueprintClientSecret`` is **null on disk** and the operator deliberately
+opts in to minting a new secret — it is not a general rotation path.
 
-   ```bash
-   a365 az ad app credential reset --id <blueprint-app-id> --append --years 2
-   ```
+### Path B Bot Framework client secret
 
-   Copy the **new secret value once**, store it where the gateway reads it
-   (generated config / keychain per your deployment), and restart the activity
-   bridge or Hermes gateway plugin so token minting picks up the new material.
+```bash
+az ad app credential reset \
+  --id <bf-app-id> \
+  --append \
+  --display-name "Hermes BF $(date +%Y-%m-%d)" \
+  --years 2 \
+  -o json
+```
 
-## Bot Framework (Path B) client secret
-
-Path B uses ``A365_BF_APP_ID`` and ``A365_BF_CLIENT_SECRET`` (or the OS secret
-store when the env var is unset). The sidecar
-(``a365.bot-service.config.json``) records the ``msaAppId`` but not the secret.
-
-1. Create a new client secret in Entra for the Bot Framework application:
-
-   ```bash
-   az login
-   az ad app credential reset --id <bf-app-id> --append --years 2
-   ```
-
-2. Update the operator profile:
-
-   - Set ``A365_BF_CLIENT_SECRET`` in ``~/.hermes/.env`` (or the agent
-     ``.env``), **or** store via the platform secret provider the gateway
-     uses for Path B.
-   - Do not commit secret values to git.
-
-3. Restart the gateway / activity bridge so outbound Bot Framework connector
-   traffic uses the new secret.
-
-4. After the new secret works, remove older ``passwordCredentials`` entries in
-   Entra for the same app (Entra portal → App registration → Certificates &
-   secrets).
+Update ``A365_BF_CLIENT_SECRET`` in ``~/.hermes/.env`` (or the agent ``.env``),
+or the OS secret store your gateway uses for Path B. Restart the gateway. Remove
+superseded Entra password entries after traffic succeeds.
 
 ## Verification
 
-After rotation:
-
 ```bash
-hermes-a365 doctor --human
+hermes-a365 doctor --human --agent-name <slug>
 hermes-a365 status --human --agent-name <slug>
 ```
 
-Both include ``end_date_time`` and ``days_remaining`` for each checked app in
-``--json`` output. Live tenant walks (#187 / #90) should show real expiry
-dates when Graph ``Application.Read.All`` (or equivalent) is available.
+JSON output includes ``end_date_time`` and ``days_remaining`` for monitored apps.
 
 ## Related issues
 

@@ -611,6 +611,7 @@ def gather_client_secret_expiry(
         graph_get=graph_get,
         now=now,
         operator_env=operator_env,
+        for_status=True,
     )
     states = [row[1] for row in rows]
     overall = worst_check_state(states)
@@ -619,7 +620,9 @@ def gather_client_secret_expiry(
         component_state = _ERROR
     elif overall == "warn":
         component_state = _WARN
-    elif all(state == "skipped" for state in states):
+    elif all(
+        state == "skipped" and payload.get("check") == "skipped" for _, state, _, payload in rows
+    ):
         component_state = _SKIPPED
     else:
         component_state = _OK
@@ -766,6 +769,13 @@ def render_json(report: StatusReport) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.ArgumentParser:
     if parser is None:
         parser = argparse.ArgumentParser(
@@ -780,11 +790,11 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     parser.add_argument("--human", action="store_true", help="markdown-aligned output")
     parser.add_argument(
         "--secret-expiry-warn-days",
-        type=int,
+        type=_non_negative_int,
         default=DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
         metavar="N",
         help=(
-            "warn when a blueprint or Bot Framework client secret expires within "
+            "warn when the last active client secret expires within "
             f"N days (default {DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS})"
         ),
     )

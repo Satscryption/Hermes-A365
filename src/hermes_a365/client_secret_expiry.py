@@ -1,13 +1,16 @@
 """Client secret expiry checks for ``doctor`` and ``status`` (#191).
 
-Reads only ``passwordCredentials[].endDateTime`` (and ``keyId`` for
-disambiguation) via Graph — never secret values, hints, or custom keys.
+Reads only ``passwordCredentials`` ``startDateTime`` / ``endDateTime`` metadata
+via Graph — never secret values, key ids, or hints.
 """
 
 from __future__ import annotations
 
 import json
 import os
+import shutil
+import subprocess
+import urllib.parse
 from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -16,26 +19,45 @@ from typing import Any, Literal
 from uuid import UUID
 
 from . import bot_service
-from ._common import parse_env
+from ._common import parse_env, slugify, validate_slug
+from .bot_service import BotServiceError
 from .entra_state import (
+    _ACCESS_DENIED_CODES,
     GraphGet,
     _is_denied,
     _is_not_found,
-    _public_error,
     application_client_secret_expiry_url,
+    assert_client_secret_expiry_read_url,
+    graph_error_code,
     graph_get_from_mutator_for_secret_expiry,
 )
 from .mutator import Mutator, get_mutator
 
 DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS = 30
+GRAPH_SECRET_EXPIRY_REST_TIMEOUT_SEC = 15.0
 
 CheckState = Literal["ok", "warn", "error", "skipped"]
 
 Clock = Callable[[], datetime]
 
+_ALLOWLISTED_GRAPH_ERROR_CODES = _ACCESS_DENIED_CODES | frozenset(
+    {
+        "UnreadableGraphResponse",
+        "Request_ResourceNotFound",
+        "ResourceNotFound",
+        "ErrorItemNotFound",
+        "itemNotFound",
+        "UnknownError",
+    }
+)
+
 
 def _utc_now() -> datetime:
     return datetime.now(UTC)
+
+
+def _format_end_z(end: datetime) -> str:
+    return end.astimezone(UTC).isoformat().replace("+00:00", "Z")
 
 
 def _parse_graph_datetime(value: object) -> datetime | None:
@@ -46,112 +68,156 @@ def _parse_graph_datetime(value: object) -> datetime | None:
         text = text[:-1] + "+00:00"
     try:
         parsed = datetime.fromisoformat(text)
-    except ValueError:
+    except (ValueError, OverflowError):
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=UTC)
-    return parsed.astimezone(UTC)
+        return None
+    try:
+        return parsed.astimezone(UTC)
+    except OverflowError:
+        return None
 
 
 def _days_remaining(*, end: datetime, now: datetime) -> int:
-    delta = end - now
-    if delta.total_seconds() <= 0:
-        return 0
-    return delta.days
+    return (end.astimezone(UTC) - now.astimezone(UTC)).days
 
 
-def select_nearest_active_credential_end(
-    credentials: list[dict[str, Any]],
+def _unavailable_state(*, for_status: bool) -> CheckState:
+    return "skipped" if for_status else "warn"
+
+
+def _unavailable_detail(*, role: str, code: str | None = None) -> str:
+    if code in _ACCESS_DENIED_CODES:
+        return f"could not check {role} client secret expiry (Graph access denied)"
+    if code and code in _ALLOWLISTED_GRAPH_ERROR_CODES:
+        return f"could not check {role} client secret expiry (Graph {code})"
+    return f"could not check {role} client secret expiry"
+
+
+def _parse_password_credential_windows(
+    raw: object,
+) -> tuple[list[tuple[datetime, datetime]] | None, bool]:
+    """Return ``(windows, malformed)``. ``malformed`` is True when unreadable."""
+    if not isinstance(raw, list):
+        return None, True
+    windows: list[tuple[datetime, datetime]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return None, True
+        start = _parse_graph_datetime(item.get("startDateTime"))
+        end = _parse_graph_datetime(item.get("endDateTime"))
+        if start is None or end is None:
+            return None, True
+        windows.append((start, end))
+    return windows, False
+
+
+def select_latest_active_credential_end(
+    windows: list[tuple[datetime, datetime]],
     *,
     now: datetime,
-) -> tuple[datetime | None, str | None, str | None]:
-    """Return ``(end, key_id, failure_reason)``.
+) -> tuple[datetime | None, datetime | None, str | None]:
+    """Return ``(active_end, latest_past_end, failure_reason)``.
 
-    Among credentials whose ``endDateTime`` is strictly after ``now``, choose
-    the minimum ``endDateTime`` (soonest expiry). When none qualify, ``end``
-    is ``None`` and ``failure_reason`` explains why.
+    Active credentials satisfy ``start <= now < end``. When any exist, return
+    ``max(end)`` (latest still-valid password). When none are active but past
+    credentials exist, ``active_end`` is ``None`` and ``latest_past_end`` is
+    ``max(end)`` among expired rows.
     """
-    parsed: list[tuple[datetime, str | None]] = []
-    for item in credentials:
-        if not isinstance(item, dict):
-            continue
-        end = _parse_graph_datetime(item.get("endDateTime"))
-        if end is None:
-            continue
-        key_id = item.get("keyId")
-        key_label = str(key_id) if isinstance(key_id, str) and key_id else None
-        parsed.append((end, key_label))
-    if not parsed:
-        return None, None, "passwordCredentials entries lacked parseable endDateTime"
-    active = [(end, key) for end, key in parsed if end > now]
-    if not active:
-        return None, None, "no active client secret (all credentials expired)"
-    chosen_end, chosen_key = min(active, key=lambda pair: pair[0])
-    return chosen_end, chosen_key, None
+    active_ends = [end for start, end in windows if start <= now < end]
+    if active_ends:
+        return max(active_ends), None, None
+    past_ends = [end for start, end in windows if end <= now]
+    if past_ends:
+        return None, max(past_ends), "all client secrets expired"
+    return None, None, "no client secret in its active window"
 
 
 def classify_client_secret_expiry(
     *,
-    end: datetime | None,
+    end: datetime,
     now: datetime,
     warn_days: int,
-    unreadable_reason: str | None = None,
 ) -> tuple[CheckState, str, dict[str, Any]]:
-    data: dict[str, Any] = {"warn_days": warn_days}
-    if unreadable_reason:
-        data["check"] = "unavailable"
-        return (
-            "warn",
-            f"could not check client secret expiry ({unreadable_reason})",
-            data,
-        )
-    if end is None:
-        data["check"] = "missing"
-        return (
-            "error",
-            "no valid client secret found (add or rotate credentials in Entra)",
-            data,
-        )
-    data["end_date_time"] = end.isoformat().replace("+00:00", "Z")
+    data: dict[str, Any] = {
+        "warn_days": warn_days,
+        "end_date_time": _format_end_z(end),
+    }
     days = _days_remaining(end=end, now=now)
     data["days_remaining"] = days
     if end <= now:
         data["check"] = "expired"
         return (
             "error",
-            f"client secret expired on {data['end_date_time']} ({days} days remaining)",
+            f"last active client secret expired on {data['end_date_time']} ({days} days remaining)",
             data,
         )
     if days <= warn_days:
         data["check"] = "expiring"
         return (
             "warn",
-            f"client secret expires on {data['end_date_time']} ({days} day(s) remaining)",
+            f"last active client secret expires on {data['end_date_time']} "
+            f"({days} day(s) remaining)",
             data,
         )
     data["check"] = "healthy"
     return (
         "ok",
-        f"client secret expires on {data['end_date_time']} ({days} day(s) remaining)",
+        f"last active client secret expires on {data['end_date_time']} ({days} day(s) remaining)",
         data,
     )
 
 
-def _sanitize_credential_list(raw: object) -> list[dict[str, Any]] | None:
-    if not isinstance(raw, list):
+def _az_rest_graph_get(url: str) -> dict[str, Any] | None:
+    assert_client_secret_expiry_read_url(url)
+    if not shutil.which("az"):
         return None
-    cleaned: list[dict[str, Any]] = []
-    for item in raw:
-        if not isinstance(item, dict):
-            continue
-        cleaned.append(
-            {
-                key: value
-                for key, value in item.items()
-                if key in {"endDateTime", "startDateTime", "keyId", "displayName"}
-            }
+    if urllib.parse.urlparse(url).hostname != "graph.microsoft.com":
+        return None
+    try:
+        proc = subprocess.run(
+            [
+                "az",
+                "rest",
+                "--method",
+                "GET",
+                "--url",
+                url,
+                "--headers",
+                "ConsistencyLevel=eventual",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=GRAPH_SECRET_EXPIRY_REST_TIMEOUT_SEC,
+            check=False,
         )
-    return cleaned
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if proc.returncode != 0:
+        return None
+    try:
+        payload = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+def graph_get_from_az_rest() -> GraphGet:
+    def graph_get(url: str) -> dict[str, Any] | None:
+        return _az_rest_graph_get(url)
+
+    return graph_get
+
+
+def build_graph_get(mutator: Mutator | None = None) -> GraphGet | None:
+    mut = mutator if mutator is not None else get_mutator()
+    if getattr(mut, "available", True):
+        return graph_get_from_mutator_for_secret_expiry(
+            mut, timeout=GRAPH_SECRET_EXPIRY_REST_TIMEOUT_SEC
+        )
+    if shutil.which("az"):
+        return graph_get_from_az_rest()
+    return None
 
 
 def check_app_client_secret_expiry(
@@ -161,71 +227,97 @@ def check_app_client_secret_expiry(
     now: datetime,
     warn_days: int = DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
     role: str = "application",
+    for_status: bool = False,
 ) -> tuple[CheckState, str, dict[str, Any]]:
     try:
         canonical = str(UUID(app_id.strip()))
     except ValueError:
+        state = _unavailable_state(for_status=for_status)
         return (
-            "warn",
-            f"could not check {role} client secret expiry (app id is not a GUID)",
+            state,
+            _unavailable_detail(role=role),
             {"role": role, "check": "unavailable"},
         )
     url = application_client_secret_expiry_url(canonical)
     payload = graph_get(url)
     if payload is None:
+        state = _unavailable_state(for_status=for_status)
         return (
-            "warn",
-            f"could not check {role} client secret expiry (Graph read failed)",
-            {"role": role, "app_id": canonical, "check": "unavailable"},
+            state,
+            _unavailable_detail(role=role),
+            {"role": role, "check": "unavailable"},
         )
     if _is_denied(payload):
+        code = graph_error_code(payload)
+        state = _unavailable_state(for_status=for_status)
         return (
-            "warn",
-            f"could not check {role} client secret expiry ({_public_error(payload)})",
-            {"role": role, "app_id": canonical, "check": "unavailable"},
+            state,
+            _unavailable_detail(role=role, code=code or "Authorization_RequestDenied"),
+            {"role": role, "check": "unavailable"},
         )
     if _is_not_found(payload):
         return (
             "error",
-            f"{role} Entra application not found (appId={canonical[:8]}…)",
-            {"role": role, "app_id": canonical, "check": "missing_app"},
+            f"{role} Entra application not found",
+            {"role": role, "check": "missing_app"},
         )
-    if "error" in payload and isinstance(payload.get("error"), dict):
+    if isinstance(payload.get("error"), dict):
+        code = graph_error_code(payload)
+        state = _unavailable_state(for_status=for_status)
         return (
-            "warn",
-            f"could not check {role} client secret expiry ({_public_error(payload)})",
-            {"role": role, "app_id": canonical, "check": "unavailable"},
+            state,
+            _unavailable_detail(role=role, code=code or "UnknownError"),
+            {"role": role, "check": "unavailable"},
         )
-    creds = _sanitize_credential_list(payload.get("passwordCredentials"))
-    if creds is None:
+    if "passwordCredentials" not in payload:
+        state = _unavailable_state(for_status=for_status)
         return (
-            "warn",
-            f"could not check {role} client secret expiry (malformed Graph response)",
-            {"role": role, "app_id": canonical, "check": "unavailable"},
+            state,
+            _unavailable_detail(role=role),
+            {"role": role, "check": "unavailable"},
         )
-    if not creds:
+    windows, malformed = _parse_password_credential_windows(payload.get("passwordCredentials"))
+    if malformed or windows is None:
+        state = _unavailable_state(for_status=for_status)
+        return (
+            state,
+            _unavailable_detail(role=role),
+            {"role": role, "check": "unavailable"},
+        )
+    if not windows:
+        return (
+            "skipped",
+            f"no client secret to monitor for {role} application",
+            {"role": role, "check": "no_password_secret"},
+        )
+    active_end, latest_past, failure = select_latest_active_credential_end(windows, now=now)
+    if active_end is not None:
+        state, detail, data = classify_client_secret_expiry(
+            end=active_end,
+            now=now,
+            warn_days=warn_days,
+        )
+        return state, detail, {**data, "role": role}
+    if latest_past is not None:
+        data = {
+            "warn_days": warn_days,
+            "end_date_time": _format_end_z(latest_past),
+            "days_remaining": _days_remaining(end=latest_past, now=now),
+            "check": "expired",
+            "role": role,
+        }
         return (
             "error",
-            f"no client secret configured for {role} application",
-            {"role": role, "app_id": canonical, "check": "missing"},
+            f"last active client secret expired on {data['end_date_time']} "
+            f"({data['days_remaining']} days remaining)",
+            data,
         )
-    end, key_id, failure = select_nearest_active_credential_end(creds, now=now)
-    if end is None:
-        reason = failure or "no active client secret"
-        return (
-            "error",
-            f"no valid client secret found ({reason}); rotate credentials in Entra",
-            {"role": role, "app_id": canonical, "check": "missing", "reason": reason},
-        )
-    state, detail, data = classify_client_secret_expiry(
-        end=end,
-        now=now,
-        warn_days=warn_days,
+    reason = failure or "no client secret in its active window"
+    return (
+        "error",
+        f"no valid client secret found ({reason})",
+        {"role": role, "check": "missing", "reason": reason},
     )
-    data = {**data, "role": role, "app_id": canonical}
-    if key_id:
-        data["key_id"] = key_id
-    return state, detail, data
 
 
 _HERMES_HOME_ENV = "HERMES_HOME"
@@ -239,6 +331,18 @@ def _read_env_file(path: Path) -> dict[str, str]:
         return parse_env(path.read_text())
     except OSError:
         return {}
+
+
+def _agent_slug(agent_name: str) -> str:
+    slug = slugify(agent_name)
+    if not slug:
+        raise ValueError(f"agent name {agent_name!r} does not produce a slug")
+    return validate_slug(slug)
+
+
+def _agent_env(hermes_home: Path, agent_name: str) -> dict[str, str]:
+    slug = _agent_slug(agent_name)
+    return _read_env_file(hermes_home / "agents" / slug / ".env")
 
 
 def _generated_blueprint_id(home: Path, generated_config_path: Path) -> str:
@@ -271,12 +375,14 @@ def resolve_blueprint_app_id(
     generated_config_path: Path,
 ) -> str:
     home_env = _read_env_file(hermes_home / ".env")
-    blueprint = (os.environ.get("A365_APP_ID") or "").strip() or (
+    gateway = (os.environ.get("A365_APP_ID") or "").strip() or (
         home_env.get("A365_APP_ID") or ""
     ).strip()
     if agent_name:
-        agent_env = _read_env_file(hermes_home / "agents" / agent_name / ".env")
-        blueprint = (agent_env.get("A365_APP_ID") or "").strip() or blueprint
+        agent_env = _agent_env(hermes_home, agent_name)
+        blueprint = (agent_env.get("A365_APP_ID") or "").strip() or gateway
+    else:
+        blueprint = gateway
     if not blueprint:
         blueprint = _generated_blueprint_id(hermes_home, generated_config_path)
     return blueprint.strip()
@@ -286,21 +392,27 @@ def resolve_bf_app_id(
     *,
     hermes_home: Path,
     sidecar_path: Path,
+    agent_name: str | None = None,
     operator_env: dict[str, str] | None = None,
-) -> str:
-    env = operator_env if operator_env is not None else _read_env_file(hermes_home / ".env")
+) -> tuple[str, bool]:
+    """Return ``(app_id, sidecar_unreadable)``."""
+    env = dict(operator_env or _read_env_file(hermes_home / ".env"))
+    if agent_name:
+        env = {**env, **_agent_env(hermes_home, agent_name)}
     bf = (os.environ.get("A365_BF_APP_ID") or "").strip() or (
         env.get("A365_BF_APP_ID") or ""
     ).strip()
     if bf:
-        return bf
+        return bf, False
     if not sidecar_path.is_file():
-        return ""
+        return "", False
     try:
         config = bot_service.BotServiceConfig.from_file(sidecar_path)
+    except BotServiceError:
+        return "", True
     except (OSError, ValueError):
-        return ""
-    return (config.msaAppId or "").strip()
+        return "", True
+    return (config.msaAppId or "").strip(), False
 
 
 @dataclass(frozen=True)
@@ -308,6 +420,7 @@ class ClientSecretExpiryTargets:
     blueprint_app_id: str
     bf_app_id: str
     bf_configured: bool
+    bf_sidecar_unreadable: bool
 
 
 def resolve_secret_expiry_targets(
@@ -324,23 +437,18 @@ def resolve_secret_expiry_targets(
         generated_config_path=generated_config_path,
     )
     bf_configured = sidecar_path.is_file()
-    bf = resolve_bf_app_id(
+    bf, unreadable = resolve_bf_app_id(
         hermes_home=hermes_home,
         sidecar_path=sidecar_path,
+        agent_name=agent_name,
         operator_env=operator_env,
     )
     return ClientSecretExpiryTargets(
         blueprint_app_id=blueprint,
         bf_app_id=bf,
         bf_configured=bf_configured,
+        bf_sidecar_unreadable=unreadable,
     )
-
-
-def build_graph_get(mutator: Mutator | None = None) -> GraphGet | None:
-    mut = mutator if mutator is not None else get_mutator()
-    if not getattr(mut, "available", True):
-        return None
-    return graph_get_from_mutator_for_secret_expiry(mut)
 
 
 def gather_client_secret_expiry_checks(
@@ -355,17 +463,27 @@ def gather_client_secret_expiry_checks(
     now: Clock | None = None,
     skip_reason: str | None = None,
     operator_env: dict[str, str] | None = None,
+    for_status: bool = False,
 ) -> list[tuple[str, CheckState, str, dict[str, Any]]]:
     """Return per-app rows: ``(probe_name, state, detail, data)``."""
     clock = now or _utc_now
     instant = clock()
-    targets = resolve_secret_expiry_targets(
-        hermes_home=hermes_home,
-        agent_name=agent_name,
-        sidecar_path=sidecar_path,
-        generated_config_path=generated_config_path,
-        operator_env=operator_env,
-    )
+    try:
+        targets = resolve_secret_expiry_targets(
+            hermes_home=hermes_home,
+            agent_name=agent_name,
+            sidecar_path=sidecar_path,
+            generated_config_path=generated_config_path,
+            operator_env=operator_env,
+        )
+    except ValueError:
+        unavailable = _unavailable_state(for_status=for_status)
+        detail = _unavailable_detail(role="blueprint")
+        return [
+            ("blueprint_client_secret", unavailable, detail, {"check": "unavailable"}),
+            ("bf_client_secret", unavailable, detail, {"check": "unavailable"}),
+        ]
+
     rows: list[tuple[str, CheckState, str, dict[str, Any]]] = []
 
     def skip_row(name: str, detail: str) -> None:
@@ -378,7 +496,7 @@ def gather_client_secret_expiry_checks(
 
     getter = graph_get if graph_get is not None else build_graph_get(mutator)
     if getter is None:
-        unavailable = "a365/az Graph read unavailable"
+        state = _unavailable_state(for_status=for_status)
         for name, role in (
             ("blueprint_client_secret", "blueprint"),
             ("bf_client_secret", "Bot Framework"),
@@ -386,8 +504,8 @@ def gather_client_secret_expiry_checks(
             rows.append(
                 (
                     name,
-                    "warn",
-                    f"could not check {role} client secret expiry ({unavailable})",
+                    state,
+                    _unavailable_detail(role=role),
                     {"role": role, "check": "unavailable"},
                 )
             )
@@ -400,6 +518,7 @@ def gather_client_secret_expiry_checks(
             now=instant,
             warn_days=warn_days,
             role="blueprint",
+            for_status=for_status,
         )
         rows.append(("blueprint_client_secret", state, detail, data))
     else:
@@ -410,13 +529,13 @@ def gather_client_secret_expiry_checks(
 
     if not targets.bf_configured:
         skip_row("bf_client_secret", "skipped; Path B sidecar absent")
-    elif not targets.bf_app_id:
+    elif targets.bf_sidecar_unreadable or not targets.bf_app_id:
+        state = _unavailable_state(for_status=for_status)
         rows.append(
             (
                 "bf_client_secret",
-                "warn",
-                "could not check Bot Framework client secret expiry "
-                "(A365_BF_APP_ID or sidecar msaAppId missing)",
+                state,
+                _unavailable_detail(role="Bot Framework"),
                 {"role": "Bot Framework", "check": "unavailable"},
             )
         )
@@ -427,18 +546,16 @@ def gather_client_secret_expiry_checks(
             now=instant,
             warn_days=warn_days,
             role="Bot Framework",
+            for_status=for_status,
         )
         rows.append(("bf_client_secret", state, detail, data))
     return rows
 
 
 def worst_check_state(states: list[CheckState]) -> CheckState:
-    if any(state == "error" for state in states):
+    actionable = [state for state in states if state != "skipped"]
+    if any(state == "error" for state in actionable):
         return "error"
-    if any(state == "warn" for state in states):
+    if any(state == "warn" for state in actionable):
         return "warn"
-    if any(state == "skipped" for state in states) and all(
-        state in ("ok", "skipped") for state in states
-    ):
-        return "ok"
     return "ok"
