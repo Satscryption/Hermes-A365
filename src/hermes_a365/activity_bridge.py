@@ -154,17 +154,13 @@ except ImportError:  # pragma: no cover — exercised by integration tests
 _HERMES_HOME_ENV = "HERMES_HOME"
 _HERMES_HOME_DEFAULT = "~/.hermes"
 
-# Resource appIds for token acquisition. The blueprint SP only ever
-# gets one S2S app-role assignment (``Agent365Observability``) — this
-# is intended behaviour per Microsoft's 2026-05-05 reply on
-# microsoft/Agent365-devTools#402, NOT a CLI defect. The Messaging
-# Bot API and Power Platform API resources are configured via
-# delegated OAuth2 grants only. Probing Observability with
-# ``client_credentials`` validates the secret + the only S2S grant
-# the GA CLI assigns. ``client_credentials`` to other resources is
-# expected to fail with ``AADSTS7000218`` (no app role) — that's
-# still positive evidence the secret works, not a missing-grant
-# signal.
+# Token acquisition resources. ``acquire_token`` defaults to
+# ``GRAPH_RESOURCE``, which ``probe_token_acquisition`` uses as the
+# verify-mode secret smoke test. The Entra "Agentic application"
+# completion marker (microsoft/Agent365-devTools#402) blocks
+# ``client_credentials`` for blueprint apps on messaging-related
+# resources; Graph remains valid for that check. ``OBSERVABILITY_RESOURCE_APPID``
+# is kept as a named constant for tests and historical references only.
 OBSERVABILITY_RESOURCE_APPID = "9b975845-388f-4429-889e-eab1ef63949c"
 GRAPH_RESOURCE = "https://graph.microsoft.com"
 
@@ -352,7 +348,7 @@ def acquire_token(
     tenant_id: str,
     client_id: str,
     client_secret: str,
-    resource: str = OBSERVABILITY_RESOURCE_APPID,
+    resource: str = GRAPH_RESOURCE,
     timeout: float = 15.0,
 ) -> dict[str, Any]:
     """Acquire an OAuth token via the client_credentials grant.

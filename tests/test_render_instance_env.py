@@ -4,7 +4,8 @@ from pathlib import Path
 
 import pytest
 
-from hermes_a365.render_instance_env import InstanceEnvInputs, render_instance_env
+from hermes_a365._common import OTLP_DEPRECATED_MESSAGE
+from hermes_a365.render_instance_env import InstanceEnvInputs, main, render_instance_env
 
 GOLDEN_DIR = Path(__file__).parent / "golden" / "instance_env"
 
@@ -127,6 +128,43 @@ def test_render_instance_env_never_emits_otlp_endpoint() -> None:
     """#189: Hermes-A365 does not provision HERMES_OTLP_ENDPOINT."""
     text = render_instance_env(_base_inputs())
     assert "HERMES_OTLP_ENDPOINT" not in text
+
+
+def test_render_instance_env_deprecated_dataclass_warns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    text = render_instance_env(
+        _base_inputs(hermes_otlp_endpoint="https://contoso.otel.agent365.microsoft.com")
+    )
+    assert OTLP_DEPRECATED_MESSAGE in capsys.readouterr().err
+    assert "HERMES_OTLP_ENDPOINT" not in text
+
+
+def test_render_instance_env_cli_hidden_otlp_flag_warns(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    rc = main(
+        [
+            "--agent-identity",
+            "inbox-helper",
+            "--owner",
+            "sadiq@contoso.com",
+            "--owner-aad-id",
+            "00000000-0000-0000-0000-000000000001",
+            "--a365-app-id",
+            "00000000-0000-0000-0000-00000000aaa1",
+            "--a365-tenant-id",
+            "contoso.onmicrosoft.com",
+            "--aa-instance-id",
+            FIXED_INSTANCE_ID,
+            "--hermes-otlp-endpoint",
+            "https://contoso.otel.agent365.microsoft.com",
+        ]
+    )
+    assert rc == 0
+    captured = capsys.readouterr()
+    assert OTLP_DEPRECATED_MESSAGE in captured.err
+    assert "HERMES_OTLP_ENDPOINT" not in captured.out
 
 
 def test_render_instance_env_never_emits_app_password() -> None:

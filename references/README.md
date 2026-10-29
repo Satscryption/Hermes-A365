@@ -2,8 +2,8 @@
 
 Reference material for the `hermes-a365` skill. Most files here are
 **dated snapshots** of an external surface (Microsoft Agent 365 CLI,
-Entra error codes, blueprint properties, OpenTelemetry vocabulary, Bot
-Framework activity shapes, license catalog) — *not* a source of truth.
+Entra error codes, blueprint properties, OTLP non-export policy (#189),
+Bot Framework activity shapes, license catalog) — *not* a source of truth.
 `live-tenant-test.md` is the operator runbook for end-to-end validation.
 
 The doctor (`hermes_a365.doctor`) and individual subcommands cross-check

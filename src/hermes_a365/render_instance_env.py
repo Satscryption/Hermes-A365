@@ -41,7 +41,7 @@ import sys
 import uuid
 from dataclasses import dataclass
 
-from ._common import jinja_env
+from ._common import OTLP_DEPRECATED_MESSAGE, jinja_env
 
 _ENV_KEY_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 
@@ -61,6 +61,7 @@ class InstanceEnvInputs:
     a365_app_id: str
     a365_tenant_id: str
     aa_instance_id: str | None = None  # generated if None
+    hermes_otlp_endpoint: str | None = None  # deprecated; never rendered
     business_hours_tz: str | None = None
     business_hours_start: str | None = None
     business_hours_end: str | None = None
@@ -77,6 +78,8 @@ class InstanceEnvInputs:
 
 def render_instance_env(inputs: InstanceEnvInputs) -> str:
     """Render the per-agent .env content as a string (with trailing newline)."""
+    if inputs.hermes_otlp_endpoint and str(inputs.hermes_otlp_endpoint).strip():
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
     preserved: dict[str, str] = {}
     for key, value in (inputs.preserved_env or {}).items():
         if not _ENV_KEY_RE.fullmatch(key):
@@ -117,6 +120,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--owner-aad-id", required=True)
     parser.add_argument("--a365-app-id", required=True)
     parser.add_argument("--a365-tenant-id", required=True)
+    parser.add_argument("--hermes-otlp-endpoint", help=argparse.SUPPRESS)
     parser.add_argument("--aa-instance-id", help="UUID; generated if omitted")
     parser.add_argument("--business-hours-tz")
     parser.add_argument("--business-hours-start")
@@ -130,6 +134,7 @@ def main(argv: list[str] | None = None) -> int:
         owner_aad_id=args.owner_aad_id,
         a365_app_id=args.a365_app_id,
         a365_tenant_id=args.a365_tenant_id,
+        hermes_otlp_endpoint=args.hermes_otlp_endpoint,
         aa_instance_id=args.aa_instance_id,
         business_hours_tz=args.business_hours_tz,
         business_hours_start=args.business_hours_start,

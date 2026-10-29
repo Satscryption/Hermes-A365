@@ -31,6 +31,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from ._common import (
+    OTLP_DEPRECATED_MESSAGE,
     ensure_contained,
     parse_env,
     validate_slug,
@@ -43,10 +44,6 @@ _HERMES_HOME_DEFAULT = "~/.hermes"
 
 _REQUIRED_PARENT_KEYS = ("A365_APP_ID", "A365_TENANT_ID")
 _DEPRECATED_OTLP_ENV_KEY = "HERMES_OTLP_ENDPOINT"
-_OTLP_DEPRECATED_MESSAGE = (
-    "WARN: HERMES_OTLP_ENDPOINT is deprecated and ignored; "
-    "Hermes-A365 does not export OTLP telemetry (#189)."
-)
 _MANAGED_AGENT_ENV_KEYS = frozenset(
     {
         "AGENT_IDENTITY",
@@ -118,13 +115,13 @@ def warn_if_deprecated_otlp_config(
 ) -> None:
     """Emit a one-line stderr warning when legacy OTLP keys are still set."""
     if cli_otlp_endpoint and cli_otlp_endpoint.strip():
-        print(_OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
         return
     if parent_env.get(_DEPRECATED_OTLP_ENV_KEY, "").strip():
-        print(_OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
         return
     if agent_env and agent_env.get(_DEPRECATED_OTLP_ENV_KEY, "").strip():
-        print(_OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
+        print(OTLP_DEPRECATED_MESSAGE, file=sys.stderr)
 
 
 def write_text_atomic(path: Path, text: str, *, mode: int = 0o600) -> None:

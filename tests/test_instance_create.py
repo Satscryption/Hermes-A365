@@ -8,8 +8,8 @@ from typing import Any
 
 import pytest
 
+from hermes_a365._common import OTLP_DEPRECATED_MESSAGE
 from hermes_a365.instance_create import (
-    _OTLP_DEPRECATED_MESSAGE,
     InstanceCreateError,
     InstanceCreateInputs,
     InstanceCreateResult,
@@ -108,7 +108,7 @@ class TestSkillEnvPreconditions:
             HERMES_OTLP_ENDPOINT="https://contoso.otel.agent365.microsoft.com",
         )
         build_instance_plan(_inputs(), hermes_home=tmp_path)
-        assert _OTLP_DEPRECATED_MESSAGE in capsys.readouterr().err
+        assert OTLP_DEPRECATED_MESSAGE in capsys.readouterr().err
 
     def test_legacy_cli_otlp_endpoint_emits_deprecation_warning(
         self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
@@ -119,7 +119,7 @@ class TestSkillEnvPreconditions:
             hermes_home=tmp_path,
             cli_otlp_endpoint="https://override",
         )
-        assert _OTLP_DEPRECATED_MESSAGE in capsys.readouterr().err
+        assert OTLP_DEPRECATED_MESSAGE in capsys.readouterr().err
 
     def test_instance_create_succeeds_without_otlp_endpoint(self, tmp_path: Path) -> None:
         _seed_skill_env(tmp_path)
