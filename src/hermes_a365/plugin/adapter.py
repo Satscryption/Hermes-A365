@@ -538,6 +538,11 @@ _CARD_ACTION_KINDS = frozenset(
     {_CARD_KIND_EXEC_APPROVAL, _CARD_KIND_SLASH_CONFIRM, _CARD_KIND_CLARIFY}
 )
 _TURN_ORIGIN_METADATA_KEY = "agent365_turn_origin"
+_PENDING_MERGE_REGISTRY: dict[int, Any] = {}
+_HERMES_MERGE_PENDING_ORIGINAL: Any = None
+_MERGE_PENDING_PATCHED = False
+_SETTLE_REGISTER_PATCHED = False
+_ORIGINAL_REGISTER_GATEWAY_SETTLE: Any = None
 
 _DEFAULT_PORT = 3978
 
@@ -2073,6 +2078,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # also keeps chats with a live card capability or an open-ended
         # clarify, independent of the session guard.
         self._session_key_to_conv: dict[str, str] = {}
+        self._pending_origin_overflow: dict[str, list[Any]] = {}
         self._agent_turn_guards: dict[str, asyncio.Event] = {}
         self._agent_turn_admissions: dict[str, asyncio.Task[Any]] = {}
         self._media_leases_by_session: dict[str, set[Path]] = {}
@@ -2210,6 +2216,18 @@ class Agent365Adapter(BasePlatformAdapter):
             "message/fetchTask": self._handle_message_fetch_task,
             "handoff/action": self._handle_handoff_action,
         }
+        self._register_pending_merge_guard()
+        self._ensure_gateway_settle_compose_patch()
+
+    @classmethod
+    def supports_exec_approval_buttons(cls) -> bool:
+        """Cards need ``approval_data['request_id']`` from the turn runner.
+
+        Hermes only passes that id on the button path when this returns True
+        (``_send_exec_approval_prompt`` override). Until then, missing ids fall
+        back to the plain-text ``/approve`` prompt with no capability minted.
+        """
+        return False
 
     @property
     def name(self) -> str:
@@ -3879,6 +3897,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._file_consent_decline_notified.clear()
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
+        self._pending_origin_overflow.clear()
         self._agent_turn_guards.clear()
         self._session_key_to_conv.clear()
         self._chat_teardown_tasks.clear()
@@ -4326,6 +4345,178 @@ class Agent365Adapter(BasePlatformAdapter):
             "session_key": str(raw.get("session_key") or ""),
         }
 
+    @staticmethod
+    def _turn_origin_key(origin: dict[str, str] | None) -> tuple[str, ...]:
+        if not origin:
+            return ()
+        return (
+            str(origin.get("user_id") or ""),
+            str(origin.get("conversation_id") or ""),
+            str(origin.get("tenant_id") or ""),
+            str(origin.get("session_key") or ""),
+        )
+
+    def _pending_turn_origins_compatible(self, existing: Any, incoming: Any) -> bool:
+        return self._turn_origin_key(self._event_turn_origin(existing)) == self._turn_origin_key(
+            self._event_turn_origin(incoming)
+        )
+
+    @staticmethod
+    def _chain_gateway_settle_callbacks(prior: Any, settle: Any):
+        def _combined(reason: str) -> None:
+            if prior is not None:
+                with contextlib.suppress(Exception):
+                    prior(reason)
+            with contextlib.suppress(Exception):
+                settle(reason)
+
+        return _combined
+
+    @staticmethod
+    def _ensure_gateway_settle_compose_patch() -> None:
+        global _SETTLE_REGISTER_PATCHED, _ORIGINAL_REGISTER_GATEWAY_SETTLE
+        if _SETTLE_REGISTER_PATCHED:
+            return
+        try:
+            import tools.approval as approval_mod
+        except Exception:
+            return
+        original = approval_mod.register_gateway_settle
+        _ORIGINAL_REGISTER_GATEWAY_SETTLE = original
+
+        def _composed_register(session_key: str, request_id: str, settle: Any) -> bool:
+            with approval_mod._lock:
+                for entry in approval_mod._gateway_queues.get(session_key, []):
+                    if entry.data.get("request_id") != request_id:
+                        continue
+                    prior = entry.settle
+                    if prior is None or prior is settle:
+                        entry.settle = settle
+                    else:
+                        entry.settle = Agent365Adapter._chain_gateway_settle_callbacks(
+                            prior, settle
+                        )
+                    return True
+            return False
+
+        approval_mod.register_gateway_settle = _composed_register
+        _SETTLE_REGISTER_PATCHED = True
+
+    def _register_pending_merge_guard(self) -> None:
+        global _MERGE_PENDING_PATCHED, _HERMES_MERGE_PENDING_ORIGINAL
+        import gateway.platforms.base as base_mod
+
+        if not _MERGE_PENDING_PATCHED:
+            original = getattr(base_mod, "merge_pending_message_event", None)
+            if original is None:
+
+                def _default_merge_pending(
+                    pending_messages: dict[str, Any],
+                    session_key: str,
+                    event: Any,
+                    *,
+                    merge_text: bool = False,
+                ) -> None:
+                    pending_messages[session_key] = event
+
+                original = _default_merge_pending
+                base_mod.merge_pending_message_event = original
+            _HERMES_MERGE_PENDING_ORIGINAL = original
+
+            def guarded(
+                pending_messages: dict[str, Any],
+                session_key: str,
+                event: Any,
+                *,
+                merge_text: bool = False,
+            ) -> None:
+                adapter = _PENDING_MERGE_REGISTRY.get(id(pending_messages))
+                if adapter is not None:
+                    adapter._agent365_merge_pending_message_event(
+                        session_key, event, merge_text=merge_text
+                    )
+                    return
+                _HERMES_MERGE_PENDING_ORIGINAL(
+                    pending_messages, session_key, event, merge_text=merge_text
+                )
+
+            base_mod.merge_pending_message_event = guarded
+            _MERGE_PENDING_PATCHED = True
+        pending_messages = getattr(self, "_pending_messages", None)
+        if pending_messages is not None:
+            _PENDING_MERGE_REGISTRY[id(pending_messages)] = self
+
+    def _agent365_merge_pending_message_event(
+        self, session_key: str, event: Any, *, merge_text: bool = False
+    ) -> None:
+        existing = self._pending_messages.get(session_key)
+        if existing is not None and not self._pending_turn_origins_compatible(existing, event):
+            self._pending_origin_overflow.setdefault(session_key, []).append(event)
+            return
+        if _HERMES_MERGE_PENDING_ORIGINAL is None:
+            self._pending_messages[session_key] = event
+            return
+        _HERMES_MERGE_PENDING_ORIGINAL(
+            self._pending_messages, session_key, event, merge_text=merge_text
+        )
+
+    async def _promote_origin_pending_overflow(self, session_key: str) -> None:
+        if session_key in self._active_sessions or session_key in self._pending_messages:
+            return
+        overflow = self._pending_origin_overflow.get(session_key)
+        if not overflow:
+            return
+        next_event = overflow.pop(0)
+        if not overflow:
+            self._pending_origin_overflow.pop(session_key, None)
+        if _HERMES_MERGE_PENDING_ORIGINAL is None:
+            self._pending_messages[session_key] = next_event
+        else:
+            _HERMES_MERGE_PENDING_ORIGINAL(self._pending_messages, session_key, next_event)
+        pending = self._pending_messages.get(session_key)
+        if pending is not None:
+            self._spawn_drain_task(pending, session_key)
+
+    @staticmethod
+    def _exec_approval_request_still_pending(session_key: str, request_id: str) -> bool:
+        if not session_key or not request_id:
+            return False
+        try:
+            from tools.approval import list_gateway_approvals
+        except Exception:
+            return True
+        pending_ids = {
+            str(item.get("request_id") or "") for item in list_gateway_approvals(session_key)
+        }
+        return request_id in pending_ids
+
+    def _register_exec_approval_capability_settle(self, session_key: str, request_id: str) -> None:
+        self._ensure_gateway_settle_compose_patch()
+        try:
+            from tools.approval import register_gateway_settle
+        except Exception:
+            register_gateway_settle = None  # type: ignore[assignment,misc]
+
+        sk = str(session_key or "")
+        rid = str(request_id or "")
+        if not sk or not rid:
+            return
+
+        def _on_settled(_reason: str) -> None:
+            self.invalidate_exec_approval_capabilities(sk, rid)
+
+        try:
+            from tools.approval import observe_gateway_settle as _observe
+        except ImportError:
+            _observe = None
+        except Exception:
+            _observe = None
+        if callable(_observe) and _observe(sk, rid, _on_settled):
+            return
+        if callable(register_gateway_settle) and register_gateway_settle(sk, rid, _on_settled):
+            return
+        self.invalidate_exec_approval_capabilities(sk, rid)
+
     async def handle_message(self, event: Any) -> None:
         if self._event_turn_origin(event) is None:
             logger.warning("agent365 dispatch rejected: admitted event has no turn origin")
@@ -4345,6 +4536,7 @@ class Agent365Adapter(BasePlatformAdapter):
             await super()._process_message_background(event, session_key)
         finally:
             _AGENT_TURN_ORIGIN.reset(origin_token)
+            await self._promote_origin_pending_overflow(session_key)
 
     def _release_agent_turn_admission(self, admission_key: str) -> None:
         if admission_key:
@@ -12568,7 +12760,7 @@ class Agent365Adapter(BasePlatformAdapter):
         conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
         conv_type = str(conv.get("conversationType") or "") if isinstance(conv, dict) else ""
         choices = [("Approve once", "once"), ("Deny", "deny")]
-        if conv_type == "personal" and (allow_session or allow_permanent):
+        if conv_type == "personal" and not smart_denied and (allow_session or allow_permanent):
             if allow_session:
                 choices.insert(1, ("Approve for session", "session"))
             if allow_permanent:
@@ -12589,15 +12781,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
         )
         if result.success:
-            from tools.approval import register_gateway_settle
-
-            sk = str(session_key or "")
-            rid = request_id_value
-
-            def _on_exec_approval_settled(_reason: str) -> None:
-                self.invalidate_exec_approval_capabilities(sk, rid)
-
-            register_gateway_settle(sk, rid, _on_exec_approval_settled)
+            self._register_exec_approval_capability_settle(session_key, request_id_value)
         return result
 
     async def send_slash_confirm(
@@ -12842,6 +13026,13 @@ class Agent365Adapter(BasePlatformAdapter):
             or not user_id
             or cap_user_id != user_id
             or (kind == _CARD_KIND_EXEC_APPROVAL and not exec_request_id)
+            or (
+                kind == _CARD_KIND_EXEC_APPROVAL
+                and not self._exec_approval_request_still_pending(
+                    str(resolver.get("session_key") or ""),
+                    exec_request_id,
+                )
+            )
             or capability.get("tenant_id") != self.tenant_id.lower()
             or capability.get("lifecycle_generation") != self._lifecycle_generation
             or capability.get("chat_generation") != self._chat_generation(conv_id)

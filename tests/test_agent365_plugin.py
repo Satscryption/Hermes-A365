@@ -122,7 +122,7 @@ class _StubBasePlatformAdapter:
         self._fatal: tuple[str, str, bool] | None = None
         self._handled_events: list[Any] = []
         self._message_handler = None
-        self._pending_messages: dict[str, list[Any]] = {}
+        self._pending_messages: dict[str, Any] = {}
         self._background_tasks: set[_asyncio.Task[Any]] = set()
         # Slice 19x-d (#4): mirror real BasePlatformAdapter's in-flight
         # state primitives so prune_conversations() can read
@@ -187,13 +187,14 @@ class _StubBasePlatformAdapter:
         try:
             await self._message_handler(event)
         finally:
-            queue = self._pending_messages.get(session_key) or []
-            if queue:
-                pending_event = queue.pop(0)
-                if not queue:
-                    self._pending_messages.pop(session_key, None)
-                self._spawn_drain_task(pending_event, session_key)
-            else:
+            drained = False
+            queue = self._pending_messages.get(session_key)
+            if queue is not None and session_key not in self._active_sessions:
+                pending_event = self._pending_messages.pop(session_key, None)
+                if pending_event is not None:
+                    self._spawn_drain_task(pending_event, session_key)
+                    drained = True
+            if not drained and session_key not in self._pending_messages:
                 self._cleanup_finished_session_task(session_key)
 
     def _mark_connected(self) -> None:
@@ -211,7 +212,17 @@ class _StubBasePlatformAdapter:
             return
         session_key = self._event_session_key(event)
         if session_key in self._active_sessions:
-            self._pending_messages.setdefault(session_key, []).append(event)
+            try:
+                from gateway.platforms.base import MessageType, merge_pending_message_event
+
+                merge_pending_message_event(
+                    self._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=getattr(event, "message_type", None) == MessageType.TEXT,
+                )
+            except Exception:
+                self._pending_messages[session_key] = event
             return
         self._start_session_processing(event, session_key)
 
@@ -242,7 +253,39 @@ class _StubBasePlatformAdapter:
         return str(p.resolve())
 
 
+_HERMES_BOOTSTRAP_MODULE = "hermes_a365_hermes_bootstrap"
+
+
+def _import_hermes_bootstrap() -> Any:
+    import importlib.util
+
+    cached = sys.modules.get(_HERMES_BOOTSTRAP_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().parent / "_hermes_bootstrap.py"
+    spec = importlib.util.spec_from_file_location(_HERMES_BOOTSTRAP_MODULE, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("hermes bootstrap unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_HERMES_BOOTSTRAP_MODULE] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 def _install_gateway_stubs() -> None:
+    with contextlib.suppress(Exception):
+        _import_hermes_bootstrap().ensure_hermes_vendor()
+    vendor_root = None
+    try:
+        vendor_root = _import_hermes_bootstrap().hermes_vendor_root()
+    except Exception:
+        vendor_root = None
+    if "gateway.platforms.base" in sys.modules:
+        mod = sys.modules["gateway.platforms.base"]
+        if getattr(getattr(mod, "BasePlatformAdapter", None), "__module__", "").startswith(
+            "gateway.platforms"
+        ):
+            return
     if "gateway.platforms.base" in sys.modules:
         return
     gateway = types.ModuleType("gateway")
@@ -279,10 +322,20 @@ def _install_gateway_stubs() -> None:
     sys.modules["gateway.platforms.base"] = base
     sys.modules["gateway.config"] = config
     sys.modules["gateway.session"] = session
+    if vendor_root is not None and vendor_root.is_dir():
+        vendor_gateway = str(vendor_root / "gateway")
+        gateway.__path__ = [vendor_gateway]  # type: ignore[attr-defined]
+        platforms.__path__ = [str(vendor_root / "gateway" / "platforms")]  # type: ignore[attr-defined]
     _install_approval_tools_stub()
 
 
 def _install_approval_tools_stub() -> None:
+    try:
+        import tools.approval
+
+        return
+    except Exception:
+        pass
     if "tools.approval" in sys.modules:
         return
     import threading
@@ -313,6 +366,16 @@ def _install_approval_tools_stub() -> None:
         for callback in ([settle] if settle is not None else []) + observers:
             with contextlib.suppress(Exception):
                 callback(reason)
+
+    def _chain_gateway_settle_callbacks(prior: Any, settle: Any):
+        def _combined(reason: str) -> None:
+            if prior is not None:
+                with contextlib.suppress(Exception):
+                    prior(reason)
+            with contextlib.suppress(Exception):
+                settle(reason)
+
+        return _combined
 
     def enqueue_gateway_approval(session_key: str, request_id: str) -> None:
         with _lock:
@@ -356,7 +419,19 @@ def _install_approval_tools_stub() -> None:
         with _lock:
             for entry in _gateway_queues.get(session_key, []):
                 if entry.data.get("request_id") == request_id:
-                    entry.settle = settle
+                    prior = entry.settle
+                    if prior is None or prior is settle:
+                        entry.settle = settle
+                        return True
+                    entry.settle = _chain_gateway_settle_callbacks(prior, settle)
+                    return True
+        return False
+
+    def observe_gateway_settle(session_key: str, request_id: str, callback: Any) -> bool:
+        with _lock:
+            for entry in _gateway_queues.get(session_key, []):
+                if entry.data.get("request_id") == request_id:
+                    entry.observers.append(callback)
                     return True
         return False
 
@@ -370,12 +445,36 @@ def _install_approval_tools_stub() -> None:
     approval.enqueue_gateway_approval = enqueue_gateway_approval
     approval.resolve_gateway_approval = resolve_gateway_approval
     approval.register_gateway_settle = register_gateway_settle
+    approval.observe_gateway_settle = observe_gateway_settle
     approval.list_gateway_approvals = list_gateway_approvals
     sys.modules["tools.approval"] = approval
     tools.approval = approval
 
 
+def _wire_real_hermes_test_modules() -> None:
+    with contextlib.suppress(Exception):
+        _import_hermes_bootstrap().wire_real_hermes_modules()
+
+
 _install_gateway_stubs()
+_wire_real_hermes_test_modules()
+
+
+def _enqueue_gateway_exec_request(session_key: str, request_id: str) -> None:
+    """Mirror Hermes queue state so exec cards can register settle hooks in integration tests."""
+    try:
+        from tools import approval as approval_mod
+        from tools.approval_gateway_wait import _ApprovalEntry
+    except Exception:
+        approval_mod = sys.modules.get("tools.approval")
+        if approval_mod is None or not hasattr(approval_mod, "enqueue_gateway_approval"):
+            return
+        approval_mod.enqueue_gateway_approval(session_key, request_id)
+        return
+    entry = _ApprovalEntry({"request_id": request_id, "session_key": session_key})
+    with approval_mod._lock:
+        approval_mod._gateway_queues.setdefault(session_key, []).append(entry)
+
 
 agent365 = importlib.import_module("hermes_a365.plugin")
 adapter_mod = importlib.import_module("hermes_a365.plugin.adapter")
@@ -499,6 +598,11 @@ def _seed_card_capability(
         "resolver": resolver,
         "choices": {choice_id: choice},
     }
+    if kind == "exec_approval":
+        request_id = str(resolver.get("request_id") or "")
+        session_key = str(resolver.get("session_key") or "")
+        if request_id and session_key:
+            _enqueue_gateway_exec_request(session_key, request_id)
     return {"hermes_kind": kind, "capability": nonce, "choice_id": choice_id}
 
 
@@ -25500,6 +25604,7 @@ class TestInteractiveCards:
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
+        _enqueue_gateway_exec_request("sess-1", "req-1")
         result = await a.send_exec_approval(
             "conv-1", "rm -rf /tmp/x", "sess-1", metadata={"request_id": "req-1"}
         )
@@ -25556,6 +25661,7 @@ class TestInteractiveCards:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        _enqueue_gateway_exec_request("sess-1", "req-1")
         result = await a.send_exec_approval(
             "conv-1", "danger", "sess-1", metadata={"request_id": "req-1"}
         )
@@ -25918,6 +26024,7 @@ class TestCardCapabilityTurnOrigin:
             await b_posted.wait()
             resolver = MagicMock(return_value=1)
             monkeypatch.setattr(adapter, "_gw_resolve_approval", resolver)
+            _enqueue_gateway_exec_request(session_key, "req-a")
             outcomes["result"] = await adapter.send_exec_approval(
                 self._GROUP_CONV,
                 "danger",
@@ -26049,6 +26156,7 @@ class TestCardCapabilityTurnOrigin:
             monkeypatch.setattr(adapter, "_gw_resolve_approval", exec_resolver)
             monkeypatch.setattr(adapter, "_gw_resolve_slash_confirm", slash_resolver)
             monkeypatch.setattr(adapter, "_gw_resolve_clarify", clarify_resolver)
+            _enqueue_gateway_exec_request(session_key, "req-b-exec")
             b_cards["exec"] = await adapter.send_exec_approval(
                 self._GROUP_CONV,
                 "danger",
@@ -26096,6 +26204,19 @@ class TestCardCapabilityTurnOrigin:
             b_posted.set()
             release_a.set()
             await a_task
+
+            if not group_sessions_per_user:
+                for _ in range(12):
+                    if b_done.is_set():
+                        break
+                    for sk in list(adapter._pending_messages.keys()):
+                        pending = adapter._pending_messages.pop(sk, None)
+                        if pending is not None:
+                            await adapter._process_message_background(pending, sk)
+                    for sk in list(adapter._pending_origin_overflow.keys()):
+                        await adapter._promote_origin_pending_overflow(sk)
+                    await asyncio.sleep(0)
+
             await asyncio.wait_for(b_done.wait(), timeout=2.0)
 
         for label in ("exec", "slash", "clarify"):
@@ -26168,6 +26289,7 @@ class TestCardCapabilityTurnOrigin:
             monkeypatch.setattr(adapter, resolver_attr, resolver)
             sender = getattr(adapter, send_method)
             if send_method == "send_exec_approval":
+                _enqueue_gateway_exec_request(session_key, "req-a")
                 result = await sender(
                     self._GROUP_CONV,
                     "danger",
@@ -26246,6 +26368,7 @@ class TestCardCapabilityTurnOrigin:
         async def gateway_message_handler(event: Any) -> None:
             session_key = adapter._session_key_for(event)
             assert session_key is not None
+            _enqueue_gateway_exec_request(session_key, "req-owner")
             outcomes["result"] = await adapter.send_exec_approval(
                 conv,
                 "danger",
@@ -26339,7 +26462,7 @@ class TestCardCapabilityTurnOrigin:
     async def test_stale_exec_card_after_settle_does_not_resolve_later_pending(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.approval import enqueue_gateway_approval, list_gateway_approvals
+        from tools.approval import list_gateway_approvals
 
         adapter = _make_adapter(monkeypatch, group_sessions_per_user=False)
         cards = TestInteractiveCards()
@@ -26348,7 +26471,7 @@ class TestCardCapabilityTurnOrigin:
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
         session_key = "sess-1"
-        enqueue_gateway_approval(session_key, "req-a")
+        _enqueue_gateway_exec_request(session_key, "req-a")
         result_a = await adapter.send_exec_approval(
             "conv-1",
             "danger",
@@ -26361,7 +26484,7 @@ class TestCardCapabilityTurnOrigin:
         ]
         assert adapter._gw_resolve_approval(session_key, "once", request_id="req-a") == 1
         assert adapter._card_capabilities == {}
-        enqueue_gateway_approval(session_key, "req-b")
+        _enqueue_gateway_exec_request(session_key, "req-b")
         token = adapter_mod._AGENT_TURN_ORIGIN.set(
             adapter._turn_origin_from_activity(_make_inbound(), session_key)
         )
@@ -26384,12 +26507,12 @@ class TestCardCapabilityTurnOrigin:
     async def test_exec_card_resolve_targets_single_pending_request(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        from tools.approval import enqueue_gateway_approval, list_gateway_approvals
+        from tools.approval import list_gateway_approvals
 
         adapter = _make_adapter(monkeypatch)
         session_key = "sess-shared"
-        enqueue_gateway_approval(session_key, "req-one")
-        enqueue_gateway_approval(session_key, "req-two")
+        _enqueue_gateway_exec_request(session_key, "req-one")
+        _enqueue_gateway_exec_request(session_key, "req-two")
         assert adapter._gw_resolve_approval(session_key, "once", request_id="req-one") == 1
         remaining = [item["request_id"] for item in list_gateway_approvals(session_key)]
         assert remaining == ["req-two"]
