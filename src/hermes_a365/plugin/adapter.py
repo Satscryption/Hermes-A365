@@ -2073,8 +2073,6 @@ class Agent365Adapter(BasePlatformAdapter):
         # also keeps chats with a live card capability or an open-ended
         # clarify, independent of the session guard.
         self._session_key_to_conv: dict[str, str] = {}
-        self._turn_event_queues: dict[str, list[Any]] = {}
-        self._turn_queue_active: set[str] = set()
         self._agent_turn_guards: dict[str, asyncio.Event] = {}
         self._agent_turn_admissions: dict[str, asyncio.Task[Any]] = {}
         self._media_leases_by_session: dict[str, set[Path]] = {}
@@ -3881,8 +3879,6 @@ class Agent365Adapter(BasePlatformAdapter):
         self._file_consent_decline_notified.clear()
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
-        self._turn_event_queues.clear()
-        self._turn_queue_active.clear()
         self._agent_turn_guards.clear()
         self._session_key_to_conv.clear()
         self._chat_teardown_tasks.clear()
@@ -4331,45 +4327,24 @@ class Agent365Adapter(BasePlatformAdapter):
         }
 
     async def handle_message(self, event: Any) -> None:
-        origin = self._event_turn_origin(event)
-        if origin is None:
+        if self._event_turn_origin(event) is None:
             logger.warning("agent365 dispatch rejected: admitted event has no turn origin")
             return
-        session_key = str(origin.get("session_key") or "")
-        if not session_key:
-            logger.warning("agent365 dispatch rejected: turn origin missing session key")
-            return
-        if session_key in self._turn_queue_active:
-            self._turn_event_queues.setdefault(session_key, []).append(event)
-            return
-        await self._drain_turn_events(session_key, event)
+        await super().handle_message(event)
 
-    async def _drain_turn_events(self, session_key: str, first_event: Any) -> None:
-        self._turn_queue_active.add(session_key)
+    async def _process_message_background(self, event: Any, session_key: str) -> None:
+        origin = self._event_turn_origin(event)
+        if origin is None:
+            logger.warning(
+                "agent365 turn skipped: missing turn origin session_key=%r",
+                session_key,
+            )
+            return
+        origin_token = _AGENT_TURN_ORIGIN.set(origin)
         try:
-            pending: list[Any] = [first_event]
-            while pending:
-                event = pending.pop(0)
-                origin = self._event_turn_origin(event)
-                if origin is None:
-                    logger.warning(
-                        "agent365 queued turn skipped: missing turn origin session_key=%r",
-                        session_key,
-                    )
-                    pending[0:0] = self._turn_event_queues.pop(session_key, [])
-                    continue
-                origin_token = _AGENT_TURN_ORIGIN.set(origin)
-                try:
-                    await super().handle_message(event)
-                    hook = getattr(self, "process_admitted_event", None)
-                    if hook is not None:
-                        await hook(event)
-                finally:
-                    _AGENT_TURN_ORIGIN.reset(origin_token)
-                # Follow-ups may enqueue while this event runs; drain them before exiting.
-                pending[0:0] = self._turn_event_queues.pop(session_key, [])
+            await super()._process_message_background(event, session_key)
         finally:
-            self._turn_queue_active.discard(session_key)
+            _AGENT_TURN_ORIGIN.reset(origin_token)
 
     def _release_agent_turn_admission(self, admission_key: str) -> None:
         if admission_key:
@@ -12570,42 +12545,60 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id: str,
         command: str,
         session_key: str,
-        description: str = "dangerous command",
+        description: str | None = None,
         metadata: dict[str, Any] | None = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+        request_id: str | None = None,
     ) -> SendResult:
         """#77: dangerous-command Approve/Deny as an Adaptive Card. ``command`` is
         already credential-redacted gateway-side. On click the route resolves via
-        ``tools.approval.resolve_gateway_approval(session_key, choice, request_id)``."""
-        request_id = str((metadata or {}).get("request_id") or "")
-        if not request_id:
+        ``tools.approval.resolve_gateway_approval`` with an explicit ``request_id``."""
+        request_id_value = str(request_id or (metadata or {}).get("request_id") or "")
+        if not request_id_value:
             return SendResult(
                 success=False,
                 error="agent365 exec_approval: missing request_id",
             )
+        if description is None:
+            description = "dangerous command"
         text = f"**Approval required** — {description}\n\n`{command}`"
         inbound = self._cached_inbound_for(chat_id) or {}
         conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
         conv_type = str(conv.get("conversationType") or "") if isinstance(conv, dict) else ""
         choices = [("Approve once", "once"), ("Deny", "deny")]
-        if conv_type == "personal":
-            choices[1:1] = [
-                ("Approve for session", "session"),
-                ("Always allow", "always"),
-            ]
+        if conv_type == "personal" and (allow_session or allow_permanent):
+            if allow_session:
+                choices.insert(1, ("Approve for session", "session"))
+            if allow_permanent:
+                insert_at = 2 if allow_session else 1
+                choices.insert(insert_at, ("Always allow", "always"))
         actions = self._mint_card_capability_actions(
             chat_id,
             _CARD_KIND_EXEC_APPROVAL,
             choices,
-            {"session_key": session_key, "request_id": request_id},
+            {"session_key": session_key, "request_id": request_id_value},
         )
         if not actions:
             return SendResult(
                 success=False,
                 error="agent365 exec_approval: card capability unavailable",
             )
-        return await self._send_card(
+        result = await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
         )
+        if result.success:
+            from tools.approval import register_gateway_settle
+
+            sk = str(session_key or "")
+            rid = request_id_value
+
+            def _on_exec_approval_settled(_reason: str) -> None:
+                self.invalidate_exec_approval_capabilities(sk, rid)
+
+            register_gateway_settle(sk, rid, _on_exec_approval_settled)
+        return result
 
     async def send_slash_confirm(
         self,
@@ -12763,11 +12756,28 @@ class Agent365Adapter(BasePlatformAdapter):
     # Gateway resolver seams — lazily import the gateway ``tools`` package (only
     # importable inside the gateway process at runtime; monkeypatched in tests).
 
-    @staticmethod
-    def _gw_resolve_approval(session_key: str, choice: str, request_id: str) -> int:
+    def _gw_resolve_approval(
+        self,
+        session_key: str,
+        choice: str,
+        *,
+        request_id: str,
+        reason: str | None = None,
+    ) -> int:
         from tools.approval import resolve_gateway_approval
 
-        return resolve_gateway_approval(session_key, choice, request_id)
+        if not str(request_id or ""):
+            return 0
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=False,
+            reason=reason,
+            request_id=str(request_id),
+        )
+        if count:
+            self.invalidate_exec_approval_capabilities(session_key, str(request_id))
+        return count
 
     def invalidate_exec_approval_capabilities(self, session_key: str, request_id: str) -> None:
         target_key = str(session_key or "")
@@ -12858,7 +12868,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._gw_resolve_approval(
                     str(resolver.get("session_key") or ""),
                     choice,
-                    exec_request_id,
+                    request_id=exec_request_id,
                 )
             elif kind == _CARD_KIND_SLASH_CONFIRM:
                 follow = await self._gw_resolve_slash_confirm(
