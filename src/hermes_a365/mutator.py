@@ -30,15 +30,17 @@ exit when one is found.
 
 from __future__ import annotations
 
+import json
 import os
+import queue
 import re
-import select
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Literal, Protocol
 
 # Verified in references/a365-cli-reference.md; only .NET ships.
 A365_CLI_BINARY = "a365"
@@ -80,6 +82,8 @@ class CliInvocationError(RuntimeError):
         output: str,
         *,
         captured_output: str | None = None,
+        sensitive: bool = False,
+        graph_error: tuple[str, str] | None = None,
     ) -> None:
         super().__init__(
             f"{argv[0]} {argv[1] if len(argv) > 1 else ''} failed (rc={returncode}): {output}"
@@ -87,10 +91,12 @@ class CliInvocationError(RuntimeError):
         self.argv = argv
         self.returncode = returncode
         self.output = output
-        # Sensitive failures keep the raw body off ``str(self)`` so callers
-        # that print the exception do not echo it. Parsers that redact first
-        # may read ``captured_output``.
-        self.captured_output = output if captured_output is None else captured_output
+        self.sensitive = sensitive
+        self.graph_error = graph_error if sensitive else None
+        if sensitive:
+            self.captured_output = None
+        else:
+            self.captured_output = output if captured_output is None else captured_output
 
 
 # ---------------------------------------------------------------------------
@@ -178,31 +184,44 @@ class A365CliMutator:
     ) -> RunResult:
         if not self.available:
             raise CliInvocationError(argv, -1, f"{A365_CLI_BINARY} not on PATH")
+        timed_out = False
+        combined = ""
         if sensitive:
             try:
-                returncode, combined = _run_captured(
+                returncode, combined = _run_sensitive_streaming(
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
             except subprocess.TimeoutExpired:
-                # Drop the captured partial output — it may hold the secret.
-                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout) from None
+                timed_out = True
         else:
-            returncode, combined = _run_streaming(
-                argv, timeout=timeout, stdin_input=stdin_input
-            )
+            try:
+                returncode, combined = _run_streaming(
+                    argv, timeout=timeout, stdin_input=stdin_input
+                )
+            except subprocess.TimeoutExpired:
+                timed_out = True
+        if timed_out:
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
         if returncode != 0:
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
-            # Sensitive runs never surface raw output in exceptions —
-            # callers print those messages (#111 / CS-003).
-            detail = _SENSITIVE_OUTPUT_SUPPRESSED if sensitive else stripped
+            detail = _sensitive_failure_detail(stripped) if sensitive else stripped
+            graph_error = _extract_sensitive_graph_error(stripped) if sensitive else None
             if match:
-                raise AADSTSError(match.group(0), detail)
+                code = match.group(0)
+                match = None
+                stripped = ""
+                combined = ""
+                raise AADSTSError(code, detail)
+            match = None
+            stripped = ""
+            combined = ""
             raise CliInvocationError(
                 argv,
                 returncode,
                 detail,
-                captured_output=stripped if sensitive else None,
+                sensitive=sensitive,
+                graph_error=graph_error,
             )
         return RunResult(
             argv=list(argv),
@@ -213,42 +232,308 @@ class A365CliMutator:
 
 
 # ---------------------------------------------------------------------------
-# Subprocess helpers — streaming (default) and captured (sensitive)
+# Subprocess helpers — streaming (default) and sensitive device-login echo
 # ---------------------------------------------------------------------------
 
-_SENSITIVE_OUTPUT_SUPPRESSED = (
-    "<output suppressed: sensitive command may emit credential material>"
+_SENSITIVE_OUTPUT_SUPPRESSED = "<output suppressed: sensitive command may emit credential material>"
+
+_READ_CHUNK_BYTES = 4096
+
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?0-9;]*[ -/]*[@-~]")
+
+_DEVICE_LOGIN_LINE_RE = re.compile(
+    r"^To sign in, use a web browser to open (?:the page )?"
+    r"(?P<url>https://login\.microsoft\.com/device|https://microsoft\.com/devicelogin)"
+    r" and enter the code "
+    r"(?P<code>[A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{8}|[A-Z0-9]{9})"
+    r"(?: to authenticate)?\.?\s*$",
+    re.IGNORECASE | re.ASCII,
 )
 
+_SENSITIVE_GRAPH_ERROR_CODES = frozenset(
+    {
+        "Request_ResourceNotFound",
+        "ResourceNotFound",
+        "ErrorItemNotFound",
+        "itemNotFound",
+        "Authorization_RequestDenied",
+        "AccessDenied",
+        "Forbidden",
+        "InsufficientPrivileges",
+    }
+)
+_SENSITIVE_GRAPH_SAFE_MESSAGES: dict[str, str] = {
+    "Request_ResourceNotFound": "The requested resource does not exist.",
+    "ResourceNotFound": "The requested resource does not exist.",
+    "ErrorItemNotFound": "The requested resource does not exist.",
+    "itemNotFound": "The requested resource does not exist.",
+    "Authorization_RequestDenied": "Insufficient privileges to complete the operation.",
+    "AccessDenied": "Access was denied.",
+    "Forbidden": "Access was denied.",
+    "InsufficientPrivileges": "Insufficient privileges to complete the operation.",
+}
+_GRAPH_ERROR_CODE_ID_RE = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,127}$")
 
-def _run_captured(
+_CANONICAL_URLS = {
+    "https://login.microsoft.com/device": "https://login.microsoft.com/device",
+    "https://microsoft.com/devicelogin": "https://microsoft.com/devicelogin",
+}
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_ESCAPE_RE.sub("", text)
+
+
+def _line_content(line: str) -> str:
+    """Strip terminators; keep interior text for matching."""
+    return _strip_ansi(line).rstrip("\r\n")
+
+
+def _parse_device_login_line(line: str, *, eof: bool = False) -> tuple[str, str] | None:
+    """Return canonical URL and user code for one complete device-login line."""
+    if not eof and not line.endswith(("\n", "\r")):
+        return None
+    content = _line_content(line)
+    if not content:
+        return None
+    if any(ch in content for ch in ('"', "'", "{", "}", "[", "]")):
+        return None
+    match = _DEVICE_LOGIN_LINE_RE.match(content)
+    if not match:
+        return None
+    url = match.group("url")
+    canonical = _CANONICAL_URLS.get(url.lower())
+    if canonical is None:
+        return None
+    code = match.group("code").upper()
+    return canonical, code
+
+
+def _emit_device_login(url: str, code: str, *, emitted: set[tuple[str, str]]) -> None:
+    key = (url, code)
+    if key in emitted:
+        return
+    emitted.add(key)
+    sys.stdout.write(f"To sign in, open {url} and enter the code {code}.\n")
+    sys.stdout.flush()
+
+
+def _try_emit_device_login_line(
+    line: str, *, emitted: set[tuple[str, str]], eof: bool = False
+) -> None:
+    parsed = _parse_device_login_line(line, eof=eof)
+    if parsed is not None:
+        _emit_device_login(parsed[0], parsed[1], emitted=emitted)
+
+
+def _optional_safe_failure_tail(text: str) -> str | None:
+    """Return a short operator-safe suffix, or ``None`` when unsure."""
+    _ = text
+    return None
+
+
+def _sensitive_failure_detail(stripped: str) -> str:
+    tail = _optional_safe_failure_tail(stripped)
+    if tail:
+        return f"{_SENSITIVE_OUTPUT_SUPPRESSED} ({tail})"
+    return _SENSITIVE_OUTPUT_SUPPRESSED
+
+
+def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
+    """Pull an allowlisted Graph ``error.code`` and a fixed safe message from captured text."""
+    start = text.find("{")
+    if start < 0:
+        return None
+    try:
+        data, _end = json.JSONDecoder().raw_decode(text[start:])
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(data, dict):
+        return None
+    error = data.get("error")
+    if not isinstance(error, dict):
+        return None
+    code_raw = error.get("code")
+    if not isinstance(code_raw, str):
+        return None
+    code = code_raw.strip()
+    if code not in _SENSITIVE_GRAPH_ERROR_CODES:
+        return None
+    if not _GRAPH_ERROR_CODE_ID_RE.match(code):
+        return None
+    safe_message = _SENSITIVE_GRAPH_SAFE_MESSAGES.get(code)
+    if safe_message is None:
+        return None
+    return code, safe_message
+
+
+@dataclass
+class _LineBuffer:
+    pending: str = ""
+
+    def feed(self, chunk: bytes) -> list[str]:
+        self.pending += chunk.decode("utf-8", errors="replace")
+        lines: list[str] = []
+        while True:
+            split_at = -1
+            split_len = 0
+            for sep in ("\r\n", "\n", "\r"):
+                idx = self.pending.find(sep)
+                if idx >= 0 and (split_at < 0 or idx < split_at):
+                    split_at = idx
+                    split_len = len(sep)
+            if split_at < 0:
+                break
+            lines.append(self.pending[: split_at + split_len])
+            self.pending = self.pending[split_at + split_len :]
+        return lines
+
+
+def _pump_stream(fd: int, name: str, out_q: queue.Queue[tuple[str, bytes | None]]) -> None:
+    try:
+        while True:
+            try:
+                chunk = os.read(fd, _READ_CHUNK_BYTES)
+            except OSError:
+                break
+            if not chunk:
+                break
+            out_q.put((name, chunk))
+    finally:
+        out_q.put((name, None))
+
+
+def _run_pumped_output(
+    proc: subprocess.Popen[bytes],
+    *,
+    argv: list[str],
+    timeout: float,
+    streams: tuple[str, ...],
+    echo: Literal["all", "device_login"],
+) -> tuple[int, str]:
+    assert proc.stdout is not None
+    out_q: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
+    fds: list[tuple[int, str]] = [(proc.stdout.fileno(), "stdout")]
+    if proc.stderr is not None:
+        fds.append((proc.stderr.fileno(), "stderr"))
+    threads = [
+        threading.Thread(target=_pump_stream, args=(fd, name, out_q), daemon=True)
+        for fd, name in fds
+    ]
+    for thread in threads:
+        thread.start()
+
+    buffers = {name: _LineBuffer() for name in streams}
+    eof_seen = {name: False for name in streams}
+    emitted_logins: set[tuple[str, str]] = set()
+    captured: list[str] = []
+    deadline = time.monotonic() + timeout
+
+    def _handle_complete_line(line: str) -> None:
+        captured.append(line)
+        if echo == "all":
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        elif echo == "device_login":
+            _try_emit_device_login_line(line, emitted=emitted_logins, eof=False)
+
+    def _flush_eof_tail(name: str) -> None:
+        buffer = buffers[name]
+        if not buffer.pending:
+            return
+        tail = buffer.pending
+        buffer.pending = ""
+        captured.append(tail)
+        if echo == "all":
+            sys.stdout.write(tail)
+            sys.stdout.flush()
+        elif echo == "device_login":
+            _try_emit_device_login_line(tail, emitted=emitted_logins, eof=True)
+
+    def _drain_chunk(name: str, chunk: bytes) -> None:
+        for line in buffers[name].feed(chunk):
+            _handle_complete_line(line)
+
+    def _process_queue_item(name: str, payload: bytes | None) -> None:
+        if payload is None:
+            eof_seen[name] = True
+            _flush_eof_tail(name)
+            return
+        _drain_chunk(name, payload)
+
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            proc.kill()
+            proc.wait(timeout=5)
+            captured.clear()
+            for buffer in buffers.values():
+                buffer.pending = ""
+            payload = None
+            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+        try:
+            name, payload = out_q.get(timeout=min(0.05, max(remaining, 0.0)))
+        except queue.Empty:
+            if proc.poll() is not None and all(eof_seen[s] for s in streams):
+                while True:
+                    try:
+                        name, payload = out_q.get_nowait()
+                    except queue.Empty:
+                        break
+                    _process_queue_item(name, payload)
+                break
+            continue
+        _process_queue_item(name, payload)
+        if all(eof_seen[s] for s in streams) and out_q.empty() and proc.poll() is not None:
+            break
+
+    proc.wait(timeout=5)
+    proc.stdout.close()
+    if proc.stderr is not None:
+        proc.stderr.close()
+    for thread in threads:
+        thread.join(timeout=1.0)
+    return proc.returncode or 0, "".join(captured)
+
+
+def _run_child_output(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdin_input: str | None,
+    echo: Literal["all", "device_login"],
+    merge_stderr: bool,
+) -> tuple[int, str]:
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if stdin_input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
+    )
+    if stdin_input is not None:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(stdin_input.encode("utf-8"))
+        finally:
+            proc.stdin.close()
+    streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
+    return _run_pumped_output(proc, argv=argv, timeout=timeout, streams=streams, echo=echo)
+
+
+def _run_sensitive_streaming(
     argv: list[str],
     *,
     timeout: float,
     stdin_input: str | None = None,
 ) -> tuple[int, str]:
-    """Run ``argv`` to completion with output captured, never echoed.
-
-    Secret-aware sibling of :func:`_run_streaming` (#111 / CS-003): the
-    child's merged stdout/stderr goes only into the returned string —
-    nothing is written to the parent's stdout — so credential material
-    in the command output (e.g. ``az ad app credential reset -o json``)
-    can't land in terminals, CI logs, or session transcripts.
-
-    Trade-off: interactive prompts from the child are invisible, so this
-    path is only for non-interactive commands (the recovery path runs
-    against an already-cached ``az login``).
-    """
-    completed = subprocess.run(
+    return _run_child_output(
         argv,
-        input=stdin_input,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
         timeout=timeout,
-        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
+        stdin_input=stdin_input,
+        echo="device_login",
+        merge_stderr=False,
     )
-    return completed.returncode, completed.stdout or ""
 
 
 def _run_streaming(
@@ -260,75 +545,19 @@ def _run_streaming(
     """Run ``argv`` to completion, streaming combined output to ``sys.stdout``.
 
     Returns ``(returncode, combined_output)``. Raises
-    :class:`subprocess.TimeoutExpired` if the wall-clock deadline is hit
-    (the partial captured output goes into ``output``).
+    :class:`subprocess.TimeoutExpired` without captured output when the
+    wall-clock deadline is hit.
 
-    Behaviour:
-
-    - ``stderr=STDOUT`` so chronological order is preserved across the
-      merged stream (a CLI that prints progress on stdout and warnings
-      on stderr would otherwise interleave incoherently).
-    - Lines are written to ``sys.stdout`` as they arrive — the operator
-      sees device-code prompts and CLI progress in real time.
-    - When ``stdin_input`` is provided, the subprocess gets a piped stdin
-      pre-fed with that string (then closed). Slice 18w added this so
-      ``cleanup`` can answer the GA CLI's "Continue with X cleanup?
-      (y/N):" prompts that ``-y`` on the parent doesn't actually
-      suppress for subcommands. Default is ``stdin=None`` (inherit
-      parent stdin), which preserves the device-code-prompt behaviour
-      slice 18j relied on for ``setup`` flows.
-    - The captured copy is returned for AADSTS detection in :meth:`run`.
-
-    Tests patch this helper directly rather than reaching into Popen.
+    Child stderr is merged into stdout so interleaved CLI progress keeps
+    chronological order in the captured stream.
     """
-    proc = subprocess.Popen(
+    return _run_child_output(
         argv,
-        stdin=subprocess.PIPE if stdin_input is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT,
-        text=True,
-        bufsize=1,
-        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
+        timeout=timeout,
+        stdin_input=stdin_input,
+        echo="all",
+        merge_stderr=True,
     )
-    if stdin_input is not None:
-        assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_input)
-        finally:
-            proc.stdin.close()
-    assert proc.stdout is not None  # for type checkers; guaranteed by stdout=PIPE
-    buf: list[str] = []
-    deadline = time.monotonic() + timeout
-    try:
-        while True:
-            now = time.monotonic()
-            remaining = deadline - now
-            if remaining <= 0:
-                proc.kill()
-                proc.wait(timeout=5)
-                raise subprocess.TimeoutExpired(
-                    cmd=argv, timeout=timeout, output="".join(buf)
-                )
-            ready, _, _ = select.select([proc.stdout], [], [], min(1.0, remaining))
-            if ready:
-                line = proc.stdout.readline()
-                if not line:
-                    break  # EOF
-                buf.append(line)
-                sys.stdout.write(line)
-                sys.stdout.flush()
-            elif proc.poll() is not None:
-                tail = proc.stdout.read()
-                if tail:
-                    buf.append(tail)
-                    sys.stdout.write(tail)
-                    sys.stdout.flush()
-                break
-    finally:
-        if proc.stdout is not None:
-            proc.stdout.close()
-    proc.wait(timeout=5)
-    return proc.returncode, "".join(buf)
 
 
 def get_mutator() -> Mutator:
