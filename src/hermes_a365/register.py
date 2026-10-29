@@ -268,9 +268,7 @@ def build_register_plan(
         by_name = {step.name: step for step in steps}
         unknown = [name for name in step_names if name not in by_name]
         if unknown:
-            raise RegisterError(
-                f"register plan has no step(s) {unknown}; refusing to invent argv."
-            )
+            raise RegisterError(f"register plan has no step(s) {unknown}; refusing to invent argv.")
         steps = [by_name[name] for name in step_names]
     return RegisterPlan(inputs=inputs, steps=steps, reconciliation=reconciliation)
 
@@ -297,6 +295,7 @@ def _run_with_license_retry(
     retries: int,
     backoff: float,
     sleep_fn: Callable[[float], None],
+    sensitive: bool = False,
 ) -> RunResult:
     """Run ``argv``; on AADSTS500011, sleep and retry up to ``retries`` times.
 
@@ -305,7 +304,7 @@ def _run_with_license_retry(
     last: AADSTSError | None = None
     for attempt in range(retries + 1):
         try:
-            return mutator.run(argv)
+            return mutator.run(argv, sensitive=sensitive)
         except AADSTSError as e:
             if e.code != AADSTS_LICENSE_NOT_PROPAGATED:
                 raise
@@ -468,6 +467,7 @@ def apply_register_plan(
                 retries=retries,
                 backoff=backoff,
                 sleep_fn=sleep_fn,
+                sensitive=step.name == "blueprint",
             )
         except AADSTSError as e:
             if e.code == AADSTS_CONSENT_REQUIRED:
@@ -489,8 +489,7 @@ def apply_register_plan(
                     graph_get=getter,
                     hermes_home=home,
                     agent_name=plan.inputs.agent_name,
-                    generated_config_path=generated_config_path
-                    or Path(GENERATED_CONFIG_FILENAME),
+                    generated_config_path=generated_config_path or Path(GENERATED_CONFIG_FILENAME),
                 )
             )
 
@@ -617,9 +616,7 @@ def _extract_first_json_object(text: str) -> dict[str, Any] | None:
     return obj if isinstance(obj, dict) else None
 
 
-def _build_recovery_argv(
-    blueprint_app_id: str, display_name: str, *, years: int = 2
-) -> list[str]:
+def _build_recovery_argv(blueprint_app_id: str, display_name: str, *, years: int = 2) -> list[str]:
     """The exact `az ad app credential reset` argv we run + suggest."""
     return [
         "az",
@@ -680,9 +677,7 @@ def auto_recover_secret(
         return outcome
 
     try:
-        app_run = mutator.run(
-            ["az", "ad", "app", "show", "--id", blueprint_app_id, "-o", "json"]
-        )
+        app_run = mutator.run(["az", "ad", "app", "show", "--id", blueprint_app_id, "-o", "json"])
     except CliInvocationError as exc:
         outcome.messages.append(f"[recover] could not verify the target Entra app: {exc}")
         return outcome
@@ -708,8 +703,7 @@ def auto_recover_secret(
         run = mutator.run(argv, sensitive=True)
     except CliInvocationError as e:
         outcome.messages.append(
-            f"[recover] `az ad app credential reset` failed: {e}; "
-            f"recover by hand: {paste_cmd}"
+            f"[recover] `az ad app credential reset` failed: {e}; recover by hand: {paste_cmd}"
         )
         return outcome
 
@@ -717,8 +711,7 @@ def auto_recover_secret(
     new_secret = payload.get("password") if isinstance(payload, dict) else None
     if not isinstance(new_secret, str) or not new_secret:
         outcome.messages.append(
-            f"[recover] `az` returned no `.password` field; "
-            f"recover by hand: {paste_cmd}"
+            f"[recover] `az` returned no `.password` field; recover by hand: {paste_cmd}"
         )
         return outcome
 
@@ -757,9 +750,7 @@ def auto_recover_secret(
     return outcome
 
 
-def report_missing_secret_warning(
-    blueprint_app_id: str, generated_config_path: Path
-) -> str:
+def report_missing_secret_warning(blueprint_app_id: str, generated_config_path: Path) -> str:
     """Operator-facing warning when detection fires without auto-recovery.
 
     Carries the exact paste-ready commands, mirroring the operator tone
@@ -915,9 +906,7 @@ def run(args: argparse.Namespace) -> int:
         # else the operator env's A365_TENANT_ID) so every `a365 setup *` step
         # carries --tenant-id and apply asserts the session matches.
         hermes_home = Path(os.path.expanduser(os.environ.get("HERMES_HOME") or "~/.hermes"))
-        pinned_tenant, _tenant_source = resolve_expected_tenant(
-            hermes_home, args.tenant_id
-        )
+        pinned_tenant, _tenant_source = resolve_expected_tenant(hermes_home, args.tenant_id)
         inputs = RegisterInputs(
             agent_name=args.agent_name,
             tenant_id=pinned_tenant,
@@ -1008,9 +997,7 @@ def run(args: argparse.Namespace) -> int:
                 )
                 sys.stdout.write("\n" + "\n".join(outcome.messages) + "\n")
             else:
-                sys.stdout.write(
-                    "\n" + report_missing_secret_warning(bp_id, generated_path) + "\n"
-                )
+                sys.stdout.write("\n" + report_missing_secret_warning(bp_id, generated_path) + "\n")
 
     if result.consent_deferred:
         sys.stdout.write(

@@ -616,6 +616,9 @@ def graph_get_from_mutator(mutator: Mutator) -> GraphGet:
                 sensitive=True,
             )
         except CliInvocationError as exc:
+            if exc.graph_error is not None:
+                code, message = exc.graph_error
+                return {"error": {"code": code, "message": message}}
             raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
             parsed = _parse_graph_json(raw)
             if parsed is not None:

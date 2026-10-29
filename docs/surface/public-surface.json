@@ -1,0 +1,2265 @@
+{
+  "a365_config_fields": [
+    "tenantId",
+    "clientAppId",
+    "subscriptionId",
+    "resourceGroup",
+    "location",
+    "environment",
+    "appServicePlanName",
+    "appServicePlanSku",
+    "webAppName",
+    "agentIdentityDisplayName",
+    "agentBlueprintDisplayName",
+    "agentUserPrincipalName",
+    "agentUserDisplayName",
+    "managerEmail",
+    "agentUserUsageLocation",
+    "deploymentProjectPath",
+    "agentDescription"
+  ],
+  "adapter_members_live": [
+    "build_app",
+    "connect",
+    "disconnect",
+    "edit_message",
+    "get_chat_info",
+    "message_len_fn",
+    "name",
+    "on_processing_complete",
+    "on_processing_start",
+    "prune_conversations",
+    "send",
+    "send_clarify",
+    "send_document",
+    "send_exec_approval",
+    "send_image",
+    "send_image_file",
+    "send_or_update_status",
+    "send_private_notice",
+    "send_slash_confirm",
+    "send_typing",
+    "streaming_overflow_limit"
+  ],
+  "adapter_public_members": [
+    "build_app",
+    "connect",
+    "disconnect",
+    "edit_message",
+    "get_chat_info",
+    "message_len_fn",
+    "name",
+    "on_processing_complete",
+    "on_processing_start",
+    "prune_conversations",
+    "send",
+    "send_clarify",
+    "send_document",
+    "send_exec_approval",
+    "send_image",
+    "send_image_file",
+    "send_or_update_status",
+    "send_private_notice",
+    "send_slash_confirm",
+    "send_typing",
+    "streaming_overflow_limit"
+  ],
+  "cli": {
+    "plugin": {
+      "actions": [],
+      "subparsers": {
+        "activity-bridge": {
+          "actions": [],
+          "subparsers": {
+            "serve": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "host",
+                  "option_strings": [
+                    "--host"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_jwt_validation",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--no-jwt-validation"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "port",
+                  "option_strings": [
+                    "--port"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "webhook",
+                  "option_strings": [
+                    "--webhook"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_m365",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--no-m365"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "human",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--human"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": true
+        },
+        "bot-service": {
+          "actions": [],
+          "subparsers": {
+            "cleanup": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm",
+                  "option_strings": [
+                    "--confirm"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "purge_resource_group",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--purge-resource-group"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "create": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "app_id",
+                  "option_strings": [
+                    "--appid",
+                    "--bf-app-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "bot_name",
+                  "option_strings": [
+                    "--bot-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "endpoint",
+                  "option_strings": [
+                    "--endpoint"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "region",
+                  "option_strings": [
+                    "--region"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "resource_group",
+                  "option_strings": [
+                    "--resource-group"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sku",
+                  "option_strings": [
+                    "--sku"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "subscription_id",
+                  "option_strings": [
+                    "--subscription-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "enable-channel": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "choices": [
+                    "msteams"
+                  ],
+                  "dest": "channel",
+                  "option_strings": [
+                    "--channel"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "directline_probe",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--directline-probe"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
+        },
+        "cleanup": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "apply",
+              "nargs": 0,
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm",
+              "option_strings": [
+                "--confirm"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_bot_target",
+              "option_strings": [
+                "--confirm-bot-target"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_legacy_binding",
+              "option_strings": [
+                "--confirm-legacy-binding"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan",
+              "option_strings": [
+                "--confirm-orphan"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan_user",
+              "option_strings": [
+                "--confirm-orphan-user"
+              ],
+              "required": false
+            },
+            {
+              "dest": "kinds",
+              "option_strings": [
+                "--kinds"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_instance_id",
+              "option_strings": [
+                "--orphan-instance-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_user_id",
+              "option_strings": [
+                "--orphan-user-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "purge_orphans",
+              "nargs": 0,
+              "option_strings": [
+                "--purge-orphans"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "consent": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "nargs": "?",
+              "option_strings": [],
+              "required": false
+            },
+            {
+              "dest": "interval",
+              "option_strings": [
+                "--interval"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_open",
+              "nargs": 0,
+              "option_strings": [
+                "--no-open"
+              ],
+              "required": false
+            },
+            {
+              "dest": "print_url_only",
+              "nargs": 0,
+              "option_strings": [
+                "--print-url-only"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "timeout",
+              "option_strings": [
+                "--timeout"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "doctor": {
+          "actions": [
+            {
+              "dest": "human",
+              "nargs": 0,
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_network",
+              "nargs": 0,
+              "option_strings": [
+                "--no-network"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "instance": {
+          "actions": [],
+          "subparsers": {
+            "create": {
+              "actions": [
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_end",
+                  "option_strings": [
+                    "--business-hours-end"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_start",
+                  "option_strings": [
+                    "--business-hours-start"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_tz",
+                  "option_strings": [
+                    "--business-hours-tz"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "otlp_endpoint",
+                  "option_strings": [
+                    "--otlp-endpoint"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "owner",
+                  "option_strings": [
+                    "--owner"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "owner_aad_id",
+                  "option_strings": [
+                    "--owner-aad-id"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
+        },
+        "license": {
+          "actions": [
+            {
+              "dest": "agents",
+              "option_strings": [
+                "--agents"
+              ],
+              "required": true
+            },
+            {
+              "dest": "bundled_security",
+              "nargs": 0,
+              "option_strings": [
+                "--bundled-security"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "E3",
+                "E5",
+                "E7"
+              ],
+              "dest": "plan",
+              "option_strings": [
+                "--plan"
+              ],
+              "required": true
+            },
+            {
+              "dest": "users",
+              "option_strings": [
+                "--users"
+              ],
+              "required": true
+            }
+          ],
+          "subparsers": {}
+        },
+        "publish": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "nargs": 0,
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "app_version",
+              "option_strings": [
+                "--app-version"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "nargs": 0,
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "bot_id",
+              "option_strings": [
+                "--bot-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "copilot_chat",
+              "nargs": 0,
+              "option_strings": [
+                "--copilot-chat"
+              ],
+              "required": false
+            },
+            {
+              "dest": "manifest_id",
+              "option_strings": [
+                "--manifest-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "profile",
+              "option_strings": [
+                "--profile"
+              ],
+              "required": false
+            },
+            {
+              "dest": "prompt_starter",
+              "option_strings": [
+                "--prompt-starter"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "use_blueprint",
+              "nargs": 0,
+              "option_strings": [
+                "--use-blueprint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "verbose",
+              "nargs": 0,
+              "option_strings": [
+                "--verbose"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "register": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "nargs": 0,
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "nargs": 0,
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "both",
+                "obo",
+                "s2s"
+              ],
+              "dest": "authmode",
+              "option_strings": [
+                "--authmode"
+              ],
+              "required": false
+            },
+            {
+              "dest": "auto_recover_secret",
+              "nargs": 0,
+              "option_strings": [
+                "--auto-recover-secret"
+              ],
+              "required": false
+            },
+            {
+              "dest": "backoff",
+              "option_strings": [
+                "--backoff"
+              ],
+              "required": false
+            },
+            {
+              "dest": "config",
+              "option_strings": [
+                "--config"
+              ],
+              "required": false
+            },
+            {
+              "dest": "m365",
+              "nargs": 0,
+              "option_strings": [
+                "--m365"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_endpoint",
+              "nargs": 0,
+              "option_strings": [
+                "--no-endpoint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "retries",
+              "option_strings": [
+                "--retries"
+              ],
+              "required": false
+            },
+            {
+              "dest": "skip_requirements",
+              "nargs": 0,
+              "option_strings": [
+                "--skip-requirements"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "update_permissions",
+              "nargs": 0,
+              "option_strings": [
+                "--update-permissions"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "status": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "nargs": "?",
+              "option_strings": [],
+              "required": false
+            },
+            {
+              "dest": "human",
+              "nargs": 0,
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        }
+      },
+      "subparsers_required": false
+    },
+    "standalone": {
+      "actions": [],
+      "subparsers": {
+        "activity-bridge": {
+          "actions": [],
+          "subparsers": {
+            "serve": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "host",
+                  "option_strings": [
+                    "--host"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_jwt_validation",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--no-jwt-validation"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "port",
+                  "option_strings": [
+                    "--port"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "webhook",
+                  "option_strings": [
+                    "--webhook"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "no_m365",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--no-m365"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "human",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--human"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [
+                    "--slug"
+                  ],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": true
+        },
+        "bot-service": {
+          "actions": [],
+          "subparsers": {
+            "cleanup": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm",
+                  "option_strings": [
+                    "--confirm"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "purge_resource_group",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--purge-resource-group"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "create": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "app_id",
+                  "option_strings": [
+                    "--appid",
+                    "--bf-app-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "bot_name",
+                  "option_strings": [
+                    "--bot-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "endpoint",
+                  "option_strings": [
+                    "--endpoint"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "region",
+                  "option_strings": [
+                    "--region"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "resource_group",
+                  "option_strings": [
+                    "--resource-group"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sku",
+                  "option_strings": [
+                    "--sku"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "subscription_id",
+                  "option_strings": [
+                    "--subscription-id"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "tenant_id",
+                  "option_strings": [
+                    "--tenant-id"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "enable-channel": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "choices": [
+                    "msteams"
+                  ],
+                  "dest": "channel",
+                  "option_strings": [
+                    "--channel"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            },
+            "update-endpoint": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "allow_local",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--allow-local"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_bot_target",
+                  "option_strings": [
+                    "--confirm-bot-target"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "url",
+                  "option_strings": [
+                    "--url"
+                  ],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            },
+            "verify": {
+              "actions": [
+                {
+                  "dest": "agent_name",
+                  "option_strings": [
+                    "--agent-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "directline_probe",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--directline-probe"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "generated_config",
+                  "option_strings": [
+                    "--generated-config"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "sidecar",
+                  "option_strings": [
+                    "--sidecar"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
+        },
+        "cleanup": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "apply",
+              "nargs": 0,
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm",
+              "option_strings": [
+                "--confirm"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_bot_target",
+              "option_strings": [
+                "--confirm-bot-target"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_legacy_binding",
+              "option_strings": [
+                "--confirm-legacy-binding"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan",
+              "option_strings": [
+                "--confirm-orphan"
+              ],
+              "required": false
+            },
+            {
+              "dest": "confirm_orphan_user",
+              "option_strings": [
+                "--confirm-orphan-user"
+              ],
+              "required": false
+            },
+            {
+              "dest": "kinds",
+              "option_strings": [
+                "--kinds"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_instance_id",
+              "option_strings": [
+                "--orphan-instance-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "orphan_user_id",
+              "option_strings": [
+                "--orphan-user-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "purge_orphans",
+              "nargs": 0,
+              "option_strings": [
+                "--purge-orphans"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "consent": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "nargs": "?",
+              "option_strings": [],
+              "required": false
+            },
+            {
+              "dest": "interval",
+              "option_strings": [
+                "--interval"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_open",
+              "nargs": 0,
+              "option_strings": [
+                "--no-open"
+              ],
+              "required": false
+            },
+            {
+              "dest": "print_url_only",
+              "nargs": 0,
+              "option_strings": [
+                "--print-url-only"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "timeout",
+              "option_strings": [
+                "--timeout"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "doctor": {
+          "actions": [
+            {
+              "dest": "human",
+              "nargs": 0,
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_network",
+              "nargs": 0,
+              "option_strings": [
+                "--no-network"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "instance": {
+          "actions": [],
+          "subparsers": {
+            "create": {
+              "actions": [
+                {
+                  "dest": "apply",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--apply"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_end",
+                  "option_strings": [
+                    "--business-hours-end"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_start",
+                  "option_strings": [
+                    "--business-hours-start"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "business_hours_tz",
+                  "option_strings": [
+                    "--business-hours-tz"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "otlp_endpoint",
+                  "option_strings": [
+                    "--otlp-endpoint"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "owner",
+                  "option_strings": [
+                    "--owner"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "owner_aad_id",
+                  "option_strings": [
+                    "--owner-aad-id"
+                  ],
+                  "required": true
+                },
+                {
+                  "dest": "slug",
+                  "option_strings": [],
+                  "required": true
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
+        },
+        "license": {
+          "actions": [
+            {
+              "dest": "agents",
+              "option_strings": [
+                "--agents"
+              ],
+              "required": true
+            },
+            {
+              "dest": "bundled_security",
+              "nargs": 0,
+              "option_strings": [
+                "--bundled-security"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "E3",
+                "E5",
+                "E7"
+              ],
+              "dest": "plan",
+              "option_strings": [
+                "--plan"
+              ],
+              "required": true
+            },
+            {
+              "dest": "users",
+              "option_strings": [
+                "--users"
+              ],
+              "required": true
+            }
+          ],
+          "subparsers": {}
+        },
+        "publish": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "nargs": 0,
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "app_version",
+              "option_strings": [
+                "--app-version"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "nargs": 0,
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "dest": "bot_id",
+              "option_strings": [
+                "--bot-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "copilot_chat",
+              "nargs": 0,
+              "option_strings": [
+                "--copilot-chat"
+              ],
+              "required": false
+            },
+            {
+              "dest": "manifest_id",
+              "option_strings": [
+                "--manifest-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "profile",
+              "option_strings": [
+                "--profile"
+              ],
+              "required": false
+            },
+            {
+              "dest": "prompt_starter",
+              "option_strings": [
+                "--prompt-starter"
+              ],
+              "required": false
+            },
+            {
+              "dest": "slug",
+              "option_strings": [
+                "--slug"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "use_blueprint",
+              "nargs": 0,
+              "option_strings": [
+                "--use-blueprint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "verbose",
+              "nargs": 0,
+              "option_strings": [
+                "--verbose"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "register": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": true
+            },
+            {
+              "dest": "aiteammate",
+              "nargs": 0,
+              "option_strings": [
+                "--aiteammate"
+              ],
+              "required": false
+            },
+            {
+              "dest": "apply",
+              "nargs": 0,
+              "option_strings": [
+                "--apply"
+              ],
+              "required": false
+            },
+            {
+              "choices": [
+                "both",
+                "obo",
+                "s2s"
+              ],
+              "dest": "authmode",
+              "option_strings": [
+                "--authmode"
+              ],
+              "required": false
+            },
+            {
+              "dest": "auto_recover_secret",
+              "nargs": 0,
+              "option_strings": [
+                "--auto-recover-secret"
+              ],
+              "required": false
+            },
+            {
+              "dest": "backoff",
+              "option_strings": [
+                "--backoff"
+              ],
+              "required": false
+            },
+            {
+              "dest": "config",
+              "option_strings": [
+                "--config"
+              ],
+              "required": false
+            },
+            {
+              "dest": "m365",
+              "nargs": 0,
+              "option_strings": [
+                "--m365"
+              ],
+              "required": false
+            },
+            {
+              "dest": "no_endpoint",
+              "nargs": 0,
+              "option_strings": [
+                "--no-endpoint"
+              ],
+              "required": false
+            },
+            {
+              "dest": "retries",
+              "option_strings": [
+                "--retries"
+              ],
+              "required": false
+            },
+            {
+              "dest": "skip_requirements",
+              "nargs": 0,
+              "option_strings": [
+                "--skip-requirements"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            },
+            {
+              "dest": "update_permissions",
+              "nargs": 0,
+              "option_strings": [
+                "--update-permissions"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        },
+        "status": {
+          "actions": [
+            {
+              "dest": "agent_name",
+              "nargs": "?",
+              "option_strings": [],
+              "required": false
+            },
+            {
+              "dest": "human",
+              "nargs": 0,
+              "option_strings": [
+                "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "tenant_id",
+              "option_strings": [
+                "--tenant-id"
+              ],
+              "required": false
+            }
+          ],
+          "subparsers": {}
+        }
+      },
+      "subparsers_required": false
+    }
+  },
+  "env_classification": {
+    "A365_AGENT_IDENTITY_IDS": "public",
+    "A365_ALLOWED_USERS": "public",
+    "A365_ALLOW_ALL_USERS": "public",
+    "A365_APP_ID": "public",
+    "A365_BF_APP_ID": "public",
+    "A365_BF_CLIENT_SECRET": "public",
+    "A365_BLUEPRINT_CLIENT_SECRET": "public",
+    "A365_CLIENT_APP_NAME": "public",
+    "A365_CONVERSATIONS_PATH": "public",
+    "A365_FEEDBACK_LOOP": "public",
+    "A365_FILE_HOST_ALLOWLIST": "public",
+    "A365_GENERATED_CONFIG_PATH": "public",
+    "A365_HANDOFF_LINK": "public",
+    "A365_TENANT_ID": "public",
+    "HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI": "public",
+    "HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC": "public",
+    "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC": "public",
+    "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC": "public",
+    "HERMES_BRIDGE_PORT": "public",
+    "HERMES_BRIDGE_WEBHOOK": "public",
+    "HERMES_GATEWAY_PROFILE": "public",
+    "HERMES_HOME": "public",
+    "HERMES_OTLP_ENDPOINT": "internal",
+    "HERMES_PROFILE": "public",
+    "HERMES_RESPONDER_HISTORY_TOKEN": "public"
+  },
+  "env_literals_scanned": [
+    "A365_AGENT_IDENTITY_IDS",
+    "A365_ALLOWED_USERS",
+    "A365_ALLOW_ALL_USERS",
+    "A365_APP_ID",
+    "A365_BF_APP_ID",
+    "A365_BF_CLIENT_SECRET",
+    "A365_BLUEPRINT_CLIENT_SECRET",
+    "A365_CLIENT_APP_NAME",
+    "A365_CONVERSATIONS_PATH",
+    "A365_FEEDBACK_LOOP",
+    "A365_FILE_HOST_ALLOWLIST",
+    "A365_GENERATED_CONFIG_PATH",
+    "A365_HANDOFF_LINK",
+    "A365_TENANT_ID",
+    "HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI",
+    "HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC",
+    "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC",
+    "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC",
+    "HERMES_BRIDGE_PORT",
+    "HERMES_BRIDGE_WEBHOOK",
+    "HERMES_GATEWAY_PROFILE",
+    "HERMES_HOME",
+    "HERMES_OTLP_ENDPOINT",
+    "HERMES_PROFILE",
+    "HERMES_RESPONDER_HISTORY_TOKEN"
+  ],
+  "exit_codes": {
+    "activity_bridge_verify": {
+      "error": 2,
+      "ok": 0,
+      "warn": 1
+    },
+    "bot_service": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "bot_service_verify": [
+      0,
+      1,
+      2
+    ],
+    "cleanup": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "consent": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "doctor": {
+      "error": 2,
+      "ok": 0,
+      "warn": 1
+    },
+    "instance_create": [
+      0,
+      2
+    ],
+    "license": [
+      0,
+      2
+    ],
+    "missing_verb_or_usage": 2,
+    "publish_run": [
+      0,
+      2
+    ],
+    "register": {
+      "failed_or_partial": 1,
+      "refusal": 2,
+      "success": 0
+    },
+    "register_aiteammate": 2,
+    "status": {
+      "broken": 2,
+      "ok": 0,
+      "partial": 1,
+      "uninitialized": 3
+    }
+  },
+  "gateway_extra_keys": [
+    "slug",
+    "port",
+    "host",
+    "tenant_id",
+    "app_id",
+    "blueprint_client_secret",
+    "bf_app_id",
+    "bf_client_secret",
+    "generated_config_path",
+    "conversations_path",
+    "conversations_prune_max_age_days",
+    "idempotency_max_entries",
+    "file_host_allowlist",
+    "agent_identity_ids",
+    "notice_delivery",
+    "reactions_dispatch_agent_turn",
+    "group_sessions_per_user",
+    "thread_sessions_per_user"
+  ],
+  "hermes_owned_sidecars": [
+    {
+      "location": "cwd",
+      "path": "a365.bot-service.config.json",
+      "schema_version_read": [
+        1,
+        2
+      ],
+      "schema_version_write": 2
+    },
+    {
+      "path": "~/.hermes/agents/<slug>/copilot-chat-publish.json",
+      "schema_version_read": [
+        1,
+        2
+      ],
+      "schema_version_write": 2
+    },
+    {
+      "missing_version_means": 1,
+      "on_disk_version_field": "schema",
+      "path": "~/.hermes/agents/<slug>/conversations.json",
+      "schema_version_read": [
+        1
+      ],
+      "schema_version_write": 1
+    }
+  ],
+  "http_routes_live": [
+    {
+      "method": "POST",
+      "path": "/api/messages"
+    },
+    {
+      "method": "GET",
+      "path": "/healthz"
+    }
+  ],
+  "instance_env_public_keys": [
+    "A365_APP_ID",
+    "A365_BF_APP_ID",
+    "A365_BF_CLIENT_SECRET",
+    "A365_TENANT_ID",
+    "AA_INSTANCE_ID",
+    "AGENT_IDENTITY",
+    "BUSINESS_HOURS_END",
+    "BUSINESS_HOURS_START",
+    "BUSINESS_HOURS_TZ",
+    "OWNER",
+    "OWNER_AAD_ID"
+  ],
+  "invoke": {
+    "adapter_handlers": [
+      "handoff/action",
+      "message/fetchTask",
+      "message/submitAction"
+    ],
+    "registry": [
+      "task/fetch"
+    ],
+    "task_fetch_card": {
+      "adaptive_card_version": "1.5",
+      "body_text": "Request received.",
+      "title": "Hermes"
+    }
+  },
+  "keychain_cli": {
+    "module": "hermes_a365.keychain",
+    "options": [
+      "--app-id",
+      "--output-fd",
+      "--secret",
+      "--tenant"
+    ],
+    "subcommands": [
+      "store",
+      "get",
+      "delete"
+    ]
+  },
+  "not_schema_artifacts": [
+    "bridge.log",
+    "responder.log",
+    "media cache",
+    "keychain",
+    ".env"
+  ],
+  "owner_decisions": {
+    "D1_serve_supported": true,
+    "D2_cea_default_scopes": [
+      "copilot",
+      "personal",
+      "team"
+    ],
+    "D3_task_fetch_card_frozen": true,
+    "D4_security_latest_1x_minor_only": true,
+    "D6_auto_migrate_additive_only": true,
+    "D7_ship_py_typed": false,
+    "D8_keychain_public": true,
+    "D8_responder_reference_only": true,
+    "accepted": {
+      "D1": "A \u2014 activity-bridge serve is a supported secondary runtime at 1.0",
+      "D2": "A \u2014 default CEA publish scopes remain copilot, personal, team",
+      "D3": "A \u2014 freeze the task/fetch placeholder card (Hermes / Request received.)",
+      "D4": "A \u2014 security fixes for the latest 1.x minor only",
+      "D5": "Removed by #267: HERMES_OTLP_ENDPOINT is not part of the 1.0 public env (deprecated literals may remain in source for migration warnings only)",
+      "D6": "B \u2014 additive auto-stamps only; keep bot-service and publish confirm gates",
+      "D7": "B \u2014 do not ship py.typed / Typing :: Typed",
+      "D8": "B \u2014 public python -m hermes_a365.keychain; hermes_responder reference-only"
+    },
+    "status": "accepted"
+  },
+  "package_version": "0.9.5",
+  "packaging": {
+    "classifiers": [
+      "Programming Language :: Python :: 3",
+      "Programming Language :: Python :: 3.11",
+      "Programming Language :: Python :: 3.12",
+      "Programming Language :: Python :: 3.13",
+      "Programming Language :: Python :: 3.14",
+      "Operating System :: MacOS",
+      "Operating System :: POSIX :: Linux"
+    ],
+    "entry_points": {
+      "hermes_agent.plugins": {
+        "agent365": "hermes_a365.plugin"
+      }
+    },
+    "license": {
+      "text": "MIT"
+    },
+    "name": "hermes-a365",
+    "optional_dependencies": [
+      "bridge",
+      "dev"
+    ],
+    "py_typed": false,
+    "requires_python": ">=3.11",
+    "scripts": {
+      "hermes-a365": "hermes_a365.cli:main"
+    },
+    "urls": {
+      "Documentation": "https://github.com/satscryption/Hermes-A365#readme",
+      "Homepage": "https://github.com/satscryption/Hermes-A365",
+      "Issues": "https://github.com/satscryption/Hermes-A365/issues"
+    },
+    "version": "0.9.5"
+  },
+  "plugin_requires_env": [
+    "A365_TENANT_ID",
+    "A365_APP_ID",
+    "AA_INSTANCE_ID",
+    "HERMES_BRIDGE_PORT"
+  ],
+  "product_http_routes_frozen": [
+    {
+      "method": "POST",
+      "path": "/api/messages"
+    },
+    {
+      "method": "GET",
+      "path": "/healthz"
+    }
+  ],
+  "publish_default_scopes": [
+    "copilot",
+    "personal",
+    "team"
+  ],
+  "python_modules": {
+    "internal": [
+      "hermes_a365.activity_bridge",
+      "hermes_a365.bot_service",
+      "hermes_a365.cleanup",
+      "hermes_a365.cli",
+      "hermes_a365.consent",
+      "hermes_a365.doctor",
+      "hermes_a365.emit_card",
+      "hermes_a365.instance_create",
+      "hermes_a365.license",
+      "hermes_a365.publish",
+      "hermes_a365.reconcile_app",
+      "hermes_a365.reconcile_blueprint",
+      "hermes_a365.register",
+      "hermes_a365.render_instance_env",
+      "hermes_a365.status"
+    ],
+    "public_cli": [
+      "hermes_a365.keychain"
+    ],
+    "reference_only": [
+      "hermes_a365.hermes_responder"
+    ]
+  },
+  "register_aiteammate_refusal": "`register --aiteammate` is unsupported. Register only runs `a365 setup blueprint` plus MCP/Bot permission setup; the AI Teammate agentic user is created/activated after `publish --aiteammate` via M365 Admin Centre upload and per-user activation.",
+  "schema_version": 1,
+  "security_support_after_v1": "After v1.0, security fixes are provided for the latest 1.x minor release only. Earlier 1.x minors and all 0.x releases are unsupported.",
+  "sidecar_migration_policy": "Planned for slice 2: within 1.x, Hermes-A365 will read every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, and be idempotent. The original bytes will be copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file will not write another backup. Identity-binding changes will stay explicit: bot-service v1\u2192v2 will still require `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1\u2192v2 will still require `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than that build will be an error and the file will be left untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2.",
+  "sidecar_migration_today": "Today (slice 1) `conversations.json` is persisted with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2.",
+  "upstream_sidecars": [
+    "a365.config.json",
+    "a365.generated.config.json"
+  ]
+}
