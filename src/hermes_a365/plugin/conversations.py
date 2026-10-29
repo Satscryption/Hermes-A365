@@ -487,14 +487,19 @@ class ConversationRegistry:
         """Read the registry from disk. Returns an empty registry if
         the file doesn't exist, isn't readable, or doesn't parse."""
         try:
-            raw = path.read_text()
+            raw = path.read_bytes()
         except FileNotFoundError:
             return cls()
         except OSError:
             logger.warning("agent365 conversations: registry read failed; starting empty")
             return cls()
         try:
-            payload = json.loads(raw)
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("agent365 conversations: registry is not valid UTF-8; starting empty")
+            return cls()
+        try:
+            payload = json.loads(text)
         except (json.JSONDecodeError, RecursionError):
             # RecursionError: a corrupted / hand-edited file nested past the
             # interpreter limit (#105/M11 review). Treat as unparseable — an
@@ -526,23 +531,33 @@ class ConversationRegistry:
                 snapshot = path.read_bytes()
                 try:
                     parsed = json.loads(snapshot)
+                except UnicodeDecodeError:
+                    quarantine = sidecar_corrupt_quarantine_path(path)
+                    published = write_owner_only_bytes_exclusive(quarantine, snapshot)
+                    logger.warning(
+                        "agent365 conversations: quarantined invalid UTF-8 at %s to %s",
+                        path,
+                        published,
+                    )
+                    write_owner_only_text_atomic(path, text)
+                    return
                 except (json.JSONDecodeError, RecursionError):
                     quarantine = sidecar_corrupt_quarantine_path(path)
-                    write_owner_only_bytes_exclusive(quarantine, snapshot)
+                    published = write_owner_only_bytes_exclusive(quarantine, snapshot)
                     logger.warning(
                         "agent365 conversations: quarantined invalid JSON at %s to %s",
                         path,
-                        quarantine,
+                        published,
                     )
                     write_owner_only_text_atomic(path, text)
                     return
                 if not isinstance(parsed, dict):
                     quarantine = sidecar_corrupt_quarantine_path(path)
-                    write_owner_only_bytes_exclusive(quarantine, snapshot)
+                    published = write_owner_only_bytes_exclusive(quarantine, snapshot)
                     logger.warning(
                         "agent365 conversations: quarantined non-object JSON at %s to %s",
                         path,
-                        quarantine,
+                        published,
                     )
                     write_owner_only_text_atomic(path, text)
                     return

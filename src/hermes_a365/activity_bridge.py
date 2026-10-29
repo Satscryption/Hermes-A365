@@ -2238,7 +2238,7 @@ def _activity_delivery_id(
     return "|".join(f"{len(part)}:{part}" for part in parts)
 
 
-def _is_trusted_service_url(url: str, suffixes: tuple[str, ...]) -> bool:
+def _is_trusted_service_url(url: Any, suffixes: tuple[str, ...]) -> bool:
     """Slice 19j / #100-M2: True iff ``url`` is https and its hostname is on the
     allowlist.
 
@@ -2254,7 +2254,10 @@ def _is_trusted_service_url(url: str, suffixes: tuple[str, ...]) -> bool:
     Empty or missing URL → False (caller dispatches the 4xx). Empty ``suffixes``
     is a config bug; caller checks for it separately so the failure mode is
     explicit ("refusing to ship outbound" rather than "silently accepted").
+    Non-string ``serviceUrl`` values fail closed here (no ``urlparse`` on them).
     """
+    if not isinstance(url, str):
+        return False
     if not url or not suffixes:
         return False
     try:
@@ -2394,6 +2397,7 @@ async def validate_inbound_jwt(
             audience=expected_app_id,
             issuer=expected_issuer,
             leeway=300,
+            options={"require": ["exp", "nbf"]},
         )
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"signature/aud/iss check failed: {e}") from e
@@ -2567,6 +2571,7 @@ async def validate_inbound_jwt_bf(
             audience=expected_app_id,
             issuer=BF_ISSUER,
             leeway=300,
+            options={"require": ["exp", "nbf"]},
         )
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"BF signature/aud/iss check failed: {e}") from e
@@ -3519,6 +3524,14 @@ class ReplyPostError(RuntimeError):
         super().__init__(detail)
 
 
+class ReplyPostMayHaveLandedError(RuntimeError):
+    """The outbound activity POST may have reached the connector; keep idempotency."""
+
+
+def _reply_failure_forgets_idempotency(error: BaseException) -> bool:
+    return not isinstance(error, ReplyPostMayHaveLandedError)
+
+
 def _response_text_excerpt(response: Any) -> str:
     try:
         text = str(response.text)
@@ -3625,7 +3638,7 @@ async def send_reply(
         # WriteTimeout from acquire_reply_token (above) is still a miss
         # and must propagate unchanged so the caller can retry.
         if type(exc).__name__ in {"ReadTimeout", "WriteTimeout"}:
-            raise RuntimeError("timeout after the request was sent") from exc
+            raise ReplyPostMayHaveLandedError("timeout after the request was sent") from exc
         raise
     status_code = int(getattr(response, "status_code", 0) or 0)
     if status_code < 200 or status_code >= 300:
@@ -3706,7 +3719,13 @@ def make_app(
             await http_client.aclose()
 
     _validate_webhook_url(cfg.webhook_url, development_mode=cfg.skip_jwt_validation)
-    app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}", lifespan=_serve_lifespan)
+    app = _FastAPI(
+        title=f"hermes a365 activity-bridge — {cfg.slug}",
+        lifespan=_serve_lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     pre_auth_state = _ServePreAuthState()
     app.add_middleware(
@@ -3721,11 +3740,7 @@ def make_app(
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
-        return {
-            "ok": True,
-            "slug": cfg.slug,
-            "blueprint_client_id": cfg.blueprint_client_id[:8] + "…",
-        }
+        return {"ok": True}
 
     @app.post("/api/messages")
     async def messages(
@@ -3745,7 +3760,10 @@ def make_app(
         # forged activity could redirect our outbound user-FIC bearer
         # to an attacker-controlled URL. Empty allowlist is a config
         # bug — refuse all rather than silently accept.
-        service_url = activity.get("serviceUrl") or ""
+        service_url_raw = activity.get("serviceUrl")
+        if service_url_raw is not None and not isinstance(service_url_raw, str):
+            raise _HTTPException(status_code=403, detail="untrusted serviceUrl")
+        service_url = service_url_raw or ""
         if not cfg.trusted_service_url_suffixes:
             raise _HTTPException(
                 status_code=403,
@@ -3846,6 +3864,50 @@ def make_app(
             return _JSONResponse({"status": "duplicate"})
 
         activity_type = str(activity.get("type") or "message")
+        try:
+            return await _serve_messages_after_dedupe(
+                activity=activity,
+                activity_type=activity_type,
+                delivery_id=delivery_id,
+                service_url=service_url,
+                validated_path=validated_path,
+                authorization=authorization,
+                cfg=cfg,
+                http_client=http_client,
+                jwks_cache=jwks_cache,
+                bf_jwks_cache=bf_jwks_cache,
+                fmi_cache=fmi_cache,
+                user_cache=user_cache,
+                bf_cache=bf_cache,
+                idempotency_cache=idempotency_cache,
+                ack_deadline=ack_deadline,
+            )
+        except _HTTPException:
+            raise
+        except Exception as exc:
+            if delivery_id is not None:
+                idempotency_cache.forget(delivery_id)
+            raise exc
+
+    async def _serve_messages_after_dedupe(
+        *,
+        activity: dict[str, Any],
+        activity_type: str,
+        delivery_id: str | None,
+        service_url: str,
+        validated_path: str | None,
+        authorization: str | None,
+        cfg: BridgeConfig,
+        http_client: Any,
+        jwks_cache: _JwksCache,
+        bf_jwks_cache: _JwksCache,
+        fmi_cache: _FmiCache,
+        user_cache: _UserTokenCache,
+        bf_cache: _BfTokenCache,
+        idempotency_cache: _IdempotencyCache,
+        ack_deadline: float,
+    ) -> Any:
+        _ = authorization
 
         # Channel-control activities — ack and bail.
         if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
@@ -3939,6 +4001,8 @@ def make_app(
                     deadline=ack_deadline,
                 )
             except Exception as reply_error:
+                if delivery_id is not None and _reply_failure_forgets_idempotency(reply_error):
+                    idempotency_cache.forget(delivery_id)
                 return _reply_failed_response(reply_error)
             return _JSONResponse({"status": "webhook_error"}, status_code=200)
 
@@ -3993,6 +4057,8 @@ def make_app(
                 deadline=ack_deadline,
             )
         except Exception as e:
+            if delivery_id is not None and _reply_failure_forgets_idempotency(e):
+                idempotency_cache.forget(delivery_id)
             return _reply_failed_response(e)
         return _JSONResponse({"status": "replied"})
 

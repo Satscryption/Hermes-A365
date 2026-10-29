@@ -82,6 +82,7 @@ class InvokeContext:
     activity: dict[str, Any]  # raw inbound activity (escape hatch)
     value: dict[str, Any]  # parsed activity.value ({} when absent/non-dict)
     user_oid: str
+    token_user_oid: str
     user_upn: str
     tenant_id: str
     service_url: str
@@ -152,6 +153,7 @@ def build_invoke_context(
         activity=activity,
         value=value,
         user_oid=str(claims.get("oid") or sender.get("aadObjectId") or ""),
+        token_user_oid=str(claims.get("oid") or ""),
         user_upn=str(claims.get("preferred_username") or claims.get("upn") or ""),
         tenant_id=str(
             claims.get("tid") or conv.get("tenantId") or recipient.get("tenantId") or ""

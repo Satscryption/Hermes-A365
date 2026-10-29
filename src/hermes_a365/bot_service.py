@@ -203,6 +203,7 @@ class BotServiceCreateInputs:
     bot_name: str | None = None
     sidecar_path: Path = field(default_factory=lambda: Path.cwd() / SIDECAR_FILENAME)
     allow_local: bool = False
+    legacy_binding_confirmation: str | None = None
 
     def __post_init__(self) -> None:
         if not self.agent_name.strip():
@@ -265,9 +266,10 @@ class BotServiceConfig:
             or isinstance(schema_version, bool)
             or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
         ):
+            kind = type(schema_version).__name__
             raise BotServiceError(
-                f"{source} schemaVersion={schema_version!r}; expected one of "
-                f"{sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
+                f"{source} schemaVersion has unsupported type {kind}; "
+                f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
             )
         if schema_version == SIDECAR_SCHEMA_VERSION:
             agent_name = raw.get("agentName")
@@ -278,8 +280,9 @@ class BotServiceConfig:
                 )
         if not isinstance(raw.get("resourceGroupManaged"), bool):
             raise BotServiceError(
-                f"{source} resourceGroupManaged must be true or false, got "
-                f"{raw.get('resourceGroupManaged')!r}; refusing to infer purge authority"
+                f"{source} resourceGroupManaged must be true or false "
+                f"(got {type(raw.get('resourceGroupManaged')).__name__}); "
+                "refusing to infer purge authority"
             )
         for key in (
             "subscriptionId",
@@ -1167,7 +1170,28 @@ def _patch_teams_terms(
     )
 
 
-def _write_bot_service_config(path: Path, config: BotServiceConfig) -> None:
+def _write_bot_service_config(
+    path: Path,
+    config: BotServiceConfig,
+    *,
+    expected_binding: tuple[int, int, int, str] | None = None,
+) -> None:
+    if expected_binding is not None and path.is_file():
+        current_binding = _sidecar_file_binding(path)
+        if current_binding != expected_binding:
+            raise BotServiceError(f"{path} changed since validation; refusing to replace")
+        raw, _binding = _read_sidecar_bytes(path)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BotServiceError(f"{path} is no longer valid JSON before write: {exc}") from exc
+        if isinstance(payload, dict):
+            from .sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
+
+            try:
+                validate_bot_service_sidecar_schema(payload, source=str(path))
+            except SidecarSchemaError as exc:
+                raise BotServiceError(str(exc)) from exc
     _write_text_atomic(path, config.to_json(), mode=0o600)
 
 
@@ -1305,6 +1329,40 @@ def _apply_create_plan_locked(
 
     inputs = plan.inputs
     bot_name = plan.bot_name
+    create_sidecar_binding: tuple[int, int, int, str] | None = None
+    if inputs.sidecar_path.is_file():
+        from .sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
+
+        raw_sidecar, create_sidecar_binding = _read_sidecar_bytes(inputs.sidecar_path)
+        try:
+            sidecar_payload = json.loads(raw_sidecar.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise BotServiceError(f"{inputs.sidecar_path} is not valid JSON: {exc}") from exc
+        if not isinstance(sidecar_payload, dict):
+            raise BotServiceError(
+                f"{inputs.sidecar_path} is JSON {type(sidecar_payload).__name__}, expected object"
+            )
+        try:
+            schema_version = validate_bot_service_sidecar_schema(
+                sidecar_payload, source=str(inputs.sidecar_path)
+            )
+        except SidecarSchemaError as exc:
+            raise BotServiceError(str(exc)) from exc
+        existing_cfg = BotServiceConfig.from_json_text(
+            raw_sidecar.decode("utf-8"), source=str(inputs.sidecar_path)
+        )
+        if existing_cfg.agentName is not None and existing_cfg.agentName != inputs.agent_name:
+            raise BotServiceError(
+                f"sidecar belongs to agent {existing_cfg.agentName!r}, not {inputs.agent_name!r}; "
+                f"refusing create for {inputs.resource_group}/{bot_name}"
+            )
+        if schema_version != SIDECAR_SCHEMA_VERSION:
+            _validate_legacy_binding_confirmation(
+                existing_cfg,
+                agent_name=inputs.agent_name,
+                confirmation=inputs.legacy_binding_confirmation,
+            )
+            _write_sidecar_backup(inputs.sidecar_path, raw_sidecar, now=now())
     app_id = _resolve_app_id(inputs, operator_env)
     account = _account_show(runner)
     tenant_id = _resolve_tenant_id(inputs, operator_env, account)
@@ -1507,7 +1565,11 @@ def _apply_create_plan_locked(
         # later cleanup can refuse a sidecar that names a different agent.
         agentName=inputs.agent_name,
     )
-    _write_bot_service_config(inputs.sidecar_path, cfg)
+    _write_bot_service_config(
+        inputs.sidecar_path,
+        cfg,
+        expected_binding=create_sidecar_binding,
+    )
     messages.append(f"[apply] wrote {inputs.sidecar_path} (mode 0600)")
     return BotServiceCreateResult(
         config=cfg,
@@ -2440,6 +2502,14 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         action="store_true",
         help="permit a localhost/loopback endpoint over http (local dev tunnels)",
     )
+    create.add_argument(
+        "--confirm-legacy-binding",
+        metavar="AGENT_NAME",
+        help=(
+            "required when create would migrate an existing schema-v1 sidecar; "
+            "must equal --agent-name"
+        ),
+    )
 
     enable = subs.add_parser(
         "enable-channel",
@@ -2565,6 +2635,7 @@ def _run_create(args: argparse.Namespace) -> int:
             bot_name=args.bot_name,
             sidecar_path=args.sidecar,
             allow_local=args.allow_local,
+            legacy_binding_confirmation=args.confirm_legacy_binding,
         )
         plan = build_create_plan(inputs)
     except (ValueError, BotServiceError) as e:

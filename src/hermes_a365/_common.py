@@ -226,7 +226,9 @@ def _exclusive_publish_file(tmp: Path, path: Path) -> Path:
                 raise SidecarBackupError(
                     f"could not publish sidecar backup at {path} via hard link ({exc})"
                 ) from exc
-            raise
+            raise SidecarBackupError(
+                f"could not publish sidecar backup at {path}: {exc}"
+            ) from exc
     raise SidecarBackupError(f"could not publish sidecar backup at {path} exclusively")
 
 
@@ -235,22 +237,31 @@ def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o6
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_name(f".{path.name}.part-{os.getpid()}")
     tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    try:
+        fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+    except OSError as exc:
+        raise SidecarBackupError(f"could not open sidecar backup at {path}: {exc}") from exc
     try:
         os.fchmod(fd, mode)
         offset = 0
         while offset < len(data):
             offset += os.write(fd, data[offset:])
         os.fsync(fd)
-    except BaseException:
+    except BaseException as exc:
         os.close(fd)
         tmp.unlink(missing_ok=True)
+        if isinstance(exc, OSError):
+            raise SidecarBackupError(f"could not write sidecar backup at {path}: {exc}") from exc
         raise
     os.close(fd)
     try:
         target = _exclusive_publish_file(tmp, path)
-    except BaseException:
+    except BaseException as exc:
         tmp.unlink(missing_ok=True)
+        if isinstance(exc, SidecarBackupError):
+            raise
+        if isinstance(exc, OSError):
+            raise SidecarBackupError(f"could not publish sidecar backup at {path}: {exc}") from exc
         raise
     tmp.unlink(missing_ok=True)
     _fsync_directory(target.parent)

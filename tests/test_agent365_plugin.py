@@ -6157,10 +6157,10 @@ class TestConversationRegistry:
 
         path = tmp_path / "sensitive-profile-name.json"
 
-        def _fail_read(_path: Path) -> str:
+        def _fail_read(_self: Path) -> bytes:
             raise OSError("sensitive-read-error")
 
-        monkeypatch.setattr(Path, "read_text", _fail_read)
+        monkeypatch.setattr(Path, "read_bytes", _fail_read)
         caplog.set_level("WARNING")
 
         reg = ConversationRegistry.load(path)
@@ -24917,7 +24917,7 @@ class TestOutboundFiles:
         )
         assert resp.status == 200
         assert a._http_client.put.await_count == 0
-        assert "c1" not in a._pending_file_uploads
+        assert "c1" in a._pending_file_uploads
 
     @pytest.mark.asyncio
     async def test_handle_consent_upload_http_error_still_acks(
@@ -25022,7 +25022,7 @@ class TestOutboundFiles:
             upload_info={"uploadUrl": self._GOOD_UPLOAD}, conv_id="conv-OTHER"
         )
         await self._accept_and_assert_no_put(a, monkeypatch, act)
-        assert "c1" not in a._pending_file_uploads  # spent even on refusal
+        assert "c1" in a._pending_file_uploads  # mismatch must not consume pending
 
     @pytest.mark.asyncio
     async def test_accept_offhost_upload_url_refused(

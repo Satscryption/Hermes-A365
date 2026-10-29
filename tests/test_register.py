@@ -362,7 +362,8 @@ class TestApplyHappyPath:
             ]
         )
         result = apply_register_plan(plan, mutator=mutator)
-        assert result.raw_outputs["blueprint"].stdout == "bp ok"
+        suppressed = "<output suppressed: sensitive command may emit credential material>"
+        assert result.raw_outputs["blueprint"].stdout == suppressed
         assert result.raw_outputs["permissions-mcp"].stdout == "mcp ok"
         assert result.raw_outputs["permissions-bot"].stdout == "bot ok"
 
@@ -434,7 +435,7 @@ class TestIssue256BlueprintSensitiveOutput:
         assert self._SENTINEL not in caplog.text
         assert "ABCD1234" in out
         assert "To sign in, open https://login.microsoft.com/device" in out
-        assert self._SENTINEL in result.raw_outputs["blueprint"].stdout
+        assert self._SENTINEL not in result.raw_outputs["blueprint"].stdout
 
     def test_apply_repair_suppresses_secret_streams_device_code(
         self,

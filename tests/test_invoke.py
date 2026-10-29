@@ -85,6 +85,7 @@ def test_build_invoke_context_prefers_claims() -> None:
     assert ctx.name == "task/fetch"
     assert ctx.value == {"commandId": "x"}
     assert ctx.user_oid == "claim-oid"
+    assert ctx.token_user_oid == "claim-oid"
     assert ctx.user_upn == "u@x.io"
     assert ctx.tenant_id == "claim-tid"
     assert ctx.chat_type == "copilot_chat"  # groupChat + Path B
@@ -97,6 +98,7 @@ def test_build_invoke_context_falls_back_to_activity_fields() -> None:
     # No claims -> oid from from.aadObjectId, tenant from recipient.tenantId.
     ctx = invoke.build_invoke_context(_invoke_activity(), claims=None, path_tag="A")
     assert ctx.user_oid == "fallback-oid"
+    assert ctx.token_user_oid == ""
     assert ctx.tenant_id == "recip-tid"
     assert ctx.chat_type == "group"  # groupChat + Path A (not CC)
 

@@ -481,7 +481,17 @@ def apply_register_plan(
             raise
 
         result.completed.append(step.name)
-        result.raw_outputs[step.name] = run
+        if step.name == "blueprint":
+            from .mutator import _SENSITIVE_OUTPUT_SUPPRESSED
+
+            result.raw_outputs[step.name] = RunResult(
+                argv=list(run.argv),
+                returncode=run.returncode,
+                stdout=_SENSITIVE_OUTPUT_SUPPRESSED,
+                stderr="",
+            )
+        else:
+            result.raw_outputs[step.name] = run
         result.messages.append(f"[apply] {step.name}: {step.description} — done")
         if step.name == "blueprint":
             result.messages.append(

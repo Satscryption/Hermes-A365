@@ -2370,7 +2370,12 @@ class Agent365Adapter(BasePlatformAdapter):
         from fastapi import Body, FastAPI, Header, HTTPException
         from fastapi.responses import JSONResponse
 
-        app = FastAPI(title=f"agent365 adapter — {self.slug or 'default'}")
+        app = FastAPI(
+            title=f"agent365 adapter — {self.slug or 'default'}",
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
+        )
 
         app.add_middleware(
             bridge.BoundedRequestBodyMiddleware,
@@ -2404,13 +2409,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
         @app.get("/healthz")
         async def healthz() -> dict[str, Any]:
-            return {
-                "ok": True,
-                "slug": self.slug,
-                "blueprint_client_id": (
-                    self.blueprint_app_id[:8] + "…" if self.blueprint_app_id else ""
-                ),
-            }
+            return {"ok": True}
 
         @app.post("/api/messages")
         async def messages(
@@ -2436,7 +2435,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
 
             # Slice 19j — serviceUrl gate before anything else.
-            service_url = activity.get("serviceUrl") or ""
+            service_url_raw = activity.get("serviceUrl")
+            if service_url_raw is not None and not isinstance(service_url_raw, str):
+                raise HTTPException(status_code=403, detail="untrusted serviceUrl")
+            service_url = service_url_raw or ""
             trusted_suffixes = bridge.DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES
             if not trusted_suffixes:
                 logger.warning("inbound 403 reason=config-bug detail=empty-trusted-suffixes")
@@ -2865,6 +2867,8 @@ class Agent365Adapter(BasePlatformAdapter):
             sk = self._session_key_for(admission_event)
             admission_key = sk or f"agent365:{chat_id}"
             if not self._reserve_agent_turn_admission(admission_key):
+                if delivery_id is not None:
+                    self._idempotency_cache.forget(delivery_id)
                 return JSONResponse(
                     {"status": "unavailable", "reason": "active_turns_full"},
                     status_code=503,
@@ -11174,7 +11178,7 @@ class Agent365Adapter(BasePlatformAdapter):
         context = value.get("context")
         context = context if isinstance(context, dict) else {}
         consent_id = str(context.get("consentId") or "")
-        pending = self._pending_file_uploads.pop(consent_id, None)
+        pending = self._pending_file_uploads.get(consent_id)
         consent_chat_id = str((activity.get("conversation") or {}).get("id") or "")
 
         async def _remove_consent_card() -> None:
@@ -11201,6 +11205,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
 
             self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
+            if action == "decline" and pending is not None:
+                self._pending_file_uploads.pop(consent_id, None)
             return invoke.empty_invoke_ack()
         if pending is None:
             # Consent we don't know about — restart dropped the in-memory map, a
@@ -11305,6 +11311,13 @@ class Agent365Adapter(BasePlatformAdapter):
         if hashlib.sha256(data).hexdigest() != pending.get("sha256"):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
             _schedule_remove_consent_card(label="digest_mismatch")
+            return invoke.InvokeResponse(status=200, body={})
+        if self._pending_file_uploads.pop(consent_id, None) is not pending:
+            logger.warning(
+                "agent365 fileConsent accept lost pending entry consent=%s",
+                consent_id[:8],
+            )
+            _schedule_remove_consent_card(label="pending_lost")
             return invoke.InvokeResponse(status=200, body={})
         upload_task = asyncio.create_task(
             self._run_file_consent_upload_accept(
@@ -12054,7 +12067,7 @@ class Agent365Adapter(BasePlatformAdapter):
         invoke_tenant = _normalized_token(ctx.tenant_id)
         adapter_tenant = _normalized_token(self.tenant_id)
         token_user = _normalized_token(record.get("user_aad"))
-        invoke_user = _normalized_token(ctx.user_oid)
+        invoke_user = _normalized_token(ctx.token_user_oid)
         if not (token_tenant and invoke_tenant and adapter_tenant and token_user and invoke_user):
             return False
         if token_tenant != invoke_tenant or token_tenant != adapter_tenant:
