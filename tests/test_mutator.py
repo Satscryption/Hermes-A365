@@ -21,6 +21,17 @@ from hermes_a365.mutator import (
     get_mutator,
 )
 
+
+def _assert_no_marker_in_exception(exc: BaseException, marker: str) -> None:
+    assert marker not in str(exc)
+    assert all(marker not in str(arg) for arg in exc.args)
+    skip = frozenset({"argv"})
+    for key, value in vars(exc).items():
+        if key in skip or value is None:
+            continue
+        assert marker not in str(value), key
+
+
 # ---------------------------------------------------------------------------
 # RunResult shape
 # ---------------------------------------------------------------------------
@@ -190,8 +201,7 @@ class TestSensitiveRun:
         assert "VISIBLE-MARKER-456" in out
 
     def test_sensitive_failure_detail_suppressed(self, capfd: pytest.CaptureFixture[str]) -> None:
-        # A failing sensitive command may have already emitted credential
-        # material; the exception text callers print must not carry it.
+        marker = "SECRET-MARKER-789"
         m = A365CliMutator()
         m.available = True
         with pytest.raises(CliInvocationError) as excinfo:
@@ -199,14 +209,16 @@ class TestSensitiveRun:
                 [
                     sys.executable,
                     "-c",
-                    "print('SECRET-MARKER-789'); raise SystemExit(3)",
+                    f"print({marker!r}); raise SystemExit(3)",
                 ],
                 sensitive=True,
             )
-        assert "SECRET-MARKER-789" not in str(excinfo.value)
+        _assert_no_marker_in_exception(excinfo.value, marker)
+        assert excinfo.value.captured_output is None
+        assert excinfo.value.sensitive is True
         assert "suppressed" in str(excinfo.value)
         out, err = capfd.readouterr()
-        assert "SECRET-MARKER-789" not in out + err
+        assert marker not in out + err
 
     def test_sensitive_aadsts_code_still_surfaced(self) -> None:
         # AADSTS detection keeps working on the captured output; only the
@@ -266,11 +278,18 @@ class TestAdversarialSensitiveSubprocess:
     """Subprocess regressions for sensitive echo and timeout handling."""
 
     _SECRET = "FAKE_SECRET"
-    _URL = "https://login.microsoft.com/device"
     _CODE = "ABCD1234"
     _PROMPT = (
         "To sign in, use a web browser to open https://login.microsoft.com/device "
         "and enter the code ABCD1234 to authenticate."
+    )
+    _PROMPT_HYPHEN = (
+        "To sign in, use a web browser to open https://login.microsoft.com/device "
+        "and enter the code ABCD-EFGH to authenticate."
+    )
+    _PROMPT_NINE = (
+        "To sign in, use a web browser to open https://login.microsoft.com/device "
+        "and enter the code ABCDEFGH1 to authenticate."
     )
 
     def _run_cap(
@@ -283,50 +302,54 @@ class TestAdversarialSensitiveSubprocess:
         assert self._SECRET not in out + err
         return result, out, err
 
-    _ADV_URL = "https://login.microsoft.com/device enter the code ABCD1234"
-
     @pytest.mark.parametrize(
         "payload",
         [
-            f"device code: secret=FAKE_SECRET {_ADV_URL}",
-            '{"password":"FAKE_SECRET","message":"device code"} ' + _ADV_URL,
-            '"clientSecret":"FAKE_SECRET" ' + _ADV_URL,
-            "Client secret created: FAKE_SECRET — " + _ADV_URL,
-            _ADV_URL + " bare-token FAKE_SECRET",
+            "device code: secret=FAKE_SECRET "
+            + "https://login.microsoft.com/device enter the code ABCD1234",
+            '{"password":"FAKE_SECRET","message":"device code"} '
+            + "https://login.microsoft.com/device enter the code ABCD1234",
+            "Client secret created: FAKE_SECRET — "
+            + "https://login.microsoft.com/device enter the code ABCD1234",
+            "https://login.microsoft.com/device.evil enter the code ABCD1234",
+            "https://evil.microsoft.com/device enter the code ABCD1234",
+            "To sign in, use a web browser to open https://login.microsoft.com/device "
+            "and enter the code SECRET12longcredential",
         ],
     )
-    def test_adversarial_stdout_lines_suppressed(
+    def test_adversarial_lines_never_emit_device_login(
         self,
         payload: str,
         capfd: pytest.CaptureFixture[str],
     ) -> None:
         script = f"print({payload!r})"
         _, out, _ = self._run_cap(script, capfd)
-        assert self._SECRET not in out
-        assert self._CODE in out
-        assert payload not in out
+        assert "To sign in, open" not in out
+        assert self._CODE not in out
 
-    def test_adversarial_ansi_and_cr_split(self, capfd: pytest.CaptureFixture[str]) -> None:
+    def test_valid_hyphen_and_nine_char_codes(self, capfd: pytest.CaptureFixture[str]) -> None:
+        script = f"print({self._PROMPT_HYPHEN!r}); print({self._PROMPT_NINE!r})"
+        _, out, _ = self._run_cap(script, capfd)
+        assert "ABCD-EFGH" in out
+        assert "ABCDEFGH1" in out
+
+    def test_adversarial_ansi_full_line(self, capfd: pytest.CaptureFixture[str]) -> None:
         script = (
             "import sys\n"
-            "sys.stdout.write('\\x1b[31mhttps://login.microsoft.com/device\\x1b[0m "
-            "enter the code ABCD1234\\r\\n')\n"
+            "sys.stdout.write('\\x1b[1m' + "
+            f"{self._PROMPT!r} + '\\x1b[0m\\n')\n"
             "sys.stderr.write('stderr-FAKE_SECRET\\n')\n"
         )
         _, out, err = self._run_cap(script, capfd)
         assert self._SECRET not in out + err
         assert self._CODE in out
 
-    def test_adversarial_long_line(self, capfd: pytest.CaptureFixture[str]) -> None:
+    def test_adversarial_long_line_rejected(self, capfd: pytest.CaptureFixture[str]) -> None:
         filler = "x" * 5000
-        payload = (
-            f"{filler} https://login.microsoft.com/device enter the code ABCD1234 "
-            "secret=FAKE_SECRET"
-        )
+        payload = filler + " " + self._PROMPT
         script = f"print({payload!r})"
         _, out, _ = self._run_cap(script, capfd)
-        assert self._SECRET not in out
-        assert self._CODE in out
+        assert "To sign in, open" not in out
 
     def test_adversarial_unterminated_partial_times_out(
         self, capfd: pytest.CaptureFixture[str]
@@ -343,7 +366,34 @@ class TestAdversarialSensitiveSubprocess:
             m.run([sys.executable, "-c", script], sensitive=True, timeout=0.4)
         assert not excinfo.value.output
         out, err = capfd.readouterr()
-        assert self._SECRET not in out + err
+        assert "PARTIAL" not in out + err
+        assert "To sign in, open" not in out + err
+
+    def test_chunk_split_mid_code_emits_only_after_full_line(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        script = (
+            "import sys,time\n"
+            "sys.stdout.write('To sign in, use a web browser to open "
+            "https://login.microsoft.com/device and enter the code AB')\n"
+            "sys.stdout.flush()\n"
+            "time.sleep(0.15)\n"
+            "sys.stdout.write('CD1234 to authenticate.\\n')\n"
+            "sys.stdout.flush()\n"
+        )
+        _, out, _ = self._run_cap(script, capfd)
+        assert self._CODE in out
+
+    def test_same_line_extra_chars_after_code_rejected(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        bad = (
+            "To sign in, use a web browser to open https://login.microsoft.com/device "
+            "and enter the code ABCD1234EXTRA"
+        )
+        script = f"print({bad!r})"
+        _, out, _ = self._run_cap(script, capfd)
+        assert "To sign in, open" not in out
 
     def test_banner_and_prompt_in_one_chunk_while_child_alive(
         self, capfd: pytest.CaptureFixture[str]
@@ -359,17 +409,16 @@ class TestAdversarialSensitiveSubprocess:
         assert "LOADING" not in out
         assert self._CODE in out
 
-    def test_sensitive_failure_path(self, capfd: pytest.CaptureFixture[str]) -> None:
-        payload = "https://login.microsoft.com/device enter the code ABCD1234 secret=FAKE_SECRET"
-        script = f"print({payload!r}); raise SystemExit(2)"
+    def test_sensitive_failure_no_secret_in_exception_attrs(
+        self, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        script = f"print({self._PROMPT!r}); print({self._SECRET!r}); raise SystemExit(2)"
         m = A365CliMutator()
         m.available = True
         with pytest.raises(CliInvocationError) as excinfo:
             m.run([sys.executable, "-c", script], sensitive=True)
-        assert self._SECRET not in str(excinfo.value)
-        out, err = capfd.readouterr()
-        assert self._SECRET not in out + err
-        assert self._CODE in out
+        _assert_no_marker_in_exception(excinfo.value, self._SECRET)
+        assert excinfo.value.captured_output is None
 
     def test_streaming_single_chunk_prompt_visible(self, capfd: pytest.CaptureFixture[str]) -> None:
         script = (
@@ -383,6 +432,24 @@ class TestAdversarialSensitiveSubprocess:
         out, _ = capfd.readouterr()
         assert "LOADING" in out
         assert "ABCD1234" in out
+
+    def test_streaming_stdout_stderr_order(self, capfd: pytest.CaptureFixture[str]) -> None:
+        script = (
+            "import sys\n"
+            "sys.stdout.write('1stdout\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.stderr.write('2stderr\\n')\n"
+            "sys.stderr.flush()\n"
+            "sys.stdout.write('3stdout\\n')\n"
+        )
+        _, combined = _run_streaming([sys.executable, "-c", script], timeout=5.0)
+        out, _ = capfd.readouterr()
+        merged = out if out else combined
+        idx1 = merged.find("1stdout")
+        idx2 = merged.find("2stderr")
+        idx3 = merged.find("3stdout")
+        assert -1 not in (idx1, idx2, idx3)
+        assert idx1 < idx2 < idx3
 
 
 # ---------------------------------------------------------------------------

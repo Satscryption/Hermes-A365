@@ -888,8 +888,26 @@ class TestAutoRecoverSecret:
         assert marker not in err
         assert outcome.recovered is False
         assert all(marker not in m for m in outcome.messages)
-        # the by-hand az hint still gets through
         assert any("az ad app credential reset" in m for m in outcome.messages)
+
+    def test_credential_reset_sensitive_failure_has_no_raw_capture(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        marker = "FAKE-PARTIAL-SECRET-zQ2"
+        _install_az_shim(tmp_path, monkeypatch, f"echo 'oops {marker}'; exit 3")
+        monkeypatch.setenv("DOTNET_ROOT", "/nonexistent")
+        mutator = A365CliMutator()
+        mutator.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            mutator.run(
+                ["az", "ad", "app", "credential", "reset", "--id", "x"],
+                sensitive=True,
+            )
+        assert marker not in repr(excinfo.value)
+        assert marker not in str(excinfo.value)
+        assert excinfo.value.captured_output is None
 
     def test_temp_file_owner_only_under_umask_022(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

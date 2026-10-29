@@ -81,6 +81,7 @@ class CliInvocationError(RuntimeError):
         output: str,
         *,
         captured_output: str | None = None,
+        sensitive: bool = False,
     ) -> None:
         super().__init__(
             f"{argv[0]} {argv[1] if len(argv) > 1 else ''} failed (rc={returncode}): {output}"
@@ -88,10 +89,11 @@ class CliInvocationError(RuntimeError):
         self.argv = argv
         self.returncode = returncode
         self.output = output
-        # Sensitive failures keep the raw body off ``str(self)`` so callers
-        # that print the exception do not echo it. Parsers that redact first
-        # may read ``captured_output``.
-        self.captured_output = output if captured_output is None else captured_output
+        self.sensitive = sensitive
+        if sensitive:
+            self.captured_output = None
+        else:
+            self.captured_output = output if captured_output is None else captured_output
 
 
 # ---------------------------------------------------------------------------
@@ -203,7 +205,7 @@ class A365CliMutator:
                 argv,
                 returncode,
                 detail,
-                captured_output=stripped if sensitive else None,
+                sensitive=sensitive,
             )
         return RunResult(
             argv=list(argv),
@@ -223,40 +225,48 @@ _READ_CHUNK_BYTES = 4096
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?0-9;]*[ -/]*[@-~]")
 
-_DEVICE_LOGIN_URLS: tuple[tuple[str, str], ...] = (
-    ("https://login.microsoft.com/device", "https://login.microsoft.com/device"),
-    ("https://microsoft.com/devicelogin", "https://microsoft.com/devicelogin"),
+_DEVICE_LOGIN_LINE_RE = re.compile(
+    r"^To sign in, use a web browser to open (?:the page )?"
+    r"(?P<url>https://login\.microsoft\.com/device|https://microsoft\.com/devicelogin)"
+    r" and enter the code "
+    r"(?P<code>[A-Z0-9]{4}-[A-Z0-9]{4}|[A-Z0-9]{8}|[A-Z0-9]{9})"
+    r"(?: to authenticate)?\.?\s*$",
+    re.IGNORECASE,
 )
 
-_DEVICE_LOGIN_CODE_RE = re.compile(r"(?i)enter the code\s+([A-Z0-9]{8}(?:-[A-Z0-9]{4})?)")
+_CANONICAL_URLS = {
+    "https://login.microsoft.com/device": "https://login.microsoft.com/device",
+    "https://microsoft.com/devicelogin": "https://microsoft.com/devicelogin",
+}
 
 
 def _strip_ansi(text: str) -> str:
     return _ANSI_ESCAPE_RE.sub("", text)
 
 
-def _parse_device_login(text: str) -> tuple[str, str] | None:
-    """Return canonical URL and user code when a complete prompt is present."""
-    clean = _strip_ansi(text)
-    url_canonical: str | None = None
-    url_pos = -1
-    for needle, canonical in _DEVICE_LOGIN_URLS:
-        idx = clean.lower().find(needle.lower())
-        if idx >= 0:
-            url_canonical = canonical
-            url_pos = idx
-            break
-    if url_canonical is None or url_pos < 0:
+def _line_content(line: str) -> str:
+    """Strip terminators; keep interior text for matching."""
+    return _strip_ansi(line).rstrip("\r\n")
+
+
+def _parse_device_login_line(line: str, *, eof: bool = False) -> tuple[str, str] | None:
+    """Return canonical URL and user code for one complete device-login line."""
+    if not eof and not line.endswith(("\n", "\r")):
         return None
-    window = clean[url_pos : url_pos + 240]
-    match = _DEVICE_LOGIN_CODE_RE.search(window)
+    content = _line_content(line)
+    if not content:
+        return None
+    if any(ch in content for ch in ('"', "'", "{", "}", "[", "]")):
+        return None
+    match = _DEVICE_LOGIN_LINE_RE.match(content)
     if not match:
         return None
-    code = match.group(1).upper()
-    body = code.replace("-", "")
-    if len(body) != 8 or not body.isalnum():
+    url = match.group("url")
+    canonical = _CANONICAL_URLS.get(url.lower())
+    if canonical is None:
         return None
-    return url_canonical, code
+    code = match.group("code").upper()
+    return canonical, code
 
 
 def _emit_device_login(url: str, code: str, *, emitted: set[tuple[str, str]]) -> None:
@@ -268,8 +278,10 @@ def _emit_device_login(url: str, code: str, *, emitted: set[tuple[str, str]]) ->
     sys.stdout.flush()
 
 
-def _scan_text_for_device_login(text: str, *, emitted: set[tuple[str, str]]) -> None:
-    parsed = _parse_device_login(text)
+def _try_emit_device_login_line(
+    line: str, *, emitted: set[tuple[str, str]], eof: bool = False
+) -> None:
+    parsed = _parse_device_login_line(line, eof=eof)
     if parsed is not None:
         _emit_device_login(parsed[0], parsed[1], emitted=emitted)
 
@@ -323,64 +335,42 @@ def _pump_stream(fd: int, name: str, out_q: queue.Queue[tuple[str, bytes | None]
         out_q.put((name, None))
 
 
-def _run_child_output(
-    argv: list[str],
+def _run_pumped_output(
+    proc: subprocess.Popen[bytes],
     *,
+    argv: list[str],
     timeout: float,
-    stdin_input: str | None,
+    streams: tuple[str, ...],
     echo: Literal["all", "device_login"],
 ) -> tuple[int, str]:
-    """Run ``argv`` with chunked reads, deadline enforcement, and optional echo."""
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE if stdin_input is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
-    )
-    assert proc.stdout is not None and proc.stderr is not None
+    assert proc.stdout is not None
     out_q: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
-    stdout_fd = proc.stdout.fileno()
-    stderr_fd = proc.stderr.fileno()
+    fds: list[tuple[int, str]] = [(proc.stdout.fileno(), "stdout")]
+    if proc.stderr is not None:
+        fds.append((proc.stderr.fileno(), "stderr"))
     threads = [
-        threading.Thread(target=_pump_stream, args=(stdout_fd, "stdout", out_q), daemon=True),
-        threading.Thread(target=_pump_stream, args=(stderr_fd, "stderr", out_q), daemon=True),
+        threading.Thread(target=_pump_stream, args=(fd, name, out_q), daemon=True)
+        for fd, name in fds
     ]
     for thread in threads:
         thread.start()
 
-    if stdin_input is not None:
-        assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_input.encode("utf-8"))
-        finally:
-            proc.stdin.close()
-
-    captured: list[str] = []
-    stdout_buf = _LineBuffer()
-    stderr_buf = _LineBuffer()
-    eof_seen = {"stdout": False, "stderr": False}
+    buffers = {name: _LineBuffer() for name in streams}
+    eof_seen = {name: False for name in streams}
     emitted_logins: set[tuple[str, str]] = set()
+    captured: list[str] = []
     deadline = time.monotonic() + timeout
 
-    def _handle_line(line: str, stream: str) -> None:
+    def _handle_complete_line(line: str) -> None:
         captured.append(line)
         if echo == "all":
             sys.stdout.write(line)
             sys.stdout.flush()
         elif echo == "device_login":
-            _scan_text_for_device_login(line, emitted=emitted_logins)
+            _try_emit_device_login_line(line, emitted=emitted_logins, eof=False)
 
-    def _handle_pending(buffer: _LineBuffer) -> None:
-        if echo == "device_login" and buffer.pending:
-            _scan_text_for_device_login(buffer.pending, emitted=emitted_logins)
-
-    def _drain_chunk(name: str, chunk: bytes) -> None:
-        buffer = stdout_buf if name == "stdout" else stderr_buf
-        for line in buffer.feed(chunk):
-            _handle_line(line, name)
-
-    def _flush_pending(buffer: _LineBuffer, stream: str) -> None:
+    def _flush_eof_tail(name: str) -> None:
+        buffer = buffers[name]
         if not buffer.pending:
             return
         tail = buffer.pending
@@ -390,16 +380,18 @@ def _run_child_output(
             sys.stdout.write(tail)
             sys.stdout.flush()
         elif echo == "device_login":
-            _scan_text_for_device_login(tail, emitted=emitted_logins)
+            _try_emit_device_login_line(tail, emitted=emitted_logins, eof=True)
+
+    def _drain_chunk(name: str, chunk: bytes) -> None:
+        for line in buffers[name].feed(chunk):
+            _handle_complete_line(line)
 
     def _process_queue_item(name: str, payload: bytes | None) -> None:
         if payload is None:
             eof_seen[name] = True
-            buffer = stdout_buf if name == "stdout" else stderr_buf
-            _flush_pending(buffer, name)
+            _flush_eof_tail(name)
             return
         _drain_chunk(name, payload)
-        _handle_pending(stdout_buf if name == "stdout" else stderr_buf)
 
     while True:
         remaining = deadline - time.monotonic()
@@ -417,20 +409,47 @@ def _run_child_output(
                     except queue.Empty:
                         break
                     _process_queue_item(name, payload)
-                _flush_pending(stdout_buf, "stdout")
-                _flush_pending(stderr_buf, "stderr")
+                for stream in streams:
+                    if not eof_seen[stream]:
+                        _flush_eof_tail(stream)
                 break
             continue
         _process_queue_item(name, payload)
-        if eof_seen["stdout"] and eof_seen["stderr"] and out_q.empty() and proc.poll() is not None:
+        if all(eof_seen[s] for s in streams) and out_q.empty() and proc.poll() is not None:
             break
 
     proc.wait(timeout=5)
     proc.stdout.close()
-    proc.stderr.close()
+    if proc.stderr is not None:
+        proc.stderr.close()
     for thread in threads:
         thread.join(timeout=1.0)
     return proc.returncode or 0, "".join(captured)
+
+
+def _run_child_output(
+    argv: list[str],
+    *,
+    timeout: float,
+    stdin_input: str | None,
+    echo: Literal["all", "device_login"],
+    merge_stderr: bool,
+) -> tuple[int, str]:
+    proc = subprocess.Popen(
+        argv,
+        stdin=subprocess.PIPE if stdin_input is not None else None,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
+    )
+    if stdin_input is not None:
+        assert proc.stdin is not None
+        try:
+            proc.stdin.write(stdin_input.encode("utf-8"))
+        finally:
+            proc.stdin.close()
+    streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
+    return _run_pumped_output(proc, argv=argv, timeout=timeout, streams=streams, echo=echo)
 
 
 def _run_sensitive_streaming(
@@ -439,7 +458,13 @@ def _run_sensitive_streaming(
     timeout: float,
     stdin_input: str | None = None,
 ) -> tuple[int, str]:
-    return _run_child_output(argv, timeout=timeout, stdin_input=stdin_input, echo="device_login")
+    return _run_child_output(
+        argv,
+        timeout=timeout,
+        stdin_input=stdin_input,
+        echo="device_login",
+        merge_stderr=False,
+    )
 
 
 def _run_streaming(
@@ -454,18 +479,16 @@ def _run_streaming(
     :class:`subprocess.TimeoutExpired` without captured output when the
     wall-clock deadline is hit.
 
-    Behaviour:
-
-    - Separate stdout/stderr pipes read in bounded chunks (threaded pumps
-      so Windows hosts behave like POSIX).
-    - Lines are written to ``sys.stdout`` as they arrive.
-    - When ``stdin_input`` is provided, the subprocess gets a piped stdin
-      pre-fed with that string (then closed).
-    - The captured copy is returned for AADSTS detection in :meth:`run`.
-
-    Tests patch this helper directly rather than reaching into Popen.
+    Child stderr is merged into stdout so interleaved CLI progress keeps
+    chronological order in the captured stream.
     """
-    return _run_child_output(argv, timeout=timeout, stdin_input=stdin_input, echo="all")
+    return _run_child_output(
+        argv,
+        timeout=timeout,
+        stdin_input=stdin_input,
+        echo="all",
+        merge_stderr=True,
+    )
 
 
 def get_mutator() -> Mutator:
