@@ -6,6 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **#191 — Client secret expiry in `doctor` / `status`.** Read
+  ``passwordCredentials`` ``endDateTime`` metadata (never secret values) for
+  the blueprint app and Path B Bot Framework app via the existing ``az rest`` /
+  mutator Graph path. **Warn** within 30 days by default
+  (``--secret-expiry-warn-days N``); **fail** when expired or no active secret;
+  degrade to a clear “could not check” notice on permission or parse errors.
+  Rotation runbook: ``references/client-secret-rotation.md``. Refs
+  [#191](https://github.com/Satscryption/Hermes-A365/issues/191).
+
 ### Removed
 
 - **#189 — Unexported OTLP telemetry key, probe, and docs claim (v0.9.6.1).**

@@ -112,9 +112,7 @@ class TestParseA365CliVersion:
             ("version unknown", None),
         ],
     )
-    def test_extracts_semver(
-        self, text: str, expected: tuple[int, int, int] | None
-    ) -> None:
+    def test_extracts_semver(self, text: str, expected: tuple[int, int, int] | None) -> None:
         assert parse_a365_cli_version(text) == expected
 
 
@@ -303,9 +301,7 @@ class TestParseAzCliVersion:
             ("azure-cli    2.55.0", None),
         ],
     )
-    def test_extracts_semver(
-        self, text: str, expected: tuple[int, int, int] | None
-    ) -> None:
+    def test_extracts_semver(self, text: str, expected: tuple[int, int, int] | None) -> None:
         assert parse_az_cli_version(text) == expected
 
     @pytest.mark.parametrize(
@@ -560,9 +556,7 @@ class TestProbeCustomClientApp:
     def test_constants_pinned(self) -> None:
         assert DEFAULT_CLIENT_APP_NAME == "Agent 365 CLI"
 
-    def test_env_var_overrides_default_name(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_env_var_overrides_default_name(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """Slice 18r (bug #3): operators with a custom client-app name can
         set A365_CLIENT_APP_NAME to skip the rename."""
         monkeypatch.setenv("A365_CLIENT_APP_NAME", "Agent365-CLI-OpenClaw")
@@ -582,9 +576,7 @@ class TestProbeCustomClientApp:
         assert "Agent365-CLI-OpenClaw" in captured[0]
         assert "Agent 365 CLI" not in captured[0]
 
-    def test_explicit_name_arg_wins_over_env(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_explicit_name_arg_wins_over_env(self, monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.setenv("A365_CLIENT_APP_NAME", "From-Env")
         captured: list[list[str]] = []
 
@@ -690,9 +682,7 @@ class TestProbeLocalConfig:
 
 
 class TestProbeFileTransfer:
-    def test_env_fallback_enabled(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_env_fallback_enabled(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # config present but the profile key is absent → env is the fallback.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         (tmp_path / "config.yaml").write_text(
@@ -704,9 +694,7 @@ class TestProbeFileTransfer:
         assert r.data["source"] == "env"
         assert r.data["host_count"] == 1
 
-    def test_profile_beats_env(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_profile_beats_env(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # Mirrors the adapter: a present profile key wins; env is ignored.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "stale-env.sharepoint.com")
@@ -726,16 +714,13 @@ class TestProbeFileTransfer:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "stale-env.sharepoint.com")
         (tmp_path / "config.yaml").write_text(
-            "gateway:\n  platforms:\n    agent365:\n      extra:\n"
-            "        file_host_allowlist: []\n"
+            "gateway:\n  platforms:\n    agent365:\n      extra:\n        file_host_allowlist: []\n"
         )
         r = probe_file_transfer()
         assert r.data["source"] == "profile-empty"
         assert r.data["host_count"] == 0
 
-    def test_profile_config_enabled(
-        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_profile_config_enabled(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         # The documented profile source must NOT be misreported as disabled.
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
@@ -781,8 +766,7 @@ class TestProbeFileTransfer:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.setenv("A365_FILE_HOST_ALLOWLIST", "env.sharepoint.com")
         (tmp_path / "config.yaml").write_text(
-            "gateway:\n  platforms:\n    agent365:\n      extra:\n"
-            "        file_host_allowlist:\n"
+            "gateway:\n  platforms:\n    agent365:\n      extra:\n        file_host_allowlist:\n"
         )
         r = probe_file_transfer()
         assert r.data["source"] == "env"
@@ -794,8 +778,7 @@ class TestProbeFileTransfer:
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))
         monkeypatch.delenv("A365_FILE_HOST_ALLOWLIST", raising=False)
         (tmp_path / "config.yaml").write_text(
-            "gateway:\n  platforms:\n    agent365:\n      extra:\n"
-            "        file_host_allowlist: 5\n"
+            "gateway:\n  platforms:\n    agent365:\n      extra:\n        file_host_allowlist: 5\n"
         )
         r = probe_file_transfer()
         assert r.state == "ok"
@@ -1004,6 +987,16 @@ class _GreenBotServiceRunner:
 
 
 class TestRunAllProbes:
+    @pytest.fixture(autouse=True)
+    def _stub_secret_expiry_graph(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_get(_url: str) -> dict[str, object]:
+            return {"passwordCredentials": []}
+
+        monkeypatch.setattr(
+            "hermes_a365.client_secret_expiry.build_graph_get",
+            lambda *_a, **_k: fake_get,
+        )
+
     def test_includes_all_probes_by_default(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -1033,9 +1026,7 @@ class TestRunAllProbes:
         names = [p.name for p in report.probes]
         assert "network" not in names
 
-    def test_path_a_only_install_does_not_add_bot_service_probes(
-        self, tmp_path: Path
-    ) -> None:
+    def test_path_a_only_install_does_not_add_bot_service_probes(self, tmp_path: Path) -> None:
         with (
             patch(
                 "hermes_a365.doctor.probe_a365_cli",
@@ -1084,9 +1075,7 @@ class TestRunAllProbes:
             no_network=True,
             bot_service_sidecar_path=sidecar,
             generated_config_path=tmp_path / "a365.generated.config.json",
-            bot_service_operator_env={
-                "A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"
-            },
+            bot_service_operator_env={"A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"},
         )
         bot_results = [p for p in report.probes if p.name.startswith("bot_service")]
 
@@ -1096,18 +1085,14 @@ class TestRunAllProbes:
         ]
         assert {p.state for p in bot_results} == {"ok"}
 
-    def test_path_b_runtime_auth_failure_maps_to_doctor_error(
-        self, tmp_path: Path
-    ) -> None:
+    def test_path_b_runtime_auth_failure_maps_to_doctor_error(self, tmp_path: Path) -> None:
         sidecar = _write_bot_service_sidecar(tmp_path)
 
         report = run_all_probes(
             bot_service_sidecar_path=sidecar,
             generated_config_path=tmp_path / "a365.generated.config.json",
             bot_service_runner=_GreenBotServiceRunner(),
-            bot_service_operator_env={
-                "A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"
-            },
+            bot_service_operator_env={"A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"},
             bot_service_runtime_auth_probe=lambda _config: DiagnosticResult(
                 "bot_service_runtime_auth",
                 "error",

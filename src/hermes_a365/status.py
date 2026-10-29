@@ -44,12 +44,21 @@ import json
 import os
 import shutil
 import sys
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Literal, Protocol
 
 from . import bot_service, bot_service_diagnostics
 from ._common import parse_env, safe_run, slugify, validate_slug
+from .client_secret_expiry import (
+    DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
+    gather_client_secret_expiry_checks,
+    status_component_detail,
+    status_component_state,
+)
+from .entra_state import GraphGet
 
 ComponentState = Literal["ok", "warn", "error", "missing", "skipped"]
 OverallState = Literal["ok", "partial", "broken", "uninitialized"]
@@ -331,9 +340,7 @@ def gather_local_config(hermes_home: Path, agent_name: str | None) -> StatusComp
         data["agent_env"] = _redact_secret_env(agent_env)
         data["agent_dir"] = str(agent_env_file.parent)
         data["aa_instance_id"] = agent_env.get("AA_INSTANCE_ID")
-        detail_parts.append(
-            f"agent={agent_env_file.parent.name} ({len(agent_env)} keys)"
-        )
+        detail_parts.append(f"agent={agent_env_file.parent.name} ({len(agent_env)} keys)")
 
     return StatusComponent("local_config", _OK, " | ".join(detail_parts), data)
 
@@ -585,6 +592,46 @@ def gather_bot_service(
     )
 
 
+def gather_client_secret_expiry(
+    hermes_home: Path,
+    *,
+    agent_name: str | None,
+    sidecar_path: Path,
+    generated_config_path: Path,
+    warn_days: int = DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
+    graph_get: GraphGet | None = None,
+    now: Callable[[], datetime] | None = None,
+    operator_env: dict[str, str] | None = None,
+) -> StatusComponent:
+    rows = gather_client_secret_expiry_checks(
+        hermes_home=hermes_home,
+        agent_name=agent_name,
+        sidecar_path=sidecar_path,
+        generated_config_path=generated_config_path,
+        warn_days=warn_days,
+        graph_get=graph_get,
+        now=now,
+        operator_env=operator_env,
+        for_status=True,
+    )
+    roll = status_component_state(rows)
+    component_state = {
+        "ok": _OK,
+        "warn": _WARN,
+        "error": _ERROR,
+        "skipped": _SKIPPED,
+    }[roll]
+    details = status_component_detail(rows)
+    data = {
+        "warn_days": warn_days,
+        "apps": {
+            name: {"state": state, "detail": detail, **payload}
+            for name, state, detail, payload in rows
+        },
+    }
+    return StatusComponent("client_secret_expiry", component_state, details, data)
+
+
 # ---------------------------------------------------------------------------
 # Orchestration
 # ---------------------------------------------------------------------------
@@ -601,6 +648,9 @@ def collect_status(
     bot_service_runner: bot_service.CommandRunner | None = None,
     bot_service_operator_env: dict[str, str] | None = None,
     bot_service_runtime_auth_probe: bot_service_diagnostics.RuntimeAuthProbe | None = None,
+    secret_expiry_warn_days: int = DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
+    graph_get: GraphGet | None = None,
+    secret_expiry_now: Callable[[], datetime] | None = None,
 ) -> StatusReport:
     """Build the full status report."""
     if hermes_home is None:
@@ -645,6 +695,19 @@ def collect_status(
 
     if agent_name:
         components.append(gather_activity_bridge(hermes_home, agent_name))
+
+    components.append(
+        gather_client_secret_expiry(
+            hermes_home,
+            agent_name=agent_name,
+            sidecar_path=bot_service_sidecar_path,
+            generated_config_path=generated_config_path,
+            warn_days=secret_expiry_warn_days,
+            graph_get=graph_get,
+            now=secret_expiry_now,
+            operator_env=bot_service_operator_env,
+        )
+    )
 
     return StatusReport(agent_name=agent_name, components=components)
 
@@ -698,6 +761,13 @@ def render_json(report: StatusReport) -> str:
 # ---------------------------------------------------------------------------
 
 
+def _non_negative_int(value: str) -> int:
+    parsed = int(value)
+    if parsed < 0:
+        raise argparse.ArgumentTypeError("must be >= 0")
+    return parsed
+
+
 def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.ArgumentParser:
     if parser is None:
         parser = argparse.ArgumentParser(
@@ -710,11 +780,25 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
     )
     parser.add_argument("--tenant-id", help="override tenant id used for cloud reads")
     parser.add_argument("--human", action="store_true", help="markdown-aligned output")
+    parser.add_argument(
+        "--secret-expiry-warn-days",
+        type=_non_negative_int,
+        default=DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
+        metavar="N",
+        help=(
+            "warn when the last active client secret expires within "
+            f"N days (default {DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS})"
+        ),
+    )
     return parser
 
 
 def run(args: argparse.Namespace) -> int:
-    report = collect_status(args.agent_name, tenant_id=args.tenant_id)
+    report = collect_status(
+        args.agent_name,
+        tenant_id=args.tenant_id,
+        secret_expiry_warn_days=args.secret_expiry_warn_days,
+    )
     sys.stdout.write(render_human(report) if args.human else render_json(report))
     return overall_to_exit_code(report.overall)
 
