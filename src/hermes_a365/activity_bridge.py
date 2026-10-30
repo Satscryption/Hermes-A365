@@ -2394,6 +2394,7 @@ async def validate_inbound_jwt(
             audience=expected_app_id,
             issuer=expected_issuer,
             leeway=300,
+            options={"require": ["exp", "nbf"]},
         )
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"signature/aud/iss check failed: {e}") from e
@@ -2567,6 +2568,7 @@ async def validate_inbound_jwt_bf(
             audience=expected_app_id,
             issuer=BF_ISSUER,
             leeway=300,
+            options={"require": ["exp", "nbf"]},
         )
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"BF signature/aud/iss check failed: {e}") from e
@@ -3706,7 +3708,13 @@ def make_app(
             await http_client.aclose()
 
     _validate_webhook_url(cfg.webhook_url, development_mode=cfg.skip_jwt_validation)
-    app = _FastAPI(title=f"hermes a365 activity-bridge — {cfg.slug}", lifespan=_serve_lifespan)
+    app = _FastAPI(
+        title=f"hermes a365 activity-bridge — {cfg.slug}",
+        lifespan=_serve_lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+    )
 
     pre_auth_state = _ServePreAuthState()
     app.add_middleware(
@@ -3721,11 +3729,7 @@ def make_app(
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
-        return {
-            "ok": True,
-            "slug": cfg.slug,
-            "blueprint_client_id": cfg.blueprint_client_id[:8] + "…",
-        }
+        return {"ok": True}
 
     @app.post("/api/messages")
     async def messages(

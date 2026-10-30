@@ -2370,7 +2370,12 @@ class Agent365Adapter(BasePlatformAdapter):
         from fastapi import Body, FastAPI, Header, HTTPException
         from fastapi.responses import JSONResponse
 
-        app = FastAPI(title=f"agent365 adapter — {self.slug or 'default'}")
+        app = FastAPI(
+            title=f"agent365 adapter — {self.slug or 'default'}",
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
+        )
 
         app.add_middleware(
             bridge.BoundedRequestBodyMiddleware,
@@ -2404,13 +2409,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
         @app.get("/healthz")
         async def healthz() -> dict[str, Any]:
-            return {
-                "ok": True,
-                "slug": self.slug,
-                "blueprint_client_id": (
-                    self.blueprint_app_id[:8] + "…" if self.blueprint_app_id else ""
-                ),
-            }
+            return {"ok": True}
 
         @app.post("/api/messages")
         async def messages(
@@ -11156,6 +11155,27 @@ class Agent365Adapter(BasePlatformAdapter):
 
         task.add_done_callback(_done)
 
+    def _file_consent_pending_matches_activity(
+        self, activity: dict[str, Any], pending: dict[str, Any]
+    ) -> bool:
+        pending_chat_id = str(pending.get("conversation_id") or "")
+        if (
+            self._disconnecting
+            or pending.get("lifecycle_generation") != self._lifecycle_generation
+            or pending.get("chat_generation") != self._chat_generation(pending_chat_id)
+        ):
+            return False
+        act_conv = str((activity.get("conversation") or {}).get("id") or "")
+        act_user = str((activity.get("from") or {}).get("id") or "")
+        act_surl = str(activity.get("serviceUrl") or "")
+        if (
+            act_conv != pending.get("conversation_id")
+            or act_user != pending.get("user_id")
+            or act_surl != pending.get("service_url")
+        ):
+            return False
+        return time.time() - float(pending.get("created_at") or 0.0) <= _PENDING_UPLOAD_TTL_SEC
+
     async def _handle_file_consent(
         self, activity: dict[str, Any], *, validated_path: str | None
     ) -> invoke.InvokeResponse:
@@ -11174,7 +11194,7 @@ class Agent365Adapter(BasePlatformAdapter):
         context = value.get("context")
         context = context if isinstance(context, dict) else {}
         consent_id = str(context.get("consentId") or "")
-        pending = self._pending_file_uploads.pop(consent_id, None)
+        pending = self._pending_file_uploads.get(consent_id)
         consent_chat_id = str((activity.get("conversation") or {}).get("id") or "")
 
         async def _remove_consent_card() -> None:
@@ -11201,6 +11221,12 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
 
             self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
+            if (
+                action == "decline"
+                and pending is not None
+                and self._file_consent_pending_matches_activity(activity, pending)
+            ):
+                self._pending_file_uploads.pop(consent_id, None)
             return invoke.empty_invoke_ack()
         if pending is None:
             # Consent we don't know about — restart dropped the in-memory map, a
@@ -11212,11 +11238,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.empty_invoke_ack()
 
         pending_chat_id = str(pending.get("conversation_id") or "")
-        if (
-            self._disconnecting
-            or pending.get("lifecycle_generation") != self._lifecycle_generation
-            or pending.get("chat_generation") != self._chat_generation(pending_chat_id)
-        ):
+        if not self._file_consent_pending_matches_activity(activity, pending):
             logger.warning(
                 "agent365 fileConsent accept for expired lifecycle consent=%s",
                 consent_id[:8],
@@ -11225,35 +11247,6 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F2 / R2-P1 — capability model, not authenticated-user check.
-        # The real boundary is: (1) this handler is only reached AFTER inbound-JWT
-        # validation (a legitimate platform caller), and (2) ``consent_id`` is an
-        # unguessable uuid4 we minted, sent only in this card, and popped once. The
-        # conversation / user / serviceUrl comparisons below are body-derived (BF
-        # service tokens carry no end-user claim) and serve as CONSISTENCY
-        # defence-in-depth — a valid consentId replayed onto a different
-        # conversation still won't upload. They are NOT claimed as authenticated
-        # identity.
-        act_conv = str((activity.get("conversation") or {}).get("id") or "")
-        act_user = str((activity.get("from") or {}).get("id") or "")
-        act_surl = str(activity.get("serviceUrl") or "")
-        if (
-            act_conv != pending.get("conversation_id")
-            or act_user != pending.get("user_id")
-            or act_surl != pending.get("service_url")
-        ):
-            logger.warning(
-                "agent365 fileConsent accept context mismatch consent=%s",
-                consent_id[:8],
-            )
-            _schedule_remove_consent_card(label="context_mismatch")
-            return invoke.InvokeResponse(status=200, body={})
-
-        # Review-F3: a consent the user answers long after the offer is stale.
-        if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
-            logger.warning("agent365 fileConsent accept expired consent=%s", consent_id[:8])
-            _schedule_remove_consent_card(label="consent_expired")
-            return invoke.InvokeResponse(status=200, body={})
-
         upload_info = value.get("uploadInfo")
         upload_info = upload_info if isinstance(upload_info, dict) else {}
         upload_url = str(upload_info.get("uploadUrl") or "")
@@ -11305,6 +11298,13 @@ class Agent365Adapter(BasePlatformAdapter):
         if hashlib.sha256(data).hexdigest() != pending.get("sha256"):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
             _schedule_remove_consent_card(label="digest_mismatch")
+            return invoke.InvokeResponse(status=200, body={})
+        if self._pending_file_uploads.pop(consent_id, None) is not pending:
+            logger.warning(
+                "agent365 fileConsent accept lost pending entry consent=%s",
+                consent_id[:8],
+            )
+            _schedule_remove_consent_card(label="pending_lost")
             return invoke.InvokeResponse(status=200, body={})
         upload_task = asyncio.create_task(
             self._run_file_consent_upload_accept(
@@ -12054,7 +12054,7 @@ class Agent365Adapter(BasePlatformAdapter):
         invoke_tenant = _normalized_token(ctx.tenant_id)
         adapter_tenant = _normalized_token(self.tenant_id)
         token_user = _normalized_token(record.get("user_aad"))
-        invoke_user = _normalized_token(ctx.user_oid)
+        invoke_user = _normalized_token(ctx.token_user_oid)
         if not (token_tenant and invoke_tenant and adapter_tenant and token_user and invoke_user):
             return False
         if token_tenant != invoke_tenant or token_tenant != adapter_tenant:
