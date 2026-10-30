@@ -12,6 +12,7 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager, suppress
@@ -251,7 +252,13 @@ def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o6
         except SidecarBackupError:
             raise
         except OSError as exc:
-            if tmp.is_dir():
+            try:
+                tmp_stat = tmp.lstat()
+            except OSError:
+                raise SidecarBackupError(
+                    f"could not prepare sidecar backup temp file at {tmp}: {exc}"
+                ) from exc
+            if stat.S_ISDIR(tmp_stat.st_mode):
                 raise SidecarBackupError(
                     f"could not open sidecar backup at {path}: temp path is a directory"
                 ) from exc

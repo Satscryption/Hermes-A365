@@ -57,14 +57,19 @@ def _sidecar_v2_bytes(agent_name: str = "agent") -> bytes:
 
 def _iter_exception_chain(exc: BaseException | None) -> Iterable[BaseException]:
     seen: set[int] = set()
-    current = exc
-    while current is not None and id(current) not in seen:
+    pending: list[BaseException] = []
+    if exc is not None:
+        pending.append(exc)
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
         seen.add(id(current))
         yield current
-        if current.__suppress_context__:
-            current = current.__cause__
-        else:
-            current = current.__cause__ or current.__context__
+        if current.__cause__ is not None:
+            pending.append(current.__cause__)
+        if current.__context__ is not None:
+            pending.append(current.__context__)
 
 
 def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
@@ -74,12 +79,13 @@ def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
     if oid in _seen:
         return
     if isinstance(value, (str, bytes, bytearray)):
-        text = value.decode() if isinstance(value, (bytes, bytearray)) else value
+        text = value.decode("latin-1") if isinstance(value, (bytes, bytearray)) else value
         assert marker not in text, repr(value)[:200]
         return
     _seen.add(oid)
     if isinstance(value, dict):
-        for item in value.values():
+        for key, item in value.items():
+            _scan_value_for_marker(key, marker, _seen=_seen)
             _scan_value_for_marker(item, marker, _seen=_seen)
         return
     if isinstance(value, (list, tuple, set, frozenset)):
@@ -91,22 +97,24 @@ def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
 def _assert_failure_artifacts_clean(exc: BaseException, marker: str) -> None:
     gc.collect()
     assert exc.__cause__ is None
+    assert exc.__context__ is None
     for link in _iter_exception_chain(exc):
         assert marker not in str(link)
         assert marker not in repr(link)
         assert all(marker not in str(arg) for arg in link.args)
-        for _key, val in vars(link).items():
-            if _key == "object":
-                _scan_value_for_marker(val, marker, _seen=set())
-            else:
-                _scan_value_for_marker(val, marker, _seen=set())
-    tb = exc.__traceback__
-    while tb is not None:
-        filename = tb.tb_frame.f_code.co_filename
-        if f"{os.sep}hermes_a365{os.sep}" in filename and f"{os.sep}tests{os.sep}" not in filename:
-            for _name, value in tb.tb_frame.f_locals.items():
-                _scan_value_for_marker(value, marker, _seen=set())
-        tb = tb.tb_next
+        for key, val in vars(link).items():
+            _scan_value_for_marker(key, marker, _seen=set())
+            _scan_value_for_marker(val, marker, _seen=set())
+    for link in _iter_exception_chain(exc):
+        tb = link.__traceback__
+        while tb is not None:
+            filename = tb.tb_frame.f_code.co_filename
+            in_pkg = f"{os.sep}hermes_a365{os.sep}" in filename
+            in_tests = f"{os.sep}tests{os.sep}" in filename
+            if in_pkg and not in_tests:
+                for _name, value in tb.tb_frame.f_locals.items():
+                    _scan_value_for_marker(value, marker, _seen=set())
+            tb = tb.tb_next
     assert marker not in "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
@@ -117,10 +125,15 @@ def _assert_marker_absent_from_bot_service_failure(exc: BaseException, marker: s
 class TestC1ConversationsStrictUtf8:
     def test_utf16_registry_roundtrip_via_save(self, tmp_path: Path) -> None:
         path = tmp_path / "conversations.json"
-        path.write_bytes('{"schemaVersion": 1, "conversations": {}}'.encode("utf-16-le"))
+        original = '{"schemaVersion": 1, "conversations": {}}'.encode("utf-16-le")
+        path.write_bytes(original)
         reg = ConversationRegistry.load(path)
         ConversationRegistry.write_payload(path, reg.to_payload())
-        assert path.read_bytes().decode("utf-8").startswith("{")
+        quarantine = next(p for p in tmp_path.iterdir() if ".corrupt-" in p.name)
+        assert quarantine.read_bytes() == original
+        rewritten = path.read_bytes()
+        assert rewritten.decode("utf-8").startswith("{")
+        assert json.loads(rewritten.decode("utf-8"))["schemaVersion"] == 1
 
     def test_utf32_bom_registry_roundtrip_via_save(self, tmp_path: Path) -> None:
         path = tmp_path / "conversations.json"
@@ -192,6 +205,7 @@ class TestC3AgentNameTypeValidation:
         }
         with pytest.raises(BotServiceError) as exc:
             BotServiceConfig.from_json_text(json.dumps(payload), source="cfg")
+        _assert_failure_artifacts_clean(exc.value, sentinel)
         assert sentinel not in str(exc.value)
         assert "dict" in str(exc.value).lower() or "unsupported type" in str(exc.value).lower()
 
@@ -215,6 +229,7 @@ class TestC3AgentNameTypeValidation:
         }
         with pytest.raises(BotServiceError) as exc:
             BotServiceConfig.from_json_text(json.dumps(payload), source="cfg")
+        _assert_failure_artifacts_clean(exc.value, sentinel)
         assert sentinel not in str(exc.value)
         assert "list" in str(exc.value).lower() or "unsupported type" in str(exc.value).lower()
 
@@ -396,19 +411,93 @@ class TestPr274FixRound:
         path.write_bytes(valid)
         reads = {"n": 0}
         real_read_bytes = Path.read_bytes
+        second_read = bytes([0xFF])
 
         def read_bytes(self: Path) -> bytes:
             reads["n"] += 1
             if reads["n"] == 1:
                 return real_read_bytes(self)
-            return bytes([0xFF])
+            return second_read
 
         monkeypatch.setattr(Path, "read_bytes", read_bytes)
         payload = {"schemaVersion": 1, "conversations": {}}
         ConversationRegistry.write_payload(path, payload)
         quarantine = next(p for p in tmp_path.iterdir() if ".corrupt-" in p.name)
-        assert quarantine.read_bytes() == bytes([0xFF])
+        assert real_read_bytes(quarantine) == second_read
         json.loads(path.read_text())
+
+    def test_from_json_text_invalid_json_reports_line_column(self) -> None:
+        with pytest.raises(BotServiceError, match=r"line 1 column") as excinfo:
+            BotServiceConfig.from_json_text("{", source="cfg")
+        assert excinfo.value.__context__ is None
+
+    def test_create_refuses_dangling_symlink_before_azure(self, tmp_path: Path) -> None:
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        sidecar.symlink_to(tmp_path / "missing.json")
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+            app_id="00000000-0000-0000-0000-000000000001",
+        )
+        env = {"A365_BF_APP_ID": "00000000-0000-0000-0000-000000000001"}
+        plan = build_create_plan(inputs, operator_env=env)
+        runner = FakeRunner(group_exists=False)
+        with pytest.raises(BotServiceError, match="not a regular sidecar file"):
+            apply_create_plan(plan, runner=runner, operator_env=env)
+        assert runner.calls == []
+
+    def test_backup_temp_permission_error_is_sidecar_backup_error(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "sidecar.json.backup-test"
+        part = target.with_name(f".{target.name}.part-{os.getpid()}")
+        part.mkdir()
+        real_is_dir = Path.is_dir
+
+        def guarded_is_dir(self: Path) -> bool:
+            if self == part:
+                raise PermissionError("injected eacces")
+            return real_is_dir(self)
+
+        monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
+        with pytest.raises(SidecarBackupError, match="prepare|directory|backup"):
+            write_owner_only_bytes_exclusive(target, b"payload\n")
+        assert not target.exists()
+
+    def test_recheck_quarantine_backup_failure_scrubs_bytes(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365 import _common
+        from hermes_a365.plugin import conversations as conversations_mod
+
+        marker = b"\xff" + b"SENTINEL-274-QUARANTINE-BACKUP"
+        path = tmp_path / "conversations.json"
+        valid = (json.dumps({"schemaVersion": 1, "conversations": {}}) + "\n").encode()
+        path.write_bytes(valid)
+        reads = {"n": 0}
+        real_read_bytes = Path.read_bytes
+        real_write = _common.write_owner_only_bytes_exclusive
+
+        def read_bytes(self: Path) -> bytes:
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return real_read_bytes(self)
+            return marker
+
+        def fail_backup(path_arg: Path, data: bytes, **kwargs: Any) -> Path:
+            if marker in data:
+                raise SidecarBackupError("injected quarantine backup failure")
+            return real_write(path_arg, data, **kwargs)
+
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+        monkeypatch.setattr(_common, "write_owner_only_bytes_exclusive", fail_backup)
+        monkeypatch.setattr(conversations_mod, "write_owner_only_bytes_exclusive", fail_backup)
+
+        with pytest.raises(SidecarBackupError) as excinfo:
+            ConversationRegistry.write_payload(path, {"schemaVersion": 1, "conversations": {}})
+        _assert_failure_artifacts_clean(excinfo.value, "SENTINEL-274-QUARANTINE-BACKUP")
 
     def test_backup_temp_directory_raises_sidecar_backup_error(self, tmp_path: Path) -> None:
         target = tmp_path / "sidecar.json.backup-test"

@@ -261,78 +261,98 @@ class BotServiceConfig:
     @classmethod
     def from_json_text(cls, text: str, *, source: str) -> BotServiceConfig:
         """Parse one already-bound sidecar snapshot."""
+        json_error: str | None = None
+        raw: Any = None
         try:
             raw = json.loads(text)
-        except json.JSONDecodeError:
-            text = ""
-            raise BotServiceError(f"{source} is not valid JSON (invalid JSON)") from None
+        except json.JSONDecodeError as exc:
+            json_error = _sidecar_json_error_message(source, exc)
+        except ValueError as exc:
+            json_error = _sidecar_json_error_message(source, exc)
         text = ""
+        if json_error is not None:
+            raw = None
+            raise BotServiceError(json_error)
         if not isinstance(raw, dict):
-            raise BotServiceError(f"{source} is JSON {type(raw).__name__}, expected object")
-        raw.setdefault("resourceGroupManaged", False)
-        missing = [
-            f.name
-            for f in fields(cls)
-            if f.name not in raw and f.default is MISSING and f.default_factory is MISSING
-        ]
-        if missing:
-            raise BotServiceError(f"{source} missing required keys: {missing}")
-        schema_version = raw.get("schemaVersion")
-        if (
-            not isinstance(schema_version, int)
-            or isinstance(schema_version, bool)
-            or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
-        ):
-            kind = type(schema_version).__name__
-            if isinstance(schema_version, int) and not isinstance(schema_version, bool):
+            kind = type(raw).__name__
+            raw = None
+            raise BotServiceError(f"{source} is JSON {kind}, expected object")
+        try:
+            raw.setdefault("resourceGroupManaged", False)
+            bound: Any = None
+            agent_name: Any = None
+            missing = [
+                f.name
+                for f in fields(cls)
+                if f.name not in raw and f.default is MISSING and f.default_factory is MISSING
+            ]
+            if missing:
+                raise BotServiceError(f"{source} missing required keys: {missing}")
+            schema_version = raw.get("schemaVersion")
+            if (
+                not isinstance(schema_version, int)
+                or isinstance(schema_version, bool)
+                or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
+            ):
+                kind = type(schema_version).__name__
+                if isinstance(schema_version, int) and not isinstance(schema_version, bool):
+                    raise BotServiceError(
+                        f"{source} schemaVersion is unsupported; "
+                        f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
+                    )
                 raise BotServiceError(
-                    f"{source} schemaVersion is unsupported; "
+                    f"{source} schemaVersion has unsupported type {kind}; "
                     f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
                 )
-            raise BotServiceError(
-                f"{source} schemaVersion has unsupported type {kind}; "
-                f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
-            )
-        if "agentName" in raw:
-            bound = raw.get("agentName")
-            if bound is not None and not isinstance(bound, str):
+            if "agentName" in raw:
+                bound = raw.get("agentName")
+                if bound is not None and not isinstance(bound, str):
+                    raise BotServiceError(
+                        f"{source} agentName has unsupported type {type(bound).__name__}; "
+                        "expected str"
+                    )
+            if schema_version == SIDECAR_SCHEMA_VERSION:
+                agent_name = raw.get("agentName")
+                if not isinstance(agent_name, str) or not agent_name.strip():
+                    raise BotServiceError(
+                        f"{source} schemaVersion={SIDECAR_SCHEMA_VERSION} requires a non-empty "
+                        "agentName binding; refusing to load"
+                    )
+            if not isinstance(raw.get("resourceGroupManaged"), bool):
                 raise BotServiceError(
-                    f"{source} agentName has unsupported type {type(bound).__name__}; expected str"
+                    f"{source} resourceGroupManaged must be true or false "
+                    f"(got {type(raw.get('resourceGroupManaged')).__name__}); "
+                    "refusing to infer purge authority"
                 )
-        if schema_version == SIDECAR_SCHEMA_VERSION:
-            agent_name = raw.get("agentName")
-            if not isinstance(agent_name, str) or not agent_name.strip():
+            for key in (
+                "subscriptionId",
+                "resourceGroup",
+                "botName",
+                "armResourceId",
+                "msaAppId",
+                "tenantId",
+                "messagingEndpoint",
+                "createdAt",
+            ):
+                if not isinstance(raw.get(key), str) or not raw[key].strip():
+                    if key == "subscriptionId":
+                        raise BotServiceError(
+                            f"{source} has a blank subscriptionId; refusing to load"
+                        )
+                    raise BotServiceError(f"{source} requires a non-empty string {key}")
+            channels = raw.get("channelsEnabled")
+            if not isinstance(channels, list) or any(
+                not isinstance(channel, str) or not channel.strip() for channel in channels
+            ):
                 raise BotServiceError(
-                    f"{source} schemaVersion={SIDECAR_SCHEMA_VERSION} requires a non-empty "
-                    "agentName binding; refusing to load"
+                    f"{source} channelsEnabled must be a list of non-empty strings"
                 )
-        if not isinstance(raw.get("resourceGroupManaged"), bool):
-            raise BotServiceError(
-                f"{source} resourceGroupManaged must be true or false "
-                f"(got {type(raw.get('resourceGroupManaged')).__name__}); "
-                "refusing to infer purge authority"
-            )
-        for key in (
-            "subscriptionId",
-            "resourceGroup",
-            "botName",
-            "armResourceId",
-            "msaAppId",
-            "tenantId",
-            "messagingEndpoint",
-            "createdAt",
-        ):
-            if not isinstance(raw.get(key), str) or not raw[key].strip():
-                if key == "subscriptionId":
-                    raise BotServiceError(f"{source} has a blank subscriptionId; refusing to load")
-                raise BotServiceError(f"{source} requires a non-empty string {key}")
-        channels = raw.get("channelsEnabled")
-        if not isinstance(channels, list) or any(
-            not isinstance(channel, str) or not channel.strip() for channel in channels
-        ):
-            raise BotServiceError(f"{source} channelsEnabled must be a list of non-empty strings")
-        known = {f.name for f in fields(cls)}
-        return cls(**{k: v for k, v in raw.items() if k in known})
+            known = {f.name for f in fields(cls)}
+            return cls(**{k: v for k, v in raw.items() if k in known})
+        finally:
+            raw = None
+            bound = None
+            agent_name = None
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, sort_keys=True) + "\n"
@@ -714,42 +734,61 @@ def _read_sidecar_bytes(path: Path) -> tuple[bytes, tuple[int, int, int, str]]:
     return raw, (*identity_after, hashlib.sha256(raw).hexdigest())
 
 
+def _sidecar_json_error_message(source: str, exc: Exception) -> str:
+    if isinstance(exc, json.JSONDecodeError):
+        return f"{source} is not valid JSON ({exc.msg} at line {exc.lineno} column {exc.colno})"
+    return f"{source} is not valid JSON ({exc})"
+
+
 def _decode_sidecar_utf8(data: bytes, *, source: str) -> str:
     """Decode sidecar bytes as strict UTF-8 without retaining them on failure."""
+    buf = data
+    data = b""
     invalid = False
+    text = ""
     try:
-        text = data.decode("utf-8")
+        text = buf.decode("utf-8")
     except UnicodeDecodeError:
         invalid = True
-    if not invalid and text.encode("utf-8") != data:
+    if not invalid and (text.encode("utf-8") != buf or "\x00" in text):
         invalid = True
-    if not invalid and "\x00" in text:
-        invalid = True
+    buf = b""
     if invalid:
-        data = b""
-        raise BotServiceError(f"{source} is not valid UTF-8") from None
-    data = b""
-    return text
+        text = ""
+        raise BotServiceError(f"{source} is not valid UTF-8")
+    decoded = text
+    text = ""
+    return decoded
 
 
 def _parse_sidecar_json_object(data: bytes, *, source: str) -> dict[str, Any]:
     """Parse UTF-8 sidecar bytes without retaining raw content on failure."""
     buf = data
     data = b""
+    json_error: str | None = None
+    parsed: Any = None
+    text = ""
     try:
         text = _decode_sidecar_utf8(buf, source=source)
-        try:
-            parsed = json.loads(text)
-        except json.JSONDecodeError:
-            text = ""
-            err = BotServiceError(f"{source} is not valid JSON (invalid JSON)")
-            raise err from None
-        text = ""
-        if not isinstance(parsed, dict):
-            raise BotServiceError(f"{source} is JSON {type(parsed).__name__}, expected object")
-        return parsed
-    finally:
+    except BotServiceError:
         buf = b""
+        raise
+    buf = b""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        json_error = _sidecar_json_error_message(source, exc)
+    except ValueError as exc:
+        json_error = _sidecar_json_error_message(source, exc)
+    text = ""
+    if json_error is not None:
+        parsed = None
+        raise BotServiceError(json_error)
+    if not isinstance(parsed, dict):
+        kind = type(parsed).__name__
+        parsed = None
+        raise BotServiceError(f"{source} is JSON {kind}, expected object")
+    return parsed
 
 
 def _existing_sidecar_payload_for_create(
@@ -1438,8 +1477,19 @@ def _apply_create_plan_locked(
     inputs = plan.inputs
     bot_name = plan.bot_name
     create_sidecar_binding: tuple[int, int, int, str] | None = None
-    if inputs.sidecar_path.exists():
-        if not inputs.sidecar_path.is_file():
+    try:
+        existing_sidecar_stat = inputs.sidecar_path.lstat()
+    except FileNotFoundError:
+        existing_sidecar_stat = None
+    except OSError as exc:
+        raise BotServiceError(f"could not inspect sidecar {inputs.sidecar_path}: {exc}") from exc
+    if existing_sidecar_stat is not None:
+        if stat.S_ISLNK(existing_sidecar_stat.st_mode):
+            raise BotServiceError(
+                f"{inputs.sidecar_path} already exists and is not a regular sidecar file; "
+                "refusing create before Azure mutation"
+            )
+        if not stat.S_ISREG(existing_sidecar_stat.st_mode):
             raise BotServiceError(
                 f"{inputs.sidecar_path} already exists and is not a regular sidecar file; "
                 "refusing create before Azure mutation"
@@ -1452,14 +1502,17 @@ def _apply_create_plan_locked(
         try:
             validate_bot_service_sidecar_schema(sidecar_payload, source=str(inputs.sidecar_path))
         except SidecarSchemaError as exc:
+            sidecar_payload.clear()
             raise BotServiceError(str(exc)) from exc
         if "agentName" in sidecar_payload:
             bound = sidecar_payload.get("agentName")
             if bound is not None and not isinstance(bound, str):
+                sidecar_payload.clear()
                 raise BotServiceError(
                     f"{inputs.sidecar_path} agentName has unsupported type "
                     f"{type(bound).__name__}; expected str"
                 )
+        sidecar_payload.clear()
         raise BotServiceError(
             f"{inputs.sidecar_path} already exists; refusing create before Azure mutation"
         )

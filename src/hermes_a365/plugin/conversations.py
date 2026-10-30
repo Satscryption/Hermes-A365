@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, ClassVar
 
 from hermes_a365._common import (
+    SidecarBackupError,
     exclusive_sidecar_lock,
     sidecar_backup_path,
     sidecar_corrupt_quarantine_path,
@@ -44,6 +45,44 @@ from hermes_a365.sidecar_schema import (
 logger = logging.getLogger(__name__)
 
 ConversationSidecarError = SidecarSchemaError
+
+
+def _strict_sidecar_utf8(data: bytes) -> tuple[bool, str]:
+    """Return ``(invalid, text)``; ``text`` is cleared when invalid."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return True, ""
+    if text.encode("utf-8") != data or "\x00" in text:
+        return True, ""
+    return False, text
+
+
+def _quarantine_corrupt_sidecar(
+    path: Path,
+    *,
+    corrupt_bytes: bytes,
+    replacement_text: str,
+    log_kind: str,
+) -> None:
+    payload = corrupt_bytes
+    corrupt_bytes = b""
+    quarantine = sidecar_corrupt_quarantine_path(path)
+    publish_error: SidecarBackupError | None = None
+    try:
+        published = write_owner_only_bytes_exclusive(quarantine, payload)
+    except SidecarBackupError as exc:
+        publish_error = SidecarBackupError(str(exc))
+    payload = b""
+    if publish_error is not None:
+        raise publish_error
+    logger.warning(
+        "agent365 conversations: quarantined %s at %s to %s",
+        log_kind,
+        path,
+        published,
+    )
+    write_owner_only_text_atomic(path, replacement_text)
 
 
 @dataclass
@@ -527,71 +566,88 @@ class ConversationRegistry:
             recheck: dict[str, Any] | None = None
             if path.is_file():
                 snapshot = path.read_bytes()
-                try:
-                    snapshot.decode("utf-8")
-                except UnicodeDecodeError:
-                    quarantine = sidecar_corrupt_quarantine_path(path)
-                    published = write_owner_only_bytes_exclusive(quarantine, snapshot)
-                    logger.warning(
-                        "agent365 conversations: quarantined invalid UTF-8 at %s to %s",
-                        path,
-                        published,
-                    )
-                    write_owner_only_text_atomic(path, text)
+                invalid_utf8, decoded = _strict_sidecar_utf8(snapshot)
+                if invalid_utf8:
+                    quarantine_bytes = snapshot
+                    snapshot = b""
+                    decoded = ""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid UTF-8",
+                        )
+                    finally:
+                        quarantine_bytes = b""
                     return
                 try:
-                    parsed = json.loads(snapshot.decode("utf-8"))
+                    parsed = json.loads(decoded)
                 except (json.JSONDecodeError, RecursionError):
-                    quarantine = sidecar_corrupt_quarantine_path(path)
-                    published = write_owner_only_bytes_exclusive(quarantine, snapshot)
-                    logger.warning(
-                        "agent365 conversations: quarantined invalid JSON at %s to %s",
-                        path,
-                        published,
-                    )
-                    write_owner_only_text_atomic(path, text)
+                    quarantine_bytes = snapshot
+                    snapshot = b""
+                    decoded = ""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid JSON",
+                        )
+                    finally:
+                        quarantine_bytes = b""
                     return
+                decoded = ""
                 if not isinstance(parsed, dict):
-                    quarantine = sidecar_corrupt_quarantine_path(path)
-                    published = write_owner_only_bytes_exclusive(quarantine, snapshot)
-                    logger.warning(
-                        "agent365 conversations: quarantined non-object JSON at %s to %s",
-                        path,
-                        published,
-                    )
-                    write_owner_only_text_atomic(path, text)
+                    quarantine_bytes = snapshot
+                    snapshot = b""
+                    parsed = None
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="non-object JSON",
+                        )
+                    finally:
+                        quarantine_bytes = b""
                     return
                 raw_on_disk = parsed
                 validate_conversations_sidecar_schema(raw_on_disk)
                 recheck_bytes = path.read_bytes()
-                try:
-                    recheck_text = recheck_bytes.decode("utf-8")
-                    if recheck_text.encode("utf-8") != recheck_bytes or "\x00" in recheck_text:
-                        raise UnicodeDecodeError(
-                            "utf-8", recheck_bytes, 0, 1, "invalid sidecar utf-8"
+                invalid_recheck, recheck_text = _strict_sidecar_utf8(recheck_bytes)
+                if invalid_recheck:
+                    quarantine_bytes = recheck_bytes
+                    recheck_bytes = b""
+                    recheck_text = ""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid UTF-8",
                         )
-                except UnicodeDecodeError:
-                    quarantine = sidecar_corrupt_quarantine_path(path)
-                    published = write_owner_only_bytes_exclusive(quarantine, recheck_bytes)
-                    logger.warning(
-                        "agent365 conversations: quarantined invalid UTF-8 at %s to %s",
-                        path,
-                        published,
-                    )
-                    write_owner_only_text_atomic(path, text)
+                    finally:
+                        quarantine_bytes = b""
                     return
                 try:
                     recheck = json.loads(recheck_text)
                 except (json.JSONDecodeError, RecursionError):
-                    quarantine = sidecar_corrupt_quarantine_path(path)
-                    published = write_owner_only_bytes_exclusive(quarantine, recheck_bytes)
-                    logger.warning(
-                        "agent365 conversations: quarantined invalid JSON at %s to %s",
-                        path,
-                        published,
-                    )
-                    write_owner_only_text_atomic(path, text)
+                    quarantine_bytes = recheck_bytes
+                    recheck_bytes = b""
+                    recheck_text = ""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid JSON",
+                        )
+                    finally:
+                        quarantine_bytes = b""
                     return
+                recheck_text = ""
+                recheck_bytes = b""
                 validate_conversations_sidecar_schema(recheck)
             if (
                 snapshot
