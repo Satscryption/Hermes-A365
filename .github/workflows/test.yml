@@ -26,6 +26,9 @@ concurrency:
 permissions:
   contents: read
 
+env:
+  HERMES_VENDOR_PIN: bf0203a794a07aac3ff764972ab9087baa4e4f4e
+
 jobs:
   unit:
     timeout-minutes: 15
@@ -56,6 +59,15 @@ jobs:
       - name: Install deps
         run: uv sync --all-extras --frozen --python ${{ matrix.python-version }}
 
+      - name: Restore Hermes vendor checkout
+        uses: actions/cache@1bd1e32a3e4538f2c89b148a4a4afe267195d66 # v4.2.0
+        with:
+          path: .vendor/hermes-agent
+          key: hermes-vendor-${{ env.HERMES_VENDOR_PIN }}-${{ runner.os }}
+
+      - name: Vendor Hermes agent for gateway tests
+        run: python scripts/vendor_hermes_agent.py
+
       - name: ruff
         run: uv run --python ${{ matrix.python-version }} ruff check .
 
@@ -78,6 +90,15 @@ jobs:
 
       - name: Install deps
         run: uv sync --all-extras --frozen --python 3.14
+
+      - name: Restore Hermes vendor checkout
+        uses: actions/cache@1bd1e32a3e4538f2c89b148a4a4afe267195d66 # v4.2.0
+        with:
+          path: .vendor/hermes-agent
+          key: hermes-vendor-${{ env.HERMES_VENDOR_PIN }}-${{ runner.os }}
+
+      - name: Vendor Hermes agent for gateway tests
+        run: python scripts/vendor_hermes_agent.py
 
       - name: Unsupported-platform contract tests
         run: >
@@ -106,6 +127,15 @@ jobs:
 
       - name: Install deps
         run: uv sync --all-extras --frozen --python 3.14
+
+      - name: Restore Hermes vendor checkout
+        uses: actions/cache@1bd1e32a3e4538f2c89b148a4a4afe267195d66 # v4.2.0
+        with:
+          path: .vendor/hermes-agent
+          key: hermes-vendor-${{ env.HERMES_VENDOR_PIN }}-${{ runner.os }}
+
+      - name: Vendor Hermes agent for gateway tests
+        run: python scripts/vendor_hermes_agent.py
 
       - name: Live libsecret round-trip
         env:
