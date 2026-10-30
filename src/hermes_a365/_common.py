@@ -12,9 +12,10 @@ import json
 import os
 import re
 import socket
+import stat
 import subprocess
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import UTC, datetime
 from importlib import resources
 from pathlib import Path
@@ -226,35 +227,102 @@ def _exclusive_publish_file(tmp: Path, path: Path) -> Path:
                 raise SidecarBackupError(
                     f"could not publish sidecar backup at {path} via hard link ({exc})"
                 ) from exc
-            raise
+            raise SidecarBackupError(f"could not publish sidecar backup at {path}: {exc}") from exc
     raise SidecarBackupError(f"could not publish sidecar backup at {path} exclusively")
 
 
 def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o600) -> Path:
     """Write a backup via a private temp, fsync, then publish exclusively at ``mode``."""
-    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise SidecarBackupError(
+            f"could not create sidecar backup directory at {path.parent}: {exc}"
+        ) from exc
     tmp = path.with_name(f".{path.name}.part-{os.getpid()}")
-    tmp.unlink(missing_ok=True)
-    fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+
+    def _prepare_temp_part() -> None:
+        try:
+            if tmp.exists():
+                if tmp.is_dir():
+                    raise SidecarBackupError(
+                        f"could not open sidecar backup at {path}: temp path is a directory"
+                    )
+                tmp.unlink()
+        except SidecarBackupError:
+            raise
+        except OSError as exc:
+            try:
+                tmp_stat = tmp.lstat()
+            except OSError:
+                raise SidecarBackupError(
+                    f"could not prepare sidecar backup temp file at {tmp}: {exc}"
+                ) from exc
+            if stat.S_ISDIR(tmp_stat.st_mode):
+                raise SidecarBackupError(
+                    f"could not open sidecar backup at {path}: temp path is a directory"
+                ) from exc
+            raise SidecarBackupError(
+                f"could not prepare sidecar backup temp file at {tmp}: {exc}"
+            ) from exc
+
+    _prepare_temp_part()
+    fd: int | None = None
     try:
-        os.fchmod(fd, mode)
-        offset = 0
-        while offset < len(data):
-            offset += os.write(fd, data[offset:])
-        os.fsync(fd)
-    except BaseException:
-        os.close(fd)
-        tmp.unlink(missing_ok=True)
-        raise
-    os.close(fd)
-    try:
-        target = _exclusive_publish_file(tmp, path)
-    except BaseException:
-        tmp.unlink(missing_ok=True)
-        raise
-    tmp.unlink(missing_ok=True)
-    _fsync_directory(target.parent)
-    return target
+        try:
+            fd = os.open(tmp, os.O_CREAT | os.O_EXCL | os.O_WRONLY, mode)
+        except OSError as exc:
+            raise SidecarBackupError(f"could not open sidecar backup at {path}: {exc}") from exc
+        try:
+            os.fchmod(fd, mode)
+            offset = 0
+            while offset < len(data):
+                offset += os.write(fd, data[offset:])
+            os.fsync(fd)
+        except BaseException as exc:
+            with suppress(OSError):
+                if tmp.exists() and not tmp.is_dir():
+                    tmp.unlink()
+            if isinstance(exc, OSError):
+                raise SidecarBackupError(
+                    f"could not write sidecar backup at {path}: {exc}"
+                ) from exc
+            raise
+        try:
+            os.close(fd)
+        except OSError as exc:
+            fd = None
+            raise SidecarBackupError(f"could not close sidecar backup at {path}: {exc}") from exc
+        fd = None
+        try:
+            target = _exclusive_publish_file(tmp, path)
+        except BaseException as exc:
+            if isinstance(exc, SidecarBackupError):
+                raise
+            if isinstance(exc, OSError):
+                raise SidecarBackupError(
+                    f"could not publish sidecar backup at {path}: {exc}"
+                ) from exc
+            raise
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError as exc:
+            raise SidecarBackupError(
+                f"could not remove sidecar backup temp file at {tmp}: {exc}"
+            ) from exc
+        try:
+            _fsync_directory(target.parent)
+        except OSError as exc:
+            raise SidecarBackupError(
+                f"could not fsync sidecar backup directory at {target.parent}: {exc}"
+            ) from exc
+        return target
+    finally:
+        if fd is not None:
+            with suppress(OSError):
+                os.close(fd)
+        with suppress(OSError):
+            tmp.unlink(missing_ok=True)
 
 
 _SLUG_NON_ALNUM_RE = re.compile(r"[^a-z0-9]+")

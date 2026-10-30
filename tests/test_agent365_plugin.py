@@ -6157,10 +6157,10 @@ class TestConversationRegistry:
 
         path = tmp_path / "sensitive-profile-name.json"
 
-        def _fail_read(_path: Path) -> str:
+        def _fail_read(_self: Path) -> bytes:
             raise OSError("sensitive-read-error")
 
-        monkeypatch.setattr(Path, "read_text", _fail_read)
+        monkeypatch.setattr(Path, "read_bytes", _fail_read)
         caplog.set_level("WARNING")
 
         reg = ConversationRegistry.load(path)
