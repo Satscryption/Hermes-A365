@@ -71,6 +71,7 @@ import asyncio
 import contextlib
 import copy
 import hashlib
+import inspect
 import ipaddress
 import json
 import logging
@@ -83,8 +84,11 @@ import stat
 import threading
 import time
 import uuid
+import weakref
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Any, NamedTuple
@@ -246,6 +250,29 @@ def _validate_profile_env_permissions(hermes_home: Path) -> None:
 _AGENT_TURN_LIFECYCLE: ContextVar[tuple[int, str, int, int, asyncio.Event] | None] = ContextVar(
     "agent365_agent_turn_lifecycle", default=None
 )
+
+
+@dataclass(frozen=True, slots=True)
+class TurnAuthorityRecord:
+    user_id: str
+    conversation_id: str
+    tenant_id: str
+    session_key: str
+    message_id: str
+    reply_activity: dict[str, Any]
+
+
+class _UnboundTurnFrameType:
+    __slots__ = ()
+
+
+_UNBOUND_TURN_FRAME = _UnboundTurnFrameType()
+
+_AGENT_TURN_FRAME: ContextVar[TurnAuthorityRecord | _UnboundTurnFrameType | None] = ContextVar(
+    "agent365_agent_turn_frame",
+    default=None,
+)
+_RUN_AGENT_FRAME_PATCHED = False
 # Hermes snapshots ``streaming_overflow_limit()`` per stream-consumer task.
 # Scope the raised cap with a ContextVar so concurrent non-personal turns
 # never inherit a personal chat's budget (#184).
@@ -538,6 +565,12 @@ _CARD_KIND_CLARIFY = "clarify"
 _CARD_ACTION_KINDS = frozenset(
     {_CARD_KIND_EXEC_APPROVAL, _CARD_KIND_SLASH_CONFIRM, _CARD_KIND_CLARIFY}
 )
+_PENDING_MERGE_REGISTRY: dict[int, weakref.ReferenceType[Any]] = {}
+_HERMES_MERGE_PENDING_ORIGINAL: Any = None
+_MERGE_PENDING_PATCHED = False
+_SETTLE_REGISTER_PATCHED = False
+_ORIGINAL_REGISTER_GATEWAY_SETTLE: Any = None
+_DEFAULT_PENDING_TURN_FIFO_MAX = 32
 
 _DEFAULT_PORT = 3978
 
@@ -2073,6 +2106,13 @@ class Agent365Adapter(BasePlatformAdapter):
         # also keeps chats with a live card capability or an open-ended
         # clarify, independent of the session guard.
         self._session_key_to_conv: dict[str, str] = {}
+        self._pending_turn_fifo: dict[str, deque[Any]] = {}
+        extra_cfg = getattr(config, "extra", None) or {}
+        try:
+            fifo_max = int(extra_cfg.get("pending_turn_fifo_max", _DEFAULT_PENDING_TURN_FIFO_MAX))
+        except (TypeError, ValueError):
+            fifo_max = _DEFAULT_PENDING_TURN_FIFO_MAX
+        self._pending_turn_fifo_max = max(1, fifo_max)
         self._agent_turn_guards: dict[str, asyncio.Event] = {}
         self._agent_turn_admissions: dict[str, asyncio.Task[Any]] = {}
         self._media_leases_by_session: dict[str, set[Path]] = {}
@@ -2210,6 +2250,23 @@ class Agent365Adapter(BasePlatformAdapter):
             "message/fetchTask": self._handle_message_fetch_task,
             "handoff/action": self._handle_handoff_action,
         }
+        self._register_pending_merge_guard()
+        self._ensure_gateway_settle_compose_patch()
+        self._turn_authority_ledger: dict[str, TurnAuthorityRecord] = {}
+        self._turn_frame_stack_tokens: dict[
+            str, list[TurnAuthorityRecord | _UnboundTurnFrameType]
+        ] = {}
+        self._install_run_agent_turn_frame_wrapper()
+
+    @classmethod
+    def supports_exec_approval_buttons(cls) -> bool:
+        """Cards need ``approval_data['request_id']`` from the turn runner.
+
+        Hermes only passes that id on the button path when this returns True
+        (``_send_exec_approval_prompt`` override). Until then, missing ids fall
+        back to the plain-text ``/approve`` prompt with no capability minted.
+        """
+        return False
 
     @property
     def name(self) -> str:
@@ -2370,12 +2427,7 @@ class Agent365Adapter(BasePlatformAdapter):
         from fastapi import Body, FastAPI, Header, HTTPException
         from fastapi.responses import JSONResponse
 
-        app = FastAPI(
-            title=f"agent365 adapter — {self.slug or 'default'}",
-            docs_url=None,
-            redoc_url=None,
-            openapi_url=None,
-        )
+        app = FastAPI(title=f"agent365 adapter — {self.slug or 'default'}")
 
         app.add_middleware(
             bridge.BoundedRequestBodyMiddleware,
@@ -2409,7 +2461,13 @@ class Agent365Adapter(BasePlatformAdapter):
 
         @app.get("/healthz")
         async def healthz() -> dict[str, Any]:
-            return {"ok": True}
+            return {
+                "ok": True,
+                "slug": self.slug,
+                "blueprint_client_id": (
+                    self.blueprint_app_id[:8] + "…" if self.blueprint_app_id else ""
+                ),
+            }
 
         @app.post("/api/messages")
         async def messages(
@@ -2983,6 +3041,15 @@ class Agent365Adapter(BasePlatformAdapter):
             # turn and keep the registry cap/prune from evicting its reply
             # target underneath it.
             turn_guard = asyncio.Event()
+            origin_key = sk if sk is not None else admission_key
+            if not self.admit_turn_authority(
+                activity,
+                origin_key,
+                message_id=str(getattr(event, "message_id", "") or activity.get("id") or ""),
+            ):
+                self._release_media_paths(request_media_leases)
+                self._release_agent_turn_admission(admission_key)
+                return JSONResponse({"status": "acked", "reason": "unroutable"})
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -3018,6 +3085,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._release_request_media_leases(sk, request_media_leases)
             else:
                 self._release_media_paths(request_media_leases)
+                self._release_agent_turn_admission(admission_key)
             return JSONResponse({"status": "dispatched"})
 
         return app
@@ -3611,6 +3679,8 @@ class Agent365Adapter(BasePlatformAdapter):
             self._disconnect_cleanup_active = True
             self._lifecycle_generation += 1
             self._retire_all_agent_turns()
+            self._pending_messages.clear()
+            self._pending_turn_fifo.clear()
             self._chat_lifecycle_generation.clear()
             http_client = self._http_client
             await self._finalize_keepalive_streams_before_http_teardown()
@@ -3870,6 +3940,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._file_consent_decline_notified.clear()
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
+        self._pending_messages.clear()
+        self._pending_turn_fifo.clear()
+        self._unregister_pending_merge_guard()
         self._agent_turn_guards.clear()
         self._session_key_to_conv.clear()
         self._chat_teardown_tasks.clear()
@@ -4272,6 +4345,396 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._agent_turn_guards.get(session_key) is guard:
             self._agent_turn_guards.pop(session_key, None)
         self._release_session_media_leases(session_key)
+
+    def admit_turn_authority(
+        self,
+        activity: dict[str, Any],
+        session_key: str,
+        *,
+        message_id: str | None = None,
+    ) -> bool:
+        mid = str(message_id or activity.get("id") or "").strip()
+        if not mid or mid in self._turn_authority_ledger:
+            return False
+        bridge = _import_bridge()
+        user_id = bridge._canonical_activity_user(activity)
+        if not user_id:
+            return False
+        conv = activity.get("conversation")
+        conv_id = str(conv.get("id") or "") if isinstance(conv, dict) else ""
+        sk = str(session_key or "")
+        if not sk:
+            return False
+        record = TurnAuthorityRecord(
+            user_id=user_id,
+            conversation_id=conv_id,
+            tenant_id=self.tenant_id.lower(),
+            session_key=sk,
+            message_id=mid,
+            reply_activity=copy.deepcopy(activity),
+        )
+        self._turn_authority_ledger[mid] = record
+        return True
+
+    def _ledger_record_for_message(self, message_id: str) -> TurnAuthorityRecord | None:
+        return self._turn_authority_ledger.get(str(message_id or "").strip())
+
+    def _event_turn_authority(self, event: Any) -> TurnAuthorityRecord | None:
+        return self._ledger_record_for_message(str(getattr(event, "message_id", "") or ""))
+
+    @staticmethod
+    def _authority_key(record: TurnAuthorityRecord | None) -> tuple[str, ...]:
+        if record is None:
+            return ()
+        return (
+            record.user_id,
+            record.conversation_id,
+            record.tenant_id,
+            record.session_key,
+        )
+
+    @contextlib.contextmanager
+    def _turn_frame_scope(
+        self,
+        session_key: str,
+        frame: TurnAuthorityRecord | _UnboundTurnFrameType,
+    ):
+        token = _AGENT_TURN_FRAME.set(frame)
+        key = str(session_key or "")
+        stack = self._turn_frame_stack_tokens.setdefault(key, [])
+        stack.append(frame)
+        try:
+            yield
+        finally:
+            _AGENT_TURN_FRAME.reset(token)
+            if stack and stack[-1] is frame:
+                stack.pop()
+            if not stack:
+                self._turn_frame_stack_tokens.pop(key, None)
+
+    def _resolve_turn_frame(
+        self, session_key: str
+    ) -> TurnAuthorityRecord | _UnboundTurnFrameType | None:
+        stack = self._turn_frame_stack_tokens.get(str(session_key or ""))
+        if stack:
+            return stack[-1]
+        return _AGENT_TURN_FRAME.get()
+
+    def _frame_for_run_agent(self, message_id: str) -> TurnAuthorityRecord | _UnboundTurnFrameType:
+        record = self._ledger_record_for_message(message_id)
+        return record if record is not None else _UNBOUND_TURN_FRAME
+
+    def _install_run_agent_turn_frame_wrapper(self) -> None:
+        global _RUN_AGENT_FRAME_PATCHED
+        if _RUN_AGENT_FRAME_PATCHED:
+            return
+        try:
+            from gateway.run_turn import GatewayRunner
+        except ImportError:
+            return
+        original = GatewayRunner._run_agent_inner
+        if getattr(original, "_agent365_turn_frame_wrapped", False):
+            _RUN_AGENT_FRAME_PATCHED = True
+            return
+        signature = inspect.signature(original)
+
+        async def _wrapped(runner: Any, /, *args: Any, **kwargs: Any) -> Any:
+            bound = signature.bind(runner, *args, **kwargs)
+            bound.apply_defaults()
+            source = bound.arguments["source"]
+            session_key = bound.arguments.get("session_key")
+            inbound_message_id = bound.arguments.get("inbound_message_id")
+            adapter = runner._delivery_adapter_for(source)
+            if type(adapter) is not Agent365Adapter:
+                return await original(runner, *args, **kwargs)
+            sk = str(session_key or runner._session_key_for_source(source) or "")
+            frame = adapter._frame_for_run_agent(str(inbound_message_id or ""))
+            with adapter._turn_frame_scope(sk, frame):
+                return await original(runner, *args, **kwargs)
+
+        _wrapped._agent365_turn_frame_wrapped = True  # type: ignore[attr-defined]
+        GatewayRunner._run_agent_inner = _wrapped
+        _RUN_AGENT_FRAME_PATCHED = True
+
+    def _pending_turn_origins_compatible(self, existing: Any, incoming: Any) -> bool:
+        return self._authority_key(self._event_turn_authority(existing)) == self._authority_key(
+            self._event_turn_authority(incoming)
+        )
+
+    @staticmethod
+    def _chain_gateway_settle_callbacks(prior: Any, settle: Any):
+        def _combined(reason: str) -> None:
+            if prior is not None:
+                with contextlib.suppress(Exception):
+                    prior(reason)
+            with contextlib.suppress(Exception):
+                settle(reason)
+
+        return _combined
+
+    @staticmethod
+    def _ensure_gateway_settle_compose_patch() -> None:
+        global _SETTLE_REGISTER_PATCHED, _ORIGINAL_REGISTER_GATEWAY_SETTLE
+        if _SETTLE_REGISTER_PATCHED:
+            return
+        try:
+            import tools.approval as approval_mod
+        except Exception:
+            return
+        original = approval_mod.register_gateway_settle
+        _ORIGINAL_REGISTER_GATEWAY_SETTLE = original
+
+        def _composed_register(session_key: str, request_id: str, settle: Any) -> bool:
+            with approval_mod._lock:
+                for entry in approval_mod._gateway_queues.get(session_key, []):
+                    if entry.data.get("request_id") != request_id:
+                        continue
+                    prior = entry.settle
+                    if prior is None or prior is settle:
+                        entry.settle = settle
+                    else:
+                        entry.settle = Agent365Adapter._chain_gateway_settle_callbacks(
+                            prior, settle
+                        )
+                    return True
+            return False
+
+        approval_mod.register_gateway_settle = _composed_register
+        _SETTLE_REGISTER_PATCHED = True
+
+    def _register_pending_merge_guard(self) -> None:
+        global _MERGE_PENDING_PATCHED, _HERMES_MERGE_PENDING_ORIGINAL
+        import gateway.platforms.base as base_mod
+
+        if getattr(base_mod, "_agent365_merge_pending_original", None) is None:
+            original = getattr(base_mod, "merge_pending_message_event", None)
+
+            def _default_merge_pending(
+                pending_messages: dict[str, Any],
+                session_key: str,
+                event: Any,
+                *,
+                merge_text: bool = False,
+            ) -> None:
+                pending_messages[session_key] = event
+
+            if original is None:
+                original = _default_merge_pending
+                base_mod.merge_pending_message_event = original
+            base_mod._agent365_merge_pending_original = original
+
+            def guarded(
+                pending_messages: dict[str, Any],
+                session_key: str,
+                event: Any,
+                *,
+                merge_text: bool = False,
+            ) -> None:
+                adapter_ref = _PENDING_MERGE_REGISTRY.get(id(pending_messages))
+                adapter = adapter_ref() if adapter_ref is not None else None
+                if adapter is not None:
+                    if not adapter._agent365_admit_pending_turn_event(
+                        session_key, event, merge_text=merge_text
+                    ):
+                        adapter._schedule_pending_turn_queue_full_reply(event, session_key)
+                    return
+                base_mod._agent365_merge_pending_original(
+                    pending_messages, session_key, event, merge_text=merge_text
+                )
+
+            base_mod.merge_pending_message_event = guarded
+
+        _HERMES_MERGE_PENDING_ORIGINAL = base_mod._agent365_merge_pending_original
+        _MERGE_PENDING_PATCHED = True
+        pending_messages = getattr(self, "_pending_messages", None)
+        if pending_messages is not None:
+            key = id(pending_messages)
+            _PENDING_MERGE_REGISTRY[key] = weakref.ref(
+                self,
+                lambda _ref, registry_key=key: _PENDING_MERGE_REGISTRY.pop(registry_key, None),
+            )
+
+    def _unregister_pending_merge_guard(self) -> None:
+        pending_messages = getattr(self, "_pending_messages", None)
+        if pending_messages is not None:
+            _PENDING_MERGE_REGISTRY.pop(id(pending_messages), None)
+
+    def _pending_turn_fifo_for(self, session_key: str) -> deque[Any]:
+        return self._pending_turn_fifo.setdefault(session_key, deque())
+
+    def _session_turn_dispatch_frozen(self, session_key: str) -> bool:
+        if self._disconnecting or self._disconnect_cleanup_active:
+            return True
+        chat_id = self._session_key_to_conv.get(session_key)
+        if chat_id and str(chat_id) in self._retiring_chats:
+            return True
+        guard = self._agent_turn_guards.get(session_key)
+        return guard is not None and guard.is_set()
+
+    def _clear_session_pending_turn_state(self, session_key: str) -> None:
+        self._pending_messages.pop(session_key, None)
+        self._pending_turn_fifo.pop(session_key, None)
+
+    def _coalesce_adjacent_pending_event(
+        self, session_key: str, event: Any, *, merge_text: bool = False
+    ) -> bool:
+        if _HERMES_MERGE_PENDING_ORIGINAL is None:
+            return False
+        fifo = self._pending_turn_fifo.get(session_key)
+        if fifo:
+            if self._pending_turn_origins_compatible(fifo[-1], event):
+                scratch: dict[str, Any] = {"_head": fifo[-1]}
+                _HERMES_MERGE_PENDING_ORIGINAL(scratch, "_head", event, merge_text=merge_text)
+                fifo[-1] = scratch["_head"]
+                return True
+            return False
+        slot = self._pending_messages.get(session_key)
+        if slot is not None and self._pending_turn_origins_compatible(slot, event):
+            _HERMES_MERGE_PENDING_ORIGINAL(
+                self._pending_messages, session_key, event, merge_text=merge_text
+            )
+            return True
+        return False
+
+    def _agent365_admit_pending_turn_event(
+        self, session_key: str, event: Any, *, merge_text: bool = False
+    ) -> bool:
+        if self._session_turn_dispatch_frozen(session_key):
+            return False
+        if self._coalesce_adjacent_pending_event(session_key, event, merge_text=merge_text):
+            return True
+        if session_key not in self._pending_messages and not self._pending_turn_fifo.get(
+            session_key
+        ):
+            if _HERMES_MERGE_PENDING_ORIGINAL is None:
+                self._pending_messages[session_key] = event
+            else:
+                _HERMES_MERGE_PENDING_ORIGINAL(
+                    self._pending_messages, session_key, event, merge_text=merge_text
+                )
+            return True
+        fifo = self._pending_turn_fifo_for(session_key)
+        if len(fifo) >= self._pending_turn_fifo_max:
+            return False
+        fifo.append(event)
+        return True
+
+    def _agent365_promote_fifo_head_to_slot(self, session_key: str) -> bool:
+        if self._session_turn_dispatch_frozen(session_key):
+            return False
+        if session_key in self._pending_messages:
+            return False
+        fifo = self._pending_turn_fifo.get(session_key)
+        if not fifo:
+            return False
+        next_event = fifo.popleft()
+        if not fifo:
+            self._pending_turn_fifo.pop(session_key, None)
+        if _HERMES_MERGE_PENDING_ORIGINAL is None:
+            self._pending_messages[session_key] = next_event
+        else:
+            _HERMES_MERGE_PENDING_ORIGINAL(self._pending_messages, session_key, next_event)
+        return True
+
+    def _schedule_pending_turn_queue_full_reply(self, event: Any, session_key: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reply_task = loop.create_task(self._send_pending_turn_queue_full_reply(event, session_key))
+        reply_task.add_done_callback(lambda _task: None)
+
+    async def _send_pending_turn_queue_full_reply(self, event: Any, session_key: str) -> None:
+        chat_id = self._session_key_to_conv.get(session_key) or self._chat_id_from_processing_event(
+            event
+        )
+        if not chat_id or self._turn_reply_blocked(str(chat_id)):
+            return
+        text = "This conversation is busy with earlier messages. Please try again in a moment."
+        with contextlib.suppress(Exception):
+            await self.send(str(chat_id), text)
+
+    def _agent365_merge_pending_message_event(
+        self, session_key: str, event: Any, *, merge_text: bool = False
+    ) -> None:
+        if not self._agent365_admit_pending_turn_event(session_key, event, merge_text=merge_text):
+            self._schedule_pending_turn_queue_full_reply(event, session_key)
+
+    def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event | None) -> None:
+        if self._session_turn_dispatch_frozen(session_key):
+            self._clear_session_pending_turn_state(session_key)
+            current_task = asyncio.current_task()
+            if current_task is not None and self._session_tasks.get(session_key) is current_task:
+                self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
+        if session_key not in self._pending_messages:
+            self._agent365_promote_fifo_head_to_slot(session_key)
+        super()._finish_session_task(session_key, interrupt_event)
+
+    @staticmethod
+    def _exec_approval_request_still_pending(session_key: str, request_id: str) -> bool:
+        if not session_key or not request_id:
+            return False
+        try:
+            from tools.approval import list_gateway_approvals
+        except Exception:
+            return True
+        pending_ids = {
+            str(item.get("request_id") or "") for item in list_gateway_approvals(session_key)
+        }
+        return request_id in pending_ids
+
+    def _register_exec_approval_capability_settle(self, session_key: str, request_id: str) -> None:
+        self._ensure_gateway_settle_compose_patch()
+        try:
+            from tools.approval import register_gateway_settle
+        except Exception:
+            register_gateway_settle = None  # type: ignore[assignment,misc]
+
+        sk = str(session_key or "")
+        rid = str(request_id or "")
+        if not sk or not rid:
+            return
+
+        def _on_settled(_reason: str) -> None:
+            self.invalidate_exec_approval_capabilities(sk, rid)
+
+        try:
+            from tools.approval import observe_gateway_settle as _observe
+        except ImportError:
+            _observe = None
+        except Exception:
+            _observe = None
+        if callable(_observe) and _observe(sk, rid, _on_settled):
+            return
+        if callable(register_gateway_settle) and register_gateway_settle(sk, rid, _on_settled):
+            return
+        self.invalidate_exec_approval_capabilities(sk, rid)
+
+    async def handle_message(self, event: Any) -> None:
+        if self._ledger_record_for_message(str(getattr(event, "message_id", "") or "")) is None:
+            logger.warning("agent365 dispatch rejected: event has no turn authority ledger entry")
+            return
+        await super().handle_message(event)
+
+    async def cancel_session_processing(self, session_key: str, **kwargs: Any) -> None:
+        self._clear_session_pending_turn_state(session_key)
+        await super().cancel_session_processing(session_key, **kwargs)
+
+    async def _process_message_background(self, event: Any, session_key: str) -> None:
+        record = self._ledger_record_for_message(str(getattr(event, "message_id", "") or ""))
+        if record is None:
+            with self._turn_frame_scope(session_key, _UNBOUND_TURN_FRAME):
+                guard = self._active_sessions.get(session_key)
+                if guard is not None and self._active_sessions.get(session_key) is guard:
+                    self._release_session_guard(session_key, guard=guard)
+            return
+        with self._turn_frame_scope(session_key, record):
+            await super()._process_message_background(event, session_key)
+
+    def _release_agent_turn_admission(self, admission_key: str) -> None:
+        if admission_key:
+            self._agent_turn_admissions.pop(admission_key, None)
 
     def _turn_reply_blocked(self, chat_id: str) -> bool:
         """True when this chat must not open a buffer or post a reply.
@@ -5289,6 +5752,23 @@ class Agent365Adapter(BasePlatformAdapter):
         bridge = _import_bridge()
         generation = self._lifecycle_generation
         chat_id = str((inbound.get("conversation") or {}).get("id") or "")
+        frame = _AGENT_TURN_FRAME.get()
+        if frame is _UNBOUND_TURN_FRAME:
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: unbound turn frame",
+            )
+        if isinstance(frame, TurnAuthorityRecord):
+            if chat_id and chat_id != frame.conversation_id:
+                return SendResult(
+                    success=False,
+                    error=(
+                        f"agent365 {log_context}: conversation mismatch "
+                        f"chat_id={chat_id!r} frame={frame.conversation_id!r}"
+                    ),
+                )
+            inbound = copy.deepcopy(frame.reply_activity)
+            chat_id = str((inbound.get("conversation") or {}).get("id") or chat_id)
         if self._turn_reply_blocked(chat_id):
             return SendResult(
                 success=False,
@@ -5415,11 +5895,16 @@ class Agent365Adapter(BasePlatformAdapter):
             and chat_id in self._seen_inbounds_this_lifetime
             and not self._turn_reply_blocked(chat_id)
         ):
-            inbound = self._cached_inbound_for(chat_id)
+            activity_id = str(getattr(event, "message_id", "") or "")
+            record = self._ledger_record_for_message(activity_id)
+            inbound = (
+                copy.deepcopy(record.reply_activity)
+                if record is not None
+                else self._cached_inbound_for(chat_id)
+            )
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
             if inbound and chat_type and chat_type != "personal":
-                activity_id = str(getattr(event, "message_id", "") or "")
                 self._open_or_nest_turn_buffer(chat_id, inbound, activity_id=activity_id)
             elif inbound and chat_type == "personal":
                 # A new turn gets its own held follow-up. The
@@ -11155,49 +11640,6 @@ class Agent365Adapter(BasePlatformAdapter):
 
         task.add_done_callback(_done)
 
-    def _file_consent_pending_matches_activity(
-        self, activity: dict[str, Any], pending: dict[str, Any]
-    ) -> bool:
-        pending_chat_id = str(pending.get("conversation_id") or "")
-        if (
-            self._disconnecting
-            or pending.get("lifecycle_generation") != self._lifecycle_generation
-            or pending.get("chat_generation") != self._chat_generation(pending_chat_id)
-        ):
-            return False
-        act_conv = str((activity.get("conversation") or {}).get("id") or "")
-        act_user = str((activity.get("from") or {}).get("id") or "")
-        act_surl = str(activity.get("serviceUrl") or "")
-        if (
-            act_conv != pending.get("conversation_id")
-            or act_user != pending.get("user_id")
-            or act_surl != pending.get("service_url")
-        ):
-            return False
-        return time.time() - float(pending.get("created_at") or 0.0) <= _PENDING_UPLOAD_TTL_SEC
-
-    def _file_consent_pending_live_context_mismatch(
-        self, activity: dict[str, Any], pending: dict[str, Any]
-    ) -> bool:
-        """True when the pending entry is live but the invoke names another user/chat."""
-        pending_chat_id = str(pending.get("conversation_id") or "")
-        if (
-            self._disconnecting
-            or pending.get("lifecycle_generation") != self._lifecycle_generation
-            or pending.get("chat_generation") != self._chat_generation(pending_chat_id)
-        ):
-            return False
-        if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
-            return False
-        act_conv = str((activity.get("conversation") or {}).get("id") or "")
-        act_user = str((activity.get("from") or {}).get("id") or "")
-        act_surl = str(activity.get("serviceUrl") or "")
-        return (
-            act_conv != pending.get("conversation_id")
-            or act_user != pending.get("user_id")
-            or act_surl != pending.get("service_url")
-        )
-
     async def _handle_file_consent(
         self, activity: dict[str, Any], *, validated_path: str | None
     ) -> invoke.InvokeResponse:
@@ -11216,7 +11658,7 @@ class Agent365Adapter(BasePlatformAdapter):
         context = value.get("context")
         context = context if isinstance(context, dict) else {}
         consent_id = str(context.get("consentId") or "")
-        pending = self._pending_file_uploads.get(consent_id)
+        pending = self._pending_file_uploads.pop(consent_id, None)
         consent_chat_id = str((activity.get("conversation") or {}).get("id") or "")
 
         async def _remove_consent_card() -> None:
@@ -11227,31 +11669,22 @@ class Agent365Adapter(BasePlatformAdapter):
 
         if action != "accept":
             logger.info("agent365 fileConsent action=%s consent=%s", action, consent_id[:8])
-            if action == "decline":
-                if pending is None:
-                    _schedule_remove_consent_card(label="unknown_consent")
-                    return invoke.empty_invoke_ack()
-                if self._file_consent_pending_matches_activity(activity, pending):
-                    send_decline_notice = (
-                        consent_id and consent_id not in self._file_consent_decline_notified
+            send_decline_notice = (
+                action == "decline"
+                and consent_id
+                and consent_id not in self._file_consent_decline_notified
+            )
+            if send_decline_notice:
+                self._file_consent_decline_notified.add(consent_id)
+
+            async def _decline_followup() -> None:
+                await _remove_consent_card()
+                if send_decline_notice:
+                    await self._send_file_consent_decline_notice(
+                        activity, validated_path=validated_path
                     )
-                    if send_decline_notice:
-                        self._file_consent_decline_notified.add(consent_id)
 
-                    async def _decline_followup() -> None:
-                        await _remove_consent_card()
-                        if send_decline_notice:
-                            await self._send_file_consent_decline_notice(
-                                activity, validated_path=validated_path
-                            )
-
-                    self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
-                    self._pending_file_uploads.pop(consent_id, None)
-                    return invoke.empty_invoke_ack()
-                if self._file_consent_pending_live_context_mismatch(activity, pending):
-                    return invoke.empty_invoke_ack()
-                _schedule_remove_consent_card(label="expired_lifecycle")
-                return invoke.empty_invoke_ack()
+            self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
             return invoke.empty_invoke_ack()
         if pending is None:
             # Consent we don't know about — restart dropped the in-memory map, a
@@ -11263,7 +11696,11 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.empty_invoke_ack()
 
         pending_chat_id = str(pending.get("conversation_id") or "")
-        if not self._file_consent_pending_matches_activity(activity, pending):
+        if (
+            self._disconnecting
+            or pending.get("lifecycle_generation") != self._lifecycle_generation
+            or pending.get("chat_generation") != self._chat_generation(pending_chat_id)
+        ):
             logger.warning(
                 "agent365 fileConsent accept for expired lifecycle consent=%s",
                 consent_id[:8],
@@ -11272,6 +11709,35 @@ class Agent365Adapter(BasePlatformAdapter):
             return invoke.InvokeResponse(status=200, body={})
 
         # Review-F2 / R2-P1 — capability model, not authenticated-user check.
+        # The real boundary is: (1) this handler is only reached AFTER inbound-JWT
+        # validation (a legitimate platform caller), and (2) ``consent_id`` is an
+        # unguessable uuid4 we minted, sent only in this card, and popped once. The
+        # conversation / user / serviceUrl comparisons below are body-derived (BF
+        # service tokens carry no end-user claim) and serve as CONSISTENCY
+        # defence-in-depth — a valid consentId replayed onto a different
+        # conversation still won't upload. They are NOT claimed as authenticated
+        # identity.
+        act_conv = str((activity.get("conversation") or {}).get("id") or "")
+        act_user = str((activity.get("from") or {}).get("id") or "")
+        act_surl = str(activity.get("serviceUrl") or "")
+        if (
+            act_conv != pending.get("conversation_id")
+            or act_user != pending.get("user_id")
+            or act_surl != pending.get("service_url")
+        ):
+            logger.warning(
+                "agent365 fileConsent accept context mismatch consent=%s",
+                consent_id[:8],
+            )
+            _schedule_remove_consent_card(label="context_mismatch")
+            return invoke.InvokeResponse(status=200, body={})
+
+        # Review-F3: a consent the user answers long after the offer is stale.
+        if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
+            logger.warning("agent365 fileConsent accept expired consent=%s", consent_id[:8])
+            _schedule_remove_consent_card(label="consent_expired")
+            return invoke.InvokeResponse(status=200, body={})
+
         upload_info = value.get("uploadInfo")
         upload_info = upload_info if isinstance(upload_info, dict) else {}
         upload_url = str(upload_info.get("uploadUrl") or "")
@@ -11323,13 +11789,6 @@ class Agent365Adapter(BasePlatformAdapter):
         if hashlib.sha256(data).hexdigest() != pending.get("sha256"):
             logger.warning("agent365 fileConsent: content changed since offer (digest)")
             _schedule_remove_consent_card(label="digest_mismatch")
-            return invoke.InvokeResponse(status=200, body={})
-        if self._pending_file_uploads.pop(consent_id, None) is not pending:
-            logger.warning(
-                "agent365 fileConsent accept lost pending entry consent=%s",
-                consent_id[:8],
-            )
-            _schedule_remove_consent_card(label="pending_lost")
             return invoke.InvokeResponse(status=200, body={})
         upload_task = asyncio.create_task(
             self._run_file_consent_upload_accept(
@@ -11752,6 +12211,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
                 continue
             turn_guard = asyncio.Event()
+            origin_key = sk if sk is not None else admission_key
+            if not self.admit_turn_authority(activity, origin_key, message_id=user_activity_id):
+                self._release_agent_turn_admission(admission_key)
+                continue
             if sk is not None:
                 self._session_key_to_conv[sk] = conv_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -11771,6 +12234,7 @@ class Agent365Adapter(BasePlatformAdapter):
             finally:
                 _AGENT_TURN_LIFECYCLE.reset(turn_token)
             if sk is None:
+                self._release_agent_turn_admission(admission_key)
                 continue
             owner = getattr(self, "_session_tasks", {}).get(sk)
             if isinstance(owner, asyncio.Task):
@@ -12079,20 +12543,17 @@ class Agent365Adapter(BasePlatformAdapter):
         invoke_tenant = _normalized_token(ctx.tenant_id)
         adapter_tenant = _normalized_token(self.tenant_id)
         token_user = _normalized_token(record.get("user_aad"))
-        invoke_user = _normalized_token(ctx.token_user_oid)
-        if not (token_tenant and invoke_tenant and adapter_tenant and token_user):
+        invoke_user = _normalized_token(ctx.user_oid)
+        if not (token_tenant and invoke_tenant and adapter_tenant and token_user and invoke_user):
             return False
         if token_tenant != invoke_tenant or token_tenant != adapter_tenant:
+            return False
+        if token_user != invoke_user:
             return False
         sender = ctx.activity.get("from")
         sender = sender if isinstance(sender, dict) else {}
         activity_user = _normalized_token(sender.get("aadObjectId"))
-        if invoke_user:
-            if token_user != invoke_user:
-                return False
-        elif not activity_user or activity_user != token_user:
-            return False
-        if invoke_user and activity_user and activity_user != token_user:
+        if activity_user and activity_user != token_user:
             return False
         activity_tenant = _normalized_token(ctx.conv.get("tenantId"))
         return not activity_tenant or activity_tenant == token_tenant
@@ -12112,8 +12573,6 @@ class Agent365Adapter(BasePlatformAdapter):
             return None
         tenant_id = self._handoff_tenant(ref)
         user_aad = self._handoff_user_aad(ref)
-        if not tenant_id or not user_aad:
-            return None
         session_id = ""
         if tenant_id and user_aad:
             session_id = (
@@ -12279,6 +12738,33 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 handoff pin skipped: active turns full")
             return
         turn_guard = asyncio.Event()
+        origin_key = sk if sk is not None else admission_key
+        handoff_activity: dict[str, Any] = {}
+        raw_message = getattr(event, "raw_message", None)
+        if isinstance(raw_message, dict):
+            handoff_activity = dict(raw_message)
+        source = getattr(event, "source", None)
+        if source is not None:
+            if not isinstance(handoff_activity.get("conversation"), dict):
+                handoff_activity["conversation"] = {"id": str(source.chat_id or "")}
+            sender = handoff_activity.get("from")
+            sender = dict(sender) if isinstance(sender, dict) else {}
+            if source.user_id:
+                sender.setdefault("aadObjectId", source.user_id)
+                sender.setdefault("id", source.user_id)
+            handoff_activity["from"] = sender
+        if handoff_activity:
+            admitted = self.admit_turn_authority(
+                handoff_activity,
+                origin_key,
+                message_id=str(getattr(event, "message_id", "") or ""),
+            )
+        else:
+            admitted = False
+        if not admitted:
+            self._release_agent_turn_admission(admission_key)
+            logger.warning("agent365 handoff pin skipped: no turn authority")
+            return
         if sk is not None:
             self._session_key_to_conv[sk] = chat_id
             turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -12299,10 +12785,16 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 handoff dispatch failed", exc_info=True)
         finally:
             _AGENT_TURN_LIFECYCLE.reset(turn_token)
-            self._finish_handoff_turn(sk, turn_guard)
+            self._finish_handoff_turn(sk, turn_guard, admission_key)
 
-    def _finish_handoff_turn(self, session_key: str | None, turn_guard: asyncio.Event) -> None:
+    def _finish_handoff_turn(
+        self,
+        session_key: str | None,
+        turn_guard: asyncio.Event,
+        admission_key: str,
+    ) -> None:
         if session_key is None:
+            self._release_agent_turn_admission(admission_key)
             return
         owner = getattr(self, "_session_tasks", {}).get(session_key)
         if isinstance(owner, asyncio.Task):
@@ -12323,9 +12815,7 @@ class Agent365Adapter(BasePlatformAdapter):
         failed handoff, so refusal stays on the 200 ack.
         """
         token = str(ctx.value.get("continuation") or "")
-        if not token:
-            return invoke.InvokeResponse(status=200, body={})
-        record = self._handoff_tokens.get(token)
+        record = self._handoff_tokens.pop(token, None) if token else None
         if record is None:
             logger.warning("agent365 handoff/action unknown token=%s", token[:8])
             return invoke.InvokeResponse(status=200, body={})
@@ -12354,8 +12844,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 handoff/action source session not live token=%s",
                 token[:8],
             )
-            return invoke.InvokeResponse(status=200, body={})
-        if self._handoff_tokens.pop(token, None) is None:
             return invoke.InvokeResponse(status=200, body={})
         try:
             self._schedule_handoff_dispatch(ctx, record)
@@ -12398,7 +12886,22 @@ class Agent365Adapter(BasePlatformAdapter):
         these are system-interaction cards, not agent output). Returns
         ``success=False`` when there's no cached inbound or the adapter isn't
         connected, so the gateway falls back to its text prompt."""
-        inbound = self._cached_inbound_for(chat_id)
+        frame = _AGENT_TURN_FRAME.get()
+        if frame is _UNBOUND_TURN_FRAME:
+            msg = f"agent365 {log_context}: unbound turn frame"
+            logger.warning(msg)
+            return SendResult(success=False, error=msg)
+        if isinstance(frame, TurnAuthorityRecord):
+            if str(chat_id) != str(frame.conversation_id or ""):
+                msg = (
+                    f"agent365 {log_context}: conversation mismatch "
+                    f"chat_id={chat_id!r} frame={frame.conversation_id!r}"
+                )
+                logger.warning(msg)
+                return SendResult(success=False, error=msg)
+            inbound = copy.deepcopy(frame.reply_activity)
+        else:
+            inbound = self._cached_inbound_for(chat_id)
         if not inbound:
             msg = f"agent365 {log_context}: no cached inbound for {chat_id!r}"
             logger.warning(msg)
@@ -12472,31 +12975,52 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id: str,
         command: str,
         session_key: str,
-        description: str = "dangerous command",
+        description: str | None = None,
         metadata: dict[str, Any] | None = None,
+        allow_permanent: bool = True,
+        allow_session: bool = True,
+        smart_denied: bool = False,
+        request_id: str | None = None,
     ) -> SendResult:
         """#77: dangerous-command Approve/Deny as an Adaptive Card. ``command`` is
         already credential-redacted gateway-side. On click the route resolves via
-        ``tools.approval.resolve_gateway_approval(session_key, choice)``."""
+        ``tools.approval.resolve_gateway_approval`` with an explicit ``request_id``."""
+        request_id_value = str(request_id or (metadata or {}).get("request_id") or "")
+        if not request_id_value:
+            return SendResult(
+                success=False,
+                error="agent365 exec_approval: missing request_id",
+            )
+        if description is None:
+            description = "dangerous command"
         text = f"**Approval required** — {description}\n\n`{command}`"
         inbound = self._cached_inbound_for(chat_id) or {}
         conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
         conv_type = str(conv.get("conversationType") or "") if isinstance(conv, dict) else ""
         choices = [("Approve once", "once"), ("Deny", "deny")]
-        if conv_type == "personal":
-            choices[1:1] = [
-                ("Approve for session", "session"),
-                ("Always allow", "always"),
-            ]
+        if conv_type == "personal" and not smart_denied and (allow_session or allow_permanent):
+            if allow_session:
+                choices.insert(1, ("Approve for session", "session"))
+            if allow_permanent:
+                insert_at = 2 if allow_session else 1
+                choices.insert(insert_at, ("Always allow", "always"))
         actions = self._mint_card_capability_actions(
             chat_id,
             _CARD_KIND_EXEC_APPROVAL,
             choices,
-            {"session_key": session_key},
+            {"session_key": session_key, "request_id": request_id_value},
         )
-        return await self._send_card(
+        if not actions:
+            return SendResult(
+                success=False,
+                error="agent365 exec_approval: card capability unavailable",
+            )
+        result = await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
         )
+        if result.success:
+            self._register_exec_approval_capability_settle(session_key, request_id_value)
+        return result
 
     async def send_slash_confirm(
         self,
@@ -12524,6 +13048,11 @@ class Agent365Adapter(BasePlatformAdapter):
             choices,
             {"session_key": session_key, "confirm_id": confirm_id},
         )
+        if not actions:
+            return SendResult(
+                success=False,
+                error="agent365 slash_confirm: card capability unavailable",
+            )
         return await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="slash_confirm"
         )
@@ -12572,6 +13101,11 @@ class Agent365Adapter(BasePlatformAdapter):
             card_choices,
             {"clarify_id": clarify_id, "session_key": session_key},
         )
+        if not actions:
+            return SendResult(
+                success=False,
+                error="agent365 clarify: card capability unavailable",
+            )
         return await self._send_card(
             chat_id, self._action_submit_card(question, actions), log_context="clarify"
         )
@@ -12585,15 +13119,50 @@ class Agent365Adapter(BasePlatformAdapter):
         choices: list[tuple[str, str]],
         resolver: dict[str, str],
     ) -> list[tuple[str, dict[str, Any]]]:
-        inbound = self._cached_inbound_for(chat_id) or {}
-        bridge = _import_bridge()
+        session_key = str(resolver.get("session_key") or "")
+        frame = self._resolve_turn_frame(session_key)
+        if frame is None or frame is _UNBOUND_TURN_FRAME:
+            logger.warning(
+                "agent365 card capability mint rejected: unbound or missing turn frame "
+                "chat_id=%r session_key=%r",
+                chat_id,
+                session_key,
+            )
+            return []
+        if not isinstance(frame, TurnAuthorityRecord):
+            logger.warning(
+                "agent365 card capability mint rejected: no turn authority "
+                "chat_id=%r session_key=%r",
+                chat_id,
+                session_key,
+            )
+            return []
+        if str(frame.conversation_id or "") != str(chat_id or ""):
+            logger.warning(
+                "agent365 card capability mint rejected: conversation mismatch chat_id=%r",
+                chat_id,
+            )
+            return []
+        if str(frame.session_key or "") != session_key:
+            logger.warning(
+                "agent365 card capability mint rejected: session_key mismatch chat_id=%r",
+                chat_id,
+            )
+            return []
+        user_id = frame.user_id
+        if not user_id:
+            logger.warning(
+                "agent365 card capability mint rejected: empty turn authority user chat_id=%r",
+                chat_id,
+            )
+            return []
         nonce = secrets.token_urlsafe(24)
         opaque_choices = {secrets.token_urlsafe(12): value for _, value in choices}
         self._card_capabilities[nonce] = {
             "kind": kind,
-            "conversation_id": chat_id,
-            "user_id": bridge._canonical_activity_user(inbound),
-            "tenant_id": self.tenant_id.lower(),
+            "conversation_id": frame.conversation_id or chat_id,
+            "user_id": user_id,
+            "tenant_id": frame.tenant_id or self.tenant_id.lower(),
             "lifecycle_generation": self._lifecycle_generation,
             "chat_generation": self._chat_generation(chat_id),
             "created_at": time.monotonic(),
@@ -12630,11 +13199,45 @@ class Agent365Adapter(BasePlatformAdapter):
     # Gateway resolver seams — lazily import the gateway ``tools`` package (only
     # importable inside the gateway process at runtime; monkeypatched in tests).
 
-    @staticmethod
-    def _gw_resolve_approval(session_key: str, choice: str) -> int:
+    def _gw_resolve_approval(
+        self,
+        session_key: str,
+        choice: str,
+        *,
+        request_id: str,
+        reason: str | None = None,
+    ) -> int:
         from tools.approval import resolve_gateway_approval
 
-        return resolve_gateway_approval(session_key, choice)
+        if not str(request_id or ""):
+            return 0
+        count = resolve_gateway_approval(
+            session_key,
+            choice,
+            resolve_all=False,
+            reason=reason,
+            request_id=str(request_id),
+        )
+        if count:
+            self.invalidate_exec_approval_capabilities(session_key, str(request_id))
+        return count
+
+    def invalidate_exec_approval_capabilities(self, session_key: str, request_id: str) -> None:
+        target_key = str(session_key or "")
+        target_id = str(request_id or "")
+        if not target_key or not target_id:
+            return
+        for nonce, capability in list(self._card_capabilities.items()):
+            if capability.get("kind") != _CARD_KIND_EXEC_APPROVAL:
+                continue
+            resolver = capability.get("resolver")
+            if not isinstance(resolver, dict):
+                continue
+            if (
+                str(resolver.get("session_key") or "") == target_key
+                and str(resolver.get("request_id") or "") == target_id
+            ):
+                self._card_capabilities.pop(nonce, None)
 
     @staticmethod
     async def _gw_resolve_slash_confirm(
@@ -12669,13 +13272,26 @@ class Agent365Adapter(BasePlatformAdapter):
         conv = activity.get("conversation")
         conv_id = str(conv.get("id") or "") if isinstance(conv, dict) else ""
         user_id = _import_bridge()._canonical_activity_user(activity)
+        cap_user_id = str((capability or {}).get("user_id") or "")
+        resolver = capability["resolver"] if isinstance(capability, dict) else {}
+        exec_request_id = str(resolver.get("request_id") or "")
         if (
             capability is None
             or time.monotonic() - float(capability.get("created_at", 0.0))
             > _CARD_CAPABILITY_TTL_SEC
             or capability.get("kind") != kind
             or capability.get("conversation_id") != conv_id
-            or capability.get("user_id") != user_id
+            or not cap_user_id
+            or not user_id
+            or cap_user_id != user_id
+            or (kind == _CARD_KIND_EXEC_APPROVAL and not exec_request_id)
+            or (
+                kind == _CARD_KIND_EXEC_APPROVAL
+                and not self._exec_approval_request_still_pending(
+                    str(resolver.get("session_key") or ""),
+                    exec_request_id,
+                )
+            )
             or capability.get("tenant_id") != self.tenant_id.lower()
             or capability.get("lifecycle_generation") != self._lifecycle_generation
             or capability.get("chat_generation") != self._chat_generation(conv_id)
@@ -12699,7 +13315,11 @@ class Agent365Adapter(BasePlatformAdapter):
             self._card_action_tasks_by_chat.setdefault(conv_id, set()).add(action_task)
         try:
             if kind == _CARD_KIND_EXEC_APPROVAL:
-                self._gw_resolve_approval(str(resolver.get("session_key") or ""), choice)
+                self._gw_resolve_approval(
+                    str(resolver.get("session_key") or ""),
+                    choice,
+                    request_id=exec_request_id,
+                )
             elif kind == _CARD_KIND_SLASH_CONFIRM:
                 follow = await self._gw_resolve_slash_confirm(
                     str(resolver.get("session_key") or ""),
@@ -14018,6 +14638,7 @@ class Agent365Adapter(BasePlatformAdapter):
             guard: Any,
             prior: Any,
         ) -> dict[str, Any]:
+            self._clear_session_pending_turn_state(session_key)
             if committed is not None:
                 # The fence wait cannot be undone. Cancel the deferred retry
                 # now so it cannot post through ``_send_reply_activity``
@@ -14371,6 +14992,8 @@ class Agent365Adapter(BasePlatformAdapter):
         safe to call unconditionally."""
         current = asyncio.current_task()
 
+        for session_key in self._session_keys_for_chat(chat_id):
+            self._clear_session_pending_turn_state(session_key)
         await self._retire_chat_agent_turns(chat_id)
 
         task_chats: dict[asyncio.Task[Any], str] = {

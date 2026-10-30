@@ -163,8 +163,17 @@ class _StubBasePlatformAdapter:
         return str(p.resolve())
 
 
-def _install_gateway_stubs() -> None:
-    if "gateway.platforms.base" in sys.modules:
+def _install_gateway_stubs(*, force: bool = False) -> None:
+    if force:
+        for name in (
+            "gateway.platforms.base",
+            "gateway.config",
+            "gateway.session",
+            "gateway.platforms",
+            "gateway",
+        ):
+            sys.modules.pop(name, None)
+    elif "gateway.platforms.base" in sys.modules:
         return
     gateway = types.ModuleType("gateway")
     platforms = types.ModuleType("gateway.platforms")
@@ -176,6 +185,17 @@ def _install_gateway_stubs() -> None:
     base.SendResult = _StubSendResult
     base.MessageEvent = _StubMessageEvent
     base.MessageType = _StubMessageType
+
+    def merge_pending_message_event(
+        pending_messages: dict[str, Any],
+        session_key: str,
+        event: Any,
+        *,
+        merge_text: bool = False,
+    ) -> None:
+        pending_messages[session_key] = event
+
+    base.merge_pending_message_event = merge_pending_message_event
     config.Platform = _StubPlatform
     config.PlatformConfig = _StubPlatformConfig
     session.SessionSource = _StubSessionSource
