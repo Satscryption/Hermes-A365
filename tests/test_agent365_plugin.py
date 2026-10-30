@@ -23719,6 +23719,7 @@ class TestInvokeRoute:
                     "oid": "claim-oid",
                     "tid": "claim-tid",
                     "preferred_username": "u@x",
+                    "scp": "User.Read",
                 }
             ),
         )
@@ -25892,6 +25893,7 @@ def _handoff_ctx(
         claims={
             "oid": _HANDOFF_USER if claims_user is None else claims_user,
             "tid": _HANDOFF_TENANT if claims_tenant is None else claims_tenant,
+            "idtyp": "user",
         },
         path_tag="B",
     )

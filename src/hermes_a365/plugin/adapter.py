@@ -12110,16 +12110,21 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if token_tenant != invoke_tenant or token_tenant != adapter_tenant:
             return False
-        sender = ctx.activity.get("from")
-        sender = sender if isinstance(sender, dict) else {}
-        activity_user = _normalized_token(sender.get("aadObjectId"))
-        if invoke_user:
-            if token_user != invoke_user:
+        bridge = _import_bridge()
+        if not bridge._is_m365_authenticated_channel(bridge._activity_channel_id(ctx.activity)):
+            if not invoke_user or token_user != invoke_user:
                 return False
-        elif not activity_user or activity_user != token_user:
-            return False
-        if invoke_user and activity_user and activity_user != token_user:
-            return False
+        else:
+            sender = ctx.activity.get("from")
+            sender = sender if isinstance(sender, dict) else {}
+            activity_user = _normalized_token(sender.get("aadObjectId"))
+            if invoke_user:
+                if token_user != invoke_user:
+                    return False
+            elif not activity_user or activity_user != token_user:
+                return False
+            if invoke_user and activity_user and activity_user != token_user:
+                return False
         activity_tenant = _normalized_token(ctx.conv.get("tenantId"))
         return not activity_tenant or activity_tenant == token_tenant
 

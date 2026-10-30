@@ -180,7 +180,15 @@ class TestMsteamsRegression:
         monkeypatch.setattr(
             bridge,
             "validate_inbound_jwt",
-            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z", "oid": _VICTIM_AAD}),
+            AsyncMock(
+                return_value={
+                    "aud": "x",
+                    "iss": "y",
+                    "azp": "z",
+                    "oid": _VICTIM_AAD,
+                    "scp": "User.Read",
+                }
+            ),
         )
         client = TestClient(adapter.build_app())
         body = _make_inbound(path="A")

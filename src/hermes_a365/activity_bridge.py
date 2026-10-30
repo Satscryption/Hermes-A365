@@ -122,7 +122,7 @@ from ._common import (
 from ._common import (
     quote_path_segment as _quote_path_segment_common,
 )
-from .invoke import empty_invoke_ack
+from .invoke import empty_invoke_ack, jwt_delegated_user_oid
 
 # #19: secrets-at-rest provider. Fills a MISS only — the plaintext
 # generated-config / per-agent .env values still win.
@@ -1135,15 +1135,8 @@ def _inbound_channel_rejection_reason(
 
 
 def _jwt_end_user_oid(claims: dict[str, Any] | None) -> str:
-    """Return a JWT ``oid`` only when it identifies an end user, not an app-only caller."""
-    if not claims:
-        return ""
-    if str(claims.get("idtyp") or "").strip().lower() == "app":
-        return ""
-    oid = claims.get("oid")
-    if isinstance(oid, str) and oid.strip():
-        return oid.strip().lower()
-    return ""
+    """Shared delegated-user oid extraction (see ``invoke.jwt_delegated_user_oid``)."""
+    return jwt_delegated_user_oid(claims)
 
 
 def _activity_user_candidates(
