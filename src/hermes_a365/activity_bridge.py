@@ -1035,6 +1035,15 @@ DEFAULT_TRUSTED_SERVICE_URL_HOST_SUFFIXES: tuple[str, ...] = (
     ".cloud.microsoft",
 )
 
+# Inbound activities are admitted only on Microsoft 365 / Teams surfaces by
+# default. Bot Framework client channels (Direct Line, Web Chat, emulator)
+# require an explicit operator opt-in — see ``A365_ALLOW_CLIENT_BF_CHANNELS``.
+DEFAULT_M365_CHANNEL_IDS: frozenset[str] = frozenset(
+    {"msteams", "agents", "m365copilot", "outlook"}
+)
+CLIENT_BF_CHANNEL_IDS: frozenset[str] = frozenset({"directline", "webchat", "emulator"})
+ALLOW_CLIENT_BF_CHANNELS_ENV_KEY = "A365_ALLOW_CLIENT_BF_CHANNELS"
+
 # Refresh outbound token 5 min before expiry to avoid mid-flight 401s.
 TOKEN_REFRESH_SKEW_SECONDS = 300
 
@@ -1066,8 +1075,108 @@ def _validate_webhook_url(url: str, *, development_mode: bool) -> None:
     )
 
 
-def _activity_user_candidates(activity: dict[str, Any]) -> tuple[str, ...]:
+def _activity_channel_id(activity: dict[str, Any]) -> str:
+    return str(activity.get("channelId") or "").strip().lower()
+
+
+def _is_m365_authenticated_channel(channel_id: str) -> bool:
+    return channel_id in DEFAULT_M365_CHANNEL_IDS
+
+
+def parse_allow_client_bf_channels(env: Mapping[str, str]) -> bool:
+    """Parse ``A365_ALLOW_CLIENT_BF_CHANNELS`` (default off when absent)."""
+    if ALLOW_CLIENT_BF_CHANNELS_ENV_KEY not in env:
+        return False
+    raw = env[ALLOW_CLIENT_BF_CHANNELS_ENV_KEY]
+    if not isinstance(raw, str):
+        raise BridgeConfigError(
+            f"{ALLOW_CLIENT_BF_CHANNELS_ENV_KEY} in env is not text; refusing to start"
+        )
+    token = raw.strip().lower()
+    if token in {"0", "false", "no", "off", ""}:
+        return False
+    if token in {"1", "true", "yes", "on"}:
+        return True
+    raise BridgeConfigError(
+        f"{ALLOW_CLIENT_BF_CHANNELS_ENV_KEY} is not a recognized on/off value; refusing to start"
+    )
+
+
+def resolve_allow_client_bf_channels(
+    hermes_home: Path,
+    *,
+    process_env: Mapping[str, str],
+) -> bool:
+    profile_file = load_profile_env(hermes_home)
+    merged = dict(profile_file.values)
+    if ALLOW_CLIENT_BF_CHANNELS_ENV_KEY in process_env:
+        merged[ALLOW_CLIENT_BF_CHANNELS_ENV_KEY] = process_env[ALLOW_CLIENT_BF_CHANNELS_ENV_KEY]
+    return parse_allow_client_bf_channels(merged)
+
+
+def _inbound_channel_admitted(activity: dict[str, Any], *, allow_client_bf_channels: bool) -> bool:
+    channel_id = _activity_channel_id(activity)
+    if _is_m365_authenticated_channel(channel_id):
+        return True
+    if channel_id in CLIENT_BF_CHANNEL_IDS:
+        return allow_client_bf_channels
+    return False
+
+
+def _inbound_channel_rejection_reason(
+    activity: dict[str, Any], *, allow_client_bf_channels: bool
+) -> str | None:
+    if _inbound_channel_admitted(activity, allow_client_bf_channels=allow_client_bf_channels):
+        return None
+    channel_id = _activity_channel_id(activity)
+    if channel_id in CLIENT_BF_CHANNEL_IDS:
+        return "client-channel-disabled"
+    return "unsupported-channel"
+
+
+def _jwt_end_user_oid(claims: dict[str, Any] | None) -> str:
+    """Return a JWT ``oid`` only when it identifies an end user, not an app-only caller."""
+    if not claims:
+        return ""
+    if str(claims.get("idtyp") or "").strip().lower() == "app":
+        return ""
+    oid = claims.get("oid")
+    if isinstance(oid, str) and oid.strip():
+        return oid.strip().lower()
+    return ""
+
+
+def _activity_user_candidates(
+    activity: dict[str, Any],
+    *,
+    claims: dict[str, Any] | None = None,
+) -> tuple[str, ...]:
     """Return stable sender identifiers in authorization preference order."""
+    channel_id = _activity_channel_id(activity)
+    candidates: list[str] = []
+    jwt_oid = _jwt_end_user_oid(claims)
+    if jwt_oid:
+        candidates.append(jwt_oid)
+    if not _is_m365_authenticated_channel(channel_id):
+        # Client / unknown channels never treat body ``from`` fields as Entra
+        # identities for allowlist matching — only a validated end-user JWT oid.
+        return tuple(candidates)
+    sender = activity.get("from")
+    if not isinstance(sender, dict):
+        return tuple(candidates)
+    for key in ("aadObjectId", "id", "userPrincipalName", "email"):
+        value = sender.get(key)
+        if isinstance(value, str) and value.strip():
+            normalized = value.strip().lower()
+            if normalized not in candidates:
+                candidates.append(normalized)
+    return tuple(candidates)
+
+
+def _activity_body_user_candidates(activity: dict[str, Any]) -> tuple[str, ...]:
+    """Body-derived sender aliases for gateway pairing on M365 channels only."""
+    if not _is_m365_authenticated_channel(_activity_channel_id(activity)):
+        return ()
     sender = activity.get("from")
     if not isinstance(sender, dict):
         return ()
@@ -1081,8 +1190,12 @@ def _activity_user_candidates(activity: dict[str, Any]) -> tuple[str, ...]:
     return tuple(candidates)
 
 
-def _canonical_activity_user(activity: dict[str, Any]) -> str:
-    candidates = _activity_user_candidates(activity)
+def _canonical_activity_user(
+    activity: dict[str, Any],
+    *,
+    claims: dict[str, Any] | None = None,
+) -> str:
+    candidates = _activity_user_candidates(activity, claims=claims)
     return candidates[0] if candidates else ""
 
 
@@ -1137,12 +1250,18 @@ def _activity_requires_end_user_auth(activity: dict[str, Any]) -> bool:
 
 
 def _activity_user_authorized(
-    activity: dict[str, Any], *, allowed_users: tuple[str, ...], allow_all: bool
+    activity: dict[str, Any],
+    *,
+    allowed_users: tuple[str, ...],
+    allow_all: bool,
+    claims: dict[str, Any] | None = None,
 ) -> bool:
     if allow_all:
         return True
     allowed = {value.strip().lower() for value in allowed_users if value.strip()}
-    return any(candidate in allowed for candidate in _activity_user_candidates(activity))
+    return any(
+        candidate in allowed for candidate in _activity_user_candidates(activity, claims=claims)
+    )
 
 
 def _safe_log_field(value: Any, *, limit: int = 160) -> str:
@@ -1426,6 +1545,8 @@ class BridgeConfig:
     allowed_users: tuple[str, ...] = ()
     allow_all_users: bool = False
     sender_allowlist_configured: bool = True
+    # Direct Line / Web Chat / emulator traffic is off unless explicitly enabled.
+    allow_client_bf_channels: bool = False
     # Teams Create-instance agents are a distinct Entra agentIdentity.
     # Their app id may be minted under only when the operator listed it.
     # Empty means "blueprint id only" (deny-by-default).
@@ -1808,6 +1929,10 @@ def load_bridge_config(
             "sender allowlist is not configured; denying every end user. "
             "Set A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS in ~/.hermes/.env"
         )
+    allow_client_bf_channels = resolve_allow_client_bf_channels(
+        hermes_home,
+        process_env=os.environ,
+    )
     return BridgeConfig(
         slug=slug,
         tenant_id=agent_env["A365_TENANT_ID"],
@@ -1822,6 +1947,7 @@ def load_bridge_config(
         allowed_users=sender_policy.allowed_users,
         allow_all_users=sender_policy.allow_all_users,
         sender_allowlist_configured=sender_policy.configured,
+        allow_client_bf_channels=allow_client_bf_channels,
         agent_identity_ids=parse_agent_identity_ids(agent_env.get("A365_AGENT_IDENTITY_IDS")),
     )
 
@@ -3772,6 +3898,7 @@ def make_app(
         # Path A/B from the (unauthenticated) activity body. None when validation
         # is skipped (dev only) → falls back to the body-derived tag.
         validated_path: str | None = None
+        inbound_claims: dict[str, Any] = {}
         if not cfg.skip_jwt_validation:
             try:
                 token = _extract_bearer_token(authorization)
@@ -3791,7 +3918,7 @@ def make_app(
             validated_path = "B" if iss == BF_ISSUER else "A"
             try:
                 if iss == BF_ISSUER:
-                    await validate_inbound_jwt_bf(
+                    inbound_claims = await validate_inbound_jwt_bf(
                         token=token,
                         expected_app_id=cfg.bf_app_id or cfg.blueprint_client_id,
                         expected_service_url=service_url,
@@ -3799,7 +3926,7 @@ def make_app(
                         cache=bf_jwks_cache,
                     )
                 else:
-                    await validate_inbound_jwt(
+                    inbound_claims = await validate_inbound_jwt(
                         token=token,
                         tenant_id=cfg.tenant_id,
                         expected_app_id=cfg.blueprint_client_id,
@@ -3815,6 +3942,13 @@ def make_app(
                 )
                 raise _HTTPException(status_code=403, detail="invalid bearer token") from e
 
+        channel_reject = _inbound_channel_rejection_reason(
+            activity, allow_client_bf_channels=cfg.allow_client_bf_channels
+        )
+        if channel_reject is not None:
+            logger.warning("inbound 403 reason=%s", _safe_log_field(channel_reject))
+            raise _HTTPException(status_code=403, detail="end user is not authorized")
+
         # Standalone serve has no GatewayRunner layer. Authorize the represented
         # end user before dedupe, persistence, forwarding, or any reply-token
         # side effect. JWT-authenticated platform lifecycle/control activities do
@@ -3824,6 +3958,7 @@ def make_app(
                 activity,
                 allowed_users=cfg.allowed_users,
                 allow_all=cfg.allow_all_users,
+                claims=inbound_claims,
             ):
                 raise _HTTPException(status_code=403, detail="end user is not authorized")
         else:

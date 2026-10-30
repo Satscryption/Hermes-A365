@@ -1843,6 +1843,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
         self._allow_all_users = sender_policy.allow_all_users
         self._sender_allowlist_configured = sender_policy.configured
+        self._allow_client_bf_channels = self._load_allow_client_bf_channels(extra)
         self._reactions_dispatch_agent_turn = _extra_bool(
             extra, "reactions_dispatch_agent_turn", default=False
         )
@@ -2312,6 +2313,18 @@ class Agent365Adapter(BasePlatformAdapter):
             slug=self.slug or "",
         )
 
+    def _load_allow_client_bf_channels(self, extra: dict[str, Any]) -> bool:
+        bridge = _import_bridge()
+        scoped: dict[str, str] = {}
+        value = _profile_env(bridge.ALLOW_CLIENT_BF_CHANNELS_ENV_KEY)
+        if value is not None:
+            scoped[bridge.ALLOW_CLIENT_BF_CHANNELS_ENV_KEY] = value
+        enabled = bridge.resolve_allow_client_bf_channels(
+            self._hermes_home,
+            process_env=scoped,
+        )
+        return enabled or _extra_bool(extra, "allow_client_bf_channels", default=False)
+
     def _make_bridge_config(self) -> Any:
         """Construct a `BridgeConfig` for the bridge helpers (token
         acquisition, JWT validation, send_reply)."""
@@ -2355,6 +2368,10 @@ class Agent365Adapter(BasePlatformAdapter):
             bf_client_secret=bf_secret,
             idempotency_max_entries=self._idempotency_max_entries,
             agent_identity_ids=bridge.parse_agent_identity_ids(raw_identity_ids),
+            allowed_users=self._allowed_users,
+            allow_all_users=self._allow_all_users,
+            sender_allowlist_configured=self._sender_allowlist_configured,
+            allow_client_bf_channels=self._allow_client_bf_channels,
         )
 
     # ── FastAPI app construction (separated for testability) ──────────────
@@ -2529,6 +2546,13 @@ class Agent365Adapter(BasePlatformAdapter):
                     logger.warning("inbound 403 path=A reason=%s", bridge._safe_log_field(e))
                     raise HTTPException(status_code=403, detail="invalid bearer token") from e
 
+            channel_reject = bridge._inbound_channel_rejection_reason(
+                activity, allow_client_bf_channels=self._allow_client_bf_channels
+            )
+            if channel_reject is not None:
+                logger.warning("inbound 403 reason=%s", bridge._safe_log_field(channel_reject))
+                raise HTTPException(status_code=403, detail="end user is not authorized")
+
             if self._disconnecting:
                 return JSONResponse(
                     {"status": "unavailable", "reason": "disconnecting"},
@@ -2542,15 +2566,16 @@ class Agent365Adapter(BasePlatformAdapter):
                     status_code=503,
                 )
 
-            sender_ids = bridge._activity_user_candidates(activity)
-            authorized_sender_id = bridge._canonical_activity_user(activity)
+            pairing_ids = bridge._activity_body_user_candidates(activity)
+            sender_ids = bridge._activity_user_candidates(activity, claims=claims)
+            authorized_sender_id = bridge._canonical_activity_user(activity, claims=claims)
             chat_type = bridge._activity_chat_type(activity)
             if bridge._activity_requires_end_user_auth(activity):
                 auth_check = getattr(self, "_is_sender_authorized", None)
                 alias_decisions: list[Any] = []
                 if callable(auth_check):
                     alias_decisions = [
-                        auth_check(sender_id, chat_type, chat_id) for sender_id in sender_ids
+                        auth_check(sender_id, chat_type, chat_id) for sender_id in pairing_ids
                     ]
                     decision = (
                         True
@@ -2563,7 +2588,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         authorized_sender_id = next(
                             sender_id
                             for sender_id, alias_decision in zip(
-                                sender_ids, alias_decisions, strict=True
+                                pairing_ids, alias_decisions, strict=True
                             )
                             if alias_decision is True
                         )
@@ -2580,6 +2605,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     activity,
                     allowed_users=self._allowed_users,
                     allow_all=self._allow_all_users,
+                    claims=claims,
                 )
                 if not local_ok:
                     decision = False

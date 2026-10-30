@@ -28120,7 +28120,8 @@ class TestMessageReaction:
             json=_reaction_activity(channel_id="webchat", activity_id="react-web"),
             headers={"Authorization": "Bearer a.b.c"},
         )
-        assert response.json()["reason"] == "ignored"
+        assert response.status_code == 403
+        assert response.json()["detail"] == "end user is not authorized"
         assert "reply-1" not in a._feedback_by_message_id
         assert a._handled_events == []
 
