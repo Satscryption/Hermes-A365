@@ -81,7 +81,6 @@ import os
 import re
 import secrets
 import stat
-import sys
 import threading
 import time
 import uuid
@@ -4726,7 +4725,9 @@ class Agent365Adapter(BasePlatformAdapter):
         record = self._ledger_record_for_message(str(getattr(event, "message_id", "") or ""))
         if record is None:
             with self._turn_frame_scope(session_key, _UNBOUND_TURN_FRAME):
-                self._release_session_guard(session_key)
+                guard = self._active_sessions.get(session_key)
+                if guard is not None and self._active_sessions.get(session_key) is guard:
+                    self._release_session_guard(session_key, guard=guard)
             return
         with self._turn_frame_scope(session_key, record):
             await super()._process_message_background(event, session_key)
@@ -13130,7 +13131,8 @@ class Agent365Adapter(BasePlatformAdapter):
             return []
         if not isinstance(frame, TurnAuthorityRecord):
             logger.warning(
-                "agent365 card capability mint rejected: no turn authority chat_id=%r session_key=%r",
+                "agent365 card capability mint rejected: no turn authority "
+                "chat_id=%r session_key=%r",
                 chat_id,
                 session_key,
             )

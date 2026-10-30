@@ -5,6 +5,8 @@ from __future__ import annotations
 import enum
 import importlib
 import importlib.util
+import inspect
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -20,7 +22,6 @@ expected_hermes_revision = _bootstrap.expected_hermes_revision
 
 
 def _extend_platform_enum() -> None:
-
     import gateway.config as cfg
 
     platform = cfg.Platform
@@ -34,6 +35,14 @@ def _extend_platform_enum() -> None:
 
 
 def _install_vendor_gateway_modules() -> None:
+    for name in (
+        "gateway.platforms.base",
+        "gateway.config",
+        "gateway.session",
+        "gateway.platforms",
+        "gateway",
+    ):
+        sys.modules.pop(name, None)
 
     import gateway.config as vendor_cfg
     import gateway.platforms.base as vendor_base
@@ -44,7 +53,17 @@ def _install_vendor_gateway_modules() -> None:
     sys.modules["gateway.session"] = vendor_session
 
 
-def load_agent365_adapter_module() -> Any:
+def load_agent365_adapter_module(*, in_subprocess: bool = False) -> Any:
+    if in_subprocess:
+        proc = subprocess.run(
+            [sys.executable, str(Path(__file__).resolve()), "--load-check"],
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(proc.stderr.strip() or proc.stdout.strip() or "harness child failed")
+        return None
     ensure_hermes_vendor()
     _install_vendor_gateway_modules()
     _extend_platform_enum()
@@ -52,6 +71,26 @@ def load_agent365_adapter_module() -> Any:
     if adapter_name in sys.modules:
         del sys.modules[adapter_name]
     return importlib.import_module(adapter_name)
+
+
+def _child_load_check() -> int:
+    ensure_hermes_vendor()
+    import gateway.platforms.base as vendor_base
+
+    vendor_root = ensure_hermes_vendor().resolve()
+    base_file = Path(inspect.getfile(vendor_base.BasePlatformAdapter)).resolve()
+    merge_file = Path(inspect.getfile(vendor_base.merge_pending_message_event)).resolve()
+    if not str(base_file).startswith(str(vendor_root)):
+        print(f"BasePlatformAdapter not under vendor tree: {base_file}", file=sys.stderr)
+        return 1
+    if not str(merge_file).startswith(str(vendor_root)):
+        print(f"merge_pending_message_event not under vendor tree: {merge_file}", file=sys.stderr)
+        return 1
+    if hasattr(vendor_base, "_StubBasePlatformAdapter"):
+        print("vendor base defines _StubBasePlatformAdapter", file=sys.stderr)
+        return 1
+    load_agent365_adapter_module()
+    return 0
 
 
 def install_bridge_stubs(monkeypatch: Any, adapter_mod: Any) -> None:
@@ -65,3 +104,8 @@ def install_bridge_stubs(monkeypatch: Any, adapter_mod: Any) -> None:
     )
     monkeypatch.setattr(bridge_mod, "send_reply", AsyncMock(return_value=None))
     monkeypatch.setattr(bridge_mod, "shutdown_jwks_cache_refresh", AsyncMock(return_value=None))
+
+
+if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--load-check":
+        raise SystemExit(_child_load_check())

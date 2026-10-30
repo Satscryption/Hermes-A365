@@ -153,9 +153,17 @@ async def _shutdown_adapter(adapter: Any) -> None:
 
 
 def test_vendor_revision_pin_is_verified() -> None:
+    import subprocess
+
     root = _bootstrap.ensure_hermes_vendor()
     assert root.is_dir()
-    assert _bootstrap.expected_hermes_revision() == "bf0203a794a07aac3ff764972ab9087baa4e4f4e"
+    rev = subprocess.run(
+        ["git", "-C", str(root), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert rev == _bootstrap.expected_hermes_revision()
 
 
 def test_vendor_revision_mismatch_is_rejected(
@@ -192,8 +200,7 @@ async def test_fifo_preserves_arrival_order_for_mixed_origins(
         event = MessageEvent(
             text=text, message_type=MessageType.TEXT, source=source, message_id=mid
         )
-        origin = adapter._turn_origin_from_activity(inbound, session_key)
-        adapter._stamp_turn_origin_on_event(event, origin)
+        adapter.admit_turn_authority(inbound, session_key, message_id=mid)
         return event
 
     b1 = _event(USER_B, "b1", "b1")
@@ -266,28 +273,33 @@ async def test_aba_http_cards_bind_to_turn_owner(
         mid = str(getattr(event, "message_id", "") or "")
         handler_counts[mid] = handler_counts.get(mid, 0) + 1
         session_key = adapter._session_key_for(event) or f"agent365:{aba_conv}"
-        origin_user = adapter._event_turn_origin(event)["user_id"]
+        record = adapter._event_turn_authority(event)
+        assert record is not None
+        origin_user = record.user_id
         if mid == "act-a1":
             a_ready.set()
             await b_posted.wait()
-            await release_a.wait()
+            with adapter._turn_frame_scope(session_key, record):
+                await release_a.wait()
             return
         if mid == "act-b":
-            cards_by_user.setdefault(origin_user, {})
-            cards_by_user[origin_user]["slash"] = await adapter.send_slash_confirm(
-                aba_conv, "Confirm", "Run?", session_key, "cfm-b"
-            )
-            cards_by_user[origin_user]["clarify"] = await adapter.send_clarify(
-                aba_conv, "Pick", ["Alpha"], "clr-b", session_key
-            )
+            with adapter._turn_frame_scope(session_key, record):
+                cards_by_user.setdefault(origin_user, {})
+                cards_by_user[origin_user]["slash"] = await adapter.send_slash_confirm(
+                    aba_conv, "Confirm", "Run?", session_key, "cfm-b"
+                )
+                cards_by_user[origin_user]["clarify"] = await adapter.send_clarify(
+                    aba_conv, "Pick", ["Alpha"], "clr-b", session_key
+                )
             return
         if mid != "act-a2":
             return
-        _enqueue_gateway_exec_request(session_key, "req-a2")
-        cards_by_user.setdefault(origin_user, {})
-        cards_by_user[origin_user]["exec"] = await adapter.send_exec_approval(
-            aba_conv, "danger", session_key, request_id="req-a2"
-        )
+        with adapter._turn_frame_scope(session_key, record):
+            _enqueue_gateway_exec_request(session_key, "req-a2")
+            cards_by_user.setdefault(origin_user, {})
+            cards_by_user[origin_user]["exec"] = await adapter.send_exec_approval(
+                aba_conv, "danger", session_key, request_id="req-a2"
+            )
         done.set()
 
     adapter.set_message_handler(gateway_message_handler)
@@ -577,8 +589,7 @@ async def test_pending_turn_fifo_rejects_when_full(
             user_id=user,
         )
         event = MessageEvent(text=mid, message_type=MessageType.TEXT, source=source, message_id=mid)
-        origin = adapter._turn_origin_from_activity(inbound, session_key)
-        adapter._stamp_turn_origin_on_event(event, origin)
+        adapter.admit_turn_authority(inbound, session_key, message_id=mid)
         return event
 
     adapter._pending_messages[session_key] = _event("slot", USER_A)
@@ -609,8 +620,7 @@ async def test_pending_turn_fifo_isolated_per_session_key(
             user_id=user,
         )
         event = MessageEvent(text=mid, message_type=MessageType.TEXT, source=source, message_id=mid)
-        origin = adapter._turn_origin_from_activity(inbound, session_key)
-        adapter._stamp_turn_origin_on_event(event, origin)
+        adapter.admit_turn_authority(inbound, session_key, message_id=mid)
         return event
 
     adapter._agent365_admit_pending_turn_event(session_a, _event(session_a, "a1", USER_A))
@@ -680,3 +690,312 @@ async def test_sustained_pending_arrivals_all_run_once(
                     )
     finally:
         await _shutdown_adapter(adapter)
+
+
+@pytest.mark.asyncio
+async def test_queue_http_followup_card_binds_to_sender(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    queue_conv = "19:queue-frame-bind@thread.v2"
+    adapter_mod = _load_adapter_mod()
+    adapter = _make_adapter(monkeypatch, adapter_mod)
+    _wire_adapter(adapter, adapter_mod, monkeypatch)
+    session_key = f"agent:main:agent365:group:{queue_conv}"
+    a_ready = asyncio.Event()
+    b_turn = asyncio.Event()
+    release_a = asyncio.Event()
+    b_card: dict[str, Any] = {}
+
+    def _inbound(**kwargs: Any) -> dict[str, Any]:
+        activity = _group_inbound(**kwargs)
+        activity["conversation"] = {
+            "id": queue_conv,
+            "conversationType": "group",
+            "tenantId": "11111111-1111-1111-1111-111111111111",
+        }
+        return activity
+
+    async def gateway_message_handler(event: Any) -> None:
+        mid = str(getattr(event, "message_id", "") or "")
+        sk = adapter._session_key_for(event) or session_key
+        if mid == "act-a-hold":
+            a_ready.set()
+            record_a = adapter._ledger_record_for_message("act-a-hold")
+            assert record_a is not None
+            with adapter._turn_frame_scope(sk, record_a):
+                await b_turn.wait()
+                post_a = await adapter.send_clarify(queue_conv, "After B", ["X"], "clr-a", sk)
+                assert post_a.success
+                assert adapter._resolve_turn_frame(sk) is record_a
+            await release_a.wait()
+            return
+        if mid == "act-b-queue":
+            record = adapter._event_turn_authority(event)
+            assert record is not None
+            frame = adapter._frame_for_run_agent(str(record.message_id))
+            with adapter._turn_frame_scope(sk, frame):
+                result = await adapter.send_clarify(queue_conv, "Pick B", ["Beta"], "clr-b", sk)
+            assert result.success
+            b_card["value"] = next(iter(adapter._card_capabilities.values()))
+            b_card["nonce"] = next(
+                k for k, v in adapter._card_capabilities.items() if v is b_card["value"]
+            )
+            b_turn.set()
+
+    adapter.set_message_handler(gateway_message_handler)
+    try:
+        transport = httpx.ASGITransport(app=adapter.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            a_task = asyncio.create_task(
+                client.post(
+                    "/api/messages",
+                    json=_inbound(
+                        activity_id="act-a-hold",
+                        text="hold-a",
+                        user_aad=USER_A,
+                        user_id="user-a",
+                    ),
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+            )
+            await asyncio.wait_for(a_ready.wait(), timeout=15.0)
+            await client.post(
+                "/api/messages",
+                json=_inbound(
+                    activity_id="act-b-queue",
+                    text="/queue",
+                    user_aad=USER_B,
+                    user_id="user-b",
+                ),
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+            await asyncio.sleep(0.05)
+            from gateway.platforms.base import MessageEvent, MessageType
+            from gateway.session import SessionSource
+
+            b_source = SessionSource(
+                platform=adapter_mod.Platform("agent365"),
+                chat_id=queue_conv,
+                chat_type="group",
+                user_id=USER_B,
+            )
+            b_event = MessageEvent(
+                text="/queue",
+                message_type=MessageType.TEXT,
+                source=b_source,
+                message_id="act-b-queue",
+            )
+            assert adapter._ledger_record_for_message("act-b-queue") is not None
+            await adapter._process_message_background(b_event, session_key)
+            await asyncio.wait_for(b_turn.wait(), timeout=15.0)
+            value = {
+                "hermes_kind": adapter_mod._CARD_KIND_CLARIFY,
+                "capability": b_card["nonce"],
+                "choice_id": next(iter(b_card["value"]["choices"])),
+            }
+            owner = _inbound(
+                activity_id="owner-b",
+                text="",
+                user_aad=USER_B,
+                user_id="user-b",
+            )
+            other = _inbound(
+                activity_id="owner-a",
+                text="",
+                user_aad=USER_A,
+                user_id="user-a",
+            )
+            assert (await adapter._handle_card_action(other, value)).status_code == 403
+            assert (await adapter._handle_card_action(owner, value)).status_code == 200
+            release_a.set()
+            await a_task
+    finally:
+        await _shutdown_adapter(adapter)
+
+
+@pytest.mark.asyncio
+async def test_unbound_followup_does_not_pop_parent_or_post(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from unittest.mock import AsyncMock
+
+    adapter_mod = _load_adapter_mod()
+    adapter = _make_adapter(monkeypatch, adapter_mod)
+    _wire_adapter(adapter, adapter_mod, monkeypatch)
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    session_key = f"agent:main:agent365:group:{GROUP_CONV}"
+    inbound_a = _group_inbound(
+        activity_id="act-a-parent",
+        text="parent",
+        user_aad=USER_A,
+        user_id="user-a",
+    )
+    assert adapter.admit_turn_authority(inbound_a, session_key, message_id="act-a-parent")
+    parent = adapter._ledger_record_for_message("act-a-parent")
+    assert parent is not None
+    bridge = adapter_mod._import_bridge()
+    send_reply = AsyncMock(return_value=None)
+    monkeypatch.setattr(bridge, "send_reply", send_reply)
+    source = SessionSource(
+        platform=adapter_mod.Platform("agent365"),
+        chat_id=GROUP_CONV,
+        chat_type="group",
+        user_id=USER_B,
+    )
+    follow = MessageEvent(
+        text="/queue",
+        message_type=MessageType.TEXT,
+        source=source,
+        message_id="act-unbound",
+    )
+    with adapter._turn_frame_scope(session_key, parent):
+        await adapter._process_message_background(follow, session_key)
+        assert adapter._resolve_turn_frame(session_key) is parent
+    send_reply.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_unbound_process_releases_session_guard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_mod = _load_adapter_mod()
+    adapter = _make_adapter(monkeypatch, adapter_mod)
+    session_key = f"agent:main:agent365:group:{GROUP_CONV}"
+    guard = asyncio.Event()
+    adapter._active_sessions[session_key] = guard
+    from gateway.platforms.base import MessageEvent, MessageType
+    from gateway.session import SessionSource
+
+    event = MessageEvent(
+        text="orphan",
+        message_type=MessageType.TEXT,
+        source=SessionSource(
+            platform=adapter_mod.Platform("agent365"),
+            chat_id=GROUP_CONV,
+            chat_type="group",
+            user_id=USER_A,
+        ),
+        message_id="",
+    )
+    await adapter._process_message_background(event, session_key)
+    assert session_key not in adapter._active_sessions
+
+
+def test_harness_ignores_cached_stubs(monkeypatch: pytest.MonkeyPatch) -> None:
+    import sys
+
+    import gateway.platforms.base as base_mod
+
+    stub_mod = type(sys)("gateway.platforms.base")
+    stub_mod.BasePlatformAdapter = type("_StubBasePlatformAdapter", (), {})
+    stub_mod.merge_pending_message_event = base_mod.merge_pending_message_event
+    monkeypatch.setitem(sys.modules, "gateway.platforms.base", stub_mod)
+    from hermes_runner_harness import load_agent365_adapter_module
+
+    load_agent365_adapter_module(in_subprocess=True)
+
+
+def test_vendor_pin_required_without_git(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    vendor = tmp_path / "hermes-agent"
+    vendor.mkdir()
+    (vendor / "gateway").mkdir()
+    monkeypatch.setattr(_bootstrap, "_VENDOR_ROOT", vendor)
+    monkeypatch.setattr(_bootstrap, "_bootstrapped", False)
+    monkeypatch.setenv("HERMES_A365_REQUIRE_VENDOR", "1")
+    with pytest.raises(RuntimeError, match=r"no \.git"):
+        _bootstrap.ensure_hermes_vendor()
+
+
+def test_vendor_fresh_clone_fetches_pin(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    import importlib.util
+    import subprocess
+
+    script_path = Path(__file__).resolve().parents[1] / "scripts" / "vendor_hermes_agent.py"
+    spec = importlib.util.spec_from_file_location("vendor_hermes_agent", script_path)
+    assert spec and spec.loader
+    vendor_script = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(vendor_script)
+
+    bare = tmp_path / "origin.git"
+    subprocess.run(["git", "init", "--bare", str(bare)], check=True, capture_output=True)
+    work = tmp_path / "seed"
+    subprocess.run(["git", "clone", str(bare), str(work)], check=True, capture_output=True)
+    env = {
+        "GIT_AUTHOR_NAME": "t",
+        "GIT_AUTHOR_EMAIL": "t@t",
+        "GIT_COMMITTER_NAME": "t",
+        "GIT_COMMITTER_EMAIL": "t@t",
+    }
+    subprocess.run(
+        ["git", "-C", str(work), "commit", "--allow-empty", "-m", "wrong-tip"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    wrong_tip = subprocess.run(
+        ["git", "-C", str(work), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(work), "commit", "--allow-empty", "-m", "pin-tip"],
+        check=True,
+        capture_output=True,
+        env=env,
+    )
+    pin_tip = subprocess.run(
+        ["git", "-C", str(work), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "-C", str(work), "push", "origin", f"{wrong_tip}:refs/heads/main"],
+        check=True,
+        capture_output=True,
+    )
+    subprocess.run(
+        ["git", "-C", str(work), "push", "origin", f"{pin_tip}:refs/heads/pin-hold"],
+        check=True,
+        capture_output=True,
+    )
+    monkeypatch.setattr(vendor_script, "REPO", str(bare))
+    monkeypatch.setattr(vendor_script, "PIN", pin_tip)
+    root = tmp_path / "proj"
+    root.mkdir()
+    (root / "scripts").mkdir()
+    monkeypatch.setattr(vendor_script, "__file__", str(root / "scripts" / "vendor_hermes_agent.py"))
+    monkeypatch.chdir(root)
+    (root / ".vendor").mkdir(exist_ok=True)
+    assert vendor_script.main() == 0
+    checkout = root / ".vendor" / "hermes-agent"
+    rev = subprocess.run(
+        ["git", "-C", str(checkout), "rev-parse", "HEAD"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout.strip()
+    assert rev == pin_tip
+
+
+@pytest.mark.asyncio
+async def test_synthetic_turn_without_message_id_mints_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    adapter_mod = _load_adapter_mod()
+    adapter = _make_adapter(monkeypatch, adapter_mod)
+    _wire_adapter(adapter, adapter_mod, monkeypatch)
+    session_key = "agent:main:agent365:group:19:x@thread.v2"
+    with adapter._turn_frame_scope(session_key, adapter_mod._UNBOUND_TURN_FRAME):
+        actions = adapter._mint_card_capability_actions(
+            GROUP_CONV,
+            adapter_mod._CARD_KIND_CLARIFY,
+            [("Yes", "y")],
+            {"clarify_id": "c1", "session_key": session_key},
+        )
+    assert actions == []

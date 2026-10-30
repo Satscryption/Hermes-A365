@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import subprocess
 import sys
 from pathlib import Path
 from typing import Any
@@ -25,22 +26,23 @@ def ensure_hermes_vendor() -> Path:
             "Hermes vendor tree is missing. Run scripts/vendor-hermes-agent.sh "
             "from the repository root, then re-run the tests."
         )
-    head_path = _VENDOR_ROOT / ".git" / "HEAD"
-    if head_path.is_file() or (_VENDOR_ROOT / ".git").exists():
-        import subprocess
-
-        rev_proc = subprocess.run(
-            ["git", "-C", str(_VENDOR_ROOT), "rev-parse", "HEAD"],
-            capture_output=True,
-            text=True,
+    if not (_VENDOR_ROOT / ".git").exists():
+        raise RuntimeError(
+            "Hermes vendor checkout has no .git metadata; run scripts/vendor-hermes-agent.sh "
+            "to refresh the checkout."
         )
-        rev = rev_proc.stdout.strip()
-        if rev_proc.returncode != 0 or rev != _HERMES_PIN:
-            detail = rev or rev_proc.stderr.strip() or "unknown revision"
-            raise RuntimeError(
-                f"Hermes vendor revision mismatch: found {detail}, expected {_HERMES_PIN}. "
-                "Run scripts/vendor-hermes-agent.sh to refresh the checkout."
-            )
+    rev_proc = subprocess.run(
+        ["git", "-C", str(_VENDOR_ROOT), "rev-parse", "HEAD"],
+        capture_output=True,
+        text=True,
+    )
+    rev = rev_proc.stdout.strip()
+    if rev_proc.returncode != 0 or rev != _HERMES_PIN:
+        detail = rev or rev_proc.stderr.strip() or "unknown revision"
+        raise RuntimeError(
+            f"Hermes vendor revision mismatch: found {detail}, expected {_HERMES_PIN}. "
+            "Run scripts/vendor-hermes-agent.sh to refresh the checkout."
+        )
     vendor_str = str(_VENDOR_ROOT)
     if vendor_str not in sys.path:
         sys.path.insert(0, vendor_str)
@@ -52,8 +54,14 @@ def try_import_real_gateway() -> bool:
     if _bootstrapped:
         return _VENDOR_ROOT.is_dir()
     _bootstrapped = True
-    try:
+    if __import__("os").environ.get("HERMES_A365_REQUIRE_VENDOR") != "1":
+        try:
+            ensure_hermes_vendor()
+        except Exception:
+            return False
+    else:
         ensure_hermes_vendor()
+    try:
         wire_real_hermes_modules()
     except Exception:
         return False
