@@ -350,6 +350,7 @@ async def collect_task_fetch_card_from_invoke() -> dict[str, Any]:
         activity={},
         value={},
         user_oid="",
+        token_user_oid="",
         user_upn="",
         tenant_id="",
         service_url="",

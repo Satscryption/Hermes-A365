@@ -82,6 +82,7 @@ class InvokeContext:
     activity: dict[str, Any]  # raw inbound activity (escape hatch)
     value: dict[str, Any]  # parsed activity.value ({} when absent/non-dict)
     user_oid: str
+    token_user_oid: str
     user_upn: str
     tenant_id: str
     service_url: str
@@ -112,9 +113,7 @@ def classify_chat_type(activity: dict[str, Any], path_tag: str) -> str:
     conv = activity.get("conversation")
     conv = conv if isinstance(conv, dict) else {}
     raw_conv_type = conv.get("conversationType")
-    conv_type = (
-        "personal" if raw_conv_type is None else str(raw_conv_type).strip().lower()
-    )
+    conv_type = "personal" if raw_conv_type is None else str(raw_conv_type).strip().lower()
     if conv_type == "channel":
         return "channel"
     if conv_type == "groupchat":
@@ -152,10 +151,9 @@ def build_invoke_context(
         activity=activity,
         value=value,
         user_oid=str(claims.get("oid") or sender.get("aadObjectId") or ""),
+        token_user_oid=str(claims.get("oid") or ""),
         user_upn=str(claims.get("preferred_username") or claims.get("upn") or ""),
-        tenant_id=str(
-            claims.get("tid") or conv.get("tenantId") or recipient.get("tenantId") or ""
-        ),
+        tenant_id=str(claims.get("tid") or conv.get("tenantId") or recipient.get("tenantId") or ""),
         service_url=str(activity.get("serviceUrl") or ""),
         conv=conv,
         chat_type=classify_chat_type(activity, path_tag),
@@ -170,9 +168,7 @@ def build_invoke_context(
 
 def task_continue(card: dict[str, Any], *, title: str = "") -> InvokeResponse:
     """A task module that continues with an Adaptive Card (``taskInfo``)."""
-    value: dict[str, Any] = {
-        "card": {"contentType": _ADAPTIVE_CARD_CONTENT_TYPE, "content": card}
-    }
+    value: dict[str, Any] = {"card": {"contentType": _ADAPTIVE_CARD_CONTENT_TYPE, "content": card}}
     if title:
         value["title"] = title
     return InvokeResponse(status=200, body={"task": {"type": "continue", "value": value}})
@@ -216,9 +212,7 @@ async def default_invoke_handler(ctx: InvokeContext) -> InvokeResponse:
     """Unknown invoke name → 501 (not-implemented). Total — never raises, so an
     unrecognised name yields a clean invokeResponse, not a 500 that Microsoft
     would read as an outage."""
-    return InvokeResponse(
-        status=501, body={"error": f"invoke name not implemented: {ctx.name}"}
-    )
+    return InvokeResponse(status=501, body={"error": f"invoke name not implemented: {ctx.name}"})
 
 
 # The per-name registry. v0.8.0 ships exactly one typed name; every other name

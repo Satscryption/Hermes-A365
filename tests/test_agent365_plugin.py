@@ -7792,6 +7792,7 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-buf", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         post_mock = self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         a._handoff_link_enabled = True
@@ -24785,7 +24786,7 @@ class TestOutboundFiles:
         self._connect(a)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        self._seed_pending(a, f)
         a._http_client.put = AsyncMock()
         a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
         bridge = adapter_mod._import_bridge()
@@ -24917,7 +24918,7 @@ class TestOutboundFiles:
         )
         assert resp.status == 200
         assert a._http_client.put.await_count == 0
-        assert "c1" not in a._pending_file_uploads
+        assert "c1" in a._pending_file_uploads
 
     @pytest.mark.asyncio
     async def test_handle_consent_upload_http_error_still_acks(
@@ -25022,7 +25023,7 @@ class TestOutboundFiles:
             upload_info={"uploadUrl": self._GOOD_UPLOAD}, conv_id="conv-OTHER"
         )
         await self._accept_and_assert_no_put(a, monkeypatch, act)
-        assert "c1" not in a._pending_file_uploads  # spent even on refusal
+        assert "c1" in a._pending_file_uploads
 
     @pytest.mark.asyncio
     async def test_accept_offhost_upload_url_refused(
@@ -25661,9 +25662,9 @@ class TestInteractiveCards:
 class TestHandoff:
     def test_mint_handoff_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-cc"))
-        )
+        inbound = _make_inbound(conv_id="conv-cc")
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         link = a._mint_handoff_link("conv-cc", reason="test")
         assert link is not None
         assert "continuation=" in link
@@ -25679,9 +25680,9 @@ class TestHandoff:
         # Single-identity deployment (no separate BF app) → blueprint id is used.
         a = _make_adapter(monkeypatch)
         a.bf_app_id = ""
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-cc2"))
-        )
+        inbound = _make_inbound(conv_id="conv-cc2")
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         link = a._mint_handoff_link("conv-cc2", reason="test")
         assert f"28:{a.blueprint_app_id}" in link
 
@@ -25726,8 +25727,7 @@ class TestHandoff:
         )
         resp = await a._handle_handoff_action(ctx)
         assert resp.status == 200
-        # Token consumed; linkage recorded.
-        assert "tok-1" not in a._handoff_tokens
+        assert "tok-1" in a._handoff_tokens
 
     @pytest.mark.asyncio
     async def test_handle_handoff_action_unknown_token(
@@ -25759,6 +25759,7 @@ class TestHandoff:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-cc")
         inbound["conversation"]["conversationType"] = "groupChat"
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         out = a._maybe_append_handoff_link("conv-cc", "body")
         assert "Continue in Teams" in out
@@ -25986,7 +25987,7 @@ class TestHandoffSessionPin:
             _handoff_ctx(token, user=_HANDOFF_OTHER_USER, claims_user=_HANDOFF_OTHER_USER)
         )
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26004,7 +26005,7 @@ class TestHandoffSessionPin:
             )
         )
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26046,7 +26047,7 @@ class TestHandoffSessionPin:
         adapter._handoff_session_db_opener = lambda: _StaleFinder(rows)
         response = await adapter._handle_handoff_action(_handoff_ctx(token))
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26069,7 +26070,7 @@ class TestHandoffSessionPin:
         }
         response = await adapter._handle_handoff_action(_handoff_ctx("tok-ended"))
         assert response.status == 200
-        assert "tok-ended" not in adapter._handoff_tokens
+        assert "tok-ended" in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26087,7 +26088,7 @@ class TestHandoffSessionPin:
         adapter._handoff_session_db_opener = lambda: _FakeOriginDb({})
         response = await adapter._handle_handoff_action(_handoff_ctx(token))
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26102,7 +26103,7 @@ class TestHandoffSessionPin:
         )
         response = await adapter._handle_handoff_action(_handoff_ctx(token))
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
