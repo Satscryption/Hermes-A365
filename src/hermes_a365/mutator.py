@@ -255,6 +255,7 @@ class A365CliMutator:
 _SENSITIVE_OUTPUT_SUPPRESSED = "<output suppressed: sensitive command may emit credential material>"
 
 _READ_CHUNK_BYTES = 4096
+_MAX_CAPTURED_LINE_CHARS = 256 * 1024
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
@@ -399,12 +400,14 @@ class _LineBuffer:
         while True:
             split_at = -1
             split_len = 0
-            for sep in ("\r\n", "\n"):
+            for sep in ("\r\n", "\n", "\r"):
                 idx = self.pending.find(sep)
                 if idx >= 0 and (split_at < 0 or idx < split_at):
                     split_at = idx
                     split_len = len(sep)
             if split_at < 0:
+                if len(self.pending) > _MAX_CAPTURED_LINE_CHARS:
+                    raise CliInvocationError([], -1, _sensitive_failure_detail(""))
                 break
             lines.append(self.pending[: split_at + split_len])
             self.pending = self.pending[split_at + split_len :]
@@ -532,7 +535,8 @@ def _run_pumped_output(
         proc.wait(timeout=5)
         return proc.returncode or 0, "".join(captured)
     finally:
-        _cleanup_child()
+        for thread in threads:
+            thread.join(timeout=1.0)
 
 
 def _run_child_output(
@@ -550,14 +554,32 @@ def _run_child_output(
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
     )
-    if stdin_input is not None:
-        assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_input.encode("utf-8"))
-        finally:
-            proc.stdin.close()
-    streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
-    return _run_pumped_output(proc, argv=argv, timeout=timeout, streams=streams, echo=echo)
+
+    def _cleanup_child() -> None:
+        if proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        if proc.stdout is not None:
+            with contextlib.suppress(OSError):
+                proc.stdout.close()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+    try:
+        if stdin_input is not None:
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(stdin_input.encode("utf-8"))
+            except BrokenPipeError:
+                pass
+            finally:
+                proc.stdin.close()
+        streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
+        return _run_pumped_output(proc, argv=argv, timeout=timeout, streams=streams, echo=echo)
+    finally:
+        _cleanup_child()
 
 
 def _run_sensitive_streaming(

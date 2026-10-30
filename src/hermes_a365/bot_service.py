@@ -267,10 +267,21 @@ class BotServiceConfig:
             or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
         ):
             kind = type(schema_version).__name__
+            if isinstance(schema_version, int) and not isinstance(schema_version, bool):
+                raise BotServiceError(
+                    f"{source} schemaVersion is unsupported; "
+                    f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
+                )
             raise BotServiceError(
                 f"{source} schemaVersion has unsupported type {kind}; "
                 f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
             )
+        if "agentName" in raw:
+            bound = raw.get("agentName")
+            if bound is not None and not isinstance(bound, str):
+                raise BotServiceError(
+                    f"{source} agentName has unsupported type {type(bound).__name__}; expected str"
+                )
         if schema_version == SIDECAR_SCHEMA_VERSION:
             agent_name = raw.get("agentName")
             if not isinstance(agent_name, str) or not agent_name.strip():
@@ -1343,26 +1354,19 @@ def _apply_create_plan_locked(
                 f"{inputs.sidecar_path} is JSON {type(sidecar_payload).__name__}, expected object"
             )
         try:
-            schema_version = validate_bot_service_sidecar_schema(
-                sidecar_payload, source=str(inputs.sidecar_path)
-            )
+            validate_bot_service_sidecar_schema(sidecar_payload, source=str(inputs.sidecar_path))
         except SidecarSchemaError as exc:
             raise BotServiceError(str(exc)) from exc
-        existing_cfg = BotServiceConfig.from_json_text(
-            raw_sidecar.decode("utf-8"), source=str(inputs.sidecar_path)
+        if "agentName" in sidecar_payload:
+            bound = sidecar_payload.get("agentName")
+            if bound is not None and not isinstance(bound, str):
+                raise BotServiceError(
+                    f"{inputs.sidecar_path} agentName has unsupported type "
+                    f"{type(bound).__name__}; expected str"
+                )
+        raise BotServiceError(
+            f"{inputs.sidecar_path} already exists; refusing create before Azure mutation"
         )
-        if existing_cfg.agentName is not None and existing_cfg.agentName != inputs.agent_name:
-            raise BotServiceError(
-                f"sidecar belongs to agent {existing_cfg.agentName!r}, not {inputs.agent_name!r}; "
-                f"refusing create for {inputs.resource_group}/{bot_name}"
-            )
-        if schema_version != SIDECAR_SCHEMA_VERSION:
-            _validate_legacy_binding_confirmation(
-                existing_cfg,
-                agent_name=inputs.agent_name,
-                confirmation=inputs.legacy_binding_confirmation,
-            )
-            _write_sidecar_backup(inputs.sidecar_path, raw_sidecar, now=now())
     app_id = _resolve_app_id(inputs, operator_env)
     account = _account_show(runner)
     tenant_id = _resolve_tenant_id(inputs, operator_env, account)

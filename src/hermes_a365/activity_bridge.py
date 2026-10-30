@@ -2111,6 +2111,7 @@ class _IdempotencyCache:
     """
 
     seen: dict[str, float] = field(default_factory=dict)
+    pending_webhook: dict[str, Any] = field(default_factory=dict)
     ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
     max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
 
@@ -2193,10 +2194,24 @@ class _IdempotencyCache:
         self.seen[cache_key] = cur
         return False
 
+    def _cache_key(self, delivery_id: str) -> str:
+        return hashlib.sha256(delivery_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+
+    def remember_webhook_result(self, delivery_id: str, result: Any) -> None:
+        """Cache operator webhook output so connector retries can finish reply-only."""
+        self.pending_webhook[self._cache_key(delivery_id)] = result
+
+    def pending_webhook_result(self, delivery_id: str) -> Any | None:
+        return self.pending_webhook.get(self._cache_key(delivery_id))
+
+    def clear_pending_webhook(self, delivery_id: str) -> None:
+        self.pending_webhook.pop(self._cache_key(delivery_id), None)
+
     def forget(self, delivery_id: str) -> None:
         """Forget one delivery so a retryable transport failure can retry it."""
-        cache_key = hashlib.sha256(delivery_id.encode("utf-8", errors="surrogatepass")).hexdigest()
+        cache_key = self._cache_key(delivery_id)
         self.seen.pop(cache_key, None)
+        self.pending_webhook.pop(cache_key, None)
 
 
 def _activity_delivery_id(
@@ -3529,7 +3544,37 @@ class ReplyPostMayHaveLandedError(RuntimeError):
 
 
 def _reply_failure_forgets_idempotency(error: BaseException) -> bool:
-    return not isinstance(error, ReplyPostMayHaveLandedError)
+    if isinstance(error, ReplyPostMayHaveLandedError):
+        return False
+    if isinstance(error, ReplyPostError):
+        status = error.status_code
+        if status in (502, 503, 504, 429):
+            return False
+        if 400 <= status < 500 and status not in (408, 429):
+            return True
+        return status < 500
+    if _httpx is not None:
+        if isinstance(
+            error,
+            (
+                _httpx.ConnectTimeout,
+                _httpx.PoolTimeout,
+                _httpx.ConnectError,
+            ),
+        ):
+            return True
+        if isinstance(
+            error,
+            (
+                _httpx.ReadTimeout,
+                _httpx.WriteTimeout,
+                _httpx.ReadError,
+                _httpx.WriteError,
+                _httpx.RemoteProtocolError,
+            ),
+        ):
+            return False
+    return True
 
 
 def _response_text_excerpt(response: Any) -> str:
@@ -3637,11 +3682,28 @@ async def send_reply(
         # Only this POST can have stored the activity. A ReadTimeout or
         # WriteTimeout from acquire_reply_token (above) is still a miss
         # and must propagate unchanged so the caller can retry.
+        if _httpx is not None and isinstance(
+            exc,
+            (
+                _httpx.ReadTimeout,
+                _httpx.WriteTimeout,
+                _httpx.ReadError,
+                _httpx.WriteError,
+                _httpx.RemoteProtocolError,
+            ),
+        ):
+            raise ReplyPostMayHaveLandedError(
+                "transport failure after the request was sent"
+            ) from exc
         if type(exc).__name__ in {"ReadTimeout", "WriteTimeout"}:
             raise ReplyPostMayHaveLandedError("timeout after the request was sent") from exc
         raise
     status_code = int(getattr(response, "status_code", 0) or 0)
     if status_code < 200 or status_code >= 300:
+        if status_code in (502, 503, 504, 429):
+            raise ReplyPostMayHaveLandedError(
+                f"reply POST returned HTTP {status_code} (may have landed)"
+            )
         raise ReplyPostError(
             status_code=status_code,
             url=url,
@@ -3843,6 +3905,8 @@ def make_app(
         else:
             return _JSONResponse({"status": "acked"})
 
+        activity_type = str(activity.get("type") or "message")
+
         # Slice 19i: dedupe by (conversationId, activityId) so connector
         # retries don't double-fire the operator webhook. Channel-control
         # activities that lack `id` skip dedupe — better to always-deliver
@@ -3851,6 +3915,33 @@ def make_app(
             activity, validated_path=validated_path or "dev", tenant_id=cfg.tenant_id
         )
         if delivery_id is not None and idempotency_cache.is_duplicate(delivery_id):
+            pending_webhook = idempotency_cache.pending_webhook_result(delivery_id)
+            if pending_webhook is not None:
+                delivery_state: dict[str, bool] = {"webhook_completed": True}
+                try:
+                    return await _serve_messages_after_dedupe(
+                        activity=activity,
+                        activity_type=activity_type,
+                        delivery_id=delivery_id,
+                        service_url=service_url,
+                        validated_path=validated_path,
+                        authorization=authorization,
+                        cfg=cfg,
+                        http_client=http_client,
+                        jwks_cache=jwks_cache,
+                        bf_jwks_cache=bf_jwks_cache,
+                        fmi_cache=fmi_cache,
+                        user_cache=user_cache,
+                        bf_cache=bf_cache,
+                        idempotency_cache=idempotency_cache,
+                        ack_deadline=ack_deadline,
+                        cached_webhook_resp=pending_webhook,
+                        delivery_state=delivery_state,
+                    )
+                except _HTTPException:
+                    raise
+                except Exception as exc:
+                    raise exc
             # A deduped *invoke* must not return the {status:duplicate} marker as
             # its body (#96): Teams reads an invoke's HTTP body as the
             # invokeResponse body, and the marker is not a valid taskInfo/result
@@ -3863,7 +3954,7 @@ def make_app(
                 return _empty_invoke_ack_response()
             return _JSONResponse({"status": "duplicate"})
 
-        activity_type = str(activity.get("type") or "message")
+        delivery_state = {"webhook_completed": False}
         try:
             return await _serve_messages_after_dedupe(
                 activity=activity,
@@ -3881,11 +3972,12 @@ def make_app(
                 bf_cache=bf_cache,
                 idempotency_cache=idempotency_cache,
                 ack_deadline=ack_deadline,
+                delivery_state=delivery_state,
             )
         except _HTTPException:
             raise
         except Exception as exc:
-            if delivery_id is not None:
+            if delivery_id is not None and not delivery_state.get("webhook_completed"):
                 idempotency_cache.forget(delivery_id)
             raise exc
 
@@ -3906,6 +3998,8 @@ def make_app(
         bf_cache: _BfTokenCache,
         idempotency_cache: _IdempotencyCache,
         ack_deadline: float,
+        cached_webhook_resp: Any | None = None,
+        delivery_state: dict[str, bool] | None = None,
     ) -> Any:
         _ = authorization
 
@@ -3957,54 +4051,69 @@ def make_app(
 
         # Forward to operator webhook.
         envelope = build_webhook_envelope(activity, cfg)
-        try:
-            webhook_resp = await forward_to_webhook(
-                envelope=envelope,
-                cfg=cfg,
-                client=http_client,
-                deadline=ack_deadline,
-            )
-        except Exception as e:
-            # An invoke's reply is the HTTP body of THIS request (#96/#97), so
-            # the out-of-band error card is wrong for it three ways: send_reply
-            # hard-requires serviceUrl/conversation.id/id and raises for an
-            # id-less invoke → 502 (which Teams reads as the invokeResponse
-            # status, i.e. "unable to reach app") with the serviceUrl echoed in
-            # the body; for an invoke WITH ids it POSTs an unsolicited error
-            # card into the chat and then returns the {"status": ...} wrapper
-            # marker as the invokeResponse body — the exact shape the dedupe
-            # branch above exists to avoid. Degrade to the canonical empty
-            # ack (#132): HTTP 200 + JSON {}, the same shape the dedupe
-            # branch returns and the plugin emits for a handler crash.
-            # Teams reads a 5xx as "unable to reach app" (#97).
-            if activity_type == "invoke":
-                logger.warning("invoke webhook error: %s", type(e).__name__)
-                return _empty_invoke_ack_response()
-            logger.warning("operator webhook error: %s", type(e).__name__)
-            error_reply = render_reply_activity(
-                activity,
-                {
-                    "text": "",
-                    "card": render_error_card("The agent backend could not be reached."),
-                },
-            )
+        if cached_webhook_resp is not None:
+            webhook_resp = cached_webhook_resp
+            if delivery_state is not None:
+                delivery_state["webhook_completed"] = True
+        else:
             try:
-                await send_reply(
-                    inbound=activity,
-                    reply=error_reply,
+                webhook_resp = await forward_to_webhook(
+                    envelope=envelope,
                     cfg=cfg,
                     client=http_client,
-                    fmi_cache=fmi_cache,
-                    user_cache=user_cache,
-                    bf_cache=bf_cache,
-                    validated_path=validated_path,
                     deadline=ack_deadline,
                 )
-            except Exception as reply_error:
-                if delivery_id is not None and _reply_failure_forgets_idempotency(reply_error):
-                    idempotency_cache.forget(delivery_id)
-                return _reply_failed_response(reply_error)
-            return _JSONResponse({"status": "webhook_error"}, status_code=200)
+            except Exception as e:
+                # An invoke's reply is the HTTP body of THIS request (#96/#97), so
+                # the out-of-band error card is wrong for it three ways: send_reply
+                # hard-requires serviceUrl/conversation.id/id and raises for an
+                # id-less invoke → 502 (which Teams reads as the invokeResponse
+                # status, i.e. "unable to reach app") with the serviceUrl echoed in
+                # the body; for an invoke WITH ids it POSTs an unsolicited error
+                # card into the chat and then returns the {"status": ...} wrapper
+                # marker as the invokeResponse body — the exact shape the dedupe
+                # branch above exists to avoid. Degrade to the canonical empty
+                # ack (#132): HTTP 200 + JSON {}, the same shape the dedupe
+                # branch returns and the plugin emits for a handler crash.
+                # Teams reads a 5xx as "unable to reach app" (#97).
+                if activity_type == "invoke":
+                    logger.warning("invoke webhook error: %s", type(e).__name__)
+                    return _empty_invoke_ack_response()
+                logger.warning("operator webhook error: %s", type(e).__name__)
+                error_reply = render_reply_activity(
+                    activity,
+                    {
+                        "text": "",
+                        "card": render_error_card("The agent backend could not be reached."),
+                    },
+                )
+                try:
+                    await send_reply(
+                        inbound=activity,
+                        reply=error_reply,
+                        cfg=cfg,
+                        client=http_client,
+                        fmi_cache=fmi_cache,
+                        user_cache=user_cache,
+                        bf_cache=bf_cache,
+                        validated_path=validated_path,
+                        deadline=ack_deadline,
+                    )
+                except Exception as reply_error:
+                    if delivery_id is not None and _reply_failure_forgets_idempotency(reply_error):
+                        idempotency_cache.forget(delivery_id)
+                    return _reply_failed_response(reply_error)
+                if delivery_id is not None:
+                    idempotency_cache.clear_pending_webhook(delivery_id)
+                return _JSONResponse({"status": "webhook_error"}, status_code=200)
+            if delivery_id is not None:
+                idempotency_cache.remember_webhook_result(delivery_id, webhook_resp)
+            if delivery_state is not None:
+                delivery_state["webhook_completed"] = True
+
+        def _delivery_complete() -> None:
+            if delivery_id is not None:
+                idempotency_cache.clear_pending_webhook(delivery_id)
 
         # Invoke replies must be synchronous. BF wire: the HTTP body is the
         # invokeResponse *body* and the HTTP status is its status — NOT a
@@ -4019,6 +4128,7 @@ def make_app(
             # webhook error (#132).
             if not isinstance(webhook_resp, dict):
                 logger.warning("invoke handler error: %s", type(webhook_resp).__name__)
+                _delivery_complete()
                 return _empty_invoke_ack_response()
             invoke_response = webhook_resp.get("invokeResponse") or {
                 "status": 200,
@@ -4033,15 +4143,25 @@ def make_app(
             # (wrong type), ValueError (bad string / NaN) or OverflowError
             # (Infinity). A non-dict envelope has no body to keep (#132).
             if not isinstance(invoke_response, dict):
+                _delivery_complete()
                 return _empty_invoke_ack_response()
             try:
                 status_code = int(invoke_response.get("status", 200) or 200)
             except (TypeError, ValueError, OverflowError):
                 status_code = 200
+            _delivery_complete()
             return _JSONResponse(invoke_response.get("body"), status_code=status_code)
 
         # Standard message: render reply and send asynchronously via serviceUrl.
+        if not isinstance(webhook_resp, dict):
+            logger.warning(
+                "operator webhook returned non-object body: %s",
+                type(webhook_resp).__name__,
+            )
+            _delivery_complete()
+            return _JSONResponse({"status": "no_reply"})
         if not webhook_resp.get("text") and not webhook_resp.get("card"):
+            _delivery_complete()
             return _JSONResponse({"status": "no_reply"})
         reply = render_reply_activity(activity, webhook_resp)
         try:
@@ -4060,6 +4180,7 @@ def make_app(
             if delivery_id is not None and _reply_failure_forgets_idempotency(e):
                 idempotency_cache.forget(delivery_id)
             return _reply_failed_response(e)
+        _delivery_complete()
         return _JSONResponse({"status": "replied"})
 
     return app

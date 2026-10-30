@@ -494,6 +494,7 @@ def apply_register_plan(
             result.raw_outputs[step.name] = run
         result.messages.append(f"[apply] {step.name}: {step.description} — done")
         if step.name == "blueprint":
+            del run
             result.messages.append(
                 _bind_created_blueprint(
                     graph_get=getter,

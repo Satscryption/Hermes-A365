@@ -23,7 +23,7 @@ from hermes_a365.bot_service import (
     apply_create_plan,
     build_create_plan,
 )
-from hermes_a365.mutator import _ANSI_ESCAPE_RE, _strip_ansi
+from hermes_a365.mutator import _strip_ansi
 from hermes_a365.plugin.conversations import ConversationRegistry
 from hermes_a365.sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
 
@@ -46,14 +46,19 @@ class TestTrustedServiceUrlTyping:
 
 
 class TestServeOpenApiHidden:
-    def test_docs_and_openapi_hidden(self) -> None:
+    @pytest.mark.parametrize("route", ["/docs", "/redoc", "/openapi.json"])
+    def test_each_openapi_route_hidden(self, route: str) -> None:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         with _client_for(cfg, capture=capture) as client:
-            assert client.get("/docs").status_code == 404
-            assert client.get("/redoc").status_code == 404
-            assert client.get("/openapi.json").status_code == 404
+            assert client.get(route).status_code == 404
+
+    def test_healthz_ok_shape(self) -> None:
+        cfg = _cfg()
+        cfg.skip_jwt_validation = True
+        capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
+        with _client_for(cfg, capture=capture) as client:
             assert client.get("/healthz").json() == {"ok": True}
 
 
@@ -66,9 +71,16 @@ class TestReplyIdempotencyContract:
 
 
 class TestAnsiRegexTidy:
-    def test_csi_sequences_stripped_identically(self) -> None:
-        for sample in ("\x1b[31mred\x1b[0m", "\x1b[2Jclear", "\x1b[?25lhide"):
-            assert _strip_ansi(sample) == _ANSI_ESCAPE_RE.sub("", sample)
+    @pytest.mark.parametrize(
+        "sample,expected",
+        [
+            ("\x1b[31mred\x1b[0m", "red"),
+            ("\x1b[2Jclear", "clear"),
+            ("\x1b[?25lhide", "hide"),
+        ],
+    )
+    def test_csi_sequences_stripped_to_fixed_expectations(self, sample: str, expected: str) -> None:
+        assert _strip_ansi(sample) == expected
 
 
 class TestBotServiceSidecarSchemaMessages:

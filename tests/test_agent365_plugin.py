@@ -24785,7 +24785,7 @@ class TestOutboundFiles:
         self._connect(a)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        self._seed_pending(a, f, consent_id="c1")
         a._http_client.put = AsyncMock()
         a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
         bridge = adapter_mod._import_bridge()

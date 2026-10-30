@@ -12,6 +12,8 @@ import logging
 
 import pytest
 
+pytest_plugins = ["test_activity_bridge"]
+
 
 @pytest.fixture(autouse=True)
 def _reset_hermes_a365_logger_level() -> None:

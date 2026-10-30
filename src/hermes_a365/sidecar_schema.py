@@ -109,7 +109,7 @@ def validate_bot_service_sidecar_schema(payload: Mapping[str, Any], *, source: s
         )
     if value not in supported:
         raise SidecarSchemaError(
-            f"{label} field 'schemaVersion' must be a {_supported_phrase(supported)}"
+            f"{label} schemaVersion is an unsupported version; expected one of {sorted(supported)}"
         )
     managed = payload.get("resourceGroupManaged")
     if managed is not None and not isinstance(managed, bool):

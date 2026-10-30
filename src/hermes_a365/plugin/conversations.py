@@ -530,7 +530,7 @@ class ConversationRegistry:
             if path.is_file():
                 snapshot = path.read_bytes()
                 try:
-                    parsed = json.loads(snapshot)
+                    snapshot.decode("utf-8")
                 except UnicodeDecodeError:
                     quarantine = sidecar_corrupt_quarantine_path(path)
                     published = write_owner_only_bytes_exclusive(quarantine, snapshot)
@@ -541,6 +541,8 @@ class ConversationRegistry:
                     )
                     write_owner_only_text_atomic(path, text)
                     return
+                try:
+                    parsed = json.loads(snapshot.decode("utf-8"))
                 except (json.JSONDecodeError, RecursionError):
                     quarantine = sidecar_corrupt_quarantine_path(path)
                     published = write_owner_only_bytes_exclusive(quarantine, snapshot)
@@ -563,7 +565,7 @@ class ConversationRegistry:
                     return
                 raw_on_disk = parsed
                 validate_conversations_sidecar_schema(raw_on_disk)
-                recheck = json.loads(path.read_bytes())
+                recheck = json.loads(path.read_bytes().decode("utf-8"))
                 validate_conversations_sidecar_schema(recheck)
             if (
                 snapshot
