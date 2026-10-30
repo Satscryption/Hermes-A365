@@ -502,9 +502,7 @@ class ConversationRegistry:
             logger.warning("agent365 conversations: registry JSON is invalid; starting empty")
             return cls()
         if not isinstance(payload, dict):
-            logger.warning(
-                "agent365 conversations: registry JSON is not an object; starting empty"
-            )
+            logger.warning("agent365 conversations: registry JSON is not an object; starting empty")
             return cls()
         validate_conversations_sidecar_schema(payload)
         return cls.from_payload(payload)

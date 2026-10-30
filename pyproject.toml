@@ -75,6 +75,7 @@ dev = [
   # on install), so order-dependent state is caught in CI, not just by luck.
   "pytest-randomly>=3.15",
   "ruff>=0.5",
+  "ruamel.yaml>=0.18",
   "build>=1.2",
   "hatchling>=1.27",
   # Bridge stack is installed in dev too so tests can exercise it.

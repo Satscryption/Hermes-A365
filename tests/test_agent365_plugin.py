@@ -105,11 +105,12 @@ class _StubSessionSource:
 
 
 class _StubBasePlatformAdapter:
-    """Just enough of BasePlatformAdapter for the adapter tests.
+    """Hermes ``BasePlatformAdapter`` stand-in for adapter tests.
 
-    Stores any event passed to ``handle_message`` on
-    ``self._handled_events`` so route tests can assert dispatch
-    happened with the right shape.
+    When ``_message_handler`` is set, ``handle_message`` mirrors the gateway's
+    active-session guard, ``_pending_messages`` queue, and ``_spawn_drain_task``
+    handoff so Agent365 can exercise drained follow-up turns. Without a handler,
+    inbound events are recorded synchronously for lightweight route tests.
     """
 
     def __init__(self, config: Any, platform: Any) -> None:
@@ -120,11 +121,92 @@ class _StubBasePlatformAdapter:
         self._running = False
         self._fatal: tuple[str, str, bool] | None = None
         self._handled_events: list[Any] = []
+        self._message_handler = None
+        self._pending_messages: dict[str, Any] = {}
+        self._background_tasks: set[_asyncio.Task[Any]] = set()
         # Slice 19x-d (#4): mirror real BasePlatformAdapter's in-flight
         # state primitives so prune_conversations() can read
         # self._active_sessions without crashing the test fakes.
         self._active_sessions: dict[str, _asyncio.Event] = {}
         self._session_tasks: dict[str, _asyncio.Task] = {}
+
+    def set_message_handler(self, handler: Any) -> None:
+        self._message_handler = handler
+
+    def _event_session_key(self, event: Any) -> str:
+        from gateway.session import build_session_key
+
+        extra = getattr(self.config, "extra", {}) or {}
+        return build_session_key(
+            event.source,
+            group_sessions_per_user=extra.get("group_sessions_per_user", True),
+            thread_sessions_per_user=extra.get("thread_sessions_per_user", False),
+        )
+
+    def _track_session_task(self, session_key: str, task: Any) -> bool:
+        self._session_tasks[session_key] = task
+        try:
+            self._background_tasks.add(task)
+        except TypeError:
+            return False
+        if hasattr(task, "add_done_callback"):
+            task.add_done_callback(self._background_tasks.discard)
+        return True
+
+    def _start_session_processing(self, event: Any, session_key: str) -> bool:
+        guard = asyncio.Event()
+        self._active_sessions[session_key] = guard
+        task = asyncio.create_task(self._process_message_background(event, session_key))
+        if not self._track_session_task(session_key, task):
+            self._session_tasks.pop(session_key, None)
+            self._active_sessions.pop(session_key, None)
+            return False
+        return True
+
+    def _spawn_drain_task(self, pending_event: Any, session_key: str) -> None:
+        guard = self._active_sessions.get(session_key)
+        if guard is not None:
+            guard.clear()
+
+        async def _drain_after() -> None:
+            await self._process_message_background(pending_event, session_key)
+
+        task = asyncio.create_task(_drain_after())
+        self._track_session_task(session_key, task)
+
+    def _cleanup_finished_session_task(self, session_key: str) -> None:
+        self._active_sessions.pop(session_key, None)
+        self._session_tasks.pop(session_key, None)
+
+    async def _process_message_background(self, event: Any, session_key: str) -> None:
+        if self._message_handler is None:
+            self._handled_events.append(event)
+            return
+        interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
+        self._active_sessions[session_key] = interrupt_event
+        start_hook = getattr(self, "on_processing_start", None)
+        complete_hook = getattr(self, "on_processing_complete", None)
+        try:
+            if callable(start_hook):
+                await start_hook(event)
+            await self._message_handler(event)
+        finally:
+            if callable(complete_hook):
+                with contextlib.suppress(Exception):
+                    await complete_hook(event)
+            self._finish_session_task(session_key, interrupt_event)
+
+    def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event | None) -> None:
+        late_pending = self._pending_messages.pop(session_key, None)
+        current_task = asyncio.current_task()
+        if late_pending is not None:
+            existing_task = self._session_tasks.get(session_key)
+            if existing_task is not None and existing_task is not current_task:
+                self._pending_messages[session_key] = late_pending
+            else:
+                self._spawn_drain_task(late_pending, session_key)
+        elif current_task is not None and self._session_tasks.get(session_key) is current_task:
+            self._cleanup_finished_session_task(session_key)
 
     def _mark_connected(self) -> None:
         self._running = True
@@ -136,19 +218,41 @@ class _StubBasePlatformAdapter:
         self._fatal = (code, message, retryable)
 
     async def handle_message(self, event: Any) -> None:
-        self._handled_events.append(event)
+        if self._message_handler is None:
+            self._handled_events.append(event)
+            return
+        session_key = self._event_session_key(event)
+        if session_key in self._active_sessions:
+            try:
+                from gateway.platforms.base import MessageType, merge_pending_message_event
+
+                merge_pending_message_event(
+                    self._pending_messages,
+                    session_key,
+                    event,
+                    merge_text=getattr(event, "message_type", None) == MessageType.TEXT,
+                )
+            except Exception:
+                self._pending_messages[session_key] = event
+            return
+        self._start_session_processing(event, session_key)
 
     async def cancel_session_processing(self, session_key: str, **_kwargs: Any) -> None:
         task = self._session_tasks.pop(session_key, None)
         if task is not None:
             task.cancel()
         self._active_sessions.pop(session_key, None)
+        self._pending_messages.pop(session_key, None)
+        fifo = getattr(self, "_pending_turn_fifo", None)
+        if isinstance(fifo, dict):
+            fifo.pop(session_key, None)
 
     async def cancel_background_tasks(self) -> None:
         for task in self._session_tasks.values():
             task.cancel()
         self._session_tasks.clear()
         self._active_sessions.clear()
+        self._pending_messages.clear()
 
     @staticmethod
     def validate_media_delivery_path(path: str) -> str | None:
@@ -163,8 +267,49 @@ class _StubBasePlatformAdapter:
         return str(p.resolve())
 
 
-def _install_gateway_stubs() -> None:
-    if "gateway.platforms.base" in sys.modules:
+_HERMES_BOOTSTRAP_MODULE = "hermes_a365_hermes_bootstrap"
+
+
+def _import_hermes_bootstrap() -> Any:
+    import importlib.util
+
+    cached = sys.modules.get(_HERMES_BOOTSTRAP_MODULE)
+    if cached is not None:
+        return cached
+    path = Path(__file__).resolve().parent / "_hermes_bootstrap.py"
+    spec = importlib.util.spec_from_file_location(_HERMES_BOOTSTRAP_MODULE, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError("hermes bootstrap unavailable")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[_HERMES_BOOTSTRAP_MODULE] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _install_gateway_stubs(*, force: bool = False) -> None:
+    with contextlib.suppress(Exception):
+        _import_hermes_bootstrap().ensure_hermes_vendor()
+    vendor_root = None
+    try:
+        vendor_root = _import_hermes_bootstrap().hermes_vendor_root()
+    except Exception:
+        vendor_root = None
+    if force:
+        for name in (
+            "gateway.platforms.base",
+            "gateway.config",
+            "gateway.session",
+            "gateway.platforms",
+            "gateway",
+        ):
+            sys.modules.pop(name, None)
+    elif "gateway.platforms.base" in sys.modules:
+        mod = sys.modules["gateway.platforms.base"]
+        if getattr(getattr(mod, "BasePlatformAdapter", None), "__module__", "").startswith(
+            "gateway.platforms"
+        ):
+            return
+    elif "gateway.platforms.base" in sys.modules:
         return
     gateway = types.ModuleType("gateway")
     platforms = types.ModuleType("gateway.platforms")
@@ -183,12 +328,14 @@ def _install_gateway_stubs() -> None:
     def _stub_build_session_key(
         source, *, group_sessions_per_user=True, thread_sessions_per_user=False
     ):
-        # Deterministic, non-crashing stand-in for the real build_session_key
-        # (#105/M11): enough for _session_key_for to compute a key. Tests that
-        # exercise the in-flight guard inject _active_sessions +
-        # _session_key_to_conv directly rather than relying on this shape.
+        # Deterministic stand-in for build_session_key. Honors
+        # group_sessions_per_user so chat-scoped vs per-user session keys
+        # match production shape in route tests.
         ct = getattr(source, "chat_type", "dm")
         cid = getattr(source, "chat_id", "")
+        if group_sessions_per_user:
+            uid = getattr(source, "user_id", "") or "unknown"
+            return f"agent:main:agent365:{ct}:{cid}:user:{uid}"
         return f"agent:main:agent365:{ct}:{cid}"
 
     session.build_session_key = _stub_build_session_key
@@ -198,9 +345,159 @@ def _install_gateway_stubs() -> None:
     sys.modules["gateway.platforms.base"] = base
     sys.modules["gateway.config"] = config
     sys.modules["gateway.session"] = session
+    if vendor_root is not None and vendor_root.is_dir():
+        vendor_gateway = str(vendor_root / "gateway")
+        gateway.__path__ = [vendor_gateway]  # type: ignore[attr-defined]
+        platforms.__path__ = [str(vendor_root / "gateway" / "platforms")]  # type: ignore[attr-defined]
+    _install_approval_tools_stub()
+
+
+def _install_approval_tools_stub() -> None:
+    try:
+        import tools.approval
+
+        return
+    except Exception:
+        pass
+    if "tools.approval" in sys.modules:
+        return
+    import threading
+
+    tools = sys.modules.get("tools")
+    if tools is None:
+        tools = types.ModuleType("tools")
+        sys.modules["tools"] = tools
+    approval = types.ModuleType("tools.approval")
+    _lock = threading.Lock()
+    _gateway_queues: dict[str, list[Any]] = {}
+
+    class _ApprovalEntry:
+        __slots__ = ("cancelled", "data", "event", "observers", "reason", "result", "settle")
+
+        def __init__(self, data: dict[str, Any]) -> None:
+            self.data = dict(data)
+            self.event = threading.Event()
+            self.result = None
+            self.reason = None
+            self.cancelled = None
+            self.settle = None
+            self.observers: list[Any] = []
+
+    def _run_settle_hooks(entry: _ApprovalEntry, reason: str) -> None:
+        settle, entry.settle = entry.settle, None
+        observers, entry.observers = entry.observers, []
+        for callback in ([settle] if settle is not None else []) + observers:
+            with contextlib.suppress(Exception):
+                callback(reason)
+
+    def _chain_gateway_settle_callbacks(prior: Any, settle: Any):
+        def _combined(reason: str) -> None:
+            if prior is not None:
+                with contextlib.suppress(Exception):
+                    prior(reason)
+            with contextlib.suppress(Exception):
+                settle(reason)
+
+        return _combined
+
+    def enqueue_gateway_approval(session_key: str, request_id: str) -> None:
+        with _lock:
+            _gateway_queues.setdefault(session_key, []).append(
+                _ApprovalEntry({"request_id": request_id, "session_key": session_key})
+            )
+
+    def resolve_gateway_approval(
+        session_key: str,
+        choice: str,
+        resolve_all: bool = False,
+        reason: str | None = None,
+        request_id: str | None = None,
+    ) -> int:
+        with _lock:
+            queue = _gateway_queues.get(session_key)
+            if not queue:
+                return 0
+            if request_id:
+                targets = [entry for entry in queue if entry.data.get("request_id") == request_id]
+                if not targets:
+                    return 0
+                queue[:] = [entry for entry in queue if entry not in targets]
+            elif resolve_all:
+                targets = list(queue)
+                queue.clear()
+            else:
+                targets = [queue.pop(0)]
+            if not queue:
+                _gateway_queues.pop(session_key, None)
+            for entry in targets:
+                entry.result = choice
+                if reason:
+                    entry.reason = reason
+                entry.event.set()
+        for entry in targets:
+            _run_settle_hooks(entry, "resolved")
+        return len(targets)
+
+    def register_gateway_settle(session_key: str, request_id: str, settle: Any) -> bool:
+        with _lock:
+            for entry in _gateway_queues.get(session_key, []):
+                if entry.data.get("request_id") == request_id:
+                    prior = entry.settle
+                    if prior is None or prior is settle:
+                        entry.settle = settle
+                        return True
+                    entry.settle = _chain_gateway_settle_callbacks(prior, settle)
+                    return True
+        return False
+
+    def observe_gateway_settle(session_key: str, request_id: str, callback: Any) -> bool:
+        with _lock:
+            for entry in _gateway_queues.get(session_key, []):
+                if entry.data.get("request_id") == request_id:
+                    entry.observers.append(callback)
+                    return True
+        return False
+
+    def list_gateway_approvals(session_key: str) -> list[dict[str, Any]]:
+        with _lock:
+            return [dict(entry.data) for entry in _gateway_queues.get(session_key, [])]
+
+    approval._gateway_queues = _gateway_queues
+    approval._lock = _lock
+    approval._ApprovalEntry = _ApprovalEntry
+    approval.enqueue_gateway_approval = enqueue_gateway_approval
+    approval.resolve_gateway_approval = resolve_gateway_approval
+    approval.register_gateway_settle = register_gateway_settle
+    approval.observe_gateway_settle = observe_gateway_settle
+    approval.list_gateway_approvals = list_gateway_approvals
+    sys.modules["tools.approval"] = approval
+    tools.approval = approval
+
+
+def _wire_real_hermes_test_modules() -> None:
+    with contextlib.suppress(Exception):
+        _import_hermes_bootstrap().wire_real_hermes_modules()
 
 
 _install_gateway_stubs()
+_wire_real_hermes_test_modules()
+
+
+def _enqueue_gateway_exec_request(session_key: str, request_id: str) -> None:
+    """Mirror Hermes queue state so exec cards can register settle hooks in integration tests."""
+    try:
+        from tools import approval as approval_mod
+        from tools.approval_gateway_wait import _ApprovalEntry
+    except Exception:
+        approval_mod = sys.modules.get("tools.approval")
+        if approval_mod is None or not hasattr(approval_mod, "enqueue_gateway_approval"):
+            return
+        approval_mod.enqueue_gateway_approval(session_key, request_id)
+        return
+    entry = _ApprovalEntry({"request_id": request_id, "session_key": session_key})
+    with approval_mod._lock:
+        approval_mod._gateway_queues.setdefault(session_key, []).append(entry)
+
 
 agent365 = importlib.import_module("hermes_a365.plugin")
 adapter_mod = importlib.import_module("hermes_a365.plugin.adapter")
@@ -324,6 +621,11 @@ def _seed_card_capability(
         "resolver": resolver,
         "choices": {choice_id: choice},
     }
+    if kind == "exec_approval":
+        request_id = str(resolver.get("request_id") or "")
+        session_key = str(resolver.get("session_key") or "")
+        if request_id and session_key:
+            _enqueue_gateway_exec_request(session_key, request_id)
     return {"hermes_kind": kind, "capability": nonce, "choice_id": choice_id}
 
 
@@ -25305,13 +25607,17 @@ class TestFeedbackAndCitations:
 
 
 class TestInteractiveCards:
-    def _connect(self, a: Any) -> None:
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
+    def _connect(self, a: Any, *, session_key: str = "sess-1") -> None:
+        inbound = _make_inbound()
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
+        origin = a._turn_origin_from_activity(inbound, session_key)
+        assert origin is not None
+        adapter_mod._AGENT_TURN_ORIGIN.set(origin)
 
     @pytest.mark.asyncio
     async def test_send_exec_approval_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -25321,7 +25627,10 @@ class TestInteractiveCards:
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        result = await a.send_exec_approval("conv-1", "rm -rf /tmp/x", "sess-1")
+        _enqueue_gateway_exec_request("sess-1", "req-1")
+        result = await a.send_exec_approval(
+            "conv-1", "rm -rf /tmp/x", "sess-1", metadata={"request_id": "req-1"}
+        )
         assert result.success is True
         reply = send_reply.await_args.kwargs["reply"]
         att = reply["attachments"][0]
@@ -25332,7 +25641,7 @@ class TestInteractiveCards:
         )
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
         assert list(capability["choices"].values()) == ["once", "session", "always", "deny"]
-        assert capability["resolver"] == {"session_key": "sess-1"}
+        assert capability["resolver"] == {"session_key": "sess-1", "request_id": "req-1"}
         assert all(act["data"]["hermes_kind"] == "exec_approval" for act in actions)
         assert all("session_key" not in act["data"] for act in actions)
         # A system approval card is NOT AI-generated content — no #73(a) entity.
@@ -25353,7 +25662,9 @@ class TestInteractiveCards:
             await release.wait()
 
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply))
-        send = asyncio.create_task(a.send_exec_approval("conv-1", "danger", "sess-1"))
+        send = asyncio.create_task(
+            a.send_exec_approval("conv-1", "danger", "sess-1", metadata={"request_id": "req-1"})
+        )
         await started.wait()
         await a._teardown_chat_state("conv-1")
         release.set()
@@ -25373,7 +25684,10 @@ class TestInteractiveCards:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
-        result = await a.send_exec_approval("conv-1", "danger", "sess-1")
+        _enqueue_gateway_exec_request("sess-1", "req-1")
+        result = await a.send_exec_approval(
+            "conv-1", "danger", "sess-1", metadata={"request_id": "req-1"}
+        )
         assert result.success is True
         value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
             "data"
@@ -25446,7 +25760,12 @@ class TestInteractiveCards:
         a = _make_adapter(monkeypatch)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
-        result = await a.send_exec_approval("ghost", "cmd", "sess-1")
+        missing_id = await a.send_exec_approval("ghost", "cmd", "sess-1")
+        assert missing_id.success is False
+        self._connect(a)
+        result = await a.send_exec_approval(
+            "ghost", "cmd", "sess-1", metadata={"request_id": "req-1"}
+        )
         # No cached inbound → success=False so the gateway text-fallback fires.
         assert result.success is False
 
@@ -25473,12 +25792,12 @@ class TestInteractiveCards:
             activity,
             kind="exec_approval",
             choice="always",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "req-1"},
         )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         assert json.loads(resp.body)["kind"] == "exec_approval"
-        resolver.assert_called_once_with("sess-1", "always")
+        resolver.assert_called_once_with("sess-1", "always", request_id="req-1")
 
     @pytest.mark.asyncio
     async def test_card_capability_is_user_bound_single_use_and_resists_dos(
@@ -25493,7 +25812,7 @@ class TestInteractiveCards:
             owner,
             kind="exec_approval",
             choice="once",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "req-1"},
         )
         attacker = _make_inbound(conv_id="conv-1")
         attacker["from"] = {"id": "user-2", "name": "Other User"}
@@ -25505,7 +25824,7 @@ class TestInteractiveCards:
 
         accepted = await a._handle_card_action(owner, value)
         assert accepted.status_code == 200
-        resolver.assert_called_once_with("sess-1", "once")
+        resolver.assert_called_once_with("sess-1", "once", request_id="req-1")
         replayed = await a._handle_card_action(owner, value)
         assert replayed.status_code == 403
         resolver.assert_called_once()
@@ -25642,15 +25961,571 @@ class TestInteractiveCards:
             body,
             kind="exec_approval",
             choice="deny",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "req-1"},
         )
         client = TestClient(a.build_app())
         r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "card_action"
         # Routed to the resolver, NOT the agent loop.
-        resolver.assert_called_once_with("sess-1", "deny")
+        resolver.assert_called_once_with("sess-1", "deny", request_id="req-1")
         assert a._handled_events == []
+
+
+class TestCardCapabilityTurnOrigin:
+    _USER_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _USER_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    _GROUP_CONV = "19:group-chat@thread.v2"
+
+    def _group_inbound(
+        self,
+        *,
+        activity_id: str,
+        text: str,
+        user_aad: str,
+        user_id: str,
+    ) -> dict[str, Any]:
+        inbound = _make_inbound(text=text, conv_id=self._GROUP_CONV, activity_id=activity_id)
+        inbound["conversation"]["conversationType"] = "groupChat"
+        inbound["from"] = {"id": user_id, "name": user_id, "aadObjectId": user_aad}
+        return inbound
+
+    def _wire_adapter(self, adapter: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        adapter._http_client = MagicMock()
+        adapter._bridge_cfg = MagicMock()
+        adapter._fmi_cache = MagicMock()
+        adapter._user_cache = MagicMock()
+        adapter._bf_token_cache = MagicMock()
+
+    async def _run_exec_approval_with_b_posted_during_a_turn(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        group_sessions_per_user: bool,
+        session_key_unavailable: bool,
+    ) -> None:
+        import httpx
+
+        adapter = _make_adapter(
+            monkeypatch,
+            group_sessions_per_user=group_sessions_per_user,
+        )
+        self._wire_adapter(adapter, monkeypatch)
+        if session_key_unavailable:
+            monkeypatch.setattr(adapter, "_session_key_for", lambda _event: None)
+        bridge = adapter_mod._import_bridge()
+        a_inbound = self._group_inbound(
+            activity_id="act-a",
+            text="from-a",
+            user_aad=self._USER_A,
+            user_id="user-a",
+        )
+        b_inbound = self._group_inbound(
+            activity_id="act-b",
+            text="from-b",
+            user_aad=self._USER_B,
+            user_id="user-b",
+        )
+        a_ready = asyncio.Event()
+        b_posted = asyncio.Event()
+        a_done = asyncio.Event()
+        outcomes: dict[str, Any] = {}
+
+        async def gateway_message_handler(event: Any) -> None:
+            if str(getattr(event, "message_id", "") or "") != "act-a":
+                return
+            session_key = adapter._session_key_for(event) or f"agent365:{self._GROUP_CONV}"
+            outcomes["session_key"] = session_key
+            a_ready.set()
+            await b_posted.wait()
+            resolver = MagicMock(return_value=1)
+            monkeypatch.setattr(adapter, "_gw_resolve_approval", resolver)
+            _enqueue_gateway_exec_request(session_key, "req-a")
+            outcomes["result"] = await adapter.send_exec_approval(
+                self._GROUP_CONV,
+                "danger",
+                session_key,
+                request_id="req-a",
+            )
+            outcomes["resolver"] = resolver
+            a_done.set()
+
+        adapter.set_message_handler(gateway_message_handler)
+        transport = httpx.ASGITransport(app=adapter.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+
+            async def post_a() -> None:
+                response = await client.post(
+                    "/api/messages",
+                    json=a_inbound,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+                assert response.status_code == 200
+                outcomes["a_status"] = response.json()["status"]
+
+            a_task = asyncio.create_task(post_a())
+            await asyncio.wait_for(a_ready.wait(), timeout=2.0)
+            b_response = await client.post(
+                "/api/messages",
+                json=b_inbound,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+            assert b_response.status_code == 200
+            assert b_response.json()["status"] == "dispatched"
+            cached = adapter._cached_inbound_for(self._GROUP_CONV)
+            assert bridge._canonical_activity_user(cached) == bridge._canonical_activity_user(
+                b_inbound
+            )
+            b_posted.set()
+            await asyncio.wait_for(a_done.wait(), timeout=2.0)
+            await a_task
+
+        assert outcomes["a_status"] == "dispatched"
+        assert outcomes["result"].success is True
+        capability = next(iter(adapter._card_capabilities.values()))
+        assert capability["user_id"] == bridge._canonical_activity_user(a_inbound)
+        card_value = bridge.send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
+            "actions"
+        ][0]["data"]
+        b_activity = self._group_inbound(
+            activity_id="act-b-submit",
+            text="",
+            user_aad=self._USER_B,
+            user_id="user-b",
+        )
+        rejected = await adapter._handle_card_action(b_activity, card_value)
+        assert rejected.status_code == 403
+        outcomes["resolver"].assert_not_called()
+        accepted = await adapter._handle_card_action(a_inbound, card_value)
+        assert accepted.status_code == 200
+        assert outcomes["resolver"].call_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_sessions_per_user", [True, False])
+    async def test_real_b_post_during_a_turn_exec_approval(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        group_sessions_per_user: bool,
+    ) -> None:
+        await self._run_exec_approval_with_b_posted_during_a_turn(
+            monkeypatch,
+            group_sessions_per_user=group_sessions_per_user,
+            session_key_unavailable=False,
+        )
+
+    @pytest.mark.asyncio
+    async def test_real_b_post_during_a_turn_when_session_key_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        await self._run_exec_approval_with_b_posted_during_a_turn(
+            monkeypatch,
+            group_sessions_per_user=False,
+            session_key_unavailable=True,
+        )
+
+    async def _run_dequeued_turn_mints_for_b(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        group_sessions_per_user: bool,
+    ) -> None:
+        import httpx
+
+        adapter = _make_adapter(
+            monkeypatch,
+            group_sessions_per_user=group_sessions_per_user,
+        )
+        self._wire_adapter(adapter, monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        a_inbound = self._group_inbound(
+            activity_id="act-a",
+            text="from-a",
+            user_aad=self._USER_A,
+            user_id="user-a",
+        )
+        b_inbound = self._group_inbound(
+            activity_id="act-b",
+            text="from-b",
+            user_aad=self._USER_B,
+            user_id="user-b",
+        )
+        a_ready = asyncio.Event()
+        b_posted = asyncio.Event()
+        release_a = asyncio.Event()
+        b_cards: dict[str, Any] = {}
+
+        b_done = asyncio.Event()
+
+        async def gateway_message_handler(event: Any) -> None:
+            message_id = str(getattr(event, "message_id", "") or "")
+            session_key = adapter._session_key_for(event) or f"agent365:{self._GROUP_CONV}"
+            if message_id == "act-a":
+                a_ready.set()
+                await b_posted.wait()
+                await release_a.wait()
+                return
+            if message_id != "act-b":
+                return
+            exec_resolver = MagicMock(return_value=1)
+            slash_resolver = AsyncMock(return_value="ok")
+            clarify_resolver = MagicMock(return_value=True)
+            monkeypatch.setattr(adapter, "_gw_resolve_approval", exec_resolver)
+            monkeypatch.setattr(adapter, "_gw_resolve_slash_confirm", slash_resolver)
+            monkeypatch.setattr(adapter, "_gw_resolve_clarify", clarify_resolver)
+            _enqueue_gateway_exec_request(session_key, "req-b-exec")
+            b_cards["exec"] = await adapter.send_exec_approval(
+                self._GROUP_CONV,
+                "danger",
+                session_key,
+                request_id="req-b-exec",
+            )
+            b_cards["slash"] = await adapter.send_slash_confirm(
+                self._GROUP_CONV,
+                "Confirm",
+                "Run?",
+                session_key,
+                "cfm-b",
+            )
+            b_cards["clarify"] = await adapter.send_clarify(
+                self._GROUP_CONV,
+                "Pick",
+                ["Alpha"],
+                "clr-b",
+                session_key,
+            )
+            b_cards["resolvers"] = (exec_resolver, slash_resolver, clarify_resolver)
+            b_cards["session_key"] = session_key
+            b_done.set()
+
+        adapter.set_message_handler(gateway_message_handler)
+        transport = httpx.ASGITransport(app=adapter.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+
+            async def post_a() -> None:
+                response = await client.post(
+                    "/api/messages",
+                    json=a_inbound,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+                assert response.status_code == 200
+
+            a_task = asyncio.create_task(post_a())
+            await asyncio.wait_for(a_ready.wait(), timeout=2.0)
+            b_response = await client.post(
+                "/api/messages",
+                json=b_inbound,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+            assert b_response.status_code == 200
+            b_posted.set()
+            release_a.set()
+            await a_task
+            await asyncio.wait_for(b_done.wait(), timeout=2.0)
+
+        for label in ("exec", "slash", "clarify"):
+            assert b_cards[label].success is True
+        a_activity = self._group_inbound(
+            activity_id="act-a-submit",
+            text="",
+            user_aad=self._USER_A,
+            user_id="user-a",
+        )
+        assert len(adapter._card_capabilities) == 3
+        for nonce, capability in adapter._card_capabilities.items():
+            assert capability["user_id"] == bridge._canonical_activity_user(b_inbound)
+            value = {
+                "hermes_kind": capability["kind"],
+                "capability": nonce,
+                "choice_id": next(iter(capability["choices"])),
+            }
+            rejected = await adapter._handle_card_action(a_activity, value)
+            assert rejected.status_code == 403
+        exec_resolver, slash_resolver, clarify_resolver = b_cards["resolvers"]
+        exec_resolver.assert_not_called()
+        slash_resolver.assert_not_called()
+        clarify_resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("group_sessions_per_user", [True, False])
+    async def test_dequeued_turn_mints_cards_bound_to_user_b(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        group_sessions_per_user: bool,
+    ) -> None:
+        await self._run_dequeued_turn_mints_for_b(
+            monkeypatch,
+            group_sessions_per_user=group_sessions_per_user,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("send_method", "resolver_attr", "resolver_is_async", "card_kind"),
+        [
+            ("send_exec_approval", "_gw_resolve_approval", False, "exec_approval"),
+            ("send_slash_confirm", "_gw_resolve_slash_confirm", True, "slash_confirm"),
+            ("send_clarify", "_gw_resolve_clarify", False, "clarify"),
+        ],
+    )
+    async def test_group_chat_card_bound_to_admitted_turn_user(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        send_method: str,
+        resolver_attr: str,
+        resolver_is_async: bool,
+        card_kind: str,
+    ) -> None:
+        import httpx
+
+        adapter = _make_adapter(monkeypatch, group_sessions_per_user=True)
+        self._wire_adapter(adapter, monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        outcomes: dict[str, Any] = {}
+        turn_done = asyncio.Event()
+
+        async def gateway_message_handler(event: Any) -> None:
+            session_key = adapter._session_key_for(event)
+            assert session_key is not None
+            if resolver_is_async:
+                resolver = AsyncMock(return_value="ok" if card_kind == "slash_confirm" else True)
+            else:
+                resolver = MagicMock(return_value=1 if card_kind == "exec_approval" else True)
+            monkeypatch.setattr(adapter, resolver_attr, resolver)
+            sender = getattr(adapter, send_method)
+            if send_method == "send_exec_approval":
+                _enqueue_gateway_exec_request(session_key, "req-a")
+                result = await sender(
+                    self._GROUP_CONV,
+                    "danger",
+                    session_key,
+                    request_id="req-a",
+                )
+            elif send_method == "send_slash_confirm":
+                result = await sender(
+                    self._GROUP_CONV,
+                    "Confirm",
+                    "Run?",
+                    session_key,
+                    "cfm-1",
+                )
+            else:
+                result = await sender(
+                    self._GROUP_CONV,
+                    "Pick one",
+                    ["Alpha"],
+                    "clr-1",
+                    session_key,
+                )
+            outcomes["result"] = result
+            outcomes["resolver"] = resolver
+            turn_done.set()
+
+        adapter.set_message_handler(gateway_message_handler)
+        a_inbound = self._group_inbound(
+            activity_id="act-a",
+            text="from-a",
+            user_aad=self._USER_A,
+            user_id="user-a",
+        )
+        transport = httpx.ASGITransport(app=adapter.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/messages",
+                json=a_inbound,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+        assert response.status_code == 200
+        assert response.json()["status"] == "dispatched"
+        await asyncio.wait_for(turn_done.wait(), timeout=2.0)
+        assert outcomes["result"].success is True
+        capability = next(iter(adapter._card_capabilities.values()))
+        assert capability["user_id"] == bridge._canonical_activity_user(a_inbound)
+        card_value = bridge.send_reply.await_args.kwargs["reply"]["attachments"][0]["content"][
+            "actions"
+        ][0]["data"]
+        b_activity = self._group_inbound(
+            activity_id="act-b-submit",
+            text="",
+            user_aad=self._USER_B,
+            user_id="user-b",
+        )
+        rejected = await adapter._handle_card_action(b_activity, card_value)
+        assert rejected.status_code == 403
+        outcomes["resolver"].assert_not_called()
+        accepted = await adapter._handle_card_action(a_inbound, card_value)
+        assert accepted.status_code == 200
+        assert outcomes["resolver"].call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_personal_card_still_bound_to_admitted_turn_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        adapter = _make_adapter(monkeypatch)
+        self._wire_adapter(adapter, monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        conv = "conv-personal-1"
+        outcomes: dict[str, Any] = {}
+        turn_done = asyncio.Event()
+
+        async def gateway_message_handler(event: Any) -> None:
+            session_key = adapter._session_key_for(event)
+            assert session_key is not None
+            _enqueue_gateway_exec_request(session_key, "req-owner")
+            outcomes["result"] = await adapter.send_exec_approval(
+                conv,
+                "danger",
+                session_key,
+                request_id="req-owner",
+            )
+            turn_done.set()
+
+        adapter.set_message_handler(gateway_message_handler)
+        owner = _make_inbound(conv_id=conv, activity_id="act-owner", text="owner")
+        owner["from"] = {"id": "owner", "aadObjectId": self._USER_A}
+        transport = httpx.ASGITransport(app=adapter.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/messages",
+                json=owner,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+        assert response.status_code == 200
+        await asyncio.wait_for(turn_done.wait(), timeout=2.0)
+        assert outcomes["result"].success is True
+        capability = next(iter(adapter._card_capabilities.values()))
+        assert capability["user_id"] == bridge._canonical_activity_user(owner)
+
+    @pytest.mark.asyncio
+    async def test_card_mint_without_turn_origin_fails_closed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        adapter._conversations.upsert(
+            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-1"))
+        )
+        adapter._http_client = MagicMock()
+        adapter._bridge_cfg = MagicMock()
+        adapter._fmi_cache = MagicMock()
+        adapter._user_cache = MagicMock()
+        adapter._bf_token_cache = MagicMock()
+        result = await adapter.send_exec_approval(
+            "conv-1", "danger", "sess-missing-origin", metadata={"request_id": "req-x"}
+        )
+        assert result.success is False
+        assert adapter._card_capabilities == {}
+        send_reply.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_card_mint_rejects_empty_turn_origin_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _make_adapter(monkeypatch)
+        self._wire_adapter(adapter, monkeypatch)
+        inbound = _make_inbound(conv_id="conv-1")
+        inbound["from"] = {}
+        adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        token = adapter_mod._AGENT_TURN_ORIGIN.set(
+            adapter._turn_origin_from_activity(inbound, "sess-1")
+        )
+        try:
+            result = await adapter.send_exec_approval(
+                "conv-1", "danger", "sess-1", metadata={"request_id": "req-x"}
+            )
+        finally:
+            adapter_mod._AGENT_TURN_ORIGIN.reset(token)
+        assert result.success is False
+        assert adapter._card_capabilities == {}
+
+    @pytest.mark.asyncio
+    async def test_card_resolve_rejects_empty_submitter_and_empty_capability_user(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = _make_adapter(monkeypatch)
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(adapter, "_gw_resolve_approval", resolver)
+        activity = _make_inbound(conv_id="conv-1")
+        activity["from"] = {}
+        value = _seed_card_capability(
+            adapter,
+            activity,
+            kind="exec_approval",
+            choice="once",
+            resolver={"session_key": "sess-1", "request_id": "req-1"},
+        )
+        adapter._card_capabilities["test-capability"]["user_id"] = ""
+        response = await adapter._handle_card_action(activity, value)
+        assert response.status_code == 403
+        resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_stale_exec_card_after_settle_does_not_resolve_later_pending(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tools.approval import list_gateway_approvals
+
+        adapter = _make_adapter(monkeypatch, group_sessions_per_user=False)
+        cards = TestInteractiveCards()
+        cards._connect(adapter)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        session_key = "sess-1"
+        _enqueue_gateway_exec_request(session_key, "req-a")
+        result_a = await adapter.send_exec_approval(
+            "conv-1",
+            "danger",
+            session_key,
+            request_id="req-a",
+        )
+        assert result_a.success is True
+        card_a = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
+        assert adapter._gw_resolve_approval(session_key, "once", request_id="req-a") == 1
+        assert adapter._card_capabilities == {}
+        _enqueue_gateway_exec_request(session_key, "req-b")
+        token = adapter_mod._AGENT_TURN_ORIGIN.set(
+            adapter._turn_origin_from_activity(_make_inbound(), session_key)
+        )
+        try:
+            result_b = await adapter.send_exec_approval(
+                "conv-1",
+                "danger-b",
+                session_key,
+                request_id="req-b",
+            )
+        finally:
+            adapter_mod._AGENT_TURN_ORIGIN.reset(token)
+        assert result_b.success is True
+        assert [item["request_id"] for item in list_gateway_approvals(session_key)] == ["req-b"]
+        response = await adapter._handle_card_action(_make_inbound(), card_a)
+        assert response.status_code == 403
+        assert [item["request_id"] for item in list_gateway_approvals(session_key)] == ["req-b"]
+
+    @pytest.mark.asyncio
+    async def test_exec_card_resolve_targets_single_pending_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from tools.approval import list_gateway_approvals
+
+        adapter = _make_adapter(monkeypatch)
+        session_key = "sess-shared"
+        _enqueue_gateway_exec_request(session_key, "req-one")
+        _enqueue_gateway_exec_request(session_key, "req-two")
+        assert adapter._gw_resolve_approval(session_key, "once", request_id="req-one") == 1
+        remaining = [item["request_id"] for item in list_gateway_approvals(session_key)]
+        assert remaining == ["req-two"]
 
 
 # ---------------------------------------------------------------------------
@@ -26261,7 +27136,9 @@ class TestHandoffSessionPin:
             await _settle_handoff(adapter)
             await asyncio.wait_for(started.wait(), timeout=1)
             sk = observed["session_key"]
-            assert sk == "agent:main:agent365:dm:conv-teams"
+            assert sk == (
+                "agent:main:agent365:dm:conv-teams:user:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+            )
             assert observed["mapped"] == "conv-teams"
             assert observed["admitted"] is True
             assert observed["guard"] is True

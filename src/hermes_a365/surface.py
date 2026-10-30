@@ -190,6 +190,7 @@ ADAPTER_PUBLIC_MEMBERS: Final[frozenset[str]] = frozenset(
         "message_len_fn",
         "streaming_overflow_limit",
         "build_app",
+        "cancel_session_processing",
         "connect",
         "disconnect",
         "prune_conversations",
@@ -203,10 +204,12 @@ ADAPTER_PUBLIC_MEMBERS: Final[frozenset[str]] = frozenset(
         "send_document",
         "send_image_file",
         "send_exec_approval",
+        "invalidate_exec_approval_capabilities",
         "send_slash_confirm",
         "send_clarify",
         "edit_message",
         "get_chat_info",
+        "handle_message",
     }
 )
 
