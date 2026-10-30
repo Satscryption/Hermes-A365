@@ -1,0 +1,331 @@
+"""0.9.6.1 hardening part 2 — sidecar UTF-8, create guard, backup errors, parse hygiene."""
+
+from __future__ import annotations
+
+import json
+import os
+import traceback
+from collections.abc import Iterable
+from pathlib import Path
+from typing import Any
+
+import pytest
+from test_bot_service import SUBSCRIPTION_ID, TENANT_ID, FakeRunner
+
+from hermes_a365._common import SidecarBackupError, write_owner_only_bytes_exclusive
+from hermes_a365.bot_service import (
+    BotServiceConfig,
+    BotServiceCreateInputs,
+    BotServiceError,
+    apply_create_plan,
+    build_create_plan,
+)
+from hermes_a365.plugin.conversations import ConversationRegistry
+from hermes_a365.sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
+
+
+def _sidecar_v1_bytes(*, agent_name: str | None = None) -> bytes:
+    payload: dict[str, Any] = {
+        "schemaVersion": 1,
+        "subscriptionId": SUBSCRIPTION_ID,
+        "resourceGroup": "rg",
+        "botName": "bot",
+        "armResourceId": (
+            "/subscriptions/x/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot"
+        ),
+        "msaAppId": "00000000-0000-0000-0000-000000000001",
+        "tenantId": TENANT_ID,
+        "messagingEndpoint": "https://example.test/api/messages",
+        "channelsEnabled": ["msteams"],
+        "createdAt": "2020-01-01T00:00:00Z",
+        "resourceGroupManaged": False,
+    }
+    if agent_name is not None:
+        payload["agentName"] = agent_name
+    return json.dumps(payload).encode()
+
+
+def _sidecar_v2_bytes(agent_name: str = "agent") -> bytes:
+    payload = json.loads(_sidecar_v1_bytes().decode())
+    payload["schemaVersion"] = 2
+    payload["agentName"] = agent_name
+    return json.dumps(payload).encode()
+
+
+def _iter_exception_chain(exc: BaseException | None) -> Iterable[BaseException]:
+    seen: set[int] = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        if current.__suppress_context__:
+            current = current.__cause__
+        else:
+            current = current.__cause__ or current.__context__
+
+
+def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
+    if value is None:
+        return
+    oid = id(value)
+    if oid in _seen:
+        return
+    if isinstance(value, (str, bytes, bytearray)):
+        text = value.decode() if isinstance(value, (bytes, bytearray)) else value
+        assert marker not in text, repr(value)[:200]
+        return
+    _seen.add(oid)
+    if isinstance(value, dict):
+        for item in value.values():
+            _scan_value_for_marker(item, marker, _seen=_seen)
+        return
+    if isinstance(value, (list, tuple, set, frozenset)):
+        for item in value:
+            _scan_value_for_marker(item, marker, _seen=_seen)
+        return
+
+
+def _assert_marker_absent_from_bot_service_failure(exc: BaseException, marker: str) -> None:
+    for link in _iter_exception_chain(exc):
+        assert marker not in str(link)
+        assert marker not in repr(link)
+        for _key, val in vars(link).items():
+            _scan_value_for_marker(val, marker, _seen=set())
+    tb = exc.__traceback__
+    while tb is not None:
+        frame = tb.tb_frame
+        if frame.f_code.co_filename.endswith(f"{os.sep}bot_service.py"):
+            for _name, value in frame.f_locals.items():
+                _scan_value_for_marker(value, marker, _seen=set())
+        tb = tb.tb_next
+    assert marker not in "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+class TestC1ConversationsStrictUtf8:
+    def test_utf16_registry_roundtrip_via_save(self, tmp_path: Path) -> None:
+        path = tmp_path / "conversations.json"
+        path.write_bytes('{"schemaVersion": 1, "conversations": {}}'.encode("utf-16-le"))
+        reg = ConversationRegistry.load(path)
+        ConversationRegistry.write_payload(path, reg.to_payload())
+        assert path.read_bytes().decode("utf-8").startswith("{")
+
+    def test_utf32_bom_registry_roundtrip_via_save(self, tmp_path: Path) -> None:
+        path = tmp_path / "conversations.json"
+        body = '{"schemaVersion": 1, "conversations": {}}'.encode("utf-32")
+        path.write_bytes(body)
+        reg = ConversationRegistry.load(path)
+        ConversationRegistry.write_payload(path, reg.to_payload())
+        assert path.read_bytes().decode("utf-8").startswith("{")
+
+
+class TestC2CreateRefusesExistingSidecar:
+    def test_valid_v1_sidecar_bytes_unchanged_no_azure(self, tmp_path: Path) -> None:
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        original = _sidecar_v1_bytes()
+        sidecar.write_bytes(original)
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+            app_id="00000000-0000-0000-0000-000000000001",
+        )
+        env = {"A365_BF_APP_ID": "00000000-0000-0000-0000-000000000001"}
+        plan = build_create_plan(inputs, operator_env=env)
+        runner = FakeRunner(group_exists=False)
+        with pytest.raises(BotServiceError, match="already exists"):
+            apply_create_plan(plan, runner=runner)
+        assert sidecar.read_bytes() == original
+        assert runner.calls == []
+
+    def test_valid_v2_same_agent_bytes_unchanged_no_azure(self, tmp_path: Path) -> None:
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        original = _sidecar_v2_bytes("agent")
+        sidecar.write_bytes(original)
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+            app_id="00000000-0000-0000-0000-000000000001",
+        )
+        env = {"A365_BF_APP_ID": "00000000-0000-0000-0000-000000000001"}
+        plan = build_create_plan(inputs, operator_env=env)
+        runner = FakeRunner(group_exists=False)
+        with pytest.raises(BotServiceError, match="already exists"):
+            apply_create_plan(plan, runner=runner, operator_env=env)
+        assert sidecar.read_bytes() == original
+        assert runner.calls == []
+
+
+class TestC3AgentNameTypeValidation:
+    def test_dict_agent_name_error_names_type_not_value(self) -> None:
+        sentinel = "SENTINEL-NOT-A-SECRET-C3"
+        payload = {
+            "schemaVersion": 2,
+            "agentName": {sentinel: 1},
+            "subscriptionId": SUBSCRIPTION_ID,
+            "resourceGroup": "rg",
+            "botName": "bot",
+            "armResourceId": (
+                "/subscriptions/x/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot"
+            ),
+            "msaAppId": "00000000-0000-0000-0000-000000000001",
+            "tenantId": TENANT_ID,
+            "messagingEndpoint": "https://example.test/api/messages",
+            "channelsEnabled": ["msteams"],
+            "createdAt": "2020-01-01T00:00:00Z",
+            "resourceGroupManaged": False,
+        }
+        with pytest.raises(BotServiceError) as exc:
+            BotServiceConfig.from_json_text(json.dumps(payload), source="cfg")
+        assert sentinel not in str(exc.value)
+        assert "dict" in str(exc.value).lower() or "unsupported type" in str(exc.value).lower()
+
+    def test_list_agent_name_error_names_type_not_value(self) -> None:
+        sentinel = "SENTINEL-NOT-A-SECRET-C3B"
+        payload = {
+            "schemaVersion": 2,
+            "agentName": [sentinel],
+            "subscriptionId": SUBSCRIPTION_ID,
+            "resourceGroup": "rg",
+            "botName": "bot",
+            "armResourceId": (
+                "/subscriptions/x/resourceGroups/rg/providers/Microsoft.BotService/botServices/bot"
+            ),
+            "msaAppId": "00000000-0000-0000-0000-000000000001",
+            "tenantId": TENANT_ID,
+            "messagingEndpoint": "https://example.test/api/messages",
+            "channelsEnabled": ["msteams"],
+            "createdAt": "2020-01-01T00:00:00Z",
+            "resourceGroupManaged": False,
+        }
+        with pytest.raises(BotServiceError) as exc:
+            BotServiceConfig.from_json_text(json.dumps(payload), source="cfg")
+        assert sentinel not in str(exc.value)
+        assert "list" in str(exc.value).lower() or "unsupported type" in str(exc.value).lower()
+
+
+class TestC4SchemaVersionOutOfRangeMessage:
+    def test_int_99_is_unsupported_version_not_type(self) -> None:
+        with pytest.raises(SidecarSchemaError, match="unsupported version"):
+            validate_bot_service_sidecar_schema({"schemaVersion": 99}, source="cfg")
+
+
+class TestC5BackupOSErrorNormalized:
+    @pytest.mark.parametrize(
+        "patch_target,failure",
+        [
+            ("mkdir", "SidecarBackupError"),
+            ("open", "SidecarBackupError"),
+            ("write", "SidecarBackupError"),
+            ("link", "SidecarBackupError"),
+            ("dir_fsync", "SidecarBackupError"),
+        ],
+    )
+    def test_fault_injection_becomes_sidecar_backup_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        patch_target: str,
+        failure: str,
+    ) -> None:
+        target = tmp_path / "nested" / "sidecar.json.backup-test"
+        real_write = os.write
+        real_fsync = os.fsync
+
+        if patch_target == "mkdir":
+
+            def fail_mkdir(self: Path, *args: Any, **kwargs: Any) -> None:
+                raise OSError("injected mkdir failure")
+
+            monkeypatch.setattr(Path, "mkdir", fail_mkdir)
+        elif patch_target == "open":
+
+            def fail_open(*args: Any, **kwargs: Any) -> int:
+                raise OSError("injected open failure")
+
+            monkeypatch.setattr(os, "open", fail_open)
+        elif patch_target == "write":
+            write_calls = 0
+
+            def fail_write(fd: int, data: bytes | memoryview) -> int:
+                nonlocal write_calls
+                write_calls += 1
+                if write_calls == 1:
+                    raise OSError("injected write failure")
+                return real_write(fd, data)
+
+            monkeypatch.setattr(os, "write", fail_write)
+        elif patch_target == "link":
+
+            def fail_link(src: str | os.PathLike, dst: str | os.PathLike) -> None:
+                raise OSError("injected link failure")
+
+            monkeypatch.setattr(os, "link", fail_link)
+        elif patch_target == "dir_fsync":
+            dir_fsync_calls = 0
+
+            def fail_fsync(fd: int) -> None:
+                nonlocal dir_fsync_calls
+                dir_fsync_calls += 1
+                if dir_fsync_calls >= 2:
+                    raise OSError("injected directory fsync failure")
+                real_fsync(fd)
+
+            monkeypatch.setattr(os, "fsync", fail_fsync)
+        else:
+            raise AssertionError(patch_target)
+
+        with pytest.raises(SidecarBackupError):
+            write_owner_only_bytes_exclusive(target, b"payload\n")
+        assert failure == "SidecarBackupError"
+        assert list(tmp_path.rglob("*.part-*")) == []
+        if patch_target != "dir_fsync":
+            assert not target.exists()
+
+    def test_close_failure_still_cleans_temp(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        target = tmp_path / "sidecar.json.backup-test"
+
+        def fail_close(fd: int) -> None:
+            raise OSError("injected close failure")
+
+        monkeypatch.setattr(os, "close", fail_close)
+        with pytest.raises(SidecarBackupError):
+            write_owner_only_bytes_exclusive(target, b"x")
+        assert not target.exists()
+        assert list(tmp_path.glob(".sidecar.json.backup-test.part-*")) == []
+
+
+class TestParseExceptionLeak:
+    def test_create_invalid_json_does_not_retain_sentinel(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        marker = "SENTINEL-PARSE-LEAK-271-2"
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        sidecar.write_bytes(f'{{"schemaVersion": 1, "secret": "{marker}"'.encode())
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+            app_id="00000000-0000-0000-0000-000000000001",
+        )
+        env = {"A365_BF_APP_ID": "00000000-0000-0000-0000-000000000001"}
+        plan = build_create_plan(inputs, operator_env=env)
+        runner = FakeRunner(group_exists=False)
+        with pytest.raises(BotServiceError) as excinfo:
+            apply_create_plan(plan, runner=runner, operator_env=env)
+        _assert_marker_absent_from_bot_service_failure(excinfo.value, marker)
+        assert marker not in capsys.readouterr().err
+        assert isinstance(excinfo.value.__cause__, type(None)) or excinfo.value.__cause__ is None
+
+    def test_from_json_text_invalid_json_does_not_chain_decode_doc(self) -> None:
+        marker = "SENTINEL-PARSE-LEAK-FROM-JSON"
+        broken = json.dumps({"schemaVersion": 1, "x": marker})[:-2]
+        with pytest.raises(BotServiceError) as excinfo:
+            BotServiceConfig.from_json_text(broken, source="cfg")
+        _assert_marker_absent_from_bot_service_failure(excinfo.value, marker)
+        assert excinfo.value.__cause__ is None

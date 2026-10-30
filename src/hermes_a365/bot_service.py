@@ -247,8 +247,10 @@ class BotServiceConfig:
         """Parse one already-bound sidecar snapshot."""
         try:
             raw = json.loads(text)
-        except json.JSONDecodeError as e:
-            raise BotServiceError(f"{source} is not valid JSON: {e}") from e
+        except json.JSONDecodeError:
+            text = ""
+            raise BotServiceError(f"{source} is not valid JSON (invalid JSON)") from None
+        text = ""
         if not isinstance(raw, dict):
             raise BotServiceError(f"{source} is JSON {type(raw).__name__}, expected object")
         raw.setdefault("resourceGroupManaged", False)
@@ -265,10 +267,22 @@ class BotServiceConfig:
             or isinstance(schema_version, bool)
             or schema_version not in _SUPPORTED_SIDECAR_SCHEMA_VERSIONS
         ):
+            kind = type(schema_version).__name__
+            if isinstance(schema_version, int) and not isinstance(schema_version, bool):
+                raise BotServiceError(
+                    f"{source} schemaVersion is unsupported; "
+                    f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
+                )
             raise BotServiceError(
-                f"{source} schemaVersion={schema_version!r}; expected one of "
-                f"{sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
+                f"{source} schemaVersion has unsupported type {kind}; "
+                f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
             )
+        if "agentName" in raw:
+            bound = raw.get("agentName")
+            if bound is not None and not isinstance(bound, str):
+                raise BotServiceError(
+                    f"{source} agentName has unsupported type {type(bound).__name__}; expected str"
+                )
         if schema_version == SIDECAR_SCHEMA_VERSION:
             agent_name = raw.get("agentName")
             if not isinstance(agent_name, str) or not agent_name.strip():
@@ -278,8 +292,9 @@ class BotServiceConfig:
                 )
         if not isinstance(raw.get("resourceGroupManaged"), bool):
             raise BotServiceError(
-                f"{source} resourceGroupManaged must be true or false, got "
-                f"{raw.get('resourceGroupManaged')!r}; refusing to infer purge authority"
+                f"{source} resourceGroupManaged must be true or false "
+                f"(got {type(raw.get('resourceGroupManaged')).__name__}); "
+                "refusing to infer purge authority"
             )
         for key in (
             "subscriptionId",
@@ -681,6 +696,35 @@ def _read_sidecar_bytes(path: Path) -> tuple[bytes, tuple[int, int, int, str]]:
     if identity_after != identity_before:
         raise BotServiceError(f"{path} changed while it was being read")
     return raw, (*identity_after, hashlib.sha256(raw).hexdigest())
+
+
+def _parse_sidecar_json_object(data: bytes, *, source: str) -> dict[str, Any]:
+    """Parse UTF-8 sidecar bytes without retaining raw content on failure."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        data = b""
+        raise BotServiceError(f"{source} is not valid JSON (invalid UTF-8)") from None
+    data = b""
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        text = ""
+        raise BotServiceError(f"{source} is not valid JSON (invalid JSON)") from None
+    text = ""
+    if not isinstance(parsed, dict):
+        raise BotServiceError(f"{source} is JSON {type(parsed).__name__}, expected object")
+    return parsed
+
+
+def _existing_sidecar_payload_for_create(
+    path: Path,
+) -> tuple[dict[str, Any], tuple[int, int, int, str]]:
+    snapshot, binding = _read_sidecar_bytes(path)
+    try:
+        return _parse_sidecar_json_object(snapshot, source=str(path)), binding
+    finally:
+        snapshot = b""
 
 
 def _read_bound_sidecar(
@@ -1167,7 +1211,27 @@ def _patch_teams_terms(
     )
 
 
-def _write_bot_service_config(path: Path, config: BotServiceConfig) -> None:
+def _write_bot_service_config(
+    path: Path,
+    config: BotServiceConfig,
+    *,
+    expected_binding: tuple[int, int, int, str] | None = None,
+) -> None:
+    if expected_binding is not None and path.is_file():
+        current_binding = _sidecar_file_binding(path)
+        if current_binding != expected_binding:
+            raise BotServiceError(f"{path} changed since validation; refusing to replace")
+        raw, _binding = _read_sidecar_bytes(path)
+        try:
+            payload = _parse_sidecar_json_object(raw, source=str(path))
+        except BotServiceError:
+            raise
+        from .sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
+
+        try:
+            validate_bot_service_sidecar_schema(payload, source=str(path))
+        except SidecarSchemaError as exc:
+            raise BotServiceError(str(exc)) from exc
     _write_text_atomic(path, config.to_json(), mode=0o600)
 
 
@@ -1305,6 +1369,27 @@ def _apply_create_plan_locked(
 
     inputs = plan.inputs
     bot_name = plan.bot_name
+    create_sidecar_binding: tuple[int, int, int, str] | None = None
+    if inputs.sidecar_path.is_file():
+        from .sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
+
+        sidecar_payload, create_sidecar_binding = _existing_sidecar_payload_for_create(
+            inputs.sidecar_path
+        )
+        try:
+            validate_bot_service_sidecar_schema(sidecar_payload, source=str(inputs.sidecar_path))
+        except SidecarSchemaError as exc:
+            raise BotServiceError(str(exc)) from exc
+        if "agentName" in sidecar_payload:
+            bound = sidecar_payload.get("agentName")
+            if bound is not None and not isinstance(bound, str):
+                raise BotServiceError(
+                    f"{inputs.sidecar_path} agentName has unsupported type "
+                    f"{type(bound).__name__}; expected str"
+                )
+        raise BotServiceError(
+            f"{inputs.sidecar_path} already exists; refusing create before Azure mutation"
+        )
     app_id = _resolve_app_id(inputs, operator_env)
     account = _account_show(runner)
     tenant_id = _resolve_tenant_id(inputs, operator_env, account)
@@ -1507,7 +1592,11 @@ def _apply_create_plan_locked(
         # later cleanup can refuse a sidecar that names a different agent.
         agentName=inputs.agent_name,
     )
-    _write_bot_service_config(inputs.sidecar_path, cfg)
+    _write_bot_service_config(
+        inputs.sidecar_path,
+        cfg,
+        expected_binding=create_sidecar_binding,
+    )
     messages.append(f"[apply] wrote {inputs.sidecar_path} (mode 0600)")
     return BotServiceCreateResult(
         config=cfg,
