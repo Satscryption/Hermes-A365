@@ -6,9 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.9.6] — 2026-11-02
+
+Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),
+per-kid JWKS refresh (#218), sensitive output handling for blueprint setup (#256),
+Direct Line probe 401 attribution (#250), sidecar schema versioning and packaging
+metadata (#193), and CI required-check fixes (#259).
+Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, #267, #268, #269, and #<THIS PR NUMBER> (release bump).
+
 ### Removed
 
-- **#189 — Unexported OTLP telemetry key, probe, and docs claim (v0.9.6.1).**
+- **#189 — Unexported OTLP telemetry key, probe, and docs claim.**
   ``HERMES_OTLP_ENDPOINT`` is no longer written by ``instance create`` or required
   in ``~/.hermes/.env``. ``activity-bridge verify`` no longer runs the
   ``otlp_endpoint`` DNS probe and ``--json`` verify output no longer includes
@@ -23,6 +31,39 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **#249 — Copilot empty bubble at preview-to-final swap.** When the final text
+  matches the last visible keep-alive post, the ``streamType=final`` activity is
+  rebuilt from that post's snapshot (only stream phase/type change), and
+  answer-preview informative openers carry the same message chrome, so Copilot
+  no longer clears the bubble for about a second. Refs
+  [#249](https://github.com/Satscryption/Hermes-A365/issues/249).
+
+- **#256 — ``register --apply`` blueprint setup output.** ``a365 setup blueprint``
+  steps (including license retries and the repair path) run with sensitive
+  output handling: child output is captured, and only the device-code sign-in
+  prompt is passed through. Permission steps still stream as before. Refs
+  [#256](https://github.com/Satscryption/Hermes-A365/issues/256).
+
+- **#251, #255 — Keep-alive rotation follow-ups.** Rotation close retires to a
+  plain post on non-retryable 4xx (400/401/404/non-terminal 403), keeps visible
+  progress for informative/close text, and re-reads stream state after the
+  answer-path gap sleep; real keep-alive sleeper tests cover 429 defer backoff.
+  Refs [#251](https://github.com/Satscryption/Hermes-A365/issues/251),
+  [#255](https://github.com/Satscryption/Hermes-A365/issues/255).
+
+- **#244 — Plain-flush retry follow-ups (#238).** ``turn_buffer_flush`` carries
+  segment ids; handoff link-alone posts pass their real segment ids so the
+  post-backoff recheck runs; a completion during plain-flush backoff arms one
+  deduped follow-up flush. Refs
+  [#244](https://github.com/Satscryption/Hermes-A365/issues/244).
+
+- **#218 — JWKS forced refresh (#208 follow-up).** The cache-wide 60s forced
+  refresh gate is replaced by a bounded per-``kid`` negative cache (128 entries,
+  60s each) and a 1s global floor between forced fetches, so an unknown ``kid``
+  no longer blocks a different new key; adds coalescing tests for failed and
+  hung fetches. Refs
+  [#218](https://github.com/Satscryption/Hermes-A365/issues/218).
+
 - **#250 — Direct Line probe HTTP 401 attribution.** ``runtime_auth`` **ERROR**
   on a live ``--directline-probe`` activity **401** reports a configured
   endpoint Path B BF Connector token rejection only when some JSON value is
@@ -31,6 +72,36 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   (channel secret or conversation token). Connector **502**/403 walk095 handling
   is unchanged. Refs
   [#250](https://github.com/Satscryption/Hermes-A365/issues/250).
+
+### Added
+
+- **#193 (slice 1) — Public-surface enumeration.**
+  Reviewed snapshot ``docs/surface/public-surface.json``, rendered
+  ``docs/SURFACE.md``, ``scripts/render_surface.py --check``/``--write``, and a
+  snapshot test as a CI gate. No runtime behaviour changes. Refs
+  [#193](https://github.com/Satscryption/Hermes-A365/issues/193).
+
+- **#193 (slices 2–3) — Sidecar schema versioning and packaging metadata.**
+  ``conversations.json`` and the Copilot Chat publish state now record a schema
+  version (``schema`` and ``schemaVersion``). A sidecar written by a newer
+  version is refused on load and on save rather than overwritten, and each
+  migration first takes an owner-only backup under an exclusive lock. Package
+  metadata uses PEP 639 (``license = "MIT"``, ``license-files``), with updated
+  classifiers and a Changelog project URL. Refs
+  [#193](https://github.com/Satscryption/Hermes-A365/issues/193).
+
+### Changed
+
+- **#189 — ``activity-bridge verify`` exit codes.** The ``otlp_endpoint`` probe is
+  removed, so ``verify`` no longer reports or fails on it and its exit code can
+  differ from 0.9.5. Scripts that check ``otlp_endpoint`` or assert on the old exit
+  code need updating. Refs
+  [#189](https://github.com/Satscryption/Hermes-A365/issues/189).
+
+- **#259 — CI required ``test`` check.** The matrix job is renamed ``unit``; an
+  aggregate ``test`` job gates on all test jobs; per-job and per-test timeouts,
+  per-PR concurrency, and a ``merge_group`` trigger for merge queue. CI only.
+  Refs [#259](https://github.com/Satscryption/Hermes-A365/issues/259).
 
 ## [0.9.5] — 2026-10-27
 
@@ -2866,7 +2937,8 @@ Microsoft.Agents.A365.DevTools.Cli **1.1.171** (round-5 walkthrough,
   operators (only "blocked" via the M365 Admin Centre). Microsoft
   platform limitation; not a wrapper bug.
 
-[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.5...HEAD
+[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.6...HEAD
+[0.9.6]: https://github.com/satscryption/Hermes-A365/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/satscryption/Hermes-A365/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/satscryption/Hermes-A365/compare/v0.9.3...v0.9.4
 [0.1.0]: https://github.com/satscryption/Hermes-A365/releases/tag/v0.1.0

@@ -1,6 +1,6 @@
 # Hermes-A365 public surface (frozen inventory)
 
-Package version **0.9.5**. Machine-readable snapshot: [`docs/surface/public-surface.json`](surface/public-surface.json). Regenerate with `scripts/render_surface.py --write`; CI runs `--check`.
+Package version **0.9.6**. Machine-readable snapshot: [`docs/surface/public-surface.json`](surface/public-surface.json). Regenerate with `scripts/render_surface.py --write`; CI runs `--check`.
 
 ## Owner decisions (accepted)
 
@@ -120,7 +120,7 @@ Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any 1.x rele
 ## Python API
 
 - Console script `hermes-a365`; entry point `hermes_agent.plugins` / `agent365` → `hermes_a365.plugin:register`.
-- `hermes_a365.__version__` → `0.9.5`.
+- `hermes_a365.__version__` → `0.9.6`.
 - `Agent365Adapter` public members: build_app, connect, disconnect, edit_message, get_chat_info, message_len_fn, name, on_processing_complete, on_processing_start, prune_conversations, send, send_clarify, send_document, send_exec_approval, send_image, send_image_file, send_or_update_status, send_private_notice, send_slash_confirm, send_typing, streaming_overflow_limit.
 - Public `python -m`: `hermes_a365.keychain` subcommands store, get, delete.
 

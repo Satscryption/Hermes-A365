@@ -2172,7 +2172,7 @@
     },
     "status": "accepted"
   },
-  "package_version": "0.9.5",
+  "package_version": "0.9.6",
   "packaging": {
     "classifiers": [
       "Programming Language :: Python :: 3",
@@ -2208,7 +2208,7 @@
       "Homepage": "https://github.com/satscryption/Hermes-A365",
       "Issues": "https://github.com/satscryption/Hermes-A365/issues"
     },
-    "version": "0.9.5"
+    "version": "0.9.6"
   },
   "plugin_requires_env": [
     "A365_TENANT_ID",
