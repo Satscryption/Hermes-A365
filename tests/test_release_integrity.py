@@ -380,20 +380,38 @@ def test_live_0_9_4_section_still_parses() -> None:
 
 
 def test_live_0_9_5_section_still_parses() -> None:
-    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.5")
+    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    heading, body = mod.changelog_section(text, "0.9.5")
 
-    assert notes.version == "0.9.5"
-    assert notes.title == (
+    assert heading.startswith("## [0.9.5] \u2014 2026-10-27")
+    assert mod.release_title("v0.9.5", body) == (
         "v0.9.5 \u2014 Copilot Chat streaming and keep-alive hardening "
         "(#214, #217, #212, #235, #247), outbound 429 / Retry-After handling (#190), "
         "and Direct Line verify diagnostics (#215)."
     )
-    assert len(notes.title) <= mod.TITLE_LIMIT
     assert (
         "Ships from ``main`` (2026-10-27) via PRs #223, #231, #232, #233, #234, #236,\n"
         "#240, #243, #245, #246, #248, #252 (release bump), #253, and #254."
+    ) in body
+    assert "2026-10-27" in body
+
+
+def test_live_0_9_6_section_still_parses() -> None:
+    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.6")
+
+    assert notes.version == "0.9.6"
+    assert notes.title == (
+        "v0.9.6 \u2014 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry "
+        "follow-ups (#244), per-kid JWKS refresh (#218), sensitive output handling for "
+        "blueprint setup (#256), Direct Line probe 401 attribution (#250), sidecar schema "
+        "versioning..."
+    )
+    assert len(notes.title) <= mod.TITLE_LIMIT
+    assert (
+        "Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, "
+        "#267, #268, #269, and #272 (release bump)."
     ) in notes.body
-    assert "2026-10-27" in notes.body
+    assert "2026-11-02" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:
@@ -720,7 +738,8 @@ def test_built_wheel_and_sdist_expose_pep639_license(tmp_path: Path) -> None:
     import zipfile
 
     with zipfile.ZipFile(wheels[0]) as archive:
-        assert archive.read("hermes_a365-0.9.5.dist-info/licenses/LICENSE").decode() == license_src
+        license_path = f"hermes_a365-{version}.dist-info/licenses/LICENSE"
+        assert archive.read(license_path).decode() == license_src
     for path in (wheels[0], sdists[0]):
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
         lines.append(f"{digest}  {path.name}")
