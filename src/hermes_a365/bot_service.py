@@ -281,6 +281,8 @@ class BotServiceConfig:
             raw.setdefault("resourceGroupManaged", False)
             bound: Any = None
             agent_name: Any = None
+            schema_version: Any = None
+            channels: Any = None
             missing = [
                 f.name
                 for f in fields(cls)
@@ -296,10 +298,12 @@ class BotServiceConfig:
             ):
                 kind = type(schema_version).__name__
                 if isinstance(schema_version, int) and not isinstance(schema_version, bool):
+                    schema_version = None
                     raise BotServiceError(
                         f"{source} schemaVersion is unsupported; "
                         f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
                     )
+                schema_version = None
                 raise BotServiceError(
                     f"{source} schemaVersion has unsupported type {kind}; "
                     f"expected one of {sorted(_SUPPORTED_SIDECAR_SCHEMA_VERSIONS)}"
@@ -307,9 +311,10 @@ class BotServiceConfig:
             if "agentName" in raw:
                 bound = raw.get("agentName")
                 if bound is not None and not isinstance(bound, str):
+                    bound_kind = type(bound).__name__
+                    bound = None
                     raise BotServiceError(
-                        f"{source} agentName has unsupported type {type(bound).__name__}; "
-                        "expected str"
+                        f"{source} agentName has unsupported type {bound_kind}; expected str"
                     )
             if schema_version == SIDECAR_SCHEMA_VERSION:
                 agent_name = raw.get("agentName")
@@ -344,6 +349,7 @@ class BotServiceConfig:
             if not isinstance(channels, list) or any(
                 not isinstance(channel, str) or not channel.strip() for channel in channels
             ):
+                channels = None
                 raise BotServiceError(
                     f"{source} channelsEnabled must be a list of non-empty strings"
                 )
@@ -353,6 +359,8 @@ class BotServiceConfig:
             raw = None
             bound = None
             agent_name = None
+            schema_version = None
+            channels = None
 
     def to_json(self) -> str:
         return json.dumps(self.__dict__, indent=2, sort_keys=True) + "\n"
@@ -736,7 +744,7 @@ def _read_sidecar_bytes(path: Path) -> tuple[bytes, tuple[int, int, int, str]]:
 
 def _sidecar_json_error_message(source: str, exc: Exception) -> str:
     if isinstance(exc, json.JSONDecodeError):
-        return f"{source} is not valid JSON ({exc.msg} at line {exc.lineno} column {exc.colno})"
+        return f"{source} is not valid JSON ({exc})"
     return f"{source} is not valid JSON ({exc})"
 
 
@@ -1499,18 +1507,23 @@ def _apply_create_plan_locked(
         sidecar_payload, create_sidecar_binding = _existing_sidecar_payload_for_create(
             inputs.sidecar_path
         )
+        schema_error: str | None = None
         try:
             validate_bot_service_sidecar_schema(sidecar_payload, source=str(inputs.sidecar_path))
         except SidecarSchemaError as exc:
+            schema_error = str(exc)
             sidecar_payload.clear()
-            raise BotServiceError(str(exc)) from exc
+        if schema_error is not None:
+            raise BotServiceError(schema_error)
         if "agentName" in sidecar_payload:
             bound = sidecar_payload.get("agentName")
             if bound is not None and not isinstance(bound, str):
+                bound_kind = type(bound).__name__
+                bound = None
                 sidecar_payload.clear()
                 raise BotServiceError(
                     f"{inputs.sidecar_path} agentName has unsupported type "
-                    f"{type(bound).__name__}; expected str"
+                    f"{bound_kind}; expected str"
                 )
         sidecar_payload.clear()
         raise BotServiceError(

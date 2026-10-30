@@ -427,9 +427,76 @@ class TestPr274FixRound:
         json.loads(path.read_text())
 
     def test_from_json_text_invalid_json_reports_line_column(self) -> None:
-        with pytest.raises(BotServiceError, match=r"line 1 column") as excinfo:
-            BotServiceConfig.from_json_text("{", source="cfg")
+        broken = '{"x": "unclosed'
+        with pytest.raises(BotServiceError) as excinfo:
+            BotServiceConfig.from_json_text(broken, source="cfg")
+        assert str(excinfo.value) == (
+            "cfg is not valid JSON (Unterminated string starting at: line 1 column 7 (char 6))"
+        )
+        assert "at at line" not in str(excinfo.value)
         assert excinfo.value.__context__ is None
+
+    def test_from_json_text_schema_version_sentinel_scrubs_locals(self) -> None:
+        marker = "SENTINEL-274-R4-SCHEMA-VERSION"
+        payload = json.loads(_sidecar_v1_bytes().decode())
+        payload["schemaVersion"] = marker
+        with pytest.raises(BotServiceError) as excinfo:
+            BotServiceConfig.from_json_text(json.dumps(payload), source="cfg")
+        _assert_failure_artifacts_clean(excinfo.value, marker)
+        assert marker not in str(excinfo.value)
+
+    def test_from_json_text_channels_sentinel_scrubs_locals(self) -> None:
+        marker = "SENTINEL-274-R4-CHANNELS"
+        payload = json.loads(_sidecar_v1_bytes().decode())
+        payload["channelsEnabled"] = marker
+        with pytest.raises(BotServiceError) as excinfo:
+            BotServiceConfig.from_json_text(json.dumps(payload), source="cfg")
+        _assert_failure_artifacts_clean(excinfo.value, marker)
+        assert marker not in str(excinfo.value)
+
+    def test_create_schema_validation_sentinel_without_cause_chain(self, tmp_path: Path) -> None:
+        marker = "SENTINEL-274-R4-CREATE-SCHEMA"
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        payload = json.loads(_sidecar_v1_bytes().decode())
+        payload["schemaVersion"] = marker
+        sidecar.write_bytes(json.dumps(payload).encode())
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+            app_id="00000000-0000-0000-0000-000000000001",
+        )
+        env = {"A365_BF_APP_ID": "00000000-0000-0000-0000-000000000001"}
+        plan = build_create_plan(inputs, operator_env=env)
+        runner = FakeRunner(group_exists=False)
+        with pytest.raises(BotServiceError) as excinfo:
+            apply_create_plan(plan, runner=runner, operator_env=env)
+        _assert_failure_artifacts_clean(excinfo.value, marker)
+        assert excinfo.value.__cause__ is None
+        assert runner.calls == []
+
+    def test_create_agent_name_sentinel_scrubs_bound_local(self, tmp_path: Path) -> None:
+        marker = "SENTINEL-274-R4-CREATE-BOUND"
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        payload = json.loads(_sidecar_v2_bytes("agent").decode())
+        payload["agentName"] = {marker: 1}
+        sidecar.write_bytes(json.dumps(payload).encode())
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+            app_id="00000000-0000-0000-0000-000000000001",
+        )
+        env = {"A365_BF_APP_ID": "00000000-0000-0000-0000-000000000001"}
+        plan = build_create_plan(inputs, operator_env=env)
+        runner = FakeRunner(group_exists=False)
+        with pytest.raises(BotServiceError) as excinfo:
+            apply_create_plan(plan, runner=runner, operator_env=env)
+        _assert_failure_artifacts_clean(excinfo.value, marker)
+        assert marker not in str(excinfo.value)
+        assert runner.calls == []
 
     def test_create_refuses_dangling_symlink_before_azure(self, tmp_path: Path) -> None:
         sidecar = tmp_path / "a365.bot-service.config.json"
@@ -462,7 +529,7 @@ class TestPr274FixRound:
             return real_is_dir(self)
 
         monkeypatch.setattr(Path, "is_dir", guarded_is_dir)
-        with pytest.raises(SidecarBackupError, match="prepare|directory|backup"):
+        with pytest.raises(SidecarBackupError, match=r"prepare|directory|backup"):
             write_owner_only_bytes_exclusive(target, b"payload\n")
         assert not target.exists()
 
