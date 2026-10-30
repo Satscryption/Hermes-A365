@@ -11176,6 +11176,28 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         return time.time() - float(pending.get("created_at") or 0.0) <= _PENDING_UPLOAD_TTL_SEC
 
+    def _file_consent_pending_live_context_mismatch(
+        self, activity: dict[str, Any], pending: dict[str, Any]
+    ) -> bool:
+        """True when the pending entry is live but the invoke names another user/chat."""
+        pending_chat_id = str(pending.get("conversation_id") or "")
+        if (
+            self._disconnecting
+            or pending.get("lifecycle_generation") != self._lifecycle_generation
+            or pending.get("chat_generation") != self._chat_generation(pending_chat_id)
+        ):
+            return False
+        if time.time() - float(pending.get("created_at") or 0.0) > _PENDING_UPLOAD_TTL_SEC:
+            return False
+        act_conv = str((activity.get("conversation") or {}).get("id") or "")
+        act_user = str((activity.get("from") or {}).get("id") or "")
+        act_surl = str(activity.get("serviceUrl") or "")
+        return (
+            act_conv != pending.get("conversation_id")
+            or act_user != pending.get("user_id")
+            or act_surl != pending.get("service_url")
+        )
+
     async def _handle_file_consent(
         self, activity: dict[str, Any], *, validated_path: str | None
     ) -> invoke.InvokeResponse:
@@ -11206,25 +11228,30 @@ class Agent365Adapter(BasePlatformAdapter):
         if action != "accept":
             logger.info("agent365 fileConsent action=%s consent=%s", action, consent_id[:8])
             if action == "decline":
-                if pending is None or not self._file_consent_pending_matches_activity(
-                    activity, pending
-                ):
+                if pending is None:
+                    _schedule_remove_consent_card(label="unknown_consent")
                     return invoke.empty_invoke_ack()
-                send_decline_notice = (
-                    consent_id and consent_id not in self._file_consent_decline_notified
-                )
-                if send_decline_notice:
-                    self._file_consent_decline_notified.add(consent_id)
-
-                async def _decline_followup() -> None:
-                    await _remove_consent_card()
+                if self._file_consent_pending_matches_activity(activity, pending):
+                    send_decline_notice = (
+                        consent_id and consent_id not in self._file_consent_decline_notified
+                    )
                     if send_decline_notice:
-                        await self._send_file_consent_decline_notice(
-                            activity, validated_path=validated_path
-                        )
+                        self._file_consent_decline_notified.add(consent_id)
 
-                self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
-                self._pending_file_uploads.pop(consent_id, None)
+                    async def _decline_followup() -> None:
+                        await _remove_consent_card()
+                        if send_decline_notice:
+                            await self._send_file_consent_decline_notice(
+                                activity, validated_path=validated_path
+                            )
+
+                    self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
+                    self._pending_file_uploads.pop(consent_id, None)
+                    return invoke.empty_invoke_ack()
+                if self._file_consent_pending_live_context_mismatch(activity, pending):
+                    return invoke.empty_invoke_ack()
+                _schedule_remove_consent_card(label="expired_lifecycle")
+                return invoke.empty_invoke_ack()
             return invoke.empty_invoke_ack()
         if pending is None:
             # Consent we don't know about — restart dropped the in-memory map, a
@@ -12057,12 +12084,15 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         if token_tenant != invoke_tenant or token_tenant != adapter_tenant:
             return False
-        if invoke_user and token_user != invoke_user:
-            return False
         sender = ctx.activity.get("from")
         sender = sender if isinstance(sender, dict) else {}
         activity_user = _normalized_token(sender.get("aadObjectId"))
-        if activity_user and activity_user != token_user:
+        if invoke_user:
+            if token_user != invoke_user:
+                return False
+        elif not activity_user or activity_user != token_user:
+            return False
+        if invoke_user and activity_user and activity_user != token_user:
             return False
         activity_tenant = _normalized_token(ctx.conv.get("tenantId"))
         return not activity_tenant or activity_tenant == token_tenant

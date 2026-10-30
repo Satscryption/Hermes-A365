@@ -28,6 +28,7 @@ from test_agent365_plugin import (
     _FakeOriginDb,
     _handoff_ctx,
     _make_adapter,
+    _make_inbound,
     _seed_copilot_origin,
     _StubPlatformConfig,
 )
@@ -314,53 +315,183 @@ class TestJwtRequiresExpAndNbf:
                     cache=_JwksCache(),
                 )
 
-    def test_serve_accepts_complete_token(self, rsa_keypair: tuple[Any, dict[str, Any]]) -> None:
+    def _serve_cfg(self) -> Any:
         cfg = _cfg()
         cfg.tenant_id = TEST_TENANT_ID
-        token, jwk = self._complete_token(rsa_keypair, aud="bot-app-id")
+        return cfg
+
+    def _serve_activity(self) -> dict[str, Any]:
+        activity = _inbound_message_activity()
+        activity["conversation"]["tenantId"] = TEST_TENANT_ID
+        activity["recipient"]["tenantId"] = TEST_TENANT_ID
+        return activity
+
+    def test_serve_accepts_complete_token(self, rsa_keypair: tuple[Any, dict[str, Any]]) -> None:
+        cfg = self._serve_cfg()
+        token, jwk = self._complete_token(rsa_keypair, aud=cfg.blueprint_client_id)
         cfg.skip_jwt_validation = False
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         with _client_for(cfg, capture=capture, jwk=jwk) as client:
-            activity = _inbound_message_activity()
             r = client.post(
                 "/api/messages",
-                json=activity,
+                json=self._serve_activity(),
                 headers={"Authorization": f"Bearer {token}"},
             )
         assert r.status_code == 200
         assert capture["webhook"]
 
     def test_serve_rejects_token_without_exp(self, rsa_keypair: tuple[Any, dict[str, Any]]) -> None:
-        cfg = _cfg()
-        cfg.tenant_id = TEST_TENANT_ID
-        token, jwk = self._token_missing_claim(rsa_keypair, aud="bot-app-id", drop="exp")
+        cfg = self._serve_cfg()
+        token, jwk = self._token_missing_claim(rsa_keypair, aud=cfg.blueprint_client_id, drop="exp")
         cfg.skip_jwt_validation = False
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         with _client_for(cfg, capture=capture, jwk=jwk) as client:
-            activity = _inbound_message_activity()
             r = client.post(
                 "/api/messages",
-                json=activity,
+                json=self._serve_activity(),
                 headers={"Authorization": f"Bearer {token}"},
             )
         assert r.status_code == 403
         assert capture["webhook"] == []
 
     def test_serve_rejects_token_without_nbf(self, rsa_keypair: tuple[Any, dict[str, Any]]) -> None:
-        cfg = _cfg()
-        cfg.tenant_id = TEST_TENANT_ID
-        token, jwk = self._token_missing_claim(rsa_keypair, aud="bot-app-id", drop="nbf")
+        cfg = self._serve_cfg()
+        token, jwk = self._token_missing_claim(rsa_keypair, aud=cfg.blueprint_client_id, drop="nbf")
         cfg.skip_jwt_validation = False
         capture: dict[str, Any] = {"webhook": [], "reply": [], "token": []}
         with _client_for(cfg, capture=capture, jwk=jwk) as client:
-            activity = _inbound_message_activity()
             r = client.post(
                 "/api/messages",
-                json=activity,
+                json=self._serve_activity(),
                 headers={"Authorization": f"Bearer {token}"},
             )
         assert r.status_code == 403
         assert capture["webhook"] == []
+
+
+class TestHandoffIdentityThroughHandler:
+    def _plant_token(self, adapter: Any, *, user_aad: str = _HANDOFF_USER) -> str:
+        token = "handoff-tok-test"
+        adapter._handoff_tokens[token] = {
+            "conversation_id": "conv-cc",
+            "chat_type": "groupChat",
+            "tenant_id": _HANDOFF_TENANT,
+            "user_aad": user_aad,
+            "hermes_session_id": "sess-cc",
+            "reason": "test",
+            "minted_at": time.time(),
+        }
+        return token
+
+    def _ready(self, monkeypatch: pytest.MonkeyPatch) -> Any:
+        adapter = _make_adapter(monkeypatch)
+        _seed_copilot_origin(adapter)
+        _bind_origin_db(
+            adapter,
+            _FakeOriginDb(
+                {
+                    "sess-cc": {
+                        "id": "sess-cc",
+                        "source": "agent365",
+                        "chat_id": "conv-cc",
+                        "user_id": _HANDOFF_USER,
+                        "session_key": f"agent:main:agent365:group:conv-cc:{_HANDOFF_USER}",
+                        "ended_at": None,
+                        "end_reason": None,
+                    }
+                }
+            ),
+        )
+        return adapter
+
+    @pytest.mark.asyncio
+    async def test_matching_token_oid_pins_and_consumes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from test_agent365_plugin import _settle_handoff
+
+        adapter = self._ready(monkeypatch)
+        token = self._plant_token(adapter)
+        response = await adapter._handle_handoff_action(_handoff_ctx(token))
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert len(adapter._handled_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_mismatched_token_oid_keeps_continuation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from test_agent365_plugin import _settle_handoff
+
+        adapter = self._ready(monkeypatch)
+        token = self._plant_token(adapter)
+        response = await adapter._handle_handoff_action(
+            _handoff_ctx(token, claims_user=_HANDOFF_OTHER_USER)
+        )
+        assert response.status == 200
+        assert token in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
+
+    @pytest.mark.asyncio
+    async def test_absent_oid_with_matching_body_pins(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from test_agent365_plugin import _settle_handoff
+
+        adapter = self._ready(monkeypatch)
+        token = self._plant_token(adapter)
+        ctx = invoke_mod.build_invoke_context(
+            {
+                "type": "invoke",
+                "name": "handoff/action",
+                "id": "inv-1",
+                "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
+                "value": {"continuation": token},
+                "conversation": {
+                    "id": "conv-teams",
+                    "conversationType": "personal",
+                    "tenantId": _HANDOFF_TENANT,
+                },
+                "from": {
+                    "id": "29:user",
+                    "aadObjectId": _HANDOFF_USER,
+                },
+            },
+            claims={"tid": _HANDOFF_TENANT},
+            path_tag="B",
+        )
+        response = await adapter._handle_handoff_action(ctx)
+        assert response.status == 200
+        assert token not in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert len(adapter._handled_events) == 1
+
+    @pytest.mark.asyncio
+    async def test_empty_oid_and_empty_body_keeps_continuation(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from test_agent365_plugin import _settle_handoff
+
+        adapter = self._ready(monkeypatch)
+        token = self._plant_token(adapter)
+        ctx = invoke_mod.build_invoke_context(
+            {
+                "type": "invoke",
+                "name": "handoff/action",
+                "value": {"continuation": token},
+                "conversation": {"id": "conv-teams", "tenantId": _HANDOFF_TENANT},
+                "from": {"id": "29:user"},
+            },
+            claims={"tid": _HANDOFF_TENANT},
+            path_tag="B",
+        )
+        response = await adapter._handle_handoff_action(ctx)
+        assert response.status == 200
+        assert token in adapter._handoff_tokens
+        await _settle_handoff(adapter)
+        assert adapter._handled_events == []
 
 
 class TestHandoffTokenUserOid:
@@ -392,6 +523,12 @@ class TestHandoffTokenUserOid:
         record = {"tenant_id": "tid", "user_aad": "record-user"}
         ctx = self._ctx(claims={"tid": "tid"}, body_user="record-user")
         assert adapter._handoff_identity_matches(record, ctx) is True
+
+    def test_empty_body_with_absent_oid_refused(self) -> None:
+        adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
+        record = {"tenant_id": "tid", "user_aad": "record-user"}
+        ctx = self._ctx(claims={"tid": "tid"}, body_user="")
+        assert adapter._handoff_identity_matches(record, ctx) is False
 
     def test_empty_oid_claim_does_not_match(self) -> None:
         adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
@@ -506,7 +643,56 @@ class TestHandoffActionContinuation:
 
 class TestFileConsentDeclineChecks:
     @pytest.mark.asyncio
-    async def test_decline_mismatch_keeps_pending(self) -> None:
+    async def test_decline_missing_pending_dismisses_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
+        remove = AsyncMock()
+        notice = AsyncMock()
+        monkeypatch.setattr(adapter, "_remove_file_consent_card", remove)
+        monkeypatch.setattr(adapter, "_send_file_consent_decline_notice", notice)
+        activity = {
+            "conversation": {"id": "conv-a"},
+            "from": {"id": "user-a"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "value": {"action": "decline", "context": {"consentId": "missing"}},
+        }
+        await adapter._handle_file_consent(activity, validated_path="A")
+        await adapter._drain_file_consent_upload_tasks()
+        remove.assert_awaited()
+        notice.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_decline_expired_pending_dismisses_card(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
+        remove = AsyncMock()
+        notice = AsyncMock()
+        monkeypatch.setattr(adapter, "_remove_file_consent_card", remove)
+        monkeypatch.setattr(adapter, "_send_file_consent_decline_notice", notice)
+        adapter._pending_file_uploads["cid"] = {
+            "conversation_id": "conv-a",
+            "user_id": "user-a",
+            "service_url": "https://smba.trafficmanager.net/teams/",
+            "lifecycle_generation": adapter._lifecycle_generation,
+            "chat_generation": adapter._chat_generation("conv-a"),
+            "created_at": time.time() - adapter_mod._PENDING_UPLOAD_TTL_SEC - 1.0,
+        }
+        activity = {
+            "conversation": {"id": "conv-a"},
+            "from": {"id": "user-a"},
+            "serviceUrl": "https://smba.trafficmanager.net/teams/",
+            "value": {"action": "decline", "context": {"consentId": "cid"}},
+        }
+        await adapter._handle_file_consent(activity, validated_path="A")
+        await adapter._drain_file_consent_upload_tasks()
+        assert "cid" in adapter._pending_file_uploads
+        remove.assert_awaited()
+        notice.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_decline_live_mismatch_keeps_pending(self) -> None:
         adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
         adapter._pending_file_uploads["cid"] = {
             "conversation_id": "conv-a",
@@ -518,26 +704,6 @@ class TestFileConsentDeclineChecks:
         }
         activity = {
             "conversation": {"id": "conv-b"},
-            "from": {"id": "user-a"},
-            "serviceUrl": "https://smba.trafficmanager.net/teams/",
-            "value": {"action": "decline", "context": {"consentId": "cid"}},
-        }
-        await adapter._handle_file_consent(activity, validated_path="A")
-        assert "cid" in adapter._pending_file_uploads
-
-    @pytest.mark.asyncio
-    async def test_decline_expired_keeps_pending(self) -> None:
-        adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
-        adapter._pending_file_uploads["cid"] = {
-            "conversation_id": "conv-a",
-            "user_id": "user-a",
-            "service_url": "https://smba.trafficmanager.net/teams/",
-            "lifecycle_generation": adapter._lifecycle_generation,
-            "chat_generation": adapter._chat_generation("conv-a"),
-            "created_at": time.time() - adapter_mod._PENDING_UPLOAD_TTL_SEC - 1.0,
-        }
-        activity = {
-            "conversation": {"id": "conv-a"},
             "from": {"id": "user-a"},
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
             "value": {"action": "decline", "context": {"consentId": "cid"}},
@@ -610,3 +776,20 @@ class TestFileConsentDeclineChecks:
         assert "cid" in adapter._file_consent_decline_notified
         remove.assert_awaited()
         notice.assert_awaited()
+
+
+class TestMintHandoffGuard:
+    def test_mint_returns_none_without_aad_object_id(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cc")
+        adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        assert adapter._mint_handoff_link("conv-cc", reason="test") is None
+
+    def test_mint_returns_none_without_tenant(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        adapter = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-cc")
+        inbound["from"]["aadObjectId"] = _HANDOFF_USER
+        inbound["conversation"].pop("tenantId", None)
+        inbound["recipient"].pop("tenantId", None)
+        adapter._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        assert adapter._mint_handoff_link("conv-cc", reason="test") is None
