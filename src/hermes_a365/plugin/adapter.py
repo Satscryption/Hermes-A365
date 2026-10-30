@@ -11179,9 +11179,7 @@ class Agent365Adapter(BasePlatformAdapter):
             or act_surl != pending.get("service_url")
         ):
             return False
-        return (
-            time.time() - float(pending.get("created_at") or 0.0) <= _PENDING_UPLOAD_TTL_SEC
-        )
+        return time.time() - float(pending.get("created_at") or 0.0) <= _PENDING_UPLOAD_TTL_SEC
 
     async def _handle_file_consent(
         self, activity: dict[str, Any], *, validated_path: str | None
