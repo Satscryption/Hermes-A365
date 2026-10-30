@@ -30,16 +30,20 @@ exit when one is found.
 
 from __future__ import annotations
 
+import asyncio
+import codecs
+import contextlib
 import json
 import os
 import queue
 import re
+import select
 import shutil
 import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 # Verified in references/a365-cli-reference.md; only .NET ships.
@@ -184,43 +188,57 @@ class A365CliMutator:
     ) -> RunResult:
         if not self.available:
             raise CliInvocationError(argv, -1, f"{A365_CLI_BINARY} not on PATH")
-        timed_out = False
+        action: str | None = None
+        exit_code: int | None = None
+        returncode = 0
         combined = ""
-        if sensitive:
-            try:
+        try:
+            if sensitive:
                 returncode, combined = _run_sensitive_streaming(
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
-            except subprocess.TimeoutExpired:
-                timed_out = True
-        else:
-            try:
+            else:
                 returncode, combined = _run_streaming(
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
-            except subprocess.TimeoutExpired:
-                timed_out = True
-        if timed_out:
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+        except BaseException as exc:
+            _release(exc)
+            action, exit_code = _classify(exc)
+        stdin_input = None
+        if action is not None:
+            combined = ""
+            _raise_clean(action, argv, timeout, exit_code, sensitive=sensitive)
         if returncode != 0:
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
             detail = _sensitive_failure_detail(stripped) if sensitive else stripped
             graph_error = _extract_sensitive_graph_error(stripped) if sensitive else None
+            rc = returncode
             if match:
                 code = match.group(0)
                 match = None
                 stripped = ""
                 combined = ""
-                raise AADSTSError(code, detail)
+                _raise_clean(
+                    "aadsts",
+                    argv,
+                    timeout,
+                    None,
+                    sensitive=sensitive,
+                    detail=detail,
+                    aadsts_code=code,
+                )
             match = None
             stripped = ""
             combined = ""
-            raise CliInvocationError(
+            _raise_clean(
+                "cli_invocation",
                 argv,
-                returncode,
-                detail,
+                timeout,
+                None,
                 sensitive=sensitive,
+                returncode=rc,
+                detail=detail,
                 graph_error=graph_error,
             )
         return RunResult(
@@ -238,6 +256,127 @@ class A365CliMutator:
 _SENSITIVE_OUTPUT_SUPPRESSED = "<output suppressed: sensitive command may emit credential material>"
 
 _READ_CHUNK_BYTES = 4096
+_MAX_LINE_PENDING_CHARS = 256 * 1024
+_MAX_TOTAL_CAPTURE_BYTES = 4 * 1024 * 1024
+_QUEUE_MAXSIZE = 32
+_REAP_TERMINATE_GRACE_SECONDS = 0.2
+
+
+class _CaptureLimit(BaseException):
+    """Internal signal: capture size limit exceeded after buffers were cleared."""
+
+
+class _Deadline(BaseException):
+    """Internal signal: wall-clock deadline hit; child will be reaped."""
+
+
+class _StreamFailure(BaseException):
+    """Internal signal: a reader thread exited before signalling EOF."""
+
+
+def _release(exc: BaseException) -> None:
+    """Drop traceback links and clear frames on an exception chain."""
+    seen: set[int] = set()
+    pending: list[BaseException] = [exc]
+    while pending:
+        current = pending.pop()
+        oid = id(current)
+        if oid in seen:
+            continue
+        seen.add(oid)
+        ctx = current.__context__
+        cause = current.__cause__
+        if ctx is not None and id(ctx) not in seen:
+            pending.append(ctx)
+        if cause is not None and id(cause) not in seen:
+            pending.append(cause)
+        tb = current.__traceback__
+        while tb is not None:
+            with contextlib.suppress(RuntimeError):
+                tb.tb_frame.clear()
+            tb = tb.tb_next
+        current.__traceback__ = None
+        current.__context__ = None
+        current.__cause__ = None
+        with contextlib.suppress(Exception):
+            current.__suppress_context__ = True
+
+
+def _classify(exc: BaseException) -> tuple[str, int | None]:
+    if isinstance(exc, (_Deadline, subprocess.TimeoutExpired)):
+        return ("timeout", None)
+    if isinstance(exc, _CaptureLimit):
+        return ("capture_overflow", None)
+    if isinstance(exc, _StreamFailure):
+        return ("stream_failure", None)
+    if isinstance(exc, KeyboardInterrupt):
+        return ("keyboard_interrupt", None)
+    if isinstance(exc, asyncio.CancelledError):
+        return ("cancelled", None)
+    if isinstance(exc, SystemExit):
+        code = exc.code
+        if isinstance(code, int):
+            return ("system_exit", code)
+        if code is None:
+            return ("system_exit", 0)
+        return ("system_exit", 1)
+    if isinstance(exc, Exception):
+        return ("unexpected", None)
+    return ("unexpected", None)
+
+
+def _raise_clean(
+    action: str,
+    argv: list[str],
+    timeout: float,
+    exit_code: int | None,
+    *,
+    sensitive: bool = False,
+    returncode: int | None = None,
+    detail: str | None = None,
+    graph_error: tuple[str, str] | None = None,
+    aadsts_code: str | None = None,
+) -> None:
+    if action == "timeout":
+        raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout)
+    if action == "keyboard_interrupt":
+        raise KeyboardInterrupt()
+    if action == "cancelled":
+        raise asyncio.CancelledError()
+    if action == "system_exit":
+        if exit_code is None:
+            raise SystemExit()
+        raise SystemExit(exit_code)
+    if action == "capture_overflow":
+        if sensitive:
+            raise CliInvocationError(argv, -1, _sensitive_failure_detail(""), sensitive=True)
+        raise CliInvocationError(
+            argv,
+            -1,
+            "subprocess output exceeded the capture size limit",
+        )
+    if action == "stream_failure":
+        if sensitive:
+            raise CliInvocationError(argv, -1, _sensitive_failure_detail(""), sensitive=True)
+        raise OSError("subprocess output reader failed")
+    if action == "unexpected":
+        if sensitive:
+            raise CliInvocationError(argv, -1, _sensitive_failure_detail(""), sensitive=True)
+        raise CliInvocationError(argv, -1, "unexpected error while reading subprocess output")
+    if action == "aadsts":
+        assert aadsts_code is not None
+        raise AADSTSError(aadsts_code, detail or _SENSITIVE_OUTPUT_SUPPRESSED)
+    if action == "cli_invocation":
+        assert returncode is not None and detail is not None
+        raise CliInvocationError(
+            argv,
+            returncode,
+            detail,
+            sensitive=sensitive,
+            graph_error=graph_error,
+        )
+    raise RuntimeError(f"unknown clean-raise action: {action!r}")
+
 
 _ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?0-9;]*[ -/]*[@-~]")
 
@@ -346,7 +485,7 @@ def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
         return None
     try:
         data, _end = json.JSONDecoder().raw_decode(text[start:])
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -370,9 +509,16 @@ def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
 @dataclass
 class _LineBuffer:
     pending: str = ""
+    _decoder: codecs.IncrementalDecoder = field(
+        default_factory=lambda: codecs.getincrementaldecoder("utf-8")(errors="replace")
+    )
+
+    def clear(self) -> None:
+        self.pending = ""
+        self._decoder.reset()
 
     def feed(self, chunk: bytes) -> list[str]:
-        self.pending += chunk.decode("utf-8", errors="replace")
+        self.pending += self._decoder.decode(chunk)
         lines: list[str] = []
         while True:
             split_at = -1
@@ -383,54 +529,178 @@ class _LineBuffer:
                     split_at = idx
                     split_len = len(sep)
             if split_at < 0:
+                if len(self.pending) > _MAX_LINE_PENDING_CHARS:
+                    self.clear()
+                    raise _CaptureLimit()
                 break
             lines.append(self.pending[: split_at + split_len])
             self.pending = self.pending[split_at + split_len :]
         return lines
 
+    def flush_eof(self) -> str:
+        tail = self._decoder.decode(b"", final=True)
+        combined = self.pending + tail
+        self.pending = ""
+        return combined
 
-def _pump_stream(fd: int, name: str, out_q: queue.Queue[tuple[str, bytes | None]]) -> None:
+
+def _capture_byte_size(captured: list[str], buffers: dict[str, _LineBuffer]) -> int:
+    total = sum(len(part.encode("utf-8", errors="replace")) for part in captured)
+    for buffer in buffers.values():
+        total += len(buffer.pending.encode("utf-8", errors="replace"))
+    return total
+
+
+def _clear_capture_buffers(captured: list[str], buffers: dict[str, _LineBuffer]) -> None:
+    captured.clear()
+    for buffer in buffers.values():
+        buffer.clear()
+
+
+def _queue_put(
+    out_q: queue.Queue[tuple[str, bytes | None]],
+    item: tuple[str, bytes | None],
+    stop: threading.Event,
+) -> None:
+    while True:
+        try:
+            out_q.put(item, timeout=0.05)
+            return
+        except queue.Full:
+            if stop.is_set():
+                return
+
+
+def _pump_stream(
+    fd: int,
+    name: str,
+    out_q: queue.Queue[tuple[str, bytes | None]],
+    stop: threading.Event,
+) -> None:
     try:
-        while True:
+        if os.name == "posix":
+            poll = select.poll()
+            poll.register(fd, select.POLLIN)
             try:
-                chunk = os.read(fd, _READ_CHUNK_BYTES)
-            except OSError:
-                break
-            if not chunk:
-                break
-            out_q.put((name, chunk))
+                while not stop.is_set():
+                    if not poll.poll(50):
+                        continue
+                    try:
+                        chunk = os.read(fd, _READ_CHUNK_BYTES)
+                    except OSError:
+                        break
+                    if not chunk:
+                        break
+                    _queue_put(out_q, (name, chunk), stop)
+            finally:
+                with contextlib.suppress(OSError, ValueError):
+                    poll.unregister(fd)
+        else:
+            while not stop.is_set():
+                try:
+                    chunk = os.read(fd, _READ_CHUNK_BYTES)
+                except OSError:
+                    break
+                if not chunk:
+                    break
+                _queue_put(out_q, (name, chunk), stop)
     finally:
-        out_q.put((name, None))
+        _queue_put(out_q, (name, None), stop)
 
 
-def _run_pumped_output(
-    proc: subprocess.Popen[bytes],
-    *,
-    argv: list[str],
-    timeout: float,
-    streams: tuple[str, ...],
-    echo: Literal["all", "device_login"],
-) -> tuple[int, str]:
+@dataclass
+class _Pump:
+    proc: subprocess.Popen[bytes]
+    argv: list[str]
+    timeout: float
+    streams: tuple[str, ...]
+    echo: Literal["all", "device_login"]
+    sensitive: bool
+    stop: threading.Event
+    out_q: queue.Queue[tuple[str, bytes | None]]
+    threads: list[threading.Thread]
+    buffers: dict[str, _LineBuffer]
+    eof_seen: dict[str, bool]
+    emitted_logins: set[tuple[str, str]]
+    captured: list[str]
+    deadline: float
+    thread_streams: list[tuple[threading.Thread, str]] = field(default_factory=list)
+    reaped: bool = False
+
+
+def _reap(pump: _Pump) -> None:
+    if pump.reaped:
+        return
+    pump.reaped = True
+    pump.stop.set()
+    proc = pump.proc
+    if proc.stdin is not None:
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.terminate()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(_REAP_TERMINATE_GRACE_SECONDS)
+    if proc.poll() is None:
+        with contextlib.suppress(OSError):
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(5)
+        if proc.poll() is None:
+            with contextlib.suppress(OSError):
+                proc.kill()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(5)
+    while True:
+        try:
+            pump.out_q.get_nowait()
+        except queue.Empty:
+            break
+    stdout = proc.stdout
+    stderr = proc.stderr
+    if os.name == "posix":
+        for thread in pump.threads:
+            thread.join(timeout=1.0)
+        if stdout is not None:
+            with contextlib.suppress(OSError):
+                stdout.close()
+        if stderr is not None:
+            with contextlib.suppress(OSError):
+                stderr.close()
+    else:
+        if stdout is not None:
+            with contextlib.suppress(OSError):
+                stdout.close()
+        if stderr is not None:
+            with contextlib.suppress(OSError):
+                stderr.close()
+        for thread in pump.threads:
+            thread.join(timeout=1.0)
+    _clear_capture_buffers(pump.captured, pump.buffers)
+    pump.emitted_logins.clear()
+    active = sys.exception()
+    if active is not None:
+        _release(active)
+
+
+def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
+    proc = pump.proc
     assert proc.stdout is not None
-    out_q: queue.Queue[tuple[str, bytes | None]] = queue.Queue()
-    fds: list[tuple[int, str]] = [(proc.stdout.fileno(), "stdout")]
-    if proc.stderr is not None:
-        fds.append((proc.stderr.fileno(), "stderr"))
-    threads = [
-        threading.Thread(target=_pump_stream, args=(fd, name, out_q), daemon=True)
-        for fd, name in fds
-    ]
-    for thread in threads:
-        thread.start()
-
-    buffers = {name: _LineBuffer() for name in streams}
-    eof_seen = {name: False for name in streams}
-    emitted_logins: set[tuple[str, str]] = set()
-    captured: list[str] = []
-    deadline = time.monotonic() + timeout
+    streams = pump.streams
+    buffers = pump.buffers
+    captured = pump.captured
+    echo = pump.echo
+    out_q = pump.out_q
+    eof_seen = pump.eof_seen
+    emitted_logins = pump.emitted_logins
+    deadline = pump.deadline
 
     def _handle_complete_line(line: str) -> None:
         captured.append(line)
+        if _capture_byte_size(captured, buffers) > _MAX_TOTAL_CAPTURE_BYTES:
+            _clear_capture_buffers(captured, buffers)
+            raise _CaptureLimit()
         if echo == "all":
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -439,11 +709,13 @@ def _run_pumped_output(
 
     def _flush_eof_tail(name: str) -> None:
         buffer = buffers[name]
-        if not buffer.pending:
+        tail = buffer.flush_eof()
+        if not tail:
             return
-        tail = buffer.pending
-        buffer.pending = ""
         captured.append(tail)
+        if _capture_byte_size(captured, buffers) > _MAX_TOTAL_CAPTURE_BYTES:
+            _clear_capture_buffers(captured, buffers)
+            raise _CaptureLimit()
         if echo == "all":
             sys.stdout.write(tail)
             sys.stdout.flush()
@@ -461,19 +733,18 @@ def _run_pumped_output(
             return
         _drain_chunk(name, payload)
 
+    hit_deadline = False
     while True:
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            proc.kill()
-            proc.wait(timeout=5)
-            captured.clear()
-            for buffer in buffers.values():
-                buffer.pending = ""
-            payload = None
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+            hit_deadline = True
+            break
         try:
             name, payload = out_q.get(timeout=min(0.05, max(remaining, 0.0)))
         except queue.Empty:
+            for thread, stream_name in pump.thread_streams:
+                if not thread.is_alive() and not eof_seen[stream_name]:
+                    raise _StreamFailure() from None
             if proc.poll() is not None and all(eof_seen[s] for s in streams):
                 while True:
                     try:
@@ -487,12 +758,11 @@ def _run_pumped_output(
         if all(eof_seen[s] for s in streams) and out_q.empty() and proc.poll() is not None:
             break
 
-    proc.wait(timeout=5)
-    proc.stdout.close()
-    if proc.stderr is not None:
-        proc.stderr.close()
-    for thread in threads:
-        thread.join(timeout=1.0)
+    if hit_deadline:
+        raise _Deadline()
+
+    with contextlib.suppress(subprocess.TimeoutExpired):
+        proc.wait(timeout=5)
     return proc.returncode or 0, "".join(captured)
 
 
@@ -503,22 +773,59 @@ def _run_child_output(
     stdin_input: str | None,
     echo: Literal["all", "device_login"],
     merge_stderr: bool,
+    sensitive: bool,
 ) -> tuple[int, str]:
     proc = subprocess.Popen(
         argv,
         stdin=subprocess.PIPE if stdin_input is not None else None,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+        bufsize=0,
         preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
     )
-    if stdin_input is not None:
-        assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_input.encode("utf-8"))
-        finally:
-            proc.stdin.close()
+    assert proc.stdout is not None
     streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
-    return _run_pumped_output(proc, argv=argv, timeout=timeout, streams=streams, echo=echo)
+    stop = threading.Event()
+    out_q: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=_QUEUE_MAXSIZE)
+    fds: list[tuple[int, str]] = [(proc.stdout.fileno(), "stdout")]
+    if proc.stderr is not None:
+        fds.append((proc.stderr.fileno(), "stderr"))
+    threads = [
+        threading.Thread(target=_pump_stream, args=(fd, name, out_q, stop), daemon=True)
+        for fd, name in fds
+    ]
+    for thread in threads:
+        thread.start()
+    thread_streams = list(zip(threads, [name for _fd, name in fds], strict=True))
+    pump = _Pump(
+        proc=proc,
+        argv=argv,
+        timeout=timeout,
+        streams=streams,
+        echo=echo,
+        sensitive=sensitive,
+        stop=stop,
+        out_q=out_q,
+        threads=threads,
+        buffers={name: _LineBuffer() for name in streams},
+        eof_seen={name: False for name in streams},
+        emitted_logins=set(),
+        captured=[],
+        deadline=time.monotonic() + timeout,
+        thread_streams=thread_streams,
+    )
+    try:
+        if stdin_input is not None:
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(stdin_input.encode("utf-8"))
+            except BrokenPipeError:
+                pass
+            finally:
+                proc.stdin.close()
+        return _run_pumped_output(pump)
+    finally:
+        _reap(pump)
 
 
 def _run_sensitive_streaming(
@@ -533,6 +840,7 @@ def _run_sensitive_streaming(
         stdin_input=stdin_input,
         echo="device_login",
         merge_stderr=False,
+        sensitive=True,
     )
 
 
@@ -557,6 +865,7 @@ def _run_streaming(
         stdin_input=stdin_input,
         echo="all",
         merge_stderr=True,
+        sensitive=False,
     )
 
 
