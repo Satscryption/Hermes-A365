@@ -8,10 +8,44 @@ golden fixtures.
 
 from __future__ import annotations
 
+import contextlib
+import importlib.util
 import logging
+import sys
+from pathlib import Path
 
 import pytest
-from cryptography.hazmat.primitives.asymmetric import rsa
+
+_HERMES_BOOTSTRAP_MODULE = "hermes_a365_hermes_bootstrap"
+_bootstrap_path = Path(__file__).resolve().parent / "_hermes_bootstrap.py"
+_spec = importlib.util.spec_from_file_location(_HERMES_BOOTSTRAP_MODULE, _bootstrap_path)
+assert _spec and _spec.loader
+_hermes_bootstrap = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(_hermes_bootstrap)  # type: ignore[union-attr]
+sys.modules[_HERMES_BOOTSTRAP_MODULE] = _hermes_bootstrap
+_hermes_bootstrap.ensure_hermes_vendor()
+
+
+@pytest.fixture(autouse=True)
+def _reset_gateway_approval_queues():  # type: ignore[no-untyped-def]
+    """Clear Hermes gateway approval queue state leaked across tests."""
+
+    def _clear() -> None:
+        try:
+            from tools import approval as approval_mod
+
+            with approval_mod._lock:
+                approval_mod._gateway_queues.clear()
+        except Exception:
+            pass
+        stub = sys.modules.get("tools.approval")
+        if stub is not None and hasattr(stub, "_gateway_queues"):
+            with contextlib.suppress(Exception):
+                stub._gateway_queues.clear()
+
+    _clear()
+    yield
+    _clear()
 
 
 @pytest.fixture(autouse=True)
@@ -93,27 +127,3 @@ def _isolate_secrets_provider():  # type: ignore[no-untyped-def]
         yield original
     finally:
         set_default_provider(original)
-
-
-@pytest.fixture
-def rsa_keypair() -> tuple[rsa.RSAPrivateKey, dict]:
-    """Ephemeral RSA key + JWKS entry (shared by bridge JWT tests)."""
-    import base64
-    from typing import Any
-
-    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
-    pub_numbers = priv.public_key().public_numbers()
-
-    def _b64u(n: int) -> str:
-        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
-        return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
-
-    jwk: dict[str, Any] = {
-        "kty": "RSA",
-        "use": "sig",
-        "alg": "RS256",
-        "kid": "test-kid-1",
-        "n": _b64u(pub_numbers.n),
-        "e": _b64u(pub_numbers.e),
-    }
-    return priv, jwk
