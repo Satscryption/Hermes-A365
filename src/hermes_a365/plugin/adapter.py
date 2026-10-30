@@ -11205,27 +11205,25 @@ class Agent365Adapter(BasePlatformAdapter):
 
         if action != "accept":
             logger.info("agent365 fileConsent action=%s consent=%s", action, consent_id[:8])
-            send_decline_notice = (
-                action == "decline"
-                and consent_id
-                and consent_id not in self._file_consent_decline_notified
-            )
-            if send_decline_notice:
-                self._file_consent_decline_notified.add(consent_id)
-
-            async def _decline_followup() -> None:
-                await _remove_consent_card()
+            if action == "decline":
+                if pending is None or not self._file_consent_pending_matches_activity(
+                    activity, pending
+                ):
+                    return invoke.empty_invoke_ack()
+                send_decline_notice = (
+                    consent_id and consent_id not in self._file_consent_decline_notified
+                )
                 if send_decline_notice:
-                    await self._send_file_consent_decline_notice(
-                        activity, validated_path=validated_path
-                    )
+                    self._file_consent_decline_notified.add(consent_id)
 
-            self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
-            if (
-                action == "decline"
-                and pending is not None
-                and self._file_consent_pending_matches_activity(activity, pending)
-            ):
+                async def _decline_followup() -> None:
+                    await _remove_consent_card()
+                    if send_decline_notice:
+                        await self._send_file_consent_decline_notice(
+                            activity, validated_path=validated_path
+                        )
+
+                self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
                 self._pending_file_uploads.pop(consent_id, None)
             return invoke.empty_invoke_ack()
         if pending is None:
@@ -12055,11 +12053,11 @@ class Agent365Adapter(BasePlatformAdapter):
         adapter_tenant = _normalized_token(self.tenant_id)
         token_user = _normalized_token(record.get("user_aad"))
         invoke_user = _normalized_token(ctx.token_user_oid)
-        if not (token_tenant and invoke_tenant and adapter_tenant and token_user and invoke_user):
+        if not (token_tenant and invoke_tenant and adapter_tenant and token_user):
             return False
         if token_tenant != invoke_tenant or token_tenant != adapter_tenant:
             return False
-        if token_user != invoke_user:
+        if invoke_user and token_user != invoke_user:
             return False
         sender = ctx.activity.get("from")
         sender = sender if isinstance(sender, dict) else {}
@@ -12084,6 +12082,8 @@ class Agent365Adapter(BasePlatformAdapter):
             return None
         tenant_id = self._handoff_tenant(ref)
         user_aad = self._handoff_user_aad(ref)
+        if not tenant_id or not user_aad:
+            return None
         session_id = ""
         if tenant_id and user_aad:
             session_id = (
@@ -12293,7 +12293,9 @@ class Agent365Adapter(BasePlatformAdapter):
         failed handoff, so refusal stays on the 200 ack.
         """
         token = str(ctx.value.get("continuation") or "")
-        record = self._handoff_tokens.pop(token, None) if token else None
+        if not token:
+            return invoke.InvokeResponse(status=200, body={})
+        record = self._handoff_tokens.get(token)
         if record is None:
             logger.warning("agent365 handoff/action unknown token=%s", token[:8])
             return invoke.InvokeResponse(status=200, body={})
@@ -12322,6 +12324,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 "agent365 handoff/action source session not live token=%s",
                 token[:8],
             )
+            return invoke.InvokeResponse(status=200, body={})
+        if self._handoff_tokens.pop(token, None) is None:
             return invoke.InvokeResponse(status=200, body={})
         try:
             self._schedule_handoff_dispatch(ctx, record)
