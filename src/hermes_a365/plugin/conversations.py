@@ -581,12 +581,15 @@ class ConversationRegistry:
                     finally:
                         quarantine_bytes = b""
                     return
+                invalid_snapshot_json = False
                 try:
                     parsed = json.loads(decoded)
                 except (json.JSONDecodeError, RecursionError):
+                    invalid_snapshot_json = True
+                decoded = ""
+                if invalid_snapshot_json:
                     quarantine_bytes = snapshot
                     snapshot = b""
-                    decoded = ""
                     try:
                         _quarantine_corrupt_sidecar(
                             path,
@@ -597,7 +600,6 @@ class ConversationRegistry:
                     finally:
                         quarantine_bytes = b""
                     return
-                decoded = ""
                 if not isinstance(parsed, dict):
                     quarantine_bytes = snapshot
                     snapshot = b""
@@ -630,12 +632,15 @@ class ConversationRegistry:
                     finally:
                         quarantine_bytes = b""
                     return
+                invalid_recheck_json = False
                 try:
                     recheck = json.loads(recheck_text)
                 except (json.JSONDecodeError, RecursionError):
+                    invalid_recheck_json = True
+                recheck_text = ""
+                if invalid_recheck_json:
                     quarantine_bytes = recheck_bytes
                     recheck_bytes = b""
-                    recheck_text = ""
                     try:
                         _quarantine_corrupt_sidecar(
                             path,
@@ -646,7 +651,6 @@ class ConversationRegistry:
                     finally:
                         quarantine_bytes = b""
                     return
-                recheck_text = ""
                 recheck_bytes = b""
                 validate_conversations_sidecar_schema(recheck)
             if (

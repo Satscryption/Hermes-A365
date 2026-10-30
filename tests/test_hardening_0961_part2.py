@@ -533,6 +533,28 @@ class TestPr274FixRound:
             write_owner_only_bytes_exclusive(target, b"payload\n")
         assert not target.exists()
 
+    def test_invalid_json_quarantine_backup_failure_has_no_decode_context(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365 import _common
+        from hermes_a365.plugin import conversations as conversations_mod
+
+        marker = "SENTINEL-274-R5-JSON-QUARANTINE"
+        path = tmp_path / "conversations.json"
+        path.write_bytes(f'{{"schemaVersion": 1, "secret": "{marker}"'.encode())
+
+        def fail_backup(path_arg: Path, data: bytes, **kwargs: Any) -> Path:
+            raise SidecarBackupError("injected quarantine backup failure")
+
+        monkeypatch.setattr(_common, "write_owner_only_bytes_exclusive", fail_backup)
+        monkeypatch.setattr(conversations_mod, "write_owner_only_bytes_exclusive", fail_backup)
+
+        with pytest.raises(SidecarBackupError) as excinfo:
+            ConversationRegistry.write_payload(path, {"schemaVersion": 1, "conversations": {}})
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+        _assert_failure_artifacts_clean(excinfo.value, marker)
+
     def test_recheck_quarantine_backup_failure_scrubs_bytes(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
