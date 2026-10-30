@@ -239,7 +239,27 @@ def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o6
             f"could not create sidecar backup directory at {path.parent}: {exc}"
         ) from exc
     tmp = path.with_name(f".{path.name}.part-{os.getpid()}")
-    tmp.unlink(missing_ok=True)
+
+    def _prepare_temp_part() -> None:
+        try:
+            if tmp.exists():
+                if tmp.is_dir():
+                    raise SidecarBackupError(
+                        f"could not open sidecar backup at {path}: temp path is a directory"
+                    )
+                tmp.unlink()
+        except SidecarBackupError:
+            raise
+        except OSError as exc:
+            if tmp.is_dir():
+                raise SidecarBackupError(
+                    f"could not open sidecar backup at {path}: temp path is a directory"
+                ) from exc
+            raise SidecarBackupError(
+                f"could not prepare sidecar backup temp file at {tmp}: {exc}"
+            ) from exc
+
+    _prepare_temp_part()
     fd: int | None = None
     try:
         try:
@@ -253,6 +273,9 @@ def write_owner_only_bytes_exclusive(path: Path, data: bytes, *, mode: int = 0o6
                 offset += os.write(fd, data[offset:])
             os.fsync(fd)
         except BaseException as exc:
+            with suppress(OSError):
+                if tmp.exists() and not tmp.is_dir():
+                    tmp.unlink()
             if isinstance(exc, OSError):
                 raise SidecarBackupError(
                     f"could not write sidecar backup at {path}: {exc}"

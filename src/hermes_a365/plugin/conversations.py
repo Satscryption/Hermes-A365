@@ -563,7 +563,35 @@ class ConversationRegistry:
                     return
                 raw_on_disk = parsed
                 validate_conversations_sidecar_schema(raw_on_disk)
-                recheck = json.loads(path.read_bytes().decode("utf-8"))
+                recheck_bytes = path.read_bytes()
+                try:
+                    recheck_text = recheck_bytes.decode("utf-8")
+                    if recheck_text.encode("utf-8") != recheck_bytes or "\x00" in recheck_text:
+                        raise UnicodeDecodeError(
+                            "utf-8", recheck_bytes, 0, 1, "invalid sidecar utf-8"
+                        )
+                except UnicodeDecodeError:
+                    quarantine = sidecar_corrupt_quarantine_path(path)
+                    published = write_owner_only_bytes_exclusive(quarantine, recheck_bytes)
+                    logger.warning(
+                        "agent365 conversations: quarantined invalid UTF-8 at %s to %s",
+                        path,
+                        published,
+                    )
+                    write_owner_only_text_atomic(path, text)
+                    return
+                try:
+                    recheck = json.loads(recheck_text)
+                except (json.JSONDecodeError, RecursionError):
+                    quarantine = sidecar_corrupt_quarantine_path(path)
+                    published = write_owner_only_bytes_exclusive(quarantine, recheck_bytes)
+                    logger.warning(
+                        "agent365 conversations: quarantined invalid JSON at %s to %s",
+                        path,
+                        published,
+                    )
+                    write_owner_only_text_atomic(path, text)
+                    return
                 validate_conversations_sidecar_schema(recheck)
             if (
                 snapshot

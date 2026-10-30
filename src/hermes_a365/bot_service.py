@@ -237,10 +237,26 @@ class BotServiceConfig:
         if not path.exists():
             raise BotServiceError(f"{path} does not exist; run `bot-service create --apply` first")
         try:
-            text = path.read_text()
+            data = path.read_bytes()
         except OSError as e:
             raise BotServiceError(f"could not read {path}: {e}") from e
-        return cls.from_json_text(text, source=str(path))
+        buf = data
+        data = b""
+        parse_error: BotServiceError | None = None
+        config: BotServiceConfig | None = None
+        try:
+            text = _decode_sidecar_utf8(buf, source=str(path))
+            try:
+                config = cls.from_json_text(text, source=str(path))
+            finally:
+                text = ""
+        except BotServiceError as exc:
+            parse_error = exc
+        buf = b""
+        if parse_error is not None:
+            raise parse_error from None
+        assert config is not None
+        return config
 
     @classmethod
     def from_json_text(cls, text: str, *, source: str) -> BotServiceConfig:
@@ -698,44 +714,96 @@ def _read_sidecar_bytes(path: Path) -> tuple[bytes, tuple[int, int, int, str]]:
     return raw, (*identity_after, hashlib.sha256(raw).hexdigest())
 
 
-def _parse_sidecar_json_object(data: bytes, *, source: str) -> dict[str, Any]:
-    """Parse UTF-8 sidecar bytes without retaining raw content on failure."""
+def _decode_sidecar_utf8(data: bytes, *, source: str) -> str:
+    """Decode sidecar bytes as strict UTF-8 without retaining them on failure."""
+    invalid = False
     try:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
+        invalid = True
+    if not invalid and text.encode("utf-8") != data:
+        invalid = True
+    if not invalid and "\x00" in text:
+        invalid = True
+    if invalid:
         data = b""
-        raise BotServiceError(f"{source} is not valid JSON (invalid UTF-8)") from None
+        raise BotServiceError(f"{source} is not valid UTF-8") from None
+    data = b""
+    return text
+
+
+def _parse_sidecar_json_object(data: bytes, *, source: str) -> dict[str, Any]:
+    """Parse UTF-8 sidecar bytes without retaining raw content on failure."""
+    buf = data
     data = b""
     try:
-        parsed = json.loads(text)
-    except json.JSONDecodeError:
+        text = _decode_sidecar_utf8(buf, source=source)
+        try:
+            parsed = json.loads(text)
+        except json.JSONDecodeError:
+            text = ""
+            err = BotServiceError(f"{source} is not valid JSON (invalid JSON)")
+            raise err from None
         text = ""
-        raise BotServiceError(f"{source} is not valid JSON (invalid JSON)") from None
-    text = ""
-    if not isinstance(parsed, dict):
-        raise BotServiceError(f"{source} is JSON {type(parsed).__name__}, expected object")
-    return parsed
+        if not isinstance(parsed, dict):
+            raise BotServiceError(f"{source} is JSON {type(parsed).__name__}, expected object")
+        return parsed
+    finally:
+        buf = b""
 
 
 def _existing_sidecar_payload_for_create(
     path: Path,
 ) -> tuple[dict[str, Any], tuple[int, int, int, str]]:
-    snapshot, binding = _read_sidecar_bytes(path)
     try:
-        return _parse_sidecar_json_object(snapshot, source=str(path)), binding
-    finally:
-        snapshot = b""
+        before = path.lstat()
+        if not stat.S_ISREG(before.st_mode) or path.is_symlink():
+            raise BotServiceError(f"{path} must be a regular non-symlink file")
+        data = path.read_bytes()
+        after = path.lstat()
+    except OSError as exc:
+        raise BotServiceError(f"could not bind cleanup sidecar {path}: {exc}") from exc
+    identity_before = (before.st_dev, before.st_ino, before.st_size)
+    identity_after = (after.st_dev, after.st_ino, after.st_size)
+    if identity_after != identity_before:
+        raise BotServiceError(f"{path} changed while it was being read")
+    binding = (*identity_after, hashlib.sha256(data).hexdigest())
+    buf = data
+    data = b""
+    parse_error: BotServiceError | None = None
+    payload: dict[str, Any] | None = None
+    try:
+        payload = _parse_sidecar_json_object(buf, source=str(path))
+    except BotServiceError as exc:
+        parse_error = exc
+    buf = b""
+    if parse_error is not None:
+        raise parse_error from None
+    assert payload is not None
+    return payload, binding
 
 
 def _read_bound_sidecar(
     path: Path,
 ) -> tuple[BotServiceConfig, tuple[int, int, int, str], bytes]:
     raw, binding = _read_sidecar_bytes(path)
+    snapshot = raw
+    raw = b""
+    parse_error: BotServiceError | None = None
+    config: BotServiceConfig | None = None
     try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        raise BotServiceError(f"{path} is not valid UTF-8: {exc}") from exc
-    return BotServiceConfig.from_json_text(text, source=str(path)), binding, raw
+        text = _decode_sidecar_utf8(snapshot, source=str(path))
+        try:
+            config = BotServiceConfig.from_json_text(text, source=str(path))
+        finally:
+            text = ""
+    except BotServiceError as exc:
+        parse_error = exc
+    if parse_error is not None:
+        snapshot = b""
+        raise parse_error from None
+    assert config is not None
+    return config, binding, snapshot
 
 
 def _sidecar_file_binding(path: Path) -> tuple[int, int, int, str]:
@@ -1370,7 +1438,12 @@ def _apply_create_plan_locked(
     inputs = plan.inputs
     bot_name = plan.bot_name
     create_sidecar_binding: tuple[int, int, int, str] | None = None
-    if inputs.sidecar_path.is_file():
+    if inputs.sidecar_path.exists():
+        if not inputs.sidecar_path.is_file():
+            raise BotServiceError(
+                f"{inputs.sidecar_path} already exists and is not a regular sidecar file; "
+                "refusing create before Azure mutation"
+            )
         from .sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
 
         sidecar_payload, create_sidecar_binding = _existing_sidecar_payload_for_create(

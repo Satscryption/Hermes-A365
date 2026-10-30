@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 import json
 import os
 import traceback
@@ -17,9 +18,11 @@ from hermes_a365.bot_service import (
     BotServiceConfig,
     BotServiceCreateInputs,
     BotServiceError,
+    _read_bound_sidecar,
     apply_create_plan,
     build_create_plan,
 )
+from hermes_a365.bot_service_diagnostics import probe_bot_service_config
 from hermes_a365.plugin.conversations import ConversationRegistry
 from hermes_a365.sidecar_schema import SidecarSchemaError, validate_bot_service_sidecar_schema
 
@@ -85,20 +88,30 @@ def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
         return
 
 
-def _assert_marker_absent_from_bot_service_failure(exc: BaseException, marker: str) -> None:
+def _assert_failure_artifacts_clean(exc: BaseException, marker: str) -> None:
+    gc.collect()
+    assert exc.__cause__ is None
     for link in _iter_exception_chain(exc):
         assert marker not in str(link)
         assert marker not in repr(link)
+        assert all(marker not in str(arg) for arg in link.args)
         for _key, val in vars(link).items():
-            _scan_value_for_marker(val, marker, _seen=set())
+            if _key == "object":
+                _scan_value_for_marker(val, marker, _seen=set())
+            else:
+                _scan_value_for_marker(val, marker, _seen=set())
     tb = exc.__traceback__
     while tb is not None:
-        frame = tb.tb_frame
-        if frame.f_code.co_filename.endswith(f"{os.sep}bot_service.py"):
-            for _name, value in frame.f_locals.items():
+        filename = tb.tb_frame.f_code.co_filename
+        if f"{os.sep}hermes_a365{os.sep}" in filename and f"{os.sep}tests{os.sep}" not in filename:
+            for _name, value in tb.tb_frame.f_locals.items():
                 _scan_value_for_marker(value, marker, _seen=set())
         tb = tb.tb_next
     assert marker not in "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+
+
+def _assert_marker_absent_from_bot_service_failure(exc: BaseException, marker: str) -> None:
+    _assert_failure_artifacts_clean(exc, marker)
 
 
 class TestC1ConversationsStrictUtf8:
@@ -329,3 +342,78 @@ class TestParseExceptionLeak:
             BotServiceConfig.from_json_text(broken, source="cfg")
         _assert_marker_absent_from_bot_service_failure(excinfo.value, marker)
         assert excinfo.value.__cause__ is None
+
+
+class TestPr274FixRound:
+    def test_read_bound_sidecar_invalid_utf8_scrubs_sentinel(self, tmp_path: Path) -> None:
+        marker = "SENTINEL-274-READ-BOUND"
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        sidecar.write_bytes(b"\xff\xfe" + marker.encode())
+        with pytest.raises(BotServiceError, match="not valid UTF-8") as excinfo:
+            _read_bound_sidecar(sidecar)
+        _assert_failure_artifacts_clean(excinfo.value, marker)
+
+    def test_from_file_invalid_utf8_scrubs_sentinel(self, tmp_path: Path) -> None:
+        marker = "SENTINEL-274-FROM-FILE"
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        sidecar.write_bytes(b"\xff\xfe" + marker.encode())
+        with pytest.raises(BotServiceError) as excinfo:
+            BotServiceConfig.from_file(sidecar)
+        _assert_failure_artifacts_clean(excinfo.value, marker)
+
+    def test_probe_bot_service_config_invalid_utf8_safe_message(self, tmp_path: Path) -> None:
+        marker = "SENTINEL-274-PROBE"
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        sidecar.write_bytes(b"\xff\xfe" + marker.encode())
+        result, config = probe_bot_service_config(sidecar)
+        assert config is None
+        assert result.state == "error"
+        assert marker not in result.detail
+        assert marker not in repr(result.data)
+
+    def test_create_refuses_directory_before_azure(self, tmp_path: Path) -> None:
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        sidecar.mkdir()
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+            app_id="00000000-0000-0000-0000-000000000001",
+        )
+        env = {"A365_BF_APP_ID": "00000000-0000-0000-0000-000000000001"}
+        plan = build_create_plan(inputs, operator_env=env)
+        runner = FakeRunner(group_exists=False)
+        with pytest.raises(BotServiceError, match="not a regular sidecar file"):
+            apply_create_plan(plan, runner=runner, operator_env=env)
+        assert runner.calls == []
+
+    def test_write_payload_recheck_utf8_quarantines_without_leak(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        path = tmp_path / "conversations.json"
+        valid = (json.dumps({"schemaVersion": 1, "conversations": {}}) + "\n").encode()
+        path.write_bytes(valid)
+        reads = {"n": 0}
+        real_read_bytes = Path.read_bytes
+
+        def read_bytes(self: Path) -> bytes:
+            reads["n"] += 1
+            if reads["n"] == 1:
+                return real_read_bytes(self)
+            return bytes([0xFF])
+
+        monkeypatch.setattr(Path, "read_bytes", read_bytes)
+        payload = {"schemaVersion": 1, "conversations": {}}
+        ConversationRegistry.write_payload(path, payload)
+        quarantine = next(p for p in tmp_path.iterdir() if ".corrupt-" in p.name)
+        assert quarantine.read_bytes() == bytes([0xFF])
+        json.loads(path.read_text())
+
+    def test_backup_temp_directory_raises_sidecar_backup_error(self, tmp_path: Path) -> None:
+        target = tmp_path / "sidecar.json.backup-test"
+        part = target.with_name(f".{target.name}.part-{os.getpid()}")
+        part.mkdir()
+        with pytest.raises(SidecarBackupError, match="directory"):
+            write_owner_only_bytes_exclusive(target, b"payload\n")
+        assert not target.exists()
