@@ -12,7 +12,7 @@ Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (
 per-kid JWKS refresh (#218), sensitive output handling for blueprint setup (#256),
 Direct Line probe 401 attribution (#250), sidecar schema versioning and packaging
 metadata (#193), and CI required-check fixes (#259).
-Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, #267, #268, #269, and #<THIS PR NUMBER> (release bump).
+Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, #267, #268, #269, and #272 (release bump).
 
 ### Removed
 
