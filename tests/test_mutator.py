@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import gc
 import os
+import queue
 import re
 import subprocess
 import sys
+import threading
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from hermes_a365.mutator import (
+    _MAX_LINE_PENDING_CHARS,
+    _MAX_TOTAL_CAPTURE_BYTES,
     A365_CLI_BINARY,
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
@@ -22,6 +28,9 @@ from hermes_a365.mutator import (
     CliInvocationError,
     Mutator,
     RunResult,
+    _LineBuffer,
+    _Pump,
+    _reap,
     _run_streaming,
     get_mutator,
 )
@@ -50,11 +59,22 @@ def _install_az_rest_shim_for_mutator_test(
 
 def _iter_exception_chain(exc: BaseException | None) -> Iterable[BaseException]:
     seen: set[int] = set()
-    current: BaseException | None = exc
-    while current is not None and id(current) not in seen:
-        seen.add(id(current))
+    pending: list[BaseException] = []
+    if exc is not None:
+        pending.append(exc)
+    while pending:
+        current = pending.pop()
+        oid = id(current)
+        if oid in seen:
+            continue
+        seen.add(oid)
         yield current
-        current = current.__cause__ or current.__context__
+        ctx = current.__context__
+        cause = current.__cause__
+        if ctx is not None and id(ctx) not in seen:
+            pending.append(ctx)
+        if cause is not None and id(cause) not in seen:
+            pending.append(cause)
 
 
 def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
@@ -62,6 +82,10 @@ def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
         return
     oid = id(value)
     if oid in _seen:
+        return
+    if isinstance(value, BaseException):
+        for link in _iter_exception_chain(value):
+            _scan_value_for_marker(link, marker, _seen=_seen)
         return
     if isinstance(value, (str, bytes, bytearray)):
         text = value.decode() if isinstance(value, (bytes, bytearray)) else value
@@ -76,28 +100,46 @@ def _scan_value_for_marker(value: Any, marker: str, *, _seen: set[int]) -> None:
             _scan_value_for_marker(item, marker, _seen=_seen)
         return
     if isinstance(value, (list, tuple, set, frozenset)):
+        if isinstance(value, list) and len(value) >= 3 and value[1] == "-c":
+            return
         for item in value:
             _scan_value_for_marker(item, marker, _seen=_seen)
         return
 
 
 def _assert_marker_absent_from_failure_artifacts(exc: BaseException, marker: str) -> None:
+    assert exc.__cause__ is None
+    assert exc.__context__ is None
     for link in _iter_exception_chain(exc):
+        assert link.__cause__ is None
+        assert link.__context__ is None
         assert marker not in str(link)
         assert marker not in repr(link)
         for key, val in vars(link).items():
             if key == "argv":
                 continue
             _scan_value_for_marker(val, marker, _seen=set())
-    tb = exc.__traceback__
-    while tb is not None:
-        frame = tb.tb_frame
-        if frame.f_code.co_filename.endswith(f"{os.sep}mutator.py"):
-            for name, value in frame.f_locals.items():
-                if name in ("argv",):
-                    continue
-                _scan_value_for_marker(value, marker, _seen=set())
-        tb = tb.tb_next
+    for link in _iter_exception_chain(exc):
+        tb = link.__traceback__
+        while tb is not None:
+            frame = tb.tb_frame
+            filename = frame.f_code.co_filename
+            if filename.endswith(f"{os.sep}mutator.py") or filename.endswith(
+                f"{os.sep}register.py"
+            ):
+                gc.collect()
+                argv_local = frame.f_locals.get("argv")
+                for name, value in frame.f_locals.items():
+                    if name in ("argv",):
+                        continue
+                    _scan_value_for_marker(value, marker, _seen=set())
+                for ref in gc.get_referents(frame):
+                    if ref is argv_local:
+                        continue
+                    if isinstance(ref, str) and isinstance(argv_local, list) and ref in argv_local:
+                        continue
+                    _scan_value_for_marker(ref, marker, _seen=set())
+            tb = tb.tb_next
 
 
 def _assert_no_marker_in_exception(exc: BaseException, marker: str) -> None:
@@ -672,6 +714,300 @@ class TestAdversarialSensitiveSubprocess:
         assert _OPAQUE_GRAPH_SECRET not in excinfo.value.graph_error[1]
         assert excinfo.value.graph_error[1] == "Access was denied."
         _assert_marker_absent_from_failure_artifacts(excinfo.value, _OPAQUE_GRAPH_SECRET)
+
+
+# ---------------------------------------------------------------------------
+# Subprocess lifetime and scrubbing (#271 slice 1)
+# ---------------------------------------------------------------------------
+
+
+def _child_script_reads_sentinel(sentinel_path: Path) -> Path:
+    script = sentinel_path.with_name("child_read_sentinel.py")
+    script.write_text(
+        "import sys\n"
+        f"sys.stdout.write(open({str(sentinel_path)!r}, encoding='utf-8').read())\n"
+        "sys.stdout.write('\\n')\n",
+        encoding="utf-8",
+    )
+    return script
+
+
+class TestMutatorSubprocessScrubbing:
+    def test_stream_exception_has_empty_chain(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = "STREAM-EXC-SENTINEL-991"
+        sentinel_path = tmp_path / "sent.txt"
+        sentinel_path.write_text(marker, encoding="utf-8")
+        script = _child_script_reads_sentinel(sentinel_path)
+        real_feed = _LineBuffer.feed
+
+        def feed(self: _LineBuffer, chunk: bytes) -> list[str]:
+            lines = real_feed(self, chunk)
+            if marker in self.pending or any(marker in line for line in lines):
+                raise RuntimeError("injected stream failure")
+            return lines
+
+        monkeypatch.setattr(_LineBuffer, "feed", feed)
+        release_calls: list[BaseException] = []
+        import hermes_a365.mutator as mutator_mod
+
+        real_release = mutator_mod._release
+
+        def release_spy(exc: BaseException) -> None:
+            release_calls.append(exc)
+            real_release(exc)
+
+        monkeypatch.setattr(mutator_mod, "_release", release_spy)
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            m.run([sys.executable, str(script)], sensitive=True)
+        assert excinfo.value.sensitive is True
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+        assert release_calls, "expected _release while handling the injected stream error"
+        assert len(release_calls) >= 2, "expected _release from run and from subprocess cleanup"
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+
+    def test_overflow_pending_and_chunk_are_gone(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = "OVERFLOW-PENDING-MARKER-44"
+        sentinel_path = tmp_path / "sent.txt"
+        sentinel_path.write_text(marker, encoding="utf-8")
+        script = tmp_path / "overflow_child.py"
+        script.write_text(
+            "import sys\n"
+            f"sys.stdout.write(open({str(sentinel_path)!r}, encoding='utf-8').read())\n"
+            f"sys.stdout.write('{'x' * (_MAX_LINE_PENDING_CHARS + 1)}')\n",
+            encoding="utf-8",
+        )
+        m = A365CliMutator()
+        m.available = True
+        clear_calls: list[int] = []
+        feed_clears: list[int] = []
+        real_clear = _LineBuffer.clear
+
+        def clear_spy(self: _LineBuffer) -> None:
+            import inspect
+
+            clear_calls.append(1)
+            if any(frame.function == "feed" for frame in inspect.stack()[1:8]):
+                feed_clears.append(1)
+            real_clear(self)
+
+        monkeypatch.setattr(_LineBuffer, "clear", clear_spy)
+        with pytest.raises(CliInvocationError) as excinfo:
+            m.run([sys.executable, str(script)], sensitive=True)
+        assert feed_clears, "expected pending buffer clear inside feed before overflow"
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+
+    def test_total_capture_cap_overflow(self, tmp_path: Path) -> None:
+        line_chars = 200 * 1024
+        line_count = (_MAX_TOTAL_CAPTURE_BYTES // line_chars) + 2
+        script = tmp_path / "total_cap_child.py"
+        script.write_text(
+            "import sys\n"
+            + "".join(
+                f"sys.stdout.write({('a' * line_chars)!r})\n" for _ in range(line_count)
+            ),
+            encoding="utf-8",
+        )
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(CliInvocationError, match="capture size limit"):
+            m.run([sys.executable, str(script)], sensitive=False)
+        import hermes_a365.mutator as mutator_mod
+
+        assert mutator_mod._MAX_TOTAL_CAPTURE_BYTES == 4 * 1024 * 1024
+
+    def test_cancelled_error_scrubs_and_reaps(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = "CANCEL-SENTINEL-882"
+        sentinel_path = tmp_path / "sent.txt"
+        sentinel_path.write_text(marker, encoding="utf-8")
+        script = _child_script_reads_sentinel(sentinel_path)
+        import hermes_a365.mutator as mutator_mod
+
+        original_emit = mutator_mod._try_emit_device_login_line
+
+        def emit_hook(line: str, *, emitted: set[tuple[str, str]], eof: bool = False) -> None:
+            if marker in line:
+                raise asyncio.CancelledError()
+            original_emit(line, emitted=emitted, eof=eof)
+
+        monkeypatch.setattr(mutator_mod, "_try_emit_device_login_line", emit_hook)
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(asyncio.CancelledError) as excinfo:
+            m.run([sys.executable, str(script)], sensitive=True)
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+
+    def test_keyboard_interrupt_scrubs_and_reaps(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        marker = "KBI-SENTINEL-771"
+        sentinel_path = tmp_path / "sent.txt"
+        sentinel_path.write_text(marker, encoding="utf-8")
+        script = _child_script_reads_sentinel(sentinel_path)
+        import hermes_a365.mutator as mutator_mod
+
+        original_emit = mutator_mod._try_emit_device_login_line
+
+        def emit_hook(line: str, *, emitted: set[tuple[str, str]], eof: bool = False) -> None:
+            if marker in line:
+                raise KeyboardInterrupt()
+            original_emit(line, emitted=emitted, eof=eof)
+
+        monkeypatch.setattr(mutator_mod, "_try_emit_device_login_line", emit_hook)
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(KeyboardInterrupt) as excinfo:
+            m.run([sys.executable, str(script)], sensitive=True)
+        assert excinfo.value.__cause__ is None
+        assert excinfo.value.__context__ is None
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+
+    def test_sensitive_failure_drops_stdin_local(
+        self, tmp_path: Path, capfd: pytest.CaptureFixture[str]
+    ) -> None:
+        marker = "STDIN-LOCAL-MARKER-665"
+        script = tmp_path / "stdin_echo_fail.py"
+        script.write_text(
+            "import sys\ntext = sys.stdin.read()\nsys.stdout.write(text)\nraise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        m = A365CliMutator()
+        m.available = True
+        with pytest.raises(CliInvocationError) as excinfo:
+            m.run(
+                [sys.executable, str(script)],
+                sensitive=True,
+                stdin_input=f"{marker}\n",
+            )
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, marker)
+        out, err = capfd.readouterr()
+        assert marker not in out + err
+
+    def test_reap_on_overflow_timeout_and_cancel(self, tmp_path: Path) -> None:
+        real_popen = subprocess.Popen
+        proc_refs: list[subprocess.Popen[bytes]] = []
+
+        def popen_wrap(*args: object, **kwargs: object) -> subprocess.Popen[bytes]:
+            proc = real_popen(*args, **kwargs)
+            proc_refs.append(proc)
+            return proc
+
+        def assert_child_reaped() -> None:
+            proc = proc_refs[-1]
+            assert proc.returncode is not None
+            with pytest.raises(ProcessLookupError):
+                os.kill(proc.pid, 0)
+
+        m = A365CliMutator()
+        m.available = True
+
+        hang = tmp_path / "hang.py"
+        hang.write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+        with (
+            patch("hermes_a365.mutator.subprocess.Popen", popen_wrap),
+            pytest.raises(subprocess.TimeoutExpired),
+        ):
+            m.run([sys.executable, str(hang)], timeout=0.5)
+        assert_child_reaped()
+
+        overflow = tmp_path / "overflow_reap.py"
+        overflow.write_text(
+            f"import sys\nsys.stdout.write('{'y' * (_MAX_LINE_PENDING_CHARS + 1)}')\n",
+            encoding="utf-8",
+        )
+        proc_refs.clear()
+        with (
+            patch("hermes_a365.mutator.subprocess.Popen", popen_wrap),
+            pytest.raises(CliInvocationError),
+        ):
+            m.run([sys.executable, str(overflow)], sensitive=True, timeout=5.0)
+        assert_child_reaped()
+
+    def test_reap_order_posix(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        order: list[str] = []
+        stdout = MagicMock()
+        stderr = MagicMock()
+        stdout.close.side_effect = lambda: order.append("stdout.close")
+        stderr.close.side_effect = lambda: order.append("stderr.close")
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.stdin = None
+        proc.stdout = stdout
+        proc.stderr = stderr
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        thread.join.side_effect = lambda timeout=0: order.append("thread.join")
+        stop = threading.Event()
+        pump = _Pump(
+            proc=proc,
+            argv=["x"],
+            timeout=1.0,
+            streams=("stdout", "stderr"),
+            echo="all",
+            sensitive=False,
+            stop=stop,
+            out_q=queue.Queue(),
+            threads=[thread],
+            buffers={"stdout": _LineBuffer(), "stderr": _LineBuffer()},
+            eof_seen={"stdout": True, "stderr": True},
+            emitted_logins=set(),
+            captured=[],
+            deadline=0.0,
+            thread_streams=[(thread, "stdout")],
+        )
+        monkeypatch.setattr(os, "name", "posix")
+        _reap(pump)
+        join_at = order.index("thread.join")
+        close_at = order.index("stdout.close")
+        assert join_at < close_at
+
+    def test_reap_order_windows(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        order: list[str] = []
+        stdout = MagicMock()
+        stderr = MagicMock()
+        stdout.close.side_effect = lambda: order.append("stdout.close")
+        stderr.close.side_effect = lambda: order.append("stderr.close")
+        proc = MagicMock()
+        proc.poll.return_value = 0
+        proc.stdin = None
+        proc.stdout = stdout
+        proc.stderr = stderr
+        thread = MagicMock()
+        thread.is_alive.return_value = False
+        thread.join.side_effect = lambda timeout=0: order.append("thread.join")
+        stop = threading.Event()
+        pump = _Pump(
+            proc=proc,
+            argv=["x"],
+            timeout=1.0,
+            streams=("stdout", "stderr"),
+            echo="all",
+            sensitive=False,
+            stop=stop,
+            out_q=queue.Queue(),
+            threads=[thread],
+            buffers={"stdout": _LineBuffer(), "stderr": _LineBuffer()},
+            eof_seen={"stdout": True, "stderr": True},
+            emitted_logins=set(),
+            captured=[],
+            deadline=0.0,
+            thread_streams=[(thread, "stdout")],
+        )
+        monkeypatch.setattr(os, "name", "nt")
+        _reap(pump)
+        close_at = order.index("stdout.close")
+        join_at = order.index("thread.join")
+        assert close_at < join_at
 
 
 # ---------------------------------------------------------------------------
