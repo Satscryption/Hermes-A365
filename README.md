@@ -756,7 +756,9 @@ as `ok`.
 >
 > …paired with `A365_TENANT_ID`, `A365_APP_ID`, `A365_BLUEPRINT_CLIENT_SECRET`,
 > and either `A365_ALLOW_ALL_USERS=true` (testing) or
-> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. That profile
+> `A365_ALLOWED_USERS=<csv>` (production) in `~/.hermes/.env`. Optional
+> `A365_ALLOW_CLIENT_BF_CHANNELS=true` opts into Direct Line / Web Chat /
+> emulator traffic (default off). That profile
 > file is the sender allowlist for both the gateway and `activity-bridge serve`.
 > A silent process adopts that file, so `serve` does not need the allowlist
 > exported when the keys are in `~/.hermes/.env`. A policy that exists only

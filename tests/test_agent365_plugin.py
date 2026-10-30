@@ -23719,6 +23719,7 @@ class TestInvokeRoute:
                     "oid": "claim-oid",
                     "tid": "claim-tid",
                     "preferred_username": "u@x",
+                    "scp": "User.Read",
                 }
             ),
         )
@@ -25892,6 +25893,7 @@ def _handoff_ctx(
         claims={
             "oid": _HANDOFF_USER if claims_user is None else claims_user,
             "tid": _HANDOFF_TENANT if claims_tenant is None else claims_tenant,
+            "idtyp": "user",
         },
         path_tag="B",
     )
@@ -28120,7 +28122,8 @@ class TestMessageReaction:
             json=_reaction_activity(channel_id="webchat", activity_id="react-web"),
             headers={"Authorization": "Bearer a.b.c"},
         )
-        assert response.json()["reason"] == "ignored"
+        assert response.status_code == 403
+        assert response.json()["detail"] == "end user is not authorized"
         assert "reply-1" not in a._feedback_by_message_id
         assert a._handled_events == []
 
