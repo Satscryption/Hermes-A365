@@ -383,7 +383,7 @@ class TestCallSiteFamilies:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         from hermes_a365 import activity_bridge as bridge
-        from hermes_a365.activity_bridge import ReplyPostError
+        from hermes_a365.activity_bridge import ReplyPostMayHaveLandedError
 
         client = MagicMock()
         client.post = AsyncMock(return_value=MagicMock(status_code=503, headers={}, text=""))
@@ -397,7 +397,7 @@ class TestCallSiteFamilies:
             "conversation": {"id": "c1"},
             "id": "a1",
         }
-        with pytest.raises(ReplyPostError):
+        with pytest.raises(ReplyPostMayHaveLandedError):
             await bridge.send_reply(
                 inbound=inbound,
                 reply={"type": "message", "text": "hi"},

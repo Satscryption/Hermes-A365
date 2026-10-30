@@ -543,7 +543,7 @@ documented). Six probes, in order:
 2. `bf_secret` — optional Path B Bot Framework client secret resolves
    from the agent `.env` or secrets provider when `A365_BF_APP_ID` is set.
 3. `generated_config` — `a365.generated.config.json` (in cwd) has
-   the blueprint client secret + appId; warns if perms looser than
+   the blueprint client secret + appId; errors if perms looser than
    0600 (slice 18i / 18x policy).
 4. `token_acquisition` — Graph `client_credentials` token probe;
    reports **error** when token acquisition fails (bad secret, network,

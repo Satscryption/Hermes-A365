@@ -208,7 +208,7 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
     lines.extend(
         [
             "",
-            "`GET /healthz` → 200 `{ok, slug, blueprint_client_id}` (id truncated to 8 chars). "
+            "`GET /healthz` → 200 `{ok: true}`. "
             "`POST /api/messages`: 400 bad activity; 401 bearer; 403 serviceUrl / allowlist / user; "
             "200 ack bodies; plugin-only 503 while connect failed. "
             '`serve` speaks operator webhook contract version `"1"` (`references/webhook-contract.md`).',

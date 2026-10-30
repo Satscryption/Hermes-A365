@@ -131,7 +131,7 @@ Gateway `build_app` and `activity-bridge serve`:
 - `POST /api/messages`
 - `GET /healthz`
 
-`GET /healthz` → 200 `{ok, slug, blueprint_client_id}` (id truncated to 8 chars). `POST /api/messages`: 400 bad activity; 401 bearer; 403 serviceUrl / allowlist / user; 200 ack bodies; plugin-only 503 while connect failed. `serve` speaks operator webhook contract version `"1"` (`references/webhook-contract.md`).
+`GET /healthz` → 200 `{ok: true}`. `POST /api/messages`: 400 bad activity; 401 bearer; 403 serviceUrl / allowlist / user; 200 ack bodies; plugin-only 503 while connect failed. `serve` speaks operator webhook contract version `"1"` (`references/webhook-contract.md`).
 
 ## Invoke wire names
 

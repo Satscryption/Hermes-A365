@@ -291,6 +291,13 @@
                   "required": false
                 },
                 {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
+                  ],
+                  "required": false
+                },
+                {
                   "dest": "endpoint",
                   "option_strings": [
                     "--endpoint"
@@ -1218,6 +1225,13 @@
                   "dest": "bot_name",
                   "option_strings": [
                     "--bot-name"
+                  ],
+                  "required": false
+                },
+                {
+                  "dest": "confirm_legacy_binding",
+                  "option_strings": [
+                    "--confirm-legacy-binding"
                   ],
                   "required": false
                 },

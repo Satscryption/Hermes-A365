@@ -30,6 +30,8 @@ exit when one is found.
 
 from __future__ import annotations
 
+import codecs
+import contextlib
 import json
 import os
 import queue
@@ -39,7 +41,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Literal, Protocol
 
 # Verified in references/a365-cli-reference.md; only .NET ships.
@@ -187,12 +189,27 @@ class A365CliMutator:
         timed_out = False
         combined = ""
         if sensitive:
+            sensitive_error: BaseException | None = None
             try:
-                returncode, combined = _run_sensitive_streaming(
-                    argv, timeout=timeout, stdin_input=stdin_input
-                )
-            except subprocess.TimeoutExpired:
-                timed_out = True
+                try:
+                    returncode, combined = _run_sensitive_streaming(
+                        argv, timeout=timeout, stdin_input=stdin_input
+                    )
+                except subprocess.TimeoutExpired:
+                    timed_out = True
+                except (KeyboardInterrupt, SystemExit):
+                    raise
+                except Exception as exc:
+                    sensitive_error = exc
+            except (KeyboardInterrupt, SystemExit):
+                raise
+            if sensitive_error is not None:
+                raise CliInvocationError(
+                    argv,
+                    -1,
+                    _sensitive_failure_detail(""),
+                    sensitive=True,
+                ) from None
         else:
             try:
                 returncode, combined = _run_streaming(
@@ -238,8 +255,9 @@ class A365CliMutator:
 _SENSITIVE_OUTPUT_SUPPRESSED = "<output suppressed: sensitive command may emit credential material>"
 
 _READ_CHUNK_BYTES = 4096
+_MAX_CAPTURED_LINE_CHARS = 256 * 1024
 
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?0-9;]*[ -/]*[@-~]")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?]*[ -/]*[@-~]")
 
 _DEVICE_LOGIN_LINE_RE = re.compile(
     r"^To sign in, use a web browser to open (?:the page )?"
@@ -291,10 +309,12 @@ def _line_content(line: str) -> str:
 
 def _parse_device_login_line(line: str, *, eof: bool = False) -> tuple[str, str] | None:
     """Return canonical URL and user code for one complete device-login line."""
-    if not eof and not line.endswith(("\n", "\r")):
+    if not eof and not line.endswith(("\n", "\r\n")):
         return None
     content = _line_content(line)
     if not content:
+        return None
+    if "\r" in content.rstrip("\r\n"):
         return None
     if any(ch in content for ch in ('"', "'", "{", "}", "[", "]")):
         return None
@@ -346,7 +366,7 @@ def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
         return None
     try:
         data, _end = json.JSONDecoder().raw_decode(text[start:])
-    except json.JSONDecodeError:
+    except (json.JSONDecodeError, ValueError, RecursionError):
         return None
     if not isinstance(data, dict):
         return None
@@ -370,9 +390,12 @@ def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
 @dataclass
 class _LineBuffer:
     pending: str = ""
+    _decoder: codecs.IncrementalDecoder = field(
+        default_factory=lambda: codecs.getincrementaldecoder("utf-8")(errors="replace")
+    )
 
     def feed(self, chunk: bytes) -> list[str]:
-        self.pending += chunk.decode("utf-8", errors="replace")
+        self.pending += self._decoder.decode(chunk)
         lines: list[str] = []
         while True:
             split_at = -1
@@ -383,10 +406,18 @@ class _LineBuffer:
                     split_at = idx
                     split_len = len(sep)
             if split_at < 0:
+                if len(self.pending) > _MAX_CAPTURED_LINE_CHARS:
+                    raise CliInvocationError([], -1, _sensitive_failure_detail(""))
                 break
             lines.append(self.pending[: split_at + split_len])
             self.pending = self.pending[split_at + split_len :]
         return lines
+
+    def flush_eof(self) -> str:
+        tail = self._decoder.decode(b"", final=True)
+        combined = self.pending + tail
+        self.pending = ""
+        return combined
 
 
 def _pump_stream(fd: int, name: str, out_q: queue.Queue[tuple[str, bytes | None]]) -> None:
@@ -439,10 +470,9 @@ def _run_pumped_output(
 
     def _flush_eof_tail(name: str) -> None:
         buffer = buffers[name]
-        if not buffer.pending:
+        tail = buffer.flush_eof()
+        if not tail:
             return
-        tail = buffer.pending
-        buffer.pending = ""
         captured.append(tail)
         if echo == "all":
             sys.stdout.write(tail)
@@ -461,39 +491,52 @@ def _run_pumped_output(
             return
         _drain_chunk(name, payload)
 
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
+    def _cleanup_child() -> None:
+        if proc.poll() is None:
             proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
             proc.wait(timeout=5)
-            captured.clear()
-            for buffer in buffers.values():
-                buffer.pending = ""
-            payload = None
-            raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
-        try:
-            name, payload = out_q.get(timeout=min(0.05, max(remaining, 0.0)))
-        except queue.Empty:
-            if proc.poll() is not None and all(eof_seen[s] for s in streams):
-                while True:
-                    try:
-                        name, payload = out_q.get_nowait()
-                    except queue.Empty:
-                        break
-                    _process_queue_item(name, payload)
-                break
-            continue
-        _process_queue_item(name, payload)
-        if all(eof_seen[s] for s in streams) and out_q.empty() and proc.poll() is not None:
-            break
+        if proc.stdout is not None:
+            with contextlib.suppress(OSError):
+                proc.stdout.close()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+        for thread in threads:
+            thread.join(timeout=1.0)
 
-    proc.wait(timeout=5)
-    proc.stdout.close()
-    if proc.stderr is not None:
-        proc.stderr.close()
-    for thread in threads:
-        thread.join(timeout=1.0)
-    return proc.returncode or 0, "".join(captured)
+    try:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                proc.kill()
+                proc.wait(timeout=5)
+                captured.clear()
+                for buffer in buffers.values():
+                    buffer.pending = ""
+                    buffer.flush_eof()
+                raise subprocess.TimeoutExpired(cmd=argv, timeout=timeout)
+            try:
+                name, payload = out_q.get(timeout=min(0.05, max(remaining, 0.0)))
+            except queue.Empty:
+                if proc.poll() is not None and all(eof_seen[s] for s in streams):
+                    while True:
+                        try:
+                            name, payload = out_q.get_nowait()
+                        except queue.Empty:
+                            break
+                        _process_queue_item(name, payload)
+                    break
+                continue
+            _process_queue_item(name, payload)
+            if all(eof_seen[s] for s in streams) and out_q.empty() and proc.poll() is not None:
+                break
+
+        proc.wait(timeout=5)
+        return proc.returncode or 0, "".join(captured)
+    finally:
+        for thread in threads:
+            thread.join(timeout=1.0)
 
 
 def _run_child_output(
@@ -511,14 +554,32 @@ def _run_child_output(
         stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
         preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
     )
-    if stdin_input is not None:
-        assert proc.stdin is not None
-        try:
-            proc.stdin.write(stdin_input.encode("utf-8"))
-        finally:
-            proc.stdin.close()
-    streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
-    return _run_pumped_output(proc, argv=argv, timeout=timeout, streams=streams, echo=echo)
+
+    def _cleanup_child() -> None:
+        if proc.poll() is None:
+            proc.kill()
+        with contextlib.suppress(subprocess.TimeoutExpired):
+            proc.wait(timeout=5)
+        if proc.stdout is not None:
+            with contextlib.suppress(OSError):
+                proc.stdout.close()
+        if proc.stderr is not None:
+            with contextlib.suppress(OSError):
+                proc.stderr.close()
+
+    try:
+        if stdin_input is not None:
+            assert proc.stdin is not None
+            try:
+                proc.stdin.write(stdin_input.encode("utf-8"))
+            except BrokenPipeError:
+                pass
+            finally:
+                proc.stdin.close()
+        streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
+        return _run_pumped_output(proc, argv=argv, timeout=timeout, streams=streams, echo=echo)
+    finally:
+        _cleanup_child()
 
 
 def _run_sensitive_streaming(
