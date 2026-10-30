@@ -83,6 +83,8 @@ import stat
 import threading
 import time
 import uuid
+import weakref
+from collections import deque
 from collections.abc import Awaitable, Callable
 from contextvars import ContextVar, Token
 from datetime import datetime
@@ -163,7 +165,11 @@ from hermes_a365.secrets_provider import (  # noqa: E402
 )
 
 # Plugin-local imports — these don't depend on the Hermes harness.
-from .conversations import ConversationRef, ConversationRegistry  # noqa: E402
+from .conversations import (  # noqa: E402
+    ConversationRef,
+    ConversationRegistry,
+    ConversationSidecarError,
+)
 
 
 def _profile_env(name: str, default: str | None = None) -> str | None:
@@ -538,11 +544,16 @@ _CARD_ACTION_KINDS = frozenset(
     {_CARD_KIND_EXEC_APPROVAL, _CARD_KIND_SLASH_CONFIRM, _CARD_KIND_CLARIFY}
 )
 _TURN_ORIGIN_METADATA_KEY = "agent365_turn_origin"
-_PENDING_MERGE_REGISTRY: dict[int, Any] = {}
+_PENDING_MERGE_REGISTRY: dict[int, weakref.ReferenceType[Any]] = {}
 _HERMES_MERGE_PENDING_ORIGINAL: Any = None
 _MERGE_PENDING_PATCHED = False
 _SETTLE_REGISTER_PATCHED = False
 _ORIGINAL_REGISTER_GATEWAY_SETTLE: Any = None
+_turn_origin_token_stack: ContextVar[list[Token] | None] = ContextVar(
+    "agent365_turn_origin_token_stack",
+    default=None,
+)
+_DEFAULT_PENDING_TURN_FIFO_MAX = 32
 
 _DEFAULT_PORT = 3978
 
@@ -2078,7 +2089,13 @@ class Agent365Adapter(BasePlatformAdapter):
         # also keeps chats with a live card capability or an open-ended
         # clarify, independent of the session guard.
         self._session_key_to_conv: dict[str, str] = {}
-        self._pending_origin_overflow: dict[str, list[Any]] = {}
+        self._pending_turn_fifo: dict[str, deque[Any]] = {}
+        extra_cfg = getattr(config, "extra", None) or {}
+        try:
+            fifo_max = int(extra_cfg.get("pending_turn_fifo_max", _DEFAULT_PENDING_TURN_FIFO_MAX))
+        except (TypeError, ValueError):
+            fifo_max = _DEFAULT_PENDING_TURN_FIFO_MAX
+        self._pending_turn_fifo_max = max(1, fifo_max)
         self._agent_turn_guards: dict[str, asyncio.Event] = {}
         self._agent_turn_admissions: dict[str, asyncio.Task[Any]] = {}
         self._media_leases_by_session: dict[str, set[Path]] = {}
@@ -3638,6 +3655,8 @@ class Agent365Adapter(BasePlatformAdapter):
             self._disconnect_cleanup_active = True
             self._lifecycle_generation += 1
             self._retire_all_agent_turns()
+            self._pending_messages.clear()
+            self._pending_turn_fifo.clear()
             self._chat_lifecycle_generation.clear()
             http_client = self._http_client
             await self._finalize_keepalive_streams_before_http_teardown()
@@ -3897,7 +3916,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._file_consent_decline_notified.clear()
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
-        self._pending_origin_overflow.clear()
+        self._pending_messages.clear()
+        self._pending_turn_fifo.clear()
+        self._unregister_pending_merge_guard()
         self._agent_turn_guards.clear()
         self._session_key_to_conv.clear()
         self._chat_teardown_tasks.clear()
@@ -4406,22 +4427,22 @@ class Agent365Adapter(BasePlatformAdapter):
         global _MERGE_PENDING_PATCHED, _HERMES_MERGE_PENDING_ORIGINAL
         import gateway.platforms.base as base_mod
 
-        if not _MERGE_PENDING_PATCHED:
+        if getattr(base_mod, "_agent365_merge_pending_original", None) is None:
             original = getattr(base_mod, "merge_pending_message_event", None)
+
+            def _default_merge_pending(
+                pending_messages: dict[str, Any],
+                session_key: str,
+                event: Any,
+                *,
+                merge_text: bool = False,
+            ) -> None:
+                pending_messages[session_key] = event
+
             if original is None:
-
-                def _default_merge_pending(
-                    pending_messages: dict[str, Any],
-                    session_key: str,
-                    event: Any,
-                    *,
-                    merge_text: bool = False,
-                ) -> None:
-                    pending_messages[session_key] = event
-
                 original = _default_merge_pending
                 base_mod.merge_pending_message_event = original
-            _HERMES_MERGE_PENDING_ORIGINAL = original
+            base_mod._agent365_merge_pending_original = original
 
             def guarded(
                 pending_messages: dict[str, Any],
@@ -4430,52 +4451,146 @@ class Agent365Adapter(BasePlatformAdapter):
                 *,
                 merge_text: bool = False,
             ) -> None:
-                adapter = _PENDING_MERGE_REGISTRY.get(id(pending_messages))
+                adapter_ref = _PENDING_MERGE_REGISTRY.get(id(pending_messages))
+                adapter = adapter_ref() if adapter_ref is not None else None
                 if adapter is not None:
-                    adapter._agent365_merge_pending_message_event(
+                    if not adapter._agent365_admit_pending_turn_event(
                         session_key, event, merge_text=merge_text
-                    )
+                    ):
+                        adapter._schedule_pending_turn_queue_full_reply(event, session_key)
                     return
-                _HERMES_MERGE_PENDING_ORIGINAL(
+                base_mod._agent365_merge_pending_original(
                     pending_messages, session_key, event, merge_text=merge_text
                 )
 
             base_mod.merge_pending_message_event = guarded
-            _MERGE_PENDING_PATCHED = True
+
+        _HERMES_MERGE_PENDING_ORIGINAL = base_mod._agent365_merge_pending_original
+        _MERGE_PENDING_PATCHED = True
         pending_messages = getattr(self, "_pending_messages", None)
         if pending_messages is not None:
-            _PENDING_MERGE_REGISTRY[id(pending_messages)] = self
+            key = id(pending_messages)
+            _PENDING_MERGE_REGISTRY[key] = weakref.ref(
+                self,
+                lambda _ref, registry_key=key: _PENDING_MERGE_REGISTRY.pop(registry_key, None),
+            )
 
-    def _agent365_merge_pending_message_event(
+    def _unregister_pending_merge_guard(self) -> None:
+        pending_messages = getattr(self, "_pending_messages", None)
+        if pending_messages is not None:
+            _PENDING_MERGE_REGISTRY.pop(id(pending_messages), None)
+
+    def _pending_turn_fifo_for(self, session_key: str) -> deque[Any]:
+        return self._pending_turn_fifo.setdefault(session_key, deque())
+
+    def _session_turn_dispatch_frozen(self, session_key: str) -> bool:
+        if self._disconnecting or self._disconnect_cleanup_active:
+            return True
+        chat_id = self._session_key_to_conv.get(session_key)
+        if chat_id and str(chat_id) in self._retiring_chats:
+            return True
+        guard = self._agent_turn_guards.get(session_key)
+        return guard is not None and guard.is_set()
+
+    def _clear_session_pending_turn_state(self, session_key: str) -> None:
+        self._pending_messages.pop(session_key, None)
+        self._pending_turn_fifo.pop(session_key, None)
+
+    def _coalesce_adjacent_pending_event(
         self, session_key: str, event: Any, *, merge_text: bool = False
-    ) -> None:
-        existing = self._pending_messages.get(session_key)
-        if existing is not None and not self._pending_turn_origins_compatible(existing, event):
-            self._pending_origin_overflow.setdefault(session_key, []).append(event)
-            return
+    ) -> bool:
         if _HERMES_MERGE_PENDING_ORIGINAL is None:
-            self._pending_messages[session_key] = event
-            return
-        _HERMES_MERGE_PENDING_ORIGINAL(
-            self._pending_messages, session_key, event, merge_text=merge_text
-        )
+            return False
+        fifo = self._pending_turn_fifo.get(session_key)
+        if fifo:
+            if self._pending_turn_origins_compatible(fifo[-1], event):
+                scratch: dict[str, Any] = {"_head": fifo[-1]}
+                _HERMES_MERGE_PENDING_ORIGINAL(scratch, "_head", event, merge_text=merge_text)
+                fifo[-1] = scratch["_head"]
+                return True
+            return False
+        slot = self._pending_messages.get(session_key)
+        if slot is not None and self._pending_turn_origins_compatible(slot, event):
+            _HERMES_MERGE_PENDING_ORIGINAL(
+                self._pending_messages, session_key, event, merge_text=merge_text
+            )
+            return True
+        return False
 
-    async def _promote_origin_pending_overflow(self, session_key: str) -> None:
-        if session_key in self._active_sessions or session_key in self._pending_messages:
-            return
-        overflow = self._pending_origin_overflow.get(session_key)
-        if not overflow:
-            return
-        next_event = overflow.pop(0)
-        if not overflow:
-            self._pending_origin_overflow.pop(session_key, None)
+    def _agent365_admit_pending_turn_event(
+        self, session_key: str, event: Any, *, merge_text: bool = False
+    ) -> bool:
+        if self._session_turn_dispatch_frozen(session_key):
+            return False
+        if self._coalesce_adjacent_pending_event(session_key, event, merge_text=merge_text):
+            return True
+        if session_key not in self._pending_messages and not self._pending_turn_fifo.get(
+            session_key
+        ):
+            if _HERMES_MERGE_PENDING_ORIGINAL is None:
+                self._pending_messages[session_key] = event
+            else:
+                _HERMES_MERGE_PENDING_ORIGINAL(
+                    self._pending_messages, session_key, event, merge_text=merge_text
+                )
+            return True
+        fifo = self._pending_turn_fifo_for(session_key)
+        if len(fifo) >= self._pending_turn_fifo_max:
+            return False
+        fifo.append(event)
+        return True
+
+    def _agent365_promote_fifo_head_to_slot(self, session_key: str) -> bool:
+        if self._session_turn_dispatch_frozen(session_key):
+            return False
+        if session_key in self._pending_messages:
+            return False
+        fifo = self._pending_turn_fifo.get(session_key)
+        if not fifo:
+            return False
+        next_event = fifo.popleft()
+        if not fifo:
+            self._pending_turn_fifo.pop(session_key, None)
         if _HERMES_MERGE_PENDING_ORIGINAL is None:
             self._pending_messages[session_key] = next_event
         else:
             _HERMES_MERGE_PENDING_ORIGINAL(self._pending_messages, session_key, next_event)
-        pending = self._pending_messages.get(session_key)
-        if pending is not None:
-            self._spawn_drain_task(pending, session_key)
+        return True
+
+    def _schedule_pending_turn_queue_full_reply(self, event: Any, session_key: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        reply_task = loop.create_task(self._send_pending_turn_queue_full_reply(event, session_key))
+        reply_task.add_done_callback(lambda _task: None)
+
+    async def _send_pending_turn_queue_full_reply(self, event: Any, session_key: str) -> None:
+        chat_id = self._session_key_to_conv.get(session_key) or self._chat_id_from_processing_event(
+            event
+        )
+        if not chat_id or self._turn_reply_blocked(str(chat_id)):
+            return
+        text = "This conversation is busy with earlier messages. Please try again in a moment."
+        with contextlib.suppress(Exception):
+            await self.send(str(chat_id), text)
+
+    def _agent365_merge_pending_message_event(
+        self, session_key: str, event: Any, *, merge_text: bool = False
+    ) -> None:
+        if not self._agent365_admit_pending_turn_event(session_key, event, merge_text=merge_text):
+            self._schedule_pending_turn_queue_full_reply(event, session_key)
+
+    def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event | None) -> None:
+        if self._session_turn_dispatch_frozen(session_key):
+            self._clear_session_pending_turn_state(session_key)
+            current_task = asyncio.current_task()
+            if current_task is not None and self._session_tasks.get(session_key) is current_task:
+                self._cleanup_finished_session_task(session_key, interrupt_event)
+            return
+        if session_key not in self._pending_messages:
+            self._agent365_promote_fifo_head_to_slot(session_key)
+        super()._finish_session_task(session_key, interrupt_event)
 
     @staticmethod
     def _exec_approval_request_still_pending(session_key: str, request_id: str) -> bool:
@@ -4523,20 +4638,18 @@ class Agent365Adapter(BasePlatformAdapter):
             return
         await super().handle_message(event)
 
+    async def cancel_session_processing(self, session_key: str, **kwargs: Any) -> None:
+        self._clear_session_pending_turn_state(session_key)
+        await super().cancel_session_processing(session_key, **kwargs)
+
     async def _process_message_background(self, event: Any, session_key: str) -> None:
-        origin = self._event_turn_origin(event)
-        if origin is None:
+        if self._event_turn_origin(event) is None:
             logger.warning(
                 "agent365 turn skipped: missing turn origin session_key=%r",
                 session_key,
             )
             return
-        origin_token = _AGENT_TURN_ORIGIN.set(origin)
-        try:
-            await super()._process_message_background(event, session_key)
-        finally:
-            _AGENT_TURN_ORIGIN.reset(origin_token)
-            await self._promote_origin_pending_overflow(session_key)
+        await super()._process_message_background(event, session_key)
 
     def _release_agent_turn_admission(self, admission_key: str) -> None:
         if admission_key:
@@ -5076,6 +5189,11 @@ class Agent365Adapter(BasePlatformAdapter):
             state["written"] = sequence
             if cancelled:
                 raise asyncio.CancelledError()
+        except ConversationSidecarError:
+            logger.warning(
+                "agent365 conversations: save refused for %s (invalid sidecar schema fields)",
+                path,
+            )
         except OSError as e:
             logger.warning(
                 "agent365 conversations: save failed for %s: %s",
@@ -5671,6 +5789,14 @@ class Agent365Adapter(BasePlatformAdapter):
         The keep-alive task is started here, on the session task, and
         posts only after the short-turn window. ``send`` does not await it.
         """
+        origin = self._event_turn_origin(event)
+        if origin is None:
+            logger.warning("agent365 processing start rejected: event has no turn origin")
+        else:
+            origin_token = _AGENT_TURN_ORIGIN.set(origin)
+            stack = list(_turn_origin_token_stack.get() or [])
+            stack.append(origin_token)
+            _turn_origin_token_stack.set(stack)
         chat_id = self._chat_id_from_processing_event(event)
         if chat_id:
             _STREAM_OVERFLOW_RESET_TOKEN.set(self._enter_stream_overflow_limit(chat_id))
@@ -8962,6 +9088,11 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._clear_personal_typing_suppression(chat_id)
                     raise
         finally:
+            stack = list(_turn_origin_token_stack.get() or [])
+            if stack:
+                origin_token = stack.pop()
+                _AGENT_TURN_ORIGIN.reset(origin_token)
+                _turn_origin_token_stack.set(stack)
             if chat_id:
                 buf = self._turn_buffers.get(chat_id)
                 if isinstance(buf, dict):
@@ -14379,6 +14510,7 @@ class Agent365Adapter(BasePlatformAdapter):
             guard: Any,
             prior: Any,
         ) -> dict[str, Any]:
+            self._clear_session_pending_turn_state(session_key)
             if committed is not None:
                 # The fence wait cannot be undone. Cancel the deferred retry
                 # now so it cannot post through ``_send_reply_activity``
@@ -14732,6 +14864,8 @@ class Agent365Adapter(BasePlatformAdapter):
         safe to call unconditionally."""
         current = asyncio.current_task()
 
+        for session_key in self._session_keys_for_chat(chat_id):
+            self._clear_session_pending_turn_state(session_key)
         await self._retire_chat_agent_turns(chat_id)
 
         task_chats: dict[asyncio.Task[Any], str] = {

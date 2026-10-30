@@ -337,6 +337,7 @@ def collect_sidecar_inventory_from_code() -> tuple[dict[str, Any], ...]:
             "schema_version_read": (conv.ConversationRegistry.SCHEMA_VERSION,),
             "missing_version_means": conv.ConversationRegistry.SCHEMA_VERSION,
             "on_disk_version_field": "schema",
+            "schema_version_field": "schemaVersion",
         },
     )
 

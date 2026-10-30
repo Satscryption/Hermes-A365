@@ -184,18 +184,29 @@ class _StubBasePlatformAdapter:
             return
         interrupt_event = self._active_sessions.get(session_key) or asyncio.Event()
         self._active_sessions[session_key] = interrupt_event
+        start_hook = getattr(self, "on_processing_start", None)
+        complete_hook = getattr(self, "on_processing_complete", None)
         try:
+            if callable(start_hook):
+                await start_hook(event)
             await self._message_handler(event)
         finally:
-            drained = False
-            queue = self._pending_messages.get(session_key)
-            if queue is not None and session_key not in self._active_sessions:
-                pending_event = self._pending_messages.pop(session_key, None)
-                if pending_event is not None:
-                    self._spawn_drain_task(pending_event, session_key)
-                    drained = True
-            if not drained and session_key not in self._pending_messages:
-                self._cleanup_finished_session_task(session_key)
+            if callable(complete_hook):
+                with contextlib.suppress(Exception):
+                    await complete_hook(event)
+            self._finish_session_task(session_key, interrupt_event)
+
+    def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event | None) -> None:
+        late_pending = self._pending_messages.pop(session_key, None)
+        current_task = asyncio.current_task()
+        if late_pending is not None:
+            existing_task = self._session_tasks.get(session_key)
+            if existing_task is not None and existing_task is not current_task:
+                self._pending_messages[session_key] = late_pending
+            else:
+                self._spawn_drain_task(late_pending, session_key)
+        elif current_task is not None and self._session_tasks.get(session_key) is current_task:
+            self._cleanup_finished_session_task(session_key)
 
     def _mark_connected(self) -> None:
         self._running = True
@@ -232,6 +243,9 @@ class _StubBasePlatformAdapter:
             task.cancel()
         self._active_sessions.pop(session_key, None)
         self._pending_messages.pop(session_key, None)
+        fifo = getattr(self, "_pending_turn_fifo", None)
+        if isinstance(fifo, dict):
+            fifo.pop(session_key, None)
 
     async def cancel_background_tasks(self) -> None:
         for task in self._session_tasks.values():
@@ -272,7 +286,7 @@ def _import_hermes_bootstrap() -> Any:
     return module
 
 
-def _install_gateway_stubs() -> None:
+def _install_gateway_stubs(*, force: bool = False) -> None:
     with contextlib.suppress(Exception):
         _import_hermes_bootstrap().ensure_hermes_vendor()
     vendor_root = None
@@ -280,13 +294,22 @@ def _install_gateway_stubs() -> None:
         vendor_root = _import_hermes_bootstrap().hermes_vendor_root()
     except Exception:
         vendor_root = None
-    if "gateway.platforms.base" in sys.modules:
+    if force:
+        for name in (
+            "gateway.platforms.base",
+            "gateway.config",
+            "gateway.session",
+            "gateway.platforms",
+            "gateway",
+        ):
+            sys.modules.pop(name, None)
+    elif "gateway.platforms.base" in sys.modules:
         mod = sys.modules["gateway.platforms.base"]
         if getattr(getattr(mod, "BasePlatformAdapter", None), "__module__", "").startswith(
             "gateway.platforms"
         ):
             return
-    if "gateway.platforms.base" in sys.modules:
+    elif "gateway.platforms.base" in sys.modules:
         return
     gateway = types.ModuleType("gateway")
     platforms = types.ModuleType("gateway.platforms")
@@ -26204,19 +26227,6 @@ class TestCardCapabilityTurnOrigin:
             b_posted.set()
             release_a.set()
             await a_task
-
-            if not group_sessions_per_user:
-                for _ in range(12):
-                    if b_done.is_set():
-                        break
-                    for sk in list(adapter._pending_messages.keys()):
-                        pending = adapter._pending_messages.pop(sk, None)
-                        if pending is not None:
-                            await adapter._process_message_background(pending, sk)
-                    for sk in list(adapter._pending_origin_overflow.keys()):
-                        await adapter._promote_origin_pending_overflow(sk)
-                    await asyncio.sleep(0)
-
             await asyncio.wait_for(b_done.wait(), timeout=2.0)
 
         for label in ("exec", "slash", "clarify"):

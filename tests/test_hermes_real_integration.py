@@ -148,7 +148,7 @@ def test_cross_origin_pending_merge_uses_overflow_not_metadata_theft(
     adapter._agent365_merge_pending_message_event(session_key, event_b, merge_text=True)
     adapter._agent365_merge_pending_message_event(session_key, event_a, merge_text=True)
     assert adapter._pending_messages[session_key] is event_b
-    assert adapter._pending_origin_overflow[session_key] == [event_a]
+    assert list(adapter._pending_turn_fifo.get(session_key, [])) == [event_a]
     assert (
         adapter._event_turn_origin(adapter._pending_messages[session_key])["user_id"]
         == _tap.TestCardCapabilityTurnOrigin._USER_B
@@ -256,24 +256,8 @@ async def test_merged_pending_cross_origin_cards_bind_to_correct_users(
         )
         release_a.set()
         await a_task
-
-        async def _flush_pending_turns() -> None:
-            session_key = observed_session_key.get("key", "")
-            if not session_key:
-                raise AssertionError("session key not observed")
-            for _ in range(12):
-                if drain_done.is_set():
-                    return
-                pending = adapter._pending_messages.pop(session_key, None)
-                if pending is not None:
-                    await adapter._process_message_background(pending, session_key)
-                    continue
-                await adapter._promote_origin_pending_overflow(session_key)
-                await asyncio.sleep(0)
-            raise AssertionError("pending turns did not drain")
-
-        await _flush_pending_turns()
-        await asyncio.wait_for(drain_done.wait(), timeout=3.0)
+        await asyncio.wait_for(drain_done.wait(), timeout=5.0)
+        assert observed_session_key.get("key")
 
     assert cards_by_user[tc._USER_B]["slash"].success
     assert cards_by_user[tc._USER_B]["clarify"].success

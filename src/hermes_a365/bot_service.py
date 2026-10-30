@@ -34,10 +34,17 @@ from urllib import error, request
 from urllib.parse import quote, urlparse
 
 from ._common import (
+    SidecarBackupError,
+    SidecarLockError,
+    exclusive_sidecar_lock,
     parse_env,
     quote_path_segment,
     slugify,
+    write_owner_only_bytes_exclusive,
     write_owner_only_text_atomic,
+)
+from ._common import (
+    sidecar_backup_path as _backup_sidecar_path,
 )
 
 SIDECAR_FILENAME = "a365.bot-service.config.json"
@@ -1166,42 +1173,24 @@ def _write_bot_service_config(path: Path, config: BotServiceConfig) -> None:
 
 @contextmanager
 def _exclusive_sidecar_lock(path: Path) -> Iterator[None]:
-    """Serialize every Hermes writer for one Bot Service sidecar."""
-    lock_path = path.with_name(f"{path.name}.lock")
-    flags = os.O_CREAT | os.O_EXCL | os.O_WRONLY
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fd = os.open(lock_path, flags, 0o600)
-    except FileExistsError as exc:
+        with exclusive_sidecar_lock(path):
+            yield
+    except SidecarLockError as exc:
+        lock_path = path.with_name(f"{path.name}.lock")
         raise BotServiceError(
             f"another Bot Service operation holds {lock_path}; refusing before "
             "Azure mutation. If no operation is active, inspect and remove the "
             "stale lock deliberately."
         ) from exc
-    except OSError as exc:
-        raise BotServiceError(f"could not acquire sidecar lock {lock_path}: {exc}") from exc
-    locked_stat = os.fstat(fd)
+
+
+def _write_sidecar_backup(path: Path, snapshot: bytes, *, now: datetime) -> Path:
+    backup = _backup_sidecar_path(path, at=now)
     try:
-        os.write(fd, f"pid={os.getpid()}\n".encode("ascii"))
-        yield
-    finally:
-        os.close(fd)
-        try:
-            current = lock_path.lstat()
-            if (current.st_dev, current.st_ino) == (
-                locked_stat.st_dev,
-                locked_stat.st_ino,
-            ):
-                lock_path.unlink()
-        except FileNotFoundError:
-            pass
-
-
-def _backup_sidecar_path(path: Path, *, now: datetime) -> Path:
-    stamp = now.astimezone(UTC).strftime("%Y%m%d-%H%M%S")
-    if path.name.endswith(".json"):
-        return path.with_name(f"{path.name[:-5]}.backup-{stamp}.json")
-    return path.with_name(f"{path.name}.backup-{stamp}")
+        return write_owner_only_bytes_exclusive(backup, snapshot)
+    except SidecarBackupError as exc:
+        raise BotServiceError(f"could not create sidecar backup beside {path}: {exc}") from exc
 
 
 def _bind_legacy_sidecar(
@@ -1217,8 +1206,8 @@ def _bind_legacy_sidecar(
     if config.schemaVersion == SIDECAR_SCHEMA_VERSION:
         return config
     _validate_legacy_binding_confirmation(config, agent_name=agent_name, confirmation=confirmation)
-    backup = _backup_sidecar_path(path, now=datetime.now(UTC))
-    _write_text_atomic(backup, snapshot.decode("utf-8"), mode=0o600)
+    moment = datetime.now(UTC)
+    backup = _write_sidecar_backup(path, snapshot, now=moment)
     messages.append(f"[apply] backed up legacy sidecar to {backup}")
     messages.append(f"[apply] migrated legacy sidecar binding to agent {agent_name}")
     return BotServiceConfig(
@@ -1885,8 +1874,7 @@ def _apply_cleanup_plan_locked(
             )
         if plan.sidecar_snapshot is None:
             raise BotServiceError("cleanup plan is missing its bound sidecar snapshot")
-        backup = _backup_sidecar_path(inputs.sidecar_path, now=now())
-        _write_text_atomic(backup, plan.sidecar_snapshot.decode("utf-8"), mode=0o600)
+        backup = _write_sidecar_backup(inputs.sidecar_path, plan.sidecar_snapshot, now=now())
         result.sidecar_backup_path = backup
         result.messages.append(f"[apply] backed up sidecar to {backup}")
         result.messages.append(

@@ -23,16 +23,27 @@ fields land in subsequent slices when those surfaces matter.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from hermes_a365._common import (
+    exclusive_sidecar_lock,
+    sidecar_backup_path,
+    sidecar_corrupt_quarantine_path,
+    write_owner_only_bytes_exclusive,
+    write_owner_only_text_atomic,
+)
+from hermes_a365.sidecar_schema import (
+    SidecarSchemaError,
+    validate_conversations_sidecar_schema,
+)
+
 logger = logging.getLogger(__name__)
+
+ConversationSidecarError = SidecarSchemaError
 
 
 @dataclass
@@ -151,10 +162,7 @@ class ConversationRef:
         over-ceiling, so the caller falls back to the flat minimal projection
         (or rejects)."""
         try:
-            return (
-                len(json.dumps(payload, indent=2, sort_keys=True, default=str))
-                <= ceiling
-            )
+            return len(json.dumps(payload, indent=2, sort_keys=True, default=str)) <= ceiling
         except (TypeError, ValueError, RecursionError):
             return False
 
@@ -221,11 +229,7 @@ class ConversationRef:
         raw = cls._project_cached_raw(activity)
         if raw is None:
             sender = activity.get("from") if isinstance(activity.get("from"), dict) else {}
-            recip = (
-                activity.get("recipient")
-                if isinstance(activity.get("recipient"), dict)
-                else {}
-            )
+            recip = activity.get("recipient") if isinstance(activity.get("recipient"), dict) else {}
             logger.warning(
                 "agent365 conversations: identity projection exceeds %d bytes — "
                 "rejecting as unroutable rather than persisting an unbounded "
@@ -282,9 +286,7 @@ class ConversationRegistry:
     def get(self, conversation_id: str) -> ConversationRef | None:
         return self._by_id.get(conversation_id)
 
-    def upsert(
-        self, ref: ConversationRef, *, now: float | None = None
-    ) -> ConversationRef:
+    def upsert(self, ref: ConversationRef, *, now: float | None = None) -> ConversationRef:
         """Insert or merge a ConversationRef. Existing entries' fields
         are kept when the incoming value is empty/None — operators can
         rename a chat without losing the cached `chat_name` on a
@@ -339,9 +341,7 @@ class ConversationRegistry:
         """
         return self._by_id.pop(conversation_id, None) is not None
 
-    def mark_used(
-        self, conversation_id: str, *, now: float | None = None
-    ) -> bool:
+    def mark_used(self, conversation_id: str, *, now: float | None = None) -> bool:
         """Slice 19x-c: bump ``last_used_at`` without touching other fields.
 
         Called from outbound paths (``send``, ``send_typing``, …) so
@@ -450,12 +450,8 @@ class ConversationRegistry:
             return 0
         active = active_conversation_ids or set()
         candidates = sorted(
-            (
-                r
-                for r in self._by_id.values()
-                if not r.pinned and r.conversation_id not in active
-            ),
-            key=lambda r: (r.last_used_at if r.last_used_at is not None else 0.0),
+            (r for r in self._by_id.values() if not r.pinned and r.conversation_id not in active),
+            key=lambda r: r.last_used_at if r.last_used_at is not None else 0.0,
         )
         overflow = len(self._by_id) - max_entries
         to_drop = [r.conversation_id for r in candidates[:overflow]]
@@ -471,6 +467,7 @@ class ConversationRegistry:
     def to_payload(self) -> dict[str, Any]:
         return {
             "schema": self.SCHEMA_VERSION,
+            "schemaVersion": self.SCHEMA_VERSION,
             "conversations": [r.to_dict() for r in self._by_id.values()],
         }
 
@@ -494,9 +491,7 @@ class ConversationRegistry:
         except FileNotFoundError:
             return cls()
         except OSError:
-            logger.warning(
-                "agent365 conversations: registry read failed; starting empty"
-            )
+            logger.warning("agent365 conversations: registry read failed; starting empty")
             return cls()
         try:
             payload = json.loads(raw)
@@ -504,12 +499,12 @@ class ConversationRegistry:
             # RecursionError: a corrupted / hand-edited file nested past the
             # interpreter limit (#105/M11 review). Treat as unparseable — an
             # empty registry beats crashing adapter construction.
-            logger.warning(
-                "agent365 conversations: registry JSON is invalid; starting empty"
-            )
+            logger.warning("agent365 conversations: registry JSON is invalid; starting empty")
             return cls()
         if not isinstance(payload, dict):
+            logger.warning("agent365 conversations: registry JSON is not an object; starting empty")
             return cls()
+        validate_conversations_sidecar_schema(payload)
         return cls.from_payload(payload)
 
     def save(self, path: Path) -> None:
@@ -518,32 +513,48 @@ class ConversationRegistry:
 
     @staticmethod
     def write_payload(path: Path, payload: dict[str, Any]) -> None:
-        """Write a pre-built ``payload`` atomically: tmpfile in same dir →
-        fsync → os.replace (same-dir is required so ``os.replace`` is atomic
-        on POSIX).
-
-        Split out of :meth:`save` so an async caller can build the payload
-        snapshot on the event loop (no concurrent mutation of ``_by_id``) and
-        then run this blocking serialize+write in an executor (#105/M11)."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # NamedTemporaryFile with delete=False so we can rename outside
-        # the with-block.
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-            encoding="utf-8",
-        ) as tmp:
-            json.dump(payload, tmp, indent=2, sort_keys=True)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
-        try:
-            os.replace(tmp_path, path)
-        except OSError:
-            # Best-effort: drop the tmpfile if the rename failed.
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
-            raise
+        """Write ``payload`` under an exclusive lock with backup-first stamping."""
+        validate_conversations_sidecar_schema(payload)
+        text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        with exclusive_sidecar_lock(path):
+            snapshot = b""
+            raw_on_disk: dict[str, Any] | None = None
+            recheck: dict[str, Any] | None = None
+            if path.is_file():
+                snapshot = path.read_bytes()
+                try:
+                    parsed = json.loads(snapshot)
+                except (json.JSONDecodeError, RecursionError):
+                    quarantine = sidecar_corrupt_quarantine_path(path)
+                    write_owner_only_bytes_exclusive(quarantine, snapshot)
+                    logger.warning(
+                        "agent365 conversations: quarantined invalid JSON at %s to %s",
+                        path,
+                        quarantine,
+                    )
+                    write_owner_only_text_atomic(path, text)
+                    return
+                if not isinstance(parsed, dict):
+                    quarantine = sidecar_corrupt_quarantine_path(path)
+                    write_owner_only_bytes_exclusive(quarantine, snapshot)
+                    logger.warning(
+                        "agent365 conversations: quarantined non-object JSON at %s to %s",
+                        path,
+                        quarantine,
+                    )
+                    write_owner_only_text_atomic(path, text)
+                    return
+                raw_on_disk = parsed
+                validate_conversations_sidecar_schema(raw_on_disk)
+                recheck = json.loads(path.read_bytes())
+                validate_conversations_sidecar_schema(recheck)
+            if (
+                snapshot
+                and raw_on_disk is not None
+                and recheck is not None
+                and "schemaVersion" not in raw_on_disk
+                and "schemaVersion" not in recheck
+            ):
+                backup = sidecar_backup_path(path)
+                write_owner_only_bytes_exclusive(backup, snapshot)
+            write_owner_only_text_atomic(path, text)
