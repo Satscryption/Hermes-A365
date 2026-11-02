@@ -14,6 +14,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   [#86](https://github.com/Satscryption/Hermes-A365/issues/86).
   Exec-approval cards expire when their bound request is no longer pending.
 
+### Fixed
+
+- Retain bridge delivery state across inbound retries so a definitely unsent reply
+  can be retried without calling the operator webhook again. Ambiguous and terminal
+  reply outcomes stop further sends; cached replies have payload and attempt limits.
+
 ## [0.9.6] — 2026-11-02
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),

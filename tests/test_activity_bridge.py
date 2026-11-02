@@ -3715,8 +3715,13 @@ class TestServeApp:
         assert "?" not in after
         assert "#" not in after
 
-    @pytest.mark.parametrize("reply_status", [401, 500])
-    def test_message_reply_post_failure_does_not_report_replied(self, reply_status: int) -> None:
+    @pytest.mark.parametrize(
+        ("reply_status", "expected_code", "expected_status"),
+        [(401, 502, "reply_failed"), (500, 200, "reply_unconfirmed")],
+    )
+    def test_message_reply_post_failure_does_not_report_replied(
+        self, reply_status: int, expected_code: int, expected_status: str
+    ) -> None:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         body = "microsoft rejected the reply"
@@ -3730,9 +3735,9 @@ class TestServeApp:
         ) as client:
             r = client.post("/api/messages", json=_inbound_message_activity())
 
-        assert r.status_code == 502
+        assert r.status_code == expected_code
         payload = r.json()
-        assert payload == {"status": "reply_failed"}
+        assert payload == {"status": expected_status}
         assert f"HTTP {reply_status}" not in r.text
         assert body not in r.text
         assert len(capture["reply"]) == 1
@@ -3751,8 +3756,8 @@ class TestServeApp:
         ) as client:
             r = client.post("/api/messages", json=_inbound_message_activity())
 
-        assert r.status_code == 502
-        assert r.json() == {"status": "reply_failed"}
+        assert r.status_code == 200
+        assert r.json() == {"status": "reply_unconfirmed"}
         assert "x" not in r.text
 
     def test_message_with_card_response(self) -> None:
@@ -3987,6 +3992,9 @@ class TestIdempotencyCache:
         cache = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
         assert cache.is_duplicate("a", now=100.0) is False
         assert cache.is_duplicate("b", now=101.0) is False
+        # Only completed tombstones may be evicted; pending work is protected.
+        cache.complete("a")
+        cache.complete("b")
         assert cache.is_duplicate("c", now=102.0) is False
         assert len(cache.seen) == 2
         # The oldest entry was evicted, so it is admitted as new.
