@@ -12786,15 +12786,19 @@ class Agent365Adapter(BasePlatformAdapter):
         # mismatched user must not be able to invalidate the owner's card.
         if kind == _CARD_KIND_EXEC_APPROVAL:
             session_key = str(capability["resolver"].get("session_key") or "")
+            list_ok = True
             try:
                 pending_ids = {
                     entry.get("request_id") for entry in self._gw_list_approvals(session_key)
                 }
             except Exception:
+                list_ok = False
                 pending_ids = set()
             if capability["resolver"]["request_id"] not in pending_ids:
                 self._card_capabilities.pop(nonce, None)
-                for other_nonce, other in list(self._card_capabilities.items()):
+                # Prune sibling cards only from a list that was actually read;
+                # an unreadable list says nothing about the other requests.
+                for other_nonce, other in list(self._card_capabilities.items()) if list_ok else []:
                     if (
                         other.get("kind") == _CARD_KIND_EXEC_APPROVAL
                         and other["resolver"].get("session_key") == session_key

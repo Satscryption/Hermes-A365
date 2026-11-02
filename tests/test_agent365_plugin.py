@@ -25643,8 +25643,9 @@ class TestInteractiveCards:
         resolver.assert_not_called()
         assert pending == [{"request_id": "request-b", "command": "later"}]
         assert cards["clicked"]["capability"] not in a._card_capabilities
-        assert cards["stale"]["capability"] not in a._card_capabilities
-        assert (cards["live"]["capability"] in a._card_capabilities) == (not unavailable)
+        # An unreadable list must not prune siblings; a readable one prunes stale ones.
+        assert (cards["stale"]["capability"] in a._card_capabilities) == unavailable
+        assert cards["live"]["capability"] in a._card_capabilities
         assert cards["other_session"]["capability"] in a._card_capabilities
         assert cards["other_kind"]["capability"] in a._card_capabilities
         assert "agent365 exec_approval: request no longer pending" in caplog.messages
