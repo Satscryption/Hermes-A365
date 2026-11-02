@@ -546,8 +546,31 @@ def _is_guid(value: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_GRAPH_JSON_MAX_DEPTH = 64
+
+
+def _json_depth_exceeds(data: Any, limit: int) -> bool:
+    """Iteratively check container nesting (no recursion, any interpreter)."""
+    stack: list[tuple[Any, int]] = [(data, 1)]
+    while stack:
+        node, depth = stack.pop()
+        if isinstance(node, dict):
+            children = node.values()
+        elif isinstance(node, list):
+            children = node
+        else:
+            continue
+        if depth > limit:
+            return True
+        stack.extend((child, depth + 1) for child in children)
+    return False
+
+
 def _parse_strict_graph_json_object(text: str) -> dict[str, Any] | None:
-    """Parse a Graph body as one complete top-level JSON object."""
+    """Parse a Graph body as one complete top-level JSON object.
+
+    Nesting is bounded explicitly: newer interpreters can decode very deep
+    input without ``RecursionError``, so that error alone is not a limit."""
     stripped = text.strip()
     if not stripped:
         return None
@@ -555,7 +578,9 @@ def _parse_strict_graph_json_object(text: str) -> dict[str, Any] | None:
         data = json.loads(stripped)
     except (json.JSONDecodeError, ValueError, RecursionError):
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict) or _json_depth_exceeds(data, _GRAPH_JSON_MAX_DEPTH):
+        return None
+    return data
 
 
 def _unreadable_graph_expiry_payload() -> dict[str, Any]:
