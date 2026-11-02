@@ -25643,8 +25643,9 @@ class TestInteractiveCards:
         resolver.assert_not_called()
         assert pending == [{"request_id": "request-b", "command": "later"}]
         assert cards["clicked"]["capability"] not in a._card_capabilities
-        assert cards["stale"]["capability"] not in a._card_capabilities
-        assert (cards["live"]["capability"] in a._card_capabilities) == (not unavailable)
+        # An unreadable list must not prune siblings; a readable one prunes stale ones.
+        assert (cards["stale"]["capability"] in a._card_capabilities) == unavailable
+        assert cards["live"]["capability"] in a._card_capabilities
         assert cards["other_session"]["capability"] in a._card_capabilities
         assert cards["other_kind"]["capability"] in a._card_capabilities
         assert "agent365 exec_approval: request no longer pending" in caplog.messages
@@ -25714,6 +25715,35 @@ class TestInteractiveCards:
         send_reply.assert_not_awaited()
         resolver.assert_not_called()
         assert not a._card_capabilities
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_failed_send_leaves_request_unbound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial: gateway queue and connector I/O are mocked."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        _pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        client = a._http_client
+        a._http_client = None
+
+        failed = await a.send_exec_approval("conv-1", "danger", "sess-1")
+
+        assert failed.success is False
+        assert a._card_capabilities == {}
+        send_reply.assert_not_awaited()
+
+        a._http_client = client
+        retried = await a.send_exec_approval("conv-1", "danger", "sess-1")
+
+        assert retried.success is True
+        send_reply.assert_awaited_once()
+        assert {cap["resolver"]["request_id"] for cap in a._card_capabilities.values()} == {
+            "request-a"
+        }
+        resolver.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_exec_approval_new_card_drops_stale_session_capability(
