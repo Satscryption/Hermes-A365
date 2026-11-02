@@ -23,16 +23,66 @@ fields land in subsequent slices when those surfaces matter.
 
 from __future__ import annotations
 
-import contextlib
 import json
 import logging
-import os
-import tempfile
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar
 
+from hermes_a365._common import (
+    SidecarBackupError,
+    exclusive_sidecar_lock,
+    sidecar_backup_path,
+    sidecar_corrupt_quarantine_path,
+    write_owner_only_bytes_exclusive,
+    write_owner_only_text_atomic,
+)
+from hermes_a365.sidecar_schema import (
+    SidecarSchemaError,
+    validate_conversations_sidecar_schema,
+)
+
 logger = logging.getLogger(__name__)
+
+ConversationSidecarError = SidecarSchemaError
+
+
+def _strict_sidecar_utf8(data: bytes) -> tuple[bool, str]:
+    """Return ``(invalid, text)``; ``text`` is cleared when invalid."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return True, ""
+    if text.encode("utf-8") != data or "\x00" in text:
+        return True, ""
+    return False, text
+
+
+def _quarantine_corrupt_sidecar(
+    path: Path,
+    *,
+    corrupt_bytes: bytes,
+    replacement_text: str,
+    log_kind: str,
+) -> None:
+    payload = corrupt_bytes
+    corrupt_bytes = b""
+    quarantine = sidecar_corrupt_quarantine_path(path)
+    publish_error: SidecarBackupError | None = None
+    try:
+        published = write_owner_only_bytes_exclusive(quarantine, payload)
+    except SidecarBackupError as exc:
+        publish_error = SidecarBackupError(str(exc))
+    payload = b""
+    if publish_error is not None:
+        raise publish_error
+    logger.warning(
+        "agent365 conversations: quarantined %s at %s to %s",
+        log_kind,
+        path,
+        published,
+    )
+    write_owner_only_text_atomic(path, replacement_text)
 
 
 @dataclass
@@ -151,10 +201,7 @@ class ConversationRef:
         over-ceiling, so the caller falls back to the flat minimal projection
         (or rejects)."""
         try:
-            return (
-                len(json.dumps(payload, indent=2, sort_keys=True, default=str))
-                <= ceiling
-            )
+            return len(json.dumps(payload, indent=2, sort_keys=True, default=str)) <= ceiling
         except (TypeError, ValueError, RecursionError):
             return False
 
@@ -221,11 +268,7 @@ class ConversationRef:
         raw = cls._project_cached_raw(activity)
         if raw is None:
             sender = activity.get("from") if isinstance(activity.get("from"), dict) else {}
-            recip = (
-                activity.get("recipient")
-                if isinstance(activity.get("recipient"), dict)
-                else {}
-            )
+            recip = activity.get("recipient") if isinstance(activity.get("recipient"), dict) else {}
             logger.warning(
                 "agent365 conversations: identity projection exceeds %d bytes — "
                 "rejecting as unroutable rather than persisting an unbounded "
@@ -282,9 +325,7 @@ class ConversationRegistry:
     def get(self, conversation_id: str) -> ConversationRef | None:
         return self._by_id.get(conversation_id)
 
-    def upsert(
-        self, ref: ConversationRef, *, now: float | None = None
-    ) -> ConversationRef:
+    def upsert(self, ref: ConversationRef, *, now: float | None = None) -> ConversationRef:
         """Insert or merge a ConversationRef. Existing entries' fields
         are kept when the incoming value is empty/None — operators can
         rename a chat without losing the cached `chat_name` on a
@@ -339,9 +380,7 @@ class ConversationRegistry:
         """
         return self._by_id.pop(conversation_id, None) is not None
 
-    def mark_used(
-        self, conversation_id: str, *, now: float | None = None
-    ) -> bool:
+    def mark_used(self, conversation_id: str, *, now: float | None = None) -> bool:
         """Slice 19x-c: bump ``last_used_at`` without touching other fields.
 
         Called from outbound paths (``send``, ``send_typing``, …) so
@@ -450,12 +489,8 @@ class ConversationRegistry:
             return 0
         active = active_conversation_ids or set()
         candidates = sorted(
-            (
-                r
-                for r in self._by_id.values()
-                if not r.pinned and r.conversation_id not in active
-            ),
-            key=lambda r: (r.last_used_at if r.last_used_at is not None else 0.0),
+            (r for r in self._by_id.values() if not r.pinned and r.conversation_id not in active),
+            key=lambda r: r.last_used_at if r.last_used_at is not None else 0.0,
         )
         overflow = len(self._by_id) - max_entries
         to_drop = [r.conversation_id for r in candidates[:overflow]]
@@ -471,6 +506,7 @@ class ConversationRegistry:
     def to_payload(self) -> dict[str, Any]:
         return {
             "schema": self.SCHEMA_VERSION,
+            "schemaVersion": self.SCHEMA_VERSION,
             "conversations": [r.to_dict() for r in self._by_id.values()],
         }
 
@@ -490,26 +526,29 @@ class ConversationRegistry:
         """Read the registry from disk. Returns an empty registry if
         the file doesn't exist, isn't readable, or doesn't parse."""
         try:
-            raw = path.read_text()
+            raw = path.read_bytes()
         except FileNotFoundError:
             return cls()
         except OSError:
-            logger.warning(
-                "agent365 conversations: registry read failed; starting empty"
-            )
+            logger.warning("agent365 conversations: registry read failed; starting empty")
             return cls()
         try:
-            payload = json.loads(raw)
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            logger.warning("agent365 conversations: registry is not valid UTF-8; starting empty")
+            return cls()
+        try:
+            payload = json.loads(text)
         except (json.JSONDecodeError, RecursionError):
             # RecursionError: a corrupted / hand-edited file nested past the
             # interpreter limit (#105/M11 review). Treat as unparseable — an
             # empty registry beats crashing adapter construction.
-            logger.warning(
-                "agent365 conversations: registry JSON is invalid; starting empty"
-            )
+            logger.warning("agent365 conversations: registry JSON is invalid; starting empty")
             return cls()
         if not isinstance(payload, dict):
+            logger.warning("agent365 conversations: registry JSON is not an object; starting empty")
             return cls()
+        validate_conversations_sidecar_schema(payload)
         return cls.from_payload(payload)
 
     def save(self, path: Path) -> None:
@@ -518,32 +557,109 @@ class ConversationRegistry:
 
     @staticmethod
     def write_payload(path: Path, payload: dict[str, Any]) -> None:
-        """Write a pre-built ``payload`` atomically: tmpfile in same dir →
-        fsync → os.replace (same-dir is required so ``os.replace`` is atomic
-        on POSIX).
-
-        Split out of :meth:`save` so an async caller can build the payload
-        snapshot on the event loop (no concurrent mutation of ``_by_id``) and
-        then run this blocking serialize+write in an executor (#105/M11)."""
-        path.parent.mkdir(parents=True, exist_ok=True)
-        # NamedTemporaryFile with delete=False so we can rename outside
-        # the with-block.
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            dir=str(path.parent),
-            prefix=f".{path.name}.",
-            suffix=".tmp",
-            delete=False,
-            encoding="utf-8",
-        ) as tmp:
-            json.dump(payload, tmp, indent=2, sort_keys=True)
-            tmp.flush()
-            os.fsync(tmp.fileno())
-            tmp_path = Path(tmp.name)
-        try:
-            os.replace(tmp_path, path)
-        except OSError:
-            # Best-effort: drop the tmpfile if the rename failed.
-            with contextlib.suppress(OSError):
-                tmp_path.unlink()
-            raise
+        """Write ``payload`` under an exclusive lock with backup-first stamping."""
+        validate_conversations_sidecar_schema(payload)
+        text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+        with exclusive_sidecar_lock(path):
+            snapshot = b""
+            raw_on_disk: dict[str, Any] | None = None
+            recheck: dict[str, Any] | None = None
+            if path.is_file():
+                snapshot = path.read_bytes()
+                invalid_utf8, decoded = _strict_sidecar_utf8(snapshot)
+                if invalid_utf8:
+                    quarantine_bytes = snapshot
+                    snapshot = b""
+                    decoded = ""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid UTF-8",
+                        )
+                    finally:
+                        quarantine_bytes = b""
+                    return
+                invalid_snapshot_json = False
+                try:
+                    parsed = json.loads(decoded)
+                except (json.JSONDecodeError, RecursionError):
+                    invalid_snapshot_json = True
+                decoded = ""
+                if invalid_snapshot_json:
+                    quarantine_bytes = snapshot
+                    snapshot = b""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid JSON",
+                        )
+                    finally:
+                        quarantine_bytes = b""
+                    return
+                if not isinstance(parsed, dict):
+                    quarantine_bytes = snapshot
+                    snapshot = b""
+                    parsed = None
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="non-object JSON",
+                        )
+                    finally:
+                        quarantine_bytes = b""
+                    return
+                raw_on_disk = parsed
+                validate_conversations_sidecar_schema(raw_on_disk)
+                recheck_bytes = path.read_bytes()
+                invalid_recheck, recheck_text = _strict_sidecar_utf8(recheck_bytes)
+                if invalid_recheck:
+                    quarantine_bytes = recheck_bytes
+                    recheck_bytes = b""
+                    recheck_text = ""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid UTF-8",
+                        )
+                    finally:
+                        quarantine_bytes = b""
+                    return
+                invalid_recheck_json = False
+                try:
+                    recheck = json.loads(recheck_text)
+                except (json.JSONDecodeError, RecursionError):
+                    invalid_recheck_json = True
+                recheck_text = ""
+                if invalid_recheck_json:
+                    quarantine_bytes = recheck_bytes
+                    recheck_bytes = b""
+                    try:
+                        _quarantine_corrupt_sidecar(
+                            path,
+                            corrupt_bytes=quarantine_bytes,
+                            replacement_text=text,
+                            log_kind="invalid JSON",
+                        )
+                    finally:
+                        quarantine_bytes = b""
+                    return
+                recheck_bytes = b""
+                validate_conversations_sidecar_schema(recheck)
+            if (
+                snapshot
+                and raw_on_disk is not None
+                and recheck is not None
+                and "schemaVersion" not in raw_on_disk
+                and "schemaVersion" not in recheck
+            ):
+                backup = sidecar_backup_path(path)
+                write_owner_only_bytes_exclusive(backup, snapshot)
+            write_owner_only_text_atomic(path, text)

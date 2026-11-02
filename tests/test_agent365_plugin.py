@@ -6157,10 +6157,10 @@ class TestConversationRegistry:
 
         path = tmp_path / "sensitive-profile-name.json"
 
-        def _fail_read(_path: Path) -> str:
+        def _fail_read(_self: Path) -> bytes:
             raise OSError("sensitive-read-error")
 
-        monkeypatch.setattr(Path, "read_text", _fail_read)
+        monkeypatch.setattr(Path, "read_bytes", _fail_read)
         caplog.set_level("WARNING")
 
         reg = ConversationRegistry.load(path)
@@ -7792,6 +7792,7 @@ class TestEditMessage:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-G-buf", activity_id="act-1")
         inbound["conversation"]["conversationType"] = "groupChat"
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         post_mock = self._wire_adapter(a, inbound=inbound)
         self._patch_token_mint(monkeypatch)
         a._handoff_link_enabled = True
@@ -23718,6 +23719,7 @@ class TestInvokeRoute:
                     "oid": "claim-oid",
                     "tid": "claim-tid",
                     "preferred_username": "u@x",
+                    "scp": "User.Read",
                 }
             ),
         )
@@ -24495,6 +24497,7 @@ class TestOutboundFiles:
             "name": f.name,
             "size": len(raw) if size is None else size,
             "sha256": hashlib.sha256(raw).hexdigest() if sha256 is None else sha256,
+            "card_activity_id": "consent-card-activity-1",
             "conversation_id": conv_id,
             "user_id": user_id,
             "service_url": service_url,
@@ -24680,6 +24683,119 @@ class TestOutboundFiles:
     # ── inbound: fileConsent/invoke handler ───────────────────────────────
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["accept", "decline"])
+    async def test_consent_unknown_never_deletes_or_acquires_token(
+        self, monkeypatch: pytest.MonkeyPatch, action: str
+    ) -> None:
+        """Partial: harness and connector I/O are mocked; the handler runs for real."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        token = AsyncMock(return_value=("token", "B"))
+        monkeypatch.setattr(adapter_mod._import_bridge(), "acquire_reply_token", token)
+        activity = self._consent_activity(action=action, consent_id="unknown")
+        activity["replyToId"] = "another-activity"
+
+        resp = await a._handle_file_consent(activity, validated_path="B")
+        assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
+        a._http_client.delete.assert_not_awaited()
+        token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("validated_path", ["B", None])
+    @pytest.mark.parametrize("card_id", ["adapter-card", ""])
+    async def test_consent_cleanup_uses_sent_card_and_explicit_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        validated_path: str | None,
+        card_id: str,
+    ) -> None:
+        """Partial: mocked connector I/O; real send, pending state and consent handler."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        inbound = _make_inbound()
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        bridge = adapter_mod._import_bridge()
+        response = MagicMock()
+        response.json.return_value = {"id": card_id}
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=response))
+        token = AsyncMock(return_value=("token", "B"))
+        monkeypatch.setattr(bridge, "acquire_reply_token", token)
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        f = tmp_path / "consent.pdf"
+        f.write_bytes(b"pdf")
+        sent = await a.send_document("conv-1", str(f))
+        assert sent.success
+        pending = a._pending_file_uploads[sent.message_id]
+        # No registry ref remains; the body still carries Path A agentic fields.
+        a._conversations._by_id.clear()
+        activity = self._consent_activity(consent_id=sent.message_id)
+        activity["replyToId"] = "another-activity"
+        assert activity["recipient"]["agenticAppId"]
+        assert "conv-1" not in a._conversations
+        # Missing uploadInfo exercises cleanup without changing the upload path.
+        resp = await a._handle_file_consent(activity, validated_path=validated_path)
+        assert resp.status == 200
+        a._http_client.delete.assert_not_awaited()  # cleanup stays post-ack
+        await a._drain_file_consent_upload_tasks()
+
+        if validated_path is None or not card_id:
+            a._http_client.delete.assert_not_awaited()
+            token.assert_not_awaited()
+        else:
+            a._http_client.delete.assert_awaited_once()
+            assert a._http_client.delete.await_args.args[0].endswith("/activities/adapter-card")
+            token.assert_awaited_once()
+            assert token.await_args.kwargs["validated_path"] == "B"
+        assert pending["card_activity_id"] == card_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action, expired", [("accept", False), ("accept", True), ("decline", True)]
+    )
+    @pytest.mark.parametrize("binding", ["conversation", "from", "serviceUrl"])
+    async def test_consent_binding_mismatch_keeps_pending_without_cleanup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        action: str,
+        binding: str,
+        expired: bool,
+    ) -> None:
+        """Partial: mocked connector I/O; real offer and mismatched consent handling."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
+        bridge = adapter_mod._import_bridge()
+        response = MagicMock()
+        response.json.return_value = {"id": "adapter-card"}
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=response))
+        token = AsyncMock(return_value=("token", "B"))
+        monkeypatch.setattr(bridge, "acquire_reply_token", token)
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        f = tmp_path / "bound.pdf"
+        f.write_bytes(b"pdf")
+        sent = await a.send_document("conv-1", str(f))
+        assert sent.success
+        pending = a._pending_file_uploads[sent.message_id]
+        if expired:
+            a._lifecycle_generation += 1
+        activity = self._consent_activity(action=action, consent_id=sent.message_id)
+        if binding == "serviceUrl":
+            activity[binding] = "https://other.example/"
+        else:
+            activity[binding]["id"] = "other"
+
+        resp = await a._handle_file_consent(activity, validated_path="B")
+        assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
+        assert a._pending_file_uploads[sent.message_id] is pending
+        a._http_client.delete.assert_not_awaited()
+        token.assert_not_awaited()
+
+    @pytest.mark.asyncio
     async def test_handle_consent_accept_uploads_and_sends_info_card(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -24785,7 +24901,7 @@ class TestOutboundFiles:
         self._connect(a)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
-        a._pending_file_uploads["c1"] = {"path": str(f), "name": "x.pdf"}
+        self._seed_pending(a, f)
         a._http_client.put = AsyncMock()
         a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
         bridge = adapter_mod._import_bridge()
@@ -24917,7 +25033,7 @@ class TestOutboundFiles:
         )
         assert resp.status == 200
         assert a._http_client.put.await_count == 0
-        assert "c1" not in a._pending_file_uploads
+        assert "c1" in a._pending_file_uploads
 
     @pytest.mark.asyncio
     async def test_handle_consent_upload_http_error_still_acks(
@@ -25022,7 +25138,7 @@ class TestOutboundFiles:
             upload_info={"uploadUrl": self._GOOD_UPLOAD}, conv_id="conv-OTHER"
         )
         await self._accept_and_assert_no_put(a, monkeypatch, act)
-        assert "c1" not in a._pending_file_uploads  # spent even on refusal
+        assert "c1" in a._pending_file_uploads
 
     @pytest.mark.asyncio
     async def test_accept_offhost_upload_url_refused(
@@ -25305,6 +25421,30 @@ class TestFeedbackAndCitations:
 
 
 class TestInteractiveCards:
+    @staticmethod
+    def _approval_queue(
+        monkeypatch: pytest.MonkeyPatch, a: Any
+    ) -> tuple[list[dict[str, str]], MagicMock]:
+        """Partial gateway seam: snapshots and atomic, request-scoped FIFO resolution."""
+        pending = [{"request_id": "request-a", "command": "danger"}]
+
+        def list_pending(session_key: str) -> list[dict[str, str]]:
+            assert session_key == "sess-1"
+            return [dict(entry) for entry in pending]
+
+        def resolve(session_key: str, choice: str, *, request_id: str | None = None) -> int:
+            assert session_key == "sess-1"
+            for index, entry in enumerate(pending):
+                if request_id is None or entry.get("request_id") == request_id:
+                    pending.pop(index)
+                    return 1
+            return 0
+
+        resolver = MagicMock(side_effect=resolve)
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending, raising=False)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        return pending, resolver
+
     def _connect(self, a: Any) -> None:
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
@@ -25315,8 +25455,10 @@ class TestInteractiveCards:
 
     @pytest.mark.asyncio
     async def test_send_exec_approval_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Partial: gateway queue and connector I/O are mocked; the card is minted for real."""
         a = _make_adapter(monkeypatch)
         self._connect(a)
+        self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -25332,7 +25474,7 @@ class TestInteractiveCards:
         )
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
         assert list(capability["choices"].values()) == ["once", "session", "always", "deny"]
-        assert capability["resolver"] == {"session_key": "sess-1"}
+        assert capability["resolver"] == {"session_key": "sess-1", "request_id": "request-a"}
         assert all(act["data"]["hermes_kind"] == "exec_approval" for act in actions)
         assert all("session_key" not in act["data"] for act in actions)
         # A system approval card is NOT AI-generated content — no #73(a) entity.
@@ -25342,8 +25484,10 @@ class TestInteractiveCards:
     async def test_delayed_approval_card_cannot_survive_chat_teardown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Partial: gateway queue and delayed connector I/O are mocked."""
         a = _make_adapter(monkeypatch)
         self._connect(a)
+        self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         started = asyncio.Event()
         release = asyncio.Event()
@@ -25355,19 +25499,23 @@ class TestInteractiveCards:
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply))
         send = asyncio.create_task(a.send_exec_approval("conv-1", "danger", "sess-1"))
         await started.wait()
+        capability = next(iter(a._card_capabilities.values()))
         await a._teardown_chat_state("conv-1")
         release.set()
         result = await asyncio.wait_for(send, timeout=0.5)
 
         assert result.success is False
         assert a._card_capabilities == {}
+        assert capability["resolver"]["request_id"] == "request-a"
 
     @pytest.mark.asyncio
     async def test_delivered_approval_is_rejected_after_chat_teardown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Partial: gateway queue and connector I/O are mocked."""
         a = _make_adapter(monkeypatch)
         self._connect(a)
+        self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -25378,12 +25526,274 @@ class TestInteractiveCards:
         value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
             "data"
         ]
+        capability = a._card_capabilities[value["capability"]]
 
         await a._teardown_chat_state("conv-1")
         response = await a._handle_card_action(_make_inbound(), value)
 
         assert response.status_code == 403
         resolver.assert_not_called()
+        assert capability["resolver"]["request_id"] == "request-a"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", ["Approve once", "Deny"])
+    @pytest.mark.parametrize("retirement", ["completed", "timed_out", "cancelled", "replaced"])
+    async def test_exec_approval_stale_card_cannot_resolve_next_request(
+        self, monkeypatch: pytest.MonkeyPatch, choice: str, retirement: str
+    ) -> None:
+        """Partial: mocked gateway queue retires A without another card send."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        sent = await a.send_exec_approval("conv-1", "danger", "sess-1")
+        assert sent.success
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
+        value = next(action["data"] for action in actions if action["title"] == choice)
+        generations = (a._lifecycle_generation, a._chat_generation("conv-1"))
+        if retirement == "completed":
+            assert resolver("sess-1", "deny", request_id="request-a") == 1
+        else:
+            pending.pop(0)
+        if retirement == "replaced":
+            pending.append({"request_id": "request-b", "command": "later"})
+        remaining = [dict(entry) for entry in pending]
+        resolver.reset_mock()
+
+        resp = await a._handle_card_action(_make_inbound(), value)
+        assert resp.status_code == 200
+        assert json.loads(resp.body) == {"status": "card_action", "kind": "exec_approval"}
+        assert pending == remaining
+        resolver.assert_not_called()
+        assert value["capability"] not in a._card_capabilities
+        assert generations == (a._lifecycle_generation, a._chat_generation("conv-1"))
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_replacement_card_resolves_only_replacement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        first = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
+        pending[:] = [{"request_id": "request-b", "command": "replacement"}]
+        assert (await a.send_exec_approval("conv-1", "replacement", "sess-1")).success
+        second = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
+        list_pending = MagicMock(wraps=a._gw_list_approvals)
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending)
+
+        assert first["capability"] not in a._card_capabilities
+        stale = await a._handle_card_action(_make_inbound(), first)
+        assert stale.status_code == 403
+        resolver.assert_not_called()
+        list_pending.assert_not_called()
+        assert pending == [{"request_id": "request-b", "command": "replacement"}]
+        assert second["capability"] in a._card_capabilities
+
+        accepted = await a._handle_card_action(_make_inbound(), second)
+        assert accepted.status_code == 200
+        list_pending.assert_called_once_with("sess-1")
+        resolver.assert_called_once_with("sess-1", "once", request_id="request-b")
+        assert pending == []
+        assert second["capability"] not in a._card_capabilities
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unavailable", [False, True])
+    async def test_exec_approval_stale_click_prunes_session_capabilities(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, unavailable: bool
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        cards = {}
+        for name, kind, session_key, request_id in (
+            ("clicked", "exec_approval", "sess-1", "request-a"),
+            ("stale", "exec_approval", "sess-1", "stale-request"),
+            ("live", "exec_approval", "sess-1", "request-b"),
+            ("other_session", "exec_approval", "sess-2", "stale-request"),
+            ("other_kind", "slash_confirm", "sess-1", "stale-request"),
+        ):
+            cards[name] = a._mint_card_capability_actions(
+                "conv-1",
+                kind,
+                [("Approve once", "once")],
+                {"session_key": session_key, "request_id": request_id},
+            )[0][1]
+        pending[:] = [{"request_id": "request-b", "command": "later"}]
+        list_pending = MagicMock(
+            side_effect=RuntimeError("queue unavailable") if unavailable else None,
+            return_value=[dict(entry) for entry in pending],
+        )
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending)
+
+        with caplog.at_level("INFO", logger=adapter_mod.logger.name):
+            response = await a._handle_card_action(_make_inbound(), cards["clicked"])
+
+        assert response.status_code == 200
+        assert json.loads(response.body) == {"status": "card_action", "kind": "exec_approval"}
+        list_pending.assert_called_once_with("sess-1")
+        resolver.assert_not_called()
+        assert pending == [{"request_id": "request-b", "command": "later"}]
+        assert cards["clicked"]["capability"] not in a._card_capabilities
+        # An unreadable list must not prune siblings; a readable one prunes stale ones.
+        assert (cards["stale"]["capability"] in a._card_capabilities) == unavailable
+        assert cards["live"]["capability"] in a._card_capabilities
+        assert cards["other_session"]["capability"] in a._card_capabilities
+        assert cards["other_kind"]["capability"] in a._card_capabilities
+        assert "agent365 exec_approval: request no longer pending" in caplog.messages
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["empty", "ambiguous", "missing_id", "already_bound"])
+    async def test_exec_approval_prunes_stale_capabilities_before_unique_request_check(
+        self, monkeypatch: pytest.MonkeyPatch, state: str
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        stale = next(iter(a._card_capabilities))
+        pending.clear()
+        if state in {"ambiguous", "already_bound"}:
+            pending.append({"request_id": "request-b", "command": "later"})
+            if state == "ambiguous":
+                pending.append({"request_id": "request-c", "command": "another"})
+            else:
+                a._mint_card_capability_actions(
+                    "conv-1",
+                    "exec_approval",
+                    [("Approve once", "once")],
+                    {"session_key": "sess-1", "request_id": "request-b"},
+                )
+        elif state == "missing_id":
+            pending.append({"command": "missing id"})
+        send_reply.reset_mock()
+
+        result = await a.send_exec_approval("conv-1", "later", "sess-1")
+
+        assert result.success is False
+        assert result.error == "agent365 exec_approval: no unique unbound approval request"
+        assert stale not in a._card_capabilities
+        if state == "already_bound":
+            assert {cap["resolver"]["request_id"] for cap in a._card_capabilities.values()} == {
+                "request-b"
+            }
+        send_reply.assert_not_awaited()
+        resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["empty", "ambiguous", "missing_id", "unavailable"])
+    async def test_exec_approval_without_unique_request_uses_text_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, state: str
+    ) -> None:
+        """Partial: gateway seam and connector I/O mocked; real send must fail closed."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        if state == "empty":
+            pending.clear()
+        elif state == "ambiguous":
+            pending.append({"request_id": "request-b", "command": "later"})
+        elif state == "missing_id":
+            pending[0].pop("request_id")
+        else:
+            monkeypatch.setattr(a, "_gw_list_approvals", MagicMock(side_effect=ImportError))
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+
+        sent = await a.send_exec_approval("conv-1", "danger", "sess-1")
+        assert sent.success is False
+        send_reply.assert_not_awaited()
+        resolver.assert_not_called()
+        assert not a._card_capabilities
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_failed_send_leaves_request_unbound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial: gateway queue and connector I/O are mocked."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        _pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        client = a._http_client
+        a._http_client = None
+
+        failed = await a.send_exec_approval("conv-1", "danger", "sess-1")
+
+        assert failed.success is False
+        assert a._card_capabilities == {}
+        send_reply.assert_not_awaited()
+
+        a._http_client = client
+        retried = await a.send_exec_approval("conv-1", "danger", "sess-1")
+
+        assert retried.success is True
+        send_reply.assert_awaited_once()
+        assert {cap["resolver"]["request_id"] for cap in a._card_capabilities.values()} == {
+            "request-a"
+        }
+        resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_new_card_drops_stale_session_capability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial: mocked gateway queue; real sends bind distinct pending requests."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        first = next(iter(a._card_capabilities))
+        # A is already bound, so only B can receive the next card.
+        pending.append({"request_id": "request-b", "command": "later"})
+        assert (await a.send_exec_approval("conv-1", "later", "sess-1")).success
+        second = next(nonce for nonce in a._card_capabilities if nonce != first)
+        assert resolver("sess-1", "deny", request_id="request-a") == 1
+        pending.append({"request_id": "request-c", "command": "new"})
+
+        assert (await a.send_exec_approval("conv-1", "new", "sess-1")).success
+        assert first not in a._card_capabilities
+        assert second in a._card_capabilities
+        assert {cap["resolver"]["request_id"] for cap in a._card_capabilities.values()} == {
+            "request-b",
+            "request-c",
+        }
+
+    @pytest.mark.asyncio
+    async def test_card_action_exec_approval_rejects_unbound_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial: mint normally, then simulate a legacy capability lacking request_id."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        self._approval_queue(monkeypatch, a)
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
+        a._card_capabilities[value["capability"]]["resolver"].pop("request_id", None)
+
+        resp = await a._handle_card_action(_make_inbound(), value)
+        assert resp.status_code == 403
+        resolver.assert_not_called()
+        assert value["capability"] in a._card_capabilities
 
     @pytest.mark.asyncio
     async def test_send_slash_confirm_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -25464,7 +25874,9 @@ class TestInteractiveCards:
 
     @pytest.mark.asyncio
     async def test_handle_card_action_exec_approval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Partial: capability is seeded; real handler forwards its bound request id."""
         a = _make_adapter(monkeypatch)
+        self._approval_queue(monkeypatch, a)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
         activity = _make_inbound(conv_id="conv-1")
@@ -25473,18 +25885,22 @@ class TestInteractiveCards:
             activity,
             kind="exec_approval",
             choice="always",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "request-a"},
         )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         assert json.loads(resp.body)["kind"] == "exec_approval"
-        resolver.assert_called_once_with("sess-1", "always")
+        resolver.assert_called_once_with("sess-1", "always", request_id="request-a")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mismatch", ["user", "tenant"])
     async def test_card_capability_is_user_bound_single_use_and_resists_dos(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, mismatch: str
     ) -> None:
+        """Partial: seeded capability exercises real binding and consumption checks."""
         a = _make_adapter(monkeypatch)
+        list_pending = MagicMock(return_value=[{"request_id": "request-a"}])
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
         owner = _make_inbound(conv_id="conv-1")
@@ -25493,21 +25909,28 @@ class TestInteractiveCards:
             owner,
             kind="exec_approval",
             choice="once",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "request-a"},
         )
         attacker = _make_inbound(conv_id="conv-1")
-        attacker["from"] = {"id": "user-2", "name": "Other User"}
+        if mismatch == "user":
+            attacker["from"] = {"id": "user-2", "name": "Other User"}
 
-        rejected = await a._handle_card_action(attacker, value)
+        with monkeypatch.context() as mismatch_patch:
+            if mismatch == "tenant":
+                mismatch_patch.setattr(a, "tenant_id", "other-tenant")
+            rejected = await a._handle_card_action(attacker, value)
         assert rejected.status_code == 403
         assert "test-capability" in a._card_capabilities
         resolver.assert_not_called()
+        list_pending.assert_not_called()
 
         accepted = await a._handle_card_action(owner, value)
         assert accepted.status_code == 200
-        resolver.assert_called_once_with("sess-1", "once")
+        list_pending.assert_called_once_with("sess-1")
+        resolver.assert_called_once_with("sess-1", "once", request_id="request-a")
         replayed = await a._handle_card_action(owner, value)
         assert replayed.status_code == 403
+        list_pending.assert_called_once_with("sess-1")
         resolver.assert_called_once()
 
     @pytest.mark.asyncio
@@ -25626,30 +26049,31 @@ class TestInteractiveCards:
         assert a._awaiting_text_chats["conv-1"] > 0
         assert "conv-1" in a._registry_protected_conversation_ids()
 
-    def test_route_card_submit_not_dispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from fastapi.testclient import TestClient
+    @pytest.mark.asyncio
+    async def test_route_card_submit_not_dispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Partial: mocked JWT, gateway queue and connector I/O; real send and route."""
+        from httpx import ASGITransport, AsyncClient
 
         a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(bridge, "validate_inbound_jwt", AsyncMock(return_value={"oid": "o1"}))
-        a._http_client = MagicMock()
-        resolver = MagicMock(return_value=1)
-        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
-
-        body = _make_inbound(conv_id="conv-card", activity_id="ca-1", text="")
-        body["value"] = _seed_card_capability(
-            a,
-            body,
-            kind="exec_approval",
-            choice="deny",
-            resolver={"session_key": "sess-1"},
-        )
-        client = TestClient(a.build_app())
-        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
+        body = _make_inbound(activity_id="ca-1", text="")
+        body["value"] = next(action["data"] for action in actions if action["title"] == "Deny")
+        async with AsyncClient(
+            transport=ASGITransport(app=a.build_app()), base_url="http://test"
+        ) as c:
+            r = await c.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "card_action"
         # Routed to the resolver, NOT the agent loop.
-        resolver.assert_called_once_with("sess-1", "deny")
+        resolver.assert_called_once_with("sess-1", "deny", request_id="request-a")
+        assert pending == []
         assert a._handled_events == []
 
 
@@ -25661,9 +26085,9 @@ class TestInteractiveCards:
 class TestHandoff:
     def test_mint_handoff_link(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-cc"))
-        )
+        inbound = _make_inbound(conv_id="conv-cc")
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         link = a._mint_handoff_link("conv-cc", reason="test")
         assert link is not None
         assert "continuation=" in link
@@ -25679,9 +26103,9 @@ class TestHandoff:
         # Single-identity deployment (no separate BF app) → blueprint id is used.
         a = _make_adapter(monkeypatch)
         a.bf_app_id = ""
-        a._conversations.upsert(
-            adapter_mod.ConversationRef.from_activity(_make_inbound(conv_id="conv-cc2"))
-        )
+        inbound = _make_inbound(conv_id="conv-cc2")
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         link = a._mint_handoff_link("conv-cc2", reason="test")
         assert f"28:{a.blueprint_app_id}" in link
 
@@ -25726,8 +26150,7 @@ class TestHandoff:
         )
         resp = await a._handle_handoff_action(ctx)
         assert resp.status == 200
-        # Token consumed; linkage recorded.
-        assert "tok-1" not in a._handoff_tokens
+        assert "tok-1" in a._handoff_tokens
 
     @pytest.mark.asyncio
     async def test_handle_handoff_action_unknown_token(
@@ -25759,6 +26182,7 @@ class TestHandoff:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-cc")
         inbound["conversation"]["conversationType"] = "groupChat"
+        inbound["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         out = a._maybe_append_handoff_link("conv-cc", "body")
         assert "Continue in Teams" in out
@@ -25891,6 +26315,7 @@ def _handoff_ctx(
         claims={
             "oid": _HANDOFF_USER if claims_user is None else claims_user,
             "tid": _HANDOFF_TENANT if claims_tenant is None else claims_tenant,
+            "idtyp": "user",
         },
         path_tag="B",
     )
@@ -25986,7 +26411,7 @@ class TestHandoffSessionPin:
             _handoff_ctx(token, user=_HANDOFF_OTHER_USER, claims_user=_HANDOFF_OTHER_USER)
         )
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26004,7 +26429,7 @@ class TestHandoffSessionPin:
             )
         )
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26046,7 +26471,7 @@ class TestHandoffSessionPin:
         adapter._handoff_session_db_opener = lambda: _StaleFinder(rows)
         response = await adapter._handle_handoff_action(_handoff_ctx(token))
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26069,7 +26494,7 @@ class TestHandoffSessionPin:
         }
         response = await adapter._handle_handoff_action(_handoff_ctx("tok-ended"))
         assert response.status == 200
-        assert "tok-ended" not in adapter._handoff_tokens
+        assert "tok-ended" in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26087,7 +26512,7 @@ class TestHandoffSessionPin:
         adapter._handoff_session_db_opener = lambda: _FakeOriginDb({})
         response = await adapter._handle_handoff_action(_handoff_ctx(token))
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -26102,7 +26527,7 @@ class TestHandoffSessionPin:
         )
         response = await adapter._handle_handoff_action(_handoff_ctx(token))
         assert response.status == 200
-        assert token not in adapter._handoff_tokens
+        assert token in adapter._handoff_tokens
         await _settle_handoff(adapter)
         assert adapter._handled_events == []
 
@@ -28119,7 +28544,8 @@ class TestMessageReaction:
             json=_reaction_activity(channel_id="webchat", activity_id="react-web"),
             headers={"Authorization": "Bearer a.b.c"},
         )
-        assert response.json()["reason"] == "ignored"
+        assert response.status_code == 403
+        assert response.json()["detail"] == "end user is not authorized"
         assert "reply-1" not in a._feedback_by_message_id
         assert a._handled_events == []
 

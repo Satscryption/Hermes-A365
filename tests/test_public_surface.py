@@ -242,9 +242,9 @@ def test_bot_service_verify_exit_codes_and_run_verify(tmp_path: Path) -> None:
 def test_sidecar_migration_today_matches_conversations_payload(snapshot: dict) -> None:
     payload = ConversationRegistry().to_payload()
     assert "schema" in payload
-    assert "schemaVersion" not in payload
-    assert surface_mod.SIDECAR_MIGRATION_TODAY in surface_mod.SIDECAR_MIGRATION_POLICY
+    assert payload["schemaVersion"] == payload["schema"]
     assert snapshot["sidecar_migration_today"] == surface_mod.SIDECAR_MIGRATION_TODAY
+    assert snapshot["sidecar_migration_policy"] == surface_mod.SIDECAR_MIGRATION_POLICY
 
 
 def test_security_md_documents_d4_window() -> None:

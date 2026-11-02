@@ -1,6 +1,6 @@
 # Hermes-A365 public surface (frozen inventory)
 
-Package version **0.9.5**. Machine-readable snapshot: [`docs/surface/public-surface.json`](surface/public-surface.json). Regenerate with `scripts/render_surface.py --write`; CI runs `--check`.
+Package version **0.9.6**. Machine-readable snapshot: [`docs/surface/public-surface.json`](surface/public-surface.json). Regenerate with `scripts/render_surface.py --write`; CI runs `--check`.
 
 ## Owner decisions (accepted)
 
@@ -95,7 +95,7 @@ Scanner classifies every `A365_*` / `HERMES_*` string literal in `src/hermes_a36
 
 ### Public env literals (scanner)
 
-A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN
+A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_ALLOW_CLIENT_BF_CHANNELS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN
 
 ### Instance create `.env` keys
 
@@ -115,12 +115,12 @@ HERMES_OTLP_ENDPOINT
 
 ## Sidecars
 
-Planned for slice 2: within 1.x, Hermes-A365 will read every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. Additive `schemaVersion` stamps will run on the owning writer, once, under an exclusive lock, and be idempotent. The original bytes will be copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite. A second run against an already-current file will not write another backup. Identity-binding changes will stay explicit: bot-service v1→v2 will still require `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 will still require `--app-version` strictly above the Admin Center version. A `schemaVersion` newer than that build will be an error and the file will be left untouched. 1.x will not claim to read 2.x sidecars. Downgrade will be restore-the-backup, not an automatic rewrite to 0.9.x. Today (slice 1) `conversations.json` is persisted with a `schema` field only (`conversations.py`); the dual-key stamp lands in slice 2.
+Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any 1.x release and every 0.9.x shape listed in SURFACE. For gateway `conversations.json` persist and Copilot Chat publish state, additive `schemaVersion` stamps run once under an exclusive lock and are idempotent: the original bytes are copied to a sibling `*.backup-<UTC-timestamp>.json` mode `0600` before the first rewrite, and a second run against an already-current file does not write another backup. Load/save on those paths refuses a `schemaVersion` newer than this build and leaves the file untouched. Identity-binding changes stay explicit: bot-service v1→v2 still requires `--confirm-legacy-binding` equal to `--agent-name` and `--confirm-bot-target` equal to the ARM id; publish v1→v2 still requires `--app-version` strictly above the Admin Center version. 1.x does not claim to read 2.x sidecars. Downgrade is restore-the-backup, not an automatic rewrite to 0.9.x.
 
 ## Python API
 
 - Console script `hermes-a365`; entry point `hermes_agent.plugins` / `agent365` → `hermes_a365.plugin:register`.
-- `hermes_a365.__version__` → `0.9.5`.
+- `hermes_a365.__version__` → `0.9.6`.
 - `Agent365Adapter` public members: build_app, connect, disconnect, edit_message, get_chat_info, message_len_fn, name, on_processing_complete, on_processing_start, prune_conversations, send, send_clarify, send_document, send_exec_approval, send_image, send_image_file, send_or_update_status, send_private_notice, send_slash_confirm, send_typing, streaming_overflow_limit.
 - Public `python -m`: `hermes_a365.keychain` subcommands store, get, delete.
 
@@ -131,7 +131,7 @@ Gateway `build_app` and `activity-bridge serve`:
 - `POST /api/messages`
 - `GET /healthz`
 
-`GET /healthz` → 200 `{ok, slug, blueprint_client_id}` (id truncated to 8 chars). `POST /api/messages`: 400 bad activity; 401 bearer; 403 serviceUrl / allowlist / user; 200 ack bodies; plugin-only 503 while connect failed. `serve` speaks operator webhook contract version `"1"` (`references/webhook-contract.md`).
+`GET /healthz` → 200 `{ok: true}`. `POST /api/messages`: 400 bad activity; 401 bearer; 403 serviceUrl / allowlist / user; 200 ack bodies; plugin-only 503 while connect failed. `serve` speaks operator webhook contract version `"1"` (`references/webhook-contract.md`).
 
 ## Invoke wire names
 

@@ -11,6 +11,7 @@ from __future__ import annotations
 import logging
 
 import pytest
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 @pytest.fixture(autouse=True)
@@ -92,3 +93,27 @@ def _isolate_secrets_provider():  # type: ignore[no-untyped-def]
         yield original
     finally:
         set_default_provider(original)
+
+
+@pytest.fixture
+def rsa_keypair() -> tuple[rsa.RSAPrivateKey, dict]:
+    """Ephemeral RSA key + JWKS entry (shared by bridge JWT tests)."""
+    import base64
+    from typing import Any
+
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub_numbers = priv.public_key().public_numbers()
+
+    def _b64u(n: int) -> str:
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+    jwk: dict[str, Any] = {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "test-kid-1",
+        "n": _b64u(pub_numbers.n),
+        "e": _b64u(pub_numbers.e),
+    }
+    return priv, jwk

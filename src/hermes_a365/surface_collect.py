@@ -337,6 +337,7 @@ def collect_sidecar_inventory_from_code() -> tuple[dict[str, Any], ...]:
             "schema_version_read": (conv.ConversationRegistry.SCHEMA_VERSION,),
             "missing_version_means": conv.ConversationRegistry.SCHEMA_VERSION,
             "on_disk_version_field": "schema",
+            "schema_version_field": "schemaVersion",
         },
     )
 
@@ -349,6 +350,7 @@ async def collect_task_fetch_card_from_invoke() -> dict[str, Any]:
         activity={},
         value={},
         user_oid="",
+        token_user_oid="",
         user_upn="",
         tenant_id="",
         service_url="",

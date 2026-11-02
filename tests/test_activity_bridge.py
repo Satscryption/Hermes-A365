@@ -3577,7 +3577,7 @@ class TestServeApp:
         with _client_for(cfg, capture=capture) as client:
             r = client.get("/healthz")
         assert r.status_code == 200
-        assert r.json()["slug"] == "inbox-helper"
+        assert r.json() == {"ok": True}
 
     def test_message_forwards_to_webhook_and_replies(self) -> None:
         cfg = _cfg()
