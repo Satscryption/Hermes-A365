@@ -10569,10 +10569,11 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound: dict[str, Any],
         activity_id: str,
         chat_id: str,
+        validated_path: str | None,
     ) -> bool:
         """Best-effort DELETE for a conversation activity (#183 FileConsentCard)."""
         activity_id = str(activity_id or "").strip()
-        if not activity_id:
+        if not activity_id or validated_path is None:
             return False
         if self._http_client is None or self._bridge_cfg is None:
             return False
@@ -10602,7 +10603,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     fmi_cache=self._fmi_cache,
                     user_cache=self._user_cache,
                     bf_cache=self._bf_token_cache,
-                    validated_path=self._validated_path_for_inbound(inbound),
+                    validated_path=validated_path,
                 ),
             )
             if not self._lifecycle_is_current(
@@ -10636,11 +10637,22 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         return False
 
-    async def _remove_file_consent_card(self, activity: dict[str, Any], *, chat_id: str) -> None:
-        """Remove the FileConsentCard the user answered (#183)."""
-        reply_to = str(activity.get("replyToId") or "").strip()
-        if reply_to:
-            await self._delete_activity(inbound=activity, activity_id=reply_to, chat_id=chat_id)
+    async def _remove_file_consent_card(
+        self,
+        activity: dict[str, Any],
+        *,
+        chat_id: str,
+        card_activity_id: str,
+        validated_path: str | None,
+    ) -> None:
+        """Remove only the stored FileConsentCard via this request's validated path."""
+        if card_activity_id:
+            await self._delete_activity(
+                inbound=activity,
+                activity_id=card_activity_id,
+                chat_id=chat_id,
+                validated_path=validated_path,
+            )
 
     async def _send_file_consent_decline_notice(
         self, activity: dict[str, Any], *, validated_path: str | None
@@ -11036,7 +11048,7 @@ class Agent365Adapter(BasePlatformAdapter):
         }
         reply = self._reply_with_attachment(inbound, card)
         try:
-            await self._await_outbound(
+            response = await self._await_outbound(
                 chat_id,
                 _import_bridge().send_reply(
                     inbound=inbound,
@@ -11075,6 +11087,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "name": file_name,
             "size": size,
             "sha256": digest,
+            "card_activity_id": _connector_activity_id(response),
             "conversation_id": str(conv.get("id") or ""),
             "user_id": str((inbound.get("from") or {}).get("id") or ""),
             "service_url": str(inbound.get("serviceUrl") or ""),
@@ -11244,9 +11257,20 @@ class Agent365Adapter(BasePlatformAdapter):
         consent_id = str(context.get("consentId") or "")
         pending = self._pending_file_uploads.get(consent_id)
         consent_chat_id = str((activity.get("conversation") or {}).get("id") or "")
+        if pending is not None and (
+            consent_chat_id != pending.get("conversation_id")
+            or str((activity.get("from") or {}).get("id") or "") != pending.get("user_id")
+            or str(activity.get("serviceUrl") or "") != pending.get("service_url")
+        ):
+            return invoke.empty_invoke_ack()
 
         async def _remove_consent_card() -> None:
-            await self._remove_file_consent_card(activity, chat_id=consent_chat_id)
+            await self._remove_file_consent_card(
+                activity,
+                chat_id=consent_chat_id,
+                card_activity_id=str((pending or {}).get("card_activity_id") or ""),
+                validated_path=validated_path,
+            )
 
         def _schedule_remove_consent_card(*, label: str) -> None:
             self._spawn_file_consent_post_ack(_remove_consent_card(), label=label)
@@ -11255,7 +11279,6 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.info("agent365 fileConsent action=%s consent=%s", action, consent_id[:8])
             if action == "decline":
                 if pending is None:
-                    _schedule_remove_consent_card(label="unknown_consent")
                     return invoke.empty_invoke_ack()
                 if self._file_consent_pending_matches_activity(activity, pending):
                     send_decline_notice = (
@@ -11285,7 +11308,6 @@ class Agent365Adapter(BasePlatformAdapter):
             # retry lands here after the pending entry was popped; the wire is
             # the same empty ack serve returns for a deduped invoke (#132).
             logger.warning("agent365 fileConsent accept for unknown consent=%s", consent_id[:8])
-            _schedule_remove_consent_card(label="unknown_consent")
             return invoke.empty_invoke_ack()
 
         pending_chat_id = str(pending.get("conversation_id") or "")
@@ -12508,7 +12530,39 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """#77: dangerous-command Approve/Deny as an Adaptive Card. ``command`` is
         already credential-redacted gateway-side. On click the route resolves via
-        ``tools.approval.resolve_gateway_approval(session_key, choice)``."""
+        ``tools.approval.resolve_gateway_approval`` with the bound request id."""
+        try:
+            pending = self._gw_list_approvals(session_key)
+        except Exception as e:
+            logger.info("agent365 exec_approval: pending approvals unavailable: %s", e)
+            return SendResult(success=False, error="agent365 exec_approval: approvals unavailable")
+        pending_ids = {entry.get("request_id") for entry in pending}
+        now = time.monotonic()
+        bound_ids = {
+            capability["resolver"].get("request_id")
+            for capability in self._card_capabilities.values()
+            if capability.get("kind") == _CARD_KIND_EXEC_APPROVAL
+            and capability["resolver"].get("session_key") == session_key
+            and capability["resolver"].get("request_id")
+            and now - float(capability.get("created_at", 0.0)) <= _CARD_CAPABILITY_TTL_SEC
+            and self._lifecycle_is_current(capability.get("lifecycle_generation"))
+            and self._chat_lifecycle_is_current(
+                str(capability.get("conversation_id") or ""), capability.get("chat_generation")
+            )
+        }
+        unbound = [entry for entry in pending if entry.get("request_id") not in bound_ids]
+        if len(unbound) != 1 or not unbound[0].get("request_id"):
+            return SendResult(
+                success=False, error="agent365 exec_approval: no unique unbound approval request"
+            )
+        request_id = unbound[0]["request_id"]
+        for nonce, capability in list(self._card_capabilities.items()):
+            if (
+                capability.get("kind") == _CARD_KIND_EXEC_APPROVAL
+                and capability["resolver"].get("session_key") == session_key
+                and capability["resolver"].get("request_id") not in pending_ids
+            ):
+                self._card_capabilities.pop(nonce, None)
         text = f"**Approval required** — {description}\n\n`{command}`"
         inbound = self._cached_inbound_for(chat_id) or {}
         conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
@@ -12523,7 +12577,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_id,
             _CARD_KIND_EXEC_APPROVAL,
             choices,
-            {"session_key": session_key},
+            {"session_key": session_key, "request_id": request_id},
         )
         return await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
@@ -12662,10 +12716,16 @@ class Agent365Adapter(BasePlatformAdapter):
     # importable inside the gateway process at runtime; monkeypatched in tests).
 
     @staticmethod
-    def _gw_resolve_approval(session_key: str, choice: str) -> int:
+    def _gw_list_approvals(session_key: str) -> list[dict[str, Any]]:
+        from tools.approval import list_gateway_approvals
+
+        return list_gateway_approvals(session_key)
+
+    @staticmethod
+    def _gw_resolve_approval(session_key: str, choice: str, *, request_id: str) -> int:
         from tools.approval import resolve_gateway_approval
 
-        return resolve_gateway_approval(session_key, choice)
+        return resolve_gateway_approval(session_key, choice, request_id=request_id)
 
     @staticmethod
     async def _gw_resolve_slash_confirm(
@@ -12719,6 +12779,9 @@ class Agent365Adapter(BasePlatformAdapter):
         if choice is None:
             logger.warning("agent365 card action rejected: invalid choice")
             return JSONResponse({"status": "card_action_rejected"}, status_code=403)
+        if kind == _CARD_KIND_EXEC_APPROVAL and not capability["resolver"].get("request_id"):
+            logger.warning("agent365 card action rejected: missing approval request binding")
+            return JSONResponse({"status": "card_action_rejected"}, status_code=403)
         # Consume only after every binding and the opaque choice validate. A
         # mismatched user must not be able to invalidate the owner's card.
         self._card_capabilities.pop(nonce, None)
@@ -12730,7 +12793,13 @@ class Agent365Adapter(BasePlatformAdapter):
             self._card_action_tasks_by_chat.setdefault(conv_id, set()).add(action_task)
         try:
             if kind == _CARD_KIND_EXEC_APPROVAL:
-                self._gw_resolve_approval(str(resolver.get("session_key") or ""), choice)
+                resolved = self._gw_resolve_approval(
+                    str(resolver.get("session_key") or ""),
+                    choice,
+                    request_id=str(resolver["request_id"]),
+                )
+                if resolved == 0:
+                    logger.info("agent365 exec_approval: request no longer pending")
             elif kind == _CARD_KIND_SLASH_CONFIRM:
                 follow = await self._gw_resolve_slash_confirm(
                     str(resolver.get("session_key") or ""),

@@ -6,6 +6,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **#86 — Consent cleanup and approval-card request binding.** File-consent
+  cleanup removes only the card the bot sent; approval cards are bound to one
+  pending request, otherwise the text prompt is used. Refs
+  [#86](https://github.com/Satscryption/Hermes-A365/issues/86).
+
 ## [0.9.6] — 2026-11-02
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),
