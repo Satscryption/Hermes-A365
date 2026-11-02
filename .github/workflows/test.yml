@@ -5,6 +5,7 @@ on:
     branches: [main]
   pull_request:
     branches: [main]
+    types: [opened, synchronize, reopened, ready_for_review]
   # Merge queue on main requires the aggregate `test` check; GitHub sends
   # merge_group with checks_requested for each queued merge candidate.
   merge_group:
@@ -18,6 +19,12 @@ on:
   # publish.yml calls this so a release runs the same matrix against
   # the tagged commit before the pypi environment. #98
   workflow_call:
+    inputs:
+      full-suite:
+        # Reusable workflows inherit the caller's event (e.g. push).
+        description: Always run the full suite for release callers
+        type: boolean
+        default: true
 
 concurrency:
   group: tests-${{ github.event.pull_request.number || github.ref }}
@@ -27,23 +34,99 @@ permissions:
   contents: read
 
 jobs:
+  plan:
+    timeout-minutes: 2
+    runs-on: ubuntu-latest
+    outputs:
+      unit: ${{ steps.select.outputs.unit }}
+      full: ${{ steps.select.outputs.full }}
+      wheel: ${{ steps.select.outputs.wheel }}
+      matrix: ${{ steps.select.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        if: >-
+          inputs.full-suite != true &&
+          (github.event_name == 'pull_request' || github.event_name == 'merge_group' ||
+          (github.event_name == 'push' && github.ref == 'refs/heads/main'))
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Select jobs and Python versions
+        id: select
+        env:
+          FORCE_FULL: ${{ inputs.full-suite == true }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import subprocess
+
+          with open(os.environ["GITHUB_EVENT_PATH"]) as stream:
+              event = json.load(stream)
+          event_name = os.environ["GITHUB_EVENT_NAME"]
+          force_full = os.environ["FORCE_FULL"] == "true"
+          draft = not force_full and event_name == "pull_request" and event["pull_request"]["draft"]
+          main_push = not force_full and event_name == "push" and os.environ["GITHUB_REF"] == "refs/heads/main"
+          base = head = None
+          if not force_full:
+              if event_name == "pull_request":
+                  base = event["pull_request"]["base"]["sha"]
+                  head = event["pull_request"]["head"]["sha"]
+              elif event_name == "merge_group":
+                  base = event["merge_group"]["base_sha"]
+                  head = event["merge_group"]["head_sha"]
+              elif main_push:
+                  base, head = event["before"], event["after"]
+
+          docs_only = False
+          if base and head:
+              # PRs compare from the merge base; pushes and queue candidates
+              # compare their exact before/after trees. Include both rename paths.
+              separator = "..." if event_name == "pull_request" else ".."
+              diff = subprocess.run(
+                  ["git", "diff", "--name-only", "--no-renames", "-z", f"{base}{separator}{head}", "--"],
+                  capture_output=True,
+              )
+              if diff.returncode == 0:
+                  paths = diff.stdout.split(b"\0")[:-1]
+                  # Only prose that no test, packaging step or surface check reads.
+                  # CHANGELOG.md, SECURITY.md, README.md, SKILL.md, docs/SURFACE.md and
+                  # docs/surface/ are read by tests or shipped, so they run the suite.
+                  def prose(p):
+                      return p.endswith(b".md") and (
+                          p.startswith((b"references/", b"reports/"))
+                          or (p.startswith(b"docs/") and p != b"docs/SURFACE.md"
+                              and not p.startswith(b"docs/surface/"))
+                      )
+                  docs_only = bool(paths) and all(prose(p) for p in paths)
+              else:
+                  print("::warning::Cannot compare changed paths; running event's normal suite")
+
+          versions = ["3.14"] if draft else ["3.11", "3.14"] if main_push else ["3.11", "3.12", "3.13", "3.14"]
+          matrix = [{"os": "ubuntu-latest", "python-version": v} for v in versions]
+          if not draft and not main_push:
+              matrix.append({"os": "macos-latest", "python-version": "3.14"})
+          outputs = {
+              "unit": not docs_only,
+              "full": not (docs_only or draft or main_push),
+              "wheel": not (docs_only or draft),
+          }
+          print(f"docs_only={docs_only}, draft={draft}, main_push={main_push}, jobs={outputs}")
+          with open(os.environ["GITHUB_OUTPUT"], "a") as stream:
+              for key, value in outputs.items():
+                  print(f"{key}={str(value).lower()}", file=stream)
+              print("matrix=" + json.dumps({"include": matrix}), file=stream)
+          PY
+
   unit:
+    needs: plan
+    if: needs.plan.outputs.unit == 'true'
     timeout-minutes: 15
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            python-version: "3.11"
-          - os: ubuntu-latest
-            python-version: "3.12"
-          - os: ubuntu-latest
-            python-version: "3.13"
-          - os: ubuntu-latest
-            python-version: "3.14"
-          - os: macos-latest
-            python-version: "3.14"
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
     name: test (${{ matrix.os }}, Python ${{ matrix.python-version }})
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
@@ -66,6 +149,8 @@ jobs:
           --randomly-seed=${{ github.run_id }} --durations=15
 
   windows-negative:
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     runs-on: windows-latest
     name: windows (unsupported host probes)
     steps:
@@ -89,6 +174,8 @@ jobs:
           -q
 
   keychain-linux:
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     runs-on: ubuntu-latest
     name: keychain (Linux libsecret)
     steps:
@@ -118,6 +205,8 @@ jobs:
           uv run --python 3.14 pytest --timeout=120 tests/test_keychain_live.py -q
 
   wheel-smoke:
+    needs: plan
+    if: needs.plan.outputs.wheel == 'true'
     runs-on: ubuntu-latest
     name: wheel smoke (fresh install)
     steps:
@@ -143,6 +232,8 @@ jobs:
           /tmp/wheel-smoke-venv/bin/python -c "import json,sys; probes={p['name']:p['state'] for p in json.load(open('/tmp/doctor-smoke.json'))['probes']}; sys.exit(2 if probes.get('python')=='error' or probes.get('host_platform')=='error' else 0)"
 
   hermes-source-smoke:
+    needs: plan
+    if: needs.plan.outputs.full == 'true'
     runs-on: ubuntu-latest
     name: hermes source (${{ matrix.hermes-ref }})
     strategy:
@@ -167,6 +258,7 @@ jobs:
     name: test
     if: always()
     needs:
+      - plan
       - unit
       - windows-negative
       - keychain-linux
@@ -176,18 +268,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Require all test jobs successful
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          set -euo pipefail
-          check() {
-            local name="$1" result="$2"
-            if [[ "$result" != "success" ]]; then
-              echo "$name: $result (expected success)" >&2
-              return 1
-            fi
-            echo "$name: success"
-          }
-          check unit "${{ needs.unit.result }}"
-          check windows-negative "${{ needs.windows-negative.result }}"
-          check keychain-linux "${{ needs.keychain-linux.result }}"
-          check wheel-smoke "${{ needs.wheel-smoke.result }}"
-          check hermes-source-smoke "${{ needs.hermes-source-smoke.result }}"
+          python3 - <<'PY'
+          import json
+          import os
+
+          needs = json.loads(os.environ["NEEDS"])
+          assert needs["plan"]["result"] == "success", "job planning failed"
+          flags = needs["plan"]["outputs"]
+          for job, flag in [
+              ("unit", "unit"),
+              ("windows-negative", "full"),
+              ("keychain-linux", "full"),
+              ("wheel-smoke", "wheel"),
+              ("hermes-source-smoke", "full"),
+          ]:
+              expected = "success" if flags[flag] == "true" else "skipped"
+              result = needs[job]["result"]
+              print(f"{job}: {result} (expected {expected})")
+              assert result == expected, f"{job}: {result} (expected {expected})"
+          PY
