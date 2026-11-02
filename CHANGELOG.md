@@ -19,6 +19,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Client secret expiry Graph responses enforce a JSON nesting depth limit of 64 before decoding.
+
 - **#86 — Consent cleanup and approval-card request binding.** File-consent
   cleanup removes only the card the bot sent; approval cards are bound to one
   pending request, otherwise the text prompt is used. Refs

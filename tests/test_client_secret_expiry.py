@@ -211,6 +211,55 @@ class TestCheckApp:
 
 
 class TestStrictJson:
+    @pytest.mark.parametrize("adapter", ["mutator", "az"])
+    @pytest.mark.parametrize("containers", ["objects", "arrays", "mixed"])
+    @pytest.mark.parametrize("depth", [64, 65])
+    def test_nesting_boundary(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        adapter: str,
+        containers: str,
+        depth: int,
+    ) -> None:
+        # Include structural characters, escaped quotes and escaped backslashes
+        # in a string at the deepest level; none count towards container depth.
+        body = json.dumps('"' + "[{]}" * 65 + "\\")
+        for level in range(depth - 1):
+            if containers == "arrays" or (containers == "mixed" and level % 2):
+                body = "[" + body + "]"
+            else:
+                body = '{"a":' + body + "}"
+        body = '{"a":' + body + "}"
+        expected = json.loads(body)
+        if adapter == "mutator":
+            mut = A365CliMutator()
+
+            def fake_run(argv, **kwargs):
+                return RunResult(argv=list(argv), returncode=0, stdout=body, stderr="")
+
+            monkeypatch.setattr(mut, "run", fake_run)
+            getter = graph_get_from_mutator_for_secret_expiry(mut)
+        else:
+            monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+            monkeypatch.setattr(
+                subprocess,
+                "run",
+                lambda *_a, **_k: subprocess.CompletedProcess(
+                    [], 0, stdout=body.encode(), stderr=b""
+                ),
+            )
+            getter = graph_get_from_az_rest()
+
+        with patch("hermes_a365.entra_state.json.loads", wraps=json.loads) as loads:
+            payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+            if depth == 64:
+                assert payload == expected
+                loads.assert_called_once()
+            else:
+                loads.assert_not_called()
+                assert payload["error"]["code"] == "UnreadableGraphResponse"
+                assert "depth limit of 64" in payload["error"]["message"]
+
     def test_rejects_trailing_garbage(self) -> None:
         body = '{"passwordCredentials": []} trailing'
         assert _parse_strict_graph_json_object(body) is None

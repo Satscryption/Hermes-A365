@@ -549,20 +549,27 @@ def _is_guid(value: str) -> bool:
 _GRAPH_JSON_MAX_DEPTH = 64
 
 
-def _json_depth_exceeds(data: Any, limit: int) -> bool:
-    """Iteratively check container nesting (no recursion, any interpreter)."""
-    stack: list[tuple[Any, int]] = [(data, 1)]
-    while stack:
-        node, depth = stack.pop()
-        if isinstance(node, dict):
-            children = node.values()
-        elif isinstance(node, list):
-            children = node
-        else:
-            continue
-        if depth > limit:
-            return True
-        stack.extend((child, depth + 1) for child in children)
+def _json_depth_exceeds(text: str, limit: int) -> bool:
+    """Check container nesting before decoding, ignoring strings and escapes."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif char in "]}":
+            depth -= 1
     return False
 
 
@@ -572,22 +579,20 @@ def _parse_strict_graph_json_object(text: str) -> dict[str, Any] | None:
     Nesting is bounded explicitly: newer interpreters can decode very deep
     input without ``RecursionError``, so that error alone is not a limit."""
     stripped = text.strip()
-    if not stripped:
+    if not stripped or _json_depth_exceeds(stripped, _GRAPH_JSON_MAX_DEPTH):
         return None
     try:
         data = json.loads(stripped)
     except (json.JSONDecodeError, ValueError, RecursionError):
         return None
-    if not isinstance(data, dict) or _json_depth_exceeds(data, _GRAPH_JSON_MAX_DEPTH):
-        return None
-    return data
+    return data if isinstance(data, dict) else None
 
 
-def _unreadable_graph_expiry_payload() -> dict[str, Any]:
+def _unreadable_graph_expiry_payload(message: str = "Graph read failed") -> dict[str, Any]:
     return {
         "error": {
             "code": "UnreadableGraphResponse",
-            "message": "Graph read failed",
+            "message": message,
         }
     }
 
@@ -598,6 +603,10 @@ def _parse_expiry_response_bytes(raw: bytes) -> dict[str, Any] | None:
     except UnicodeDecodeError:
         return _unreadable_graph_expiry_payload()
     parsed = _parse_strict_graph_json_object(text)
+    if parsed is None and _json_depth_exceeds(text, _GRAPH_JSON_MAX_DEPTH):
+        return _unreadable_graph_expiry_payload(
+            f"Graph response exceeds JSON nesting depth limit of {_GRAPH_JSON_MAX_DEPTH}"
+        )
     return parsed if parsed is not None else _unreadable_graph_expiry_payload()
 
 
