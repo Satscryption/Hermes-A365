@@ -12537,6 +12537,13 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.info("agent365 exec_approval: pending approvals unavailable: %s", e)
             return SendResult(success=False, error="agent365 exec_approval: approvals unavailable")
         pending_ids = {entry.get("request_id") for entry in pending}
+        for nonce, capability in list(self._card_capabilities.items()):
+            if (
+                capability.get("kind") == _CARD_KIND_EXEC_APPROVAL
+                and capability["resolver"].get("session_key") == session_key
+                and capability["resolver"].get("request_id") not in pending_ids
+            ):
+                self._card_capabilities.pop(nonce, None)
         now = time.monotonic()
         bound_ids = {
             capability["resolver"].get("request_id")
@@ -12556,13 +12563,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False, error="agent365 exec_approval: no unique unbound approval request"
             )
         request_id = unbound[0]["request_id"]
-        for nonce, capability in list(self._card_capabilities.items()):
-            if (
-                capability.get("kind") == _CARD_KIND_EXEC_APPROVAL
-                and capability["resolver"].get("session_key") == session_key
-                and capability["resolver"].get("request_id") not in pending_ids
-            ):
-                self._card_capabilities.pop(nonce, None)
         text = f"**Approval required** — {description}\n\n`{command}`"
         inbound = self._cached_inbound_for(chat_id) or {}
         conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
@@ -12784,6 +12784,25 @@ class Agent365Adapter(BasePlatformAdapter):
             return JSONResponse({"status": "card_action_rejected"}, status_code=403)
         # Consume only after every binding and the opaque choice validate. A
         # mismatched user must not be able to invalidate the owner's card.
+        if kind == _CARD_KIND_EXEC_APPROVAL:
+            session_key = str(capability["resolver"].get("session_key") or "")
+            try:
+                pending_ids = {
+                    entry.get("request_id") for entry in self._gw_list_approvals(session_key)
+                }
+            except Exception:
+                pending_ids = set()
+            if capability["resolver"]["request_id"] not in pending_ids:
+                self._card_capabilities.pop(nonce, None)
+                for other_nonce, other in list(self._card_capabilities.items()):
+                    if (
+                        other.get("kind") == _CARD_KIND_EXEC_APPROVAL
+                        and other["resolver"].get("session_key") == session_key
+                        and other["resolver"].get("request_id") not in pending_ids
+                    ):
+                        self._card_capabilities.pop(other_nonce, None)
+                logger.info("agent365 exec_approval: request no longer pending")
+                return JSONResponse({"status": "card_action", "kind": kind})
         self._card_capabilities.pop(nonce, None)
         resolver = capability["resolver"]
         action_generation = int(capability["lifecycle_generation"])
