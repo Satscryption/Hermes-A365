@@ -1441,3 +1441,40 @@ def test_line_limit_includes_crlf_split_between_reads(tmp_path, watched_children
             timeout=3,
         )
     _assert_children_clean(*watched_children)
+
+
+def test_stdin_deadline_does_not_send_early_eof(tmp_path, monkeypatch, watched_children):
+    """A writer that reaches the deadline with input pending must not close
+    stdin (early EOF) and the run must time out, not return partial input."""
+    import hermes_a365.mutator as mod
+
+    real_feed = mod._feed_stdin
+
+    class _PastDeadlineView:
+        # The writer sees its deadline as already passed; every other attribute
+        # (including writes such as the truncation flag) goes to the real pump,
+        # whose own deadline is unchanged for the output loop.
+        def __init__(self, pump):
+            object.__setattr__(self, "_pump", pump)
+
+        def __getattr__(self, name):
+            if name == "deadline":
+                return time.monotonic() - 1.0
+            return getattr(self._pump, name)
+
+        def __setattr__(self, name, value):
+            setattr(self._pump, name, value)
+
+    def feed_past_deadline(pump, stdin_input):
+        real_feed(_PastDeadlineView(pump), stdin_input)
+
+    monkeypatch.setattr(mod, "_feed_stdin", feed_past_deadline)
+    with pytest.raises(subprocess.TimeoutExpired):
+        _real_run(
+            tmp_path,
+            "import sys\ndata=sys.stdin.buffer.read()\nprint('received='+str(len(data)))\n",
+            stdin_input="abc" * 1000,
+            sensitive=True,
+            timeout=1.0,
+        )
+    _assert_children_clean(*watched_children)

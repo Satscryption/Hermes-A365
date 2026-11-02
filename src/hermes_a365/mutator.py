@@ -630,6 +630,9 @@ def _feed_stdin(pump: _Pump, stdin_input: str) -> None:
     try:
         while pending and not pump.stop.is_set():
             if time.monotonic() >= pump.deadline:
+                # Leave stdin open: closing it here would send EOF on partial
+                # input. The deadline path reaps the child and closes the pipe.
+                pump.stdin_truncated = True
                 break
             written = proc.stdin.write(pending)
             if written is None or written <= 0:
@@ -643,8 +646,9 @@ def _feed_stdin(pump: _Pump, stdin_input: str) -> None:
     finally:
         pending.release()
         pending = memoryview(b"")
-        with contextlib.suppress(OSError):
-            proc.stdin.close()
+        if not pump.stdin_truncated:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
 
 
 @dataclass
@@ -667,6 +671,7 @@ class _Pump:
     reaped: bool = False
     capture_bytes: int = 0
     termination_started: bool = False
+    stdin_truncated: bool = False
 
 
 def _reap(pump: _Pump, failure: BaseException | None = None) -> None:
@@ -834,7 +839,7 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
         if all(eof_seen[s] for s in streams) and out_q.empty() and proc.poll() is not None:
             break
 
-    if hit_deadline:
+    if hit_deadline or pump.stdin_truncated:
         raise _Deadline()
 
     with contextlib.suppress(subprocess.TimeoutExpired):
