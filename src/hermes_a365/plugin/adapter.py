@@ -2427,7 +2427,12 @@ class Agent365Adapter(BasePlatformAdapter):
         from fastapi import Body, FastAPI, Header, HTTPException
         from fastapi.responses import JSONResponse
 
-        app = FastAPI(title=f"agent365 adapter — {self.slug or 'default'}")
+        app = FastAPI(
+            title=f"agent365 adapter — {self.slug or 'default'}",
+            docs_url=None,
+            redoc_url=None,
+            openapi_url=None,
+        )
 
         app.add_middleware(
             bridge.BoundedRequestBodyMiddleware,
@@ -2461,13 +2466,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
         @app.get("/healthz")
         async def healthz() -> dict[str, Any]:
-            return {
-                "ok": True,
-                "slug": self.slug,
-                "blueprint_client_id": (
-                    self.blueprint_app_id[:8] + "…" if self.blueprint_app_id else ""
-                ),
-            }
+            return {"ok": True}
 
         @app.post("/api/messages")
         async def messages(
@@ -3679,7 +3678,9 @@ class Agent365Adapter(BasePlatformAdapter):
             self._disconnect_cleanup_active = True
             self._lifecycle_generation += 1
             self._retire_all_agent_turns()
-            self._pending_messages.clear()
+            pending_messages = getattr(self, "_pending_messages", None)
+            if pending_messages is not None:
+                pending_messages.clear()
             self._pending_turn_fifo.clear()
             self._chat_lifecycle_generation.clear()
             http_client = self._http_client
@@ -3940,7 +3941,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._file_consent_decline_notified.clear()
         self._card_capabilities.clear()
         self._awaiting_text_chats.clear()
-        self._pending_messages.clear()
+        pending_messages = getattr(self, "_pending_messages", None)
+        if pending_messages is not None:
+            pending_messages.clear()
         self._pending_turn_fifo.clear()
         self._unregister_pending_merge_guard()
         self._agent_turn_guards.clear()

@@ -27,7 +27,8 @@ def main() -> int:
         )
         _run(["git", "-C", str(vendor), "checkout", "--detach", PIN])
     else:
-        _run(["git", "clone", "--depth", "1", REPO, str(vendor)])
+        _run(["git", "clone", "--filter=blob:none", "--no-checkout", REPO, str(vendor)])
+        _run(["git", "-C", str(vendor), "fetch", "--depth", "1", "origin", PIN])
         _run(["git", "-C", str(vendor), "checkout", "--detach", PIN])
 
     rev = _run(["git", "-C", str(vendor), "rev-parse", "HEAD"]).stdout.strip()

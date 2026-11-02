@@ -37,10 +37,75 @@ adapter_mod = _tap.adapter_mod
 _make_adapter = _tap._make_adapter
 _make_inbound = _tap._make_inbound
 
+_vendor_root = _hermes_bootstrap.hermes_vendor_root()
+
+
+def _hermes_vendor_tree_present() -> bool:
+    return _vendor_root.is_dir() and (_vendor_root / ".git").exists()
+
+
 pytestmark = pytest.mark.skipif(
-    not _hermes_bootstrap.try_import_real_gateway(),
+    not _hermes_vendor_tree_present(),
     reason="Hermes vendor checkout unavailable",
 )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_vendor_adapter_module():  # type: ignore[no-untyped-def]
+    saved_base = sys.modules.get("gateway.platforms.base")
+    saved_config = sys.modules.get("gateway.config")
+    saved_session = sys.modules.get("gateway.session")
+    adapter_name = "hermes_a365.plugin.adapter"
+    saved_adapter = sys.modules.get(adapter_name)
+    had_adapter = adapter_name in sys.modules
+    yield
+    if saved_config is not None:
+        sys.modules["gateway.config"] = saved_config
+    if saved_session is not None:
+        sys.modules["gateway.session"] = saved_session
+    if saved_base is not None:
+        sys.modules["gateway.platforms.base"] = saved_base
+    if had_adapter:
+        if saved_adapter is not None:
+            sys.modules[adapter_name] = saved_adapter
+        else:
+            sys.modules.pop(adapter_name, None)
+            importlib.import_module(adapter_name)
+    loaded = sys.modules.get(adapter_name)
+    if loaded is not None:
+        loaded._PENDING_MERGE_REGISTRY.clear()
+    _tap._install_gateway_stubs(force=True)
+
+
+def _load_vendor_adapter_mod() -> Any:
+    from hermes_runner_harness import load_agent365_adapter_module
+
+    return load_agent365_adapter_module()
+
+
+def _make_vendor_adapter(monkeypatch: pytest.MonkeyPatch, adapter_mod: Any, **extra: Any) -> Any:
+    monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
+    monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
+    monkeypatch.setenv("A365_ALLOW_ALL_USERS", "1")
+    _tap._write_matching_allow_all_profile()
+    cfg_extra = {"slug": "test-agent", "port": 0, "group_sessions_per_user": False}
+    cfg_extra.update(extra)
+    return adapter_mod.Agent365Adapter(_tap._StubPlatformConfig(extra=cfg_extra))
+
+
+def _wire_vendor_adapter(adapter: Any, adapter_mod: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    from unittest.mock import MagicMock
+
+    from hermes_runner_harness import install_bridge_stubs
+
+    install_bridge_stubs(monkeypatch, adapter_mod)
+    adapter._http_client = MagicMock()
+    adapter._bridge_cfg = MagicMock()
+    adapter._fmi_cache = MagicMock()
+    adapter._user_cache = MagicMock()
+    adapter._bf_token_cache = MagicMock()
+    adapter._running = True
 
 
 def _connect_cards(adapter: Any) -> None:
@@ -48,6 +113,8 @@ def _connect_cards(adapter: Any) -> None:
 
 
 def _enqueue_exec(session_key: str, request_id: str) -> None:
+    if _hermes_vendor_tree_present():
+        _hermes_bootstrap.ensure_hermes_vendor()
     from tools import approval as approval_mod
     from tools.approval_gateway_wait import _ApprovalEntry
 
@@ -135,7 +202,8 @@ def test_cross_origin_pending_merge_uses_overflow_not_metadata_theft(
     from gateway.platforms.base import MessageEvent, MessageType
     from gateway.session import SessionSource
 
-    adapter = _make_adapter(monkeypatch, group_sessions_per_user=False)
+    adapter_mod = _load_vendor_adapter_mod()
+    adapter = _make_vendor_adapter(monkeypatch, adapter_mod, group_sessions_per_user=False)
     session_key = "agent:main:agent365:group:19:group-chat@thread.v2"
     user_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     user_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
@@ -185,7 +253,9 @@ async def test_merged_pending_cross_origin_cards_bind_to_correct_users(
 ) -> None:
     import httpx
 
-    adapter = _make_adapter(monkeypatch, group_sessions_per_user=False)
+    adapter_mod = _load_vendor_adapter_mod()
+    adapter = _make_vendor_adapter(monkeypatch, adapter_mod, group_sessions_per_user=False)
+    _wire_vendor_adapter(adapter, adapter_mod, monkeypatch)
     user_a = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     user_b = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
     group = "19:group-chat@thread.v2"
@@ -209,30 +279,6 @@ async def test_merged_pending_cross_origin_cards_bind_to_correct_users(
             "recipient": {"id": "agent-1"},
             "text": kwargs["text"],
         }
-
-    _wire = _tap.TestInteractiveCards()._connect
-    _wire(adapter)
-    monkeypatch.setenv("A365_TENANT_ID", "11111111-1111-1111-1111-111111111111")
-    monkeypatch.setenv("A365_APP_ID", "22222222-2222-2222-2222-222222222222")
-    monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", "fake-secret")
-    monkeypatch.setenv("A365_ALLOW_ALL_USERS", "1")
-    from unittest.mock import MagicMock
-
-    import hermes_a365.activity_bridge as bridge_mod
-
-    monkeypatch.setattr(adapter_mod, "_import_bridge", lambda: bridge_mod)
-    monkeypatch.setattr(
-        bridge_mod,
-        "validate_inbound_jwt",
-        AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
-    )
-    monkeypatch.setattr(bridge_mod, "send_reply", AsyncMock(return_value=None))
-    adapter._http_client = MagicMock()
-    adapter._bridge_cfg = MagicMock()
-    adapter._fmi_cache = MagicMock()
-    adapter._user_cache = MagicMock()
-    adapter._bf_token_cache = MagicMock()
-    adapter._running = True
 
     a_inbound = _group_inbound(
         activity_id="act-a1",
@@ -366,8 +412,9 @@ async def test_exec_settlement_observers_revoke_stale_capabilities(
 ) -> None:
     from tools.approval import list_gateway_approvals
 
-    adapter = _make_adapter(monkeypatch, group_sessions_per_user=False)
-    _connect_cards(adapter)
+    adapter_mod = _load_vendor_adapter_mod()
+    adapter = _make_vendor_adapter(monkeypatch, adapter_mod)
+    _wire_vendor_adapter(adapter, adapter_mod, monkeypatch)
     bridge = adapter_mod._import_bridge()
     send_reply = AsyncMock(return_value=None)
     monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -433,8 +480,9 @@ async def test_exec_settlement_observers_revoke_stale_capabilities(
 async def test_exec_card_revoked_after_timeout_settle_hook(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    adapter = _make_adapter(monkeypatch)
-    _connect_cards(adapter)
+    adapter_mod = _load_vendor_adapter_mod()
+    adapter = _make_vendor_adapter(monkeypatch, adapter_mod)
+    _wire_vendor_adapter(adapter, adapter_mod, monkeypatch)
     bridge = adapter_mod._import_bridge()
     monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
     session_key = "sess-timeout"

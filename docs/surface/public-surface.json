@@ -46,11 +46,15 @@
     "streaming_overflow_limit"
   ],
   "adapter_public_members": [
+    "admit_turn_authority",
     "build_app",
+    "cancel_session_processing",
     "connect",
     "disconnect",
     "edit_message",
     "get_chat_info",
+    "handle_message",
+    "invalidate_exec_approval_capabilities",
     "message_len_fn",
     "name",
     "on_processing_complete",

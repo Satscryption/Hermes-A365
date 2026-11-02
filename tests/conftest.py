@@ -9,21 +9,11 @@ golden fixtures.
 from __future__ import annotations
 
 import contextlib
-import importlib.util
 import logging
 import sys
-from pathlib import Path
 
 import pytest
-
-_HERMES_BOOTSTRAP_MODULE = "hermes_a365_hermes_bootstrap"
-_bootstrap_path = Path(__file__).resolve().parent / "_hermes_bootstrap.py"
-_spec = importlib.util.spec_from_file_location(_HERMES_BOOTSTRAP_MODULE, _bootstrap_path)
-assert _spec and _spec.loader
-_hermes_bootstrap = importlib.util.module_from_spec(_spec)
-_spec.loader.exec_module(_hermes_bootstrap)  # type: ignore[union-attr]
-sys.modules[_HERMES_BOOTSTRAP_MODULE] = _hermes_bootstrap
-_hermes_bootstrap.ensure_hermes_vendor()
+from cryptography.hazmat.primitives.asymmetric import rsa
 
 
 @pytest.fixture(autouse=True)
@@ -127,3 +117,59 @@ def _isolate_secrets_provider():  # type: ignore[no-untyped-def]
         yield original
     finally:
         set_default_provider(original)
+
+
+@pytest.fixture
+def rsa_keypair() -> tuple[rsa.RSAPrivateKey, dict]:
+    """Ephemeral RSA key + JWKS entry (shared by bridge JWT tests)."""
+    import base64
+    from typing import Any
+
+    priv = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    pub_numbers = priv.public_key().public_numbers()
+
+    def _b64u(n: int) -> str:
+        b = n.to_bytes((n.bit_length() + 7) // 8, "big")
+        return base64.urlsafe_b64encode(b).rstrip(b"=").decode("ascii")
+
+    jwk: dict[str, Any] = {
+        "kty": "RSA",
+        "use": "sig",
+        "alg": "RS256",
+        "kid": "test-kid-1",
+        "n": _b64u(pub_numbers.n),
+        "e": _b64u(pub_numbers.e),
+    }
+    return priv, jwk
+
+
+def pytest_collection_modifyitems(config, items):  # type: ignore[no-untyped-def]
+    """Skip vendored Hermes lifecycle tests when the vendor tree is absent."""
+    import importlib.util
+    from pathlib import Path
+
+    bootstrap_path = Path(__file__).resolve().parent / "_hermes_bootstrap.py"
+    spec = importlib.util.spec_from_file_location("hermes_a365_hermes_bootstrap", bootstrap_path)
+    assert spec and spec.loader
+    bootstrap = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(bootstrap)  # type: ignore[union-attr]
+    vendor_root = bootstrap.hermes_vendor_root()
+    vendor_ok = vendor_root.is_dir() and (vendor_root / ".git").exists()
+    skip = pytest.mark.skipif(
+        not vendor_ok,
+        reason="Hermes vendor checkout unavailable",
+    )
+    lifecycle = Path(__file__).resolve().parent / "test_hermes_runner_lifecycle.py"
+    exempt = frozenset(
+        {
+            "test_vendor_pin_required_without_git",
+            "test_vendor_fresh_clone_fetches_pin",
+            "test_vendor_revision_mismatch_is_rejected",
+        }
+    )
+    for item in items:
+        if Path(str(getattr(item, "path", item.fspath))) != lifecycle:
+            continue
+        if item.name in exempt:
+            continue
+        item.add_marker(skip)

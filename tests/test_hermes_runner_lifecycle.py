@@ -17,11 +17,6 @@ assert _spec and _spec.loader
 _bootstrap = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(_bootstrap)
 
-pytestmark = pytest.mark.skipif(
-    not _bootstrap.try_import_real_gateway(),
-    reason="Hermes vendor checkout unavailable",
-)
-
 USER_A = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 USER_B = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 GROUP_CONV = "19:group-chat@thread.v2"

@@ -24465,7 +24465,7 @@ class TestInboundMedia:
 
 
 class TestOutboundFiles:
-    def _connect(self, a: Any) -> None:
+    def _connect(self, a: Any, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -24532,7 +24532,7 @@ class TestOutboundFiles:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -24564,7 +24564,7 @@ class TestOutboundFiles:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         started = asyncio.Event()
         release = asyncio.Event()
@@ -24608,7 +24608,7 @@ class TestOutboundFiles:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -24630,7 +24630,7 @@ class TestOutboundFiles:
         inbound = _make_inbound(conv_id="conv-grp")
         inbound["conversation"]["conversationType"] = "groupChat"
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -24655,7 +24655,7 @@ class TestOutboundFiles:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -24672,7 +24672,7 @@ class TestOutboundFiles:
     ) -> None:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -24691,7 +24691,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
         result = await a.send_document("ghost", str(f))
@@ -24705,7 +24705,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "report.pdf"
         payload = b"the-actual-pdf-bytes"
         f.write_bytes(payload)
@@ -24759,7 +24759,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         file_path = tmp_path / "cross-client.pdf"
         file_path.write_bytes(b"cross-client")
         self._seed_pending(a, file_path)
@@ -24803,7 +24803,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
         self._seed_pending(a, f)
@@ -24838,7 +24838,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
         self._seed_pending(a, f, consent_id="c-retry")
@@ -24863,7 +24863,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
         self._seed_pending(a, f)
@@ -24888,7 +24888,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"data")
         self._seed_pending(a, f)
@@ -24914,7 +24914,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         a._http_client.put = AsyncMock()
         resp = await a._handle_file_consent(
             self._consent_activity(consent_id="nope", upload_info={"uploadUrl": "https://x/y"}),
@@ -24928,7 +24928,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"x")
         self._seed_pending(a, f)
@@ -24945,7 +24945,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "x.pdf"
         f.write_bytes(b"data")
         self._seed_pending(a, f)
@@ -24985,7 +24985,7 @@ class TestOutboundFiles:
             "validate_inbound_jwt",
             AsyncMock(return_value={"oid": "o1", "tid": "t1"}),
         )
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"pdf")
         # Route body arrives on conv-fc from the _make_inbound default user.
@@ -25033,7 +25033,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"data")
         # Pending bound to conv-1; the accept arrives on a DIFFERENT conversation.
@@ -25050,7 +25050,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"data")
         self._seed_pending(a, f)
@@ -25064,7 +25064,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"data")
         self._seed_pending(a, f)
@@ -25079,7 +25079,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"small")
         self._seed_pending(a, f, size=5)
@@ -25094,7 +25094,7 @@ class TestOutboundFiles:
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"data")
         # Offered well beyond the TTL.
@@ -25110,7 +25110,7 @@ class TestOutboundFiles:
         # R2-P2: a same-size replacement passes the size check but the SHA-256
         # binding catches it — the offered content is not uploaded.
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         f = tmp_path / "r.pdf"
         f.write_bytes(b"AAAAA")
         self._seed_pending(a, f)  # digest bound to b"AAAAA"
@@ -25126,7 +25126,7 @@ class TestOutboundFiles:
         # R2-P1: a DIFFERENT tenant's SharePoint host is refused even though it
         # matches the *.sharepoint.com shape — configured host is contoso-my.
         a = _make_adapter(monkeypatch)
-        self._connect(a)  # allowlist = contoso-my.sharepoint.com
+        self._connect(a, monkeypatch)  # allowlist = contoso-my.sharepoint.com
         f = tmp_path / "r.pdf"
         f.write_bytes(b"data")
         self._seed_pending(a, f)
@@ -25143,7 +25143,7 @@ class TestOutboundFiles:
         monkeypatch.setattr(adapter_mod, "_MAX_CORRELATOR_ENTRIES", 3)
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
         f = tmp_path / "r.pdf"
@@ -25202,7 +25202,7 @@ class TestOutboundFiles:
         a = _make_adapter(monkeypatch)
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._seen_inbounds_this_lifetime.add("conv-1")
-        self._connect(a)
+        self._connect(a, monkeypatch)
         a._file_host_allowlist = ()  # empty ⇒ fail-closed
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -25326,23 +25326,44 @@ class TestFeedbackAndCitations:
 
 
 class TestInteractiveCards:
-    def _connect(self, a: Any) -> None:
+    def _connect(self, a: Any, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
+        if monkeypatch is not None:
+            monkeypatch.setattr(
+                a, "_register_exec_approval_capability_settle", lambda _sk, _rid: None
+            )
+
+    def _card_turn(
+        self,
+        a: Any,
+        *,
+        session_key: str = "sess-1",
+        conv_id: str = "conv-1",
+        message_id: str = "act-card-turn",
+    ):
+        inbound = _make_inbound(conv_id=conv_id, activity_id=message_id)
+        assert a.admit_turn_authority(inbound, session_key, message_id=message_id)
+        record = a._ledger_record_for_message(message_id)
+        assert record is not None
+        return a._turn_frame_scope(session_key, record)
 
     @pytest.mark.asyncio
     async def test_send_exec_approval_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        result = await a.send_exec_approval("conv-1", "rm -rf /tmp/x", "sess-1")
+        with self._card_turn(a):
+            result = await a.send_exec_approval(
+                "conv-1", "rm -rf /tmp/x", "sess-1", request_id="req-test"
+            )
         assert result.success is True
         reply = send_reply.await_args.kwargs["reply"]
         att = reply["attachments"][0]
@@ -25353,7 +25374,7 @@ class TestInteractiveCards:
         )
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
         assert list(capability["choices"].values()) == ["once", "session", "always", "deny"]
-        assert capability["resolver"] == {"session_key": "sess-1"}
+        assert capability["resolver"] == {"session_key": "sess-1", "request_id": "req-test"}
         assert all(act["data"]["hermes_kind"] == "exec_approval" for act in actions)
         assert all("session_key" not in act["data"] for act in actions)
         # A system approval card is NOT AI-generated content — no #73(a) entity.
@@ -25364,7 +25385,7 @@ class TestInteractiveCards:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         started = asyncio.Event()
         release = asyncio.Event()
@@ -25374,11 +25395,14 @@ class TestInteractiveCards:
             await release.wait()
 
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply))
-        send = asyncio.create_task(a.send_exec_approval("conv-1", "danger", "sess-1"))
-        await started.wait()
-        await a._teardown_chat_state("conv-1")
-        release.set()
-        result = await asyncio.wait_for(send, timeout=0.5)
+        with self._card_turn(a):
+            send = asyncio.create_task(
+                a.send_exec_approval("conv-1", "danger", "sess-1", request_id="req-delay")
+            )
+            await started.wait()
+            await a._teardown_chat_state("conv-1")
+            release.set()
+            result = await asyncio.wait_for(send, timeout=0.5)
 
         assert result.success is False
         assert a._card_capabilities == {}
@@ -25388,13 +25412,16 @@ class TestInteractiveCards:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
-        result = await a.send_exec_approval("conv-1", "danger", "sess-1")
+        with self._card_turn(a):
+            result = await a.send_exec_approval(
+                "conv-1", "danger", "sess-1", request_id="req-delivered"
+            )
         assert result.success is True
         value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
             "data"
@@ -25409,12 +25436,13 @@ class TestInteractiveCards:
     @pytest.mark.asyncio
     async def test_send_slash_confirm_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        result = await a.send_slash_confirm("conv-1", "Confirm", "Run it?", "sess-1", "cfm-9")
+        with self._card_turn(a):
+            result = await a.send_slash_confirm("conv-1", "Confirm", "Run it?", "sess-1", "cfm-9")
         assert result.success is True
         actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
@@ -25428,12 +25456,15 @@ class TestInteractiveCards:
     @pytest.mark.asyncio
     async def test_send_clarify_with_choices(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        result = await a.send_clarify("conv-1", "Which one?", ["Alpha", "Beta"], "clr-1", "sess-1")
+        with self._card_turn(a):
+            result = await a.send_clarify(
+                "conv-1", "Which one?", ["Alpha", "Beta"], "clr-1", "sess-1"
+            )
         assert result.success is True
         actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
         assert [act["title"] for act in actions] == ["Alpha", "Beta", "Something else"]
@@ -25445,7 +25476,7 @@ class TestInteractiveCards:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         a._seen_inbounds_this_lifetime.add("conv-1")
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -25453,7 +25484,8 @@ class TestInteractiveCards:
         mark = MagicMock()
         monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
 
-        result = await a.send_clarify("conv-1", "Say more?", None, "clr-2", "sess-1")
+        with self._card_turn(a):
+            result = await a.send_clarify("conv-1", "Say more?", None, "clr-2", "sess-1")
         assert result.success is True
         # Question sent as a plain text reply; intercept armed for the answer.
         assert send_reply.await_args.kwargs["reply"]["text"] == "Say more?"
@@ -25486,6 +25518,7 @@ class TestInteractiveCards:
     @pytest.mark.asyncio
     async def test_handle_card_action_exec_approval(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
+        monkeypatch.setattr(a, "_exec_approval_request_still_pending", lambda _sk, _rid: True)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
         activity = _make_inbound(conv_id="conv-1")
@@ -25494,18 +25527,19 @@ class TestInteractiveCards:
             activity,
             kind="exec_approval",
             choice="always",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "req-handle"},
         )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         assert json.loads(resp.body)["kind"] == "exec_approval"
-        resolver.assert_called_once_with("sess-1", "always")
+        resolver.assert_called_once_with("sess-1", "always", request_id="req-handle")
 
     @pytest.mark.asyncio
     async def test_card_capability_is_user_bound_single_use_and_resists_dos(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
+        monkeypatch.setattr(a, "_exec_approval_request_still_pending", lambda _sk, _rid: True)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
         owner = _make_inbound(conv_id="conv-1")
@@ -25514,7 +25548,7 @@ class TestInteractiveCards:
             owner,
             kind="exec_approval",
             choice="once",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "req-handle"},
         )
         attacker = _make_inbound(conv_id="conv-1")
         attacker["from"] = {"id": "user-2", "name": "Other User"}
@@ -25526,7 +25560,7 @@ class TestInteractiveCards:
 
         accepted = await a._handle_card_action(owner, value)
         assert accepted.status_code == 200
-        resolver.assert_called_once_with("sess-1", "once")
+        resolver.assert_called_once_with("sess-1", "once", request_id="req-handle")
         replayed = await a._handle_card_action(owner, value)
         assert replayed.status_code == 403
         resolver.assert_called_once()
@@ -25536,7 +25570,7 @@ class TestInteractiveCards:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -25564,7 +25598,7 @@ class TestInteractiveCards:
     ) -> None:
         monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
-        self._connect(a)
+        self._connect(a, monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -25654,6 +25688,7 @@ class TestInteractiveCards:
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(bridge, "validate_inbound_jwt", AsyncMock(return_value={"oid": "o1"}))
         a._http_client = MagicMock()
+        monkeypatch.setattr(a, "_exec_approval_request_still_pending", lambda _sk, _rid: True)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
 
@@ -25663,14 +25698,14 @@ class TestInteractiveCards:
             body,
             kind="exec_approval",
             choice="deny",
-            resolver={"session_key": "sess-1"},
+            resolver={"session_key": "sess-1", "request_id": "req-handle"},
         )
         client = TestClient(a.build_app())
         r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "card_action"
         # Routed to the resolver, NOT the agent loop.
-        resolver.assert_called_once_with("sess-1", "deny")
+        resolver.assert_called_once_with("sess-1", "deny", request_id="req-handle")
         assert a._handled_events == []
 
 
