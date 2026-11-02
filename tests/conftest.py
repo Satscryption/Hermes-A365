@@ -8,34 +8,10 @@ golden fixtures.
 
 from __future__ import annotations
 
-import contextlib
 import logging
-import sys
 
 import pytest
 from cryptography.hazmat.primitives.asymmetric import rsa
-
-
-@pytest.fixture(autouse=True)
-def _reset_gateway_approval_queues():  # type: ignore[no-untyped-def]
-    """Clear Hermes gateway approval queue state leaked across tests."""
-
-    def _clear() -> None:
-        try:
-            from tools import approval as approval_mod
-
-            with approval_mod._lock:
-                approval_mod._gateway_queues.clear()
-        except Exception:
-            pass
-        stub = sys.modules.get("tools.approval")
-        if stub is not None and hasattr(stub, "_gateway_queues"):
-            with contextlib.suppress(Exception):
-                stub._gateway_queues.clear()
-
-    _clear()
-    yield
-    _clear()
 
 
 @pytest.fixture(autouse=True)
@@ -141,35 +117,3 @@ def rsa_keypair() -> tuple[rsa.RSAPrivateKey, dict]:
         "e": _b64u(pub_numbers.e),
     }
     return priv, jwk
-
-
-def pytest_collection_modifyitems(config, items):  # type: ignore[no-untyped-def]
-    """Skip vendored Hermes lifecycle tests when the vendor tree is absent."""
-    import importlib.util
-    from pathlib import Path
-
-    bootstrap_path = Path(__file__).resolve().parent / "_hermes_bootstrap.py"
-    spec = importlib.util.spec_from_file_location("hermes_a365_hermes_bootstrap", bootstrap_path)
-    assert spec and spec.loader
-    bootstrap = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(bootstrap)  # type: ignore[union-attr]
-    vendor_root = bootstrap.hermes_vendor_root()
-    vendor_ok = vendor_root.is_dir() and (vendor_root / ".git").exists()
-    skip = pytest.mark.skipif(
-        not vendor_ok,
-        reason="Hermes vendor checkout unavailable",
-    )
-    lifecycle = Path(__file__).resolve().parent / "test_hermes_runner_lifecycle.py"
-    exempt = frozenset(
-        {
-            "test_vendor_pin_required_without_git",
-            "test_vendor_fresh_clone_fetches_pin",
-            "test_vendor_revision_mismatch_is_rejected",
-        }
-    )
-    for item in items:
-        if Path(str(getattr(item, "path", item.fspath))) != lifecycle:
-            continue
-        if item.name in exempt:
-            continue
-        item.add_marker(skip)

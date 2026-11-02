@@ -6,6 +6,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+- Bind interactive approval cards and replies to the turn that created them.
+
 ## [0.9.6] — 2026-11-02
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),
