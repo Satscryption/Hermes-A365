@@ -13,6 +13,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   pending request, otherwise the text prompt is used. Refs
   [#86](https://github.com/Satscryption/Hermes-A365/issues/86).
   Exec-approval cards expire when their bound request is no longer pending.
+  A failed approval-list read expires only the clicked card.
+  A failed approval-card send no longer blocks a later card for the same request.
 
 ## [0.9.6] — 2026-11-02
 
