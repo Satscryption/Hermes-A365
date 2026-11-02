@@ -24,6 +24,7 @@ OVERRIDES = ROOT / "overrides.txt"
 TEST_WORKFLOW = ROOT / ".github" / "workflows" / "test.yml"
 
 AGGREGATE_TEST_NEEDS = (
+    "plan",
     "unit",
     "windows-negative",
     "keychain-linux",
@@ -94,8 +95,9 @@ def test_ci_matrix_covers_supported_python_versions() -> None:
     for job_id in AGGREGATE_TEST_NEEDS:
         assert f"needs.{job_id}.result" in step_run
 
+    plan_script = jobs["plan"]["steps"][-1]["run"]
     for version in ("3.11", "3.12", "3.13", "3.14"):
-        assert f'python-version: "{version}"' in text
+        assert f'"{version}"' in plan_script
     assert "macos-latest" in text
     assert "windows-negative" in text
     assert "keychain-linux" in text
