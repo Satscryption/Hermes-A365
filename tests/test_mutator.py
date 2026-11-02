@@ -944,8 +944,10 @@ class TestMutatorSubprocessScrubbing:
             "timeout": subprocess.TimeoutExpired,
             "cancel": asyncio.CancelledError,
         }[mode]
+        # Allow slow runners to start the child and drain its output before timing out.
+        timeout = 10.0 if mode == "overflow" else 0.5
         with pytest.raises(expected):
-            _real_run(tmp_path, script, sensitive=True, timeout=0.5)
+            _real_run(tmp_path, script, sensitive=True, timeout=timeout)
         _assert_children_clean(*watched_children)
 
     def test_reap_order_posix(self, monkeypatch: pytest.MonkeyPatch) -> None:

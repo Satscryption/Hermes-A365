@@ -6,6 +6,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- Test suite: made a subprocess overflow test independent of runner speed.
+
 ### Changed
 
 - **#86 — Consent cleanup and approval-card request binding.** File-consent
