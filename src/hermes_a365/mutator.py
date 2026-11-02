@@ -191,7 +191,11 @@ class A365CliMutator:
         action: str | None = None
         exit_code: int | None = None
         returncode = 0
-        combined = ""
+        combined = stripped = ""
+        match = None
+        detail = None
+        graph_error = None
+        code = None
         try:
             if sensitive:
                 returncode, combined = _run_sensitive_streaming(
@@ -201,51 +205,36 @@ class A365CliMutator:
                 returncode, combined = _run_streaming(
                     argv, timeout=timeout, stdin_input=stdin_input
                 )
-        except BaseException as exc:
-            _release(exc)
-            action, exit_code = _classify(exc)
-        stdin_input = None
-        if action is not None:
-            combined = ""
-            _raise_clean(action, argv, timeout, exit_code, sensitive=sensitive)
-        if returncode != 0:
+            if returncode == 0:
+                return RunResult(argv=list(argv), returncode=returncode, stdout=combined, stderr="")
             stripped = combined.strip()
             match = _AADSTS_RE.search(stripped)
             detail = _sensitive_failure_detail(stripped) if sensitive else stripped
             graph_error = _extract_sensitive_graph_error(stripped) if sensitive else None
-            rc = returncode
             if match:
                 code = match.group(0)
-                match = None
-                stripped = ""
-                combined = ""
-                _raise_clean(
-                    "aadsts",
-                    argv,
-                    timeout,
-                    None,
-                    sensitive=sensitive,
-                    detail=detail,
-                    aadsts_code=code,
-                )
+                action = "aadsts"
+            else:
+                action = "cli_invocation"
+        except BaseException as exc:
+            action, exit_code = _classify(exc)
+            detail = graph_error = code = None
+            _release(exc)
+        finally:
+            stdin_input = None
+            combined = stripped = ""
             match = None
-            stripped = ""
-            combined = ""
-            _raise_clean(
-                "cli_invocation",
-                argv,
-                timeout,
-                None,
-                sensitive=sensitive,
-                returncode=rc,
-                detail=detail,
-                graph_error=graph_error,
-            )
-        return RunResult(
-            argv=list(argv),
+        assert action is not None
+        _raise_clean(
+            action,
+            argv,
+            timeout,
+            exit_code,
+            sensitive=sensitive,
             returncode=returncode,
-            stdout=combined,
-            stderr="",
+            detail=detail,
+            graph_error=graph_error,
+            aadsts_code=code,
         )
 
 
@@ -256,7 +245,7 @@ class A365CliMutator:
 _SENSITIVE_OUTPUT_SUPPRESSED = "<output suppressed: sensitive command may emit credential material>"
 
 _READ_CHUNK_BYTES = 4096
-_MAX_LINE_PENDING_CHARS = 256 * 1024
+_MAX_LINE_BYTES = 256 * 1024
 _MAX_TOTAL_CAPTURE_BYTES = 4 * 1024 * 1024
 _QUEUE_MAXSIZE = 32
 _REAP_TERMINATE_GRACE_SECONDS = 0.2
@@ -509,16 +498,38 @@ def _extract_sensitive_graph_error(text: str) -> tuple[str, str] | None:
 @dataclass
 class _LineBuffer:
     pending: str = ""
+    pending_bytes: int = 0
+    total_bytes: int = 0
+    _trailing_cr_bytes: int = 0
     _decoder: codecs.IncrementalDecoder = field(
         default_factory=lambda: codecs.getincrementaldecoder("utf-8")(errors="replace")
     )
 
     def clear(self) -> None:
         self.pending = ""
+        self.pending_bytes = self.total_bytes = self._trailing_cr_bytes = 0
         self._decoder.reset()
 
+    def _decode(self, chunk: bytes, *, final: bool = False) -> None:
+        previous = len(self._decoder.getstate()[0])
+        text = self._decoder.decode(chunk, final=final)
+        size = len(text.encode("utf-8"))
+        self.pending += text
+        self.pending_bytes += size
+        # Include bytes still held by the incremental UTF-8 decoder.
+        self.total_bytes += size + len(self._decoder.getstate()[0]) - previous
+
+    def _check_line(self, size: int) -> None:
+        if size > _MAX_LINE_BYTES:
+            self.clear()
+            raise _CaptureLimit()
+
     def feed(self, chunk: bytes) -> list[str]:
-        self.pending += self._decoder.decode(chunk)
+        self._decode(chunk)
+        # A CR already emitted at a chunk boundary may acquire its LF now.
+        if self._trailing_cr_bytes and self.pending.startswith("\n"):
+            self._check_line(self._trailing_cr_bytes + 1)
+        self._trailing_cr_bytes = 0
         lines: list[str] = []
         while True:
             split_at = -1
@@ -529,26 +540,26 @@ class _LineBuffer:
                     split_at = idx
                     split_len = len(sep)
             if split_at < 0:
-                if len(self.pending) > _MAX_LINE_PENDING_CHARS:
-                    self.clear()
-                    raise _CaptureLimit()
+                self._check_line(self.pending_bytes + len(self._decoder.getstate()[0]))
                 break
-            lines.append(self.pending[: split_at + split_len])
+            line = self.pending[: split_at + split_len]
+            size = len(line.encode("utf-8"))
+            self._check_line(size)
+            lines.append(line)
             self.pending = self.pending[split_at + split_len :]
+            self.pending_bytes -= size
+            self._trailing_cr_bytes = size if line.endswith("\r") else 0
+        if self.pending or self._decoder.getstate()[0]:
+            self._trailing_cr_bytes = 0
         return lines
 
     def flush_eof(self) -> str:
-        tail = self._decoder.decode(b"", final=True)
-        combined = self.pending + tail
+        self._decode(b"", final=True)
+        self._check_line(self.pending_bytes)
+        tail = self.pending
         self.pending = ""
-        return combined
-
-
-def _capture_byte_size(captured: list[str], buffers: dict[str, _LineBuffer]) -> int:
-    total = sum(len(part.encode("utf-8", errors="replace")) for part in captured)
-    for buffer in buffers.values():
-        total += len(buffer.pending.encode("utf-8", errors="replace"))
-    return total
+        self.pending_bytes = 0
+        return tail
 
 
 def _clear_capture_buffers(captured: list[str], buffers: dict[str, _LineBuffer]) -> None:
@@ -557,9 +568,12 @@ def _clear_capture_buffers(captured: list[str], buffers: dict[str, _LineBuffer])
         buffer.clear()
 
 
+_OutputEvent = tuple[str, bytes | Literal["reader_failure", "stdin_failure"] | None]
+
+
 def _queue_put(
-    out_q: queue.Queue[tuple[str, bytes | None]],
-    item: tuple[str, bytes | None],
+    out_q: queue.Queue[_OutputEvent],
+    item: _OutputEvent,
     stop: threading.Event,
 ) -> None:
     while True:
@@ -574,9 +588,10 @@ def _queue_put(
 def _pump_stream(
     fd: int,
     name: str,
-    out_q: queue.Queue[tuple[str, bytes | None]],
+    out_q: queue.Queue[_OutputEvent],
     stop: threading.Event,
 ) -> None:
+    chunk = b""
     try:
         if os.name == "posix":
             poll = select.poll()
@@ -585,10 +600,7 @@ def _pump_stream(
                 while not stop.is_set():
                     if not poll.poll(50):
                         continue
-                    try:
-                        chunk = os.read(fd, _READ_CHUNK_BYTES)
-                    except OSError:
-                        break
+                    chunk = os.read(fd, _READ_CHUNK_BYTES)
                     if not chunk:
                         break
                     _queue_put(out_q, (name, chunk), stop)
@@ -597,27 +609,54 @@ def _pump_stream(
                     poll.unregister(fd)
         else:
             while not stop.is_set():
-                try:
-                    chunk = os.read(fd, _READ_CHUNK_BYTES)
-                except OSError:
-                    break
+                chunk = os.read(fd, _READ_CHUNK_BYTES)
                 if not chunk:
                     break
                 _queue_put(out_q, (name, chunk), stop)
-    finally:
+    except BaseException as exc:
+        _release(exc)
+        _queue_put(out_q, (name, "reader_failure"), stop)
+    else:
         _queue_put(out_q, (name, None), stop)
+    finally:
+        chunk = b""
+
+
+def _feed_stdin(pump: _Pump, stdin_input: str) -> None:
+    proc = pump.proc
+    assert proc is not None and proc.stdin is not None
+    pending = memoryview(stdin_input.encode("utf-8"))
+    stdin_input = ""
+    try:
+        while pending and not pump.stop.is_set():
+            if time.monotonic() >= pump.deadline:
+                break
+            written = proc.stdin.write(pending)
+            if written is None or written <= 0:
+                raise OSError("subprocess stdin write failed")
+            pending = pending[written:]
+    except BrokenPipeError:
+        pass
+    except BaseException as exc:
+        _release(exc)
+        _queue_put(pump.out_q, ("stdin", "stdin_failure"), pump.stop)
+    finally:
+        pending.release()
+        pending = memoryview(b"")
+        with contextlib.suppress(OSError):
+            proc.stdin.close()
 
 
 @dataclass
 class _Pump:
-    proc: subprocess.Popen[bytes]
+    proc: subprocess.Popen[bytes] | None
     argv: list[str]
     timeout: float
     streams: tuple[str, ...]
     echo: Literal["all", "device_login"]
     sensitive: bool
     stop: threading.Event
-    out_q: queue.Queue[tuple[str, bytes | None]]
+    out_q: queue.Queue[_OutputEvent]
     threads: list[threading.Thread]
     buffers: dict[str, _LineBuffer]
     eof_seen: dict[str, bool]
@@ -626,67 +665,94 @@ class _Pump:
     deadline: float
     thread_streams: list[tuple[threading.Thread, str]] = field(default_factory=list)
     reaped: bool = False
+    capture_bytes: int = 0
+    termination_started: bool = False
 
 
-def _reap(pump: _Pump) -> None:
-    if pump.reaped:
-        return
-    pump.reaped = True
+def _reap(pump: _Pump, failure: BaseException | None = None) -> None:
+    interrupted: tuple[str, int | None] | None = None
+    try:
+        while not pump.reaped:
+            try:
+                _reap_resources(pump)
+            except (KeyboardInterrupt, asyncio.CancelledError, SystemExit) as exc:
+                if interrupted is None:
+                    interrupted = _classify(exc)
+                _release(exc)
+                # Every operation is repeatable. A partly completed soft stop
+                # resumes at hard kill, then repeats waits and resource cleanup.
+    finally:
+        if failure is not None:
+            _release(failure)
+            failure = None
+    if interrupted is not None:
+        _raise_clean(
+            interrupted[0], pump.argv, pump.timeout, interrupted[1], sensitive=pump.sensitive
+        )
+
+
+def _reap_resources(pump: _Pump) -> None:
     pump.stop.set()
     proc = pump.proc
-    if proc.stdin is not None:
-        with contextlib.suppress(OSError):
-            proc.stdin.close()
-    if proc.poll() is None:
-        with contextlib.suppress(OSError):
-            proc.terminate()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(_REAP_TERMINATE_GRACE_SECONDS)
-    if proc.poll() is None:
-        with contextlib.suppress(OSError):
-            proc.kill()
-        with contextlib.suppress(subprocess.TimeoutExpired):
-            proc.wait(5)
+    if proc is not None:
+        if proc.poll() is None and not pump.termination_started:
+            pump.termination_started = True
+            with contextlib.suppress(OSError):
+                proc.terminate()
+            with contextlib.suppress(subprocess.TimeoutExpired):
+                proc.wait(_REAP_TERMINATE_GRACE_SECONDS)
         if proc.poll() is None:
             with contextlib.suppress(OSError):
                 proc.kill()
             with contextlib.suppress(subprocess.TimeoutExpired):
                 proc.wait(5)
+            if proc.poll() is None:
+                with contextlib.suppress(OSError):
+                    proc.kill()
+                with contextlib.suppress(subprocess.TimeoutExpired):
+                    proc.wait(5)
+        # Killing the child unblocks a writer stuck in an unbuffered pipe write.
+        if proc.stdin is not None:
+            with contextlib.suppress(OSError):
+                proc.stdin.close()
+        if os.name == "posix":
+            for thread in pump.threads:
+                if thread.ident is not None:
+                    thread.join(timeout=1.0)
+        for pipe in (proc.stdout, proc.stderr):
+            if pipe is not None:
+                with contextlib.suppress(OSError):
+                    pipe.close()
+        if os.name != "posix":
+            for thread in pump.threads:
+                if thread.ident is not None:
+                    thread.join(timeout=1.0)
+    # Producers have stopped: drain again so no late EOF/data survives cleanup.
     while True:
         try:
             pump.out_q.get_nowait()
         except queue.Empty:
             break
-    stdout = proc.stdout
-    stderr = proc.stderr
-    if os.name == "posix":
-        for thread in pump.threads:
-            thread.join(timeout=1.0)
-        if stdout is not None:
-            with contextlib.suppress(OSError):
-                stdout.close()
-        if stderr is not None:
-            with contextlib.suppress(OSError):
-                stderr.close()
-    else:
-        if stdout is not None:
-            with contextlib.suppress(OSError):
-                stdout.close()
-        if stderr is not None:
-            with contextlib.suppress(OSError):
-                stderr.close()
-        for thread in pump.threads:
-            thread.join(timeout=1.0)
     _clear_capture_buffers(pump.captured, pump.buffers)
     pump.emitted_logins.clear()
-    active = sys.exception()
-    if active is not None:
-        _release(active)
+    pump.capture_bytes = 0
+    if (
+        proc is not None
+        and (
+            proc.returncode is None
+            or any(
+                pipe is not None and not pipe.closed
+                for pipe in (proc.stdin, proc.stdout, proc.stderr)
+            )
+        )
+    ) or any(thread.is_alive() for thread in pump.threads):
+        raise _StreamFailure()
+    pump.reaped = True
 
 
 def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
     proc = pump.proc
-    assert proc.stdout is not None
+    assert proc is not None and proc.stdout is not None
     streams = pump.streams
     buffers = pump.buffers
     captured = pump.captured
@@ -698,9 +764,6 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
 
     def _handle_complete_line(line: str) -> None:
         captured.append(line)
-        if _capture_byte_size(captured, buffers) > _MAX_TOTAL_CAPTURE_BYTES:
-            _clear_capture_buffers(captured, buffers)
-            raise _CaptureLimit()
         if echo == "all":
             sys.stdout.write(line)
             sys.stdout.flush()
@@ -709,24 +772,37 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
 
     def _flush_eof_tail(name: str) -> None:
         buffer = buffers[name]
+        previous = buffer.total_bytes
         tail = buffer.flush_eof()
+        _count_bytes(buffer.total_bytes - previous)
         if not tail:
             return
         captured.append(tail)
-        if _capture_byte_size(captured, buffers) > _MAX_TOTAL_CAPTURE_BYTES:
-            _clear_capture_buffers(captured, buffers)
-            raise _CaptureLimit()
         if echo == "all":
             sys.stdout.write(tail)
             sys.stdout.flush()
         elif echo == "device_login":
             _try_emit_device_login_line(tail, emitted=emitted_logins, eof=True)
 
+    def _count_bytes(size: int) -> None:
+        pump.capture_bytes += size
+        if pump.capture_bytes > _MAX_TOTAL_CAPTURE_BYTES:
+            _clear_capture_buffers(captured, buffers)
+            raise _CaptureLimit()
+
     def _drain_chunk(name: str, chunk: bytes) -> None:
-        for line in buffers[name].feed(chunk):
+        buffer = buffers[name]
+        previous = buffer.total_bytes
+        lines = buffer.feed(chunk)
+        _count_bytes(buffer.total_bytes - previous)
+        for line in lines:
             _handle_complete_line(line)
 
-    def _process_queue_item(name: str, payload: bytes | None) -> None:
+    def _process_queue_item(
+        name: str, payload: bytes | Literal["reader_failure", "stdin_failure"] | None
+    ) -> None:
+        if isinstance(payload, str):
+            raise _StreamFailure()
         if payload is None:
             eof_seen[name] = True
             _flush_eof_tail(name)
@@ -775,57 +851,60 @@ def _run_child_output(
     merge_stderr: bool,
     sensitive: bool,
 ) -> tuple[int, str]:
-    proc = subprocess.Popen(
-        argv,
-        stdin=subprocess.PIPE if stdin_input is not None else None,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
-        bufsize=0,
-        preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
-    )
-    assert proc.stdout is not None
     streams: tuple[str, ...] = ("stdout",) if merge_stderr else ("stdout", "stderr")
-    stop = threading.Event()
-    out_q: queue.Queue[tuple[str, bytes | None]] = queue.Queue(maxsize=_QUEUE_MAXSIZE)
-    fds: list[tuple[int, str]] = [(proc.stdout.fileno(), "stdout")]
-    if proc.stderr is not None:
-        fds.append((proc.stderr.fileno(), "stderr"))
-    threads = [
-        threading.Thread(target=_pump_stream, args=(fd, name, out_q, stop), daemon=True)
-        for fd, name in fds
-    ]
-    for thread in threads:
-        thread.start()
-    thread_streams = list(zip(threads, [name for _fd, name in fds], strict=True))
     pump = _Pump(
-        proc=proc,
+        proc=None,
         argv=argv,
         timeout=timeout,
         streams=streams,
         echo=echo,
         sensitive=sensitive,
-        stop=stop,
-        out_q=out_q,
-        threads=threads,
+        stop=threading.Event(),
+        out_q=queue.Queue(maxsize=_QUEUE_MAXSIZE),
+        threads=[],
         buffers={name: _LineBuffer() for name in streams},
         eof_seen={name: False for name in streams},
         emitted_logins=set(),
         captured=[],
         deadline=time.monotonic() + timeout,
-        thread_streams=thread_streams,
     )
+    failure = None
     try:
+        pump.proc = subprocess.Popen(
+            argv,
+            stdin=subprocess.PIPE if stdin_input is not None else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT if merge_stderr else subprocess.PIPE,
+            bufsize=0,
+            preexec_fn=_owner_only_child_setup if os.name == "posix" else None,
+        )
+        proc = pump.proc
+        assert proc.stdout is not None
+        for name in streams:
+            pipe = getattr(proc, name)
+            assert pipe is not None
+            thread = threading.Thread(
+                target=_pump_stream,
+                args=(pipe.fileno(), name, pump.out_q, pump.stop),
+                daemon=True,
+            )
+            # Register before start: an interrupt may follow the native start.
+            # Cleanup checks ident and joins only threads that actually started.
+            pump.threads.append(thread)
+            pump.thread_streams.append((thread, name))
+            thread.start()
         if stdin_input is not None:
-            assert proc.stdin is not None
-            try:
-                proc.stdin.write(stdin_input.encode("utf-8"))
-            except BrokenPipeError:
-                pass
-            finally:
-                proc.stdin.close()
+            writer = threading.Thread(target=_feed_stdin, args=(pump, stdin_input), daemon=True)
+            pump.threads.append(writer)
+            writer.start()
+        stdin_input = None
         return _run_pumped_output(pump)
+    except BaseException as exc:
+        failure = exc
+        raise
     finally:
-        _reap(pump)
+        stdin_input = None
+        _reap(pump, failure)
 
 
 def _run_sensitive_streaming(
