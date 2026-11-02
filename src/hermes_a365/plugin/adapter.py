@@ -12579,9 +12579,15 @@ class Agent365Adapter(BasePlatformAdapter):
             choices,
             {"session_key": session_key, "request_id": request_id},
         )
-        return await self._send_card(
+        result = await self._send_card(
             chat_id, self._action_submit_card(text, actions), log_context="exec_approval"
         )
+        if not result.success:
+            # The request stays unbound when no card was confirmed as sent, so a later
+            # card for the same request can still be offered.
+            for _title, data in actions:
+                self._card_capabilities.pop(str(data.get("capability") or ""), None)
+        return result
 
     async def send_slash_confirm(
         self,
