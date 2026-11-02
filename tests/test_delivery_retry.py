@@ -6,6 +6,7 @@ import asyncio
 import json
 from collections.abc import Callable
 from contextlib import AsyncExitStack
+from dataclasses import asdict
 from typing import Any
 
 import httpx
@@ -267,7 +268,7 @@ async def test_pending_payload_evicts_with_record(delivery):
     # pre-dispatch probe to inspect the empty cache, as the plugin may do.
     expires = cache.record(d.key).inserted_at + cache.ttl_seconds
     assert cache.claim("ttl-probe", now=expires) == "new"
-    cache.release_if_received("ttl-probe")
+    cache.release_if_received("ttl-probe", cache.record("ttl-probe"))
     assert len(cache.seen) == 0
     assert cache.result_bytes == 0
     assert cache.record(d.key) is None
@@ -487,3 +488,176 @@ async def test_cancellation_before_post_preserves_ready(delivery, monkeypatch, o
     response_is(await d.post(), 200, "duplicate")
     assert d.webhook_calls == 1
     assert len(d.posts) == (0 if oversize else 1)
+
+
+@pytest.mark.parametrize("outcome", [200, httpx.ConnectError("failure"), 400, 502])
+async def test_expired_reply_outcome_does_not_change_replacement(delivery, outcome):
+    cache = bridge._IdempotencyCache(ttl_seconds=60)
+    old = delivery(cache=cache, replies=[outcome])
+    new = delivery(cache=cache)
+    old.block_at = new.block_at = "reply"
+    first = asyncio.create_task(old.post())
+    await old.entered.wait()
+    old_record = cache.record(old.key)
+    old_record.inserted_at -= cache.ttl_seconds
+    second = asyncio.create_task(new.post())
+    await new.entered.wait()
+    new_record = cache.record(new.key)
+    assert new_record is not old_record
+    retained_bytes = cache.result_bytes
+    try:
+        old.resume.set()
+        await first
+        assert cache.record(new.key) is new_record
+        assert new_record.reply == "inflight"
+        assert new_record.result == new.webhook
+        assert new_record.attempts == 1
+        assert cache.result_bytes == retained_bytes > 0
+    finally:
+        old.resume.set()
+        new.resume.set()
+        await asyncio.gather(first, second)
+    response_is(second.result(), 200, "replied")
+    response_is(await new.post(), 200, "duplicate")
+    assert old.webhook_calls == new.webhook_calls == 1
+    assert len(old.posts) == len(new.posts) == 1
+    assert cache.result_bytes == 0
+
+
+@pytest.mark.parametrize(
+    ("stage", "update"),
+    [
+        ("received", "enter_webhook"),
+        ("received", "release_if_received"),
+        ("webhook_running", "complete"),
+        ("webhook_running", "store_result"),
+        ("ready", "begin_reply"),
+        ("inflight", "finish_reply"),
+    ],
+)
+def test_stale_record_cannot_update_replacement(stage, update):
+    cache = bridge._IdempotencyCache(ttl_seconds=60)
+
+    def prepare(now):
+        assert cache.claim("key", now=now) == "new"
+        record = cache.record("key")
+        if stage != "received":
+            assert cache.enter_webhook("key", record)
+            if stage != "webhook_running":
+                cache.store_result("key", record, {"text": "retained"})
+                if stage == "inflight":
+                    assert cache.begin_reply("key", record)
+        return record
+
+    old = prepare(100)
+    new = prepare(160)
+    before = asdict(new)
+    retained_bytes = cache.result_bytes
+    args = {
+        "complete": ("no_reply",),
+        "store_result": ({"text": "stale"},),
+        "finish_reply": ("sent",),
+    }.get(update, ())
+    getattr(cache, update)("key", old, *args)
+    assert cache.record("key") is new
+    assert asdict(new) == before
+    assert cache.result_bytes == retained_bytes
+
+
+def test_payload_shedding_scans_cache_linearly(monkeypatch):
+    monkeypatch.setattr(bridge, "REPLY_PAYLOAD_MAX_BYTES", 256)
+    monkeypatch.setattr(bridge, "REPLY_PAYLOAD_TOTAL_MAX_BYTES", 256)
+
+    class CountedRecords(dict):
+        visits = 0
+
+        def values(self):
+            for record in super().values():
+                self.visits += 1
+                yield record
+
+        def items(self):
+            for item in super().items():
+                self.visits += 1
+                yield item
+
+    records = CountedRecords()
+    cache = bridge._IdempotencyCache(seen=records)
+    for index in range(200):
+        cache.is_duplicate(f"tombstone-{index}", now=100)
+
+    def store(key, text):
+        assert cache.claim(key, now=100) == "new"
+        record = cache.record(key)
+        assert cache.enter_webhook(key, record)
+        cache.store_result(key, record, {"text": text})
+        return record
+
+    small = [store(f"small-{index}", "x" * 20) for index in range(8)]
+    assert cache.result_bytes == 256
+    records.visits = 0
+    large = store("large", "x" * 200)
+    assert records.visits <= 2 * len(records)
+    assert [record.reply for record in small] == ["held"] * 7 + ["ready"]
+    assert large.result == {"text": "x" * 200}
+    assert cache.result_bytes == 244
+    assert cache.result_bytes == sum(record.result_bytes for record in records.values())
+
+
+@pytest.mark.parametrize("release", ["complete", "finish", "expire", "evict", "forget"])
+def test_payload_total_tracks_every_release_path(release):
+    cache = bridge._IdempotencyCache(ttl_seconds=60, max_entries=1)
+    assert cache.claim("key", now=100) == "new"
+    record = cache.record("key")
+    assert cache.enter_webhook("key", record)
+    cache.store_result("key", record, {"text": "retained"})
+    assert cache.result_bytes == record.result_bytes > 0
+    if release == "complete":
+        cache.complete("key", record)
+    elif release == "finish":
+        assert cache.begin_reply("key", record)
+        cache.finish_reply("key", record, "sent")
+    elif release == "expire":
+        assert cache.claim("new", now=160) == "new"
+    elif release == "evict":
+        # Shedding normally clears held records first. Exercise removal's
+        # accounting even if an evictable record still owns a body.
+        record.reply = "held"
+        assert cache.claim("new", now=101) == "new"
+    else:
+        record.state = "received"
+        cache.forget("key")
+    assert record.result is None
+    assert record.result_bytes == 0
+    assert cache.result_bytes == 0
+
+
+@pytest.mark.parametrize("later_post", [False, True])
+async def test_cancellation_during_429_retry(delivery, monkeypatch, later_post):
+    d = delivery(replies=[429, 200])
+    sleeping = asyncio.Event()
+    resume_sleep = asyncio.Event()
+
+    async def backoff(_seconds):
+        sleeping.set()
+        await resume_sleep.wait()
+
+    monkeypatch.setattr(outbound_retry.asyncio, "sleep", backoff)
+    first = asyncio.create_task(d.post())
+    await sleeping.wait()
+    if later_post:
+        d.block_at = "reply"
+        resume_sleep.set()
+        await d.entered.wait()
+    first.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await first
+    record = d.cache.record(d.key)
+    assert record.reply == ("held" if later_post else "ready")
+    assert (d.cache.result_bytes > 0) is (not later_post)
+    assert (record.result is not None) is (not later_post)
+    assert len(d.posts) == (2 if later_post else 1)
+    d.block_at = ""
+    response_is(await d.post(), 200, "duplicate" if later_post else "replied")
+    assert d.webhook_calls == 1
+    assert len(d.posts) == 2

@@ -3992,14 +3992,27 @@ class TestIdempotencyCache:
         cache = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
         assert cache.is_duplicate("a", now=100.0) is False
         assert cache.is_duplicate("b", now=101.0) is False
-        # Only completed tombstones may be evicted; pending work is protected.
-        cache.complete("a")
-        cache.complete("b")
+        # The plugin only calls is_duplicate and forget; successful dispatch
+        # has no completion callback. It must still admit new keys at capacity.
+        assert cache.is_duplicate("a", now=101.5) is True
         assert cache.is_duplicate("c", now=102.0) is False
         assert len(cache.seen) == 2
+        cache.forget("c")
+        assert cache.is_duplicate("c", now=102.5) is False
+        assert cache.is_duplicate("b", now=102.6) is True
         # The oldest entry was evicted, so it is admitted as new.
         assert cache.is_duplicate("a", now=103.0) is False
         assert len(cache.seen) == 2
+
+    def test_retained_activity_type_is_bounded(self) -> None:
+        cache = _IdempotencyCache()
+        activity_type = "caller-controlled-" + "\U0001f600" * 40_000
+        assert cache.claim("large", now=100.0, activity_type=activity_type) == "new"
+        record = cache.record("large")
+        assert record is not None
+        assert record.activity_type == activity_type[:64]
+        assert cache.claim("message", now=100.0, activity_type="message") == "new"
+        assert cache.record("message").activity_type == "message"
 
     def test_is_duplicate_mutates_in_place_without_rebuilding(self) -> None:
         # #105 review: the check runs on the inbound request coroutine in both

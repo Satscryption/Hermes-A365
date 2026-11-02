@@ -2230,21 +2230,26 @@ class _DeliveryRecord:
     result: dict[str, Any] | None = field(default=None, repr=False)
     result_bytes: int = 0
 
+    def __post_init__(self) -> None:
+        self.activity_type = self.activity_type[:64]
+
 
 @dataclass
 class _IdempotencyCache:
     """Process-local delivery records; payloads live and expire with their key.
 
-    Capacity evicts only completed tombstones. Active work and retryable replies
-    instead apply backpressure until completion or the monotonic TTL expires.
+    Capacity evicts completed tombstones and plugin-accepted keys. Serve work
+    and retryable replies apply backpressure until completion or TTL expiry.
     ``is_duplicate`` retains the plugin's pre-dispatch ``forget`` contract.
     """
 
     seen: dict[str, _DeliveryRecord] = field(default_factory=dict)
     ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
     max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+    result_bytes: int = field(default=0, init=False)
 
     def __post_init__(self) -> None:
+        self.result_bytes = sum(record.result_bytes for record in self.seen.values())
         # #105 review: normalize + de-silence the operator-tunable cap here, in
         # the one place BOTH runtimes construct the cache, so neither can drift.
         # A non-integer cap can reach us from either config path (a malformed
@@ -2281,9 +2286,13 @@ class _IdempotencyCache:
     def record(self, delivery_id: str) -> _DeliveryRecord | None:
         return self.seen.get(self._key(delivery_id))
 
-    @property
-    def result_bytes(self) -> int:
-        return sum(record.result_bytes for record in self.seen.values())
+    def _release_result(self, record: _DeliveryRecord) -> None:
+        self.result_bytes -= record.result_bytes
+        record.result = None
+        record.result_bytes = 0
+
+    def _remove(self, key: str) -> None:
+        self._release_result(self.seen.pop(key))
 
     def _log(
         self,
@@ -2317,10 +2326,10 @@ class _IdempotencyCache:
             oldest = next(iter(self.seen))
             if cur - self.seen[oldest].inserted_at < self.ttl_seconds:
                 break
-            del self.seen[oldest]
+            self._remove(oldest)
         record = self.seen.get(key)
         if record is not None and cur - record.inserted_at >= self.ttl_seconds:
-            del self.seen[key]
+            self._remove(key)
             record = None
         if record is not None:
             if record.state in {"received", "webhook_running"} or record.reply == "inflight":
@@ -2334,30 +2343,35 @@ class _IdempotencyCache:
                 (
                     k
                     for k, r in self.seen.items()
-                    if r.state == "done" or r.reply in {"sent", "held"}
+                    if r.state in {"done", "plugin_received"} or r.reply in {"sent", "held"}
                 ),
                 None,
             )
             if evictable is None:
                 self._log("delivery_cache_full", key, _DeliveryRecord(cur, activity_type))
                 return "busy"
-            del self.seen[evictable]
+            self._remove(evictable)
         record = _DeliveryRecord(cur, activity_type)
         self.seen[key] = record
         self._log("delivery_claim", key, record)
         return "new"
 
     def is_duplicate(self, delivery_id: str, *, now: float | None = None) -> bool:
-        return self.claim(delivery_id, now=now) != "new"
+        claimed = self.claim(delivery_id, now=now)
+        if claimed == "new":
+            record = self.record(delivery_id)
+            if record is not None:
+                # The plugin has no completion callback. Its accepted keys are
+                # evictable, while forget still releases pre-dispatch failures.
+                record.state = "plugin_received"
+        return claimed != "new"
 
-    def complete(self, delivery_id: str, reason: str = "done") -> None:
-        record = self.record(delivery_id)
-        if record is not None:
+    def complete(self, delivery_id: str, record: _DeliveryRecord, reason: str = "done") -> None:
+        if self.record(delivery_id) is record:
             record.state = "done"
             record.reply = "held"
             record.hold_reason = reason
-            record.result = None
-            record.result_bytes = 0
+            self._release_result(record)
             ambiguous = reason == "reply_unconfirmed"
             self._log(
                 "delivery_reply_ambiguous" if ambiguous else "delivery_webhook_once",
@@ -2367,27 +2381,28 @@ class _IdempotencyCache:
                 warning=ambiguous,
             )
 
-    def release_if_received(self, delivery_id: str) -> None:
+    def release_if_received(self, delivery_id: str, record: _DeliveryRecord) -> None:
         key = self._key(delivery_id)
-        record = self.seen.get(key)
-        if record is not None and record.state == "received":
-            del self.seen[key]
+        if self.seen.get(key) is record and record.state in {"received", "plugin_received"}:
+            self._remove(key)
             self._log("delivery_released", key, record, "before_webhook", warning=True)
 
     def forget(self, delivery_id: str) -> None:
-        self.release_if_received(delivery_id)
-
-    def enter_webhook(self, delivery_id: str) -> bool:
         record = self.record(delivery_id)
-        if record is None or record.state != "received":
+        if record is not None:
+            self.release_if_received(delivery_id, record)
+
+    def enter_webhook(self, delivery_id: str, record: _DeliveryRecord) -> bool:
+        if self.record(delivery_id) is not record or record.state != "received":
             return False
         record.state = "webhook_running"
         self._log("delivery_webhook_once", self._key(delivery_id), record)
         return True
 
-    def store_result(self, delivery_id: str, result: dict[str, Any]) -> None:
-        record = self.record(delivery_id)
-        if record is None or record.state != "webhook_running":
+    def store_result(
+        self, delivery_id: str, record: _DeliveryRecord, result: dict[str, Any]
+    ) -> None:
+        if self.record(delivery_id) is not record or record.state != "webhook_running":
             return
         record.state = "webhook_done"
         record.reply = "ready"
@@ -2415,28 +2430,28 @@ class _IdempotencyCache:
             if self.result_bytes + size <= REPLY_PAYLOAD_TOTAL_MAX_BYTES:
                 break
             if older.result is not None:
-                older.result = None
-                older.result_bytes = 0
+                self._release_result(older)
                 older.hold_reason = "reply_unconfirmed"
                 if older.reply == "ready":
                     older.reply = "held"
                 self._log("delivery_payload_shed", key, older, "byte_cap", warning=True)
         record.result = stored
         record.result_bytes = size
+        self.result_bytes += size
         self._log("delivery_webhook_once", self._key(delivery_id), record, "result_ready")
 
-    def begin_reply(self, delivery_id: str) -> bool:
-        record = self.record(delivery_id)
-        if record is None or record.reply != "ready":
+    def begin_reply(self, delivery_id: str, record: _DeliveryRecord) -> bool:
+        if self.record(delivery_id) is not record or record.reply != "ready":
             return False
         record.reply = "inflight"
         record.attempts += 1
         self._log("delivery_reply_retry", self._key(delivery_id), record, "begin")
         return True
 
-    def finish_reply(self, delivery_id: str, outcome: str, evidence: str = "") -> str:
-        record = self.record(delivery_id)
-        if record is None or record.reply != "inflight":
+    def finish_reply(
+        self, delivery_id: str, record: _DeliveryRecord, outcome: str, evidence: str = ""
+    ) -> str:
+        if self.record(delivery_id) is not record or record.reply != "inflight":
             return "reply_unconfirmed"
         if outcome == "sent":
             record.reply = "sent"
@@ -2457,8 +2472,7 @@ class _IdempotencyCache:
             record.reply = "held"
             status, event = "reply_unconfirmed", "delivery_reply_ambiguous"
         record.hold_reason = status if record.reply == "held" else ""
-        record.result = None
-        record.result_bytes = 0
+        self._release_result(record)
         self._log(
             event,
             self._key(delivery_id),
@@ -3808,8 +3822,8 @@ class ReplyRejected(ReplyPostError):
     """A terminal connector rejection; never resend this delivery."""
 
 
-class _ReplyTokenCancelled(asyncio.CancelledError):
-    """Cancellation during token acquisition, before any reply POST."""
+class _ReplyNotSentCancelled(asyncio.CancelledError):
+    """Cancellation before a POST or after a definite connector non-send."""
 
 
 def _reply_status_outcome(status: int | None) -> str:
@@ -3898,7 +3912,7 @@ async def send_reply(
             deadline=deadline,
         )
     except asyncio.CancelledError as exc:
-        raise _ReplyTokenCancelled() from exc
+        raise _ReplyNotSentCancelled() from exc
     except _httpx.TimeoutException:
         # Preserve real token-mint timeouts for the plugin's retry contract.
         raise
@@ -3908,6 +3922,7 @@ async def send_reply(
         OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
         OUTBOUND_DEFAULT_MAX_ATTEMPTS,
         OutboundBudgetExhausted,
+        http_status_code,
         request_with_outbound_retry,
     )
 
@@ -3921,13 +3936,20 @@ async def send_reply(
             else OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
         )
 
+    post_may_have_sent = False
+
     async def _post_once(timeout_sec: float) -> Any:
-        return await client.post(
+        nonlocal post_may_have_sent
+        post_may_have_sent = True
+        response = await client.post(
             url,
             json=reply,
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout_sec,
         )
+        if http_status_code(response) == 429:
+            post_may_have_sent = False
+        return response
 
     try:
         response = await request_with_outbound_retry(
@@ -3937,6 +3959,10 @@ async def send_reply(
             sleep=sleep,
             **retry_kwargs,
         )
+    except asyncio.CancelledError as exc:
+        if not post_may_have_sent:
+            raise _ReplyNotSentCancelled() from exc
+        raise
     except OutboundBudgetExhausted as exc:
         raise ReplyNotSent("reply budget exhausted before send") from exc
     except (_httpx.ConnectTimeout, _httpx.PoolTimeout, _httpx.ConnectError) as exc:
@@ -3945,8 +3971,6 @@ async def send_reply(
         raise ReplyAmbiguous("timeout after the request was sent") from exc
     except Exception as exc:
         raise ReplyAmbiguous("reply POST outcome unknown") from exc
-    from hermes_a365.outbound_retry import http_status_code
-
     status_code = http_status_code(response)
     outcome = _reply_status_outcome(status_code)
     if outcome != "sent":
@@ -4177,17 +4201,17 @@ def make_app(
             webhook_error = False
             if claimed == "new":
                 if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
-                    cache.complete(key)
+                    cache.complete(key, record)
                     return _JSONResponse({"status": "acked"})
                 if not activity_forwards_to_webhook(activity):
-                    cache.complete(key)
+                    cache.complete(key, record)
                     return _JSONResponse({"status": "acked", "reason": "unhandled_type"})
                 if delivery_id is None and activity_type != "invoke":
-                    cache.complete(key)
+                    cache.complete(key, record)
                     return _JSONResponse({"status": "acked", "reason": "unroutable"})
 
                 envelope = build_webhook_envelope(activity, cfg)
-                cache.enter_webhook(key)
+                cache.enter_webhook(key, record)
                 try:
                     webhook_resp = await forward_to_webhook(
                         envelope=envelope,
@@ -4198,7 +4222,7 @@ def make_app(
                 except Exception as exc:
                     logger.warning("operator webhook error: %s", type(exc).__name__)
                     if activity_type == "invoke":
-                        cache.complete(key, "invoke_error")
+                        cache.complete(key, record, "invoke_error")
                         return _empty_invoke_ack_response()
                     webhook_error = True
                     webhook_resp = {
@@ -4207,7 +4231,7 @@ def make_app(
 
                 if activity_type == "invoke":
                     # Invoke bodies are used only on the original request.
-                    cache.complete(key, "invoke_done")
+                    cache.complete(key, record, "invoke_done")
                     if not isinstance(webhook_resp, dict):
                         return _empty_invoke_ack_response()
                     invoke_response = webhook_resp.get("invokeResponse") or {
@@ -4225,19 +4249,19 @@ def make_app(
                 if not isinstance(webhook_resp, dict) or not (
                     webhook_resp.get("text") or webhook_resp.get("card")
                 ):
-                    cache.complete(key, "no_reply")
+                    cache.complete(key, record, "no_reply")
                     return _JSONResponse({"status": "no_reply"})
-                cache.store_result(key, webhook_resp)
+                cache.store_result(key, record, webhook_resp)
             else:
                 webhook_resp = record.result
                 if webhook_resp is None:
-                    cache.complete(key, "reply_unconfirmed")
+                    cache.complete(key, record, "reply_unconfirmed")
                     return _JSONResponse({"status": "reply_unconfirmed"})
 
             # Render from THIS inbound: a redelivery's serviceUrl is validated
             # again above and is deliberately absent from the delivery key.
             reply = render_reply_activity(activity, webhook_resp)
-            if not cache.begin_reply(key):
+            if not cache.begin_reply(key, record):
                 return _JSONResponse({"status": "delivery_in_progress"}, status_code=503)
             try:
                 await send_reply(
@@ -4251,19 +4275,19 @@ def make_app(
                     validated_path=validated_path,
                     deadline=ack_deadline,
                 )
-            except _ReplyTokenCancelled:
-                cache.finish_reply(key, "not_sent", "cancelled_before_post")
+            except _ReplyNotSentCancelled:
+                cache.finish_reply(key, record, "not_sent", "cancelled_before_post")
                 raise
             except Exception as exc:
                 evidence = type(exc).__name__
                 if isinstance(exc, ReplyPostError) and exc.status_code is not None:
                     evidence += f":{exc.status_code}"
-                status = cache.finish_reply(key, _reply_outcome(exc), evidence)
+                status = cache.finish_reply(key, record, _reply_outcome(exc), evidence)
                 return _JSONResponse(
                     {"status": status},
                     status_code=502 if status == "reply_failed" else 200,
                 )
-            status = cache.finish_reply(key, "sent")
+            status = cache.finish_reply(key, record, "sent")
             return _JSONResponse({"status": "webhook_error" if webhook_error else status})
         finally:
             # CancelledError is a BaseException. A cancellation after entry must
@@ -4271,11 +4295,11 @@ def make_app(
             # Don't alter a newer record if this request outlived its TTL.
             if cache.record(key) is record:
                 if record.state == "received":
-                    cache.release_if_received(key)
+                    cache.release_if_received(key, record)
                 elif record.state == "webhook_running":
-                    cache.complete(key, "reply_unconfirmed")
+                    cache.complete(key, record, "reply_unconfirmed")
                 elif record.reply == "inflight":
-                    cache.finish_reply(key, "ambiguous", "cancelled_or_interrupted")
+                    cache.finish_reply(key, record, "ambiguous", "cancelled_or_interrupted")
 
     return app
 
