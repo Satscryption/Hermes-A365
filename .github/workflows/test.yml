@@ -91,13 +91,20 @@ jobs:
               if diff.returncode == 0:
                   paths = diff.stdout.split(b"\0")[:-1]
                   # Only prose that no test, packaging step or surface check reads.
-                  # CHANGELOG.md, SECURITY.md, README.md, SKILL.md, docs/SURFACE.md and
-                  # docs/surface/ are read by tests or shipped, so they run the suite.
+                  # CHANGELOG.md, SECURITY.md, README.md, SKILL.md, docs/SURFACE.md,
+                  # docs/surface/ and the files in TEST_READ are read by tests or
+                  # shipped, so changing them runs the suite.
+                  TEST_READ = {
+                      b"docs/SURFACE.md",
+                      b"references/hermes-runtime-compatibility.md",
+                      b"references/v1-compatibility-matrix.md",
+                  }
                   def prose(p):
-                      return p.endswith(b".md") and (
-                          p.startswith((b"references/", b"reports/"))
-                          or (p.startswith(b"docs/") and p != b"docs/SURFACE.md"
-                              and not p.startswith(b"docs/surface/"))
+                      return (
+                          p.endswith(b".md")
+                          and p not in TEST_READ
+                          and p.startswith((b"references/", b"reports/", b"docs/"))
+                          and not p.startswith(b"docs/surface/")
                       )
                   docs_only = bool(paths) and all(prose(p) for p in paths)
               else:
@@ -267,26 +274,26 @@ jobs:
     timeout-minutes: 2
     runs-on: ubuntu-latest
     steps:
-      - name: Require all test jobs successful
-        env:
-          NEEDS: ${{ toJSON(needs) }}
+      - name: Require selected jobs successful and excluded jobs skipped
         run: |
-          python3 - <<'PY'
-          import json
-          import os
-
-          needs = json.loads(os.environ["NEEDS"])
-          assert needs["plan"]["result"] == "success", "job planning failed"
-          flags = needs["plan"]["outputs"]
-          for job, flag in [
-              ("unit", "unit"),
-              ("windows-negative", "full"),
-              ("keychain-linux", "full"),
-              ("wheel-smoke", "wheel"),
-              ("hermes-source-smoke", "full"),
-          ]:
-              expected = "success" if flags[flag] == "true" else "skipped"
-              result = needs[job]["result"]
-              print(f"{job}: {result} (expected {expected})")
-              assert result == expected, f"{job}: {result} (expected {expected})"
-          PY
+          set -euo pipefail
+          if [[ "${{ needs.plan.result }}" != "success" ]]; then
+            echo "plan: ${{ needs.plan.result }} (expected success)" >&2
+            exit 1
+          fi
+          check() {
+            local name="$1" result="$2" selected="$3" expected="skipped"
+            if [[ "$selected" == "true" ]]; then
+              expected="success"
+            fi
+            if [[ "$result" != "$expected" ]]; then
+              echo "$name: $result (expected $expected)" >&2
+              return 1
+            fi
+            echo "$name: $result"
+          }
+          check unit "${{ needs.unit.result }}" "${{ needs.plan.outputs.unit }}"
+          check windows-negative "${{ needs.windows-negative.result }}" "${{ needs.plan.outputs.full }}"
+          check keychain-linux "${{ needs.keychain-linux.result }}" "${{ needs.plan.outputs.full }}"
+          check wheel-smoke "${{ needs.wheel-smoke.result }}" "${{ needs.plan.outputs.wheel }}"
+          check hermes-source-smoke "${{ needs.hermes-source-smoke.result }}" "${{ needs.plan.outputs.full }}"
