@@ -2356,6 +2356,16 @@ def _response_is_stripped_connector_bot_403_envelope(response: dict[str, Any]) -
 _GATEWAY_LOG_INBOUND_403_UNAUTHORIZED_END_USER = "inbound 403 reason=unauthorized-end-user"
 _GATEWAY_LOG_INBOUND_403_PATH_B_REASON_PREFIX = "inbound 403 path=B reason="
 _GATEWAY_LOG_INBOUND_403_UNTRUSTED_SERVICE_URL = "inbound 403 reason=untrusted-service-url"
+_GATEWAY_LOG_INBOUND_403_CLIENT_CHANNEL_DISABLED = "inbound 403 reason=client-channel-disabled"
+
+# Use the literal to avoid activity_bridge's optional HTTP/JWT stack imports;
+# keep aligned with activity_bridge.ALLOW_CLIENT_BF_CHANNELS_ENV_KEY.
+_CLIENT_BF_CHANNELS_REMEDIATION = (
+    "Bot Framework client channels (Direct Line / Web Chat) are disabled by design, "
+    "which is expected unless deliberately enabled. To probe through Direct Line, "
+    "set A365_ALLOW_CLIENT_BF_CHANNELS=1 for the probed agent's gateway profile "
+    "and restart the gateway."
+)
 
 _STRIPPED_CONNECTOR_BOT_403_REMEDIATION = (
     "The Connector stripped the bot's 403 reason (body above). Check the gateway log: "
@@ -2364,7 +2374,9 @@ _STRIPPED_CONNECTOR_BOT_403_REMEDIATION = (
     f"`{_GATEWAY_LOG_INBOUND_403_PATH_B_REASON_PREFIX}` with a BF signature/aud/iss or "
     "serviceUrl mismatch means a real Path B auth failure; "
     f"`{_GATEWAY_LOG_INBOUND_403_UNTRUSTED_SERVICE_URL}` means the activity serviceUrl "
-    "failed the trusted-suffix check."
+    "failed the trusted-suffix check; "
+    f"`{_GATEWAY_LOG_INBOUND_403_CLIENT_CHANNEL_DISABLED}` means "
+    f"{_CLIENT_BF_CHANNELS_REMEDIATION}"
 )
 
 
@@ -2386,6 +2398,9 @@ def _directline_allowlist_warn(status: int, detail: str) -> ProbeResult:
         f"(A365_ALLOWED_USERS; HTTP {status}). Add {_PROBE_USER_ID} to "
         "A365_ALLOWED_USERS for the probed agent, or set A365_ALLOW_ALL_USERS on "
         "a disposable probe, then re-run `bot-service verify --directline-probe`. "
+        f"If the gateway log shows `{_GATEWAY_LOG_INBOUND_403_CLIENT_CHANNEL_DISABLED}`, "
+        "this is the client-channel default, not the allowlist. "
+        f"{_CLIENT_BF_CHANNELS_REMEDIATION} "
         f"Response: {detail}",
     )
 

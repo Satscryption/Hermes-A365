@@ -83,6 +83,15 @@ Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, #267
   is unchanged. Refs
   [#250](https://github.com/Satscryption/Hermes-A365/issues/250).
 
+- **``bot-service verify --directline-probe`` and gateway 401 log wording.**
+  The Direct Line probe's 403 hints now name the gateway's
+  ``reason=client-channel-disabled`` log line, say that Bot Framework client
+  channels are off by default, and explain how to turn them on
+  (``A365_ALLOW_CLIENT_BF_CHANNELS=1``) to probe through Direct Line. The
+  gateway now logs ``reason=missing-bearer-token`` when the Authorization header
+  is absent, instead of ``reason=invalid-bearer-token``. Probe results, HTTP
+  status codes and responses are unchanged.
+
 ### Added
 
 - **#193 (slice 1) — Public-surface enumeration.**
