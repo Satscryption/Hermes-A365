@@ -85,6 +85,17 @@ Also ships PRs #273, #274, #276, #277, #279, #280, and #281, merged to ``main`` 
   is absent, instead of ``reason=invalid-bearer-token``. Probe results, HTTP
   status codes and responses are unchanged.
 
+- **``register`` re-run with a missing blueprint client secret.** When a
+  re-run skips ``a365 setup blueprint`` because the blueprint already exists,
+  ``register`` now checks the configured secret sources (the generated config,
+  ``A365_BLUEPRINT_CLIENT_SECRET`` in the environment or profile env, and the
+  secrets provider) without printing the value. Only when none of them has the
+  secret does it say so and point to ``a365 setup blueprint`` or
+  ``--auto-recover-secret``; with ``--apply`` it then stops before making
+  changes unless ``--auto-recover-secret`` is given. If the secrets provider is
+  unreachable or the profile env file can't be read, it warns instead and
+  continues.
+
 - **``register --apply`` admin-consent wait.** When the ``a365`` blueprint step
   waits for admin consent, ``register --apply`` now prints a fixed one-line
   notice (complete consent, or run ``hermes a365 consent <agent-name>`` or
