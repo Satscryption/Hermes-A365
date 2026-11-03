@@ -83,6 +83,13 @@ Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, #267
   is unchanged. Refs
   [#250](https://github.com/Satscryption/Hermes-A365/issues/250).
 
+- **``register`` re-run with a missing blueprint client secret.** When a
+  re-run skips ``a365 setup blueprint`` because the blueprint already exists,
+  but the generated config has no blueprint client secret (for example after
+  an earlier run stopped at admin consent), ``register`` now says so and points
+  to ``a365 setup blueprint`` or ``--auto-recover-secret``. With ``--apply`` it
+  stops before making changes unless ``--auto-recover-secret`` is given.
+
 ### Added
 
 - **#193 (slice 1) — Public-surface enumeration.**

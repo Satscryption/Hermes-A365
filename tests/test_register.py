@@ -281,6 +281,116 @@ class TestCliAiteammateUnsupported:
         assert "a365 setup blueprint" not in captured.out
 
 
+class TestSkippedBlueprintSecret:
+    @pytest.fixture
+    def matching_blueprint(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        mutator = FakeMutator()
+        monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
+        monkeypatch.setattr(
+            "hermes_a365.register.resolve_registration",
+            lambda *args, **kwargs: RegistrationDecision(
+                action="repair",
+                step_names=("permissions-bot",),
+                reason=None,
+                messages=("entra: blueprint matches; setup blueprint will not run",),
+            ),
+        )
+        _write_generated(
+            tmp_path,
+            {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+        )
+        return mutator
+
+    @staticmethod
+    def _args(*flags: str):
+        return build_parser().parse_args(
+            ["--agent-name", "Inbox Helper", "--tenant-id", _TEST_TENANT, "--m365", *flags]
+        )
+
+    @pytest.mark.parametrize("flags", [(), ("--update-permissions",), ("--auto-recover-secret",)])
+    def test_dry_run_warns_without_mutations(self, matching_blueprint, capsys, flags):
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert "no usable agentBlueprintClientSecret" in output.out
+        assert "a365 setup blueprint" in output.out
+        assert "--auto-recover-secret" in output.out
+        assert "done. Next:" not in output.out
+        assert all(call[:3] == ["az", "account", "show"] for call in matching_blueprint.calls)
+
+    @pytest.mark.parametrize("flags", [(), ("--update-permissions",)])
+    def test_apply_refuses_before_any_step(self, matching_blueprint, capsys, flags, tmp_path):
+        assert run(self._args("--apply", *flags)) == 2
+        output = capsys.readouterr()
+        assert "no usable agentBlueprintClientSecret" in output.out
+        assert "ERROR: blueprint client secret is missing" in output.err
+        assert "--auto-recover-secret" in output.out
+        assert "done. Next:" not in output.out
+        assert all(call[:3] == ["az", "account", "show"] for call in matching_blueprint.calls)
+        assert not (tmp_path / CONFIG_FILENAME).exists()
+
+    @pytest.mark.parametrize("flags", [(), ("--apply",)])
+    def test_present_secret_preserves_output_and_is_never_printed(
+        self, matching_blueprint, capsys, tmp_path, flags
+    ):
+        # Compare to the existing no-signal path to catch any new output.
+        path = tmp_path / "a365.generated.config.json"
+        path.unlink()
+        assert run(self._args(*flags)) == 0
+        baseline = capsys.readouterr()
+        matching_blueprint.calls.clear()
+        _write_generated(
+            tmp_path,
+            {
+                "agentBlueprintId": "bp-app-id",
+                "agentBlueprintClientSecret": "SENTINEL-SECRET-DO-NOT-PRINT",
+            },
+        )
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert output == baseline
+        assert "SENTINEL-SECRET-DO-NOT-PRINT" not in output.out + output.err
+        assert "no usable agentBlueprintClientSecret" not in output.out + output.err
+        if "--apply" in flags:
+            assert any(
+                call[:4] == ["a365", "setup", "permissions", "bot"]
+                for call in matching_blueprint.calls
+            )
+
+    @pytest.mark.parametrize("recovered", [True, False])
+    def test_auto_recovery_precedes_steps_and_failure_stops_apply(
+        self, matching_blueprint, capsys, tmp_path, recovered
+    ):
+        matching_blueprint.scripted.append(
+            RunResult(
+                argv=[],
+                returncode=0,
+                stdout=json.dumps({"password": "RECOVERED-SECRET"} if recovered else {}),
+                stderr="",
+            )
+        )
+        assert run(self._args("--apply", "--auto-recover-secret")) == (0 if recovered else 2)
+        output = capsys.readouterr()
+        assert "RECOVERED-SECRET" not in output.out + output.err
+        calls = matching_blueprint.calls
+        reset_index = next(i for i, call in enumerate(calls) if "reset" in call)
+        assert matching_blueprint.sensitive_flags[reset_index] is True
+        assert "RECOVERED-SECRET" not in str(calls)
+        steps = [i for i, call in enumerate(calls) if call[0] == "a365"]
+        if recovered:
+            assert steps and all(i > reset_index for i in steps)
+            assert (
+                json.loads((tmp_path / "a365.generated.config.json").read_text())[
+                    "agentBlueprintClientSecret"
+                ]
+                == "RECOVERED-SECRET"
+            )
+        else:
+            assert not steps
+            assert not (tmp_path / CONFIG_FILENAME).exists()
+
+
 class TestPlanRender:
     def test_human_lists_steps_and_argv(self) -> None:
         plan = build_register_plan(RegisterInputs(agent_name="inbox-helper"))

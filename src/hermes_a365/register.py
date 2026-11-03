@@ -947,6 +947,35 @@ def run(args: argparse.Namespace) -> int:
         plan = build_register_plan(inputs)
         sys.stdout.write(plan.render_human() + "\n")
 
+    # Reconciliation checks Entra state, not whether the local credential
+    # survived an earlier consent defer. Check before any apply mutations.
+    if not any(step.name == "blueprint" for step in plan.steps):
+        generated_path = Path(GENERATED_CONFIG_FILENAME)
+        is_missing, bp_id = detect_missing_secret(generated_path)
+        if is_missing and bp_id:
+            sys.stdout.write(
+                "\n[warn] Blueprint has no usable agentBlueprintClientSecret in "
+                "the generated config. Run `a365 setup blueprint` or re-run "
+                "with --apply --auto-recover-secret before continuing.\n"
+            )
+            if args.apply:
+                if not args.auto_recover_secret:
+                    print(
+                        "ERROR: blueprint client secret is missing; no changes applied.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                outcome = auto_recover_secret(
+                    generated_path,
+                    bp_id,
+                    mutator=get_mutator(),
+                    display_name=default_recovery_display_name(),
+                    expected_app_display_name=f"{args.agent_name} Blueprint",
+                )
+                sys.stdout.write("\n" + "\n".join(outcome.messages) + "\n")
+                if not outcome.recovered:
+                    return 2
+
     if not args.apply:
         sys.stdout.write("\nNo mutations. Re-run with --apply to execute.\n")
         return 0
