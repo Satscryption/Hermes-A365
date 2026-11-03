@@ -8,6 +8,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **``register`` secret check after ``a365 setup blueprint`` (#289).** When
+  the generated config has no blueprint secret after the blueprint step,
+  ``register`` now checks ``A365_BLUEPRINT_CLIENT_SECRET`` (process and profile
+  env) and the secrets provider first, as the skipped-blueprint path already
+  does. A configured secret skips the missing-secret notice and recovery; an
+  unreachable provider prints a notice and skips recovery.
+
 - **``register`` re-run with a generated config for a different agent.** When
   a re-run skips ``a365 setup blueprint``, the blueprint secret check now runs
   only if the generated config's blueprint ID matches this agent's recorded
