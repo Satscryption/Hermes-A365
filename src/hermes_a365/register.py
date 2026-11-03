@@ -43,7 +43,6 @@ See ``references/a365-cli-reference.md`` for the verified command surface.
 from __future__ import annotations
 
 import argparse
-import contextlib
 import datetime as _dt
 import json
 import os
@@ -588,10 +587,13 @@ def _skipped_blueprint_secret_missing(hermes_home: Path, tenant: str, bp_id: str
 
     key = "A365_BLUEPRINT_CLIENT_SECRET"
     env_found = bool(os.environ.get(key))
+    profile_env_error = None
     if not env_found:
         # Profile failures must not expose file contents or block provider lookup.
-        with contextlib.suppress(Exception):
+        try:
             env_found = bool(load_profile_env(hermes_home).values.get(key))
+        except Exception as exc:
+            profile_env_error = type(exc).__name__
     state = resolve_secret_state(tenant, bp_id, existing="")
     if env_found or bool(state.value):
         return False
@@ -599,6 +601,13 @@ def _skipped_blueprint_secret_missing(hermes_home: Path, tenant: str, bp_id: str
         sys.stdout.write(
             "\n[warn] Blueprint secret could not be confirmed because the secrets "
             "provider was unreachable. Restore provider access and re-run.\n"
+        )
+        return False
+    if profile_env_error:
+        sys.stdout.write(
+            "\n[warn] Blueprint secret could not be confirmed because the profile "
+            f"env file could not be read ({profile_env_error}). "
+            "Check profile env file access and re-run.\n"
         )
         return False
     return True

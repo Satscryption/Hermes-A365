@@ -423,6 +423,84 @@ class TestSkippedBlueprintSecret:
         )
 
     @pytest.mark.parametrize("flags", [("--apply",), ("--apply", "--auto-recover-secret")])
+    def test_unreadable_profile_env_warns_without_recovery(
+        self, matching_blueprint, capsys, tmp_path, monkeypatch, flags
+    ):
+        dummy = "SENTINEL-UNREADABLE-PROFILE-SECRET"
+        home = Path(os.environ["HERMES_HOME"])
+        home.mkdir()
+        env_path = home / ".env"
+        env_path.write_text(f"A365_BLUEPRINT_CLIENT_SECRET={dummy}\n")
+        env_path.chmod(0o644)
+        lookups = []
+
+        class Provider:
+            name = "empty-test-provider"
+
+            def resolve(self, tenant, app_id):
+                lookups.append((tenant, app_id))
+                return None
+
+        def unexpected_recovery(*args, **kwargs):
+            pytest.fail("unreadable profile env must prevent recovery")
+
+        set_default_provider(Provider())
+        monkeypatch.setattr("hermes_a365.register.auto_recover_secret", unexpected_recovery)
+        path = tmp_path / "a365.generated.config.json"
+        original = path.read_bytes()
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert (
+            "[warn] Blueprint secret could not be confirmed because the profile "
+            "env file could not be read (BridgeConfigError). "
+            "Check profile env file access and re-run.\n"
+        ) in output.out
+        assert dummy not in output.out + output.err
+        assert "no usable agentBlueprintClientSecret" not in output.out + output.err
+        assert "blueprint client secret is missing" not in output.out + output.err
+        assert lookups == [(_TEST_TENANT, "bp-app-id")]
+        assert path.read_bytes() == original
+        assert not any("reset" in call for call in matching_blueprint.calls)
+        assert any(
+            call[:4] == ["a365", "setup", "permissions", "bot"] for call in matching_blueprint.calls
+        )
+
+    @pytest.mark.parametrize("flags", [(), ("--apply",), ("--apply", "--auto-recover-secret")])
+    def test_unreadable_profile_env_provider_hit_clears_warning(
+        self, matching_blueprint, capsys, tmp_path, monkeypatch, flags
+    ):
+        dummy = "SENTINEL-UNREADABLE-PROFILE-SECRET"
+        home = Path(os.environ["HERMES_HOME"])
+        home.mkdir()
+        env_path = home / ".env"
+        env_path.write_text(f"A365_BLUEPRINT_CLIENT_SECRET={dummy}\n")
+        env_path.chmod(0o644)
+        lookups = []
+
+        class Provider:
+            name = "test-provider"
+            value = None
+
+            def resolve(self, tenant, app_id):
+                lookups.append((tenant, app_id))
+                return self.value
+
+        provider = Provider()
+        set_default_provider(provider)
+        # The same unreadable file warns only while no source confirms a secret.
+        assert run(self._args()) == 0
+        output = capsys.readouterr()
+        assert "could not be confirmed" in output.out
+        assert "profile env file could not be read (BridgeConfigError)" in output.out
+        assert dummy not in output.out + output.err
+
+        provider.value = dummy
+        self._assert_external_secret_preserves_output(
+            matching_blueprint, capsys, tmp_path, monkeypatch, flags, provider.value
+        )
+        assert lookups == [(_TEST_TENANT, "bp-app-id")] * 2
+
+    @pytest.mark.parametrize("flags", [("--apply",), ("--apply", "--auto-recover-secret")])
     def test_provider_unreachable_warns_without_recovery(
         self, matching_blueprint, capsys, tmp_path, monkeypatch, flags
     ):
