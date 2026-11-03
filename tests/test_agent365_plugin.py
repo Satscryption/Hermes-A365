@@ -12313,6 +12313,7 @@ class TestEditMessage:
         assert turn is not None
         record = a._delivery_record(buf, turn)
         record["plain_due"] = True
+        record["plain_reason"] = "rotated"
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         pre_gap_keepalive = {
             "stream_id": "gap-stream",
@@ -12342,7 +12343,7 @@ class TestEditMessage:
             record,
             chunk_segment_ids=[],
         )
-        assert route == ("fallback", "keepalive stream rotated")
+        assert route == ("fallback", "rotated")
         assert finals == 0
         assert pre_gap_keepalive["stream_id"] == "gap-stream"
         assert buf["keepalive"] is not pre_gap_keepalive
@@ -12814,6 +12815,88 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert all(t != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in finals) or finals == []
         assert send_reply_mock.await_count == 1
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue247_age_budget_plain_fallback_logs_info_reason(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-age-budget-reason"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+        buf["keepalive"] = {
+            "stream_id": "age-budget-stream",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (max_age + 1),
+        }
+
+        async def retire_during_gap(_chat_id: str, live_buf: dict[str, Any]) -> None:
+            live_buf["keepalive"] = {"stream_id": "", "closed_by": "keepalive"}
+
+        monkeypatch.setattr(a, "_sleep_turn_buffer_stream_gap_locked", retire_during_gap)
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "age_budget")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=age_budget" in logs[0].message
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue247_rotated_plain_fallback_logs_info_reason(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-rotated-reason"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        record["plain_due"] = True
+        record["plain_reason"] = "rotated"
+        buf["keepalive_rotated"] = True
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "rotated")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=rotated" in logs[0].message
         await a._drop_turn_buffer(chat)
 
     @pytest.mark.asyncio

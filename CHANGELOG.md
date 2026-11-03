@@ -6,6 +6,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Changed
+
+- **#291 — Plain-fallback log reason.** The plain fallback log now names its reason (`age_budget`, `rotated`, `retry_exhausted`); expected age-budget and rotation fallbacks log at info instead of warning.
+
 ## [0.9.6] — 2026-11-03
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),
