@@ -96,6 +96,12 @@ Also ships PRs #273, #274, #276, #277, #279, #280, and #281, merged to ``main`` 
   unreachable or the profile env file can't be read, it warns instead and
   continues.
 
+- **``register --apply`` admin-consent wait.** When the ``a365`` blueprint step
+  waits for admin consent, ``register --apply`` now prints a fixed one-line
+  notice (complete consent, or run ``hermes a365 consent <agent-name>`` or
+  ``hermes a365 consent --print-url-only``) instead of showing no output.
+  Other blueprint-step output stays hidden as before.
+
 ### Added
 
 - **#193 (slice 1) — Public-surface enumeration.**
