@@ -2,7 +2,7 @@
 
 Snapshot date: 2026-10-29
 
-As of v0.9.6.1 ([#189](https://github.com/Satscryption/Hermes-A365/issues/189)),
+As of v0.9.6 ([#189](https://github.com/Satscryption/Hermes-A365/issues/189)),
 **Hermes-A365 does not export OTLP spans**. There is no
 ``HERMES_OTLP_ENDPOINT`` configuration key, no OpenTelemetry exporter
 dependency, and no admin-centre telemetry promise from this skill.
