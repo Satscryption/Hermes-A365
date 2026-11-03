@@ -411,7 +411,7 @@ def test_live_0_9_6_section_still_parses() -> None:
         "Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, "
         "#267, #268, #269, and #272 (release bump)."
     ) in notes.body
-    assert "2026-11-02" in notes.body
+    assert "2026-11-03" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:
