@@ -1785,6 +1785,43 @@ def test_directline_403_after_token_check_names_the_allowlist(
 
 
 class TestDirectlineActivityFailureClassification:
+    def test_stripped_bot_403_explains_client_channel_default(self) -> None:
+        from hermes_a365 import bot_service
+
+        result = bot_service._directline_activity_failure(
+            502,
+            {
+                "error": {
+                    "code": "BotError",
+                    "message": "Failed to send activity: bot returned an error",
+                },
+                "httpStatusCode": 403,
+            },
+        )
+        assert result.status == "ERROR"
+        assert "inbound 403 reason=client-channel-disabled" in result.detail
+        assert "disabled by design" in result.detail
+        assert "expected unless deliberately enabled" in result.detail
+        assert "A365_ALLOW_CLIENT_BF_CHANNELS=1" in result.detail
+        assert "probed agent's gateway profile" in result.detail
+        assert "restart the gateway" in result.detail
+        assert "update-endpoint" not in result.detail
+
+    def test_allowlist_warn_explains_client_channel_default(self) -> None:
+        from hermes_a365 import bot_service
+
+        result = bot_service._directline_activity_failure(
+            403, {"detail": "end user is not authorized"}
+        )
+        assert result.status == "WARN"
+        assert "reason=client-channel-disabled" in result.detail
+        assert "client-channel default, not the allowlist" in result.detail
+        assert "disabled by design" in result.detail
+        assert "A365_ALLOW_CLIENT_BF_CHANNELS=1" in result.detail
+        assert "probed agent's gateway profile" in result.detail
+        assert "restart the gateway" in result.detail
+        assert "update-endpoint" not in result.detail
+
     def test_bare_403_without_allowlist_marker_is_error(self) -> None:
         from hermes_a365.bot_service import _directline_activity_failure
 
@@ -1971,8 +2008,7 @@ class TestDirectlineActivityFailureClassification:
             )
             assert result.status == "ERROR"
             assert result.detail == (
-                f"Direct Line client authentication failed (HTTP 401): {detail_json}. "
-                f"{remediation}"
+                f"Direct Line client authentication failed (HTTP 401): {detail_json}. {remediation}"
             )
             assert "BF Connector token" not in result.detail
 
