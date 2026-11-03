@@ -413,8 +413,17 @@ class TestSensitiveRun:
 class TestSensitiveAdminConsent:
     _NOTICE = (
         "a365 is waiting for admin consent (a browser may open). Complete consent, "
-        "or run `hermes a365 consent` from another shell; details are in the a365 setup log.\n"
+        "or run `hermes a365 consent <agent-name>` from another shell "
+        "(or `hermes a365 consent --print-url-only` to print the consent URL only); "
+        "details are in the a365 setup log.\n"
     )
+
+    def test_notice_shows_required_consent_argument(self) -> None:
+        from hermes_a365.mutator import _ADMIN_CONSENT_WAIT_NOTICE
+
+        assert _ADMIN_CONSENT_WAIT_NOTICE == self._NOTICE
+        assert "`hermes a365 consent <agent-name>`" in _ADMIN_CONSENT_WAIT_NOTICE
+        assert "`hermes a365 consent --print-url-only`" in _ADMIN_CONSENT_WAIT_NOTICE
 
     @pytest.mark.parametrize("stream", ["stdout", "stderr"])
     @pytest.mark.parametrize("ending", ["\n", ""])

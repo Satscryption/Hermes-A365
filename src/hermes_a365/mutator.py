@@ -382,7 +382,9 @@ _DEVICE_LOGIN_LINE_RE = re.compile(
 _ADMIN_CONSENT_WAIT_RE = re.compile(r"^Opening browser for admin consent(?:\.{3}|\s|$)")
 _ADMIN_CONSENT_WAIT_NOTICE = (
     "a365 is waiting for admin consent (a browser may open). Complete consent, "
-    "or run `hermes a365 consent` from another shell; details are in the a365 setup log.\n"
+    "or run `hermes a365 consent <agent-name>` from another shell "
+    "(or `hermes a365 consent --print-url-only` to print the consent URL only); "
+    "details are in the a365 setup log.\n"
 )
 
 _SENSITIVE_GRAPH_ERROR_CODES = frozenset(
