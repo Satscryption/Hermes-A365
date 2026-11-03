@@ -6,6 +6,14 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Copilot first-turn timing when the add notice arrives late (refs #290).** The
+  first-turn marker is now recorded when the conversation-add activity is
+  received, before it is persisted, and a marker that arrives during the final
+  minimum-age wait now applies to the current turn instead of carrying over to
+  the next one. Activity payloads are unchanged.
+
 ## [0.9.6] — 2026-11-03
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),

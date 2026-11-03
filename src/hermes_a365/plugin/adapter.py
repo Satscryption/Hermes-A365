@@ -2802,6 +2802,11 @@ class Agent365Adapter(BasePlatformAdapter):
                         return JSONResponse({"status": "acked", "reason": "lifecycle_changed"})
                     ref = ConversationRef.from_activity(activity)
                 if ref is not None:
+                    self._note_copilot_member_added_pending(
+                        lifecycle_conv_id,
+                        activity,
+                        validated_path,
+                    )
                     # L4 (#100, #106 review follow-up): stamp the JWT-validated
                     # path on lifecycle-captured refs too, so a later proactive
                     # mint off this ref binds to the validated path rather than
@@ -2833,11 +2838,6 @@ class Agent365Adapter(BasePlatformAdapter):
                             _complete_persist_mutation(reservation[0], reservation[1])
                             raise
                         await self._persist_conversations(reservation)
-                    self._note_copilot_member_added_pending(
-                        lifecycle_conv_id,
-                        activity,
-                        validated_path,
-                    )
                 logger.info(
                     "inbound lifecycle type=%s action=%s conv=%s",
                     str(activity.get("type") or ""),
@@ -8567,6 +8567,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if min_age <= 0:
             turn["copilot_member_added_decided"] = True
             return
+        recheck_member_added = not turn.get("copilot_post_member_added")
         while self._turn_buffers.get(chat_id) is buf:
             stream = self._keepalive_stream(buf)
             if not str(stream.get("stream_id") or ""):
@@ -8579,6 +8580,17 @@ class Agent365Adapter(BasePlatformAdapter):
             await self._sleep_turn_buffer_locked(chat_id, buf, min_age - age)
             if self._turn_buffers.get(chat_id) is not buf:
                 return
+            if recheck_member_added:
+                # A lifecycle marker may arrive while the ordinary age wait
+                # releases the lock. Apply it to this final once, using the
+                # same accepted opener to measure the remaining first-turn age.
+                recheck_member_added = False
+                self._copilot_needs_min_stream_age_before_final(chat_id, turn)
+                if turn.get("copilot_post_member_added"):
+                    min_age = self._copilot_first_turn_min_stream_age_before_final_sec
+                    if not math.isfinite(min_age) or min_age < 0:
+                        min_age = _COPILOT_FIRST_TURN_STREAM_TIMING_DEFAULT_SEC
+                    min_age = min(min_age, _COPILOT_STREAM_TIMING_MAX_SEC)
         turn["copilot_member_added_decided"] = True
 
     def _clear_copilot_post_member_added(self, chat_id: str, turn: dict[str, Any]) -> None:
