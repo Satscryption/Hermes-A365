@@ -26319,6 +26319,83 @@ class TestTurnFrame:
         assert (await a._handle_card_action(_make_inbound(), data)).status_code == 403
         runtime.resolver.assert_called_once()
 
+    @pytest.fixture
+    async def alias_card(self, runtime: Any, monkeypatch: pytest.MonkeyPatch) -> Any:
+        a = runtime.adapter
+        a._allow_all_users = False
+        a._allowed_users = ("owner@example.com", "other@example.com")
+        inbound = _make_inbound(activity_id="alias-origin")
+        inbound["from"]["userPrincipalName"] = " Owner@Example.com "
+        (event,) = await self._admit(runtime, inbound)
+        session_key = a._session_key_for(event)
+        runtime.resolver.side_effect = lambda *_args, **_kwargs: 1
+
+        async def process(_base: Any, _event: Any, sk: str) -> None:
+            assert (await self._send(a, "exec", sk)).success
+
+        monkeypatch.setattr(
+            _StubBasePlatformAdapter, "_process_message_background", process, raising=False
+        )
+        await a._process_message_background(event, session_key)
+        sent = runtime.posted.await_args.kwargs
+        data = sent["reply"]["attachments"][0]["content"]["actions"][0]["data"]
+        capability = a._card_capabilities[data["capability"]]
+        assert capability["user_id"] == "owner@example.com"
+        assert capability["user_id"] != adapter_mod._import_bridge()._canonical_activity_user(
+            inbound
+        )
+        click = _make_inbound(text="", activity_id="alias-click")
+        click["from"] = dict(inbound["from"])
+        click["value"] = data
+        return SimpleNamespace(
+            runtime=runtime, click=click, data=data, session_key=session_key, capability=capability
+        )
+
+    async def test_card_click_from_admitted_alias_is_accepted(self, alias_card: Any) -> None:
+        import httpx
+
+        runtime = alias_card.runtime
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runtime.adapter.build_app()),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/api/messages",
+                json=alias_card.click,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+        assert response.status_code == 200, response.text
+        assert response.json() == {"status": "card_action", "kind": "exec_approval"}
+        runtime.resolver.assert_called_once_with(
+            alias_card.session_key, "once", request_id="req-frame"
+        )
+        assert alias_card.data["capability"] not in runtime.adapter._card_capabilities
+
+    async def test_card_click_from_different_user_is_rejected(self, alias_card: Any) -> None:
+        import httpx
+
+        runtime = alias_card.runtime
+        alias_card.click["from"] = {
+            "id": "other-user",
+            "userPrincipalName": "other@example.com",
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runtime.adapter.build_app()),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/api/messages",
+                json=alias_card.click,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+        assert response.status_code == 403, response.text
+        assert response.json() == {"status": "card_action_rejected"}
+        runtime.resolver.assert_not_called()
+        assert (
+            runtime.adapter._card_capabilities[alias_card.data["capability"]]
+            is alias_card.capability
+        )
+
     async def test_settled_origin_card_uses_main_stale_ack(
         self, runtime: Any, caplog: pytest.LogCaptureFixture
     ) -> None:

@@ -2781,7 +2781,9 @@ class Agent365Adapter(BasePlatformAdapter):
             # wasteful).
             card_action = self._extract_card_action(activity)
             if card_action is not None:
-                return await self._handle_card_action(activity, card_action)
+                return await self._handle_card_action(
+                    activity, card_action, authorized_sender_id=authorized_sender_id
+                )
 
             # #79 — BF lifecycle activities (install add/remove,
             # membersAdded) are channel-control, not user turns, but they
@@ -13288,7 +13290,13 @@ class Agent365Adapter(BasePlatformAdapter):
 
         mark_awaiting_text(clarify_id)
 
-    async def _handle_card_action(self, activity: dict[str, Any], value: dict[str, Any]) -> Any:
+    async def _handle_card_action(
+        self,
+        activity: dict[str, Any],
+        value: dict[str, Any],
+        *,
+        authorized_sender_id: str | None = None,
+    ) -> Any:
         """Route a card ``Action.Submit`` back to the gateway's pending-approval
         resolver. Never dispatches to the agent loop; always acks 200 (the button
         press is a control signal, not a user turn). Resolver errors degrade to a
@@ -13301,13 +13309,17 @@ class Agent365Adapter(BasePlatformAdapter):
         conv = activity.get("conversation")
         conv_id = str(conv.get("id") or "") if isinstance(conv, dict) else ""
         user_id = _import_bridge()._canonical_activity_user(activity)
+        authorized_user_id = (authorized_sender_id or "").strip().lower()
         if (
             capability is None
             or time.monotonic() - float(capability.get("created_at", 0.0))
             > _CARD_CAPABILITY_TTL_SEC
             or capability.get("kind") != kind
             or capability.get("conversation_id") != conv_id
-            or capability.get("user_id") != user_id
+            or not (
+                capability.get("user_id") == user_id
+                or (authorized_user_id and capability.get("user_id") == authorized_user_id)
+            )
             or capability.get("tenant_id") != self.tenant_id.lower()
             or capability.get("lifecycle_generation") != self._lifecycle_generation
             or capability.get("chat_generation") != self._chat_generation(conv_id)
