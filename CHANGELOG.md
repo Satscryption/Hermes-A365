@@ -6,7 +6,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-## [0.9.6] — 2026-11-02
+## [0.9.6] — 2026-11-03
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),
 per-kid JWKS refresh (#218), sensitive output handling for blueprint setup (#256),
