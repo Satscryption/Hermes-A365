@@ -6,23 +6,16 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
-### Changed
-
-- **#86 — Consent cleanup and approval-card request binding.** File-consent
-  cleanup removes only the card the bot sent; approval cards are bound to one
-  pending request, otherwise the text prompt is used. Refs
-  [#86](https://github.com/Satscryption/Hermes-A365/issues/86).
-  Exec-approval cards expire when their bound request is no longer pending.
-  A failed approval-list read expires only the clicked card.
-  A failed approval-card send no longer blocks a later card for the same request.
-
 ## [0.9.6] — 2026-11-02
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),
 per-kid JWKS refresh (#218), sensitive output handling for blueprint setup (#256),
 Direct Line probe 401 attribution (#250), sidecar schema versioning and packaging
-metadata (#193), and CI required-check fixes (#259).
+metadata (#193), inbound channel and sender identity defaults (#277), plugin and
+auth surface changes (#273), sidecar, backup and subprocess handling (#274, #276),
+consent cleanup and approval-card request binding (#86), and CI fixes (#259, #280).
 Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, #267, #268, #269, and #272 (release bump).
+Also ships PRs #273, #274, #276, #277, #279, #280, and #281, merged to ``main`` after the release bump.
 
 ### Removed
 
@@ -112,6 +105,52 @@ Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, #267
   aggregate ``test`` job gates on all test jobs; per-job and per-test timeouts,
   per-PR concurrency, and a ``merge_group`` trigger for merge queue. CI only.
   Refs [#259](https://github.com/Satscryption/Hermes-A365/issues/259).
+
+- **#277 — Inbound channels and sender identity.** Microsoft 365 / Teams
+  channels are admitted by default. Direct Line, Web Chat, and emulator traffic
+  is not accepted unless the new ``A365_ALLOW_CLIENT_BF_CHANNELS=true`` setting
+  is enabled (default off). Sender identity for allowlist matching and handoff
+  comes only from platform-authenticated fields: body ``from`` aliases on
+  Microsoft 365 channels, and a token user id only when the token is a
+  delegated-user token. Deployments that use Direct Line or Web Chat need the
+  new setting. Refs [#277](https://github.com/Satscryption/Hermes-A365/pull/277).
+
+- **#273 — Plugin and auth surfaces.** The gateway and ``activity-bridge serve``
+  apps no longer expose interactive API docs routes, and ``GET /healthz``
+  returns only ``{"ok": true}``; scripts that read ``slug`` or
+  ``blueprint_client_id`` from it need updating. Inbound token validation
+  requires ``exp`` and ``nbf``, handoff identity is matched to the token user,
+  and file-consent decline runs the same pending checks as accept. Refs
+  [#273](https://github.com/Satscryption/Hermes-A365/pull/273).
+
+- **#86 — Consent cleanup and approval-card request binding.** File-consent
+  cleanup removes only the card the bot sent; approval cards are bound to one
+  pending request, otherwise the text prompt is used. Refs
+  [#86](https://github.com/Satscryption/Hermes-A365/issues/86),
+  [#279](https://github.com/Satscryption/Hermes-A365/pull/279),
+  [#281](https://github.com/Satscryption/Hermes-A365/pull/281).
+  Exec-approval cards expire when their bound request is no longer pending.
+  A failed approval-list read expires only the clicked card.
+  A failed approval-card send no longer blocks a later card for the same request.
+
+- **#274 — Sidecar and backup handling.** The conversations registry loads and
+  saves as strict UTF-8, and an unreadable file is kept as a byte-identical
+  owner-only quarantine copy. Bot-service create refuses to start when a sidecar
+  already exists, before any Azure changes, and validates the schema and agent
+  name more strictly. Backup failures are reported as ``SidecarBackupError``,
+  and sidecar parse failures report a short error. Refs
+  [#274](https://github.com/Satscryption/Hermes-A365/pull/274).
+
+- **#276 — Mutator subprocess handling.** Child processes are reaped with a short
+  terminate grace before a kill, captured output is size-capped, and error
+  handling is simplified. ``register`` blueprint output is unchanged. Refs
+  [#276](https://github.com/Satscryption/Hermes-A365/pull/276).
+
+- **#280 — CI run selection.** Draft PRs run a reduced Ubuntu job, pushes to
+  ``main`` run a slimmer set, and prose-only changes skip the test jobs; ready
+  PRs, merge queue, and release runs keep the full suite. The required ``test``
+  check still reports in every case. CI only.
+  Refs [#280](https://github.com/Satscryption/Hermes-A365/pull/280).
 
 ## [0.9.5] — 2026-10-27
 
