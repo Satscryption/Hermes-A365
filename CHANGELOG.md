@@ -6,6 +6,17 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **``register`` re-run with a generated config for a different agent.** When
+  a re-run skips ``a365 setup blueprint``, the blueprint secret check now runs
+  only if the generated config's blueprint ID matches this agent's recorded
+  ``A365_APP_ID`` (or no ID is recorded). Otherwise ``register`` prints a
+  warning that the generated config refers to a different blueprint and skips
+  the check, instead of exiting 2 or attempting recovery for that other
+  blueprint. Refs
+  [#292](https://github.com/Satscryption/Hermes-A365/issues/292).
+
 ## [0.9.6] — 2026-11-03
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),
