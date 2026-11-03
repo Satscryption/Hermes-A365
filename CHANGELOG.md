@@ -16,6 +16,13 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   A failed approval-list read expires only the clicked card.
   A failed approval-card send no longer blocks a later card for the same request.
 
+### Fixed
+
+- **``register --apply`` admin-consent wait.** When the ``a365`` blueprint step
+  waits for admin consent, ``register --apply`` now prints a fixed one-line
+  notice (complete consent or run ``hermes a365 consent``) instead of showing
+  no output. Other blueprint-step output stays hidden as before.
+
 ## [0.9.6] — 2026-11-02
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),

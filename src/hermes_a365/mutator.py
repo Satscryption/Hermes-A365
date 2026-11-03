@@ -378,6 +378,13 @@ _DEVICE_LOGIN_LINE_RE = re.compile(
     re.IGNORECASE | re.ASCII,
 )
 
+# Recognize only the CLI's consent-wait prefix; never echo its trailing data.
+_ADMIN_CONSENT_WAIT_RE = re.compile(r"^Opening browser for admin consent(?:\.{3}|\s|$)")
+_ADMIN_CONSENT_WAIT_NOTICE = (
+    "a365 is waiting for admin consent (a browser may open). Complete consent, "
+    "or run `hermes a365 consent` from another shell; details are in the a365 setup log.\n"
+)
+
 _SENSITIVE_GRAPH_ERROR_CODES = frozenset(
     {
         "Request_ResourceNotFound",
@@ -766,6 +773,15 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
     eof_seen = pump.eof_seen
     emitted_logins = pump.emitted_logins
     deadline = pump.deadline
+    consent_notice_emitted = False
+
+    def _emit_sensitive_notice(line: str, *, eof: bool) -> None:
+        nonlocal consent_notice_emitted
+        _try_emit_device_login_line(line, emitted=emitted_logins, eof=eof)
+        if not consent_notice_emitted and _ADMIN_CONSENT_WAIT_RE.match(_line_content(line)):
+            consent_notice_emitted = True
+            sys.stdout.write(_ADMIN_CONSENT_WAIT_NOTICE)
+            sys.stdout.flush()
 
     def _handle_complete_line(line: str) -> None:
         captured.append(line)
@@ -773,7 +789,7 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
             sys.stdout.write(line)
             sys.stdout.flush()
         elif echo == "device_login":
-            _try_emit_device_login_line(line, emitted=emitted_logins, eof=False)
+            _emit_sensitive_notice(line, eof=False)
 
     def _flush_eof_tail(name: str) -> None:
         buffer = buffers[name]
@@ -787,7 +803,7 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
             sys.stdout.write(tail)
             sys.stdout.flush()
         elif echo == "device_login":
-            _try_emit_device_login_line(tail, emitted=emitted_logins, eof=True)
+            _emit_sensitive_notice(tail, eof=True)
 
     def _count_bytes(size: int) -> None:
         pump.capture_bytes += size
