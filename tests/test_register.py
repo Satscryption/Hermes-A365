@@ -47,6 +47,7 @@ from hermes_a365.register import (
 from hermes_a365.register import (
     apply_register_plan as _apply_register_plan,
 )
+from hermes_a365.secrets_provider import set_default_provider
 
 _TEST_TENANT = "aaaa1111-0000-0000-0000-000000000001"
 # Keep apply() off the real ~/.hermes so a developer anchor cannot change
@@ -286,6 +287,7 @@ class TestSkippedBlueprintSecret:
     def matching_blueprint(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.chdir(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
         mutator = FakeMutator()
         monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
         monkeypatch.setattr(
@@ -357,6 +359,98 @@ class TestSkippedBlueprintSecret:
                 call[:4] == ["a365", "setup", "permissions", "bot"]
                 for call in matching_blueprint.calls
             )
+
+    def _assert_external_secret_preserves_output(
+        self, matching_blueprint, capsys, tmp_path, monkeypatch, flags, dummy
+    ):
+        def unexpected_recovery(*args, **kwargs):
+            pytest.fail("external secret must prevent recovery")
+
+        monkeypatch.setattr("hermes_a365.register.auto_recover_secret", unexpected_recovery)
+        path = tmp_path / "a365.generated.config.json"
+        original = path.read_bytes()
+        path.unlink()
+        assert run(self._args(*flags)) == 0
+        baseline = capsys.readouterr()
+        matching_blueprint.calls.clear()
+        path.write_bytes(original)
+
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert dummy not in output.out + output.err
+        assert "no usable agentBlueprintClientSecret" not in output.out + output.err
+        assert "blueprint client secret is missing" not in output.out + output.err
+        assert output == baseline
+        assert path.read_bytes() == original
+        assert not any("reset" in call for call in matching_blueprint.calls)
+
+    @pytest.mark.parametrize("flags", [(), ("--apply",), ("--apply", "--auto-recover-secret")])
+    def test_provider_hit_skips_secret_gate(
+        self, matching_blueprint, capsys, tmp_path, monkeypatch, flags
+    ):
+        dummy = "dummy-provider-credential"
+        lookups = []
+
+        class Provider:
+            name = "test-provider"
+
+            def resolve(self, tenant, app_id):
+                lookups.append((tenant, app_id))
+                return dummy if (tenant, app_id) == (_TEST_TENANT, "bp-app-id") else None
+
+        set_default_provider(Provider())
+        self._assert_external_secret_preserves_output(
+            matching_blueprint, capsys, tmp_path, monkeypatch, flags, dummy
+        )
+        assert lookups == [(_TEST_TENANT, "bp-app-id")]
+
+    @pytest.mark.parametrize("flags", [(), ("--apply",), ("--apply", "--auto-recover-secret")])
+    @pytest.mark.parametrize("source", ["profile", "process"])
+    def test_env_hit_skips_secret_gate(
+        self, matching_blueprint, capsys, tmp_path, monkeypatch, flags, source
+    ):
+        dummy = "dummy-env-credential"
+        if source == "profile":
+            home = Path(os.environ["HERMES_HOME"])
+            home.mkdir()
+            env_path = home / ".env"
+            env_path.write_text(f"A365_BLUEPRINT_CLIENT_SECRET={dummy}\n")
+            env_path.chmod(0o600)
+        else:
+            monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", dummy)
+        self._assert_external_secret_preserves_output(
+            matching_blueprint, capsys, tmp_path, monkeypatch, flags, dummy
+        )
+
+    @pytest.mark.parametrize("flags", [("--apply",), ("--apply", "--auto-recover-secret")])
+    def test_provider_unreachable_warns_without_recovery(
+        self, matching_blueprint, capsys, tmp_path, monkeypatch, flags
+    ):
+        class Provider:
+            name = "unreachable-test-provider"
+
+            def resolve(self, tenant, app_id):
+                raise RuntimeError("provider unavailable")
+
+        def unexpected_recovery(*args, **kwargs):
+            pytest.fail("unreachable provider must prevent recovery")
+
+        set_default_provider(Provider())
+        monkeypatch.setattr("hermes_a365.register.auto_recover_secret", unexpected_recovery)
+        path = tmp_path / "a365.generated.config.json"
+        original = path.read_bytes()
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert "[warn]" in output.out
+        assert "secrets provider was unreachable" in output.out
+        assert "Restore provider access and re-run" in output.out
+        assert "no usable agentBlueprintClientSecret" not in output.out + output.err
+        assert "blueprint client secret is missing" not in output.out + output.err
+        assert path.read_bytes() == original
+        assert not any("reset" in call for call in matching_blueprint.calls)
+        assert any(
+            call[:4] == ["a365", "setup", "permissions", "bot"] for call in matching_blueprint.calls
+        )
 
     @pytest.mark.parametrize("recovered", [True, False])
     def test_auto_recovery_precedes_steps_and_failure_stops_apply(

@@ -43,6 +43,7 @@ See ``references/a365-cli-reference.md`` for the verified command surface.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import datetime as _dt
 import json
 import os
@@ -580,6 +581,29 @@ def detect_missing_secret(generated_config_path: Path) -> tuple[bool, str | None
     return is_missing, bp_id
 
 
+def _skipped_blueprint_secret_missing(hermes_home: Path, tenant: str, bp_id: str) -> bool:
+    """Gate recovery only when all configured sources confirm an absent secret."""
+    from .activity_bridge import load_profile_env
+    from .secrets_provider import resolve_secret_state
+
+    key = "A365_BLUEPRINT_CLIENT_SECRET"
+    env_found = bool(os.environ.get(key))
+    if not env_found:
+        # Profile failures must not expose file contents or block provider lookup.
+        with contextlib.suppress(Exception):
+            env_found = bool(load_profile_env(hermes_home).values.get(key))
+    state = resolve_secret_state(tenant, bp_id, existing="")
+    if env_found or bool(state.value):
+        return False
+    if not state.reachable:
+        sys.stdout.write(
+            "\n[warn] Blueprint secret could not be confirmed because the secrets "
+            "provider was unreachable. Restore provider access and re-run.\n"
+        )
+        return False
+    return True
+
+
 def _harden_generated_config(path: Path) -> None:
     """Require the CLI's plaintext generated config to be a 0600 regular file."""
     try:
@@ -952,7 +976,11 @@ def run(args: argparse.Namespace) -> int:
     if not any(step.name == "blueprint" for step in plan.steps):
         generated_path = Path(GENERATED_CONFIG_FILENAME)
         is_missing, bp_id = detect_missing_secret(generated_path)
-        if is_missing and bp_id:
+        if (
+            is_missing
+            and bp_id
+            and _skipped_blueprint_secret_missing(hermes_home, inputs.tenant_id or "", bp_id)
+        ):
             sys.stdout.write(
                 "\n[warn] Blueprint has no usable agentBlueprintClientSecret in "
                 "the generated config. Run `a365 setup blueprint` or re-run "
