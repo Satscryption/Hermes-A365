@@ -66,6 +66,7 @@ ENV_CLASSIFICATION: dict[str, EnvClass] = {
     "A365_AGENT_IDENTITY_IDS": "public",
     "A365_ALLOWED_USERS": "public",
     "A365_ALLOW_ALL_USERS": "public",
+    "A365_ALLOW_CLIENT_BF_CHANNELS": "public",
     "A365_APP_ID": "public",
     "A365_BF_APP_ID": "public",
     "A365_BF_CLIENT_SECRET": "public",
@@ -210,7 +211,6 @@ ADAPTER_PUBLIC_MEMBERS: Final[frozenset[str]] = frozenset(
         "admit_turn_authority",
         "cancel_session_processing",
         "handle_message",
-        "invalidate_exec_approval_capabilities",
     }
 )
 

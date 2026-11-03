@@ -399,7 +399,7 @@ def test_backup_partial_write_leaves_no_final_name(
         return real_write(fd, data)
 
     monkeypatch.setattr(os, "write", write)
-    with pytest.raises(OSError):
+    with pytest.raises(SidecarBackupError):
         write_owner_only_bytes_exclusive(backup, original)
     assert sidecar.read_bytes() == original
     assert not backup.exists()

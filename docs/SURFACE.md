@@ -95,7 +95,7 @@ Scanner classifies every `A365_*` / `HERMES_*` string literal in `src/hermes_a36
 
 ### Public env literals (scanner)
 
-A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN
+A365_AGENT_IDENTITY_IDS, A365_ALLOWED_USERS, A365_ALLOW_ALL_USERS, A365_ALLOW_CLIENT_BF_CHANNELS, A365_APP_ID, A365_BF_APP_ID, A365_BF_CLIENT_SECRET, A365_BLUEPRINT_CLIENT_SECRET, A365_CLIENT_APP_NAME, A365_CONVERSATIONS_PATH, A365_FEEDBACK_LOOP, A365_FILE_HOST_ALLOWLIST, A365_GENERATED_CONFIG_PATH, A365_HANDOFF_LINK, A365_TENANT_ID, HERMES_A365_ALLOW_INSECURE_MACOS_KEYCHAIN_CLI, HERMES_A365_COPILOT_FIRST_TURN_MIN_STREAM_AGE_SEC, HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC, HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC, HERMES_BRIDGE_PORT, HERMES_BRIDGE_WEBHOOK, HERMES_GATEWAY_PROFILE, HERMES_HOME, HERMES_PROFILE, HERMES_RESPONDER_HISTORY_TOKEN
 
 ### Instance create `.env` keys
 
@@ -121,7 +121,7 @@ Within 1.x, Hermes-A365 reads every Hermes-owned sidecar written by any 1.x rele
 
 - Console script `hermes-a365`; entry point `hermes_agent.plugins` / `agent365` → `hermes_a365.plugin:register`.
 - `hermes_a365.__version__` → `0.9.6`.
-- `Agent365Adapter` public members: admit_turn_authority, build_app, cancel_session_processing, connect, disconnect, edit_message, get_chat_info, handle_message, invalidate_exec_approval_capabilities, message_len_fn, name, on_processing_complete, on_processing_start, prune_conversations, send, send_clarify, send_document, send_exec_approval, send_image, send_image_file, send_or_update_status, send_private_notice, send_slash_confirm, send_typing, streaming_overflow_limit.
+- `Agent365Adapter` public members: admit_turn_authority, build_app, cancel_session_processing, connect, disconnect, edit_message, get_chat_info, handle_message, message_len_fn, name, on_processing_complete, on_processing_start, prune_conversations, send, send_clarify, send_document, send_exec_approval, send_image, send_image_file, send_or_update_status, send_private_notice, send_slash_confirm, send_typing, streaming_overflow_limit.
 - Public `python -m`: `hermes_a365.keychain` subcommands store, get, delete.
 
 ## HTTP (product)

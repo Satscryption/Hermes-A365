@@ -79,12 +79,18 @@ def _invoke_activity(**over: object) -> dict:
 def test_build_invoke_context_prefers_claims() -> None:
     ctx = invoke.build_invoke_context(
         _invoke_activity(),
-        claims={"oid": "claim-oid", "preferred_username": "u@x.io", "tid": "claim-tid"},
+        claims={
+            "oid": "claim-oid",
+            "preferred_username": "u@x.io",
+            "tid": "claim-tid",
+            "scp": "User.Read",
+        },
         path_tag="B",
     )
     assert ctx.name == "task/fetch"
     assert ctx.value == {"commandId": "x"}
     assert ctx.user_oid == "claim-oid"
+    assert ctx.token_user_oid == "claim-oid"
     assert ctx.user_upn == "u@x.io"
     assert ctx.tenant_id == "claim-tid"
     assert ctx.chat_type == "copilot_chat"  # groupChat + Path B

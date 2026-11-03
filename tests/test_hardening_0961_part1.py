@@ -446,6 +446,7 @@ class TestHandoffIdentityThroughHandler:
             {
                 "type": "invoke",
                 "name": "handoff/action",
+                "channelId": "msteams",
                 "id": "inv-1",
                 "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
                 "value": {"continuation": token},
@@ -505,6 +506,7 @@ class TestHandoffTokenUserOid:
             {
                 "type": "invoke",
                 "name": "handoff/action",
+                "channelId": "msteams",
                 "from": {"aadObjectId": body_user},
                 "conversation": {"id": "conv-teams", "tenantId": "tid"},
                 "value": {"continuation": "tok"},
@@ -539,13 +541,19 @@ class TestHandoffTokenUserOid:
     def test_mismatched_oid_refused(self) -> None:
         adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
         record = {"tenant_id": "tid", "user_aad": "record-user"}
-        ctx = self._ctx(claims={"tid": "tid", "oid": "other-user"}, body_user="record-user")
+        ctx = self._ctx(
+            claims={"tid": "tid", "oid": "other-user", "idtyp": "user"},
+            body_user="record-user",
+        )
         assert adapter._handoff_identity_matches(record, ctx) is False
 
     def test_matching_oid_dispatches_identity(self) -> None:
         adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
         record = {"tenant_id": "tid", "user_aad": "record-user"}
-        ctx = self._ctx(claims={"tid": "tid", "oid": "record-user"}, body_user="record-user")
+        ctx = self._ctx(
+            claims={"tid": "tid", "oid": "record-user", "idtyp": "user"},
+            body_user="record-user",
+        )
         assert adapter._handoff_identity_matches(record, ctx) is True
 
 
@@ -575,6 +583,7 @@ class TestHandoffActionContinuation:
             {
                 "type": "invoke",
                 "name": "handoff/action",
+                "channelId": "msteams",
                 "id": "inv-1",
                 "serviceUrl": "https://smba.trafficmanager.net/amer/x/",
                 "value": {"continuation": token},
@@ -643,7 +652,7 @@ class TestHandoffActionContinuation:
 
 class TestFileConsentDeclineChecks:
     @pytest.mark.asyncio
-    async def test_decline_missing_pending_dismisses_card(
+    async def test_decline_missing_pending_does_not_dismiss_card(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         adapter = adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"tenant_id": "tid"}))
@@ -657,9 +666,10 @@ class TestFileConsentDeclineChecks:
             "serviceUrl": "https://smba.trafficmanager.net/teams/",
             "value": {"action": "decline", "context": {"consentId": "missing"}},
         }
-        await adapter._handle_file_consent(activity, validated_path="A")
+        resp = await adapter._handle_file_consent(activity, validated_path="A")
         await adapter._drain_file_consent_upload_tasks()
-        remove.assert_awaited()
+        assert resp == invoke_mod.empty_invoke_ack()
+        remove.assert_not_awaited()
         notice.assert_not_awaited()
 
     @pytest.mark.asyncio

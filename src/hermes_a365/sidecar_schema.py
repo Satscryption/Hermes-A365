@@ -93,6 +93,33 @@ def validate_conversations_sidecar_schema(payload: Mapping[str, Any]) -> int:
     return effective_version
 
 
+def validate_bot_service_sidecar_schema(payload: Mapping[str, Any], *, source: str) -> int:
+    """Validate bot-service sidecar ``schemaVersion`` without echoing raw values."""
+    supported = frozenset({1, 2})
+    label = source
+    if "schemaVersion" not in payload:
+        raise SidecarSchemaError(
+            f"{label} field 'schemaVersion' is missing; expected a {_supported_phrase(supported)}"
+        )
+    value = payload["schemaVersion"]
+    if not isinstance(value, int) or isinstance(value, bool):
+        raise SidecarSchemaError(
+            f"{label} schemaVersion has unsupported type {type(value).__name__}; "
+            f"expected one of {sorted(supported)}"
+        )
+    if value not in supported:
+        raise SidecarSchemaError(
+            f"{label} schemaVersion is an unsupported version; expected one of {sorted(supported)}"
+        )
+    managed = payload.get("resourceGroupManaged")
+    if managed is not None and not isinstance(managed, bool):
+        raise SidecarSchemaError(
+            f"{label} resourceGroupManaged must be true or false "
+            f"(got {type(managed).__name__}); refusing to infer purge authority"
+        )
+    return value
+
+
 def validate_publish_state_schema_version(payload: Mapping[str, Any]) -> int:
     """Validate publish-state ``schemaVersion`` only."""
     label = "Copilot Chat publish state"

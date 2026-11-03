@@ -31,11 +31,37 @@ Two hard constraints:
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 _ADAPTIVE_CARD_CONTENT_TYPE = "application/vnd.microsoft.card.adaptive"
+
+
+def _claim_has_delegated_user_evidence(claims: Mapping[str, Any]) -> bool:
+    """True only when the token positively identifies a delegated end user."""
+    idtyp = str(claims.get("idtyp") or "").strip().lower()
+    if idtyp == "user":
+        return True
+    scp = claims.get("scp")
+    return isinstance(scp, str) and bool(scp.strip())
+
+
+def jwt_delegated_user_oid(claims: dict[str, Any] | None) -> str:
+    """Return a normalized JWT ``oid`` only for delegated-user tokens.
+
+    App-only and ambiguous tokens (including v2 ``{oid, roles}`` with no
+    ``scp``/``idtyp``, and v1 ``{appid, roles}`` shapes) yield an empty
+    string — their ``oid`` is never treated as an end-user identity.
+    """
+    if not claims:
+        return ""
+    if not _claim_has_delegated_user_evidence(claims):
+        return ""
+    oid = claims.get("oid")
+    if isinstance(oid, str) and oid.strip():
+        return oid.strip().lower()
+    return ""
 
 
 @dataclass(frozen=True)
@@ -146,12 +172,13 @@ def build_invoke_context(
     recipient = recipient if isinstance(recipient, dict) else {}
     value = activity.get("value")
     value = value if isinstance(value, dict) else {}
+    token_user_oid = jwt_delegated_user_oid(claims)
     return InvokeContext(
         name=str(activity.get("name") or ""),
         activity=activity,
         value=value,
-        user_oid=str(claims.get("oid") or sender.get("aadObjectId") or ""),
-        token_user_oid=str(claims.get("oid") or ""),
+        user_oid=token_user_oid or str(sender.get("aadObjectId") or ""),
+        token_user_oid=token_user_oid,
         user_upn=str(claims.get("preferred_username") or claims.get("upn") or ""),
         tenant_id=str(claims.get("tid") or conv.get("tenantId") or recipient.get("tenantId") or ""),
         service_url=str(activity.get("serviceUrl") or ""),

@@ -127,18 +127,14 @@ def test_release_job_finalizes_after_pypi_without_pushing_tags() -> None:
     assert finalize["env"]["RELEASE_SHA"] == "${{ github.sha }}"
     assert "git push" not in text
     assert "git tag" not in text
-    environments = [
-        job["environment"] for job in workflow["jobs"].values() if "environment" in job
-    ]
+    environments = [job["environment"] for job in workflow["jobs"].values() if "environment" in job]
     assert environments == ["pypi"]
 
 
 def test_digest_verification_survives_smoke_and_gates_the_upload() -> None:
     workflow = _workflow()
     publish = workflow["jobs"]["publish"]
-    verify = next(
-        step for step in _steps(publish) if step.get("name") == "Verify artefact digests"
-    )
+    verify = next(step for step in _steps(publish) if step.get("name") == "Verify artefact digests")
     script = verify["run"]
     publish_names = [step.get("name") for step in _steps(publish)]
 
@@ -204,7 +200,7 @@ def test_smoke_installs_hash_pinned_packaging_for_version_compare() -> None:
     # Hashes stay in publish-requirements.txt. pip has no CLI --hash option.
     assert not re.search(r"(?:^|\s)--hash(?:\s|=)", command)
     assert all(digest not in command for digest in hashes)
-    wheel_install, packaging_install = command.split("bin/pip\" install", maxsplit=2)[1:]
+    wheel_install, packaging_install = command.split('bin/pip" install', maxsplit=2)[1:]
     assert "dist/*.whl" in wheel_install
     assert "--require-hashes" not in wheel_install
     assert "-r " in packaging_install
@@ -255,6 +251,10 @@ def test_called_test_workflow_keeps_python_3_14() -> None:
     text = _TEST_WORKFLOW_PATH.read_text()
 
     assert "workflow_call:" in text
+    workflow = yaml.safe_load(text)
+    full_suite = workflow[True]["workflow_call"]["inputs"]["full-suite"]
+    assert full_suite["default"] is True
+    plan_script = workflow["jobs"]["plan"]["steps"][-1]["run"]
     for version in ("3.11", "3.12", "3.13", "3.14"):
-        assert f'python-version: "{version}"' in text
+        assert f'"{version}"' in plan_script
     assert "permissions:\n  contents: read\n" in text

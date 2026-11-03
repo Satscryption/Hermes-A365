@@ -2495,39 +2495,33 @@ class TestLifecycleCapture:
 
         monkeypatch.setattr(a, "handle_message", spawn_turn)
         transport = httpx.ASGITransport(app=a.build_app())
-        try:
-            async with httpx.AsyncClient(
-                transport=transport, base_url="http://testserver"
-            ) as client:
-                dispatched = await asyncio.create_task(
-                    client.post(
-                        "/api/messages",
-                        json=_make_inbound(conv_id="conv-turn-reinstall"),
-                        headers={"Authorization": "Bearer a.b.c"},
-                    )
-                )
-                await asyncio.wait_for(turn_started.wait(), timeout=1)
-                removed = await client.post(
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            dispatched = await asyncio.create_task(
+                client.post(
                     "/api/messages",
-                    json=self._lifecycle_body(
-                        conv_id="conv-turn-reinstall",
-                        type="installationUpdate",
-                        action="remove",
-                    ),
+                    json=_make_inbound(conv_id="conv-turn-reinstall"),
                     headers={"Authorization": "Bearer a.b.c"},
                 )
-                installed = await client.post(
-                    "/api/messages",
-                    json=self._lifecycle_body(
-                        conv_id="conv-turn-reinstall",
-                        type="installationUpdate",
-                        action="add",
-                    ),
-                    headers={"Authorization": "Bearer a.b.c"},
-                )
-        finally:
-            release_turn.set()
-            await asyncio.wait_for(asyncio.gather(*turn_tasks, return_exceptions=True), timeout=1)
+            )
+            await turn_started.wait()
+            removed = await client.post(
+                "/api/messages",
+                json=self._lifecycle_body(
+                    conv_id="conv-turn-reinstall",
+                    type="installationUpdate",
+                    action="remove",
+                ),
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+            installed = await client.post(
+                "/api/messages",
+                json=self._lifecycle_body(
+                    conv_id="conv-turn-reinstall",
+                    type="installationUpdate",
+                    action="add",
+                ),
+                headers={"Authorization": "Bearer a.b.c"},
+            )
 
         assert dispatched.status_code == 200
         assert removed.status_code == 200
@@ -3099,39 +3093,35 @@ class TestLifecycleCapture:
         a._session_tasks[session_key] = turn_task
         a._session_key_to_conv[session_key] = copilot
         turn_task._agent365_chat_id = copilot  # type: ignore[attr-defined]
-        try:
-            for conv_id in (personal, copilot):
-                activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
-                a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+        for conv_id in (personal, copilot):
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
 
-            async def record_send(**_kwargs: Any) -> Any:
-                posted.append("sent")
-                return adapter_mod.SendResult(success=True)
+        async def record_send(**_kwargs: Any) -> Any:
+            posted.append("sent")
+            return adapter_mod.SendResult(success=True)
 
-            monkeypatch.setattr(a, "_send_reply_activity", record_send)
-            assert await asyncio.to_thread(started.wait, 1)
+        monkeypatch.setattr(a, "_send_reply_activity", record_send)
+        await asyncio.to_thread(started.wait)
 
-            await asyncio.wait_for(a._evict_conversations([personal, copilot]), timeout=2)
+        await asyncio.wait_for(a._evict_conversations([personal, copilot]), timeout=2)
 
-            assert stop.is_set()
-            _done, pending = await asyncio.wait({turn_task}, timeout=1)
-            assert not pending
-            import contextlib
+        assert stop.is_set()
+        _done, pending = await asyncio.wait({turn_task}, timeout=1)
+        assert not pending
+        import contextlib
 
-            with contextlib.suppress(asyncio.CancelledError):
-                turn_task.result()
-            frozen = ticks["n"]
-            await asyncio.sleep(0.05)
-            assert ticks["n"] == frozen
-            assert session_key not in runner._running_agents
-            a._active_conversation_ids()
-            assert session_key not in a._session_key_to_conv
-            late = await a.send(copilot, "after uninstall")
-            assert late.success is False
-            assert posted == []
-        finally:
-            stop.set()
-            await asyncio.wait_for(asyncio.gather(turn_task, return_exceptions=True), timeout=1)
+        with contextlib.suppress(asyncio.CancelledError):
+            turn_task.result()
+        frozen = ticks["n"]
+        await asyncio.sleep(0.05)
+        assert ticks["n"] == frozen
+        assert session_key not in runner._running_agents
+        a._active_conversation_ids()
+        assert session_key not in a._session_key_to_conv
+        late = await a.send(copilot, "after uninstall")
+        assert late.success is False
+        assert posted == []
 
     @pytest.mark.asyncio
     async def test_copilot_turn_cancelled_before_personal_teardown_waits(
@@ -6175,10 +6165,10 @@ class TestConversationRegistry:
 
         path = tmp_path / "sensitive-profile-name.json"
 
-        def _fail_read(_path: Path) -> str:
+        def _fail_read(_self: Path) -> bytes:
             raise OSError("sensitive-read-error")
 
-        monkeypatch.setattr(Path, "read_text", _fail_read)
+        monkeypatch.setattr(Path, "read_bytes", _fail_read)
         caplog.set_level("WARNING")
 
         reg = ConversationRegistry.load(path)
@@ -23737,6 +23727,7 @@ class TestInvokeRoute:
                     "oid": "claim-oid",
                     "tid": "claim-tid",
                     "preferred_username": "u@x",
+                    "scp": "User.Read",
                 }
             ),
         )
@@ -24514,6 +24505,7 @@ class TestOutboundFiles:
             "name": f.name,
             "size": len(raw) if size is None else size,
             "sha256": hashlib.sha256(raw).hexdigest() if sha256 is None else sha256,
+            "card_activity_id": "consent-card-activity-1",
             "conversation_id": conv_id,
             "user_id": user_id,
             "service_url": service_url,
@@ -24697,6 +24689,119 @@ class TestOutboundFiles:
         assert "no cached inbound" in (result.error or "")
 
     # ── inbound: fileConsent/invoke handler ───────────────────────────────
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("action", ["accept", "decline"])
+    async def test_consent_unknown_never_deletes_or_acquires_token(
+        self, monkeypatch: pytest.MonkeyPatch, action: str
+    ) -> None:
+        """Partial: harness and connector I/O are mocked; the handler runs for real."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        token = AsyncMock(return_value=("token", "B"))
+        monkeypatch.setattr(adapter_mod._import_bridge(), "acquire_reply_token", token)
+        activity = self._consent_activity(action=action, consent_id="unknown")
+        activity["replyToId"] = "another-activity"
+
+        resp = await a._handle_file_consent(activity, validated_path="B")
+        assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
+        a._http_client.delete.assert_not_awaited()
+        token.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("validated_path", ["B", None])
+    @pytest.mark.parametrize("card_id", ["adapter-card", ""])
+    async def test_consent_cleanup_uses_sent_card_and_explicit_path(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        validated_path: str | None,
+        card_id: str,
+    ) -> None:
+        """Partial: mocked connector I/O; real send, pending state and consent handler."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        inbound = _make_inbound()
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        bridge = adapter_mod._import_bridge()
+        response = MagicMock()
+        response.json.return_value = {"id": card_id}
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=response))
+        token = AsyncMock(return_value=("token", "B"))
+        monkeypatch.setattr(bridge, "acquire_reply_token", token)
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        f = tmp_path / "consent.pdf"
+        f.write_bytes(b"pdf")
+        sent = await a.send_document("conv-1", str(f))
+        assert sent.success
+        pending = a._pending_file_uploads[sent.message_id]
+        # No registry ref remains; the body still carries Path A agentic fields.
+        a._conversations._by_id.clear()
+        activity = self._consent_activity(consent_id=sent.message_id)
+        activity["replyToId"] = "another-activity"
+        assert activity["recipient"]["agenticAppId"]
+        assert "conv-1" not in a._conversations
+        # Missing uploadInfo exercises cleanup without changing the upload path.
+        resp = await a._handle_file_consent(activity, validated_path=validated_path)
+        assert resp.status == 200
+        a._http_client.delete.assert_not_awaited()  # cleanup stays post-ack
+        await a._drain_file_consent_upload_tasks()
+
+        if validated_path is None or not card_id:
+            a._http_client.delete.assert_not_awaited()
+            token.assert_not_awaited()
+        else:
+            a._http_client.delete.assert_awaited_once()
+            assert a._http_client.delete.await_args.args[0].endswith("/activities/adapter-card")
+            token.assert_awaited_once()
+            assert token.await_args.kwargs["validated_path"] == "B"
+        assert pending["card_activity_id"] == card_id
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "action, expired", [("accept", False), ("accept", True), ("decline", True)]
+    )
+    @pytest.mark.parametrize("binding", ["conversation", "from", "serviceUrl"])
+    async def test_consent_binding_mismatch_keeps_pending_without_cleanup(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        action: str,
+        binding: str,
+        expired: bool,
+    ) -> None:
+        """Partial: mocked connector I/O; real offer and mismatched consent handling."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
+        bridge = adapter_mod._import_bridge()
+        response = MagicMock()
+        response.json.return_value = {"id": "adapter-card"}
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=response))
+        token = AsyncMock(return_value=("token", "B"))
+        monkeypatch.setattr(bridge, "acquire_reply_token", token)
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200))
+        f = tmp_path / "bound.pdf"
+        f.write_bytes(b"pdf")
+        sent = await a.send_document("conv-1", str(f))
+        assert sent.success
+        pending = a._pending_file_uploads[sent.message_id]
+        if expired:
+            a._lifecycle_generation += 1
+        activity = self._consent_activity(action=action, consent_id=sent.message_id)
+        if binding == "serviceUrl":
+            activity[binding] = "https://other.example/"
+        else:
+            activity[binding]["id"] = "other"
+
+        resp = await a._handle_file_consent(activity, validated_path="B")
+        assert resp.status == 200
+        await a._drain_file_consent_upload_tasks()
+        assert a._pending_file_uploads[sent.message_id] is pending
+        a._http_client.delete.assert_not_awaited()
+        token.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_handle_consent_accept_uploads_and_sends_info_card(
@@ -25324,44 +25429,49 @@ class TestFeedbackAndCitations:
 
 
 class TestInteractiveCards:
-    def _connect(self, a: Any, monkeypatch: pytest.MonkeyPatch | None = None) -> None:
+    @staticmethod
+    def _approval_queue(
+        monkeypatch: pytest.MonkeyPatch, a: Any
+    ) -> tuple[list[dict[str, str]], MagicMock]:
+        """Partial gateway seam: snapshots and atomic, request-scoped FIFO resolution."""
+        pending = [{"request_id": "request-a", "command": "danger"}]
+
+        def list_pending(session_key: str) -> list[dict[str, str]]:
+            assert session_key == "sess-1"
+            return [dict(entry) for entry in pending]
+
+        def resolve(session_key: str, choice: str, *, request_id: str | None = None) -> int:
+            assert session_key == "sess-1"
+            for index, entry in enumerate(pending):
+                if request_id is None or entry.get("request_id") == request_id:
+                    pending.pop(index)
+                    return 1
+            return 0
+
+        resolver = MagicMock(side_effect=resolve)
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending, raising=False)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        return pending, resolver
+
+    def _connect(self, a: Any) -> None:
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(_make_inbound()))
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
         a._user_cache = MagicMock()
         a._bf_token_cache = MagicMock()
-        if monkeypatch is not None:
-            monkeypatch.setattr(
-                a, "_register_exec_approval_capability_settle", lambda _sk, _rid: None
-            )
-
-    def _card_turn(
-        self,
-        a: Any,
-        *,
-        session_key: str = "sess-1",
-        conv_id: str = "conv-1",
-        message_id: str = "act-card-turn",
-    ):
-        inbound = _make_inbound(conv_id=conv_id, activity_id=message_id)
-        assert a.admit_turn_authority(inbound, session_key, message_id=message_id)
-        record = a._ledger_record_for_message(message_id)
-        assert record is not None
-        return a._turn_frame_scope(session_key, record)
 
     @pytest.mark.asyncio
     async def test_send_exec_approval_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Partial: gateway queue and connector I/O are mocked; the card is minted for real."""
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
+        self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        with self._card_turn(a):
-            result = await a.send_exec_approval(
-                "conv-1", "rm -rf /tmp/x", "sess-1", request_id="req-test"
-            )
+        result = await a.send_exec_approval("conv-1", "rm -rf /tmp/x", "sess-1")
         assert result.success is True
         reply = send_reply.await_args.kwargs["reply"]
         att = reply["attachments"][0]
@@ -25372,7 +25482,7 @@ class TestInteractiveCards:
         )
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
         assert list(capability["choices"].values()) == ["once", "session", "always", "deny"]
-        assert capability["resolver"] == {"session_key": "sess-1", "request_id": "req-test"}
+        assert capability["resolver"] == {"session_key": "sess-1", "request_id": "request-a"}
         assert all(act["data"]["hermes_kind"] == "exec_approval" for act in actions)
         assert all("session_key" not in act["data"] for act in actions)
         # A system approval card is NOT AI-generated content — no #73(a) entity.
@@ -25382,8 +25492,10 @@ class TestInteractiveCards:
     async def test_delayed_approval_card_cannot_survive_chat_teardown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Partial: gateway queue and delayed connector I/O are mocked."""
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
+        self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         started = asyncio.Event()
         release = asyncio.Event()
@@ -25393,54 +25505,313 @@ class TestInteractiveCards:
             await release.wait()
 
         monkeypatch.setattr(bridge, "send_reply", AsyncMock(side_effect=delayed_send_reply))
-        with self._card_turn(a):
-            send = asyncio.create_task(
-                a.send_exec_approval("conv-1", "danger", "sess-1", request_id="req-delay")
-            )
-            await started.wait()
-            await a._teardown_chat_state("conv-1")
-            release.set()
-            result = await asyncio.wait_for(send, timeout=0.5)
+        send = asyncio.create_task(a.send_exec_approval("conv-1", "danger", "sess-1"))
+        await started.wait()
+        capability = next(iter(a._card_capabilities.values()))
+        await a._teardown_chat_state("conv-1")
+        release.set()
+        result = await asyncio.wait_for(send, timeout=0.5)
 
         assert result.success is False
         assert a._card_capabilities == {}
+        assert capability["resolver"]["request_id"] == "request-a"
 
     @pytest.mark.asyncio
     async def test_delivered_approval_is_rejected_after_chat_teardown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
+        """Partial: gateway queue and connector I/O are mocked."""
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
+        self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
-        with self._card_turn(a):
-            result = await a.send_exec_approval(
-                "conv-1", "danger", "sess-1", request_id="req-delivered"
-            )
+        result = await a.send_exec_approval("conv-1", "danger", "sess-1")
         assert result.success is True
         value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
             "data"
         ]
+        capability = a._card_capabilities[value["capability"]]
 
         await a._teardown_chat_state("conv-1")
         response = await a._handle_card_action(_make_inbound(), value)
 
         assert response.status_code == 403
         resolver.assert_not_called()
+        assert capability["resolver"]["request_id"] == "request-a"
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("choice", ["Approve once", "Deny"])
+    @pytest.mark.parametrize("retirement", ["completed", "timed_out", "cancelled", "replaced"])
+    async def test_exec_approval_stale_card_cannot_resolve_next_request(
+        self, monkeypatch: pytest.MonkeyPatch, choice: str, retirement: str
+    ) -> None:
+        """Partial: mocked gateway queue retires A without another card send."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        sent = await a.send_exec_approval("conv-1", "danger", "sess-1")
+        assert sent.success
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
+        value = next(action["data"] for action in actions if action["title"] == choice)
+        generations = (a._lifecycle_generation, a._chat_generation("conv-1"))
+        if retirement == "completed":
+            assert resolver("sess-1", "deny", request_id="request-a") == 1
+        else:
+            pending.pop(0)
+        if retirement == "replaced":
+            pending.append({"request_id": "request-b", "command": "later"})
+        remaining = [dict(entry) for entry in pending]
+        resolver.reset_mock()
+
+        resp = await a._handle_card_action(_make_inbound(), value)
+        assert resp.status_code == 200
+        assert json.loads(resp.body) == {"status": "card_action", "kind": "exec_approval"}
+        assert pending == remaining
+        resolver.assert_not_called()
+        assert value["capability"] not in a._card_capabilities
+        assert generations == (a._lifecycle_generation, a._chat_generation("conv-1"))
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_replacement_card_resolves_only_replacement(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        first = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
+        pending[:] = [{"request_id": "request-b", "command": "replacement"}]
+        assert (await a.send_exec_approval("conv-1", "replacement", "sess-1")).success
+        second = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
+        list_pending = MagicMock(wraps=a._gw_list_approvals)
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending)
+
+        assert first["capability"] not in a._card_capabilities
+        stale = await a._handle_card_action(_make_inbound(), first)
+        assert stale.status_code == 403
+        resolver.assert_not_called()
+        list_pending.assert_not_called()
+        assert pending == [{"request_id": "request-b", "command": "replacement"}]
+        assert second["capability"] in a._card_capabilities
+
+        accepted = await a._handle_card_action(_make_inbound(), second)
+        assert accepted.status_code == 200
+        list_pending.assert_called_once_with("sess-1")
+        resolver.assert_called_once_with("sess-1", "once", request_id="request-b")
+        assert pending == []
+        assert second["capability"] not in a._card_capabilities
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("unavailable", [False, True])
+    async def test_exec_approval_stale_click_prunes_session_capabilities(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, unavailable: bool
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        cards = {}
+        for name, kind, session_key, request_id in (
+            ("clicked", "exec_approval", "sess-1", "request-a"),
+            ("stale", "exec_approval", "sess-1", "stale-request"),
+            ("live", "exec_approval", "sess-1", "request-b"),
+            ("other_session", "exec_approval", "sess-2", "stale-request"),
+            ("other_kind", "slash_confirm", "sess-1", "stale-request"),
+        ):
+            cards[name] = a._mint_card_capability_actions(
+                "conv-1",
+                kind,
+                [("Approve once", "once")],
+                {"session_key": session_key, "request_id": request_id},
+            )[0][1]
+        pending[:] = [{"request_id": "request-b", "command": "later"}]
+        list_pending = MagicMock(
+            side_effect=RuntimeError("queue unavailable") if unavailable else None,
+            return_value=[dict(entry) for entry in pending],
+        )
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending)
+
+        with caplog.at_level("INFO", logger=adapter_mod.logger.name):
+            response = await a._handle_card_action(_make_inbound(), cards["clicked"])
+
+        assert response.status_code == 200
+        assert json.loads(response.body) == {"status": "card_action", "kind": "exec_approval"}
+        list_pending.assert_called_once_with("sess-1")
+        resolver.assert_not_called()
+        assert pending == [{"request_id": "request-b", "command": "later"}]
+        assert cards["clicked"]["capability"] not in a._card_capabilities
+        # An unreadable list must not prune siblings; a readable one prunes stale ones.
+        assert (cards["stale"]["capability"] in a._card_capabilities) == unavailable
+        assert cards["live"]["capability"] in a._card_capabilities
+        assert cards["other_session"]["capability"] in a._card_capabilities
+        assert cards["other_kind"]["capability"] in a._card_capabilities
+        assert "agent365 exec_approval: request no longer pending" in caplog.messages
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["empty", "ambiguous", "missing_id", "already_bound"])
+    async def test_exec_approval_prunes_stale_capabilities_before_unique_request_check(
+        self, monkeypatch: pytest.MonkeyPatch, state: str
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        stale = next(iter(a._card_capabilities))
+        pending.clear()
+        if state in {"ambiguous", "already_bound"}:
+            pending.append({"request_id": "request-b", "command": "later"})
+            if state == "ambiguous":
+                pending.append({"request_id": "request-c", "command": "another"})
+            else:
+                a._mint_card_capability_actions(
+                    "conv-1",
+                    "exec_approval",
+                    [("Approve once", "once")],
+                    {"session_key": "sess-1", "request_id": "request-b"},
+                )
+        elif state == "missing_id":
+            pending.append({"command": "missing id"})
+        send_reply.reset_mock()
+
+        result = await a.send_exec_approval("conv-1", "later", "sess-1")
+
+        assert result.success is False
+        assert result.error == "agent365 exec_approval: no unique unbound approval request"
+        assert stale not in a._card_capabilities
+        if state == "already_bound":
+            assert {cap["resolver"]["request_id"] for cap in a._card_capabilities.values()} == {
+                "request-b"
+            }
+        send_reply.assert_not_awaited()
+        resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("state", ["empty", "ambiguous", "missing_id", "unavailable"])
+    async def test_exec_approval_without_unique_request_uses_text_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, state: str
+    ) -> None:
+        """Partial: gateway seam and connector I/O mocked; real send must fail closed."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        if state == "empty":
+            pending.clear()
+        elif state == "ambiguous":
+            pending.append({"request_id": "request-b", "command": "later"})
+        elif state == "missing_id":
+            pending[0].pop("request_id")
+        else:
+            monkeypatch.setattr(a, "_gw_list_approvals", MagicMock(side_effect=ImportError))
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+
+        sent = await a.send_exec_approval("conv-1", "danger", "sess-1")
+        assert sent.success is False
+        send_reply.assert_not_awaited()
+        resolver.assert_not_called()
+        assert not a._card_capabilities
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_failed_send_leaves_request_unbound(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial: gateway queue and connector I/O are mocked."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        _pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        client = a._http_client
+        a._http_client = None
+
+        failed = await a.send_exec_approval("conv-1", "danger", "sess-1")
+
+        assert failed.success is False
+        assert a._card_capabilities == {}
+        send_reply.assert_not_awaited()
+
+        a._http_client = client
+        retried = await a.send_exec_approval("conv-1", "danger", "sess-1")
+
+        assert retried.success is True
+        send_reply.assert_awaited_once()
+        assert {cap["resolver"]["request_id"] for cap in a._card_capabilities.values()} == {
+            "request-a"
+        }
+        resolver.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_exec_approval_new_card_drops_stale_session_capability(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial: mocked gateway queue; real sends bind distinct pending requests."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        first = next(iter(a._card_capabilities))
+        # A is already bound, so only B can receive the next card.
+        pending.append({"request_id": "request-b", "command": "later"})
+        assert (await a.send_exec_approval("conv-1", "later", "sess-1")).success
+        second = next(nonce for nonce in a._card_capabilities if nonce != first)
+        assert resolver("sess-1", "deny", request_id="request-a") == 1
+        pending.append({"request_id": "request-c", "command": "new"})
+
+        assert (await a.send_exec_approval("conv-1", "new", "sess-1")).success
+        assert first not in a._card_capabilities
+        assert second in a._card_capabilities
+        assert {cap["resolver"]["request_id"] for cap in a._card_capabilities.values()} == {
+            "request-b",
+            "request-c",
+        }
+
+    @pytest.mark.asyncio
+    async def test_card_action_exec_approval_rejects_unbound_request(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial: mint normally, then simulate a legacy capability lacking request_id."""
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        self._approval_queue(monkeypatch, a)
+        resolver = MagicMock(return_value=1)
+        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        value = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
+            "data"
+        ]
+        a._card_capabilities[value["capability"]]["resolver"].pop("request_id", None)
+
+        resp = await a._handle_card_action(_make_inbound(), value)
+        assert resp.status_code == 403
+        resolver.assert_not_called()
+        assert value["capability"] in a._card_capabilities
 
     @pytest.mark.asyncio
     async def test_send_slash_confirm_card(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        with self._card_turn(a):
-            result = await a.send_slash_confirm("conv-1", "Confirm", "Run it?", "sess-1", "cfm-9")
+        result = await a.send_slash_confirm("conv-1", "Confirm", "Run it?", "sess-1", "cfm-9")
         assert result.success is True
         actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
         capability = a._card_capabilities[actions[0]["data"]["capability"]]
@@ -25454,15 +25825,12 @@ class TestInteractiveCards:
     @pytest.mark.asyncio
     async def test_send_clarify_with_choices(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
-        with self._card_turn(a):
-            result = await a.send_clarify(
-                "conv-1", "Which one?", ["Alpha", "Beta"], "clr-1", "sess-1"
-            )
+        result = await a.send_clarify("conv-1", "Which one?", ["Alpha", "Beta"], "clr-1", "sess-1")
         assert result.success is True
         actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
         assert [act["title"] for act in actions] == ["Alpha", "Beta", "Something else"]
@@ -25474,7 +25842,7 @@ class TestInteractiveCards:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
         a._seen_inbounds_this_lifetime.add("conv-1")
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
@@ -25482,8 +25850,7 @@ class TestInteractiveCards:
         mark = MagicMock()
         monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
 
-        with self._card_turn(a):
-            result = await a.send_clarify("conv-1", "Say more?", None, "clr-2", "sess-1")
+        result = await a.send_clarify("conv-1", "Say more?", None, "clr-2", "sess-1")
         assert result.success is True
         # Question sent as a plain text reply; intercept armed for the answer.
         assert send_reply.await_args.kwargs["reply"]["text"] == "Say more?"
@@ -25515,8 +25882,9 @@ class TestInteractiveCards:
 
     @pytest.mark.asyncio
     async def test_handle_card_action_exec_approval(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Partial: capability is seeded; real handler forwards its bound request id."""
         a = _make_adapter(monkeypatch)
-        monkeypatch.setattr(a, "_exec_approval_request_still_pending", lambda _sk, _rid: True)
+        self._approval_queue(monkeypatch, a)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
         activity = _make_inbound(conv_id="conv-1")
@@ -25525,19 +25893,22 @@ class TestInteractiveCards:
             activity,
             kind="exec_approval",
             choice="always",
-            resolver={"session_key": "sess-1", "request_id": "req-handle"},
+            resolver={"session_key": "sess-1", "request_id": "request-a"},
         )
         resp = await a._handle_card_action(activity, value)
         assert resp.status_code == 200
         assert json.loads(resp.body)["kind"] == "exec_approval"
-        resolver.assert_called_once_with("sess-1", "always", request_id="req-handle")
+        resolver.assert_called_once_with("sess-1", "always", request_id="request-a")
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("mismatch", ["user", "tenant"])
     async def test_card_capability_is_user_bound_single_use_and_resists_dos(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, mismatch: str
     ) -> None:
+        """Partial: seeded capability exercises real binding and consumption checks."""
         a = _make_adapter(monkeypatch)
-        monkeypatch.setattr(a, "_exec_approval_request_still_pending", lambda _sk, _rid: True)
+        list_pending = MagicMock(return_value=[{"request_id": "request-a"}])
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending)
         resolver = MagicMock(return_value=1)
         monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
         owner = _make_inbound(conv_id="conv-1")
@@ -25546,21 +25917,28 @@ class TestInteractiveCards:
             owner,
             kind="exec_approval",
             choice="once",
-            resolver={"session_key": "sess-1", "request_id": "req-handle"},
+            resolver={"session_key": "sess-1", "request_id": "request-a"},
         )
         attacker = _make_inbound(conv_id="conv-1")
-        attacker["from"] = {"id": "user-2", "name": "Other User"}
+        if mismatch == "user":
+            attacker["from"] = {"id": "user-2", "name": "Other User"}
 
-        rejected = await a._handle_card_action(attacker, value)
+        with monkeypatch.context() as mismatch_patch:
+            if mismatch == "tenant":
+                mismatch_patch.setattr(a, "tenant_id", "other-tenant")
+            rejected = await a._handle_card_action(attacker, value)
         assert rejected.status_code == 403
         assert "test-capability" in a._card_capabilities
         resolver.assert_not_called()
+        list_pending.assert_not_called()
 
         accepted = await a._handle_card_action(owner, value)
         assert accepted.status_code == 200
-        resolver.assert_called_once_with("sess-1", "once", request_id="req-handle")
+        list_pending.assert_called_once_with("sess-1")
+        resolver.assert_called_once_with("sess-1", "once", request_id="request-a")
         replayed = await a._handle_card_action(owner, value)
         assert replayed.status_code == 403
+        list_pending.assert_called_once_with("sess-1")
         resolver.assert_called_once()
 
     @pytest.mark.asyncio
@@ -25568,7 +25946,7 @@ class TestInteractiveCards:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -25596,7 +25974,7 @@ class TestInteractiveCards:
     ) -> None:
         monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.01)
         a = _make_adapter(monkeypatch)
-        self._connect(a, monkeypatch)
+        self._connect(a)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
@@ -25679,31 +26057,31 @@ class TestInteractiveCards:
         assert a._awaiting_text_chats["conv-1"] > 0
         assert "conv-1" in a._registry_protected_conversation_ids()
 
-    def test_route_card_submit_not_dispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        from fastapi.testclient import TestClient
+    @pytest.mark.asyncio
+    async def test_route_card_submit_not_dispatched(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        """Partial: mocked JWT, gateway queue and connector I/O; real send and route."""
+        from httpx import ASGITransport, AsyncClient
 
         a = _make_adapter(monkeypatch)
+        self._connect(a)
+        pending, resolver = self._approval_queue(monkeypatch, a)
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(bridge, "validate_inbound_jwt", AsyncMock(return_value={"oid": "o1"}))
-        a._http_client = MagicMock()
-        monkeypatch.setattr(a, "_exec_approval_request_still_pending", lambda _sk, _rid: True)
-        resolver = MagicMock(return_value=1)
-        monkeypatch.setattr(a, "_gw_resolve_approval", resolver)
-
-        body = _make_inbound(conv_id="conv-card", activity_id="ca-1", text="")
-        body["value"] = _seed_card_capability(
-            a,
-            body,
-            kind="exec_approval",
-            choice="deny",
-            resolver={"session_key": "sess-1", "request_id": "req-handle"},
-        )
-        client = TestClient(a.build_app())
-        r = client.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        assert (await a.send_exec_approval("conv-1", "danger", "sess-1")).success
+        actions = send_reply.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"]
+        body = _make_inbound(activity_id="ca-1", text="")
+        body["value"] = next(action["data"] for action in actions if action["title"] == "Deny")
+        async with AsyncClient(
+            transport=ASGITransport(app=a.build_app()), base_url="http://test"
+        ) as c:
+            r = await c.post("/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"})
         assert r.status_code == 200, r.text
         assert r.json()["status"] == "card_action"
         # Routed to the resolver, NOT the agent loop.
-        resolver.assert_called_once_with("sess-1", "deny", request_id="req-handle")
+        resolver.assert_called_once_with("sess-1", "deny", request_id="request-a")
+        assert pending == []
         assert a._handled_events == []
 
 
@@ -25713,30 +26091,39 @@ class TestInteractiveCards:
 
 
 class TestTurnFrame:
+    def _card_turn(
+        self,
+        a: Any,
+        *,
+        session_key: str = "sess-1",
+        conv_id: str = "conv-1",
+        message_id: str = "act-card-turn",
+    ):
+        inbound = _make_inbound(conv_id=conv_id, activity_id=message_id)
+        assert a.admit_turn_authority(inbound, session_key, message_id=message_id)
+        record = a._ledger_record_for_message(message_id)
+        assert record is not None
+        return a._turn_frame_scope(session_key, record)
+
     @pytest.fixture
     def runtime(self, monkeypatch: pytest.MonkeyPatch) -> Any:
         """Keep gateway/connector boundaries local; run the real adapter methods."""
-        import threading
-
-        approval = types.ModuleType("tools.approval")
-        approval._lock = threading.Lock()
-        approval._gateway_queues = {}
-        approval.register_gateway_settle = MagicMock(return_value=True)
-        approval.observe_gateway_settle = MagicMock(return_value=True)
-        approval.list_gateway_approvals = MagicMock(return_value=[{"request_id": "req-frame"}])
-        approval.resolve_gateway_approval = MagicMock(return_value=1)
-        tools_mod = types.ModuleType("tools")
-        tools_mod.approval = approval
-        monkeypatch.setitem(sys.modules, "tools", tools_mod)
-        monkeypatch.setitem(sys.modules, "tools.approval", approval)
-        monkeypatch.setattr(adapter_mod, "_SETTLE_REGISTER_PATCHED", False, raising=False)
         a = _make_adapter(monkeypatch, group_sessions_per_user=False)
         TestInteractiveCards()._connect(a)
+        # Main's queue fixture is session-specific. Frame tests also exercise
+        # computed session keys, so expose the same pending snapshot for those.
+        pending, resolver = TestInteractiveCards._approval_queue(monkeypatch, a)
+        pending[:] = [{"request_id": "req-frame"}]
+        list_pending = MagicMock(side_effect=lambda _sk: [dict(entry) for entry in pending])
+        monkeypatch.setattr(a, "_gw_list_approvals", list_pending)
         bridge = adapter_mod._import_bridge()
         monkeypatch.setattr(bridge, "validate_inbound_jwt", AsyncMock(return_value={"aud": "x"}))
+        monkeypatch.setattr(a, "_gw_mark_awaiting_text", MagicMock())
         posted = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", posted)
-        return SimpleNamespace(adapter=a, posted=posted, approval=approval)
+        return SimpleNamespace(
+            adapter=a, posted=posted, pending=pending, resolver=resolver, list_pending=list_pending
+        )
 
     async def _admit(self, runtime: Any, *activities: dict[str, Any]) -> list[Any]:
         import httpx
@@ -25755,11 +26142,11 @@ class TestTurnFrame:
     @staticmethod
     async def _send(a: Any, kind: str, session_key: str, **kwargs: Any) -> Any:
         if kind == "exec":
-            return await a.send_exec_approval(
-                "conv-1", "danger", session_key, request_id="req-frame", **kwargs
-            )
+            return await a.send_exec_approval("conv-1", "danger", session_key, **kwargs)
         if kind == "slash":
             return await a.send_slash_confirm("conv-1", "Confirm", "Run?", session_key, "cfm")
+        if kind == "open":
+            return await a.send_clarify("conv-1", "Say more?", None, "clr", session_key)
         return await a.send_clarify("conv-1", "Pick", ["Alpha"], "clr", session_key)
 
     @pytest.mark.parametrize("kind", ["exec", "slash", "clarify"])
@@ -25784,6 +26171,7 @@ class TestTurnFrame:
             _StubBasePlatformAdapter, "_process_message_background", process, raising=False
         )
         for event, inbound in zip(events, activities, strict=True):
+            runtime.pending[:] = [{"request_id": f"req-{inbound['id']}"}]
             await a._process_message_background(event, session_key)
             sent = runtime.posted.await_args.kwargs
             assert sent["inbound"]["id"] == inbound["id"]
@@ -25792,22 +26180,22 @@ class TestTurnFrame:
             cap = a._card_capabilities[data["capability"]]
             assert cap["user_id"] == inbound["from"]["id"]
             if kind == "exec":
-                assert cap["resolver"]["request_id"] == "req-frame"
+                assert cap["resolver"]["request_id"] == f"req-{inbound['id']}"
         assert runtime.posted.await_count == 3
         assert adapter_mod._AGENT_TURN_FRAME.get() is None
         assert a._turn_frame_stack_tokens == {}
 
-    @pytest.mark.parametrize("kind", ["exec", "slash", "clarify"])
-    async def test_card_without_turn_cannot_borrow_cached_origin(
-        self, runtime: Any, kind: str
-    ) -> None:
-        assert not (await self._send(runtime.adapter, kind, "sess-1")).success
+    @pytest.mark.parametrize("kind", ["exec", "slash", "clarify", "open"])
+    async def test_unbound_turn_cannot_borrow_cached_origin(self, runtime: Any, kind: str) -> None:
+        with runtime.adapter._turn_frame_scope("sess-1", adapter_mod._UNBOUND_TURN_FRAME):
+            assert not (await self._send(runtime.adapter, kind, "sess-1")).success
         runtime.posted.assert_not_awaited()
         assert runtime.adapter._card_capabilities == {}
 
     @pytest.mark.parametrize("mismatch", ["session", "conversation"])
+    @pytest.mark.parametrize("kind", ["exec", "slash", "clarify", "open"])
     async def test_card_rejects_mismatched_turn(
-        self, runtime: Any, monkeypatch: pytest.MonkeyPatch, mismatch: str
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch, mismatch: str, kind: str
     ) -> None:
         a = runtime.adapter
         inbound = _make_inbound(conv_id="other" if mismatch == "conversation" else "conv-1")
@@ -25815,7 +26203,7 @@ class TestTurnFrame:
         sk = a._session_key_for(event)
 
         async def process(_base: Any, _event: Any, session_key: str) -> None:
-            result = await self._send(a, "slash", "wrong" if mismatch == "session" else session_key)
+            result = await self._send(a, kind, "wrong" if mismatch == "session" else session_key)
             assert not result.success
 
         monkeypatch.setattr(
@@ -25884,8 +26272,9 @@ class TestTurnFrame:
         assert adapter_mod._AGENT_TURN_FRAME.get() is None
         assert runtime.posted.await_count == 2
 
-    async def test_exec_choice_policy_uses_origin_conversation(
-        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("kind", ["exec", "slash"])
+    async def test_choice_policy_uses_origin_conversation(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch, kind: str
     ) -> None:
         a = runtime.adapter
         first = _make_inbound(activity_id="personal")
@@ -25895,53 +26284,58 @@ class TestTurnFrame:
         sk = a._session_key_for(event)
 
         async def process(_base: Any, _event: Any, session_key: str) -> None:
-            assert (await self._send(a, "exec", session_key)).success
+            assert (await self._send(a, kind, session_key)).success
 
         monkeypatch.setattr(
             _StubBasePlatformAdapter, "_process_message_background", process, raising=False
         )
         await a._process_message_background(event, sk)
         (cap,) = a._card_capabilities.values()
-        assert list(cap["choices"].values()) == ["once", "session", "always", "deny"]
+        expected = (
+            ["once", "session", "always", "deny"]
+            if kind == "exec"
+            else ["once", "always", "cancel"]
+        )
+        assert list(cap["choices"].values()) == expected
         assert runtime.posted.await_args.kwargs["inbound"]["id"] == "personal"
 
-    async def test_exec_click_resolves_only_its_request(self, runtime: Any) -> None:
+    async def test_exec_click_keeps_origin_actor_and_request_binding(self, runtime: Any) -> None:
         a = runtime.adapter
-        with TestInteractiveCards()._card_turn(a):
+        later = _make_inbound(activity_id="later")
+        later["from"]["id"] = "other-user"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(later))
+        with self._card_turn(a):
             assert (await self._send(a, "exec", "sess-1")).success
         sent = runtime.posted.await_args.kwargs
+        assert sent["inbound"]["id"] == "act-card-turn"
         data = sent["reply"]["attachments"][0]["content"]["actions"][0]["data"]
+        assert (await a._handle_card_action(later, data)).status_code == 403
+        runtime.resolver.assert_not_called()
+        assert data["capability"] in a._card_capabilities
         response = await a._handle_card_action(_make_inbound(), data)
         assert response.status_code == 200
-        runtime.approval.resolve_gateway_approval.assert_called_once_with(
-            "sess-1", "once", resolve_all=False, reason=None, request_id="req-frame"
-        )
+        runtime.resolver.assert_called_once_with("sess-1", "once", request_id="req-frame")
         assert a._card_capabilities == {}
         assert (await a._handle_card_action(_make_inbound(), data)).status_code == 403
-        runtime.approval.resolve_gateway_approval.assert_called_once()
+        runtime.resolver.assert_called_once()
 
-    async def test_settled_request_cannot_be_resolved_by_old_card(self, runtime: Any) -> None:
-        a = runtime.adapter
-        with TestInteractiveCards()._card_turn(a):
-            assert (await self._send(a, "exec", "sess-1")).success
-        data = runtime.posted.await_args.kwargs["reply"]["attachments"][0]["content"]["actions"][0][
-            "data"
-        ]
-        runtime.approval.list_gateway_approvals.return_value = []
-        assert (await a._handle_card_action(_make_inbound(), data)).status_code == 403
-        runtime.approval.resolve_gateway_approval.assert_not_called()
+    async def test_settled_origin_card_uses_main_stale_ack(
+        self, runtime: Any, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
 
-    async def test_settle_callback_removes_only_matching_request_cards(self, runtime: Any) -> None:
         a = runtime.adapter
-        with TestInteractiveCards()._card_turn(a):
+        with self._card_turn(a):
             assert (await self._send(a, "exec", "sess-1")).success
-            callback = runtime.approval.observe_gateway_settle.call_args.args[2]
-            assert (
-                await a.send_exec_approval("conv-1", "other", "sess-1", request_id="other")
-            ).success
-        callback("resolved")
-        (cap,) = a._card_capabilities.values()
-        assert cap["resolver"]["request_id"] == "other"
+        sent = runtime.posted.await_args.kwargs
+        assert sent["inbound"]["id"] == "act-card-turn"
+        data = sent["reply"]["attachments"][0]["content"]["actions"][0]["data"]
+        runtime.pending.clear()
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            assert (await a._handle_card_action(_make_inbound(), data)).status_code == 200
+        assert "request no longer pending" in caplog.text
+        assert a._card_capabilities == {}
+        runtime.resolver.assert_not_called()
 
     @pytest.mark.parametrize("known", [True, False])
     @pytest.mark.parametrize("explicit_session", [True, False])
@@ -26097,6 +26491,38 @@ class TestTurnFrame:
         assert sent["inbound"]["id"] == "handoff-user"
         (cap,) = a._card_capabilities.values()
         assert cap["user_id"] == _HANDOFF_USER
+
+    @pytest.mark.parametrize("kind", ["exec", "slash", "clarify", "open"])
+    async def test_callback_uses_unambiguous_session_frame(self, runtime: Any, kind: str) -> None:
+        a = runtime.adapter
+        later = _make_inbound(activity_id="later")
+        later["from"]["id"] = "other-user"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(later))
+        with self._card_turn(a):
+            token = adapter_mod._AGENT_TURN_FRAME.set(None)
+            try:
+                assert (await self._send(a, kind, "sess-1")).success
+            finally:
+                adapter_mod._AGENT_TURN_FRAME.reset(token)
+        sent = runtime.posted.await_args.kwargs
+        assert sent["inbound"]["id"] == "act-card-turn"
+        assert sent["reply"]["replyToId"] == "act-card-turn"
+        if kind != "open":
+            (cap,) = a._card_capabilities.values()
+            assert cap["user_id"] == _make_inbound()["from"]["id"]
+
+    async def test_reply_uses_frame_activity_after_registry_changes(self, runtime: Any) -> None:
+        a = runtime.adapter
+        later = _make_inbound(activity_id="later")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(later))
+        with self._card_turn(a):
+            result = await a._send_reply_activity(
+                inbound=later, content="Reply", log_context="frame_test"
+            )
+        assert result.success
+        sent = runtime.posted.await_args.kwargs
+        assert sent["inbound"]["id"] == "act-card-turn"
+        assert sent["reply"]["replyToId"] == "act-card-turn"
 
 
 class TestHandoff:
@@ -26332,6 +26758,7 @@ def _handoff_ctx(
         claims={
             "oid": _HANDOFF_USER if claims_user is None else claims_user,
             "tid": _HANDOFF_TENANT if claims_tenant is None else claims_tenant,
+            "idtyp": "user",
         },
         path_tag="B",
     )
@@ -28560,7 +28987,8 @@ class TestMessageReaction:
             json=_reaction_activity(channel_id="webchat", activity_id="react-web"),
             headers={"Authorization": "Bearer a.b.c"},
         )
-        assert response.json()["reason"] == "ignored"
+        assert response.status_code == 403
+        assert response.json()["detail"] == "end user is not authorized"
         assert "reply-1" not in a._feedback_by_message_id
         assert a._handled_events == []
 
