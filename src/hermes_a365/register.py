@@ -580,6 +580,39 @@ def detect_missing_secret(generated_config_path: Path) -> tuple[bool, str | None
     return is_missing, bp_id
 
 
+def _skipped_blueprint_secret_missing(hermes_home: Path, tenant: str, bp_id: str) -> bool:
+    """Gate recovery only when all configured sources confirm an absent secret."""
+    from .activity_bridge import load_profile_env
+    from .secrets_provider import resolve_secret_state
+
+    key = "A365_BLUEPRINT_CLIENT_SECRET"
+    env_found = bool(os.environ.get(key))
+    profile_env_error = None
+    if not env_found:
+        # Profile failures must not expose file contents or block provider lookup.
+        try:
+            env_found = bool(load_profile_env(hermes_home).values.get(key))
+        except Exception as exc:
+            profile_env_error = type(exc).__name__
+    state = resolve_secret_state(tenant, bp_id, existing="")
+    if env_found or bool(state.value):
+        return False
+    if not state.reachable:
+        sys.stdout.write(
+            "\n[warn] Blueprint secret could not be confirmed because the secrets "
+            "provider was unreachable. Restore provider access and re-run.\n"
+        )
+        return False
+    if profile_env_error:
+        sys.stdout.write(
+            "\n[warn] Blueprint secret could not be confirmed because the profile "
+            f"env file could not be read ({profile_env_error}). "
+            "Check profile env file access and re-run.\n"
+        )
+        return False
+    return True
+
+
 def _harden_generated_config(path: Path) -> None:
     """Require the CLI's plaintext generated config to be a 0600 regular file."""
     try:
@@ -946,6 +979,49 @@ def run(args: argparse.Namespace) -> int:
     else:
         plan = build_register_plan(inputs)
         sys.stdout.write(plan.render_human() + "\n")
+
+    # Reconciliation checks Entra state, not whether the local credential
+    # survived an earlier consent defer. Check before any apply mutations.
+    if not any(step.name == "blueprint" for step in plan.steps):
+        generated_path = Path(GENERATED_CONFIG_FILENAME)
+        is_missing, bp_id = detect_missing_secret(generated_path)
+        anchor_app_id = (
+            load_anchor_app_id(home, inputs.agent_name)
+            if is_missing and bp_id and home is not None
+            else ""
+        )
+        if anchor_app_id and bp_id and anchor_app_id.casefold() != bp_id.casefold():
+            sys.stdout.write(
+                "\n[warn] The generated config refers to a different blueprint than "
+                "this agent's, so the blueprint secret check was skipped.\n"
+            )
+        elif (
+            is_missing
+            and bp_id
+            and _skipped_blueprint_secret_missing(hermes_home, inputs.tenant_id or "", bp_id)
+        ):
+            sys.stdout.write(
+                "\n[warn] Blueprint has no usable agentBlueprintClientSecret in "
+                "the generated config. Run `a365 setup blueprint` or re-run "
+                "with --apply --auto-recover-secret before continuing.\n"
+            )
+            if args.apply:
+                if not args.auto_recover_secret:
+                    print(
+                        "ERROR: blueprint client secret is missing; no changes applied.",
+                        file=sys.stderr,
+                    )
+                    return 2
+                outcome = auto_recover_secret(
+                    generated_path,
+                    bp_id,
+                    mutator=get_mutator(),
+                    display_name=default_recovery_display_name(),
+                    expected_app_display_name=f"{args.agent_name} Blueprint",
+                )
+                sys.stdout.write("\n" + "\n".join(outcome.messages) + "\n")
+                if not outcome.recovered:
+                    return 2
 
     if not args.apply:
         sys.stdout.write("\nNo mutations. Re-run with --apply to execute.\n")
