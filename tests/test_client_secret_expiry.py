@@ -15,6 +15,7 @@ import pytest
 from hermes_a365 import doctor
 from hermes_a365.client_secret_expiry import (
     check_app_client_secret_expiry,
+    classify_client_secret_expiry,
     gather_client_secret_expiry_checks,
     graph_get_from_az_rest,
     select_latest_active_credential_end,
@@ -108,10 +109,15 @@ class TestSelectLatestActive:
 
 
 class TestCheckApp:
-    def test_all_expired_reports_latest_past_end(self) -> None:
-        past = _NOW - timedelta(days=3)
+    @pytest.mark.parametrize("elapsed", [timedelta(days=3), timedelta(hours=1), timedelta(0)])
+    @pytest.mark.parametrize("for_status", [False, True])
+    def test_all_expired_reports_latest_past_end(
+        self, elapsed: timedelta, for_status: bool
+    ) -> None:
+        past = _NOW - elapsed
         payload = {
             "passwordCredentials": [
+                _cred(start=past - timedelta(days=400), end=past - timedelta(days=1)),
                 _cred(start=past - timedelta(days=400), end=past),
             ],
         }
@@ -119,10 +125,22 @@ class TestCheckApp:
             _BLUEPRINT,
             graph_get=_graph_get(payload),
             now=_NOW,
+            for_status=for_status,
         )
         assert state == "error"
-        assert "last active client secret expired" in detail
-        assert data["days_remaining"] < 0
+        assert detail == f"last active client secret expired on {_iso(past)}"
+        assert data["check"] == "expired"
+        assert data["end_date_time"] == _iso(past)
+        assert data["days_remaining"] == (-elapsed).days
+
+    @pytest.mark.parametrize("elapsed", [timedelta(days=3), timedelta(hours=1), timedelta(0)])
+    def test_classify_expired_detail(self, elapsed: timedelta) -> None:
+        end = _NOW - elapsed
+        state, detail, data = classify_client_secret_expiry(end=end, now=_NOW, warn_days=30)
+        assert state == "error"
+        assert detail == f"last active client secret expired on {_iso(end)}"
+        assert data["check"] == "expired"
+        assert data["days_remaining"] == (-elapsed).days
 
     def test_no_password_credentials_skips(self) -> None:
         payload = {
@@ -208,6 +226,77 @@ class TestCheckApp:
         assert stat_state == "skipped"
         assert "no active client secret yet" in doc_detail
         assert data["check"] == "no_active_yet"
+
+
+class TestGraphErrors:
+    @pytest.fixture(params=["mutator", "az_stdout", "az_stderr", "az_stderr_prefix"])
+    def error_getter(self, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
+        def build(code: str):
+            body = json.dumps({"error": {"code": code, "message": _GRAPH_MSG}})
+            if request.param == "mutator":
+                mut = A365CliMutator()
+                monkeypatch.setattr(mut, "available", True)
+
+                def fake_streaming(argv, *, timeout, stdin_input):
+                    # Exercise A365CliMutator.run's production sensitive-error handling.
+                    return 1, f"ERROR: {body}"
+
+                monkeypatch.setattr("hermes_a365.mutator._run_sensitive_streaming", fake_streaming)
+                return graph_get_from_mutator_for_secret_expiry(mut)
+
+            stdout = body.encode() if request.param == "az_stdout" else b""
+            stderr = b"" if request.param == "az_stdout" else body.encode()
+            if request.param == "az_stderr_prefix":
+                stderr = b"ERROR: " + stderr
+            monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+            monkeypatch.setattr(
+                subprocess,
+                "run",
+                lambda *_a, **_k: subprocess.CompletedProcess([], 1, stdout=stdout, stderr=stderr),
+            )
+            return graph_get_from_az_rest()
+
+        return build
+
+    @pytest.mark.parametrize("code", ["Request_ResourceNotFound", "Authorization_RequestDenied"])
+    @pytest.mark.parametrize("for_status", [False, True])
+    def test_adapters_preserve_error_classification(self, error_getter, code, for_status) -> None:
+        getter = error_getter(code)
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload is not None
+        assert payload["error"]["code"] == code
+        state, detail, data = check_app_client_secret_expiry(
+            _BLUEPRINT, graph_get=getter, now=_NOW, for_status=for_status
+        )
+        if code == "Request_ResourceNotFound":
+            assert state == "error"
+            assert data["check"] == "missing_app"
+            assert "Entra application not found" in detail
+        else:
+            assert state == ("skipped" if for_status else "warn")
+            assert data["check"] == "unavailable"
+            assert "Graph access denied" in detail
+        _assert_no_leaks(detail)
+        _assert_no_leaks(json.dumps(data))
+
+    def test_missing_app_makes_status_fail(self, tmp_path: Path, error_getter) -> None:
+        (tmp_path / ".env").write_text(
+            f"A365_TENANT_ID=00000000-0000-0000-0000-000000000001\nA365_APP_ID={_BLUEPRINT}\n"
+        )
+        report = collect_status(
+            None,
+            hermes_home=tmp_path,
+            query_source=_UnavailableQuerySource(),
+            graph_get=error_getter("Request_ResourceNotFound"),
+            secret_expiry_now=lambda: _NOW,
+            bot_service_sidecar_path=tmp_path / "missing-sidecar.json",
+        )
+        comp = next(c for c in report.components if c.name == "client_secret_expiry")
+        assert comp.state == "error"
+        assert "blueprint Entra application not found" in comp.detail
+        assert status_exit(report.overall) == 2
+        _assert_no_leaks(comp.detail)
+        _assert_no_leaks(json.dumps(comp.data))
 
 
 class TestStrictJson:
@@ -326,6 +415,43 @@ class TestStrictJson:
 
 
 class TestAzAdapterStrictJson:
+    @pytest.mark.parametrize("code", ["Request_ResourceNotFound", "Authorization_RequestDenied"])
+    def test_structured_error_on_zero_exit(
+        self, monkeypatch: pytest.MonkeyPatch, code: str
+    ) -> None:
+        body = json.dumps({"error": {"code": code, "message": _GRAPH_MSG}}).encode()
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess([], 0, stdout=body, stderr=b""),
+        )
+        getter = graph_get_from_az_rest()
+        payload = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        assert payload is not None
+        assert payload["error"]["code"] == code
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            b"not JSON",
+            b'{"passwordCredentials": []}',
+            b'{"error": {"code": "Request_ResourceNotFound"}} trailing',
+            b"invalid utf-8: \xff",
+        ],
+    )
+    def test_nonzero_exit_without_structured_error_is_unavailable(
+        self, monkeypatch: pytest.MonkeyPatch, body: bytes
+    ) -> None:
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+        monkeypatch.setattr(
+            subprocess,
+            "run",
+            lambda *_a, **_k: subprocess.CompletedProcess([], 1, stdout=body, stderr=body),
+        )
+        getter = graph_get_from_az_rest()
+        assert getter(application_client_secret_expiry_url(_BLUEPRINT)) is None
+
     def test_huge_integer_unavailable_az(self, monkeypatch: pytest.MonkeyPatch) -> None:
         huge = "1" + "0" * 10000
         body = f'{{"passwordCredentials": [], "n": {huge}}}'
@@ -624,6 +750,7 @@ def _minimal_doctor_patches():
         probe_az_cli=lambda: ProbeResult("az_cli", "ok", ""),
         probe_powershell=lambda: ProbeResult("powershell", "ok", ""),
         probe_custom_client_app=lambda: ProbeResult("custom_client_app", "ok", ""),
+        probe_network=lambda: ProbeResult("network", "ok", ""),
         probe_keychain=lambda: ProbeResult("keychain", "ok", ""),
         probe_local_config=lambda: ProbeResult("local_config", "ok", ""),
         probe_hermes_harness=lambda: ProbeResult("hermes_harness", "ok", ""),

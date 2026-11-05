@@ -717,6 +717,9 @@ def graph_get_from_mutator_for_secret_expiry(
         except UnicodeDecodeError:
             return _unreadable_graph_expiry_payload()
         except CliInvocationError as exc:
+            if exc.graph_error is not None:
+                code, message = exc.graph_error
+                return {"error": {"code": code, "message": message}}
             raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
             if isinstance(raw, bytes):
                 return _parse_expiry_response_bytes(raw)

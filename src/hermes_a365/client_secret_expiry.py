@@ -159,7 +159,7 @@ def classify_client_secret_expiry(
         data["check"] = "expired"
         return (
             "error",
-            f"last active client secret expired on {end_z} ({days} days remaining)",
+            f"last active client secret expired on {end_z}",
             data,
         )
     if days <= warn_days:
@@ -203,17 +203,19 @@ def _az_rest_graph_get(url: str) -> dict[str, Any] | None:
     except (OSError, subprocess.TimeoutExpired):
         return None
     if proc.returncode != 0:
+        # Azure CLI can put Graph errors on either stream, with an ERROR: prefix.
+        for raw in (proc.stdout, proc.stderr):
+            if not raw:
+                continue
+            parsed = _parse_expiry_response_bytes(raw.strip().removeprefix(b"ERROR:").strip())
+            if (
+                parsed is not None
+                and isinstance(parsed.get("error"), dict)
+                and graph_error_code(parsed) != "UnreadableGraphResponse"
+            ):
+                return parsed
         return None
-    raw = proc.stdout or b""
-    parsed = _parse_expiry_response_bytes(raw)
-    if parsed is None:
-        return None
-    if isinstance(parsed.get("error"), dict):
-        code = str(parsed["error"].get("code") or "")
-        if code == "UnreadableGraphResponse":
-            return parsed
-        return None
-    return parsed
+    return _parse_expiry_response_bytes(proc.stdout or b"")
 
 
 def graph_get_from_az_rest() -> GraphGet:
@@ -332,8 +334,7 @@ def check_app_client_secret_expiry(
         }
         return (
             "error",
-            f"last active client secret expired on {data['end_date_time']} "
-            f"({data['days_remaining']} days remaining)",
+            f"last active client secret expired on {data['end_date_time']}",
             data,
         )
     reason = failure or "no client secret in its active window"
