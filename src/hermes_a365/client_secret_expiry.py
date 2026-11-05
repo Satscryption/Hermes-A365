@@ -19,7 +19,14 @@ from typing import Any, Literal
 from uuid import UUID
 
 from . import bot_service
-from ._common import parse_env, slugify, validate_slug
+from ._common import (
+    TenantResolutionError,
+    active_az_tenant,
+    parse_env,
+    slugify,
+    tenant_ids_match,
+    validate_slug,
+)
 from .bot_service import BotServiceError
 from .entra_state import (
     _ACCESS_DENIED_CODES,
@@ -196,6 +203,7 @@ def _az_rest_graph_get(url: str) -> dict[str, Any] | None:
                 "ConsistencyLevel=eventual",
                 "--output",
                 "json",
+                "--only-show-errors",
             ],
             capture_output=True,
             text=False,
@@ -236,6 +244,27 @@ def build_graph_get(mutator: Mutator | None = None) -> GraphGet | None:
     if shutil.which("az"):
         return graph_get_from_az_rest()
     return None
+
+
+def _expiry_tenant_matches(tenant_id: str, mutator: Mutator) -> bool:
+    def run(argv: list[str]) -> object:
+        if getattr(mutator, "available", True):
+            return mutator.run(argv, sensitive=True, timeout=GRAPH_SECRET_EXPIRY_REST_TIMEOUT_SEC)
+        return subprocess.run(
+            argv,
+            capture_output=True,
+            text=True,
+            timeout=GRAPH_SECRET_EXPIRY_REST_TIMEOUT_SEC,
+            check=True,
+        )
+
+    active = active_az_tenant(run)
+    if active is None:
+        return False
+    try:
+        return tenant_ids_match(active, tenant_id, source="selected tenant")
+    except TenantResolutionError:
+        return False
 
 
 def check_app_client_secret_expiry(
@@ -492,6 +521,7 @@ def gather_client_secret_expiry_checks(
     agent_name: str | None,
     sidecar_path: Path,
     generated_config_path: Path,
+    tenant_id: str | None = None,
     warn_days: int = DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
     graph_get: GraphGet | None = None,
     mutator: Mutator | None = None,
@@ -528,6 +558,24 @@ def gather_client_secret_expiry_checks(
         skip_row("blueprint_client_secret", f"skipped; {skip_reason}")
         skip_row("bf_client_secret", f"skipped; {skip_reason}")
         return rows
+
+    if tenant_id:
+        mutator = mutator if mutator is not None else get_mutator()
+        if not _expiry_tenant_matches(tenant_id, mutator):
+            for name, role in (
+                ("blueprint_client_secret", "blueprint"),
+                ("bf_client_secret", "Bot Framework"),
+            ):
+                rows.append(
+                    (
+                        name,
+                        _unavailable_state(for_status=for_status),
+                        f"{_unavailable_detail(role=role)} "
+                        "(active Azure CLI tenant differs or could not be verified)",
+                        {"role": role, "check": "unavailable"},
+                    )
+                )
+            return rows
 
     getter = graph_get if graph_get is not None else build_graph_get(mutator)
     if getter is None:

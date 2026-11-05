@@ -7,12 +7,12 @@ import subprocess
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 from uuid import UUID
 
 import pytest
 
-from hermes_a365 import doctor
+from hermes_a365 import client_secret_expiry, doctor
 from hermes_a365.client_secret_expiry import (
     check_app_client_secret_expiry,
     classify_client_secret_expiry,
@@ -233,7 +233,17 @@ class TestAdapterArgv:
     def test_mutator_requests_json(self) -> None:
         mut = A365CliMutator()
         url = application_client_secret_expiry_url(_BLUEPRINT)
-        argv = ["az", "rest", "--method", "GET", "--uri", url, "--output", "json"]
+        argv = [
+            "az",
+            "rest",
+            "--method",
+            "GET",
+            "--uri",
+            url,
+            "--output",
+            "json",
+            "--only-show-errors",
+        ]
         result = RunResult(argv=argv, returncode=0, stdout='{"passwordCredentials":[]}', stderr="")
         with patch.object(mut, "run", return_value=result) as run:
             getter = graph_get_from_mutator_for_secret_expiry(mut)
@@ -254,6 +264,7 @@ class TestAdapterArgv:
             "ConsistencyLevel=eventual",
             "--output",
             "json",
+            "--only-show-errors",
         ]
         result = subprocess.CompletedProcess(
             argv, 0, stdout=b'{"passwordCredentials":[]}', stderr=b""
@@ -263,6 +274,156 @@ class TestAdapterArgv:
         run.assert_called_once_with(
             argv, capture_output=True, text=False, timeout=15.0, check=False
         )
+
+    @pytest.mark.parametrize("adapter", ["mutator", "subprocess"])
+    def test_expired_secret_with_warning_on_stderr(
+        self, adapter: str, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        payload = {
+            "passwordCredentials": [
+                _cred(start=_NOW - timedelta(days=100), end=_NOW - timedelta(days=1)),
+            ],
+        }
+        body = json.dumps(payload)
+        warning = "WARNING: upgrade available\n"
+        run = Mock()
+        if adapter == "mutator":
+            run.return_value = RunResult([], 0, body, warning)
+            mut = A365CliMutator()
+            monkeypatch.setattr(mut, "run", run)
+            getter = graph_get_from_mutator_for_secret_expiry(mut)
+        else:
+            run.return_value = subprocess.CompletedProcess(
+                [], 0, stdout=body.encode(), stderr=warning.encode()
+            )
+            monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+            monkeypatch.setattr(subprocess, "run", run)
+            getter = graph_get_from_az_rest()
+
+        assert getter(application_client_secret_expiry_url(_BLUEPRINT)) == payload
+        state, detail, data = check_app_client_secret_expiry(
+            _BLUEPRINT, graph_get=getter, now=_NOW, for_status=True
+        )
+        assert state == "error"
+        assert data["check"] == "expired"
+        assert "expired" in detail
+        assert all("--only-show-errors" in call.args[0] for call in run.call_args_list)
+
+
+class TestTenantSelection:
+    _TENANT = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    _OTHER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+
+    @pytest.mark.parametrize("adapter", ["mutator", "subprocess"])
+    @pytest.mark.parametrize(
+        ("selected", "account_body", "account_rc", "expected"),
+        [
+            (_TENANT, {"tenantId": _OTHER}, 0, "unavailable"),
+            (_TENANT, {}, 0, "unavailable"),
+            (_TENANT, {"tenantId": _TENANT}, 1, "unavailable"),
+            (_TENANT, {"tenantId": _TENANT.upper()}, 0, "expired"),
+            (None, {}, 1, "expired"),
+        ],
+    )
+    def test_validates_session_before_graph_read(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        adapter: str,
+        selected: str | None,
+        account_body: dict[str, str],
+        account_rc: int,
+        expected: str,
+    ) -> None:
+        home = _seed_home(tmp_path)
+        calls: list[list[str]] = []
+        payload = {
+            "passwordCredentials": [
+                _cred(start=_NOW - timedelta(days=100), end=_NOW - timedelta(days=1)),
+            ],
+        }
+
+        def run(argv, **kwargs):
+            calls.append(argv)
+            if argv[:3] == ["az", "account", "show"]:
+                assert argv == ["az", "account", "show", "-o", "json", "--only-show-errors"]
+                rc, body = account_rc, account_body
+                if adapter == "subprocess" and rc:
+                    raise subprocess.CalledProcessError(rc, argv)
+                if adapter == "mutator" and rc:
+                    raise CliInvocationError(argv, rc, "not logged in")
+            else:
+                assert argv[:2] == ["az", "rest"]
+                assert expected == "expired", "Graph must not read an unverified tenant"
+                rc, body = 0, payload
+            if adapter == "mutator":
+                assert kwargs == {"sensitive": True, "timeout": 15.0}
+                return RunResult(argv, rc, json.dumps(body), "")
+            text = json.dumps(body)
+            return subprocess.CompletedProcess(
+                argv, rc, stdout=text if kwargs["text"] else text.encode(), stderr=""
+            )
+
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", adapter == "mutator")
+        monkeypatch.setattr(mut, "run", run)
+        monkeypatch.setattr(subprocess, "run", run)
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+        rows = gather_client_secret_expiry_checks(
+            hermes_home=home,
+            agent_name=None,
+            sidecar_path=tmp_path / "missing-sidecar.json",
+            generated_config_path=tmp_path / "missing.json",
+            tenant_id=selected,
+            mutator=mut,
+            now=lambda: _NOW,
+            for_status=True,
+        )
+        bp = next(row for row in rows if row[0] == "blueprint_client_secret")
+        assert bp[3]["check"] == expected
+        assert bp[1] == ("skipped" if expected == "unavailable" else "error")
+        assert len(calls) == (int(selected is not None) + int(expected == "expired"))
+
+    @pytest.mark.parametrize("explicit", [True, False])
+    @pytest.mark.parametrize("active", [_OTHER, None])
+    def test_status_forwards_resolved_tenant_and_does_not_report_missing_app(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, explicit: bool, active: str | None
+    ) -> None:
+        home = _seed_home(tmp_path)
+        (home / ".env").write_text(
+            f"A365_TENANT_ID={self._OTHER if explicit else self._TENANT}\n"
+            f"A365_APP_ID={_BLUEPRINT}\n"
+        )
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", True)
+        run = Mock(return_value=RunResult([], 0, json.dumps({"tenantId": active}), ""))
+        monkeypatch.setattr(mut, "run", run)
+        monkeypatch.setattr(client_secret_expiry, "get_mutator", lambda: mut)
+        graph_get = Mock(return_value={"error": {"code": "Request_ResourceNotFound"}})
+        with patch(
+            "hermes_a365.status.gather_client_secret_expiry_checks",
+            wraps=gather_client_secret_expiry_checks,
+        ) as gather:
+            report = collect_status(
+                None,
+                hermes_home=home,
+                tenant_id=self._TENANT if explicit else None,
+                query_source=_UnavailableQuerySource(),
+                graph_get=graph_get,
+                bot_service_sidecar_path=tmp_path / "missing.json",
+            )
+        assert gather.call_args.kwargs["tenant_id"] == self._TENANT
+        run.assert_called_once_with(
+            ["az", "account", "show", "-o", "json", "--only-show-errors"],
+            sensitive=True,
+            timeout=15.0,
+        )
+        graph_get.assert_not_called()
+        component = next(c for c in report.components if c.name == "client_secret_expiry")
+        assert component.state == "skipped"
+        assert component.data["apps"]["blueprint_client_secret"]["check"] == "unavailable"
+        assert "missing_app" not in json.dumps(component.data)
+        assert report.overall != "broken"
 
 
 class TestGraphErrors:
@@ -333,7 +494,14 @@ class TestGraphErrors:
         _assert_no_leaks(detail)
         _assert_no_leaks(json.dumps(data))
 
-    def test_missing_app_makes_status_fail(self, tmp_path: Path, error_getter) -> None:
+    def test_missing_app_makes_status_fail(
+        self, tmp_path: Path, error_getter, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            client_secret_expiry,
+            "active_az_tenant",
+            lambda _run: "00000000-0000-0000-0000-000000000001",
+        )
         (tmp_path / ".env").write_text(
             f"A365_TENANT_ID=00000000-0000-0000-0000-000000000001\nA365_APP_ID={_BLUEPRINT}\n"
         )
@@ -788,7 +956,14 @@ class TestStatusRollup:
         assert "older active secrets may expire sooner" in detail
         _assert_no_leaks(detail)
 
-    def test_no_active_yet_does_not_roll_up_ok(self, tmp_path: Path) -> None:
+    def test_no_active_yet_does_not_roll_up_ok(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            client_secret_expiry,
+            "active_az_tenant",
+            lambda _run: "00000000-0000-0000-0000-000000000001",
+        )
         home = tmp_path / "hermes"
         home.mkdir()
         (home / ".env").write_text(
@@ -823,6 +998,7 @@ class TestStatusRollup:
         )
         comp = next(c for c in report.components if c.name == "client_secret_expiry")
         assert comp.state == "skipped"
+        assert comp.data["apps"]["blueprint_client_secret"]["check"] == "no_active_yet"
         assert status_exit(report.overall) == 0
 
 
@@ -987,7 +1163,14 @@ class TestDoctorStatusIntegration:
         assert probe.state == "warn"
         assert overall_to_exit_code(report.overall) == 1
 
-    def test_status_could_not_check_keeps_exit_ok(self, tmp_path: Path) -> None:
+    def test_status_could_not_check_keeps_exit_ok(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setattr(
+            client_secret_expiry,
+            "active_az_tenant",
+            lambda _run: "00000000-0000-0000-0000-000000000001",
+        )
         (tmp_path / ".env").write_text(
             f"A365_TENANT_ID=00000000-0000-0000-0000-000000000001\nA365_APP_ID={_BLUEPRINT}\n"
         )

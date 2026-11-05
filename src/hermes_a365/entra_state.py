@@ -703,7 +703,17 @@ def graph_get_from_mutator_for_secret_expiry(
         assert_client_secret_expiry_read_url(url)
         try:
             result = mutator.run(
-                ["az", "rest", "--method", "GET", "--uri", url, "--output", "json"],
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "GET",
+                    "--uri",
+                    url,
+                    "--output",
+                    "json",
+                    "--only-show-errors",
+                ],
                 sensitive=True,
                 timeout=timeout,
             )
@@ -731,6 +741,9 @@ def graph_get_from_mutator_for_secret_expiry(
         except (AADSTSError, OSError):
             return None
         try:
+            # Use stdout alone when the runner preserves separate streams. The
+            # production mutator captures both in stdout, so suppress CLI warnings
+            # above; keep strict JSON parsing if any noise still reaches the body.
             body = (result.stdout or "").encode("utf-8")
         except UnicodeEncodeError:
             return _unreadable_graph_expiry_payload()
