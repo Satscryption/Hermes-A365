@@ -410,6 +410,66 @@ class TestSensitiveRun:
         assert device_line not in out
 
 
+class TestSensitiveAdminConsent:
+    _NOTICE = (
+        "a365 is waiting for admin consent (a browser may open). Complete consent, "
+        "or run `hermes a365 consent <agent-name>` from another shell "
+        "(or `hermes a365 consent --print-url-only` to print the consent URL only); "
+        "details are in the a365 setup log.\n"
+    )
+
+    def test_notice_shows_required_consent_argument(self) -> None:
+        from hermes_a365.mutator import _ADMIN_CONSENT_WAIT_NOTICE
+
+        assert _ADMIN_CONSENT_WAIT_NOTICE == self._NOTICE
+        assert "`hermes a365 consent <agent-name>`" in _ADMIN_CONSENT_WAIT_NOTICE
+        assert "`hermes a365 consent --print-url-only`" in _ADMIN_CONSENT_WAIT_NOTICE
+
+    @pytest.mark.parametrize("stream", ["stdout", "stderr"])
+    @pytest.mark.parametrize("ending", ["\n", ""])
+    def test_sensitive_consent_wait_emits_fixed_notice_once(
+        self, capfd: pytest.CaptureFixture[str], stream: str, ending: str
+    ) -> None:
+        line = (
+            "Opening browser for admin consent... https://example.invalid/SECRET-URL "
+            "tenant=PRIVATE-TENANT secret=FAKE-SECRET trailing-private-text"
+        )
+        # Repeat across both streams, including an EOF tail, and run twice to
+        # verify the notice flag belongs to each child invocation.
+        script = (
+            "import sys\n"
+            f"sys.{stream}.write({(line + chr(10) + line + ending)!r})\n"
+            f"sys.{'stderr' if stream == 'stdout' else 'stdout'}.write({(line + ending)!r})\n"
+        )
+        m = A365CliMutator()
+        m.available = True
+        for _ in range(2):
+            result = m.run([sys.executable, "-c", script], sensitive=True)
+            out, err = capfd.readouterr()
+            assert out == self._NOTICE
+            assert err == ""
+            assert result.stdout.count(line) == 3
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "Checking consent status for an existing application",
+            "secret=FAKE-SECRET https://example.invalid/private",
+            "prefix Opening browser for admin consent...",
+            "Opening browser for admin consented application",
+        ],
+    )
+    def test_sensitive_nonmatching_consent_lines_stay_suppressed(
+        self, capfd: pytest.CaptureFixture[str], line: str
+    ) -> None:
+        script = f"import sys; print({line!r}); print({line!r}, file=sys.stderr)"
+        m = A365CliMutator()
+        m.available = True
+        result = m.run([sys.executable, "-c", script], sensitive=True)
+        assert capfd.readouterr() == ("", "")
+        assert result.stdout.count(line) == 2
+
+
 class TestAdversarialSensitiveSubprocess:
     """Subprocess regressions for sensitive echo and timeout handling."""
 
