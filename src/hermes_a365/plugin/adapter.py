@@ -2530,7 +2530,10 @@ class Agent365Adapter(BasePlatformAdapter):
             try:
                 token = bridge._extract_bearer_token(authorization)
             except bridge.JwtValidationError as exc:
-                logger.warning("inbound 401 reason=invalid-bearer-token")
+                logger.warning(
+                    "inbound 401 reason=%s",
+                    "missing-bearer-token" if not authorization else "invalid-bearer-token",
+                )
                 detail = "missing bearer token" if not authorization else "invalid bearer token"
                 raise HTTPException(status_code=401, detail=detail) from exc
 

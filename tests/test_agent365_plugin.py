@@ -1310,6 +1310,42 @@ class TestAdapterConstruction:
 
 
 class TestMessagesRoute:
+    async def test_missing_empty_and_malformed_authorization_log_distinct_401_reasons(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from httpx import ASGITransport, AsyncClient
+
+        a = _make_adapter(monkeypatch)
+        transport = ASGITransport(app=a.build_app())
+        body = _make_inbound(service_url="https://smba.trafficmanager.net/amer/")
+        for headers, reason, detail, other_reason in (
+            ({}, "missing-bearer-token", "missing bearer token", "invalid-bearer-token"),
+            (
+                {"Authorization": ""},
+                "missing-bearer-token",
+                "missing bearer token",
+                "invalid-bearer-token",
+            ),
+            (
+                {"Authorization": "Basic malformed"},
+                "invalid-bearer-token",
+                "invalid bearer token",
+                "missing-bearer-token",
+            ),
+        ):
+            caplog.clear()
+            async with AsyncClient(transport=transport, base_url="http://test") as client:
+                with caplog.at_level(logging.WARNING):
+                    response = await client.post("/api/messages", json=body, headers=headers)
+            assert response.status_code == 401
+            assert response.json()["detail"] == detail
+            assert any(
+                record.levelno == logging.WARNING
+                and f"inbound 401 reason={reason}" in record.getMessage()
+                for record in caplog.records
+            )
+            assert f"reason={other_reason}" not in caplog.text
+
     def test_untrusted_service_url_returns_403(self, monkeypatch: pytest.MonkeyPatch) -> None:
         from fastapi.testclient import TestClient
 

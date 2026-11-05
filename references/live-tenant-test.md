@@ -553,7 +553,7 @@ documented). Six probes, in order:
    `login.microsoftonline.com` + `graph.microsoft.com`.
 
 `--json` verify output lists those six probe names only; `otlp_endpoint`
-was removed in v0.9.6.1 (#189).
+was removed in v0.9.6 (#189).
 
 Exit codes match doctor: 0 = all ok, 1 = at least one warn, 2 = at
 least one error. Run as a CI gate before deploying the bridge daemon
