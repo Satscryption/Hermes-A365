@@ -7854,7 +7854,10 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             if stream_id:
                 return None
-            reason = str(record.get("plain_reason") or "unknown")
+            reason = str(
+                record.get("plain_reason")
+                or ("rotated" if buf.get("keepalive_rotated") else "unknown")
+            )
             log = logger.info if reason in {"age_budget", "rotated"} else logger.warning
             log(
                 "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",

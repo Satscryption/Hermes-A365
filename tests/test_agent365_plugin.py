@@ -12899,6 +12899,55 @@ class TestEditMessage:
         assert "reason=rotated" in logs[0].message
         await a._drop_turn_buffer(chat)
 
+    @pytest.mark.parametrize(
+        ("rotated", "plain_reason", "expected_reason", "expected_level"),
+        [
+            (True, None, "rotated", logging.INFO),
+            (True, "", "rotated", logging.INFO),
+            (True, "age_budget", "age_budget", logging.INFO),
+            (True, "retry_exhausted", "retry_exhausted", logging.WARNING),
+            (False, None, "unknown", logging.WARNING),
+        ],
+    )
+    def test_answer_pre_post_plain_fallback_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        rotated: bool,
+        plain_reason: str | None,
+        expected_reason: str,
+        expected_level: int,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-rotated-other-turn-reason"
+        turn = {"seq": 1, "activity_id": "act-1"}
+        keepalive_turn = {"seq": 2, "activity_id": "act-2"}
+        buf = {
+            "turns": [turn, keepalive_turn],
+            "keepalive": {"stream_id": "", "closed_by": "keepalive"},
+            "keepalive_rotated": rotated,
+        }
+        # Rotation marks only the keepalive turn's delivery record.
+        keepalive_record = a._delivery_record(buf, keepalive_turn)
+        keepalive_record["plain_due"] = True
+        keepalive_record["plain_reason"] = "rotated"
+        record = a._delivery_record(buf, turn)
+        if plain_reason is None:
+            record.pop("plain_reason")
+        else:
+            record["plain_reason"] = plain_reason
+        if plain_reason or not rotated:
+            record["plain_due"] = True
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
+
+        assert route == ("fallback", expected_reason)
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == expected_level
+        assert f"reason={expected_reason}" in logs[0].message
+
     @pytest.mark.asyncio
     async def test_issue247_failed_rotation_close_stays_plain_no_answer_stream_final(
         self, monkeypatch: pytest.MonkeyPatch
