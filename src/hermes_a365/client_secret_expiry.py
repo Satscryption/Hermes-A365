@@ -194,6 +194,8 @@ def _az_rest_graph_get(url: str) -> dict[str, Any] | None:
                 url,
                 "--headers",
                 "ConsistencyLevel=eventual",
+                "--output",
+                "json",
             ],
             capture_output=True,
             text=False,

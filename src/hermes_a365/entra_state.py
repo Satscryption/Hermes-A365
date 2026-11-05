@@ -703,7 +703,7 @@ def graph_get_from_mutator_for_secret_expiry(
         assert_client_secret_expiry_read_url(url)
         try:
             result = mutator.run(
-                ["az", "rest", "--method", "GET", "--uri", url],
+                ["az", "rest", "--method", "GET", "--uri", url, "--output", "json"],
                 sensitive=True,
                 timeout=timeout,
             )

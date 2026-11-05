@@ -39,7 +39,7 @@ from hermes_a365.entra_state import (
     graph_get_from_mutator_for_secret_expiry,
     redact,
 )
-from hermes_a365.mutator import A365CliMutator, RunResult
+from hermes_a365.mutator import A365CliMutator, CliInvocationError, RunResult
 from hermes_a365.status import _UnavailableQuerySource, collect_status
 from hermes_a365.status import overall_to_exit_code as status_exit
 
@@ -229,11 +229,64 @@ class TestCheckApp:
         assert data["check"] == "no_active_yet"
 
 
+class TestAdapterArgv:
+    def test_mutator_requests_json(self) -> None:
+        mut = A365CliMutator()
+        url = application_client_secret_expiry_url(_BLUEPRINT)
+        argv = ["az", "rest", "--method", "GET", "--uri", url, "--output", "json"]
+        result = RunResult(argv=argv, returncode=0, stdout='{"passwordCredentials":[]}', stderr="")
+        with patch.object(mut, "run", return_value=result) as run:
+            getter = graph_get_from_mutator_for_secret_expiry(mut)
+            assert getter(url) == {"passwordCredentials": []}
+        run.assert_called_once_with(argv, sensitive=True, timeout=15.0)
+
+    def test_fallback_requests_json(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.setattr("shutil.which", lambda _name: "/usr/bin/az")
+        url = application_client_secret_expiry_url(_BLUEPRINT)
+        argv = [
+            "az",
+            "rest",
+            "--method",
+            "GET",
+            "--url",
+            url,
+            "--headers",
+            "ConsistencyLevel=eventual",
+            "--output",
+            "json",
+        ]
+        result = subprocess.CompletedProcess(
+            argv, 0, stdout=b'{"passwordCredentials":[]}', stderr=b""
+        )
+        with patch.object(subprocess, "run", return_value=result) as run:
+            assert graph_get_from_az_rest()(url) == {"passwordCredentials": []}
+        run.assert_called_once_with(
+            argv, capture_output=True, text=False, timeout=15.0, check=False
+        )
+
+
 class TestGraphErrors:
-    @pytest.fixture(params=["mutator", "az_stdout", "az_stderr", "az_stderr_prefix"])
+    @pytest.fixture(
+        params=["mutator", "mutator_graph_error", "az_stdout", "az_stderr", "az_stderr_prefix"]
+    )
     def error_getter(self, request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch):
         def build(code: str):
             body = json.dumps({"error": {"code": code, "message": _GRAPH_MSG}})
+            if request.param == "mutator_graph_error":
+                mut = A365CliMutator()
+
+                def fake_run(argv, *, sensitive, timeout):
+                    assert sensitive is True
+                    raise CliInvocationError(
+                        argv,
+                        1,
+                        "<output suppressed>",
+                        sensitive=True,
+                        graph_error=(code, "Graph request failed"),
+                    )
+
+                monkeypatch.setattr(mut, "run", fake_run)
+                return graph_get_from_mutator_for_secret_expiry(mut)
             if request.param == "mutator":
                 mut = A365CliMutator()
                 monkeypatch.setattr(mut, "available", True)
@@ -294,10 +347,31 @@ class TestGraphErrors:
         )
         comp = next(c for c in report.components if c.name == "client_secret_expiry")
         assert comp.state == "error"
+        assert comp.data["apps"]["blueprint_client_secret"]["check"] == "missing_app"
         assert "blueprint Entra application not found" in comp.detail
         assert status_exit(report.overall) == 2
         _assert_no_leaks(comp.detail)
         _assert_no_leaks(json.dumps(comp.data))
+
+    def test_missing_app_makes_doctor_fail(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error_getter
+    ) -> None:
+        home = _seed_home(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with _minimal_doctor_patches():
+            report = run_all_probes(
+                no_network=False,
+                graph_get=error_getter("Request_ResourceNotFound"),
+                secret_expiry_now=lambda: _NOW,
+                bot_service_sidecar_path=tmp_path / "missing-sidecar.json",
+            )
+        probe = next(p for p in report.probes if p.name == "blueprint_client_secret")
+        assert probe.state == "error"
+        assert probe.data["check"] == "missing_app"
+        assert "blueprint Entra application not found" in probe.detail
+        assert overall_to_exit_code(report.overall) == 2
+        _assert_no_leaks(probe.detail)
+        _assert_no_leaks(json.dumps(probe.data))
 
 
 class TestStrictJson:
