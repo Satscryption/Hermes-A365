@@ -18,6 +18,7 @@ from hermes_a365.client_secret_expiry import (
     classify_client_secret_expiry,
     gather_client_secret_expiry_checks,
     graph_get_from_az_rest,
+    resolve_bf_app_id,
     select_latest_active_credential_end,
     status_component_detail,
     status_component_state,
@@ -536,6 +537,51 @@ class TestAgentEnvLookup:
     _PARENT = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
     _AGENT = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 
+    @pytest.mark.parametrize(
+        ("agent_name", "agent_value", "process_value", "operator_value", "expected"),
+        [
+            ("Agent.One", "agent", "process", None, "agent"),
+            ("Agent.One", "agent", None, None, "agent"),
+            ("Agent.One", "agent", "process", "operator", "agent"),
+            ("Agent.One", None, "process", None, "process"),
+            ("Agent.One", None, None, None, "home"),
+            ("Agent.One", "", None, None, "home"),
+            ("Agent.One", "   ", None, "operator", "operator"),
+            ("Agent.One", "", "process", "operator", "process"),
+            (None, "agent", "process", "operator", "process"),
+            (None, "agent", None, "operator", "operator"),
+            (None, "agent", None, None, "home"),
+        ],
+    )
+    def test_bf_app_id_precedence(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        agent_name: str | None,
+        agent_value: str | None,
+        process_value: str | None,
+        operator_value: str | None,
+        expected: str,
+    ) -> None:
+        home = tmp_path / "hermes"
+        agent = home / "agents" / "Agent.One"
+        agent.mkdir(parents=True)
+        (home / ".env").write_text("A365_BF_APP_ID=home\n")
+        (agent / ".env").write_text(
+            "" if agent_value is None else f'A365_BF_APP_ID="{agent_value}"\n'
+        )
+        monkeypatch.delenv("A365_BF_APP_ID", raising=False)
+        if process_value is not None:
+            monkeypatch.setenv("A365_BF_APP_ID", process_value)
+        operator_env = None if operator_value is None else {"A365_BF_APP_ID": operator_value}
+
+        assert resolve_bf_app_id(
+            hermes_home=home,
+            agent_name=agent_name,
+            sidecar_path=tmp_path / "missing-sidecar.json",
+            operator_env=operator_env,
+        ) == (expected, False)
+
     def test_agent_one_uses_agent_env_not_gateway(self, tmp_path: Path) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
@@ -768,6 +814,58 @@ class TestDoctorStatusIntegration:
             "hermes_a365.client_secret_expiry.build_graph_get",
             lambda *_a, **_k: None,
         )
+
+    @pytest.mark.parametrize("command", ["doctor", "status"])
+    def test_agent_bf_secret_expiry_uses_agent_app(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str
+    ) -> None:
+        home = _seed_home(tmp_path)
+        gateway_bf = "22222222-2222-2222-2222-222222222222"
+        agent_bf = "33333333-3333-3333-3333-333333333333"
+        (home / ".env").write_text(f"A365_APP_ID={_BLUEPRINT}\nA365_BF_APP_ID={gateway_bf}\n")
+        agent = home / "agents" / "Agent.One"
+        agent.mkdir(parents=True)
+        (agent / ".env").write_text(f"A365_BF_APP_ID={agent_bf}\n")
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.setenv("A365_BF_APP_ID", gateway_bf)
+        seen: list[str] = []
+
+        def router(url: str) -> dict[str, Any]:
+            seen.append(url)
+            days = 5 if agent_bf in url else 400
+            return {
+                "passwordCredentials": [
+                    _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=days)),
+                ],
+            }
+
+        if command == "doctor":
+            with _minimal_doctor_patches():
+                report = run_all_probes(
+                    agent_name="Agent.One",
+                    graph_get=router,
+                    secret_expiry_now=lambda: _NOW,
+                    bot_service_sidecar_path=tmp_path / "missing.json",
+                )
+            bf_state = next(p.state for p in report.probes if p.name == "bf_client_secret")
+        else:
+            status = collect_status(
+                "Agent.One",
+                hermes_home=home,
+                query_source=_UnavailableQuerySource(),
+                graph_get=router,
+                secret_expiry_now=lambda: _NOW,
+                bot_service_sidecar_path=tmp_path / "missing.json",
+            )
+            component = next(c for c in status.components if c.name == "client_secret_expiry")
+            assert component.state == "warn"
+            bf_state = component.data["apps"]["bf_client_secret"]["state"]
+
+        assert bf_state == "warn"
+        assert seen == [
+            application_client_secret_expiry_url(_BLUEPRINT),
+            application_client_secret_expiry_url(agent_bf),
+        ]
 
     def test_doctor_ok_healthy_secret(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch

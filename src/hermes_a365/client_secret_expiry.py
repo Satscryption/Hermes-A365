@@ -425,10 +425,13 @@ def resolve_bf_app_id(
     agent_name: str | None = None,
     operator_env: dict[str, str] | None = None,
 ) -> tuple[str, bool]:
-    """Return ``(app_id, sidecar_unreadable)``."""
-    env = dict(operator_env or _read_env_file(hermes_home / ".env"))
+    """Return ``(app_id, sidecar_unreadable)``, preferring the selected agent."""
     if agent_name:
-        env = {**env, **_read_agent_env(hermes_home, agent_name)}
+        agent_env = _read_agent_env(hermes_home, agent_name)
+        bf = (agent_env.get("A365_BF_APP_ID") or "").strip()
+        if bf:
+            return bf, False
+    env = dict(operator_env or _read_env_file(hermes_home / ".env"))
     bf = (os.environ.get("A365_BF_APP_ID") or "").strip() or (
         env.get("A365_BF_APP_ID") or ""
     ).strip()
