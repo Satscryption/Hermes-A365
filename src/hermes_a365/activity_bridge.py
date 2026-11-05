@@ -2324,11 +2324,11 @@ class _IdempotencyCache:
         key = self._key(delivery_id)
         while self.seen:
             oldest = next(iter(self.seen))
-            if cur - self.seen[oldest].inserted_at < self.ttl_seconds:
+            if cur < self.seen[oldest].inserted_at + self.ttl_seconds:
                 break
             self._remove(oldest)
         record = self.seen.get(key)
-        if record is not None and cur - record.inserted_at >= self.ttl_seconds:
+        if record is not None and cur >= record.inserted_at + self.ttl_seconds:
             self._remove(key)
             record = None
         if record is not None:
@@ -2429,12 +2429,19 @@ class _IdempotencyCache:
         for key, older in self.seen.items():
             if self.result_bytes + size <= REPLY_PAYLOAD_TOTAL_MAX_BYTES:
                 break
-            if older.result is not None:
+            if older.result is not None and older.reply != "inflight":
                 self._release_result(older)
                 older.hold_reason = "reply_unconfirmed"
                 if older.reply == "ready":
                     older.reply = "held"
                 self._log("delivery_payload_shed", key, older, "byte_cap", warning=True)
+        if self.result_bytes + size > REPLY_PAYLOAD_TOTAL_MAX_BYTES:
+            # In-flight replies need their bodies if the send is definitely not accepted.
+            # Leave this result unavailable, as for an oversized payload.
+            self._log(
+                "delivery_payload_shed", self._key(delivery_id), record, "byte_cap", warning=True
+            )
+            return
         record.result = stored
         record.result_bytes = size
         self.result_bytes += size

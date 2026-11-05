@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 from collections.abc import Callable
 from contextlib import AsyncExitStack
 from dataclasses import asdict
@@ -306,6 +307,81 @@ async def test_pending_payload_evicts_with_record(delivery):
     response_is(await pressure.post(id="0"), 200, "duplicate")
     assert pressure.webhook_calls == 5
     assert len(pressure.posts) == 5
+
+
+@pytest.mark.parametrize("newer_first", [False, True])
+def test_payload_expires_at_exact_deadline(newer_first):
+    cache = bridge._IdempotencyCache(ttl_seconds=0.1, max_entries=2 if newer_first else 1)
+    inserted_at = 1e6 + 0.1
+    expires = inserted_at + cache.ttl_seconds
+    # Subtracting large monotonic timestamps rounds below the TTL at expiry.
+    assert expires - inserted_at < cache.ttl_seconds
+    if newer_first:
+        # A newer first entry stops the sweep; the key lookup must expire too.
+        assert cache.claim("newer", now=expires) == "new"
+    assert cache.claim("key", now=inserted_at) == "new"
+    record = cache.record("key")
+    assert cache.enter_webhook("key", record)
+    cache.store_result("key", record, {"text": "retained"})
+    assert cache.result_bytes > 0
+    assert cache.claim("key", now=math.nextafter(expires, -math.inf)) == "done"
+
+    probe = "key" if newer_first else "ttl-probe"
+    assert cache.claim(probe, now=expires) == "new"
+    assert cache.record(probe) is not record
+    assert record.result is None
+    assert record.result_bytes == cache.result_bytes == 0
+    if not newer_first:
+        assert cache.record("key") is None
+
+
+@pytest.mark.parametrize("eligible_body", [False, True])
+async def test_payload_pressure_preserves_inflight_retry(delivery, monkeypatch, eligible_body):
+    d = delivery(replies=[httpx.ConnectError("failure"), 200])
+    size = len(json.dumps(d.webhook).encode("utf-8"))
+    cap = size * (2 if eligible_body else 1)
+    monkeypatch.setattr(bridge, "REPLY_PAYLOAD_TOTAL_MAX_BYTES", cap)
+    d.block_at = "reply"
+    first = asyncio.create_task(d.post())
+
+    def store(key):
+        assert d.cache.claim(key) == "new"
+        record = d.cache.record(key)
+        assert d.cache.enter_webhook(key, record)
+        d.cache.store_result(key, record, d.webhook)
+        return record
+
+    try:
+        await d.entered.wait()
+        inflight = d.cache.record(d.key)
+        assert inflight.reply == "inflight"
+        eligible = store("eligible") if eligible_body else None
+        newest = store("newest")
+        assert inflight.result == d.webhook
+        assert inflight.result_bytes == size
+        assert inflight.reply == "inflight"
+        if eligible_body:
+            assert eligible.result is None
+            assert eligible.reply == "held"
+            assert newest.result == d.webhook
+        else:
+            # All retained bodies are in flight, so shed the new payload.
+            assert newest.result is None
+            assert newest.result_bytes == 0
+            assert newest.reply == "ready"
+        assert d.cache.result_bytes <= cap
+        assert d.cache.result_bytes == sum(r.result_bytes for r in d.cache.seen.values())
+    finally:
+        d.resume.set()
+        await first
+
+    response_is(first.result(), 502, "reply_failed")
+    assert inflight.result == d.webhook
+    assert inflight.reply == "ready"
+    response_is(await d.post(), 200, "replied")
+    assert d.webhook_calls == 1
+    assert len(d.posts) == 2
+    assert json.loads(d.posts[0].content) == json.loads(d.posts[1].content)
 
 
 async def test_attempt_cap_stops(delivery):
