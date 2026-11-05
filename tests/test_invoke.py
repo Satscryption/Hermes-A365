@@ -108,9 +108,7 @@ def test_build_invoke_context_falls_back_to_activity_fields() -> None:
 
 
 def test_build_invoke_context_non_dict_value_becomes_empty() -> None:
-    ctx = invoke.build_invoke_context(
-        _invoke_activity(value="not-a-dict"), claims={}, path_tag="B"
-    )
+    ctx = invoke.build_invoke_context(_invoke_activity(value="not-a-dict"), claims={}, path_tag="B")
     assert ctx.value == {}
 
 

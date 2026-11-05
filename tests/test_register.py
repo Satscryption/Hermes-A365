@@ -16,7 +16,7 @@ import pytest
 
 from hermes_a365._common import write_owner_only_text_atomic
 from hermes_a365.a365_config import CONFIG_FILENAME
-from hermes_a365.entra_state import RegistrationDecision
+from hermes_a365.entra_state import RegistrationDecision, record_ownership_anchor
 from hermes_a365.mutator import (
     AADSTS_CONSENT_REQUIRED,
     AADSTS_LICENSE_NOT_PROPAGATED,
@@ -331,6 +331,124 @@ class TestSkippedBlueprintSecret:
         assert "done. Next:" not in output.out
         assert all(call[:3] == ["az", "account", "show"] for call in matching_blueprint.calls)
         assert not (tmp_path / CONFIG_FILENAME).exists()
+
+    @pytest.mark.parametrize("uppercase", [False, True])
+    def test_matching_anchor_missing_secret_still_refuses_apply(
+        self, matching_blueprint, capsys, tmp_path, uppercase
+    ):
+        app_id = "bbbb2222-0000-0000-0000-000000000002"
+        record_ownership_anchor(Path(os.environ["HERMES_HOME"]), "Inbox Helper", app_id)
+        path = _write_generated(
+            tmp_path,
+            {
+                "agentBlueprintId": app_id.upper() if uppercase else app_id,
+                "agentBlueprintClientSecret": None,
+            },
+        )
+        original = path.read_bytes()
+
+        assert run(self._args("--apply")) == 2
+        output = capsys.readouterr()
+        assert "no usable agentBlueprintClientSecret" in output.out
+        assert "ERROR: blueprint client secret is missing" in output.err
+        assert "different blueprint" not in output.out
+        assert path.read_bytes() == original
+        assert all(call[:3] == ["az", "account", "show"] for call in matching_blueprint.calls)
+        assert not (tmp_path / CONFIG_FILENAME).exists()
+
+    def test_no_anchor_missing_secret_still_refuses_apply(
+        self, matching_blueprint, capsys, tmp_path
+    ):
+        assert not (Path(os.environ["HERMES_HOME"]) / "agents").exists()
+        path = tmp_path / "a365.generated.config.json"
+        original = path.read_bytes()
+
+        assert run(self._args("--apply")) == 2
+        output = capsys.readouterr()
+        assert "no usable agentBlueprintClientSecret" in output.out
+        assert "ERROR: blueprint client secret is missing" in output.err
+        assert "different blueprint" not in output.out
+        assert path.read_bytes() == original
+        assert all(call[:3] == ["az", "account", "show"] for call in matching_blueprint.calls)
+        assert not (tmp_path / CONFIG_FILENAME).exists()
+
+    @pytest.mark.parametrize("flags", [(), ("--apply",), ("--apply", "--auto-recover-secret")])
+    @pytest.mark.parametrize("step_names", [(), ("permissions-bot",)])
+    def test_mismatching_anchor_skips_secret_gate(
+        self, matching_blueprint, capsys, tmp_path, monkeypatch, flags, step_names
+    ):
+        anchor_path = record_ownership_anchor(
+            Path(os.environ["HERMES_HOME"]),
+            "Inbox Helper",
+            "bbbb2222-0000-0000-0000-000000000002",
+        )
+        # An unrelated credential in the anchor file must never reach output.
+        with anchor_path.open("a") as env_file:
+            env_file.write("BOT_PASSWORD=SENTINEL-ANCHOR-SECRET\n")
+        anchor_original = anchor_path.read_bytes()
+        path = tmp_path / "a365.generated.config.json"
+        _write_generated(
+            tmp_path,
+            {
+                "agentBlueprintId": "cccc3333-0000-0000-0000-000000000003",
+                "agentBlueprintClientSecret": None,
+                "otherSecret": "SENTINEL-CONFIG-SECRET",
+            },
+        )
+        original = path.read_bytes()
+        monkeypatch.setattr(
+            "hermes_a365.register.resolve_registration",
+            lambda *args, **kwargs: RegistrationDecision(
+                action="repair" if step_names else "noop",
+                step_names=step_names,
+                reason=None,
+                messages=("entra: blueprint matches; setup blueprint will not run",),
+            ),
+        )
+
+        def unexpected_secret_gate(*args, **kwargs):
+            pytest.fail("a different blueprint must skip the secret gate entirely")
+
+        def unexpected_recovery(*args, **kwargs):
+            pytest.fail("a different blueprint must not trigger secret recovery")
+
+        monkeypatch.setattr(
+            "hermes_a365.register._skipped_blueprint_secret_missing", unexpected_secret_gate
+        )
+        monkeypatch.setattr("hermes_a365.register.auto_recover_secret", unexpected_recovery)
+
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        warning = (
+            "[warn] The generated config refers to a different blueprint than "
+            "this agent's, so the blueprint secret check was skipped."
+        )
+        assert output.out.count(warning) == 1
+        assert "no usable agentBlueprintClientSecret" not in output.out + output.err
+        assert output.err == ""
+        assert "SENTINEL-ANCHOR-SECRET" not in output.out + output.err
+        assert "SENTINEL-CONFIG-SECRET" not in output.out + output.err
+        assert path.read_bytes() == original
+        assert anchor_path.read_bytes() == anchor_original
+        calls = matching_blueprint.calls
+        assert not any("reset" in call for call in calls)
+        assert all(call[:3] == ["az", "account", "show"] or call[0] == "a365" for call in calls)
+        assert [call for call in calls if call[0] == "a365"] == (
+            [
+                [
+                    "a365",
+                    "setup",
+                    "permissions",
+                    "bot",
+                    "--agent-name",
+                    "Inbox Helper",
+                    "--tenant-id",
+                    _TEST_TENANT,
+                ]
+            ]
+            if "--apply" in flags and step_names
+            else []
+        )
 
     @pytest.mark.parametrize("flags", [(), ("--apply",)])
     def test_present_secret_preserves_output_and_is_never_printed(
