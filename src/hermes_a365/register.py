@@ -985,7 +985,17 @@ def run(args: argparse.Namespace) -> int:
     if not any(step.name == "blueprint" for step in plan.steps):
         generated_path = Path(GENERATED_CONFIG_FILENAME)
         is_missing, bp_id = detect_missing_secret(generated_path)
-        if (
+        anchor_app_id = (
+            load_anchor_app_id(home, inputs.agent_name)
+            if is_missing and bp_id and home is not None
+            else ""
+        )
+        if anchor_app_id and bp_id and anchor_app_id.casefold() != bp_id.casefold():
+            sys.stdout.write(
+                "\n[warn] The generated config refers to a different blueprint than "
+                "this agent's, so the blueprint secret check was skipped.\n"
+            )
+        elif (
             is_missing
             and bp_id
             and _skipped_blueprint_secret_missing(hermes_home, inputs.tenant_id or "", bp_id)
