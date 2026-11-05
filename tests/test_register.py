@@ -47,7 +47,7 @@ from hermes_a365.register import (
 from hermes_a365.register import (
     apply_register_plan as _apply_register_plan,
 )
-from hermes_a365.secrets_provider import set_default_provider
+from hermes_a365.secrets_provider import KeychainSecretsProvider, set_default_provider
 
 _TEST_TENANT = "aaaa1111-0000-0000-0000-000000000001"
 # Keep apply() off the real ~/.hermes so a developer anchor cannot change
@@ -331,6 +331,33 @@ class TestSkippedBlueprintSecret:
         assert "done. Next:" not in output.out
         assert all(call[:3] == ["az", "account", "show"] for call in matching_blueprint.calls)
         assert not (tmp_path / CONFIG_FILENAME).exists()
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    @pytest.mark.parametrize("flags", [(), ("--apply",), ("--apply", "--auto-recover-secret")])
+    def test_unsupported_default_backend_keeps_secret_gate(
+        self, matching_blueprint, capsys, monkeypatch, tmp_path, platform, flags
+    ):
+        monkeypatch.setattr("hermes_a365.keychain.sys.platform", platform)
+        monkeypatch.setattr("hermes_a365.keychain.shutil.which", lambda binary: None)
+        set_default_provider(KeychainSecretsProvider())
+        recovering = "--auto-recover-secret" in flags
+        if recovering:
+            matching_blueprint.scripted.append(
+                RunResult(
+                    argv=[], returncode=0, stdout='{"password": "RECOVERED-SECRET"}', stderr=""
+                )
+            )
+
+        assert run(self._args(*flags)) == (2 if flags == ("--apply",) else 0)
+        output = capsys.readouterr()
+        assert "no usable agentBlueprintClientSecret" in output.out
+        assert "Restore provider access" not in output.out
+        assert "RECOVERED-SECRET" not in output.out + output.err
+        assert any("reset" in call for call in matching_blueprint.calls) is recovering
+        secret = json.loads((tmp_path / "a365.generated.config.json").read_text())[
+            "agentBlueprintClientSecret"
+        ]
+        assert secret == ("RECOVERED-SECRET" if recovering else None)
 
     @pytest.mark.parametrize("uppercase", [False, True])
     def test_matching_anchor_missing_secret_still_refuses_apply(
@@ -801,6 +828,40 @@ class TestPostBlueprintSecretSources:
         output = capsys.readouterr()
         expected = report_missing_secret_warning("bp-app-id", Path("a365.generated.config.json"))
         assert expected in output.out
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    @pytest.mark.parametrize("recovering", [False, True])
+    def test_unsupported_default_backend_keeps_notice_and_recovery(
+        self, blueprint_run, capsys, monkeypatch, tmp_path, platform, recovering
+    ):
+        monkeypatch.setattr("hermes_a365.keychain.sys.platform", platform)
+        monkeypatch.setattr("hermes_a365.keychain.shutil.which", lambda binary: None)
+        set_default_provider(KeychainSecretsProvider())
+        if recovering:
+            blueprint_run.scripted.append(
+                RunResult(
+                    argv=[], returncode=0, stdout='{"password": "RECOVERED-SECRET"}', stderr=""
+                )
+            )
+
+        assert run(self._args(*(["--auto-recover-secret"] if recovering else []))) == 0
+        output = capsys.readouterr()
+        assert "Restore provider access" not in output.out
+        assert "RECOVERED-SECRET" not in output.out + output.err
+        if not recovering:
+            expected = report_missing_secret_warning(
+                "bp-app-id", Path("a365.generated.config.json")
+            )
+            assert expected in output.out
+        resets = [i for i, call in enumerate(blueprint_run.calls) if "reset" in call]
+        assert len(resets) == int(recovering)
+        if recovering:
+            assert blueprint_run.sensitive_flags[resets[0]] is True
+        path = tmp_path / "a365.generated.config.json"
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
+            "RECOVERED-SECRET" if recovering else None
+        )
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 class TestPlanRender:
