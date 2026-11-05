@@ -8,6 +8,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Sidecar read errors during bot-service create now identify the create step.
+
+### Changed
+
 - **``register`` re-run with a generated config for a different agent.** When
   a re-run skips ``a365 setup blueprint``, the blueprint secret check now runs
   only if the generated config's blueprint ID matches this agent's recorded
