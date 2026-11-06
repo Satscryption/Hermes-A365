@@ -145,6 +145,35 @@ class TestC1ConversationsStrictUtf8:
 
 
 class TestC2CreateRefusesExistingSidecar:
+    def test_existing_sidecar_read_error_names_create(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        sidecar = tmp_path / "a365.bot-service.config.json"
+        sidecar.write_bytes(_sidecar_v1_bytes())
+        inputs = BotServiceCreateInputs(
+            agent_name="agent",
+            resource_group="rg",
+            endpoint="https://example.test/api/messages",
+            sidecar_path=sidecar,
+        )
+        plan = build_create_plan(inputs, operator_env={})
+        runner = FakeRunner(group_exists=False)
+        original_read_bytes = Path.read_bytes
+
+        def fail_sidecar_read(path: Path) -> bytes:
+            if path == sidecar:
+                raise OSError("read failed")
+            return original_read_bytes(path)
+
+        monkeypatch.setattr(Path, "read_bytes", fail_sidecar_read)
+        with pytest.raises(BotServiceError) as exc:
+            apply_create_plan(plan, runner=runner, operator_env={})
+        assert (
+            str(exc.value)
+            == f"could not read existing sidecar {sidecar} during create: read failed"
+        )
+        assert runner.calls == []
+
     def test_valid_v1_sidecar_bytes_unchanged_no_azure(self, tmp_path: Path) -> None:
         sidecar = tmp_path / "a365.bot-service.config.json"
         original = _sidecar_v1_bytes()

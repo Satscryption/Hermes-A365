@@ -14,6 +14,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   env) and the secrets provider first, as the skipped-blueprint path already
   does. A configured secret skips the missing-secret notice and recovery; an
   unreachable provider prints a notice and skips recovery.
+- Retain bridge delivery state across inbound retries so a definitely unsent reply
+  can be retried without calling the operator webhook again. Ambiguous and terminal
+  reply outcomes stop further sends; cached replies have payload and attempt limits.
+- Sidecar read errors during bot-service create now identify the create step.
+
+### Changed
 
 - **``register`` re-run with a generated config for a different agent.** When
   a re-run skips ``a365 setup blueprint``, the blueprint secret check now runs

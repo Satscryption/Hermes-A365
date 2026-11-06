@@ -3715,8 +3715,13 @@ class TestServeApp:
         assert "?" not in after
         assert "#" not in after
 
-    @pytest.mark.parametrize("reply_status", [401, 500])
-    def test_message_reply_post_failure_does_not_report_replied(self, reply_status: int) -> None:
+    @pytest.mark.parametrize(
+        ("reply_status", "expected_code", "expected_status"),
+        [(401, 502, "reply_failed"), (500, 200, "reply_unconfirmed")],
+    )
+    def test_message_reply_post_failure_does_not_report_replied(
+        self, reply_status: int, expected_code: int, expected_status: str
+    ) -> None:
         cfg = _cfg()
         cfg.skip_jwt_validation = True
         body = "microsoft rejected the reply"
@@ -3730,9 +3735,9 @@ class TestServeApp:
         ) as client:
             r = client.post("/api/messages", json=_inbound_message_activity())
 
-        assert r.status_code == 502
+        assert r.status_code == expected_code
         payload = r.json()
-        assert payload == {"status": "reply_failed"}
+        assert payload == {"status": expected_status}
         assert f"HTTP {reply_status}" not in r.text
         assert body not in r.text
         assert len(capture["reply"]) == 1
@@ -3751,8 +3756,8 @@ class TestServeApp:
         ) as client:
             r = client.post("/api/messages", json=_inbound_message_activity())
 
-        assert r.status_code == 502
-        assert r.json() == {"status": "reply_failed"}
+        assert r.status_code == 200
+        assert r.json() == {"status": "reply_unconfirmed"}
         assert "x" not in r.text
 
     def test_message_with_card_response(self) -> None:
@@ -3987,11 +3992,27 @@ class TestIdempotencyCache:
         cache = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
         assert cache.is_duplicate("a", now=100.0) is False
         assert cache.is_duplicate("b", now=101.0) is False
+        # The plugin only calls is_duplicate and forget; successful dispatch
+        # has no completion callback. It must still admit new keys at capacity.
+        assert cache.is_duplicate("a", now=101.5) is True
         assert cache.is_duplicate("c", now=102.0) is False
         assert len(cache.seen) == 2
+        cache.forget("c")
+        assert cache.is_duplicate("c", now=102.5) is False
+        assert cache.is_duplicate("b", now=102.6) is True
         # The oldest entry was evicted, so it is admitted as new.
         assert cache.is_duplicate("a", now=103.0) is False
         assert len(cache.seen) == 2
+
+    def test_retained_activity_type_is_bounded(self) -> None:
+        cache = _IdempotencyCache()
+        activity_type = "caller-controlled-" + "\U0001f600" * 40_000
+        assert cache.claim("large", now=100.0, activity_type=activity_type) == "new"
+        record = cache.record("large")
+        assert record is not None
+        assert record.activity_type == activity_type[:64]
+        assert cache.claim("message", now=100.0, activity_type="message") == "new"
+        assert cache.record("message").activity_type == "message"
 
     def test_is_duplicate_mutates_in_place_without_rebuilding(self) -> None:
         # #105 review: the check runs on the inbound request coroutine in both
