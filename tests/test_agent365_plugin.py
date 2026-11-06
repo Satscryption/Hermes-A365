@@ -9631,6 +9631,249 @@ class TestEditMessage:
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
     @pytest.mark.asyncio
+    async def test_copilot_member_added_during_min_stream_age_wait_applies_to_current_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-marker-during-wait@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("bearer-test", "B"))
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_short_turn_max_duration_sec = 3.0
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = buf["turns"][0]
+        assert not turn.get("copilot_post_member_added")
+        opened = clock["t"] - 0.05
+        buf["keepalive"] = {
+            "stream_id": "ka-marker-during-wait",
+            "sequence": 1,
+            "opened_mono": opened,
+        }
+        marker_recorded = False
+
+        async def sleep_with_marker(delay: float) -> None:
+            nonlocal marker_recorded
+            if delay > 0 and not marker_recorded:
+                assert delay == pytest.approx(2.95)
+                assert post_mock.await_count == 0
+                clock["t"] += 1.0
+                a._note_copilot_member_added_pending(
+                    chat,
+                    {
+                        "type": "conversationUpdate",
+                        "conversation": inbound["conversation"],
+                        "membersAdded": [{"id": "agent-1"}],
+                    },
+                    "B",
+                )
+                assert a._copilot_member_added_pending[chat] > turn["started_mono"]
+                marker_recorded = True
+                clock["t"] += delay - 1.0
+            else:
+                clock["t"] += delay
+
+        sleep_mock.side_effect = sleep_with_marker
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+
+        waits = [float(call.args[0]) for call in sleep_mock.await_args_list if call.args[0] > 0]
+        assert marker_recorded
+        assert waits == pytest.approx([2.95, 7.0])
+        assert clock["t"] - opened == pytest.approx(10.0)
+        assert chat not in a._copilot_member_added_pending
+        assert post_mock.await_count == 1
+        final = post_mock.await_args.kwargs["json"]
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][0]["streamId"] == "ka-marker-during-wait"
+
+    @pytest.mark.parametrize("second_turn_state", ["new", "already_open"])
+    @pytest.mark.parametrize("marker_timing", ["pending", "during_wait"])
+    @pytest.mark.asyncio
+    async def test_copilot_member_added_age_wait_keeps_turn_ownership(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        second_turn_state: str,
+        marker_timing: str,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-turn-age-ownership@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_first_turn_min_stream_age_before_final_sec = 10.0
+        a._copilot_short_turn_max_duration_sec = 3.0
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        event1 = _StubMessageEvent(
+            text="first",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event1)
+        buf = a._turn_buffers[chat]
+        turn1 = buf["turns"][0]
+        second_inbound = copy.deepcopy(inbound)
+        second_inbound["id"] = "act-2"
+        second_inbound["from"]["id"] = "user-2"
+        if second_turn_state == "already_open":
+            a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-2")
+            assert not buf["turns"][-1].get("copilot_post_member_added")
+        clock["t"] += 0.1
+
+        def note_marker() -> None:
+            a._note_copilot_member_added_pending(
+                chat,
+                {
+                    "type": "conversationUpdate",
+                    "conversation": inbound["conversation"],
+                    "membersAdded": [{"id": "agent-1"}],
+                },
+                "B",
+            )
+
+        if marker_timing == "pending":
+            note_marker()
+        opened = clock["t"] - 0.05
+        buf["keepalive"] = {
+            "stream_id": "ka-turn-age-ownership",
+            "sequence": 1,
+            "opened_mono": opened,
+        }
+        lock = a._turn_buffer_lock(buf)
+        second_final_started = False
+
+        async def sleep_with_second_turn(delay: float) -> None:
+            nonlocal second_final_started
+            if delay <= 0:
+                return
+            assert not lock.locked()
+            if second_final_started:
+                clock["t"] += delay
+                return
+            second_final_started = True
+            wake_at = clock["t"] + delay
+            clock["t"] += 1.0
+            if marker_timing == "during_wait":
+                note_marker()
+            pending = a._copilot_member_added_pending[chat]
+            if second_turn_state == "new":
+                a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-2")
+            turn2 = buf["turns"][-1]
+            assert turn2 is not turn1
+            assert not turn2.get("copilot_post_member_added")
+            async with lock:
+                await a._ensure_copilot_min_stream_age_before_final_locked(chat, buf, turn2)
+                assert not turn2.get("copilot_post_member_added")
+                assert "copilot_member_added_consumed_mono" not in turn2
+                a._release_copilot_member_added_for_turn(chat, turn2)
+            assert a._copilot_member_added_pending[chat] == pending
+            clock["t"] = max(clock["t"], wake_at)
+
+        sleep_mock.side_effect = sleep_with_second_turn
+        async with lock:
+            await a._ensure_copilot_min_stream_age_before_final_locked(chat, buf, turn1)
+        waits = [float(call.args[0]) for call in sleep_mock.await_args_list if call.args[0] > 0]
+        assert second_final_started
+        expected_waits = [9.95, 1.95] if marker_timing == "pending" else [2.95, 1.95, 7.0]
+        assert waits == pytest.approx(expected_waits)
+        assert clock["t"] - opened == pytest.approx(10.0)
+        assert turn1.get("copilot_post_member_added") is True
+        assert turn1["copilot_member_added_consumed_mono"] == a._copilot_member_added_pending[chat]
+        a._release_copilot_member_added_for_turn(chat, turn1)
+        assert chat not in a._copilot_member_added_pending
+        a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-3")
+        assert not buf["turns"][-1].get("copilot_post_member_added")
+
+    @pytest.mark.asyncio
+    async def test_copilot_member_added_receipt_visible_while_lifecycle_persistence_awaits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-marker-at-receipt@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        lifecycle = {
+            **inbound,
+            "id": "members-added-1",
+            "type": "conversationUpdate",
+            "membersAdded": [{"id": "agent-1"}],
+        }
+        lifecycle.pop("text")
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _token: bridge.BF_ISSUER)
+        monkeypatch.setattr(
+            bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"iss": bridge.BF_ISSUER})
+        )
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        _sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        a._http_client = MagicMock()
+        persist_started = asyncio.Event()
+        release_persist = asyncio.Event()
+        persist_calls = 0
+
+        async def blocked_lifecycle_persist(reservation: Any = None) -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                persist_started.set()
+                await release_persist.wait()
+            adapter_mod._complete_persist_mutation(reservation[0], reservation[1])
+
+        monkeypatch.setattr(a, "_persist_conversations", blocked_lifecycle_persist)
+        monkeypatch.setattr(a, "handle_message", a.on_processing_start)
+        transport = httpx.ASGITransport(app=a.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            lifecycle_request = asyncio.create_task(
+                client.post(
+                    "/api/messages",
+                    json=lifecycle,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+            )
+            try:
+                await persist_started.wait()
+                received = clock["t"]
+                clock["t"] += 0.1
+                response = await client.post(
+                    "/api/messages",
+                    json=inbound,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+                assert response.status_code == 200
+                assert response.json()["status"] == "dispatched"
+                assert not lifecycle_request.done()
+                turn = a._turn_buffers[chat]["turns"][0]
+                assert turn["validated_path"] == "B"
+                assert turn.get("copilot_post_member_added") is True
+                assert turn["copilot_member_added_consumed_mono"] == received
+                assert a._copilot_member_added_pending[chat] == received
+            finally:
+                release_persist.set()
+                lifecycle_response = await lifecycle_request
+
+        assert lifecycle_response.status_code == 200
+        assert lifecycle_response.json() == {"status": "acked", "lifecycle": "upsert"}
+        assert persist_calls == 2
+        assert a._copilot_member_added_pending[chat] == received
+
+    @pytest.mark.asyncio
     async def test_copilot_first_turn_after_member_added_waits_min_stream_age(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -12400,6 +12643,7 @@ class TestEditMessage:
         assert turn is not None
         record = a._delivery_record(buf, turn)
         record["plain_due"] = True
+        record["plain_reason"] = "rotated"
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         pre_gap_keepalive = {
             "stream_id": "gap-stream",
@@ -12429,7 +12673,7 @@ class TestEditMessage:
             record,
             chunk_segment_ids=[],
         )
-        assert route == ("fallback", "keepalive stream rotated")
+        assert route == ("fallback", "rotated")
         assert finals == 0
         assert pre_gap_keepalive["stream_id"] == "gap-stream"
         assert buf["keepalive"] is not pre_gap_keepalive
@@ -12901,6 +13145,313 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert all(t != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in finals) or finals == []
         assert send_reply_mock.await_count == 1
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue247_age_budget_plain_fallback_logs_info_reason(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-age-budget-reason"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+        buf["keepalive"] = {
+            "stream_id": "age-budget-stream",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (max_age + 1),
+        }
+
+        async def retire_during_gap(_chat_id: str, live_buf: dict[str, Any]) -> None:
+            live_buf["keepalive"] = {"stream_id": "", "closed_by": "keepalive"}
+
+        monkeypatch.setattr(a, "_sleep_turn_buffer_stream_gap_locked", retire_during_gap)
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "age_budget")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=age_budget" in logs[0].message
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue247_rotated_plain_fallback_logs_info_reason(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-rotated-reason"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        record["plain_due"] = True
+        record["plain_reason"] = "rotated"
+        buf["keepalive_rotated"] = True
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "rotated")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=rotated" in logs[0].message
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.parametrize(
+        ("rotated", "plain_reason", "expected_reason", "expected_level"),
+        [
+            (True, None, "rotated", logging.INFO),
+            (True, "", "rotated", logging.INFO),
+            (True, "age_budget", "age_budget", logging.INFO),
+            (True, "retry_exhausted", "retry_exhausted", logging.WARNING),
+            (False, None, "unknown", logging.WARNING),
+        ],
+    )
+    def test_answer_pre_post_plain_fallback_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        rotated: bool,
+        plain_reason: str | None,
+        expected_reason: str,
+        expected_level: int,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-rotated-other-turn-reason"
+        turn = {"seq": 1, "activity_id": "act-1"}
+        keepalive_turn = {"seq": 2, "activity_id": "act-2"}
+        buf = {
+            "turns": [turn, keepalive_turn],
+            "keepalive": {"stream_id": "", "closed_by": "keepalive"},
+            "keepalive_rotated": rotated,
+        }
+        # Rotation marks only the keepalive turn's delivery record.
+        keepalive_record = a._delivery_record(buf, keepalive_turn)
+        keepalive_record["plain_due"] = True
+        keepalive_record["plain_reason"] = "rotated"
+        record = a._delivery_record(buf, turn)
+        if plain_reason is None:
+            record.pop("plain_reason")
+        else:
+            record["plain_reason"] = plain_reason
+        if plain_reason or not rotated:
+            record["plain_due"] = True
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
+
+        assert route == ("fallback", expected_reason)
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == expected_level
+        assert f"reason={expected_reason}" in logs[0].message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id",
+        [
+            pytest.param("close_success", id="close_success"),
+            pytest.param("past_cap", id="past_cap"),
+            pytest.param("close_rejected", id="close_rejected"),
+            pytest.param("informative_expired_403", id="informative_expired_403"),
+        ],
+    )
+    async def test_rotation_preserves_retry_exhausted_plain_fallback_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        case_id: str,
+    ) -> None:
+        """Rotation helpers keep retry_exhausted on the delivery record (#291)."""
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-291-rotation-reason-{case_id}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = body["entities"][0]
+            if case_id == "close_rejected" and entity.get("streamType") == "final" and entity.get(
+                "streamId"
+            ):
+                return self._http_result(400)
+            if (
+                case_id == "informative_expired_403"
+                and entity.get("streamType") == "informative"
+                and entity.get("streamId")
+            ):
+                return MagicMock(
+                    status_code=403,
+                    text="Content stream finished due to exceeded streaming time",
+                    json=lambda: {
+                        "error": {
+                            "message": (
+                                "Content stream finished due to exceeded streaming time"
+                            )
+                        }
+                    },
+                )
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record_before = a._delivery_record(buf, turn)
+        record_before["plain_due"] = True
+        record_before["plain_reason"] = "retry_exhausted"
+        record_before["force_plain"] = True
+        record_before["state"] = "FORCED_PLAIN"
+        record_before["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+        record_before["plain_attempts"] = 0
+        record_before["force_plain_exhausted"] = False
+
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+
+        if case_id == "past_cap":
+            opened_mono = time.monotonic() - (cap + 1.0)
+        else:
+            opened_mono = time.monotonic() - (rotate_at + 0.01)
+
+        buf["keepalive"] = {
+            "stream_id": f"ka-{case_id}",
+            "sequence": 3,
+            "opened_mono": opened_mono,
+        }
+
+        snap = {
+            "deferral_count": record_before["deferral_count"],
+            "force_plain": record_before["force_plain"],
+            "state": record_before["state"],
+            "plain_attempts": record_before["plain_attempts"],
+            "force_plain_exhausted": record_before["force_plain_exhausted"],
+        }
+        posts_before = len(posts)
+
+        async with a._turn_buffer_lock(buf):
+            if case_id in {"close_success", "past_cap", "close_rejected"}:
+                result = await a._post_keepalive_rotation_final_locked(chat, buf)
+                assert result is True
+            else:
+                progress = "💻 progress for informative"
+                result = await a._post_informative_locked(
+                    chat,
+                    buf,
+                    allow_restart=True,
+                    turn_for_text=turn,
+                    text_override=progress,
+                )
+                assert result is False
+
+        record_after = a._delivery_record(buf, turn)
+        assert record_after is record_before
+        assert record_after.get("plain_reason") == "retry_exhausted"
+        assert record_after.get("plain_due") is True
+        assert buf.get("keepalive_rotated") is True
+        assert buf.get("skip_stream_open") is True
+        assert not str(buf["keepalive"].get("stream_id") or "")
+
+        assert record_after.get("deferral_count") == snap["deferral_count"]
+        assert record_after.get("force_plain") == snap["force_plain"]
+        assert record_after.get("state") == snap["state"]
+        assert record_after.get("plain_attempts") == snap["plain_attempts"]
+        assert record_after.get("force_plain_exhausted") == snap["force_plain_exhausted"]
+        assert buf.get("retry_task") is None
+
+        finals = [
+            p
+            for p in posts[posts_before:]
+            if p.get("type") == "message"
+            and p.get("entities")
+            and p["entities"][0].get("streamType") == "final"
+        ]
+        informative_with_id = [
+            p
+            for p in posts[posts_before:]
+            if p.get("entities")
+            and p["entities"][0].get("streamType") == "informative"
+            and p["entities"][0].get("streamId")
+        ]
+
+        if case_id == "close_success":
+            assert finals
+            assert informative_with_id == []
+        elif case_id == "past_cap":
+            assert finals == []
+            assert informative_with_id == []
+        elif case_id == "close_rejected":
+            assert len(finals) == 1
+            assert informative_with_id == []
+        else:
+            assert len(informative_with_id) == 1
+            assert informative_with_id[0]["text"] == "💻 progress for informative"
+            assert finals == []
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(
+                chat, buf, turn, record_after, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "retry_exhausted")
+        fb_logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(fb_logs) == 1
+        assert fb_logs[0].levelno == logging.WARNING
+        assert fb_logs[0].message == (
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
+            "reason=retry_exhausted"
+        )
+
         await a._drop_turn_buffer(chat)
 
     @pytest.mark.asyncio

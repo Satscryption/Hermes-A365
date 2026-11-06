@@ -202,6 +202,31 @@ def test_unavailable_backend_degrades_to_miss() -> None:
     assert resolve_secret(TENANT, BF_APP, existing="env", provider=provider) == "env"
 
 
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_unsupported_default_backend_is_an_absent_source(monkeypatch, platform) -> None:
+    monkeypatch.setattr("hermes_a365.keychain.sys.platform", platform)
+    monkeypatch.setattr("hermes_a365.keychain.shutil.which", lambda binary: None)
+
+    state = resolve_secret_state(
+        TENANT, BF_APP, existing="", provider=KeychainSecretsProvider()
+    )
+
+    assert state.value == ""
+    assert state.reachable is True
+
+
+def test_default_backend_lookup_failure_remains_unreachable(monkeypatch) -> None:
+    backend = FakeBackend(raise_on_get=KeychainError("locked"))
+    monkeypatch.setattr("hermes_a365.keychain.get_backend", lambda: backend)
+
+    state = resolve_secret_state(
+        TENANT, BF_APP, existing="", provider=KeychainSecretsProvider()
+    )
+
+    assert state.value == ""
+    assert state.reachable is False
+
+
 def test_provider_that_raises_does_not_break_the_read(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

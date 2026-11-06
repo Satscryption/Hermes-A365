@@ -2062,6 +2062,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._turn_buffers: dict[str, dict[str, Any]] = {}
         # #217 — first user turn after membersAdded / install on Copilot Chat.
         self._copilot_member_added_pending: dict[str, float] = {}
+        self._copilot_member_added_claims: dict[str, dict[str, Any]] = {}
         self._copilot_min_stream_age_before_final_sec = _copilot_stream_timing_sec(
             "HERMES_A365_COPILOT_MIN_STREAM_AGE_BEFORE_FINAL_SEC",
         )
@@ -2853,6 +2854,11 @@ class Agent365Adapter(BasePlatformAdapter):
                         return JSONResponse({"status": "acked", "reason": "lifecycle_changed"})
                     ref = ConversationRef.from_activity(activity)
                 if ref is not None:
+                    self._note_copilot_member_added_pending(
+                        lifecycle_conv_id,
+                        activity,
+                        validated_path,
+                    )
                     # L4 (#100, #106 review follow-up): stamp the JWT-validated
                     # path on lifecycle-captured refs too, so a later proactive
                     # mint off this ref binds to the validated path rather than
@@ -2884,11 +2890,6 @@ class Agent365Adapter(BasePlatformAdapter):
                             _complete_persist_mutation(reservation[0], reservation[1])
                             raise
                         await self._persist_conversations(reservation)
-                    self._note_copilot_member_added_pending(
-                        lifecycle_conv_id,
-                        activity,
-                        validated_path,
-                    )
                 logger.info(
                     "inbound lifecycle type=%s action=%s conv=%s",
                     str(activity.get("type") or ""),
@@ -3876,6 +3877,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._cancel_segment_informative_task(buf)
             await self._cancel_keepalive_and_close(str(chat_id), buf)
         self._turn_buffers.clear()
+        self._copilot_member_added_claims.clear()
         for orphan_chat in list(self._orphan_keepalive):
             state = self._orphan_keepalive.get(orphan_chat) or {}
             inbound = state.get("inbound")
@@ -3933,6 +3935,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if informative_tasks:
             await asyncio.gather(*informative_tasks, return_exceptions=True)
         self._turn_buffers.clear()
+        self._copilot_member_added_claims.clear()
         self._orphan_keepalive.clear()
         for stream_key in list(self._streams):
             message_id = stream_key[1]
@@ -6189,6 +6192,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if isinstance(inbound, dict):
                     teardown_inbound = inbound
         buf = self._turn_buffers.pop(chat_id, None)
+        self._copilot_member_added_claims.pop(chat_id, None)
         if buf is not None:
             self._cancel_keepalive_prompt_task(buf)
             self._cancel_segment_informative_task(buf)
@@ -6472,6 +6476,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
                 record["force_plain_exhausted"] = True
                 record["plain_due"] = False
+                record["plain_reason"] = ""
                 return
             if not record.get("force_plain"):
                 logger.warning(
@@ -6486,6 +6491,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if not buf.get("segments"):
                 return
             record["plain_due"] = True
+            record["plain_reason"] = "retry_exhausted"
             buf["retry_turn_key"] = turn_key
             buf["retry_task"] = asyncio.create_task(self._deferred_turn_buffer_retry(chat_id))
             return
@@ -7341,6 +7347,8 @@ class Agent365Adapter(BasePlatformAdapter):
             buf["keepalive_rotated"] = True
             buf["skip_stream_open"] = True
             record["plain_due"] = True
+            if record.get("plain_reason") != "retry_exhausted":
+                record["plain_reason"] = "rotated"
             self._cancel_turn_buffer_keepalive(buf)
             return True
 
@@ -7371,6 +7379,8 @@ class Agent365Adapter(BasePlatformAdapter):
         buf["keepalive_rotated"] = True
         buf["skip_stream_open"] = True
         record["plain_due"] = True
+        if record.get("plain_reason") != "retry_exhausted":
+            record["plain_reason"] = "rotated"
         self._cancel_turn_buffer_keepalive(buf)
         return True
 
@@ -7714,6 +7724,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 buf["skip_stream_open"] = True
                 record = self._delivery_record(buf, turn)
                 record["plain_due"] = True
+                if record.get("plain_reason") != "retry_exhausted":
+                    record["plain_reason"] = "rotated"
                 self._cancel_turn_buffer_keepalive(buf)
                 return False
             logger.warning(
@@ -8375,6 +8387,7 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         record["state"] = "DONE"
         record["plain_due"] = False
+        record["plain_reason"] = ""
         record["answer_final_settled"] = True
         if not stream.get("closed_by"):
             stream["closed_by"] = f"turn:{record['turn_key']}"
@@ -8460,12 +8473,17 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             if stream_id:
                 return None
-            logger.warning(
-                "agent365 turn buffer answer plain fallback: chat_id=%s "
-                "reason=keepalive stream rotated",
-                chat_id,
+            reason = str(
+                record.get("plain_reason")
+                or ("rotated" if buf.get("keepalive_rotated") else "unknown")
             )
-            return ("fallback", "keepalive stream rotated")
+            log = logger.info if reason in {"age_budget", "rotated"} else logger.warning
+            log(
+                "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
+                chat_id,
+                reason,
+            )
+            return ("fallback", reason)
         if record.get("plain_due"):
             if record.get("may_have_landed"):
                 return self._answer_uncertain_for_turn(
@@ -8586,6 +8604,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             plain = True
             record["plain_due"] = True
+            record["plain_reason"] = "age_budget"
         if not plain:
             return None
         if stream_id:
@@ -8595,12 +8614,12 @@ class Agent365Adapter(BasePlatformAdapter):
             stream = self._keepalive_stream(buf)
             stream_id = str(stream.get("stream_id") or "")
             if not stream_id:
-                reason = (
-                    "keepalive stream rotated"
-                    if buf.get("keepalive_rotated") or record.get("plain_due")
-                    else "stream age past budget"
+                reason = str(
+                    record.get("plain_reason")
+                    or ("rotated" if buf.get("keepalive_rotated") else "unknown")
                 )
-                logger.warning(
+                log = logger.info if reason in {"age_budget", "rotated"} else logger.warning
+                log(
                     "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
                     chat_id,
                     reason,
@@ -8624,16 +8643,16 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     if not closed:
                         record["plain_due"] = True
+                        record["plain_reason"] = "rotated"
                         return ("retry", None)
             else:
                 stream["stream_id"] = ""
                 buf["keepalive"] = stream
-        reason = (
-            "keepalive stream rotated"
-            if buf.get("keepalive_rotated") or record.get("plain_due")
-            else "stream age past budget"
+        reason = str(
+            record.get("plain_reason") or ("rotated" if buf.get("keepalive_rotated") else "unknown")
         )
-        logger.warning(
+        log = logger.info if reason in {"age_budget", "rotated"} else logger.warning
+        log(
             "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
             chat_id,
             reason,
@@ -9076,6 +9095,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return
         if time.monotonic() - float(noted) > _COPILOT_MEMBER_ADDED_PENDING_TTL_SEC:
             self._copilot_member_added_pending.pop(str(chat_id), None)
+            self._copilot_member_added_claims.pop(str(chat_id), None)
 
     def _apply_copilot_member_added_to_turn(self, chat_id: str, turn: dict[str, Any]) -> None:
         self._expire_stale_copilot_member_added_pending(chat_id)
@@ -9088,6 +9108,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._remember_copilot_post_member_added(chat_id, turn)
 
     def _remember_copilot_post_member_added(self, chat_id: str, turn: dict[str, Any]) -> None:
+        owner = self._copilot_member_added_claims.setdefault(str(chat_id), turn)
+        if owner is not turn:
+            return
         turn["copilot_post_member_added"] = True
         pending = self._copilot_member_added_pending.get(str(chat_id))
         if pending is not None:
@@ -9098,6 +9121,10 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> None:
         if not isinstance(turn, dict):
             return
+        owner = self._copilot_member_added_claims.get(str(chat_id))
+        if owner is not None and owner is not turn:
+            return
+        self._copilot_member_added_claims.pop(str(chat_id), None)
         had_flag = bool(turn.get("copilot_post_member_added"))
         consumed = turn.pop("copilot_member_added_consumed_mono", None)
         turn.pop("copilot_post_member_added", None)
@@ -9179,6 +9206,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if min_age <= 0:
             turn["copilot_member_added_decided"] = True
             return
+        recheck_member_added = not turn.get("copilot_post_member_added")
         while self._turn_buffers.get(chat_id) is buf:
             stream = self._keepalive_stream(buf)
             if not str(stream.get("stream_id") or ""):
@@ -9188,9 +9216,22 @@ class Agent365Adapter(BasePlatformAdapter):
             if age >= min_age:
                 turn["copilot_member_added_decided"] = True
                 return
+            # Keep a marker received during this age wait scoped to this turn.
+            self._copilot_member_added_claims.setdefault(str(chat_id), turn)
             await self._sleep_turn_buffer_locked(chat_id, buf, min_age - age)
             if self._turn_buffers.get(chat_id) is not buf:
                 return
+            if recheck_member_added:
+                # A lifecycle marker may arrive while the ordinary age wait
+                # releases the lock. Apply it to this final once, using the
+                # same accepted opener to measure the remaining first-turn age.
+                recheck_member_added = False
+                self._copilot_needs_min_stream_age_before_final(chat_id, turn)
+                if turn.get("copilot_post_member_added"):
+                    min_age = self._copilot_first_turn_min_stream_age_before_final_sec
+                    if not math.isfinite(min_age) or min_age < 0:
+                        min_age = _COPILOT_FIRST_TURN_STREAM_TIMING_DEFAULT_SEC
+                    min_age = min(min_age, _COPILOT_STREAM_TIMING_MAX_SEC)
         turn["copilot_member_added_decided"] = True
 
     def _clear_copilot_post_member_added(self, chat_id: str, turn: dict[str, Any]) -> None:
@@ -9797,6 +9838,7 @@ class Agent365Adapter(BasePlatformAdapter):
                                 record = self._delivery_record(buf, turn)
                                 record["state"] = "DONE"
                                 record["plain_due"] = False
+                                record["plain_reason"] = ""
                                 record["answer_final_settled"] = True
                                 buf.pop("keepalive_rotated", None)
                                 self._remove_turn_segments(
@@ -9830,6 +9872,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         record = self._delivery_record(buf, turn)
                         record["state"] = "DONE"
                         record["plain_due"] = False
+                        record["plain_reason"] = ""
                         record["answer_final_settled"] = True
                         buf.pop("keepalive_rotated", None)
                         self._remove_turn_segments(
@@ -9868,6 +9911,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         record = self._delivery_record(buf, turn)
                         record["state"] = "DONE"
                         record["plain_due"] = False
+                        record["plain_reason"] = ""
                         record["answer_final_settled"] = True
                         buf.pop("keepalive_rotated", None)
                         self._remove_turn_segments(
@@ -15382,6 +15426,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._drop_coalesced_turn_target(turn_key)
         self._coalesced_turn_target_count_by_chat.pop(chat_id, None)
         self._copilot_member_added_pending.pop(str(chat_id), None)
+        self._copilot_member_added_claims.pop(str(chat_id), None)
         await self._drop_turn_buffer(chat_id)
         for key in list(self._recently_finalized):
             if key[0] == chat_id:

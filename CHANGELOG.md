@@ -21,11 +21,24 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 - Bind interactive approval cards and replies to the turn that created them.
 - Retain turn origins across callbacks and reconnects, and release completed turn records.
+- **#291 — Plain-fallback log reason.** The plain fallback log now names its reason (`age_budget`, `rotated`, `retry_exhausted`); expected age-budget and rotation fallbacks log at info instead of warning.
 - Client secret expiry Graph responses enforce a JSON nesting depth limit of 64 before decoding.
 
 ### Fixed
 
+- **``register`` secret check after ``a365 setup blueprint`` (#289).** When
+  the generated config has no blueprint secret after the blueprint step,
+  ``register`` now checks ``A365_BLUEPRINT_CLIENT_SECRET`` (process and profile
+  env) and the secrets provider first, as the skipped-blueprint path already
+  does. A configured secret skips the missing-secret notice and recovery; an
+  unreachable provider prints a notice and skips recovery.
 - Test suite: made a subprocess overflow test independent of runner speed.
+- Keep late first-turn timing scoped to its own turn during the minimum-age wait.
+- **Copilot first-turn timing when the add notice arrives late (refs #290).** The
+  first-turn marker is now recorded when the conversation-add activity is
+  received, before it is persisted, and a marker that arrives during the final
+  minimum-age wait now applies to the current turn instead of carrying over to
+  the next one. Activity payloads are unchanged.
 - Retain bridge delivery state across inbound retries so a definitely unsent reply
   can be retried without calling the operator webhook again. Ambiguous and terminal
   reply outcomes stop further sends; cached replies have payload and attempt limits.
