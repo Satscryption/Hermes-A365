@@ -6734,7 +6734,8 @@ class Agent365Adapter(BasePlatformAdapter):
             buf["keepalive_rotated"] = True
             buf["skip_stream_open"] = True
             record["plain_due"] = True
-            record["plain_reason"] = "rotated"
+            if record.get("plain_reason") != "retry_exhausted":
+                record["plain_reason"] = "rotated"
             self._cancel_turn_buffer_keepalive(buf)
             return True
 
@@ -6765,7 +6766,8 @@ class Agent365Adapter(BasePlatformAdapter):
         buf["keepalive_rotated"] = True
         buf["skip_stream_open"] = True
         record["plain_due"] = True
-        record["plain_reason"] = "rotated"
+        if record.get("plain_reason") != "retry_exhausted":
+            record["plain_reason"] = "rotated"
         self._cancel_turn_buffer_keepalive(buf)
         return True
 
@@ -7109,7 +7111,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 buf["skip_stream_open"] = True
                 record = self._delivery_record(buf, turn)
                 record["plain_due"] = True
-                record["plain_reason"] = "rotated"
+                if record.get("plain_reason") != "retry_exhausted":
+                    record["plain_reason"] = "rotated"
                 self._cancel_turn_buffer_keepalive(buf)
                 return False
             logger.warning(

@@ -12988,6 +12988,182 @@ class TestEditMessage:
         assert f"reason={expected_reason}" in logs[0].message
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id",
+        [
+            pytest.param("close_success", id="close_success"),
+            pytest.param("past_cap", id="past_cap"),
+            pytest.param("close_rejected", id="close_rejected"),
+            pytest.param("informative_expired_403", id="informative_expired_403"),
+        ],
+    )
+    async def test_rotation_preserves_retry_exhausted_plain_fallback_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        case_id: str,
+    ) -> None:
+        """Rotation helpers keep retry_exhausted on the delivery record (#291)."""
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-291-rotation-reason-{case_id}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = body["entities"][0]
+            if case_id == "close_rejected" and entity.get("streamType") == "final" and entity.get(
+                "streamId"
+            ):
+                return self._http_result(400)
+            if (
+                case_id == "informative_expired_403"
+                and entity.get("streamType") == "informative"
+                and entity.get("streamId")
+            ):
+                return MagicMock(
+                    status_code=403,
+                    text="Content stream finished due to exceeded streaming time",
+                    json=lambda: {
+                        "error": {
+                            "message": (
+                                "Content stream finished due to exceeded streaming time"
+                            )
+                        }
+                    },
+                )
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record_before = a._delivery_record(buf, turn)
+        record_before["plain_due"] = True
+        record_before["plain_reason"] = "retry_exhausted"
+        record_before["force_plain"] = True
+        record_before["state"] = "FORCED_PLAIN"
+        record_before["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+        record_before["plain_attempts"] = 0
+        record_before["force_plain_exhausted"] = False
+
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+
+        if case_id == "past_cap":
+            opened_mono = time.monotonic() - (cap + 1.0)
+        else:
+            opened_mono = time.monotonic() - (rotate_at + 0.01)
+
+        buf["keepalive"] = {
+            "stream_id": f"ka-{case_id}",
+            "sequence": 3,
+            "opened_mono": opened_mono,
+        }
+
+        snap = {
+            "deferral_count": record_before["deferral_count"],
+            "force_plain": record_before["force_plain"],
+            "state": record_before["state"],
+            "plain_attempts": record_before["plain_attempts"],
+            "force_plain_exhausted": record_before["force_plain_exhausted"],
+        }
+        posts_before = len(posts)
+
+        async with a._turn_buffer_lock(buf):
+            if case_id in {"close_success", "past_cap", "close_rejected"}:
+                result = await a._post_keepalive_rotation_final_locked(chat, buf)
+                assert result is True
+            else:
+                progress = "💻 progress for informative"
+                result = await a._post_informative_locked(
+                    chat,
+                    buf,
+                    allow_restart=True,
+                    turn_for_text=turn,
+                    text_override=progress,
+                )
+                assert result is False
+
+        record_after = a._delivery_record(buf, turn)
+        assert record_after is record_before
+        assert record_after.get("plain_reason") == "retry_exhausted"
+        assert record_after.get("plain_due") is True
+        assert buf.get("keepalive_rotated") is True
+        assert buf.get("skip_stream_open") is True
+        assert not str(buf["keepalive"].get("stream_id") or "")
+
+        assert record_after.get("deferral_count") == snap["deferral_count"]
+        assert record_after.get("force_plain") == snap["force_plain"]
+        assert record_after.get("state") == snap["state"]
+        assert record_after.get("plain_attempts") == snap["plain_attempts"]
+        assert record_after.get("force_plain_exhausted") == snap["force_plain_exhausted"]
+        assert buf.get("retry_task") is None
+
+        finals = [
+            p
+            for p in posts[posts_before:]
+            if p.get("type") == "message"
+            and p.get("entities")
+            and p["entities"][0].get("streamType") == "final"
+        ]
+        informative_with_id = [
+            p
+            for p in posts[posts_before:]
+            if p.get("entities")
+            and p["entities"][0].get("streamType") == "informative"
+            and p["entities"][0].get("streamId")
+        ]
+
+        if case_id == "close_success":
+            assert finals
+            assert informative_with_id == []
+        elif case_id == "past_cap":
+            assert finals == []
+            assert informative_with_id == []
+        elif case_id == "close_rejected":
+            assert len(finals) == 1
+            assert informative_with_id == []
+        else:
+            assert len(informative_with_id) == 1
+            assert informative_with_id[0]["text"] == "💻 progress for informative"
+            assert finals == []
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(
+                chat, buf, turn, record_after, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "retry_exhausted")
+        fb_logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(fb_logs) == 1
+        assert fb_logs[0].levelno == logging.WARNING
+        assert fb_logs[0].message == (
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
+            "reason=retry_exhausted"
+        )
+
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
     async def test_issue247_failed_rotation_close_stays_plain_no_answer_stream_final(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
