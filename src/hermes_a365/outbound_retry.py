@@ -180,6 +180,10 @@ def clamp_retry_delay_sec(delay: float, remaining_budget_sec: float | None) -> f
     return min(max(0.0, delay), remaining_budget_sec)
 
 
+class OutboundBudgetExhausted(RuntimeError):
+    """The retry budget expired before any send was attempted."""
+
+
 async def request_with_outbound_retry(
     send_once: SendOnceFn,
     *,
@@ -292,4 +296,6 @@ async def request_with_outbound_retry(
             if not ok:
                 return last_response
         await sleep_fn(delay)
+    if last_response is None:
+        raise OutboundBudgetExhausted("outbound budget exhausted before send")
     return last_response
