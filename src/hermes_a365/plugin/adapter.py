@@ -8014,6 +8014,7 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         from hermes_a365.outbound_retry import (
             OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+            OutboundBudgetExhausted,
             request_with_outbound_retry,
         )
 
@@ -8042,6 +8043,8 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         except asyncio.CancelledError:
             raise
+        except OutboundBudgetExhausted:
+            resp = None
         except RuntimeError as exc:
             if str(exc) == "agent365 outbound operation cancelled":
                 raise

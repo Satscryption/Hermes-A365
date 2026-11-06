@@ -2214,26 +2214,42 @@ async def _refresh_jwks(
             )
 
 
-# Slice 19i: in-memory dedupe of inbound BF / A365 activity deliveries.
-# BF's connector retries on 5xx and slow ACK; without dedupe we forward
-# the same user message to the operator webhook multiple times. Pattern
-# adapted from NousResearch/hermes-agent#10037.
+REPLY_PAYLOAD_MAX_BYTES = 256 * 1024
+REPLY_PAYLOAD_TOTAL_MAX_BYTES = 1024 * 1024
+REPLY_ATTEMPT_CAP = 3
+
+
 @dataclass
-class _IdempotencyCache:
-    """TTL/count-bounded dedupe of ``conversationId:activityId`` pairs.
-
-    Effective retention is TTL **or** capacity, whichever is reached first, so
-    a sustained burst of unique deliveries can shorten the retry window below
-    ``ttl_seconds``. ``max_entries <= 0`` DISABLES dedupe outright (it is a cap,
-    not a "0 means unlimited" knob) — every retry then re-delivers; callers log
-    a startup WARNING for that case rather than letting it pass silently.
-    """
-
-    seen: dict[str, float] = field(default_factory=dict)
-    ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
-    max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+class _DeliveryRecord:
+    inserted_at: float
+    activity_type: str = ""
+    state: str = "received"
+    reply: str = "none"
+    hold_reason: str = ""
+    attempts: int = 0
+    result: dict[str, Any] | None = field(default=None, repr=False)
+    result_bytes: int = 0
 
     def __post_init__(self) -> None:
+        self.activity_type = self.activity_type[:64]
+
+
+@dataclass
+class _IdempotencyCache:
+    """Process-local delivery records; payloads live and expire with their key.
+
+    Capacity evicts completed tombstones and plugin-accepted keys. Serve work
+    and retryable replies apply backpressure until completion or TTL expiry.
+    ``is_duplicate`` retains the plugin's pre-dispatch ``forget`` contract.
+    """
+
+    seen: dict[str, _DeliveryRecord] = field(default_factory=dict)
+    ttl_seconds: float = DEFAULT_IDEMPOTENCY_TTL_SECONDS
+    max_entries: int = DEFAULT_IDEMPOTENCY_MAX_ENTRIES
+    result_bytes: int = field(default=0, init=False)
+
+    def __post_init__(self) -> None:
+        self.result_bytes = sum(record.result_bytes for record in self.seen.values())
         # #105 review: normalize + de-silence the operator-tunable cap here, in
         # the one place BOTH runtimes construct the cache, so neither can drift.
         # A non-integer cap can reach us from either config path (a malformed
@@ -2263,59 +2279,215 @@ class _IdempotencyCache:
                 self.max_entries,
             )
 
-    def is_duplicate(self, delivery_id: str, *, now: float | None = None) -> bool:
-        """Return True if ``delivery_id`` was seen within the TTL.
+    @staticmethod
+    def _key(delivery_id: str) -> str:
+        return hashlib.sha256(delivery_id.encode("utf-8", errors="surrogatepass")).hexdigest()
 
-        Side effect: records ``delivery_id`` as seen on first call and
-        prunes expired entries opportunistically.
+    def record(self, delivery_id: str) -> _DeliveryRecord | None:
+        return self.seen.get(self._key(delivery_id))
 
-        Runs in **amortized O(1)** (#105 review): this is called synchronously
-        from the inbound request coroutine in both runtimes, so it must not
-        scan the cache. Expiry pops from the FRONT (``dict`` preserves
-        insertion order and production stamps ``now=time.monotonic()``, so
-        insertion order is timestamp order) and each entry is popped at most
-        once; capacity eviction pops the front too, which is why no ``min()``
-        scan is needed. Correctness does not depend on the prune being
-        exhaustive — a stale entry that survives (only reachable when a caller
-        passes a non-monotonic ``now``, i.e. tests) is still rejected by the
-        per-hit TTL check below.
-        """
-        import time as _time
+    def _release_result(self, record: _DeliveryRecord) -> None:
+        self.result_bytes -= record.result_bytes
+        record.result = None
+        record.result_bytes = 0
 
-        # Monotonic time is load-bearing for the front-expiry ordering. Wall
-        # time can move backwards after an NTP/host-clock correction, leaving
-        # an expired entry behind a newer front entry; capacity eviction could
-        # then discard a live key while retaining the expired one.
-        cur = now if now is not None else _time.monotonic()
-        # Store a fixed-size digest rather than the caller-controlled raw ids.
-        # ``surrogatepass`` keeps hashing total for any string JSON may decode.
-        cache_key = hashlib.sha256(delivery_id.encode("utf-8", errors="surrogatepass")).hexdigest()
-        # Drop expired entries from the front — O(1) amortized, not a full scan.
+    def _remove(self, key: str) -> None:
+        self._release_result(self.seen.pop(key))
+
+    def _log(
+        self,
+        event: str,
+        key: str,
+        record: _DeliveryRecord,
+        reason: str = "",
+        *,
+        warning: bool = False,
+    ) -> None:
+        log = logger.warning if warning else logger.info
+        log(
+            "%s key=%s type=%s state=%s reply=%s reason=%s attempts=%d",
+            event,
+            key[:12],
+            _safe_log_field(record.activity_type),
+            record.state,
+            record.reply,
+            reason,
+            record.attempts,
+        )
+
+    def claim(
+        self, delivery_id: str, *, now: float | None = None, activity_type: str = ""
+    ) -> Literal["new", "inflight", "done", "busy"]:
+        import time
+
+        cur = time.monotonic() if now is None else now
+        key = self._key(delivery_id)
         while self.seen:
-            oldest_key = next(iter(self.seen))
-            if cur - self.seen[oldest_key] < self.ttl_seconds:
+            oldest = next(iter(self.seen))
+            if cur < self.seen[oldest].inserted_at + self.ttl_seconds:
                 break
-            del self.seen[oldest_key]
-        seen_at = self.seen.get(cache_key)
-        if seen_at is not None and cur - seen_at < self.ttl_seconds:
-            return True
-        # Absent or expired: drop any stale copy so the re-insert below lands at
-        # the END, keeping insertion order aligned with recency.
-        self.seen.pop(cache_key, None)
+            self._remove(oldest)
+        record = self.seen.get(key)
+        if record is not None and cur >= record.inserted_at + self.ttl_seconds:
+            self._remove(key)
+            record = None
+        if record is not None:
+            if record.state in {"received", "webhook_running"} or record.reply == "inflight":
+                self._log("delivery_inflight", key, record)
+                return "inflight"
+            return "done"
         if self.max_entries <= 0:
-            # Retention disabled — every delivery is treated as new. Loudly
-            # flagged at startup (see the adapter/bridge cap wiring); dedupe
-            # off means BF connector retries re-deliver.
-            return False
-        while len(self.seen) >= self.max_entries:
-            del self.seen[next(iter(self.seen))]
-        self.seen[cache_key] = cur
-        return False
+            return "new"
+        if len(self.seen) >= self.max_entries:
+            evictable = next(
+                (
+                    k
+                    for k, r in self.seen.items()
+                    if r.state in {"done", "plugin_received"} or r.reply in {"sent", "held"}
+                ),
+                None,
+            )
+            if evictable is None:
+                self._log("delivery_cache_full", key, _DeliveryRecord(cur, activity_type))
+                return "busy"
+            self._remove(evictable)
+        record = _DeliveryRecord(cur, activity_type)
+        self.seen[key] = record
+        self._log("delivery_claim", key, record)
+        return "new"
+
+    def is_duplicate(self, delivery_id: str, *, now: float | None = None) -> bool:
+        claimed = self.claim(delivery_id, now=now)
+        if claimed == "new":
+            record = self.record(delivery_id)
+            if record is not None:
+                # The plugin has no completion callback. Its accepted keys are
+                # evictable, while forget still releases pre-dispatch failures.
+                record.state = "plugin_received"
+        return claimed != "new"
+
+    def complete(self, delivery_id: str, record: _DeliveryRecord, reason: str = "done") -> None:
+        if self.record(delivery_id) is record:
+            record.state = "done"
+            record.reply = "held"
+            record.hold_reason = reason
+            self._release_result(record)
+            ambiguous = reason == "reply_unconfirmed"
+            self._log(
+                "delivery_reply_ambiguous" if ambiguous else "delivery_webhook_once",
+                self._key(delivery_id),
+                record,
+                reason,
+                warning=ambiguous,
+            )
+
+    def release_if_received(self, delivery_id: str, record: _DeliveryRecord) -> None:
+        key = self._key(delivery_id)
+        if self.seen.get(key) is record and record.state in {"received", "plugin_received"}:
+            self._remove(key)
+            self._log("delivery_released", key, record, "before_webhook", warning=True)
 
     def forget(self, delivery_id: str) -> None:
-        """Forget one delivery so a retryable transport failure can retry it."""
-        cache_key = hashlib.sha256(delivery_id.encode("utf-8", errors="surrogatepass")).hexdigest()
-        self.seen.pop(cache_key, None)
+        record = self.record(delivery_id)
+        if record is not None:
+            self.release_if_received(delivery_id, record)
+
+    def enter_webhook(self, delivery_id: str, record: _DeliveryRecord) -> bool:
+        if self.record(delivery_id) is not record or record.state != "received":
+            return False
+        record.state = "webhook_running"
+        self._log("delivery_webhook_once", self._key(delivery_id), record)
+        return True
+
+    def store_result(
+        self, delivery_id: str, record: _DeliveryRecord, result: dict[str, Any]
+    ) -> None:
+        if self.record(delivery_id) is not record or record.state != "webhook_running":
+            return
+        record.state = "webhook_done"
+        record.reply = "ready"
+        # Stop encoding as soon as the bounded payload exceeds its allowance.
+        parts: list[bytes] = []
+        size = 0
+        try:
+            for part in json.JSONEncoder(ensure_ascii=True).iterencode(result):
+                encoded = part.encode("utf-8")
+                size += len(encoded)
+                if size > REPLY_PAYLOAD_MAX_BYTES:
+                    raise ValueError("payload cap")
+                parts.append(encoded)
+            stored = json.loads(b"".join(parts))
+        except (TypeError, ValueError, OverflowError, RecursionError):
+            self._log(
+                "delivery_payload_shed",
+                self._key(delivery_id),
+                record,
+                "payload_unavailable",
+                warning=True,
+            )
+            return
+        for key, older in self.seen.items():
+            if self.result_bytes + size <= REPLY_PAYLOAD_TOTAL_MAX_BYTES:
+                break
+            if older.result is not None and older.reply != "inflight":
+                self._release_result(older)
+                older.hold_reason = "reply_unconfirmed"
+                if older.reply == "ready":
+                    older.reply = "held"
+                self._log("delivery_payload_shed", key, older, "byte_cap", warning=True)
+        if self.result_bytes + size > REPLY_PAYLOAD_TOTAL_MAX_BYTES:
+            # In-flight replies need their bodies if the send is definitely not accepted.
+            # Leave this result unavailable, as for an oversized payload.
+            self._log(
+                "delivery_payload_shed", self._key(delivery_id), record, "byte_cap", warning=True
+            )
+            return
+        record.result = stored
+        record.result_bytes = size
+        self.result_bytes += size
+        self._log("delivery_webhook_once", self._key(delivery_id), record, "result_ready")
+
+    def begin_reply(self, delivery_id: str, record: _DeliveryRecord) -> bool:
+        if self.record(delivery_id) is not record or record.reply != "ready":
+            return False
+        record.reply = "inflight"
+        record.attempts += 1
+        self._log("delivery_reply_retry", self._key(delivery_id), record, "begin")
+        return True
+
+    def finish_reply(
+        self, delivery_id: str, record: _DeliveryRecord, outcome: str, evidence: str = ""
+    ) -> str:
+        if self.record(delivery_id) is not record or record.reply != "inflight":
+            return "reply_unconfirmed"
+        if outcome == "sent":
+            record.reply = "sent"
+            status, event = "replied", "delivery_reply_retry"
+        elif outcome == "not_sent" and record.attempts < REPLY_ATTEMPT_CAP:
+            if record.result is not None:
+                record.reply = "ready"
+                self._log("delivery_reply_retry", self._key(delivery_id), record, evidence)
+                return "reply_failed"
+            record.reply = "held"
+            status, event = "reply_unconfirmed", "delivery_reply_ambiguous"
+        elif outcome == "rejected" or (
+            outcome == "not_sent" and record.attempts >= REPLY_ATTEMPT_CAP
+        ):
+            record.reply = "held"
+            status, event = "reply_rejected", "delivery_reply_rejected"
+        else:
+            record.reply = "held"
+            status, event = "reply_unconfirmed", "delivery_reply_ambiguous"
+        record.hold_reason = status if record.reply == "held" else ""
+        self._release_result(record)
+        self._log(
+            event,
+            self._key(delivery_id),
+            record,
+            evidence or status,
+            warning=record.reply == "held",
+        )
+        return status
 
 
 def _activity_delivery_id(
@@ -3618,36 +3790,75 @@ def render_error_card(message: str) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-_REPLY_ERROR_EXCERPT_CHARS = 500
-
-
 class ReplyPostError(RuntimeError):
-    """Raised when the Bot Framework reply endpoint rejects a reply POST."""
+    """Reply delivery failure, with optional HTTP status and legacy attributes."""
 
     def __init__(
         self,
+        message: str | None = None,
         *,
-        status_code: int,
-        url: str,
-        body_excerpt: str,
+        status_code: int | None = None,
+        url: str = "",
+        body_excerpt: str = "",
     ) -> None:
         self.status_code = status_code
         self.url = url
         self.body_excerpt = body_excerpt
-        detail = f"reply POST failed: HTTP {status_code} from {url}"
-        if body_excerpt:
-            detail += f"; response body: {body_excerpt}"
-        super().__init__(detail)
+        # Keep the legacy constructor contract for existing plugin callers.
+        # send_reply's typed failures never supply a URL or connector excerpt.
+        if message is None:
+            message = "reply POST failed"
+            if status_code is not None:
+                message += f": HTTP {status_code}"
+            if url:
+                message += f" from {url}"
+            if body_excerpt:
+                message += f"; response body: {body_excerpt}"
+        super().__init__(message)
 
 
-def _response_text_excerpt(response: Any) -> str:
-    try:
-        text = str(response.text)
-    except Exception:
-        text = ""
-    if len(text) > _REPLY_ERROR_EXCERPT_CHARS:
-        return text[:_REPLY_ERROR_EXCERPT_CHARS] + "..."
-    return text
+class ReplyNotSent(ReplyPostError):
+    """Positive evidence that the reply was not accepted; redelivery may retry."""
+
+
+class ReplyAmbiguous(ReplyPostError):
+    """The POST may have landed; never resend this delivery."""
+
+
+class ReplyRejected(ReplyPostError):
+    """A terminal connector rejection; never resend this delivery."""
+
+
+class _ReplyNotSentCancelled(asyncio.CancelledError):
+    """Cancellation before a POST or after a definite connector non-send."""
+
+
+def _reply_status_outcome(status: int | None) -> str:
+    if status is not None and 200 <= status < 300:
+        return "sent"
+    if status in {401, 429}:
+        return "not_sent"
+    if status is not None and 400 <= status < 500 and status != 408:
+        return "rejected"
+    return "ambiguous"
+
+
+def _reply_outcome(error: Exception) -> str:
+    if isinstance(error, ReplyNotSent):
+        return "not_sent"
+    if isinstance(error, ReplyRejected):
+        return "rejected"
+    if isinstance(error, ReplyAmbiguous):
+        return "ambiguous"
+    if isinstance(error, ReplyPostError):
+        return _reply_status_outcome(error.status_code)
+    if isinstance(error, (_httpx.ConnectTimeout, _httpx.PoolTimeout, _httpx.ConnectError)):
+        return "not_sent"
+    # Only token acquisition can expose raw read/write timeouts: send_reply
+    # wraps those from the connector POST and preserves the plugin marker.
+    if isinstance(error, (_httpx.TimeoutException, TokenAcquisitionError)):
+        return "not_sent"
+    return "ambiguous"
 
 
 async def send_reply(
@@ -3683,10 +3894,7 @@ async def send_reply(
     conv_id = inbound.get("conversation", {}).get("id", "")
     activity_id = inbound.get("id", "")
     if not service_url or not conv_id or not activity_id:
-        raise RuntimeError(
-            f"reply target incomplete: serviceUrl={service_url!r}, "
-            f"conversationId={conv_id!r}, activityId={activity_id!r}"
-        )
+        raise ReplyNotSent("reply target incomplete")
     # #103/M4: conv_id / activity_id come straight from the inbound webhook
     # body — percent-encode each path segment so a hostile id can't break out
     # of the path (``/``), append a query/fragment (``?`` / ``#``), or traverse
@@ -3699,19 +3907,29 @@ async def send_reply(
     )
     if bf_cache is None:
         bf_cache = _BfTokenCache()
-    token, _path = await acquire_reply_token(
-        client=client,
-        cfg=cfg,
-        activity=inbound,
-        fmi_cache=fmi_cache,
-        user_cache=user_cache,
-        bf_cache=bf_cache,
-        validated_path=validated_path,
-        deadline=deadline,
-    )
+    try:
+        token, _path = await acquire_reply_token(
+            client=client,
+            cfg=cfg,
+            activity=inbound,
+            fmi_cache=fmi_cache,
+            user_cache=user_cache,
+            bf_cache=bf_cache,
+            validated_path=validated_path,
+            deadline=deadline,
+        )
+    except asyncio.CancelledError as exc:
+        raise _ReplyNotSentCancelled() from exc
+    except _httpx.TimeoutException:
+        # Preserve real token-mint timeouts for the plugin's retry contract.
+        raise
+    except Exception as exc:
+        raise ReplyNotSent("reply token acquisition failed") from exc
     from hermes_a365.outbound_retry import (
         OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC,
         OUTBOUND_DEFAULT_MAX_ATTEMPTS,
+        OutboundBudgetExhausted,
+        http_status_code,
         request_with_outbound_retry,
     )
 
@@ -3725,13 +3943,20 @@ async def send_reply(
             else OUTBOUND_BF_REPLY_TOTAL_BUDGET_SEC
         )
 
+    post_may_have_sent = False
+
     async def _post_once(timeout_sec: float) -> Any:
-        return await client.post(
+        nonlocal post_may_have_sent
+        post_may_have_sent = True
+        response = await client.post(
             url,
             json=reply,
             headers={"Authorization": f"Bearer {token}"},
             timeout=timeout_sec,
         )
+        if http_status_code(response) == 429:
+            post_may_have_sent = False
+        return response
 
     try:
         response = await request_with_outbound_retry(
@@ -3741,20 +3966,27 @@ async def send_reply(
             sleep=sleep,
             **retry_kwargs,
         )
-    except Exception as exc:
-        # Only this POST can have stored the activity. A ReadTimeout or
-        # WriteTimeout from acquire_reply_token (above) is still a miss
-        # and must propagate unchanged so the caller can retry.
-        if type(exc).__name__ in {"ReadTimeout", "WriteTimeout"}:
-            raise RuntimeError("timeout after the request was sent") from exc
+    except asyncio.CancelledError as exc:
+        if not post_may_have_sent:
+            raise _ReplyNotSentCancelled() from exc
         raise
-    status_code = int(getattr(response, "status_code", 0) or 0)
-    if status_code < 200 or status_code >= 300:
-        raise ReplyPostError(
-            status_code=status_code,
-            url=url,
-            body_excerpt=_response_text_excerpt(response),
-        )
+    except OutboundBudgetExhausted as exc:
+        raise ReplyNotSent("reply budget exhausted before send") from exc
+    except (_httpx.ConnectTimeout, _httpx.PoolTimeout, _httpx.ConnectError) as exc:
+        raise ReplyNotSent("reply connection failed before send") from exc
+    except (_httpx.ReadTimeout, _httpx.WriteTimeout) as exc:
+        raise ReplyAmbiguous("timeout after the request was sent") from exc
+    except Exception as exc:
+        raise ReplyAmbiguous("reply POST outcome unknown") from exc
+    status_code = http_status_code(response)
+    outcome = _reply_status_outcome(status_code)
+    if outcome != "sent":
+        error_type = {
+            "not_sent": ReplyNotSent,
+            "rejected": ReplyRejected,
+            "ambiguous": ReplyAmbiguous,
+        }[outcome]
+        raise error_type(status_code=status_code)
     return response
 
 
@@ -3762,17 +3994,6 @@ def _empty_invoke_ack_response() -> Any:
     """Serialize ``empty_invoke_ack`` (#132): HTTP 200, JSON ``{}`` body."""
     ack = empty_invoke_ack()
     return _JSONResponse(ack.body, status_code=ack.status)
-
-
-def _reply_failed_response(error: Exception) -> Any:
-    if isinstance(error, ReplyPostError):
-        logger.warning("reply POST failed: HTTP %s", error.status_code)
-    else:
-        logger.warning("reply POST failed: %s", type(error).__name__)
-    return _JSONResponse(
-        {"status": "reply_failed"},
-        status_code=502,
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -3964,104 +4185,95 @@ def make_app(
         delivery_id = _activity_delivery_id(
             activity, validated_path=validated_path or "dev", tenant_id=cfg.tenant_id
         )
-        if delivery_id is not None and idempotency_cache.is_duplicate(delivery_id):
-            # A deduped *invoke* must not return the {status:duplicate} marker as
-            # its body (#96): Teams reads an invoke's HTTP body as the
-            # invokeResponse body, and the marker is not a valid taskInfo/result
-            # envelope. Serve deliberately does NOT re-forward — the whole point
-            # of deduping here is that the operator webhook may be non-idempotent
-            # (see the comment above) — so it returns a benign empty 200 invoke
-            # ack; the original turn already produced the real response. Per-name
-            # response replay is 19w-g.
-            if str(activity.get("type") or "") == "invoke":
+        activity_type = str(activity.get("type") or "message")
+        # Id-less invokes and explicitly disabled dedupe still use the same
+        # per-request transitions, but retain nothing after the request.
+        cache = idempotency_cache
+        if delivery_id is None or cache.max_entries <= 0:
+            cache = _IdempotencyCache(max_entries=1)
+        key = delivery_id or ""
+        claimed = cache.claim(key, activity_type=activity_type)
+        if claimed == "busy":
+            return _JSONResponse({"status": "delivery_busy"}, status_code=503)
+        if claimed == "inflight":
+            return _JSONResponse({"status": "delivery_in_progress"}, status_code=503)
+        record = cache.record(key)
+        assert record is not None
+        if claimed == "done" and record.reply != "ready":
+            if activity_type == "invoke":
                 return _empty_invoke_ack_response()
             return _JSONResponse({"status": "duplicate"})
 
-        activity_type = str(activity.get("type") or "message")
-
-        # Channel-control activities — ack and bail.
-        if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
-            return _JSONResponse({"status": "acked"})
-
-        if not activity_forwards_to_webhook(activity):
-            channel_data = activity.get("channelData")
-            event_type = ""
-            if isinstance(channel_data, dict):
-                event_type = str(channel_data.get("eventType") or "")
-            logger.debug(
-                "inbound acked without forwarding: unhandled activity type=%s eventType=%s",
-                _safe_log_field(activity_type),
-                _safe_log_field(event_type),
-            )
-            return _JSONResponse({"status": "acked", "reason": "unhandled_type"})
-
-        # #105 review: a *forwarded-and-replied-to* activity we could not build
-        # a delivery key for (missing / non-string conversation or activity id)
-        # is BOTH un-dedupable — the dedupe above was skipped, so every
-        # connector retry would re-fire the non-idempotent operator webhook —
-        # and un-repliable, since ``send_reply`` needs those ids for its
-        # replyToActivity target. Ack without forwarding.
-        #
-        # INVOKE IS EXEMPT, as a deliberate trade-off rather than a free win.
-        # An invoke's response is the HTTP body of this same POST (see the
-        # unwrap below), so it needs no reply target — acking it here would
-        # hand Teams a blank invokeResponse and break the interaction outright,
-        # which is strictly worse than the cost of not deduping it. That cost
-        # is real: serve's invoke "handler" is the arbitrary OPERATOR WEBHOOK,
-        # which may be non-idempotent (the very reason the dedupe above
-        # exists), so a connector retry of an id-less invoke re-forwards. We
-        # accept it because it is unreachable for well-formed traffic — BF
-        # stamps ``id`` on every real invoke — and because dedupe is skipped
-        # for these regardless of what we do here. NOTE this reasoning is
-        # serve-specific: the plugin also routes invokes ahead of its dedupe,
-        # but its invoke registry is LOCAL and idempotent, so the same
-        # exemption is free there and merely a trade-off here.
-        # Channel-control flows that legitimately lack an id already bailed.
-        if delivery_id is None and activity_type != "invoke":
-            logger.warning(
-                "inbound acked without forwarding: unroutable activity "
-                "(missing or non-string conversation/activity id) type=%s",
-                activity_type,
-            )
-            return _JSONResponse({"status": "acked", "reason": "unroutable"})
-
-        # Forward to operator webhook.
-        envelope = build_webhook_envelope(activity, cfg)
         try:
-            webhook_resp = await forward_to_webhook(
-                envelope=envelope,
-                cfg=cfg,
-                client=http_client,
-                deadline=ack_deadline,
-            )
-        except Exception as e:
-            # An invoke's reply is the HTTP body of THIS request (#96/#97), so
-            # the out-of-band error card is wrong for it three ways: send_reply
-            # hard-requires serviceUrl/conversation.id/id and raises for an
-            # id-less invoke → 502 (which Teams reads as the invokeResponse
-            # status, i.e. "unable to reach app") with the serviceUrl echoed in
-            # the body; for an invoke WITH ids it POSTs an unsolicited error
-            # card into the chat and then returns the {"status": ...} wrapper
-            # marker as the invokeResponse body — the exact shape the dedupe
-            # branch above exists to avoid. Degrade to the canonical empty
-            # ack (#132): HTTP 200 + JSON {}, the same shape the dedupe
-            # branch returns and the plugin emits for a handler crash.
-            # Teams reads a 5xx as "unable to reach app" (#97).
-            if activity_type == "invoke":
-                logger.warning("invoke webhook error: %s", type(e).__name__)
-                return _empty_invoke_ack_response()
-            logger.warning("operator webhook error: %s", type(e).__name__)
-            error_reply = render_reply_activity(
-                activity,
-                {
-                    "text": "",
-                    "card": render_error_card("The agent backend could not be reached."),
-                },
-            )
+            webhook_error = False
+            if claimed == "new":
+                if activity_type in ("conversationUpdate", "typing", "endOfConversation"):
+                    cache.complete(key, record)
+                    return _JSONResponse({"status": "acked"})
+                if not activity_forwards_to_webhook(activity):
+                    cache.complete(key, record)
+                    return _JSONResponse({"status": "acked", "reason": "unhandled_type"})
+                if delivery_id is None and activity_type != "invoke":
+                    cache.complete(key, record)
+                    return _JSONResponse({"status": "acked", "reason": "unroutable"})
+
+                envelope = build_webhook_envelope(activity, cfg)
+                cache.enter_webhook(key, record)
+                try:
+                    webhook_resp = await forward_to_webhook(
+                        envelope=envelope,
+                        cfg=cfg,
+                        client=http_client,
+                        deadline=ack_deadline,
+                    )
+                except Exception as exc:
+                    logger.warning("operator webhook error: %s", type(exc).__name__)
+                    if activity_type == "invoke":
+                        cache.complete(key, record, "invoke_error")
+                        return _empty_invoke_ack_response()
+                    webhook_error = True
+                    webhook_resp = {
+                        "card": render_error_card("The agent backend could not be reached."),
+                    }
+
+                if activity_type == "invoke":
+                    # Invoke bodies are used only on the original request.
+                    cache.complete(key, record, "invoke_done")
+                    if not isinstance(webhook_resp, dict):
+                        return _empty_invoke_ack_response()
+                    invoke_response = webhook_resp.get("invokeResponse") or {
+                        "status": 200,
+                        "body": webhook_resp,
+                    }
+                    if not isinstance(invoke_response, dict):
+                        return _empty_invoke_ack_response()
+                    try:
+                        status_code = int(invoke_response.get("status", 200) or 200)
+                    except (TypeError, ValueError, OverflowError):
+                        status_code = 200
+                    return _JSONResponse(invoke_response.get("body"), status_code=status_code)
+
+                if not isinstance(webhook_resp, dict) or not (
+                    webhook_resp.get("text") or webhook_resp.get("card")
+                ):
+                    cache.complete(key, record, "no_reply")
+                    return _JSONResponse({"status": "no_reply"})
+                cache.store_result(key, record, webhook_resp)
+            else:
+                webhook_resp = record.result
+                if webhook_resp is None:
+                    cache.complete(key, record, "reply_unconfirmed")
+                    return _JSONResponse({"status": "reply_unconfirmed"})
+
+            # Render from THIS inbound: a redelivery's serviceUrl is validated
+            # again above and is deliberately absent from the delivery key.
+            reply = render_reply_activity(activity, webhook_resp)
+            if not cache.begin_reply(key, record):
+                return _JSONResponse({"status": "delivery_in_progress"}, status_code=503)
             try:
                 await send_reply(
                     inbound=activity,
-                    reply=error_reply,
+                    reply=reply,
                     cfg=cfg,
                     client=http_client,
                     fmi_cache=fmi_cache,
@@ -4070,63 +4282,31 @@ def make_app(
                     validated_path=validated_path,
                     deadline=ack_deadline,
                 )
-            except Exception as reply_error:
-                return _reply_failed_response(reply_error)
-            return _JSONResponse({"status": "webhook_error"}, status_code=200)
-
-        # Invoke replies must be synchronous. BF wire: the HTTP body is the
-        # invokeResponse *body* and the HTTP status is its status — NOT a
-        # {status, body} wrapper (that is an SDK abstraction the transport
-        # unwraps; sending the wrapper makes Teams reject it as "Unable to
-        # reach app"). The operator webhook still returns {status, body}; we
-        # unwrap it here.
-        if activity_type == "invoke":
-            # A non-object webhook body used to raise AttributeError on
-            # ``.get`` and become an unhandled HTTP 500. That is a handler
-            # failure, not an operator invokeResponse: same empty ack as a
-            # webhook error (#132).
-            if not isinstance(webhook_resp, dict):
-                logger.warning("invoke handler error: %s", type(webhook_resp).__name__)
-                return _empty_invoke_ack_response()
-            invoke_response = webhook_resp.get("invokeResponse") or {
-                "status": 200,
-                "body": webhook_resp,
-            }
-            # #97 — the operator webhook response is arbitrary operator-
-            # controlled JSON, so both the invokeResponse envelope AND its status
-            # must be coerced defensively: a non-dict envelope, or a status that
-            # is non-numeric / Infinity / NaN / wrong-type, must degrade to the
-            # canonical empty ack — never an unhandled HTTP 500 that Microsoft
-            # reads as an outage. int() on operator data can raise TypeError
-            # (wrong type), ValueError (bad string / NaN) or OverflowError
-            # (Infinity). A non-dict envelope has no body to keep (#132).
-            if not isinstance(invoke_response, dict):
-                return _empty_invoke_ack_response()
-            try:
-                status_code = int(invoke_response.get("status", 200) or 200)
-            except (TypeError, ValueError, OverflowError):
-                status_code = 200
-            return _JSONResponse(invoke_response.get("body"), status_code=status_code)
-
-        # Standard message: render reply and send asynchronously via serviceUrl.
-        if not webhook_resp.get("text") and not webhook_resp.get("card"):
-            return _JSONResponse({"status": "no_reply"})
-        reply = render_reply_activity(activity, webhook_resp)
-        try:
-            await send_reply(
-                inbound=activity,
-                reply=reply,
-                cfg=cfg,
-                client=http_client,
-                fmi_cache=fmi_cache,
-                user_cache=user_cache,
-                bf_cache=bf_cache,
-                validated_path=validated_path,
-                deadline=ack_deadline,
-            )
-        except Exception as e:
-            return _reply_failed_response(e)
-        return _JSONResponse({"status": "replied"})
+            except _ReplyNotSentCancelled:
+                cache.finish_reply(key, record, "not_sent", "cancelled_before_post")
+                raise
+            except Exception as exc:
+                evidence = type(exc).__name__
+                if isinstance(exc, ReplyPostError) and exc.status_code is not None:
+                    evidence += f":{exc.status_code}"
+                status = cache.finish_reply(key, record, _reply_outcome(exc), evidence)
+                return _JSONResponse(
+                    {"status": status},
+                    status_code=502 if status == "reply_failed" else 200,
+                )
+            status = cache.finish_reply(key, record, "sent")
+            return _JSONResponse({"status": "webhook_error" if webhook_error else status})
+        finally:
+            # CancelledError is a BaseException. A cancellation after entry must
+            # keep the tombstone; only a cancellation before entry releases it.
+            # Don't alter a newer record if this request outlived its TTL.
+            if cache.record(key) is record:
+                if record.state == "received":
+                    cache.release_if_received(key, record)
+                elif record.state == "webhook_running":
+                    cache.complete(key, record, "reply_unconfirmed")
+                elif record.reply == "inflight":
+                    cache.finish_reply(key, record, "ambiguous", "cancelled_or_interrupted")
 
     return app
 

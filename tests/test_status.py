@@ -239,9 +239,7 @@ class TestLocalConfig:
         assert result.state == "ok"
         assert "agent=hermes-inbox-helper" in result.detail
 
-    def test_warn_message_lists_both_paths_when_agent_dir_missing(
-        self, tmp_path: Path
-    ) -> None:
+    def test_warn_message_lists_both_paths_when_agent_dir_missing(self, tmp_path: Path) -> None:
         _seed_skill_env(tmp_path)
         result = gather_local_config(tmp_path, "Hermes Inbox Helper")
         assert result.state == "warn"
@@ -514,6 +512,16 @@ class TestActivityBridge:
 
 
 class TestCollectStatus:
+    @pytest.fixture(autouse=True)
+    def _stub_secret_expiry_graph(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        def fake_get(_url: str) -> dict[str, object]:
+            return {"passwordCredentials": []}
+
+        monkeypatch.setattr(
+            "hermes_a365.client_secret_expiry.build_graph_get",
+            lambda *_a, **_k: fake_get,
+        )
+
     def test_uninitialised_short_circuits_cloud_probes(self, tmp_path: Path) -> None:
         report = collect_status(
             None, hermes_home=tmp_path, query_source=FakeQuerySource(available=True)
@@ -552,6 +560,7 @@ class TestCollectStatus:
             "instance_scopes",
             "bot_service",
             "activity_bridge",
+            "client_secret_expiry",
         ]
         bot_service = next(c for c in report.components if c.name == "bot_service")
         assert bot_service.state == "skipped"
@@ -596,9 +605,7 @@ class TestCollectStatus:
             hermes_home=tmp_path,
             query_source=FakeQuerySource(available=False),
         )
-        env = next(
-            c for c in report.components if c.name == "local_config"
-        ).data["agent_env"]
+        env = next(c for c in report.components if c.name == "local_config").data["agent_env"]
         for k in ("APIKEY", "GRAPH_CONNECTIONSTRING", "GITHUB_PAT", "MY_CREDENTIAL"):
             assert env[k] == "***redacted***", k
         # Non-secret keys still pass through untouched.
@@ -619,9 +626,7 @@ class TestCollectStatus:
             bot_service_sidecar_path=sidecar,
             generated_config_path=tmp_path / "a365.generated.config.json",
             bot_service_runner=FakeBotServiceRunner(),
-            bot_service_operator_env={
-                "A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"
-            },
+            bot_service_operator_env={"A365_BF_APP_ID": "11111111-1111-1111-1111-111111111111"},
             bot_service_runtime_auth_probe=lambda _config: DiagnosticResult(
                 "bot_service_runtime_auth", "ok", "runtime ok"
             ),
@@ -634,6 +639,7 @@ class TestCollectStatus:
             "instance_scopes",
             "bot_service",
             "activity_bridge",
+            "client_secret_expiry",
         ]
         assert report.components[3].state == "ok"
 
