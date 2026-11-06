@@ -9583,6 +9583,249 @@ class TestEditMessage:
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
     @pytest.mark.asyncio
+    async def test_copilot_member_added_during_min_stream_age_wait_applies_to_current_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-marker-during-wait@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("bearer-test", "B"))
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_short_turn_max_duration_sec = 3.0
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = buf["turns"][0]
+        assert not turn.get("copilot_post_member_added")
+        opened = clock["t"] - 0.05
+        buf["keepalive"] = {
+            "stream_id": "ka-marker-during-wait",
+            "sequence": 1,
+            "opened_mono": opened,
+        }
+        marker_recorded = False
+
+        async def sleep_with_marker(delay: float) -> None:
+            nonlocal marker_recorded
+            if delay > 0 and not marker_recorded:
+                assert delay == pytest.approx(2.95)
+                assert post_mock.await_count == 0
+                clock["t"] += 1.0
+                a._note_copilot_member_added_pending(
+                    chat,
+                    {
+                        "type": "conversationUpdate",
+                        "conversation": inbound["conversation"],
+                        "membersAdded": [{"id": "agent-1"}],
+                    },
+                    "B",
+                )
+                assert a._copilot_member_added_pending[chat] > turn["started_mono"]
+                marker_recorded = True
+                clock["t"] += delay - 1.0
+            else:
+                clock["t"] += delay
+
+        sleep_mock.side_effect = sleep_with_marker
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+
+        waits = [float(call.args[0]) for call in sleep_mock.await_args_list if call.args[0] > 0]
+        assert marker_recorded
+        assert waits == pytest.approx([2.95, 7.0])
+        assert clock["t"] - opened == pytest.approx(10.0)
+        assert chat not in a._copilot_member_added_pending
+        assert post_mock.await_count == 1
+        final = post_mock.await_args.kwargs["json"]
+        assert final["entities"][0]["streamType"] == "final"
+        assert final["entities"][0]["streamId"] == "ka-marker-during-wait"
+
+    @pytest.mark.parametrize("second_turn_state", ["new", "already_open"])
+    @pytest.mark.parametrize("marker_timing", ["pending", "during_wait"])
+    @pytest.mark.asyncio
+    async def test_copilot_member_added_age_wait_keeps_turn_ownership(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        second_turn_state: str,
+        marker_timing: str,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-turn-age-ownership@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_first_turn_min_stream_age_before_final_sec = 10.0
+        a._copilot_short_turn_max_duration_sec = 3.0
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        event1 = _StubMessageEvent(
+            text="first",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event1)
+        buf = a._turn_buffers[chat]
+        turn1 = buf["turns"][0]
+        second_inbound = copy.deepcopy(inbound)
+        second_inbound["id"] = "act-2"
+        second_inbound["from"]["id"] = "user-2"
+        if second_turn_state == "already_open":
+            a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-2")
+            assert not buf["turns"][-1].get("copilot_post_member_added")
+        clock["t"] += 0.1
+
+        def note_marker() -> None:
+            a._note_copilot_member_added_pending(
+                chat,
+                {
+                    "type": "conversationUpdate",
+                    "conversation": inbound["conversation"],
+                    "membersAdded": [{"id": "agent-1"}],
+                },
+                "B",
+            )
+
+        if marker_timing == "pending":
+            note_marker()
+        opened = clock["t"] - 0.05
+        buf["keepalive"] = {
+            "stream_id": "ka-turn-age-ownership",
+            "sequence": 1,
+            "opened_mono": opened,
+        }
+        lock = a._turn_buffer_lock(buf)
+        second_final_started = False
+
+        async def sleep_with_second_turn(delay: float) -> None:
+            nonlocal second_final_started
+            if delay <= 0:
+                return
+            assert not lock.locked()
+            if second_final_started:
+                clock["t"] += delay
+                return
+            second_final_started = True
+            wake_at = clock["t"] + delay
+            clock["t"] += 1.0
+            if marker_timing == "during_wait":
+                note_marker()
+            pending = a._copilot_member_added_pending[chat]
+            if second_turn_state == "new":
+                a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-2")
+            turn2 = buf["turns"][-1]
+            assert turn2 is not turn1
+            assert not turn2.get("copilot_post_member_added")
+            async with lock:
+                await a._ensure_copilot_min_stream_age_before_final_locked(chat, buf, turn2)
+                assert not turn2.get("copilot_post_member_added")
+                assert "copilot_member_added_consumed_mono" not in turn2
+                a._release_copilot_member_added_for_turn(chat, turn2)
+            assert a._copilot_member_added_pending[chat] == pending
+            clock["t"] = max(clock["t"], wake_at)
+
+        sleep_mock.side_effect = sleep_with_second_turn
+        async with lock:
+            await a._ensure_copilot_min_stream_age_before_final_locked(chat, buf, turn1)
+        waits = [float(call.args[0]) for call in sleep_mock.await_args_list if call.args[0] > 0]
+        assert second_final_started
+        expected_waits = [9.95, 1.95] if marker_timing == "pending" else [2.95, 1.95, 7.0]
+        assert waits == pytest.approx(expected_waits)
+        assert clock["t"] - opened == pytest.approx(10.0)
+        assert turn1.get("copilot_post_member_added") is True
+        assert turn1["copilot_member_added_consumed_mono"] == a._copilot_member_added_pending[chat]
+        a._release_copilot_member_added_for_turn(chat, turn1)
+        assert chat not in a._copilot_member_added_pending
+        a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-3")
+        assert not buf["turns"][-1].get("copilot_post_member_added")
+
+    @pytest.mark.asyncio
+    async def test_copilot_member_added_receipt_visible_while_lifecycle_persistence_awaits(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import httpx
+
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-marker-at-receipt@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        lifecycle = {
+            **inbound,
+            "id": "members-added-1",
+            "type": "conversationUpdate",
+            "membersAdded": [{"id": "agent-1"}],
+        }
+        lifecycle.pop("text")
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _token: bridge.BF_ISSUER)
+        monkeypatch.setattr(
+            bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"iss": bridge.BF_ISSUER})
+        )
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        _sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        a._http_client = MagicMock()
+        persist_started = asyncio.Event()
+        release_persist = asyncio.Event()
+        persist_calls = 0
+
+        async def blocked_lifecycle_persist(reservation: Any = None) -> None:
+            nonlocal persist_calls
+            persist_calls += 1
+            if persist_calls == 1:
+                persist_started.set()
+                await release_persist.wait()
+            adapter_mod._complete_persist_mutation(reservation[0], reservation[1])
+
+        monkeypatch.setattr(a, "_persist_conversations", blocked_lifecycle_persist)
+        monkeypatch.setattr(a, "handle_message", a.on_processing_start)
+        transport = httpx.ASGITransport(app=a.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            lifecycle_request = asyncio.create_task(
+                client.post(
+                    "/api/messages",
+                    json=lifecycle,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+            )
+            try:
+                await persist_started.wait()
+                received = clock["t"]
+                clock["t"] += 0.1
+                response = await client.post(
+                    "/api/messages",
+                    json=inbound,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+                assert response.status_code == 200
+                assert response.json()["status"] == "dispatched"
+                assert not lifecycle_request.done()
+                turn = a._turn_buffers[chat]["turns"][0]
+                assert turn["validated_path"] == "B"
+                assert turn.get("copilot_post_member_added") is True
+                assert turn["copilot_member_added_consumed_mono"] == received
+                assert a._copilot_member_added_pending[chat] == received
+            finally:
+                release_persist.set()
+                lifecycle_response = await lifecycle_request
+
+        assert lifecycle_response.status_code == 200
+        assert lifecycle_response.json() == {"status": "acked", "lifecycle": "upsert"}
+        assert persist_calls == 2
+        assert a._copilot_member_added_pending[chat] == received
+
+    @pytest.mark.asyncio
     async def test_copilot_first_turn_after_member_added_waits_min_stream_age(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

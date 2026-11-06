@@ -30,6 +30,12 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   does. A configured secret skips the missing-secret notice and recovery; an
   unreachable provider prints a notice and skips recovery.
 - Test suite: made a subprocess overflow test independent of runner speed.
+- Keep late first-turn timing scoped to its own turn during the minimum-age wait.
+- **Copilot first-turn timing when the add notice arrives late (refs #290).** The
+  first-turn marker is now recorded when the conversation-add activity is
+  received, before it is persisted, and a marker that arrives during the final
+  minimum-age wait now applies to the current turn instead of carrying over to
+  the next one. Activity payloads are unchanged.
 - Retain bridge delivery state across inbound retries so a definitely unsent reply
   can be retried without calling the operator webhook again. Ambiguous and terminal
   reply outcomes stop further sends; cached replies have payload and attempt limits.
