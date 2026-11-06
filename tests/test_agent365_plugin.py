@@ -12595,6 +12595,7 @@ class TestEditMessage:
         assert turn is not None
         record = a._delivery_record(buf, turn)
         record["plain_due"] = True
+        record["plain_reason"] = "rotated"
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         pre_gap_keepalive = {
             "stream_id": "gap-stream",
@@ -12624,7 +12625,7 @@ class TestEditMessage:
             record,
             chunk_segment_ids=[],
         )
-        assert route == ("fallback", "keepalive stream rotated")
+        assert route == ("fallback", "rotated")
         assert finals == 0
         assert pre_gap_keepalive["stream_id"] == "gap-stream"
         assert buf["keepalive"] is not pre_gap_keepalive
@@ -13096,6 +13097,313 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert all(t != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT for t in finals) or finals == []
         assert send_reply_mock.await_count == 1
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue247_age_budget_plain_fallback_logs_info_reason(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-age-budget-reason"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+        buf["keepalive"] = {
+            "stream_id": "age-budget-stream",
+            "sequence": 1,
+            "opened_mono": time.monotonic() - (max_age + 1),
+        }
+
+        async def retire_during_gap(_chat_id: str, live_buf: dict[str, Any]) -> None:
+            live_buf["keepalive"] = {"stream_id": "", "closed_by": "keepalive"}
+
+        monkeypatch.setattr(a, "_sleep_turn_buffer_stream_gap_locked", retire_during_gap)
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "age_budget")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=age_budget" in logs[0].message
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue247_rotated_plain_fallback_logs_info_reason(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-247-rotated-reason"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        record["plain_due"] = True
+        record["plain_reason"] = "rotated"
+        buf["keepalive_rotated"] = True
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "rotated")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=rotated" in logs[0].message
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.parametrize(
+        ("rotated", "plain_reason", "expected_reason", "expected_level"),
+        [
+            (True, None, "rotated", logging.INFO),
+            (True, "", "rotated", logging.INFO),
+            (True, "age_budget", "age_budget", logging.INFO),
+            (True, "retry_exhausted", "retry_exhausted", logging.WARNING),
+            (False, None, "unknown", logging.WARNING),
+        ],
+    )
+    def test_answer_pre_post_plain_fallback_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        rotated: bool,
+        plain_reason: str | None,
+        expected_reason: str,
+        expected_level: int,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-rotated-other-turn-reason"
+        turn = {"seq": 1, "activity_id": "act-1"}
+        keepalive_turn = {"seq": 2, "activity_id": "act-2"}
+        buf = {
+            "turns": [turn, keepalive_turn],
+            "keepalive": {"stream_id": "", "closed_by": "keepalive"},
+            "keepalive_rotated": rotated,
+        }
+        # Rotation marks only the keepalive turn's delivery record.
+        keepalive_record = a._delivery_record(buf, keepalive_turn)
+        keepalive_record["plain_due"] = True
+        keepalive_record["plain_reason"] = "rotated"
+        record = a._delivery_record(buf, turn)
+        if plain_reason is None:
+            record.pop("plain_reason")
+        else:
+            record["plain_reason"] = plain_reason
+        if plain_reason or not rotated:
+            record["plain_due"] = True
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
+
+        assert route == ("fallback", expected_reason)
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == expected_level
+        assert f"reason={expected_reason}" in logs[0].message
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "case_id",
+        [
+            pytest.param("close_success", id="close_success"),
+            pytest.param("past_cap", id="past_cap"),
+            pytest.param("close_rejected", id="close_rejected"),
+            pytest.param("informative_expired_403", id="informative_expired_403"),
+        ],
+    )
+    async def test_rotation_preserves_retry_exhausted_plain_fallback_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        case_id: str,
+    ) -> None:
+        """Rotation helpers keep retry_exhausted on the delivery record (#291)."""
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-291-rotation-reason-{case_id}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            posts.append(body)
+            entity = body["entities"][0]
+            if case_id == "close_rejected" and entity.get("streamType") == "final" and entity.get(
+                "streamId"
+            ):
+                return self._http_result(400)
+            if (
+                case_id == "informative_expired_403"
+                and entity.get("streamType") == "informative"
+                and entity.get("streamId")
+            ):
+                return MagicMock(
+                    status_code=403,
+                    text="Content stream finished due to exceeded streaming time",
+                    json=lambda: {
+                        "error": {
+                            "message": (
+                                "Content stream finished due to exceeded streaming time"
+                            )
+                        }
+                    },
+                )
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="sleep",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="💻 Running sleep 140", reply_to=None)
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record_before = a._delivery_record(buf, turn)
+        record_before["plain_due"] = True
+        record_before["plain_reason"] = "retry_exhausted"
+        record_before["force_plain"] = True
+        record_before["state"] = "FORCED_PLAIN"
+        record_before["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+        record_before["plain_attempts"] = 0
+        record_before["force_plain_exhausted"] = False
+
+        rotate_at = adapter_mod._keepalive_rotation_age_sec()
+        cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
+
+        if case_id == "past_cap":
+            opened_mono = time.monotonic() - (cap + 1.0)
+        else:
+            opened_mono = time.monotonic() - (rotate_at + 0.01)
+
+        buf["keepalive"] = {
+            "stream_id": f"ka-{case_id}",
+            "sequence": 3,
+            "opened_mono": opened_mono,
+        }
+
+        snap = {
+            "deferral_count": record_before["deferral_count"],
+            "force_plain": record_before["force_plain"],
+            "state": record_before["state"],
+            "plain_attempts": record_before["plain_attempts"],
+            "force_plain_exhausted": record_before["force_plain_exhausted"],
+        }
+        posts_before = len(posts)
+
+        async with a._turn_buffer_lock(buf):
+            if case_id in {"close_success", "past_cap", "close_rejected"}:
+                result = await a._post_keepalive_rotation_final_locked(chat, buf)
+                assert result is True
+            else:
+                progress = "💻 progress for informative"
+                result = await a._post_informative_locked(
+                    chat,
+                    buf,
+                    allow_restart=True,
+                    turn_for_text=turn,
+                    text_override=progress,
+                )
+                assert result is False
+
+        record_after = a._delivery_record(buf, turn)
+        assert record_after is record_before
+        assert record_after.get("plain_reason") == "retry_exhausted"
+        assert record_after.get("plain_due") is True
+        assert buf.get("keepalive_rotated") is True
+        assert buf.get("skip_stream_open") is True
+        assert not str(buf["keepalive"].get("stream_id") or "")
+
+        assert record_after.get("deferral_count") == snap["deferral_count"]
+        assert record_after.get("force_plain") == snap["force_plain"]
+        assert record_after.get("state") == snap["state"]
+        assert record_after.get("plain_attempts") == snap["plain_attempts"]
+        assert record_after.get("force_plain_exhausted") == snap["force_plain_exhausted"]
+        assert buf.get("retry_task") is None
+
+        finals = [
+            p
+            for p in posts[posts_before:]
+            if p.get("type") == "message"
+            and p.get("entities")
+            and p["entities"][0].get("streamType") == "final"
+        ]
+        informative_with_id = [
+            p
+            for p in posts[posts_before:]
+            if p.get("entities")
+            and p["entities"][0].get("streamType") == "informative"
+            and p["entities"][0].get("streamId")
+        ]
+
+        if case_id == "close_success":
+            assert finals
+            assert informative_with_id == []
+        elif case_id == "past_cap":
+            assert finals == []
+            assert informative_with_id == []
+        elif case_id == "close_rejected":
+            assert len(finals) == 1
+            assert informative_with_id == []
+        else:
+            assert len(informative_with_id) == 1
+            assert informative_with_id[0]["text"] == "💻 progress for informative"
+            assert finals == []
+
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(
+                chat, buf, turn, record_after, chunk_segment_ids=[]
+            )
+        assert route == ("fallback", "retry_exhausted")
+        fb_logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(fb_logs) == 1
+        assert fb_logs[0].levelno == logging.WARNING
+        assert fb_logs[0].message == (
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
+            "reason=retry_exhausted"
+        )
+
         await a._drop_turn_buffer(chat)
 
     @pytest.mark.asyncio

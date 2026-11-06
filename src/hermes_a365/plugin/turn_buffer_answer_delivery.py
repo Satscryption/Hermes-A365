@@ -15,6 +15,7 @@ _DELIVERY_DEFAULTS: dict[str, Any] = {
     "deferral_count": 0,
     "force_plain": False,
     "plain_due": False,
+    "plain_reason": "",
     "plain_attempts": 0,
     "force_plain_exhausted": False,
     "answer_final_settled": False,

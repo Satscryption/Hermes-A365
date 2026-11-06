@@ -20,7 +20,7 @@ On one turn seq it finds the last segment whose text is `_is_hermes_tool_progres
 
 Segments store no `finish_reason`. A streamed lead-in and a streamed fact use the same shape: `_first_send` with `reply_to` and `expect_edits`, or a later `notify` send. Walk094's "I'll run the sleep, then reply." and the #226 probe "The capital of France is Paris." are the same shape.
 
-`_buffer_has_kept_answer_segments` is true for any `kind=answer`. #214 clears that for the lead-in, so `_emit_turn_buffer_keepalive` may rotate once `_keepalive_rotation_due` (stream age near the 120s cap). The rotation final is `_TURN_BUFFER_KEEPALIVE_TEXT` ("Working on it.").
+`_buffer_has_kept_answer_segments` is true for any `kind=answer`. #214 clears that for the lead-in, so `_emit_turn_buffer_keepalive` may rotate once `_keepalive_rotation_due` (stream age near the 120s cap). At rotation age, the progress bubble ends with its last progress line; the answer is one plain message.
 
 ## Options
 
@@ -135,7 +135,7 @@ Answer-like means `kind=="answer"`, or a missing `kind` whose text is not tool p
 
 A segment at or before that last progress index does not block rotation. This includes a genuine marked answer and an intent preamble. With no tool-progress segment on the turn, any answer-like segment still blocks, which is the current short-reply behaviour.
 
-The rotation final text stays "Working on it." The pre-tool answer remains in the buffer and is joined into the answer final on the stream that is current when the turn flushes.
+At rotation age, the progress bubble ends with its last progress line. The pre-tool answer remains in the buffer and is included in the one plain answer message after the turn flushes.
 
 ### Edit survival
 
@@ -154,9 +154,9 @@ Flush reconcile still sets every marked non-progress segment to `answer` and the
 
 The position gate and the three call sites stay. The change is the extra predicate on the demotion, plus the rotation check ignoring answer-like segments at or before the last progress index.
 
-K4 still rotates: lead-in plus `💻 Running sleep 130`, stream age 121s, no post-tool answer yet, `_buffer_has_kept_answer_segments` is false, keepalive final then a new informative stream. After "Done after sleep." arrives, that post-tool answer blocks further rotation. The answer final is `Done after sleep.`
+K4 reaches rotation age: the progress bubble ends with its last progress line. After "Done after sleep." arrives, the answer is delivered as one plain message.
 
-A genuine fact before a long tool also rotates. The fact is in the later final. Leaving `kind=answer` on that fact and still blocking rotation would bring the walk094 K3 cap back for the #226 probes.
+A genuine fact before a long tool also reaches rotation age. The fact is included in the later plain answer message. Leaving `kind=answer` on that fact and still blocking rotation would bring the walk094 K3 cap back for the #226 probes.
 
 ### #228
 
@@ -211,8 +211,8 @@ Record these on the v0.9.5 candidate in the walk095 note. #227's other scope ite
 
 1. **P1 fact before a tool.** Ask for a fact the model states, then a tool, then a short confirmation. The final bubble contains the fact and the confirmation. The fact is still visible after the final replaces the informative line.
 2. **L1 / L2 lead-in.** The walk094 sleep prompt ("I'll run the sleep, then reply." / "I'm about to sleep 30 seconds…"). The final is only the post-tool answer. The lead-in may show as informative and then disappear. It is not duplicated under the answer.
-3. **L5 / K4 rotation.** A tool longer than 120s after that lead-in. The stream rotates (one keepalive final, one new informative stream). The answer final is the post-tool answer, once.
-4. **P1 across rotation.** A fact before a tool that runs past 120s, then a short confirmation. Rotation happens. The final still contains the fact and the confirmation.
+3. **L5 / K4 rotation.** A tool longer than 120s after that lead-in. The progress bubble ends with its last progress line; the post-tool answer is one plain message.
+4. **P1 across rotation.** A fact before a tool that runs past 120s, then a short confirmation. The answer is one plain message containing the fact and confirmation.
 5. **L3 / #228 edit.** If the turn edits the lead-in in place, the edited lead-in shows on the informative stream and is absent from the final. If a live edit cannot be forced, cite the unit test and say so.
 6. **#217 first turn.** A new conversation whose first answer is a pre-tool fact plus a confirmation. The bubble paints without a reload, and the text is the joined final from row P1. This row does not add an extra informative hop for the fact.
 7. **#212 keepalive.** A turn whose live text is a tool-progress line heartbeats with that line or "Working on it.", and does not post the pre-tool fact as the keepalive body. Reply delivery matches the #212 notes that are in scope for the candidate; rows this design leaves to #212 stay on #212's own expected result.

@@ -5867,6 +5867,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
                 record["force_plain_exhausted"] = True
                 record["plain_due"] = False
+                record["plain_reason"] = ""
                 return
             if not record.get("force_plain"):
                 logger.warning(
@@ -5881,6 +5882,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if not buf.get("segments"):
                 return
             record["plain_due"] = True
+            record["plain_reason"] = "retry_exhausted"
             buf["retry_turn_key"] = turn_key
             buf["retry_task"] = asyncio.create_task(self._deferred_turn_buffer_retry(chat_id))
             return
@@ -6736,6 +6738,8 @@ class Agent365Adapter(BasePlatformAdapter):
             buf["keepalive_rotated"] = True
             buf["skip_stream_open"] = True
             record["plain_due"] = True
+            if record.get("plain_reason") != "retry_exhausted":
+                record["plain_reason"] = "rotated"
             self._cancel_turn_buffer_keepalive(buf)
             return True
 
@@ -6766,6 +6770,8 @@ class Agent365Adapter(BasePlatformAdapter):
         buf["keepalive_rotated"] = True
         buf["skip_stream_open"] = True
         record["plain_due"] = True
+        if record.get("plain_reason") != "retry_exhausted":
+            record["plain_reason"] = "rotated"
         self._cancel_turn_buffer_keepalive(buf)
         return True
 
@@ -7109,6 +7115,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 buf["skip_stream_open"] = True
                 record = self._delivery_record(buf, turn)
                 record["plain_due"] = True
+                if record.get("plain_reason") != "retry_exhausted":
+                    record["plain_reason"] = "rotated"
                 self._cancel_turn_buffer_keepalive(buf)
                 return False
             logger.warning(
@@ -7770,6 +7778,7 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         record["state"] = "DONE"
         record["plain_due"] = False
+        record["plain_reason"] = ""
         record["answer_final_settled"] = True
         if not stream.get("closed_by"):
             stream["closed_by"] = f"turn:{record['turn_key']}"
@@ -7855,12 +7864,17 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             if stream_id:
                 return None
-            logger.warning(
-                "agent365 turn buffer answer plain fallback: chat_id=%s "
-                "reason=keepalive stream rotated",
-                chat_id,
+            reason = str(
+                record.get("plain_reason")
+                or ("rotated" if buf.get("keepalive_rotated") else "unknown")
             )
-            return ("fallback", "keepalive stream rotated")
+            log = logger.info if reason in {"age_budget", "rotated"} else logger.warning
+            log(
+                "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
+                chat_id,
+                reason,
+            )
+            return ("fallback", reason)
         if record.get("plain_due"):
             if record.get("may_have_landed"):
                 return self._answer_uncertain_for_turn(
@@ -7981,6 +7995,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 )
             plain = True
             record["plain_due"] = True
+            record["plain_reason"] = "age_budget"
         if not plain:
             return None
         if stream_id:
@@ -7990,12 +8005,12 @@ class Agent365Adapter(BasePlatformAdapter):
             stream = self._keepalive_stream(buf)
             stream_id = str(stream.get("stream_id") or "")
             if not stream_id:
-                reason = (
-                    "keepalive stream rotated"
-                    if buf.get("keepalive_rotated") or record.get("plain_due")
-                    else "stream age past budget"
+                reason = str(
+                    record.get("plain_reason")
+                    or ("rotated" if buf.get("keepalive_rotated") else "unknown")
                 )
-                logger.warning(
+                log = logger.info if reason in {"age_budget", "rotated"} else logger.warning
+                log(
                     "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
                     chat_id,
                     reason,
@@ -8019,16 +8034,16 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     if not closed:
                         record["plain_due"] = True
+                        record["plain_reason"] = "rotated"
                         return ("retry", None)
             else:
                 stream["stream_id"] = ""
                 buf["keepalive"] = stream
-        reason = (
-            "keepalive stream rotated"
-            if buf.get("keepalive_rotated") or record.get("plain_due")
-            else "stream age past budget"
+        reason = str(
+            record.get("plain_reason") or ("rotated" if buf.get("keepalive_rotated") else "unknown")
         )
-        logger.warning(
+        log = logger.info if reason in {"age_budget", "rotated"} else logger.warning
+        log(
             "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
             chat_id,
             reason,
@@ -9214,6 +9229,7 @@ class Agent365Adapter(BasePlatformAdapter):
                                 record = self._delivery_record(buf, turn)
                                 record["state"] = "DONE"
                                 record["plain_due"] = False
+                                record["plain_reason"] = ""
                                 record["answer_final_settled"] = True
                                 buf.pop("keepalive_rotated", None)
                                 self._remove_turn_segments(
@@ -9247,6 +9263,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         record = self._delivery_record(buf, turn)
                         record["state"] = "DONE"
                         record["plain_due"] = False
+                        record["plain_reason"] = ""
                         record["answer_final_settled"] = True
                         buf.pop("keepalive_rotated", None)
                         self._remove_turn_segments(
@@ -9285,6 +9302,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         record = self._delivery_record(buf, turn)
                         record["state"] = "DONE"
                         record["plain_due"] = False
+                        record["plain_reason"] = ""
                         record["answer_final_settled"] = True
                         buf.pop("keepalive_rotated", None)
                         self._remove_turn_segments(
