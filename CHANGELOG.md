@@ -22,6 +22,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 - Client secret expiry Graph responses enforce a JSON nesting depth limit of 64 before decoding.
 ### Fixed
 
+- Test suite: made a subprocess overflow test independent of runner speed.
 - Retain bridge delivery state across inbound retries so a definitely unsent reply
   can be retried without calling the operator webhook again. Ambiguous and terminal
   reply outcomes stop further sends; cached replies have payload and attempt limits.
