@@ -635,6 +635,13 @@
         "doctor": {
           "actions": [
             {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": false
+            },
+            {
               "dest": "human",
               "nargs": 0,
               "option_strings": [
@@ -647,6 +654,13 @@
               "nargs": 0,
               "option_strings": [
                 "--no-network"
+              ],
+              "required": false
+            },
+            {
+              "dest": "secret_expiry_warn_days",
+              "option_strings": [
+                "--secret-expiry-warn-days"
               ],
               "required": false
             }
@@ -980,6 +994,13 @@
               "nargs": 0,
               "option_strings": [
                 "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "secret_expiry_warn_days",
+              "option_strings": [
+                "--secret-expiry-warn-days"
               ],
               "required": false
             },
@@ -1566,6 +1587,13 @@
         "doctor": {
           "actions": [
             {
+              "dest": "agent_name",
+              "option_strings": [
+                "--agent-name"
+              ],
+              "required": false
+            },
+            {
               "dest": "human",
               "nargs": 0,
               "option_strings": [
@@ -1578,6 +1606,13 @@
               "nargs": 0,
               "option_strings": [
                 "--no-network"
+              ],
+              "required": false
+            },
+            {
+              "dest": "secret_expiry_warn_days",
+              "option_strings": [
+                "--secret-expiry-warn-days"
               ],
               "required": false
             }
@@ -1911,6 +1946,13 @@
               "nargs": 0,
               "option_strings": [
                 "--human"
+              ],
+              "required": false
+            },
+            {
+              "dest": "secret_expiry_warn_days",
+              "option_strings": [
+                "--secret-expiry-warn-days"
               ],
               "required": false
             },
