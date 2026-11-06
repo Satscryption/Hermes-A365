@@ -3074,6 +3074,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._release_media_paths(request_media_leases)
                 self._release_agent_turn_admission(admission_key)
                 return JSONResponse({"status": "acked", "reason": "unroutable"})
+            self._own_turn_for_ledger_message(
+                str(getattr(event, "message_id", "") or activity.get("id") or ""),
+                str(ref.conversation_id or ""),
+            )
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -4433,6 +4437,8 @@ class Agent365Adapter(BasePlatformAdapter):
         for key, record in list(self._turn_authority_ledger.items()):
             if conversation_id is not None and record.conversation_id != conversation_id:
                 continue
+            if str(record.message_id or "").startswith("handoff:"):
+                continue
             owner = self._turn_authority_owners.get(key)
             if id(record) in retained or (owner is not None and not owner.done()):
                 continue
@@ -4456,6 +4462,12 @@ class Agent365Adapter(BasePlatformAdapter):
         if task not in self._turn_authority_watched_tasks:
             self._turn_authority_watched_tasks.add(task)
             task.add_done_callback(self._turn_authority_owner_done)
+
+    def _own_turn_for_ledger_message(self, message_id: str, conversation_id: str) -> None:
+        task = asyncio.current_task()
+        rec = self._ledger_record_for_message(str(message_id or "").strip(), str(conversation_id or ""))
+        if task is not None and rec is not None:
+            self._own_turn_authority(rec, task)
 
     def _own_scheduled_turn_authority(self, event: Any, session_key: str) -> None:
         record = self._event_turn_authority(event)
@@ -4569,7 +4581,9 @@ class Agent365Adapter(BasePlatformAdapter):
 
         ref = self._conversations.get(cid)
         if sk:
-            return None
+            if ref is not None and ref.raw is inbound:
+                return None
+            return copy.deepcopy(inbound)
 
         agg = [
             entry
@@ -11321,11 +11335,15 @@ class Agent365Adapter(BasePlatformAdapter):
         authorized_sender_id: str,
     ) -> None:
         try:
-            self.admit_turn_authority(
+            if self.admit_turn_authority(
                 activity,
                 f"agent365:{str((activity.get('conversation') or {}).get('id') or '')}",
                 authorized_user_id=authorized_sender_id,
-            )
+            ):
+                self._own_turn_for_ledger_message(
+                    str(activity.get("id") or "").strip(),
+                    str((activity.get("conversation") or {}).get("id") or ""),
+                )
             await self._send_reply_activity(
                 inbound=activity,
                 content=_FILE_CONSENT_DECLINED_NOTICE,
@@ -13043,6 +13061,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 sender.setdefault("id", source.user_id)
             handoff_activity["from"] = sender
         if handoff_activity:
+            for lk, prev in list(self._turn_authority_ledger.items()):
+                mid = str(prev.message_id or "")
+                if prev.conversation_id == chat_id and mid.startswith("handoff:"):
+                    self._turn_authority_ledger.pop(lk, None)
+                    self._turn_authority_owners.pop(lk, None)
             # The pin has no user-message id when Teams has no cached inbound.
             # Keep that reply behaviour and use a separate internal ledger key.
             authority_id = f"handoff:{uuid.uuid4().hex}"
@@ -13660,12 +13683,15 @@ class Agent365Adapter(BasePlatformAdapter):
 
                     async def _post_slash_confirm_follow() -> None:
                         sk = str(resolver.get("session_key") or "")
-                        bridge_mod = _import_bridge()
-                        self.admit_turn_authority(
+                        if self.admit_turn_authority(
                             activity,
                             sk,
-                            authorized_user_id=bridge_mod._canonical_activity_user(activity),
-                        )
+                            authorized_user_id=authorized_user_id,
+                        ):
+                            self._own_turn_for_ledger_message(
+                                str(activity.get("id") or "").strip(),
+                                str((activity.get("conversation") or {}).get("id") or ""),
+                            )
                         await self._send_reply_activity(
                             inbound=activity,
                             content=follow_text,
