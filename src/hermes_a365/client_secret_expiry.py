@@ -246,7 +246,9 @@ def build_graph_get(mutator: Mutator | None = None) -> GraphGet | None:
     return None
 
 
-def _expiry_tenant_matches(tenant_id: str, mutator: Mutator) -> bool:
+def _expiry_tenant_matches(tenant_id: str, mutator: Mutator) -> bool | None:
+    """Return False only for a verified mismatch; None means unverifiable."""
+
     def run(argv: list[str]) -> object:
         if getattr(mutator, "available", True):
             return mutator.run(argv, sensitive=True, timeout=GRAPH_SECRET_EXPIRY_REST_TIMEOUT_SEC)
@@ -260,11 +262,11 @@ def _expiry_tenant_matches(tenant_id: str, mutator: Mutator) -> bool:
 
     active = active_az_tenant(run)
     if active is None:
-        return False
+        return None
     try:
         return tenant_ids_match(active, tenant_id, source="selected tenant")
     except TenantResolutionError:
-        return False
+        return None
 
 
 def check_app_client_secret_expiry(
@@ -559,23 +561,30 @@ def gather_client_secret_expiry_checks(
         skip_row("bf_client_secret", f"skipped; {skip_reason}")
         return rows
 
-    if tenant_id:
-        mutator = mutator if mutator is not None else get_mutator()
-        if not _expiry_tenant_matches(tenant_id, mutator):
-            for name, role in (
-                ("blueprint_client_secret", "blueprint"),
-                ("bf_client_secret", "Bot Framework"),
-            ):
-                rows.append(
-                    (
-                        name,
-                        _unavailable_state(for_status=for_status),
-                        f"{_unavailable_detail(role=role)} "
-                        "(active Azure CLI tenant differs or could not be verified)",
-                        {"role": role, "check": "unavailable"},
-                    )
+    if not tenant_id or not tenant_id.strip():
+        skip_row("blueprint_client_secret", "skipped; no tenant pinned (A365_TENANT_ID)")
+        skip_row("bf_client_secret", "skipped; no tenant pinned (A365_TENANT_ID)")
+        return rows
+
+    mutator = mutator if mutator is not None else get_mutator()
+    tenant_matches = _expiry_tenant_matches(tenant_id, mutator)
+    if tenant_matches is not True:
+        for name, role in (
+            ("blueprint_client_secret", "blueprint"),
+            ("bf_client_secret", "Bot Framework"),
+        ):
+            rows.append(
+                (
+                    name,
+                    "skipped"
+                    if tenant_matches is False
+                    else _unavailable_state(for_status=for_status),
+                    f"{_unavailable_detail(role=role)} "
+                    "(active Azure CLI tenant differs or could not be verified)",
+                    {"role": role, "check": "unavailable"},
                 )
-            return rows
+            )
+        return rows
 
     getter = graph_get if graph_get is not None else build_graph_get(mutator)
     if getter is None:

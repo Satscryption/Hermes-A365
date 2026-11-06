@@ -44,6 +44,7 @@ from hermes_a365.mutator import A365CliMutator, CliInvocationError, RunResult
 from hermes_a365.status import _UnavailableQuerySource, collect_status
 from hermes_a365.status import overall_to_exit_code as status_exit
 
+_TENANT = "00000000-0000-0000-0000-000000000001"
 _BLUEPRINT = "11111111-1111-1111-1111-111111111111"
 _NOW = datetime(2026, 6, 1, 12, 0, 0, tzinfo=UTC)
 _LEAK_KEY = "00000000-0000-4000-8000-leakMarker1"
@@ -78,6 +79,12 @@ def _graph_get(payload: dict[str, Any]):
 def _assert_no_leaks(text: str) -> None:
     for marker in (_LEAK_KEY, _LEAK_HINT, _LEAK_SECRET, "leakMarker9"):
         assert marker not in text
+
+
+@pytest.fixture
+def pinned_tenant(monkeypatch: pytest.MonkeyPatch) -> str:
+    monkeypatch.setattr(client_secret_expiry, "active_az_tenant", lambda _run: _TENANT)
+    return _TENANT
 
 
 class TestSelectLatestActive:
@@ -277,7 +284,7 @@ class TestAdapterArgv:
         )
 
     @pytest.mark.parametrize("adapter", ["mutator", "subprocess"])
-    def test_expired_secret_with_warning_on_stderr(
+    def test_warning_stream_matches_adapter_capture(
         self, adapter: str, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         payload = {
@@ -289,9 +296,10 @@ class TestAdapterArgv:
         warning = "WARNING: upgrade available\n"
         run = Mock()
         if adapter == "mutator":
-            run.return_value = RunResult([], 0, body, warning)
+            run.return_value = (0, warning + body)
             mut = A365CliMutator()
-            monkeypatch.setattr(mut, "run", run)
+            monkeypatch.setattr(mut, "available", True)
+            monkeypatch.setattr("hermes_a365.mutator._run_sensitive_streaming", run)
             getter = graph_get_from_mutator_for_secret_expiry(mut)
         else:
             run.return_value = subprocess.CompletedProcess(
@@ -301,13 +309,17 @@ class TestAdapterArgv:
             monkeypatch.setattr(subprocess, "run", run)
             getter = graph_get_from_az_rest()
 
-        assert getter(application_client_secret_expiry_url(_BLUEPRINT)) == payload
+        result = getter(application_client_secret_expiry_url(_BLUEPRINT))
+        if adapter == "mutator":
+            assert result["error"]["code"] == "UnreadableGraphResponse"
+        else:
+            assert result == payload
         state, detail, data = check_app_client_secret_expiry(
             _BLUEPRINT, graph_get=getter, now=_NOW, for_status=True
         )
-        assert state == "error"
-        assert data["check"] == "expired"
-        assert "expired" in detail
+        assert state == ("skipped" if adapter == "mutator" else "error")
+        assert data["check"] == ("unavailable" if adapter == "mutator" else "expired")
+        assert ("could not check" if adapter == "mutator" else "expired") in detail
         assert all("--only-show-errors" in call.args[0] for call in run.call_args_list)
 
 
@@ -323,7 +335,8 @@ class TestTenantSelection:
             (_TENANT, {}, 0, "unavailable"),
             (_TENANT, {"tenantId": _TENANT}, 1, "unavailable"),
             (_TENANT, {"tenantId": _TENANT.upper()}, 0, "expired"),
-            (None, {}, 1, "expired"),
+            (None, {}, 1, "skipped"),
+            ("   ", {}, 1, "skipped"),
         ],
     )
     def test_validates_session_before_graph_read(
@@ -382,8 +395,8 @@ class TestTenantSelection:
         )
         bp = next(row for row in rows if row[0] == "blueprint_client_secret")
         assert bp[3]["check"] == expected
-        assert bp[1] == ("skipped" if expected == "unavailable" else "error")
-        assert len(calls) == (int(selected is not None) + int(expected == "expired"))
+        assert bp[1] == ("error" if expected == "expired" else "skipped")
+        assert len(calls) == (int(bool(selected and selected.strip())) + int(expected == "expired"))
 
     @pytest.mark.parametrize("explicit", [True, False])
     @pytest.mark.parametrize("active", [_OTHER, None])
@@ -426,14 +439,77 @@ class TestTenantSelection:
         assert "missing_app" not in json.dumps(component.data)
         assert report.overall != "broken"
 
+    @pytest.mark.parametrize("command", ["doctor", "status"])
+    @pytest.mark.parametrize("tenant_id", [None, "", "   "])
+    @pytest.mark.parametrize("graph_missing", [False, True])
+    def test_unpinned_tenant_skips_without_trusting_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        command: str,
+        tenant_id: str | None,
+        graph_missing: bool,
+    ) -> None:
+        home = _seed_home(tmp_path)
+        (home / ".env").write_text(
+            f"A365_TENANT_ID={tenant_id or ''}\n"
+            f"A365_APP_ID={_BLUEPRINT}\nA365_BF_APP_ID={_BLUEPRINT}\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        active = Mock(return_value=self._OTHER)
+        monkeypatch.setattr(client_secret_expiry, "active_az_tenant", active)
+        graph_get = Mock(
+            return_value={"error": {"code": "Request_ResourceNotFound"}}
+            if graph_missing
+            else {
+                "passwordCredentials": [
+                    _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=400)),
+                ],
+            }
+        )
+        if command == "doctor":
+            # Isolate expiry's rollup from the separate local-config pin requirement.
+            with _minimal_doctor_patches(tenant_id=tenant_id):
+                report = run_all_probes(
+                    graph_get=graph_get,
+                    bot_service_sidecar_path=tmp_path / "missing.json",
+                )
+            expiry = [
+                p
+                for p in report.probes
+                if p.name in ("blueprint_client_secret", "bf_client_secret")
+            ]
+            assert len(expiry) == 2
+            assert all(p.state == "skipped" and p.data["check"] == "skipped" for p in expiry)
+            assert all("no tenant pinned" in p.detail for p in expiry)
+            assert report.overall == "ok"
+            assert "missing_app" not in render_json(report)
+        else:
+            status = collect_status(
+                None,
+                hermes_home=home,
+                query_source=_UnavailableQuerySource(),
+                graph_get=graph_get,
+                bot_service_sidecar_path=tmp_path / "missing.json",
+            )
+            component = next(c for c in status.components if c.name == "client_secret_expiry")
+            assert component.state == "skipped"
+            assert all(app["check"] == "skipped" for app in component.data["apps"].values())
+            assert "no tenant pinned" in component.detail
+            assert "missing_app" not in json.dumps(component.data)
+            assert status.overall != "broken"
+        graph_get.assert_not_called()
+        active.assert_not_called()
+
     @pytest.mark.parametrize(
-        ("configured", "active", "expected"),
+        ("configured", "active", "payload_check", "expected"),
         [
-            (True, _OTHER, "unavailable"),
-            (True, None, "unavailable"),
-            (True, _TENANT.upper(), "healthy"),
-            (False, None, "healthy"),
-            (False, None, "missing_app"),
+            (True, _OTHER, "missing_app", "unavailable"),
+            (True, None, "missing_app", "unavailable"),
+            (True, _TENANT.upper(), "healthy", "healthy"),
+            (True, _TENANT, "missing_app", "missing_app"),
+            (False, None, "healthy", "skipped"),
+            (False, None, "missing_app", "skipped"),
         ],
     )
     def test_doctor_forwards_configured_tenant_and_guards_expiry_reads(
@@ -442,6 +518,7 @@ class TestTenantSelection:
         monkeypatch: pytest.MonkeyPatch,
         configured: bool,
         active: str | None,
+        payload_check: str,
         expected: str,
     ) -> None:
         home = _seed_home(tmp_path)
@@ -461,7 +538,7 @@ class TestTenantSelection:
                     _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=400)),
                 ],
             }
-            if expected == "healthy"
+            if payload_check == "healthy"
             else {"error": {"code": "Request_ResourceNotFound"}}
         )
         graph_get = Mock(return_value=payload)
@@ -494,11 +571,13 @@ class TestTenantSelection:
             )
         else:
             run.assert_not_called()
-        if expected == "unavailable":
+        if expected in ("unavailable", "skipped"):
             graph_get.assert_not_called()
-            assert all(p.state == "warn" for p in expiry)
+            state = "warn" if configured and active is None else "skipped"
+            assert all(p.state == state for p in expiry)
             assert "missing_app" not in render_json(report)
-            assert report.overall == "warn"
+            if configured:
+                assert report.overall == ("warn" if active is None else "ok")
         else:
             assert graph_get.call_count == 2
             assert all(p.state == ("ok" if expected == "healthy" else "error") for p in expiry)
@@ -604,13 +683,19 @@ class TestGraphErrors:
     ) -> None:
         home = _seed_home(tmp_path)
         monkeypatch.setenv("HERMES_HOME", str(home))
-        with _minimal_doctor_patches():
+        active = Mock(return_value=_TENANT)
+        monkeypatch.setattr(client_secret_expiry, "active_az_tenant", active)
+        with (
+            _minimal_doctor_patches(),
+            patch("hermes_a365.doctor.probe_local_config", wraps=probe_local_config),
+        ):
             report = run_all_probes(
                 no_network=False,
                 graph_get=error_getter("Request_ResourceNotFound"),
                 secret_expiry_now=lambda: _NOW,
                 bot_service_sidecar_path=tmp_path / "missing-sidecar.json",
             )
+        active.assert_called_once()
         probe = next(p for p in report.probes if p.name == "blueprint_client_secret")
         assert probe.state == "error"
         assert probe.data["check"] == "missing_app"
@@ -902,7 +987,7 @@ class TestAgentEnvLookup:
             operator_env=operator_env,
         ) == (expected, False)
 
-    def test_agent_one_uses_agent_env_not_gateway(self, tmp_path: Path) -> None:
+    def test_agent_one_uses_agent_env_not_gateway(self, tmp_path: Path, pinned_tenant: str) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
         agents = home / "agents" / "Agent.One"
@@ -932,6 +1017,7 @@ class TestAgentEnvLookup:
             agent_name="Agent.One",
             sidecar_path=tmp_path / "missing-sidecar.json",
             generated_config_path=tmp_path / "missing.json",
+            tenant_id=pinned_tenant,
             graph_get=router,
             now=lambda: _NOW,
             warn_days=30,
@@ -973,7 +1059,7 @@ class TestMutatorTimeout:
 
 
 class TestBfConfiguredWithoutSidecar:
-    def test_bf_env_without_sidecar_runs_check(self, tmp_path: Path) -> None:
+    def test_bf_env_without_sidecar_runs_check(self, tmp_path: Path, pinned_tenant: str) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
         bf = "22222222-2222-2222-2222-222222222222"
@@ -994,6 +1080,7 @@ class TestBfConfiguredWithoutSidecar:
             agent_name=None,
             sidecar_path=sidecar,
             generated_config_path=tmp_path / "missing.json",
+            tenant_id=pinned_tenant,
             graph_get=router,
             now=lambda: _NOW,
         )
@@ -1002,7 +1089,9 @@ class TestBfConfiguredWithoutSidecar:
 
 
 class TestStatusRollup:
-    def test_healthy_plus_denied_skipped_with_both_details(self, tmp_path: Path) -> None:
+    def test_healthy_plus_denied_skipped_with_both_details(
+        self, tmp_path: Path, pinned_tenant: str
+    ) -> None:
         home = tmp_path / "hermes"
         home.mkdir()
         bf = "22222222-2222-2222-2222-222222222222"
@@ -1024,6 +1113,7 @@ class TestStatusRollup:
             agent_name=None,
             sidecar_path=tmp_path / "missing-sidecar.json",
             generated_config_path=tmp_path / "missing.json",
+            tenant_id=pinned_tenant,
             graph_get=router,
             now=lambda: _NOW,
             for_status=True,
@@ -1059,6 +1149,7 @@ class TestStatusRollup:
             agent_name=None,
             sidecar_path=tmp_path / "missing-sidecar.json",
             generated_config_path=tmp_path / "missing.json",
+            tenant_id="00000000-0000-0000-0000-000000000001",
             graph_get=_graph_get(payload),
             now=lambda: _NOW,
             for_status=True,
@@ -1110,11 +1201,11 @@ class TestEntraUrl:
 def _seed_home(tmp_path: Path, *, app_id: str = _BLUEPRINT) -> Path:
     home = tmp_path / "hermes"
     home.mkdir()
-    (home / ".env").write_text(f"A365_APP_ID={app_id}\n")
+    (home / ".env").write_text(f"A365_TENANT_ID={_TENANT}\nA365_APP_ID={app_id}\n")
     return home
 
 
-def _minimal_doctor_patches():
+def _minimal_doctor_patches(*, tenant_id: str | None = _TENANT):
     return patch.multiple(
         "hermes_a365.doctor",
         probe_python_runtime=lambda: ProbeResult("python", "ok", ""),
@@ -1126,7 +1217,7 @@ def _minimal_doctor_patches():
         probe_custom_client_app=lambda: ProbeResult("custom_client_app", "ok", ""),
         probe_network=lambda: ProbeResult("network", "ok", ""),
         probe_keychain=lambda: ProbeResult("keychain", "ok", ""),
-        probe_local_config=lambda: ProbeResult("local_config", "ok", ""),
+        probe_local_config=lambda: ProbeResult("local_config", "ok", "", {"tenant_id": tenant_id}),
         probe_hermes_harness=lambda: ProbeResult("hermes_harness", "ok", ""),
         probe_agent_instance_allowlist=lambda **_kwargs: ProbeResult(
             "agent_instance_allowlist", "ok", ""
@@ -1137,7 +1228,7 @@ def _minimal_doctor_patches():
 
 class TestDoctorStatusIntegration:
     @pytest.fixture(autouse=True)
-    def _block_live_graph(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    def _block_live_graph(self, monkeypatch: pytest.MonkeyPatch, pinned_tenant: str) -> None:
         monkeypatch.setattr(
             "hermes_a365.client_secret_expiry.build_graph_get",
             lambda *_a, **_k: None,
@@ -1150,7 +1241,9 @@ class TestDoctorStatusIntegration:
         home = _seed_home(tmp_path)
         gateway_bf = "22222222-2222-2222-2222-222222222222"
         agent_bf = "33333333-3333-3333-3333-333333333333"
-        (home / ".env").write_text(f"A365_APP_ID={_BLUEPRINT}\nA365_BF_APP_ID={gateway_bf}\n")
+        (home / ".env").write_text(
+            f"A365_TENANT_ID={_TENANT}\nA365_APP_ID={_BLUEPRINT}\nA365_BF_APP_ID={gateway_bf}\n"
+        )
         agent = home / "agents" / "Agent.One"
         agent.mkdir(parents=True)
         (agent / ".env").write_text(f"A365_BF_APP_ID={agent_bf}\n")
