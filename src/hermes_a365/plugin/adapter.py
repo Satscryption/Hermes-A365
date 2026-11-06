@@ -254,7 +254,6 @@ _AGENT_TURN_LIFECYCLE: ContextVar[tuple[int, str, int, int, asyncio.Event] | Non
 
 @dataclass(frozen=True, slots=True)
 class TurnAuthorityRecord:
-    adapter_id: int
     user_id: str
     conversation_id: str
     tenant_id: str
@@ -4391,7 +4390,6 @@ class Agent365Adapter(BasePlatformAdapter):
         if not sk:
             return False
         record = TurnAuthorityRecord(
-            adapter_id=id(self),
             user_id=user_id,
             conversation_id=conv_id,
             tenant_id=self.tenant_id.lower(),
@@ -4505,20 +4503,19 @@ class Agent365Adapter(BasePlatformAdapter):
         self, session_key: str, *, conversation_id: str = ""
     ) -> TurnAuthorityRecord | _UnboundTurnFrameType | None:
         frame = _AGENT_TURN_FRAME.get()
-        if isinstance(frame, TurnAuthorityRecord) and frame.adapter_id != id(self):
-            return _UNBOUND_TURN_FRAME
         if frame is not None:
             return frame
         stack = self._turn_frame_stack_tokens.get(str(session_key or ""), [])
         if not session_key and conversation_id:
             stack = [
                 entry
-                for entries in self._turn_frame_stack_tokens.values()
+                for key, entries in self._turn_frame_stack_tokens.items()
                 for entry in entries
                 if (
                     isinstance(entry, TurnAuthorityRecord)
                     and entry.conversation_id == conversation_id
                 )
+                or self._session_key_to_conv.get(key) == conversation_id
             ]
         if stack:
             # A gateway callback without task context can only use an
@@ -5810,7 +5807,6 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound: dict[str, Any],
         content: str,
         log_context: str,
-        session_key: str = "",
         citations: Any = None,
         validated_path: str | None = None,
         turn_buffer_flush: tuple[str, dict[str, Any], tuple[str, ...]] | None = None,
@@ -5818,7 +5814,12 @@ class Agent365Adapter(BasePlatformAdapter):
         bridge = _import_bridge()
         generation = self._lifecycle_generation
         chat_id = str((inbound.get("conversation") or {}).get("id") or "")
-        frame = self._resolve_turn_frame(session_key, conversation_id=chat_id)
+        frame = self._resolve_turn_frame("", conversation_id=chat_id)
+        if frame is _UNBOUND_TURN_FRAME:
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: unbound turn frame",
+            )
         if isinstance(frame, TurnAuthorityRecord):
             if chat_id and chat_id != frame.conversation_id:
                 return SendResult(
@@ -5829,28 +5830,6 @@ class Agent365Adapter(BasePlatformAdapter):
                     ),
                 )
             inbound = copy.deepcopy(frame.reply_activity)
-            chat_id = str((inbound.get("conversation") or {}).get("id") or chat_id)
-        elif turn_buffer_flush is not None:
-            # Explicit turn-buffer snapshot: keep the caller origin even when
-            # another turn is active in the same conversation (ambiguous
-            # conversation-scoped resolve). This is not a cache fallback.
-            pass
-        else:
-            # No usable frame. Allow only an explicit admitted origin the
-            # caller already selected (message id present in the ledger).
-            # Plain cache routing without an admitted id stays refused.
-            mid = str((inbound or {}).get("id") or "").strip()
-            record = (
-                self._ledger_record_for_message(mid, chat_id)
-                if mid and chat_id
-                else None
-            )
-            if record is None:
-                return SendResult(
-                    success=False,
-                    error=f"agent365 {log_context}: unbound turn frame",
-                )
-            inbound = copy.deepcopy(record.reply_activity)
             chat_id = str((inbound.get("conversation") or {}).get("id") or chat_id)
         if self._turn_reply_blocked(chat_id):
             return SendResult(
@@ -5957,7 +5936,7 @@ class Agent365Adapter(BasePlatformAdapter):
         """Open a local per-turn buffer for a live non-personal chat.
 
         Hermes calls this on the session task before the stream consumer
-        starts sending. The buffer holds a copy of the admitted turn origin and
+        starts sending. The buffer holds a copy of the cached inbound and
         its validated path so the later merged POST does not follow a
         registry update mid-turn. Personal chats keep streaming. A chat
         with no inbound this gateway lifetime is left alone (proactive
@@ -5980,7 +5959,11 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             activity_id = str(getattr(event, "message_id", "") or "")
             record = self._event_turn_authority(event)
-            inbound = copy.deepcopy(record.reply_activity) if record is not None else None
+            inbound = (
+                copy.deepcopy(record.reply_activity)
+                if record is not None
+                else self._cached_inbound_for(chat_id)
+            )
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
             if inbound and chat_type and chat_type != "personal":
@@ -13050,23 +13033,26 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send an Adaptive Card as a reply (no AI-content label / feedback loop —
         these are system-interaction cards, not agent output). Returns
-        ``success=False`` when there's no turn frame or the adapter isn't
+        ``success=False`` when there's no cached inbound or the adapter isn't
         connected, so the gateway falls back to its text prompt."""
         frame = self._resolve_turn_frame(session_key)
-        if not isinstance(frame, TurnAuthorityRecord):
+        if frame is _UNBOUND_TURN_FRAME:
             msg = f"agent365 {log_context}: unbound turn frame"
             logger.warning(msg)
             return SendResult(success=False, error=msg)
-        if str(chat_id) != str(frame.conversation_id or ""):
-            msg = (
-                f"agent365 {log_context}: conversation mismatch "
-                f"chat_id={chat_id!r} frame={frame.conversation_id!r}"
-            )
-            logger.warning(msg)
-            return SendResult(success=False, error=msg)
-        inbound = copy.deepcopy(frame.reply_activity)
+        if isinstance(frame, TurnAuthorityRecord):
+            if str(chat_id) != str(frame.conversation_id or ""):
+                msg = (
+                    f"agent365 {log_context}: conversation mismatch "
+                    f"chat_id={chat_id!r} frame={frame.conversation_id!r}"
+                )
+                logger.warning(msg)
+                return SendResult(success=False, error=msg)
+            inbound = copy.deepcopy(frame.reply_activity)
+        else:
+            inbound = self._cached_inbound_for(chat_id)
         if not inbound:
-            msg = f"agent365 {log_context}: no reply activity for {chat_id!r}"
+            msg = f"agent365 {log_context}: no cached inbound for {chat_id!r}"
             logger.warning(msg)
             return SendResult(success=False, error=msg)
         if self._http_client is None or self._bridge_cfg is None:
@@ -13275,20 +13261,22 @@ class Agent365Adapter(BasePlatformAdapter):
         keeps the chat in ``_awaiting_text_chats`` for the card TTL."""
         if not choices:
             frame = self._resolve_turn_frame(session_key)
-            if not isinstance(frame, TurnAuthorityRecord) or (
-                frame.conversation_id != chat_id or frame.session_key != session_key
+            if frame is _UNBOUND_TURN_FRAME or (
+                isinstance(frame, TurnAuthorityRecord)
+                and (frame.conversation_id != chat_id or frame.session_key != session_key)
             ):
                 return SendResult(success=False, error="agent365 clarify: mismatched turn frame")
-            inbound = copy.deepcopy(frame.reply_activity)
+            inbound = (
+                copy.deepcopy(frame.reply_activity)
+                if isinstance(frame, TurnAuthorityRecord)
+                else self._cached_inbound_for(chat_id)
+            )
             if not inbound:
-                msg = f"agent365 clarify: no reply activity for {chat_id!r}"
+                msg = f"agent365 clarify: no cached inbound for {chat_id!r}"
                 logger.warning(msg)
                 return SendResult(success=False, error=msg)
             result = await self._send_reply_activity(
-                inbound=inbound,
-                content=question,
-                log_context="clarify",
-                session_key=session_key,
+                inbound=inbound, content=question, log_context="clarify"
             )
             if result.success:
                 # #130: keep this chat in the registry until the typed answer
@@ -13332,21 +13320,27 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> list[tuple[str, dict[str, Any]]]:
         session_key = str(resolver.get("session_key") or "")
         frame = self._resolve_turn_frame(session_key)
-        if not isinstance(frame, TurnAuthorityRecord):
+        if frame is _UNBOUND_TURN_FRAME:
             logger.warning("agent365 card capability mint rejected: unbound turn frame")
             return []
-        if frame.conversation_id != str(chat_id or "") or frame.session_key != session_key:
-            logger.warning("agent365 card capability mint rejected: mismatched turn frame")
-            return []
-        user_id = frame.user_id
-        tenant_id = frame.tenant_id
+        if isinstance(frame, TurnAuthorityRecord):
+            if frame.conversation_id != str(chat_id or "") or frame.session_key != session_key:
+                logger.warning("agent365 card capability mint rejected: mismatched turn frame")
+                return []
+            inbound = frame.reply_activity
+            user_id = frame.user_id
+            tenant_id = frame.tenant_id
+        else:
+            inbound = self._cached_inbound_for(chat_id) or {}
+            user_id = _import_bridge()._canonical_activity_user(inbound)
+            tenant_id = self.tenant_id.lower()
         nonce = secrets.token_urlsafe(24)
         opaque_choices = {secrets.token_urlsafe(12): value for _, value in choices}
         self._card_capabilities[nonce] = {
             "kind": kind,
             "conversation_id": chat_id,
             "user_id": user_id,
-            "requires_authorized_sender": True,
+            "requires_authorized_sender": isinstance(frame, TurnAuthorityRecord),
             "tenant_id": tenant_id,
             "lifecycle_generation": self._lifecycle_generation,
             "chat_generation": self._chat_generation(chat_id),
@@ -13434,6 +13428,7 @@ class Agent365Adapter(BasePlatformAdapter):
         capability = self._card_capabilities.get(nonce) if nonce else None
         conv = activity.get("conversation")
         conv_id = str(conv.get("id") or "") if isinstance(conv, dict) else ""
+        user_id = _import_bridge()._canonical_activity_user(activity)
         authorized_user_id = (authorized_sender_id or "").strip().lower()
         if (
             capability is None
@@ -13441,8 +13436,13 @@ class Agent365Adapter(BasePlatformAdapter):
             > _CARD_CAPABILITY_TTL_SEC
             or capability.get("kind") != kind
             or capability.get("conversation_id") != conv_id
-            or not authorized_user_id
-            or capability.get("user_id") != authorized_user_id
+            or not (
+                (authorized_user_id and capability.get("user_id") == authorized_user_id)
+                or (
+                    not capability.get("requires_authorized_sender")
+                    and capability.get("user_id") == user_id
+                )
+            )
             or capability.get("tenant_id") != self.tenant_id.lower()
             or capability.get("lifecycle_generation") != self._lifecycle_generation
             or capability.get("chat_generation") != self._chat_generation(conv_id)
@@ -13519,7 +13519,6 @@ class Agent365Adapter(BasePlatformAdapter):
                             inbound=activity,
                             content=follow_text,
                             log_context="slash_confirm",
-                            session_key=str(resolver.get("session_key") or ""),
                         )
 
                     self._spawn_slash_confirm_followup(conv_id, _post_slash_confirm_follow())

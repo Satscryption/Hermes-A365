@@ -25,7 +25,6 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
-- Tighten turn-frame handling for card and reply paths.
 - Test suite: made a subprocess overflow test independent of runner speed.
 - Retain bridge delivery state across inbound retries so a definitely unsent reply
   can be retried without calling the operator webhook again. Ambiguous and terminal

@@ -756,10 +756,7 @@ class TestAckPathTiming:
             resolver={"session_key": "sess-1", "confirm_id": "cfm-1"},
         )
         started = time.monotonic()
-        authorized = plugin_tests.adapter_mod._import_bridge()._canonical_activity_user(activity)
-        resp = await a._handle_card_action(
-            activity, value, authorized_sender_id=authorized
-        )
+        resp = await a._handle_card_action(activity, value)
         ack_elapsed = time.monotonic() - started
         assert resp.status_code == 200
         assert ack_elapsed < 1.0
