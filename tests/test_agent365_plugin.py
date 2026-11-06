@@ -26176,13 +26176,13 @@ class TestTurnFrame:
     ):
         inbound = _make_inbound(conv_id=conv_id, activity_id=message_id)
         assert a.admit_turn_authority(inbound, session_key, message_id=message_id)
-        record = a._ledger_record_for_message(message_id)
+        record = a._ledger_record_for_message(message_id, conv_id)
         assert record is not None
         return a._turn_frame_scope(session_key, record)
 
     @pytest.fixture
-    def runtime(self, monkeypatch: pytest.MonkeyPatch) -> Any:
-        """Keep gateway/connector boundaries local; run the real adapter methods."""
+    async def runtime(self, monkeypatch: pytest.MonkeyPatch) -> Any:
+        """Partial: simulated gateway owner, JWT, approval queue and connector I/O."""
         a = _make_adapter(monkeypatch, group_sessions_per_user=False)
         TestInteractiveCards()._connect(a)
         # Main's queue fixture is session-specific. Frame tests also exercise
@@ -26196,9 +26196,26 @@ class TestTurnFrame:
         monkeypatch.setattr(a, "_gw_mark_awaiting_text", MagicMock())
         posted = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", posted)
-        return SimpleNamespace(
-            adapter=a, posted=posted, pending=pending, resolver=resolver, list_pending=list_pending
-        )
+        # Keep admitted events owned until each test invokes the real background
+        # adapter entry point; the harness stub itself does not spawn turns.
+        owner = asyncio.create_task(asyncio.Event().wait())
+
+        async def dispatch(base: Any, event: Any) -> None:
+            base._handled_events.append(event)
+            base._session_tasks.setdefault(a._session_key_for(event), owner)
+
+        monkeypatch.setattr(_StubBasePlatformAdapter, "handle_message", dispatch)
+        try:
+            yield SimpleNamespace(
+                adapter=a,
+                posted=posted,
+                pending=pending,
+                resolver=resolver,
+                list_pending=list_pending,
+            )
+        finally:
+            owner.cancel()
+            await asyncio.gather(owner, return_exceptions=True)
 
     async def _admit(self, runtime: Any, *activities: dict[str, Any]) -> list[Any]:
         import httpx
@@ -26387,11 +26404,17 @@ class TestTurnFrame:
         assert (await a._handle_card_action(later, data)).status_code == 403
         runtime.resolver.assert_not_called()
         assert data["capability"] in a._card_capabilities
-        response = await a._handle_card_action(_make_inbound(), data)
+        response = await a._handle_card_action(
+            _make_inbound(), data, authorized_sender_id=_make_inbound()["from"]["id"]
+        )
         assert response.status_code == 200
         runtime.resolver.assert_called_once_with("sess-1", "once", request_id="req-frame")
         assert a._card_capabilities == {}
-        assert (await a._handle_card_action(_make_inbound(), data)).status_code == 403
+        assert (
+            await a._handle_card_action(
+                _make_inbound(), data, authorized_sender_id=_make_inbound()["from"]["id"]
+            )
+        ).status_code == 403
         runtime.resolver.assert_called_once()
 
     @pytest.fixture
@@ -26484,7 +26507,11 @@ class TestTurnFrame:
         data = sent["reply"]["attachments"][0]["content"]["actions"][0]["data"]
         runtime.pending.clear()
         with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
-            assert (await a._handle_card_action(_make_inbound(), data)).status_code == 200
+            assert (
+                await a._handle_card_action(
+                    _make_inbound(), data, authorized_sender_id=_make_inbound()["from"]["id"]
+                )
+            ).status_code == 200
         assert "request no longer pending" in caplog.text
         assert a._card_capabilities == {}
         runtime.resolver.assert_not_called()
@@ -26675,6 +26702,344 @@ class TestTurnFrame:
         sent = runtime.posted.await_args.kwargs
         assert sent["inbound"]["id"] == "act-card-turn"
         assert sent["reply"]["replyToId"] == "act-card-turn"
+
+    async def test_card_click_body_identity_requires_admitted_sender(self, alias_card: Any) -> None:
+        """Partial JWT/resolver I/O; real capability mint, route and sender admission."""
+        import httpx
+
+        runtime = alias_card.runtime
+        runtime.adapter._allowed_users = ("other@example.com",)
+        alias_card.click["from"] = {
+            "id": "owner@example.com",
+            "userPrincipalName": "other@example.com",
+        }
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=runtime.adapter.build_app()),
+            base_url="http://testserver",
+        ) as client:
+            response = await client.post(
+                "/api/messages", json=alias_card.click, headers={"Authorization": "Bearer a.b.c"}
+            )
+        assert response.status_code == 403, response.text
+        runtime.resolver.assert_not_called()
+        assert (
+            runtime.adapter._card_capabilities[alias_card.data["capability"]]
+            is alias_card.capability
+        )
+
+    @pytest.mark.parametrize("sender", [None, "", "   "])
+    async def test_card_click_requires_nonempty_admitted_sender(
+        self, alias_card: Any, sender: str | None
+    ) -> None:
+        """Partial resolver I/O; real mint and handler, without route sender context."""
+        runtime = alias_card.runtime
+        alias_card.click["from"] = {"id": "owner@example.com"}
+        response = await runtime.adapter._handle_card_action(
+            alias_card.click, alias_card.data, authorized_sender_id=sender
+        )
+        assert response.status_code == 403
+        runtime.resolver.assert_not_called()
+        assert alias_card.data["capability"] in runtime.adapter._card_capabilities
+
+    async def test_ledger_same_message_id_in_two_chats(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial gateway/connector I/O; real inbound admission and frame lookup."""
+        a = runtime.adapter
+        first = _make_inbound(conv_id="chat-one", activity_id="shared-id")
+        second = _make_inbound(conv_id="chat-two", activity_id="shared-id")
+        second["from"]["id"] = "second-user"
+        events = await self._admit(runtime, first, second)
+        assert len(events) == 2
+
+        async def process(_base: Any, event: Any, sk: str) -> None:
+            assert (
+                await a.send_slash_confirm(event.source.chat_id, "Confirm", "Run?", sk, "cfm")
+            ).success
+
+        monkeypatch.setattr(
+            _StubBasePlatformAdapter, "_process_message_background", process, raising=False
+        )
+        for event, inbound in zip(events, (first, second), strict=True):
+            record = a._event_turn_authority(event)
+            assert record.conversation_id == inbound["conversation"]["id"]
+            assert record.user_id == inbound["from"]["id"]
+            assert a._frame_for_run_agent("shared-id", record.conversation_id) is record
+            await a._process_message_background(event, a._session_key_for(event))
+            sent = runtime.posted.await_args.kwargs
+            assert sent["inbound"]["conversation"]["id"] == record.conversation_id
+            data = sent["reply"]["attachments"][0]["content"]["actions"][0]["data"]
+            assert a._card_capabilities[data["capability"]]["user_id"] == record.user_id
+
+    async def test_reply_callback_uses_session_stack_origin(self, runtime: Any) -> None:
+        """Partial connector I/O; real reply resolution and rendering."""
+        a = runtime.adapter
+        later = _make_inbound(activity_id="later")
+        with self._card_turn(a):
+            token = adapter_mod._AGENT_TURN_FRAME.set(None)
+            try:
+                result = await a._send_reply_activity(
+                    inbound=later, content="Reply", log_context="callback"
+                )
+            finally:
+                adapter_mod._AGENT_TURN_FRAME.reset(token)
+        assert result.success
+        sent = runtime.posted.await_args.kwargs
+        assert sent["inbound"]["id"] == "act-card-turn"
+        assert sent["reply"]["replyToId"] == "act-card-turn"
+
+    async def test_nested_frame_callback_uses_distinct_origins(self, runtime: Any) -> None:
+        """Partial connector I/O; real nested scopes with shared and distinct origins."""
+        a = runtime.adapter
+        for distinct in (False, True):
+            runtime.posted.reset_mock()
+            a._card_capabilities.clear()
+            with self._card_turn(a):
+                outer = adapter_mod._AGENT_TURN_FRAME.get()
+                if distinct:
+                    inbound = _make_inbound(activity_id="second-origin")
+                    assert a.admit_turn_authority(inbound, "sess-1")
+                    inner = a._ledger_record_for_message("second-origin", "conv-1")
+                else:
+                    inner = outer
+                with a._turn_frame_scope("sess-1", inner):
+                    token = adapter_mod._AGENT_TURN_FRAME.set(None)
+                    try:
+                        result = await self._send(a, "slash", "sess-1")
+                    finally:
+                        adapter_mod._AGENT_TURN_FRAME.reset(token)
+            assert result.success is not distinct
+            if distinct:
+                runtime.posted.assert_not_awaited()
+                assert a._card_capabilities == {}
+            else:
+                assert runtime.posted.await_args.kwargs["inbound"]["id"] == outer.message_id
+
+    @pytest.mark.parametrize("exit_kind", ["complete", "error", "cancel"])
+    async def test_ledger_retires_finished_background_turn(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch, exit_kind: str
+    ) -> None:
+        """Partial gateway work; real route admission and background lifecycle."""
+        a = runtime.adapter
+        (event,) = await self._admit(runtime, _make_inbound())
+        record = a._event_turn_authority(event)
+        assert record is not None
+
+        async def process(_base: Any, _event: Any, _sk: str) -> None:
+            assert a._event_turn_authority(event) is record
+            if exit_kind == "error":
+                raise ValueError("turn incomplete")
+            if exit_kind == "cancel":
+                raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            _StubBasePlatformAdapter, "_process_message_background", process, raising=False
+        )
+        if exit_kind == "complete":
+            await a._process_message_background(event, a._session_key_for(event))
+        else:
+            with pytest.raises(ValueError if exit_kind == "error" else asyncio.CancelledError):
+                await a._process_message_background(event, a._session_key_for(event))
+        assert a._turn_authority_ledger == {}
+        assert a._turn_authority_owners == {}
+
+    async def test_ledger_preserves_active_and_queued_turns(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial gateway work; real pending admission, scopes and retirement."""
+        import gateway.platforms.base as base
+
+        a = runtime.adapter
+        first, second = await self._admit(
+            runtime, _make_inbound(activity_id="active"), _make_inbound(activity_id="queued")
+        )
+        sk = a._session_key_for(first)
+        first_record = a._event_turn_authority(first)
+        second_record = a._event_turn_authority(second)
+
+        async def process(_base: Any, event: Any, _sk: str) -> None:
+            assert a._event_turn_authority(event) is not None
+
+        monkeypatch.setattr(
+            _StubBasePlatformAdapter, "_process_message_background", process, raising=False
+        )
+        with a._turn_frame_scope(sk, first_record):
+            a._clear_session_pending_turn_state(sk)
+            assert a._event_turn_authority(first) is first_record
+            base.merge_pending_message_event(a._pending_messages, sk, second)
+            assert a._event_turn_authority(second) is second_record
+        await a._process_message_background(first, sk)
+        assert a._event_turn_authority(first) is None
+        assert a._event_turn_authority(second) is second_record
+        a._pending_messages.pop(sk)
+        await a._process_message_background(second, sk)
+        assert a._turn_authority_ledger == {}
+
+    @pytest.mark.parametrize("entry", ["start", "drain"])
+    async def test_ledger_preserves_scheduled_turn_until_background_entry(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch, entry: str
+    ) -> None:
+        """Partial gateway scheduler; real scheduling hooks, frame and ledger lifecycle."""
+        a = runtime.adapter
+        (event,) = await self._admit(runtime, _make_inbound(activity_id="scheduled"))
+        sk = a._session_key_for(event)
+        record = a._event_turn_authority(event)
+        ready = asyncio.Event()
+        release = asyncio.Event()
+
+        async def deferred() -> None:
+            ready.set()
+            await release.wait()
+            await a._process_message_background(event, sk)
+
+        def schedule(_base: Any, _event: Any, key: str, **_kwargs: Any) -> bool:
+            a._session_tasks[key] = asyncio.create_task(deferred())
+            return True
+
+        async def process(_base: Any, _event: Any, _key: str) -> None:
+            assert adapter_mod._AGENT_TURN_FRAME.get() is record
+
+        monkeypatch.setattr(
+            _StubBasePlatformAdapter, "_start_session_processing", schedule, raising=False
+        )
+        monkeypatch.setattr(_StubBasePlatformAdapter, "_spawn_drain_task", schedule, raising=False)
+        monkeypatch.setattr(
+            _StubBasePlatformAdapter, "_process_message_background", process, raising=False
+        )
+        old_owner = a._session_tasks[sk]
+        if entry == "start":
+            assert a._start_session_processing(event, sk)
+        else:
+            a._spawn_drain_task(event, sk)
+        scheduled = a._session_tasks[sk]
+        try:
+            await ready.wait()
+            old_owner.cancel()
+            await asyncio.gather(old_owner, return_exceptions=True)
+            await asyncio.sleep(0)
+            assert a._event_turn_authority(event) is record
+        finally:
+            release.set()
+            await scheduled
+        assert a._turn_authority_ledger == {}
+
+    async def test_ledger_failed_dispatch_can_readmit(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Partial gateway dispatch failure; real admit/handle/retire/re-admit path."""
+        a = runtime.adapter
+        inbound = _make_inbound(activity_id="retry-key")
+        event = a._activity_to_event(inbound, media=([], [], adapter_mod.MessageType.TEXT))
+        sk = a._session_key_for(event)
+        assert a.admit_turn_authority(inbound, sk)
+
+        async def fail(_base: Any, _event: Any) -> None:
+            raise RuntimeError("dispatch unavailable")
+
+        monkeypatch.setattr(_StubBasePlatformAdapter, "handle_message", fail)
+        with pytest.raises(RuntimeError, match="dispatch unavailable"):
+            await a.handle_message(event)
+        assert a.admit_turn_authority(inbound, sk)
+        assert a._event_turn_authority(event) is not None
+
+    @pytest.mark.parametrize("same_user", [True, False])
+    async def test_ledger_stays_bounded_during_pending_traffic(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch, same_user: bool
+    ) -> None:
+        """Partial gateway merger I/O; real route, queue guards and ledger lifecycle."""
+        import gateway.platforms.base as base
+
+        a = runtime.adapter
+        a._pending_turn_fifo_max = 2
+
+        async def queue(_base: Any, event: Any) -> None:
+            a._handled_events.append(event)
+            base.merge_pending_message_event(
+                a._pending_messages, a._session_key_for(event), event, merge_text=True
+            )
+
+        monkeypatch.setattr(_StubBasePlatformAdapter, "handle_message", queue)
+        for index in range(32):
+            inbound = _make_inbound(activity_id=f"queued-{index}")
+            if not same_user:
+                inbound["from"]["id"] = f"user-{index}"
+            await self._admit(runtime, inbound)
+            assert len(a._turn_authority_ledger) <= (1 if same_user else 3)
+        sk = a._session_key_for(a._handled_events[0])
+        await a.cancel_session_processing(sk)
+        assert a._turn_authority_ledger == {}
+
+    @pytest.mark.parametrize("cleanup", ["chat", "disconnect"])
+    async def test_ledger_cleanup_releases_idle_and_pending_records(
+        self, runtime: Any, cleanup: str
+    ) -> None:
+        """Partial gateway/connector I/O; real chat teardown or disconnect cleanup."""
+        import gateway.platforms.base as base
+
+        a = runtime.adapter
+        inbound = _make_inbound(activity_id="idle")
+        queued = _make_inbound(activity_id="pending")
+        event = a._activity_to_event(queued, media=([], [], adapter_mod.MessageType.TEXT))
+        sk = a._session_key_for(event)
+        a._session_key_to_conv[sk] = "conv-1"
+        assert a.admit_turn_authority(inbound, sk)
+        assert a.admit_turn_authority(queued, sk)
+        base.merge_pending_message_event(a._pending_messages, sk, event)
+        if cleanup == "chat":
+            await a._teardown_chat_state("conv-1")
+        else:
+            a._http_client.aclose = AsyncMock()
+            await a.disconnect()
+        assert a._turn_authority_ledger == {}
+
+    @pytest.mark.parametrize("cleanup", ["disconnect", "failed_connect"])
+    async def test_pending_merge_registration_restored_on_reconnect(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch, cleanup: str
+    ) -> None:
+        """Partial uvicorn/config/JWT I/O; real connect, cleanup and merge wrapper."""
+        import gateway.platforms.base as base
+
+        class LocalServer:
+            def __init__(self, _config: Any) -> None:
+                self.started = True
+                self.should_exit = False
+
+            async def serve(self) -> None:
+                while not self.should_exit:
+                    await asyncio.sleep(0)
+
+        monkeypatch.setitem(
+            sys.modules,
+            "uvicorn",
+            SimpleNamespace(Config=lambda *a, **kw: object(), Server=LocalServer),
+        )
+        a = runtime.adapter
+        a._http_client.aclose = AsyncMock()
+        if cleanup == "disconnect":
+            await a.disconnect()
+        else:
+            await a._run_failed_connect_cleanup()
+        assert id(a._pending_messages) not in adapter_mod._PENDING_MERGE_REGISTRY
+        monkeypatch.setattr(a, "_make_bridge_config", MagicMock(return_value=MagicMock()))
+        assert await a._connect(is_reconnect=True)
+        try:
+            first = _make_inbound(activity_id="first-reconnected")
+            second = _make_inbound(activity_id="second-reconnected")
+            second["from"]["id"] = "second-user"
+
+            async def queue(base_adapter: Any, event: Any) -> None:
+                base_adapter._handled_events.append(event)
+                base.merge_pending_message_event(
+                    a._pending_messages, a._session_key_for(event), event, merge_text=True
+                )
+
+            monkeypatch.setattr(_StubBasePlatformAdapter, "handle_message", queue)
+            events = await asyncio.create_task(self._admit(runtime, first, second))
+            sk = a._session_key_for(events[0])
+            assert a._pending_messages[sk] is events[0]
+            assert list(a._pending_turn_fifo[sk]) == [events[1]]
+        finally:
+            await a.disconnect()
 
 
 class TestHandoff:
