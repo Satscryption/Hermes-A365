@@ -8,6 +8,7 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- Keep late first-turn timing scoped to its own turn during the minimum-age wait.
 - **Copilot first-turn timing when the add notice arrives late (refs #290).** The
   first-turn marker is now recorded when the conversation-add activity is
   received, before it is persisted, and a marker that arrives during the final

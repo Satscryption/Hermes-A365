@@ -9652,6 +9652,105 @@ class TestEditMessage:
         assert final["entities"][0]["streamType"] == "final"
         assert final["entities"][0]["streamId"] == "ka-marker-during-wait"
 
+    @pytest.mark.parametrize("second_turn_state", ["new", "already_open"])
+    @pytest.mark.parametrize("marker_timing", ["pending", "during_wait"])
+    @pytest.mark.asyncio
+    async def test_copilot_member_added_age_wait_keeps_turn_ownership(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        second_turn_state: str,
+        marker_timing: str,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "19:copilot-turn-age-ownership@thread.v2"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 3.0
+        a._copilot_first_turn_min_stream_age_before_final_sec = 10.0
+        a._copilot_short_turn_max_duration_sec = 3.0
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        event1 = _StubMessageEvent(
+            text="first",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event1)
+        buf = a._turn_buffers[chat]
+        turn1 = buf["turns"][0]
+        second_inbound = copy.deepcopy(inbound)
+        second_inbound["id"] = "act-2"
+        second_inbound["from"]["id"] = "user-2"
+        if second_turn_state == "already_open":
+            a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-2")
+            assert not buf["turns"][-1].get("copilot_post_member_added")
+        clock["t"] += 0.1
+
+        def note_marker() -> None:
+            a._note_copilot_member_added_pending(
+                chat,
+                {
+                    "type": "conversationUpdate",
+                    "conversation": inbound["conversation"],
+                    "membersAdded": [{"id": "agent-1"}],
+                },
+                "B",
+            )
+
+        if marker_timing == "pending":
+            note_marker()
+        opened = clock["t"] - 0.05
+        buf["keepalive"] = {
+            "stream_id": "ka-turn-age-ownership",
+            "sequence": 1,
+            "opened_mono": opened,
+        }
+        lock = a._turn_buffer_lock(buf)
+        second_final_started = False
+
+        async def sleep_with_second_turn(delay: float) -> None:
+            nonlocal second_final_started
+            if delay <= 0:
+                return
+            assert not lock.locked()
+            if second_final_started:
+                clock["t"] += delay
+                return
+            second_final_started = True
+            wake_at = clock["t"] + delay
+            clock["t"] += 1.0
+            if marker_timing == "during_wait":
+                note_marker()
+            pending = a._copilot_member_added_pending[chat]
+            if second_turn_state == "new":
+                a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-2")
+            turn2 = buf["turns"][-1]
+            assert turn2 is not turn1
+            assert not turn2.get("copilot_post_member_added")
+            async with lock:
+                await a._ensure_copilot_min_stream_age_before_final_locked(chat, buf, turn2)
+                assert not turn2.get("copilot_post_member_added")
+                assert "copilot_member_added_consumed_mono" not in turn2
+                a._release_copilot_member_added_for_turn(chat, turn2)
+            assert a._copilot_member_added_pending[chat] == pending
+            clock["t"] = max(clock["t"], wake_at)
+
+        sleep_mock.side_effect = sleep_with_second_turn
+        async with lock:
+            await a._ensure_copilot_min_stream_age_before_final_locked(chat, buf, turn1)
+        waits = [float(call.args[0]) for call in sleep_mock.await_args_list if call.args[0] > 0]
+        assert second_final_started
+        expected_waits = [9.95, 1.95] if marker_timing == "pending" else [2.95, 1.95, 7.0]
+        assert waits == pytest.approx(expected_waits)
+        assert clock["t"] - opened == pytest.approx(10.0)
+        assert turn1.get("copilot_post_member_added") is True
+        assert turn1["copilot_member_added_consumed_mono"] == a._copilot_member_added_pending[chat]
+        a._release_copilot_member_added_for_turn(chat, turn1)
+        assert chat not in a._copilot_member_added_pending
+        a._open_or_nest_turn_buffer(chat, second_inbound, activity_id="act-3")
+        assert not buf["turns"][-1].get("copilot_post_member_added")
+
     @pytest.mark.asyncio
     async def test_copilot_member_added_receipt_visible_while_lifecycle_persistence_awaits(
         self, monkeypatch: pytest.MonkeyPatch
