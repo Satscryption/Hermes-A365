@@ -13,6 +13,9 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   received, before it is persisted, and a marker that arrives during the final
   minimum-age wait now applies to the current turn instead of carrying over to
   the next one. Activity payloads are unchanged.
+- Retain bridge delivery state across inbound retries so a definitely unsent reply
+  can be retried without calling the operator webhook again. Ambiguous and terminal
+  reply outcomes stop further sends; cached replies have payload and attempt limits.
 - Sidecar read errors during bot-service create now identify the create step.
 
 ### Changed
