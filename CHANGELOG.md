@@ -6,10 +6,29 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **#191 — Client secret expiry in `doctor` / `status`.** Read
+  ``passwordCredentials`` ``endDateTime`` metadata (never secret values) for
+  the blueprint app and Path B Bot Framework app via the existing ``az rest`` /
+  mutator Graph path. **Warn** within 30 days by default
+  (``--secret-expiry-warn-days N``); **fail** when expired or no active secret;
+  degrade to a clear “could not check” notice on permission or parse errors.
+  Rotation runbook: ``references/client-secret-rotation.md``. Refs
+  [#191](https://github.com/Satscryption/Hermes-A365/issues/191).
+
 ### Changed
 
 - **#291 — Plain-fallback log reason.** The plain fallback log now names its reason (`age_budget`, `rotated`, `retry_exhausted`); expected age-budget and rotation fallbacks log at info instead of warning.
+- Client secret expiry Graph responses enforce a JSON nesting depth limit of 64 before decoding.
 ### Fixed
+
+- Retain bridge delivery state across inbound retries so a definitely unsent reply
+  can be retried without calling the operator webhook again. Ambiguous and terminal
+  reply outcomes stop further sends; cached replies have payload and attempt limits.
+- Sidecar read errors during bot-service create now identify the create step.
+
+### Changed
 
 - **``register`` re-run with a generated config for a different agent.** When
   a re-run skips ``a365 setup blueprint``, the blueprint secret check now runs

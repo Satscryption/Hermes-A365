@@ -8591,8 +8591,38 @@ class TestEditMessage:
         assert adapter_mod._classify_answer_final_post(result) == adapter_mod._ANSWER_FINAL_NOT_SENT
 
     @pytest.mark.asyncio
-    async def test_answer_final_near_cap_budget_exhausted_plain_fallback(
-        self, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize("budget_left", [-1.0, 0.5])
+    async def test_answer_final_budget_exhausted_before_post_is_not_sent(
+        self, monkeypatch: pytest.MonkeyPatch, budget_left: float
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-budget-before-post"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+
+        result = await a._post_keepalive_activity(
+            chat,
+            {"inbound": inbound, "validated_path": "A"},
+            stream_id="ka-budget-before-post",
+            sequence=0,
+            final=True,
+            text="Answer that was never sent",
+            message_chrome=True,
+            outbound_deadline=time.monotonic() + budget_left,
+        )
+
+        post_mock.assert_not_awaited()
+        assert result.status is None
+        assert result.budget_exhausted_before_send is True
+        assert result.untracked is False
+        assert result.timeout_after_send is False
+        assert adapter_mod._classify_answer_final_post(result) == adapter_mod._ANSWER_FINAL_NOT_SENT
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("cap_left", [0.5, 60.0])
+    async def test_answer_final_budget_exhausted_plain_fallback(
+        self, monkeypatch: pytest.MonkeyPatch, cap_left: float
     ) -> None:
         a = _make_adapter(monkeypatch)
         chat = "conv-G-cap-budget-plain"
@@ -8604,7 +8634,14 @@ class TestEditMessage:
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         cap = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_CAP_SEC
         margin = adapter_mod._ANSWER_FINAL_STREAM_CAP_MARGIN_SEC
-        cap_left = 0.5
+        if cap_left > 1.0:
+            # A young stream still needs fallback when the shared retry helper
+            # runs out of budget before its first POST (e.g. after token mint).
+            monkeypatch.setattr(
+                a,
+                "_keepalive_stream_outbound_deadline",
+                lambda _chat_id, **_kwargs: time.monotonic() - 1.0,
+            )
         finals = {"n": 0}
 
         bridge_mod = adapter_mod._import_bridge()
@@ -8618,7 +8655,7 @@ class TestEditMessage:
                     for e in body.get("entities") or []
                 ):
                     finals["n"] += 1
-                    raise AssertionError("answer final must not POST when cap budget < 1s")
+                    raise AssertionError("answer final must not POST after budget exhaustion")
                 return self._http_result(202)
             return self._http_result(201, "ka-cap-budget")
 
@@ -8640,8 +8677,10 @@ class TestEditMessage:
             "opened_mono": time.monotonic() - (cap - margin - cap_left),
         }
         await a.send(chat_id=chat, content="Plain after cap budget", reply_to=None)
+        record = a._delivery_record(buf, buf["turns"][0])
         await a.on_processing_complete(event, outcome="success")
         assert finals["n"] == 0
+        assert not record.get("may_have_landed")
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == "Plain after cap budget"
         assert chat not in a._turn_buffers
