@@ -48,6 +48,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -140,6 +141,9 @@ _JWT_RE = re.compile(r"eyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]
 _JSON_SECRET_RE = re.compile(
     r"(?i)(\"(?:password|secret|client_secret|access_token|refresh_token|token)\"\s*:\s*\")[^\"]*\""
 )
+_JSON_CREDENTIAL_METADATA_RE = re.compile(
+    r"(?i)(\"(?:hint|secretText|customKeyIdentifier|keyId)\"\s*:\s*\")[^\"]*\""
+)
 
 GRAPH_READ_PERMISSION_HINT = (
     "Graph rejected the registration state read (insufficient privileges). "
@@ -216,6 +220,7 @@ def redact(text: str) -> str:
     redacted = _JWT_RE.sub("[redacted]", text)
     redacted = _BEARER_RE.sub("Bearer [redacted]", redacted)
     redacted = _JSON_SECRET_RE.sub(r'\1[redacted]"', redacted)
+    redacted = _JSON_CREDENTIAL_METADATA_RE.sub(r'\1[redacted]"', redacted)
     if len(redacted) > 400:
         return redacted[:400] + "…"
     return redacted
@@ -365,6 +370,51 @@ def application_by_app_id_url(app_id: str) -> str:
     )
 
 
+_SECRET_EXPIRY_SELECT = frozenset(
+    {"passwordCredentials", "keyCredentials", "federatedIdentityCredentials"}
+)
+_SECRET_EXPIRY_SELECT_CSV = "passwordCredentials,keyCredentials,federatedIdentityCredentials"
+
+
+def application_client_secret_expiry_url(app_id: str) -> str:
+    """Read credential metadata (dates only); never secret values."""
+    canonical = str(UUID(app_id))
+    return (
+        f"https://{_GRAPH_HOST}/beta/applications(appId='{canonical}')"
+        f"?{_select_query(_SECRET_EXPIRY_SELECT_CSV)}"
+    )
+
+
+def assert_client_secret_expiry_read_url(url: str) -> None:
+    """Allow only the narrow client-secret expiry metadata read."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.netloc != _GRAPH_HOST:
+        raise EntraStateError("refusing a non-Graph URL during client secret expiry read.")
+    if parts.fragment or not parts.query:
+        raise EntraStateError("refusing a Graph client secret expiry read without a query.")
+    query_keys = frozenset(parse_qs(parts.query, keep_blank_values=True))
+    if query_keys != frozenset({"$select"}):
+        raise EntraStateError(
+            "refusing a Graph client secret expiry read with query parameters other than $select."
+        )
+    path = parts.path
+    if not path.startswith("/beta/applications(appId='") or not path.endswith("')"):
+        raise EntraStateError(
+            "refusing a Graph client secret expiry read outside applications(appId=…)."
+        )
+    inner = path[len("/beta/applications(appId='") : -2]
+    if not _is_guid(inner):
+        raise EntraStateError("refusing a Graph client secret expiry read with a non-GUID appId.")
+    select = _query_select(parts.query)
+    if select is None:
+        raise EntraStateError("refusing a Graph client secret expiry read without $select.")
+    if select != _SECRET_EXPIRY_SELECT:
+        raise EntraStateError(
+            "refusing a Graph client secret expiry read whose $select is not exactly "
+            f"{sorted(_SECRET_EXPIRY_SELECT)}."
+        )
+
+
 def blueprint_cast_url(object_id: str) -> str:
     canonical = str(UUID(object_id))
     return (
@@ -496,6 +546,70 @@ def _is_guid(value: str) -> bool:
 # ---------------------------------------------------------------------------
 
 
+_GRAPH_JSON_MAX_DEPTH = 64
+
+
+def _json_depth_exceeds(text: str, limit: int) -> bool:
+    """Check container nesting before decoding, ignoring strings and escapes."""
+    depth = 0
+    in_string = False
+    escaped = False
+    for char in text:
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+        elif char == '"':
+            in_string = True
+        elif char in "[{":
+            depth += 1
+            if depth > limit:
+                return True
+        elif char in "]}":
+            depth -= 1
+    return False
+
+
+def _parse_strict_graph_json_object(text: str) -> dict[str, Any] | None:
+    """Parse a Graph body as one complete top-level JSON object.
+
+    Nesting is bounded explicitly: newer interpreters can decode very deep
+    input without ``RecursionError``, so that error alone is not a limit."""
+    stripped = text.strip()
+    if not stripped or _json_depth_exceeds(stripped, _GRAPH_JSON_MAX_DEPTH):
+        return None
+    try:
+        data = json.loads(stripped)
+    except (json.JSONDecodeError, ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _unreadable_graph_expiry_payload(message: str = "Graph read failed") -> dict[str, Any]:
+    return {
+        "error": {
+            "code": "UnreadableGraphResponse",
+            "message": message,
+        }
+    }
+
+
+def _parse_expiry_response_bytes(raw: bytes) -> dict[str, Any] | None:
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return _unreadable_graph_expiry_payload()
+    parsed = _parse_strict_graph_json_object(text)
+    if parsed is None and _json_depth_exceeds(text, _GRAPH_JSON_MAX_DEPTH):
+        return _unreadable_graph_expiry_payload(
+            f"Graph response exceeds JSON nesting depth limit of {_GRAPH_JSON_MAX_DEPTH}"
+        )
+    return parsed if parsed is not None else _unreadable_graph_expiry_payload()
+
+
 def _parse_graph_json(text: str) -> dict[str, Any] | None:
     start = text.find("{")
     if start < 0:
@@ -570,6 +684,70 @@ def graph_get_from_mutator(mutator: Mutator) -> GraphGet:
         except (AADSTSError, OSError):
             return None
         return _parse_graph_json(result.stdout or "")
+
+    return graph_get
+
+
+def graph_error_code(payload: Mapping[str, Any] | None) -> str:
+    return _error_code(payload)
+
+
+def graph_get_from_mutator_for_secret_expiry(
+    mutator: Mutator,
+    *,
+    timeout: float = 15.0,
+) -> GraphGet:
+    """GET passwordCredentials expiry metadata via ``az rest`` (no secret values)."""
+
+    def graph_get(url: str) -> dict[str, Any] | None:
+        assert_client_secret_expiry_read_url(url)
+        try:
+            result = mutator.run(
+                [
+                    "az",
+                    "rest",
+                    "--method",
+                    "GET",
+                    "--uri",
+                    url,
+                    "--output",
+                    "json",
+                    "--only-show-errors",
+                ],
+                sensitive=True,
+                timeout=timeout,
+            )
+        except subprocess.TimeoutExpired:
+            return {
+                "error": {
+                    "code": "UnreadableGraphResponse",
+                    "message": "Graph read timed out",
+                }
+            }
+        except UnicodeDecodeError:
+            return _unreadable_graph_expiry_payload()
+        except CliInvocationError as exc:
+            if exc.graph_error is not None:
+                code, message = exc.graph_error
+                return {"error": {"code": code, "message": message}}
+            raw = exc.captured_output if exc.captured_output is not None else (exc.output or "")
+            if isinstance(raw, bytes):
+                return _parse_expiry_response_bytes(raw)
+            try:
+                encoded = raw.encode("utf-8")
+            except UnicodeEncodeError:
+                return _unreadable_graph_expiry_payload()
+            return _parse_expiry_response_bytes(encoded)
+        except (AADSTSError, OSError):
+            return None
+        try:
+            # Use stdout alone when the runner preserves separate streams. The
+            # production mutator captures both in stdout, so suppress CLI warnings
+            # above; keep strict JSON parsing if any noise still reaches the body.
+            body = (result.stdout or "").encode("utf-8")
+        except UnicodeEncodeError:
+            return _unreadable_graph_expiry_payload()
+        return _parse_expiry_response_bytes(body)
 
     return graph_get
 
