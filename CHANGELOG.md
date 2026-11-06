@@ -19,6 +19,8 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ### Changed
 
+- Bind interactive approval cards and replies to the turn that created them.
+- Retain turn origins across callbacks and reconnects, and release completed turn records.
 - **#291 — Plain-fallback log reason.** The plain fallback log now names its reason (`age_budget`, `rotated`, `retry_exhausted`); expected age-budget and rotation fallbacks log at info instead of warning.
 - Client secret expiry Graph responses enforce a JSON nesting depth limit of 64 before decoding.
 

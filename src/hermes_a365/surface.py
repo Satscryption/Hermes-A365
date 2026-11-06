@@ -208,6 +208,9 @@ ADAPTER_PUBLIC_MEMBERS: Final[frozenset[str]] = frozenset(
         "send_clarify",
         "edit_message",
         "get_chat_info",
+        "admit_turn_authority",
+        "cancel_session_processing",
+        "handle_message",
     }
 )
 
