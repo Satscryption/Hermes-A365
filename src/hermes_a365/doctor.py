@@ -786,6 +786,7 @@ def probe_local_config() -> ProbeResult:
 
     parts: list[str] = [str(home)]
     state: ProbeState = _OK
+    tenant_id = ""
 
     if env_file.exists():
         try:
@@ -818,7 +819,8 @@ def probe_local_config() -> ProbeResult:
             "home": str(home),
             "env_present": env_file.exists(),
             "config_yaml_present": config_file.exists(),
-            "tenant_pinned": bool(env_file.exists() and parsed.get("A365_TENANT_ID", "").strip()),
+            "tenant_pinned": bool(tenant_id),
+            "tenant_id": tenant_id or None,
         },
     )
 
@@ -1371,7 +1373,8 @@ def run_all_probes(
     else:
         probes.append(probe_agent_instance_allowlist(skip_reason="--no-network"))
     probes.append(probe_keychain())
-    probes.append(probe_local_config())
+    local_config = probe_local_config()
+    probes.append(local_config)
     probes.append(probe_file_transfer())
     if bot_service_sidecar_path is None:
         bot_service_sidecar_path = Path.cwd() / bot_service.SIDECAR_FILENAME
@@ -1396,6 +1399,7 @@ def run_all_probes(
         agent_name=agent_name,
         sidecar_path=bot_service_sidecar_path or Path.cwd() / bot_service.SIDECAR_FILENAME,
         generated_config_path=generated_config_path or Path.cwd() / "a365.generated.config.json",
+        tenant_id=local_config.data.get("tenant_id") or None,
         warn_days=secret_expiry_warn_days,
         graph_get=graph_get,
         now=secret_expiry_now,

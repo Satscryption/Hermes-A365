@@ -26,6 +26,7 @@ from hermes_a365.client_secret_expiry import (
 from hermes_a365.doctor import (
     ProbeResult,
     overall_to_exit_code,
+    probe_local_config,
     render_human,
     render_json,
     run_all_probes,
@@ -424,6 +425,83 @@ class TestTenantSelection:
         assert component.data["apps"]["blueprint_client_secret"]["check"] == "unavailable"
         assert "missing_app" not in json.dumps(component.data)
         assert report.overall != "broken"
+
+    @pytest.mark.parametrize(
+        ("configured", "active", "expected"),
+        [
+            (True, _OTHER, "unavailable"),
+            (True, None, "unavailable"),
+            (True, _TENANT.upper(), "healthy"),
+            (False, None, "healthy"),
+            (False, None, "missing_app"),
+        ],
+    )
+    def test_doctor_forwards_configured_tenant_and_guards_expiry_reads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        configured: bool,
+        active: str | None,
+        expected: str,
+    ) -> None:
+        home = _seed_home(tmp_path)
+        tenant_line = f"A365_TENANT_ID= {self._TENANT} \n" if configured else ""
+        (home / ".env").write_text(
+            f"{tenant_line}A365_APP_ID={_BLUEPRINT}\nA365_BF_APP_ID={_BLUEPRINT}\n"
+        )
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        mut = A365CliMutator()
+        monkeypatch.setattr(mut, "available", True)
+        run = Mock(return_value=RunResult([], 0, json.dumps({"tenantId": active}), ""))
+        monkeypatch.setattr(mut, "run", run)
+        monkeypatch.setattr(client_secret_expiry, "get_mutator", lambda: mut)
+        payload = (
+            {
+                "passwordCredentials": [
+                    _cred(start=_NOW - timedelta(days=1), end=_NOW + timedelta(days=400)),
+                ],
+            }
+            if expected == "healthy"
+            else {"error": {"code": "Request_ResourceNotFound"}}
+        )
+        graph_get = Mock(return_value=payload)
+        with (
+            _minimal_doctor_patches(),
+            patch("hermes_a365.doctor.probe_local_config", wraps=probe_local_config),
+            patch(
+                "hermes_a365.doctor.gather_client_secret_expiry_checks",
+                wraps=gather_client_secret_expiry_checks,
+            ) as gather,
+        ):
+            report = run_all_probes(
+                graph_get=graph_get,
+                secret_expiry_now=lambda: _NOW,
+                bot_service_sidecar_path=tmp_path / "missing.json",
+            )
+
+        assert gather.call_args.kwargs["tenant_id"] == (self._TENANT if configured else None)
+        assert gather.call_args.kwargs["for_status"] is False
+        expiry = [
+            p for p in report.probes if p.name in ("blueprint_client_secret", "bf_client_secret")
+        ]
+        assert len(expiry) == 2
+        assert all(p.data["check"] == expected for p in expiry)
+        if configured:
+            run.assert_called_once_with(
+                ["az", "account", "show", "-o", "json", "--only-show-errors"],
+                sensitive=True,
+                timeout=15.0,
+            )
+        else:
+            run.assert_not_called()
+        if expected == "unavailable":
+            graph_get.assert_not_called()
+            assert all(p.state == "warn" for p in expiry)
+            assert "missing_app" not in render_json(report)
+            assert report.overall == "warn"
+        else:
+            assert graph_get.call_count == 2
+            assert all(p.state == ("ok" if expected == "healthy" else "error") for p in expiry)
 
 
 class TestGraphErrors:
