@@ -47,7 +47,7 @@ from hermes_a365.register import (
 from hermes_a365.register import (
     apply_register_plan as _apply_register_plan,
 )
-from hermes_a365.secrets_provider import set_default_provider
+from hermes_a365.secrets_provider import KeychainSecretsProvider, set_default_provider
 
 _TEST_TENANT = "aaaa1111-0000-0000-0000-000000000001"
 # Keep apply() off the real ~/.hermes so a developer anchor cannot change
@@ -331,6 +331,33 @@ class TestSkippedBlueprintSecret:
         assert "done. Next:" not in output.out
         assert all(call[:3] == ["az", "account", "show"] for call in matching_blueprint.calls)
         assert not (tmp_path / CONFIG_FILENAME).exists()
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    @pytest.mark.parametrize("flags", [(), ("--apply",), ("--apply", "--auto-recover-secret")])
+    def test_unsupported_default_backend_keeps_secret_gate(
+        self, matching_blueprint, capsys, monkeypatch, tmp_path, platform, flags
+    ):
+        monkeypatch.setattr("hermes_a365.keychain.sys.platform", platform)
+        monkeypatch.setattr("hermes_a365.keychain.shutil.which", lambda binary: None)
+        set_default_provider(KeychainSecretsProvider())
+        recovering = "--auto-recover-secret" in flags
+        if recovering:
+            matching_blueprint.scripted.append(
+                RunResult(
+                    argv=[], returncode=0, stdout='{"password": "RECOVERED-SECRET"}', stderr=""
+                )
+            )
+
+        assert run(self._args(*flags)) == (2 if flags == ("--apply",) else 0)
+        output = capsys.readouterr()
+        assert "no usable agentBlueprintClientSecret" in output.out
+        assert "Restore provider access" not in output.out
+        assert "RECOVERED-SECRET" not in output.out + output.err
+        assert any("reset" in call for call in matching_blueprint.calls) is recovering
+        secret = json.loads((tmp_path / "a365.generated.config.json").read_text())[
+            "agentBlueprintClientSecret"
+        ]
+        assert secret == ("RECOVERED-SECRET" if recovering else None)
 
     @pytest.mark.parametrize("uppercase", [False, True])
     def test_matching_anchor_missing_secret_still_refuses_apply(
@@ -679,6 +706,162 @@ class TestSkippedBlueprintSecret:
         else:
             assert not steps
             assert not (tmp_path / CONFIG_FILENAME).exists()
+
+
+class TestPostBlueprintSecretSources:
+    """#289 — after the blueprint step, consult configured secret sources."""
+
+    @pytest.fixture
+    def blueprint_run(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        mutator = FakeMutator()
+        monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
+        monkeypatch.setattr(
+            "hermes_a365.register.resolve_registration",
+            lambda *args, **kwargs: RegistrationDecision(
+                action="create",
+                step_names=("blueprint",),
+                reason=None,
+                messages=(),
+            ),
+        )
+
+        def fake_apply(plan, **kwargs):
+            path = _write_generated(
+                tmp_path,
+                {"agentBlueprintId": "bp-app-id", "agentBlueprintClientSecret": None},
+            )
+            path.chmod(0o600)
+            return ApplyResult(plan=plan, completed=["blueprint"])
+
+        monkeypatch.setattr("hermes_a365.register.apply_register_plan", fake_apply)
+        return mutator
+
+    @staticmethod
+    def _args(*flags: str):
+        return build_parser().parse_args(
+            [
+                "--agent-name",
+                "Inbox Helper",
+                "--tenant-id",
+                _TEST_TENANT,
+                "--m365",
+                "--apply",
+                *flags,
+            ]
+        )
+
+    @staticmethod
+    def _forbid_recovery(monkeypatch: pytest.MonkeyPatch) -> None:
+        def unexpected_recovery(*args, **kwargs):
+            pytest.fail("a configured secret source must prevent recovery")
+
+        monkeypatch.setattr("hermes_a365.register.auto_recover_secret", unexpected_recovery)
+
+    @pytest.mark.parametrize("flags", [(), ("--auto-recover-secret",)])
+    def test_provider_hit_skips_notice_and_recovery(
+        self, blueprint_run, capsys, monkeypatch, flags
+    ):
+        dummy = "dummy-provider-credential"
+        lookups = []
+
+        class Provider:
+            name = "test-provider"
+
+            def resolve(self, tenant, app_id):
+                lookups.append((tenant, app_id))
+                return dummy
+
+        set_default_provider(Provider())
+        self._forbid_recovery(monkeypatch)
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert lookups == [(_TEST_TENANT, "bp-app-id")]
+        assert dummy not in output.out + output.err
+        assert "agentBlueprintClientSecret" not in output.out + output.err
+        assert "done. Next:" in output.out
+
+    @pytest.mark.parametrize("flags", [(), ("--auto-recover-secret",)])
+    @pytest.mark.parametrize("source", ["profile", "process"])
+    def test_env_hit_skips_notice_and_recovery(
+        self, blueprint_run, capsys, monkeypatch, tmp_path, flags, source
+    ):
+        dummy = "dummy-env-credential"
+        if source == "profile":
+            home = Path(os.environ["HERMES_HOME"])
+            home.mkdir()
+            env_path = home / ".env"
+            env_path.write_text(f"A365_BLUEPRINT_CLIENT_SECRET={dummy}\n")
+            env_path.chmod(0o600)
+        else:
+            monkeypatch.setenv("A365_BLUEPRINT_CLIENT_SECRET", dummy)
+        self._forbid_recovery(monkeypatch)
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert dummy not in output.out + output.err
+        assert "agentBlueprintClientSecret" not in output.out + output.err
+        assert "done. Next:" in output.out
+
+    @pytest.mark.parametrize("flags", [(), ("--auto-recover-secret",)])
+    def test_provider_unreachable_warns_without_recovery(
+        self, blueprint_run, capsys, monkeypatch, flags
+    ):
+        class Provider:
+            name = "unreachable-test-provider"
+
+            def resolve(self, tenant, app_id):
+                raise RuntimeError("provider unavailable")
+
+        set_default_provider(Provider())
+        self._forbid_recovery(monkeypatch)
+        assert run(self._args(*flags)) == 0
+        output = capsys.readouterr()
+        assert "secrets provider was unreachable" in output.out
+        assert "Restore provider access and re-run" in output.out
+        assert "agentBlueprintClientSecret" not in output.out + output.err
+        assert not any("reset" in call for call in blueprint_run.calls)
+
+    def test_no_source_keeps_missing_secret_notice(self, blueprint_run, capsys, tmp_path):
+        assert run(self._args()) == 0
+        output = capsys.readouterr()
+        expected = report_missing_secret_warning("bp-app-id", Path("a365.generated.config.json"))
+        assert expected in output.out
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    @pytest.mark.parametrize("recovering", [False, True])
+    def test_unsupported_default_backend_keeps_notice_and_recovery(
+        self, blueprint_run, capsys, monkeypatch, tmp_path, platform, recovering
+    ):
+        monkeypatch.setattr("hermes_a365.keychain.sys.platform", platform)
+        monkeypatch.setattr("hermes_a365.keychain.shutil.which", lambda binary: None)
+        set_default_provider(KeychainSecretsProvider())
+        if recovering:
+            blueprint_run.scripted.append(
+                RunResult(
+                    argv=[], returncode=0, stdout='{"password": "RECOVERED-SECRET"}', stderr=""
+                )
+            )
+
+        assert run(self._args(*(["--auto-recover-secret"] if recovering else []))) == 0
+        output = capsys.readouterr()
+        assert "Restore provider access" not in output.out
+        assert "RECOVERED-SECRET" not in output.out + output.err
+        if not recovering:
+            expected = report_missing_secret_warning(
+                "bp-app-id", Path("a365.generated.config.json")
+            )
+            assert expected in output.out
+        resets = [i for i, call in enumerate(blueprint_run.calls) if "reset" in call]
+        assert len(resets) == int(recovering)
+        if recovering:
+            assert blueprint_run.sensitive_flags[resets[0]] is True
+        path = tmp_path / "a365.generated.config.json"
+        assert json.loads(path.read_text())["agentBlueprintClientSecret"] == (
+            "RECOVERED-SECRET" if recovering else None
+        )
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
 
 
 class TestPlanRender:

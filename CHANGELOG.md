@@ -20,8 +20,15 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 ### Changed
 
 - Client secret expiry Graph responses enforce a JSON nesting depth limit of 64 before decoding.
+
 ### Fixed
 
+- **``register`` secret check after ``a365 setup blueprint`` (#289).** When
+  the generated config has no blueprint secret after the blueprint step,
+  ``register`` now checks ``A365_BLUEPRINT_CLIENT_SECRET`` (process and profile
+  env) and the secrets provider first, as the skipped-blueprint path already
+  does. A configured secret skips the missing-secret notice and recovery; an
+  unreachable provider prints a notice and skips recovery.
 - Test suite: made a subprocess overflow test independent of runner speed.
 - Retain bridge delivery state across inbound retries so a definitely unsent reply
   can be retried without calling the operator webhook again. Ambiguous and terminal
