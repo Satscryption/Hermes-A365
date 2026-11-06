@@ -1,6 +1,6 @@
-# Path A quickstart (AI Teammate) — round C1.1
+# Path A quickstart (AI Teammate) — rounds C1.1 and C1.2
 
-Path A covers **AI Teammate**: an M365 agentic directory identity and Teams 1:1 chat (`manifestVersion: devPreview` from GA `a365 publish` — see [`references/v1-compatibility-matrix.md`](../references/v1-compatibility-matrix.md)). This document is **round C1.1** only: prerequisites, install/preflight, blueprint registration, and admin consent. Later steps (local instance, publish, tunnel, Teams verification) are **C1.2**; the full numbered runbook remains [`references/live-tenant-test.md`](../references/live-tenant-test.md). Hermes product contract (CLI, env, HTTP): [`docs/SURFACE.md`](SURFACE.md).
+Path A covers **AI Teammate**: an M365 agentic directory identity and Teams 1:1 chat (`manifestVersion: devPreview` from GA `a365 publish` — see [`references/v1-compatibility-matrix.md`](../references/v1-compatibility-matrix.md)). This document covers **C1.1 and C1.2**: prerequisites, install/preflight, blueprint registration, and admin consent (C1.1), followed by local instance, runtime configuration, publish, activation, tunnel, and Teams verification (C1.2). The full numbered runbook remains [`references/live-tenant-test.md`](../references/live-tenant-test.md). Hermes product contract (CLI, env, HTTP): [`docs/SURFACE.md`](SURFACE.md).
 
 ## Prerequisites and operator inputs
 
@@ -36,8 +36,8 @@ For single-agent Path A, stay on the default: **do not** set multiplex to `true`
 2. **Confirm discovery:** `hermes plugins list` should show `agent365` (entry-point discovery — [`SKILL.md`](../SKILL.md) → **Prerequisites**).
 3. **Seed operator config:** copy `a365.config.json.example` to `a365.config.json` in your working directory (`a365.config.json` fields are summarized in [`docs/SURFACE.md`](SURFACE.md) → **`A365Config` fields**).
 4. **Optional operator env shell:** create or edit `~/.hermes/.env` with `A365_TENANT_ID=<tenant-id>` before first apply (bootstrap pattern in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **0. Local bootstrap**).
-5. Run **`hermes a365 doctor --human`** — expect exit `0` (probes described in [`SKILL.md`](../SKILL.md) → **`hermes a365 doctor`**).
-6. Run **`hermes a365 license --users <n> --agents <n> --plan <SKU>`** if you want a read-only license recommendation (`A365_LICENSE_MODEL` — [`SKILL.md`](../SKILL.md) → **`hermes a365 license`**).
+5. Run **`hermes a365 doctor --human`** — exit `0` means OK, `1` means warnings, and `2` means errors. The installed `a365` CLI probe currently always warns, so expect exit `1` when no errors are present; review each warning before continuing and resolve errors before proceeding (probes described in [`SKILL.md`](../SKILL.md) → **`hermes a365 doctor`**).
+6. Run **`hermes a365 license --users <n> --agents <n> --plan <SKU>`** if you want a read-only license recommendation; replace `<SKU>` with your current M365 plan: `E3`, `E5`, or `E7` ([`SKILL.md`](../SKILL.md) → **`hermes a365 license`**).
 7. Run the upstream prereq check (installs PS modules / fixes client-app wiring as needed): `yes y | a365 setup requirements` — pass criteria in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **1. doctor**.
 
 This preflight is written so the **single-agent** path works with **`gateway.multiplex_profiles` left at the default (`false`)** — you do not need multiplex for the steps above.
@@ -101,7 +101,7 @@ Configure the gateway plugin and sender policy next (wizard + env):
 2. In **`~/.hermes/.env`**, set either `A365_ALLOW_ALL_USERS=true` (dev) or `A365_ALLOWED_USERS=<csv>` (restricted), matching [`README.md`](../README.md) → **Operator setup** — the profile `.env` is the sender allowlist for the gateway.
 3. Start from the default single-agent posture: leave **`gateway.multiplex_profiles` unset / `false`** unless you are deliberately on multiplex (floors in [Gateway mode, Hermes floors, and profile ownership](#gateway-mode-hermes-floors-and-profile-ownership) and [`references/v1-compatibility-matrix.md`](../references/v1-compatibility-matrix.md)).
 
-**C1.2 checkpoint:** wizard completes, `hermes a365 doctor --human` still exits `0`, and `hermes a365 activity-bridge verify --slug <slug>` is ready to run before you expose `/api/messages` (verify contract: [`docs/SURFACE.md`](SURFACE.md) → **CLI** / adapter docs).
+**C1.2 checkpoint:** wizard completes, `hermes a365 doctor --human` reports no errors and each warning has been reviewed (expect exit `1` with the current installed-CLI warning; exit `2` means errors), and `hermes a365 activity-bridge verify --slug <slug>` is ready to run before you expose `/api/messages` (verify contract: [`docs/SURFACE.md`](SURFACE.md) → **CLI** / adapter docs).
 
 ## Publish AI Teammate package and activate in admin centre (C1.2)
 
@@ -117,7 +117,7 @@ hermes a365 publish \
 
 **Expected:** the command prints a **manifest zip path**; the file exists on disk — acceptance bullets in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **6. publish**.
 
-**Operator upload and activation** (UI steps, not CLI): sign in to **M365 Admin Centre**, upload the zip under the Agents / Integrated apps flow, wait for propagation, then **activate** the agent for target users so the agentic Entra user binds — ordered checklist in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **7. Operator step — Admin Centre (AI Teammate flow only)**.
+**Operator upload and activation** (UI steps, not CLI): sign in to **M365 Admin Centre**, upload the zip under **Settings → Integrated apps → Upload custom apps**, wait for propagation, then **activate** the agent for target users so the agentic Entra user binds — ordered checklist in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **7. Operator step — Admin Centre (AI Teammate flow only)**.
 
 > **Ordering note:** if `publish --apply` runs in the same session as `register --apply`, re-check `agentBlueprintClientSecret` in `a365.generated.config.json` — GA `a365 publish` can clobber local fields (warning in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **6. publish**).
 
@@ -166,4 +166,4 @@ In **Microsoft Teams**, open a **1:1 chat** with the agent (search for `<display
 
 **Full tenant cleanup (includes `cleanup` plans and confirmation gates):** [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **10. cleanup** — read the dry-run plan before **`--apply`**.
 
-**Migration / support contract pointer (hand-edited surfaces):** [`docs/SURFACE.md`](SURFACE.md) → **Migrations** (D6 additive auto-stamps; read-only in this round).
+**Migration / support contract pointer (hand-edited surfaces):** [`docs/SURFACE.md`](SURFACE.md) → **Sidecars** (D6 additive auto-stamps; read-only in this round).
