@@ -809,7 +809,9 @@ def _existing_sidecar_payload_for_create(
         data = path.read_bytes()
         after = path.lstat()
     except OSError as exc:
-        raise BotServiceError(f"could not bind cleanup sidecar {path}: {exc}") from exc
+        raise BotServiceError(
+            f"could not read existing sidecar {path} during create: {exc}"
+        ) from exc
     identity_before = (before.st_dev, before.st_ino, before.st_size)
     identity_after = (after.st_dev, after.st_ino, after.st_size)
     if identity_after != identity_before:
