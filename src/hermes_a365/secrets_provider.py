@@ -104,9 +104,22 @@ class KeychainSecretsProvider:
         unrelated sentinel after a target-specific denial can succeed and
         falsely label the target store as empty, which makes the setup wizard
         recommend minting over a credential that may still exist.
+
+        An unsupported default backend is an absent source, so it must not
+        block recovery. Once a backend is selected, lookup failures still
+        mean the store is unreachable.
         """
+        from .keychain import get_backend
+
         try:
-            found = get_secret(tenant, app_id, backend=self._backend)
+            backend = self._backend
+            if backend is None:
+                try:
+                    backend = get_backend()
+                except KeychainError as e:
+                    logger.debug("secrets provider: no default keychain backend (%s)", e)
+                    return "", True
+            found = get_secret(tenant, app_id, backend=backend)
         except (KeychainTimeoutError, TimeoutExpired):
             logger.warning("secrets provider: keychain lookup timed out")
             return "", False

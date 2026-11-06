@@ -581,7 +581,10 @@ def detect_missing_secret(generated_config_path: Path) -> tuple[bool, str | None
 
 
 def _skipped_blueprint_secret_missing(hermes_home: Path, tenant: str, bp_id: str) -> bool:
-    """Gate recovery only when all configured sources confirm an absent secret."""
+    """Gate recovery only when all configured sources confirm an absent secret.
+
+    Used by both the skipped-blueprint and post-blueprint paths in ``run``.
+    """
     from .activity_bridge import load_profile_env
     from .secrets_provider import resolve_secret_state
 
@@ -1062,7 +1065,12 @@ def run(args: argparse.Namespace) -> int:
     if "blueprint" in result.completed:
         generated_path = Path(GENERATED_CONFIG_FILENAME)
         is_missing, bp_id = detect_missing_secret(generated_path)
-        if is_missing and bp_id:
+        # Same configured-source check as the skipped-blueprint gate (#289).
+        if (
+            is_missing
+            and bp_id
+            and _skipped_blueprint_secret_missing(hermes_home, inputs.tenant_id or "", bp_id)
+        ):
             if args.auto_recover_secret:
                 outcome = auto_recover_secret(
                     generated_path,
