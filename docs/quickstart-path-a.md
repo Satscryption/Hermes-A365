@@ -77,3 +77,93 @@ hermes a365 consent "<display-name>"
 …or poll without opening a browser (`--no-open`) — see [`SKILL.md`](../SKILL.md) → **`hermes a365 consent`** and [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **4. consent**.
 
 **C1.1 exit criteria:** `register --apply` completes the blueprint + permission plan, `a365.generated.config.json` exists (and is gitignored), and `consent` exits `0` once scopes show as granted — detailed checkboxes in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **3. register** and **4. consent**. **Next:** instance/runtime, publish, tunnel, and Teams verification are **C1.2** (same runbook file, later sections).
+
+Round **C1.2** continues this file below with those steps.
+
+## Create local instance and configure runtime (C1.2)
+
+`instance create` is **local file generation only** — it writes `~/.hermes/agents/<slug>/.env` with slug, owner metadata, and inherited tenant/app ids; it does **not** create the cloud agentic user (that comes from AI Teammate upload/activation). Behaviour and pitfalls: [`SKILL.md`](../SKILL.md) → **`hermes a365 instance create`**, checklist: [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **5. instance**.
+
+**Placeholders (add to your table):** `<owner-email>` (M365 user who will own the instance) and `<owner-aad-id>` (that user's Entra object id).
+
+```bash
+hermes a365 instance create <slug> \
+  --owner "<owner-email>" \
+  --owner-aad-id "<owner-aad-id>" \
+  --apply
+```
+
+**Expected:** `~/.hermes/agents/<slug>/.env` exists with `AA_INSTANCE_ID`; blueprint **client secret** is **not** in that file — see the grep check in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **5. instance**.
+
+Configure the gateway plugin and sender policy next (wizard + env):
+
+1. Run **`hermes gateway setup --platform agent365`** — patches `~/.hermes/.env` and `~/.hermes/config.yaml` (`gateway.platforms.agent365`), see [`README.md`](../README.md) → **Operator setup**.
+2. In **`~/.hermes/.env`**, set either `A365_ALLOW_ALL_USERS=true` (dev) or `A365_ALLOWED_USERS=<csv>` (restricted), matching [`README.md`](../README.md) → **Operator setup** — the profile `.env` is the sender allowlist for the gateway.
+3. Start from the default single-agent posture: leave **`gateway.multiplex_profiles` unset / `false`** unless you are deliberately on multiplex (floors in [Gateway mode, Hermes floors, and profile ownership](#gateway-mode-hermes-floors-and-profile-ownership) and [`references/v1-compatibility-matrix.md`](../references/v1-compatibility-matrix.md)).
+
+**C1.2 checkpoint:** wizard completes, `hermes a365 doctor --human` still exits `0`, and `hermes a365 activity-bridge verify --slug <slug>` is ready to run before you expose `/api/messages` (verify contract: [`docs/SURFACE.md`](SURFACE.md) → **CLI** / adapter docs).
+
+## Publish AI Teammate package and activate in admin centre (C1.2)
+
+Path A needs **`--aiteammate`** so `publish` emits the **AI Teammate** zip for M365 Admin Centre upload — not blueprint-only Graph registration (wrapper behaviour: [`SKILL.md`](../SKILL.md) → **`hermes a365 publish`**).
+
+```bash
+hermes a365 publish \
+  --agent-name "<display-name>" \
+  --tenant-id "<tenant-id>" \
+  --aiteammate \
+  --apply
+```
+
+**Expected:** the command prints a **manifest zip path**; the file exists on disk — acceptance bullets in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **6. publish**.
+
+**Operator upload and activation** (UI steps, not CLI): sign in to **M365 Admin Centre**, upload the zip under the Agents / Integrated apps flow, wait for propagation, then **activate** the agent for target users so the agentic Entra user binds — ordered checklist in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **7. Operator step — Admin Centre (AI Teammate flow only)**.
+
+> **Ordering note:** if `publish --apply` runs in the same session as `register --apply`, re-check `agentBlueprintClientSecret` in `a365.generated.config.json` — GA `a365 publish` can clobber local fields (warning in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **6. publish**).
+
+## Start gateway, tunnel, and messaging endpoint (C1.2)
+
+Microsoft delivers inbound activities to whatever **public HTTPS URL** you register for `/api/messages`. Pick any tunnel or reverse proxy that meets the HTTPS / reachability constraints in [`references/exposing-the-bot-endpoint.md`](../references/exposing-the-bot-endpoint.md) → **What Microsoft requires** (concrete options in the same file).
+
+**Typical layout (two terminals):**
+
+1. **Gateway —** load profile env, then run the gateway (health + adapter connect pattern in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **9d.3 — Start the Hermes gateway**):
+
+   ```bash
+   set -a
+   . ~/.hermes/.env
+   . ~/.hermes/agents/<slug>/.env
+   set +a
+   hermes gateway run
+   # or: hermes gateway run --profile <slug>  # see runbook §9d.3 if the profile is refused
+   ```
+
+   **Sanity:** `curl -fsS http://127.0.0.1:3978/healthz` returns JSON with `"ok": true` (same section).
+
+2. **Tunnel —** publish `http://localhost:3978` (plugin port / `extra.port`) to a public `https://<tunnel-host>/…` URL using your chosen tooling — examples start at [`references/exposing-the-bot-endpoint.md`](../references/exposing-the-bot-endpoint.md) → **Options**.
+
+3. **Messaging endpoint —** point MCP Platform at the tunnel URL (wrapper drives `a365 setup blueprint --m365 --update-endpoint`):
+
+   ```bash
+   hermes a365 activity-bridge update-endpoint \
+     --agent-name "<display-name>" \
+     --url "https://<tunnel-host>/api/messages" \
+     --apply
+   ```
+
+**Expected:** `update-endpoint --apply` completes; the gateway log shows the adapter **connected** and `/api/messages` receives traffic when Teams delivers an activity — extended gates in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **9d.4** and **9d.5**.
+
+## Verify Teams 1:1 reply (C1.2)
+
+In **Microsoft Teams**, open a **1:1 chat** with the agent (search for `<display-name>`), send a **distinctive test prompt**, and confirm a **visible assistant reply in the thread**.
+
+- Treat **UI evidence** (message bubble content) as the primary pass/fail signal.
+- Gateway / Hermes logs (for example `Agent365Adapter.handle_message` lines) are **diagnostics** — useful, but not a substitute for seeing the reply in Teams — see acceptance bullets in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **9d.5 — Drive a Teams turn through the agent loop**.
+
+## Stop, optional cleanup, further reading (C1.2)
+
+**Stop runtime only (leave tenant registrations for another pass):** [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **9d.7 — Tear down** (stop gateway, stop tunnel, optional local artefact cleanup).
+
+**Full tenant cleanup (includes `cleanup` plans and confirmation gates):** [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **10. cleanup** — read the dry-run plan before **`--apply`**.
+
+**Migration / support contract pointer (hand-edited surfaces):** [`docs/SURFACE.md`](SURFACE.md) → **Migrations** (D6 additive auto-stamps; read-only in this round).

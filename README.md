@@ -553,7 +553,7 @@ section below covers the two remaining manual config edits.
 ## Quick start
 
 The canonical end-to-end walkthrough is
-[`references/live-tenant-test.md`](references/live-tenant-test.md). At a
+[`references/live-tenant-test.md`](references/live-tenant-test.md). A shorter Path A (AI Teammate) guide is [`docs/quickstart-path-a.md`](docs/quickstart-path-a.md). At a
 glance, against a Frontier-Preview-enrolled M365 tenant where you hold
 Global Admin and a `MICROSOFT_AGENT_365_TIER_3` license:
 
