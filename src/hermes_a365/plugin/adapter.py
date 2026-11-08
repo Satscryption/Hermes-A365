@@ -260,7 +260,6 @@ class TurnAuthorityRecord:
     session_key: str
     message_id: str
     reply_activity: dict[str, Any]
-    adapter_id: int
 
 
 class _UnboundTurnFrameType:
@@ -2732,9 +2731,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if invoke_name == _FILE_CONSENT_INVOKE:
                     try:
                         resp = await self._handle_file_consent(
-                            activity,
-                            validated_path=validated_path,
-                            authorized_sender_id=authorized_sender_id,
+                            activity, validated_path=validated_path
                         )
                     except Exception as e:
                         logger.error("agent365 fileConsent handler crashed: %s", e)
@@ -4402,7 +4399,6 @@ class Agent365Adapter(BasePlatformAdapter):
             session_key=sk,
             message_id=mid,
             reply_activity=copy.deepcopy(activity if reply_activity is None else reply_activity),
-            adapter_id=id(self),
         )
         self._turn_authority_ledger[(conv_id, mid)] = record
         return True
@@ -4510,18 +4506,19 @@ class Agent365Adapter(BasePlatformAdapter):
         self, session_key: str, *, conversation_id: str = ""
     ) -> TurnAuthorityRecord | _UnboundTurnFrameType | None:
         frame = _AGENT_TURN_FRAME.get()
-        if isinstance(frame, TurnAuthorityRecord) and frame.adapter_id != id(self):
-            return _UNBOUND_TURN_FRAME
         if frame is not None:
             return frame
         stack = self._turn_frame_stack_tokens.get(str(session_key or ""), [])
         if not session_key and conversation_id:
             stack = [
                 entry
-                for entries in self._turn_frame_stack_tokens.values()
+                for key, entries in self._turn_frame_stack_tokens.items()
                 for entry in entries
-                if isinstance(entry, TurnAuthorityRecord)
-                and entry.conversation_id == conversation_id
+                if (
+                    isinstance(entry, TurnAuthorityRecord)
+                    and entry.conversation_id == conversation_id
+                )
+                or self._session_key_to_conv.get(key) == conversation_id
             ]
         if stack:
             # A gateway callback without task context can only use an
@@ -4529,101 +4526,12 @@ class Agent365Adapter(BasePlatformAdapter):
             return stack[0] if all(entry is stack[0] for entry in stack) else _UNBOUND_TURN_FRAME
         return None
 
-    def _select_reply_origin(
-        self,
-        inbound: dict[str, Any],
-        *,
-        session_key: str = "",
-        chat_id: str | None = None,
-    ) -> dict[str, Any] | None:
-        """Resolve which inbound activity anchors an outbound reply.
-
-        First matching rule wins (see turn-frame design). Caller passes
-        ``turn_buffer_flush`` snapshots separately; this function does not
-        replace those paths.
-        """
-        cid = str(chat_id or (inbound.get("conversation") or {}).get("id") or "")
-        frame = _AGENT_TURN_FRAME.get()
-        if isinstance(frame, TurnAuthorityRecord):
-            if frame.adapter_id != id(self):
-                return None
-            if cid and cid != frame.conversation_id:
-                return None
-            return copy.deepcopy(frame.reply_activity)
-        if frame is _UNBOUND_TURN_FRAME:
-            return None
-
-        sk = str(session_key or "")
-        if sk:
-            stack = self._turn_frame_stack_tokens.get(sk, [])
-            auth = [e for e in stack if isinstance(e, TurnAuthorityRecord)]
-            if auth and all(e.conversation_id == cid for e in auth) and all(
-                e is auth[0] for e in auth
-            ):
-                return copy.deepcopy(auth[0].reply_activity)
-
-        mid = str(inbound.get("id") or "").strip()
-        ledger_rec = self._ledger_record_for_message(mid, cid)
-        if ledger_rec is not None:
-            return copy.deepcopy(ledger_rec.reply_activity)
-
-        ref = self._conversations.get(cid)
-        if sk:
-            return None
-
-        agg = [
-            entry
-            for entries in self._turn_frame_stack_tokens.values()
-            for entry in entries
-            if isinstance(entry, TurnAuthorityRecord) and entry.conversation_id == cid
-        ]
-        if agg:
-            return (
-                copy.deepcopy(agg[0].reply_activity)
-                if all(entry is agg[0] for entry in agg)
-                else None
-            )
-
-        # Caller-prepared dict that is not the live registry reference keeps
-        # its body even when the activity id matches the cached row (K6).
-        if ref is not None and ref.raw is not inbound:
-            return copy.deepcopy(inbound)
-
-        if ref is not None and ref.raw is inbound:
-            return None
-        return copy.deepcopy(inbound)
-
-    def _card_origin_for_session(
-        self, chat_id: str, session_key: str
-    ) -> tuple[str, str, dict[str, Any]] | None:
-        """Resolve user, tenant, and reply activity for session-bound card mint/send."""
-        frame = self._resolve_turn_frame(session_key)
-        if frame is _UNBOUND_TURN_FRAME:
-            return None
-        sk = str(session_key or "")
-        cid = str(chat_id or "")
-        if isinstance(frame, TurnAuthorityRecord):
-            if frame.conversation_id != cid or frame.session_key != sk:
-                return None
-            return (frame.user_id, frame.tenant_id, frame.reply_activity)
-        matches = [
-            r
-            for r in self._turn_authority_ledger.values()
-            if r.session_key == sk and r.conversation_id == cid and r.adapter_id == id(self)
-        ]
-        if len(matches) != 1:
-            return None
-        r = matches[0]
-        return (r.user_id, r.tenant_id, r.reply_activity)
-
     def _frame_for_run_agent(
         self, message_id: str, conversation_id: str
     ) -> TurnAuthorityRecord | _UnboundTurnFrameType:
         # Synthetic turns have their own ledger key while retaining the
         # gateway's existing reply anchor (possibly empty for a handoff).
         current = _AGENT_TURN_FRAME.get()
-        if isinstance(current, TurnAuthorityRecord) and current.adapter_id != id(self):
-            return _UNBOUND_TURN_FRAME
         if (
             isinstance(current, TurnAuthorityRecord)
             and self._ledger_record_for_message(current.message_id, conversation_id) is current
@@ -5905,20 +5813,27 @@ class Agent365Adapter(BasePlatformAdapter):
         citations: Any = None,
         validated_path: str | None = None,
         turn_buffer_flush: tuple[str, dict[str, Any], tuple[str, ...]] | None = None,
-        session_key: str = "",
     ) -> SendResult:
         bridge = _import_bridge()
         generation = self._lifecycle_generation
         chat_id = str((inbound.get("conversation") or {}).get("id") or "")
-        if turn_buffer_flush is None:
-            selected = self._select_reply_origin(inbound, session_key=session_key, chat_id=chat_id)
-            if selected is None:
+        frame = self._resolve_turn_frame("", conversation_id=chat_id)
+        if frame is _UNBOUND_TURN_FRAME:
+            return SendResult(
+                success=False,
+                error=f"agent365 {log_context}: unbound turn frame",
+            )
+        if isinstance(frame, TurnAuthorityRecord):
+            if chat_id and chat_id != frame.conversation_id:
                 return SendResult(
                     success=False,
-                    error=f"agent365 {log_context}: unbound turn frame",
+                    error=(
+                        f"agent365 {log_context}: conversation mismatch "
+                        f"chat_id={chat_id!r} frame={frame.conversation_id!r}"
+                    ),
                 )
-            inbound = selected
-            chat_id = str((inbound.get("conversation") or {}).get("id") or "")
+            inbound = copy.deepcopy(frame.reply_activity)
+            chat_id = str((inbound.get("conversation") or {}).get("id") or chat_id)
         if self._turn_reply_blocked(chat_id):
             return SendResult(
                 success=False,
@@ -6047,17 +5962,11 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             activity_id = str(getattr(event, "message_id", "") or "")
             record = self._event_turn_authority(event)
-            raw = getattr(event, "raw_message", None)
-            cached = self._cached_inbound_for(chat_id)
-            cached_id = str(cached.get("id") or "") if isinstance(cached, dict) else ""
-            if record is not None:
-                inbound = copy.deepcopy(record.reply_activity)
-            elif isinstance(raw, dict):
-                inbound = copy.deepcopy(raw)
-            elif activity_id and cached_id == activity_id:
-                inbound = copy.deepcopy(cached)
-            else:
-                inbound = None
+            inbound = (
+                copy.deepcopy(record.reply_activity)
+                if record is not None
+                else self._cached_inbound_for(chat_id)
+            )
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
             if inbound and chat_type and chat_type != "personal":
@@ -10644,7 +10553,7 @@ class Agent365Adapter(BasePlatformAdapter):
             state = {
                 "chat_id": chat_id,
                 "lines": [],
-                "inbound": copy.deepcopy(inbound),
+                "inbound": inbound,
                 "opened_ts": now,
                 "last_update_ts": now,
                 "lifecycle_generation": self._lifecycle_generation,
@@ -10662,7 +10571,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 error="agent365 status: coalesced status buffer full",
             )
         lines.append(line)
-        state["inbound"] = copy.deepcopy(inbound)
+        state["inbound"] = inbound
         state["last_update_ts"] = now
         self._ensure_coalesced_status_task(key)
         return SendResult(success=True, message_id=key)
@@ -11314,18 +11223,9 @@ class Agent365Adapter(BasePlatformAdapter):
             )
 
     async def _send_file_consent_decline_notice(
-        self,
-        activity: dict[str, Any],
-        *,
-        validated_path: str | None,
-        authorized_sender_id: str,
+        self, activity: dict[str, Any], *, validated_path: str | None
     ) -> None:
         try:
-            self.admit_turn_authority(
-                activity,
-                f"agent365:{str((activity.get('conversation') or {}).get('id') or '')}",
-                authorized_user_id=authorized_sender_id,
-            )
             await self._send_reply_activity(
                 inbound=activity,
                 content=_FILE_CONSENT_DECLINED_NOTICE,
@@ -11906,11 +11806,7 @@ class Agent365Adapter(BasePlatformAdapter):
         )
 
     async def _handle_file_consent(
-        self,
-        activity: dict[str, Any],
-        *,
-        validated_path: str | None,
-        authorized_sender_id: str = "",
+        self, activity: dict[str, Any], *, validated_path: str | None
     ) -> invoke.InvokeResponse:
         """#76c: handle a ``fileConsent/invoke`` — the user's Accept/Decline on a
         FileConsentCard we sent. On Accept: PUT the file bytes to the OneDrive
@@ -11959,17 +11855,11 @@ class Agent365Adapter(BasePlatformAdapter):
                     if send_decline_notice:
                         self._file_consent_decline_notified.add(consent_id)
 
-                    user_id = (authorized_sender_id or "").strip() or str(
-                        (activity.get("from") or {}).get("id") or ""
-                    )
-
                     async def _decline_followup() -> None:
                         await _remove_consent_card()
                         if send_decline_notice:
                             await self._send_file_consent_decline_notice(
-                                activity,
-                                validated_path=validated_path,
-                                authorized_sender_id=user_id,
+                                activity, validated_path=validated_path
                             )
 
                     self._spawn_file_consent_post_ack(_decline_followup(), label="decline")
@@ -13194,12 +13084,21 @@ class Agent365Adapter(BasePlatformAdapter):
             msg = f"agent365 {log_context}: unbound turn frame"
             logger.warning(msg)
             return SendResult(success=False, error=msg)
-        origin = self._card_origin_for_session(chat_id, session_key)
-        if origin is None:
+        if isinstance(frame, TurnAuthorityRecord):
+            if str(chat_id) != str(frame.conversation_id or ""):
+                msg = (
+                    f"agent365 {log_context}: conversation mismatch "
+                    f"chat_id={chat_id!r} frame={frame.conversation_id!r}"
+                )
+                logger.warning(msg)
+                return SendResult(success=False, error=msg)
+            inbound = copy.deepcopy(frame.reply_activity)
+        else:
+            inbound = self._cached_inbound_for(chat_id)
+        if not inbound:
             msg = f"agent365 {log_context}: no cached inbound for {chat_id!r}"
             logger.warning(msg)
             return SendResult(success=False, error=msg)
-        inbound = copy.deepcopy(origin[2])
         if self._http_client is None or self._bridge_cfg is None:
             msg = f"agent365 {log_context}: adapter not connected"
             logger.warning(msg)
@@ -13309,15 +13208,10 @@ class Agent365Adapter(BasePlatformAdapter):
         request_id = unbound[0]["request_id"]
         text = f"**Approval required** — {description}\n\n`{command}`"
         frame = self._resolve_turn_frame(session_key)
-        _origin = self._card_origin_for_session(chat_id, session_key)
         inbound = (
-            _origin[2]
-            if _origin is not None
-            else (
-                frame.reply_activity
-                if isinstance(frame, TurnAuthorityRecord)
-                else self._cached_inbound_for(chat_id) or {}
-            )
+            frame.reply_activity
+            if isinstance(frame, TurnAuthorityRecord)
+            else self._cached_inbound_for(chat_id) or {}
         )
         conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
         conv_type = str(conv.get("conversationType") or "") if isinstance(conv, dict) else ""
@@ -13365,15 +13259,10 @@ class Agent365Adapter(BasePlatformAdapter):
         any follow-up text the resolver returns."""
         text = f"**{title}**\n\n{message}"
         frame = self._resolve_turn_frame(session_key)
-        _origin = self._card_origin_for_session(chat_id, session_key)
         inbound = (
-            _origin[2]
-            if _origin is not None
-            else (
-                frame.reply_activity
-                if isinstance(frame, TurnAuthorityRecord)
-                else self._cached_inbound_for(chat_id) or {}
-            )
+            frame.reply_activity
+            if isinstance(frame, TurnAuthorityRecord)
+            else self._cached_inbound_for(chat_id) or {}
         )
         conv = inbound.get("conversation") if isinstance(inbound, dict) else {}
         conv_type = str(conv.get("conversationType") or "") if isinstance(conv, dict) else ""
@@ -13416,17 +13305,22 @@ class Agent365Adapter(BasePlatformAdapter):
         keeps the chat in ``_awaiting_text_chats`` for the card TTL."""
         if not choices:
             frame = self._resolve_turn_frame(session_key)
-            if frame is _UNBOUND_TURN_FRAME:
+            if frame is _UNBOUND_TURN_FRAME or (
+                isinstance(frame, TurnAuthorityRecord)
+                and (frame.conversation_id != chat_id or frame.session_key != session_key)
+            ):
                 return SendResult(success=False, error="agent365 clarify: mismatched turn frame")
-            origin = self._card_origin_for_session(chat_id, session_key)
-            if origin is None:
-                return SendResult(success=False, error="agent365 clarify: mismatched turn frame")
-            inbound = copy.deepcopy(origin[2])
+            inbound = (
+                copy.deepcopy(frame.reply_activity)
+                if isinstance(frame, TurnAuthorityRecord)
+                else self._cached_inbound_for(chat_id)
+            )
+            if not inbound:
+                msg = f"agent365 clarify: no cached inbound for {chat_id!r}"
+                logger.warning(msg)
+                return SendResult(success=False, error=msg)
             result = await self._send_reply_activity(
-                inbound=inbound,
-                content=question,
-                log_context="clarify",
-                session_key=session_key,
+                inbound=inbound, content=question, log_context="clarify"
             )
             if result.success:
                 # #130: keep this chat in the registry until the typed answer
@@ -13473,18 +13367,24 @@ class Agent365Adapter(BasePlatformAdapter):
         if frame is _UNBOUND_TURN_FRAME:
             logger.warning("agent365 card capability mint rejected: unbound turn frame")
             return []
-        origin = self._card_origin_for_session(chat_id, session_key)
-        if origin is None:
-            logger.warning("agent365 card capability mint rejected: no origin for session")
-            return []
-        user_id, tenant_id, inbound = origin
+        if isinstance(frame, TurnAuthorityRecord):
+            if frame.conversation_id != str(chat_id or "") or frame.session_key != session_key:
+                logger.warning("agent365 card capability mint rejected: mismatched turn frame")
+                return []
+            inbound = frame.reply_activity
+            user_id = frame.user_id
+            tenant_id = frame.tenant_id
+        else:
+            inbound = self._cached_inbound_for(chat_id) or {}
+            user_id = _import_bridge()._canonical_activity_user(inbound)
+            tenant_id = self.tenant_id.lower()
         nonce = secrets.token_urlsafe(24)
         opaque_choices = {secrets.token_urlsafe(12): value for _, value in choices}
         self._card_capabilities[nonce] = {
             "kind": kind,
             "conversation_id": chat_id,
             "user_id": user_id,
-            "requires_authorized_sender": True,
+            "requires_authorized_sender": isinstance(frame, TurnAuthorityRecord),
             "tenant_id": tenant_id,
             "lifecycle_generation": self._lifecycle_generation,
             "chat_generation": self._chat_generation(chat_id),
@@ -13659,18 +13559,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     follow_text = str(follow)
 
                     async def _post_slash_confirm_follow() -> None:
-                        sk = str(resolver.get("session_key") or "")
-                        bridge_mod = _import_bridge()
-                        self.admit_turn_authority(
-                            activity,
-                            sk,
-                            authorized_user_id=bridge_mod._canonical_activity_user(activity),
-                        )
                         await self._send_reply_activity(
                             inbound=activity,
                             content=follow_text,
                             log_context="slash_confirm",
-                            session_key=sk,
                         )
 
                     self._spawn_slash_confirm_followup(conv_id, _post_slash_confirm_follow())
