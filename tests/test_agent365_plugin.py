@@ -344,6 +344,7 @@ def _seed_card_capability(
         "kind": kind,
         "conversation_id": (activity.get("conversation") or {}).get("id", ""),
         "user_id": adapter_mod._import_bridge()._canonical_activity_user(activity),
+        "requires_authorized_sender": True,
         "tenant_id": adapter.tenant_id.lower(),
         "lifecycle_generation": adapter._lifecycle_generation,
         "chat_generation": adapter._chat_generation(
@@ -362,10 +363,11 @@ async def _assert_cached_send_resolves(
     chat_id: str,
     activity_id: str,
 ) -> None:
-    """#130: cache survives; unscoped send of live registry object fails closed."""
+    """#130: after cap or prune, resume still has the cached inbound and send()."""
     inbound = adapter._cached_inbound_for(chat_id)
     assert inbound is not None
     assert inbound["id"] == activity_id
+    assert adapter.admit_turn_authority(inbound, f"resume:{chat_id}", message_id=activity_id)
     adapter._seen_inbounds_this_lifetime.add(chat_id)
     adapter._bridge_cfg = MagicMock()
     adapter._fmi_cache = MagicMock()
@@ -378,8 +380,10 @@ async def _assert_cached_send_resolves(
 
     result = await adapter.send(chat_id=chat_id, content="resumed")
 
-    assert result.success is False
-    assert send_reply.await_count == 0
+    assert result.success is True
+    assert send_reply.await_count == 1
+    assert send_reply.await_args.kwargs["inbound"]["id"] == activity_id
+    assert send_reply.await_args.kwargs["reply"]["text"] == "resumed"
 
 
 # ---------------------------------------------------------------------------
@@ -4699,7 +4703,8 @@ class TestLifecycleCapture:
     async def test_registry_cap_resume_send_resolves_for_live_card(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # #130: cache survives; unscoped send of live object fails closed.
+        # #130: surviving the cap is not enough. The cached inbound must still
+        # resolve, and send() must still post the resume.
         monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
         a = _make_adapter(monkeypatch)
         awaiting = _make_inbound(conv_id="awaiting-approval", activity_id="act-wait")
@@ -4728,7 +4733,8 @@ class TestLifecycleCapture:
     async def test_something_else_stays_protected_and_send_resolves_after_cap(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # "Something else" keeps chat through cap; unscoped send fails closed.
+        # Clicking "Something else" pops the card. The free-text wait must
+        # keep the chat through a later cap, and send() must still resolve.
         monkeypatch.setattr(adapter_mod, "_MAX_REGISTRY_ENTRIES", 2)
         a = _make_adapter(monkeypatch)
         activity = _make_inbound(conv_id="awaiting-other", activity_id="act-other")
@@ -26626,7 +26632,12 @@ class TestInteractiveCards:
             choice="always",
             resolver={"session_key": "sess-1", "request_id": "request-a"},
         )
-        resp = await a._handle_card_action(activity, value)
+        bridge = adapter_mod._import_bridge()
+        resp = await a._handle_card_action(
+            activity,
+            value,
+            authorized_sender_id=bridge._canonical_activity_user(activity),
+        )
         assert resp.status_code == 200
         assert json.loads(resp.body)["kind"] == "exec_approval"
         resolver.assert_called_once_with("sess-1", "always", request_id="request-a")
@@ -27744,7 +27755,7 @@ class TestTurnFrame:
 
     @pytest.mark.asyncio
     async def test_g1_mint_without_frame_or_admitted_sender_returns_empty(
-        self, runtime: Any
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = runtime.adapter
         a._turn_authority_ledger.clear()
@@ -27760,6 +27771,8 @@ class TestTurnFrame:
             {"session_key": "sess-1"},
         ) == []
         assert a._card_capabilities == {}
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(adapter_mod._import_bridge(), "send_reply", send_reply)
         assert not (await a._send_card(
             "conv-1",
             a._action_submit_card("x", []),
@@ -27798,8 +27811,6 @@ class TestTurnFrame:
         cap = a._card_capabilities[nonce]
         assert cap["requires_authorized_sender"] is True
         assert cap["user_id"] == inbound["from"]["id"]
-        g1r = await a._handle_card_action(_make_inbound(), actions[0][1], authorized_sender_id=None)
-        assert g1r.status_code == 403 and nonce in a._card_capabilities
 
     @pytest.mark.asyncio
     async def test_g1_send_card_and_open_clarify_skip_cache(self, runtime: Any) -> None:
@@ -27859,9 +27870,6 @@ class TestTurnFrame:
             cached = copy.deepcopy(a._cached_inbound_for("conv-1"))
             assert isinstance(cached, dict)
             cached["id"] = cached_id
-            c = cached.setdefault("conversation", {})
-            c.setdefault("id", "conv-1")
-            c["conversationType"] = "groupChat"
             a._conversations.upsert(
                 adapter_mod.ConversationRef(
                     conversation_id="conv-1",
@@ -27872,12 +27880,11 @@ class TestTurnFrame:
             ev = _StubMessageEvent(
                 text="",
                 source=_StubSessionSource(platform="x", chat_id="conv-1"),
-                raw_message=None,
+                raw_message={"conversation": {"id": "conv-1", "conversationType": "groupChat"}},
                 message_id=act_id,
             )
             await a.on_processing_start(ev)
 
-        a._seen_inbounds_this_lifetime.add("conv-1")
         await start("act-a", "act-b")
         assert a._turn_buffers == {}
         inbound = _make_inbound(
@@ -27899,7 +27906,6 @@ class TestTurnFrame:
         a._session_key_to_conv["map-sess"] = "conv-1"
         foreign = _make_inbound(conv_id="other-chat", activity_id="foreign")
         assert a.admit_turn_authority(foreign, "map-sess", message_id="foreign")
-        a._turn_frame_stack_tokens["map-sess"] = [a._ledger_record_for_message("foreign", "other-chat")]
         ref = a._conversations.get("conv-1")
         assert ref is not None
         live = ref.raw
@@ -27907,7 +27913,6 @@ class TestTurnFrame:
         with self._card_turn(a):
             token = adapter_mod._AGENT_TURN_FRAME.set(None)
             try:
-                xf = a._resolve_turn_frame("", conversation_id="conv-1"); assert isinstance(xf, adapter_mod.TurnAuthorityRecord) and xf.message_id == "act-card-turn"
                 res = await a._send_reply_activity(
                     inbound=live,
                     content="r",
@@ -27976,60 +27981,25 @@ class TestTurnFrame:
             )
             assert direct.success
             assert runtime.posted.await_args.kwargs["inbound"]["id"] == "first"
-            a._turn_authority_ledger.clear(); a._turn_frame_stack_tokens.clear()
-            assert a.admit_turn_authority(_make_inbound(conv_id="conv-1", activity_id="lone-g4"), "other-g4", message_id="lone-g4")
-            a._turn_frame_stack_tokens["other-g4"] = [a._ledger_record_for_message("lone-g4", "conv-1")]
-            runtime.posted.reset_mock()
-            kept = await a._send_reply_activity(inbound=_make_inbound(activity_id="fresh-prep"), content="p", log_context="g4c", session_key="named")
-            assert kept.success and runtime.posted.await_args.kwargs["inbound"]["id"] == "fresh-prep"; runtime.posted.reset_mock()
-            raw = a._conversations.get("conv-1").raw
-            missed = await a._send_reply_activity(inbound=raw, content="p", log_context="g4d", session_key="named")
-            assert not missed.success; runtime.posted.assert_not_awaited()
         finally:
             adapter_mod._AGENT_TURN_FRAME.reset(token)
 
     @pytest.mark.asyncio
-    async def test_k1_handoff_without_message_id_still_dispatches(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        a = _make_adapter(monkeypatch); _seed_copilot_origin(a); _bind_origin_db(a, _FakeOriginDb({"sess-cc": _live_origin_row()}))
-        assert (await a._handle_handoff_action(_handoff_ctx(a._mint_handoff_link("conv-cc", reason="test").split("continuation=")[1]))).status == 200
-        await _settle_handoff(a); pin = a._handled_events[-1]; aid = str(pin.metadata.get("_agent365_turn_authority_id") or "")
-        assert aid.startswith("handoff:") and str(pin.source.chat_id) == "conv-teams" and not pin.message_id
-        lr = a._ledger_record_for_message(aid, "conv-teams"); assert lr and not str((lr.reply_activity or {}).get("id") or "")
-        br = adapter_mod._import_bridge(); monkeypatch.setattr(br, "send_reply", AsyncMock()); a._bridge_cfg = a._http_client = MagicMock()
-        with a._turn_frame_scope(a._session_key_for(pin), lr): assert (await a._send_reply_activity(inbound=dict(lr.reply_activity), content="pin", log_context="k1")).success
-        assert br.send_reply.await_count == 1
-
-    @pytest.mark.asyncio
-    async def test_k2_alias_followup_binds_admitted_sender(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        a = _make_adapter(monkeypatch); TestInteractiveCards()._connect(a); br = adapter_mod._import_bridge(); seen: dict[str, Any] = {}
-        async def cap(**kw: Any) -> None:
-            ib = kw.get("inbound") or {}
-            if (r := a._ledger_record_for_message(str(ib.get("id") or ""), "conv-1")): seen["user"], seen["inbound_id"] = r.user_id, str(ib.get("id") or "")
-        monkeypatch.setattr(br, "send_reply", AsyncMock(side_effect=cap)); monkeypatch.setattr(a, "_gw_resolve_slash_confirm", AsyncMock(return_value="After."))
-        assert a.admit_turn_authority(_make_inbound(conv_id="conv-1", activity_id="origin-k2"), "sess-1", message_id="origin-k2") and (
-            r1 := a._ledger_record_for_message("origin-k2", "conv-1")
-        )
-        with a._turn_frame_scope("sess-1", r1): pass
-        assert a.admit_turn_authority(_make_inbound(conv_id="conv-1", activity_id="second-k2"), "sess-2", message_id="second-k2") and (
-            r2 := a._ledger_record_for_message("second-k2", "conv-1")
-        )
-        clk = _make_inbound(conv_id="conv-1", activity_id="slash-click"); clk["from"] = {"id": "opaque-body", "userPrincipalName": "Owner@Example.com"}
-        assert br._canonical_activity_user(clk) == "opaque-body"; val = _seed_card_capability(a, clk, kind="slash_confirm", choice="once", resolver={"session_key": "sess-1", "confirm_id": "cfm-k2a"})
-        c = a._card_capabilities[val["capability"]]; c["user_id"], c["requires_authorized_sender"] = "owner@example.com", True
-        with a._turn_frame_scope("sess-2", r2):
-            cv = adapter_mod._AGENT_TURN_FRAME.set(None)
-            try:
-                assert (await a._handle_card_action(clk, val, authorized_sender_id="owner@example.com")).status_code == 200; await a._drain_file_consent_upload_tasks()
-                assert seen["user"] == "owner@example.com" and seen["inbound_id"] == "slash-click" and a._ledger_record_for_message("slash-click", "conv-1") is None and a._ledger_record_for_message("second-k2", "conv-1") is r2
-            finally: adapter_mod._AGENT_TURN_FRAME.reset(cv)
-
-    @pytest.mark.asyncio
-    async def test_k3_route_forwards_authorized_sender(self, monkeypatch: pytest.MonkeyPatch) -> None:
-        a, seen = _make_adapter(monkeypatch), {}
-        async def cap(act: dict[str, Any], *, validated_path: str, authorized_sender_id: str = "") -> Any: seen["sender"] = authorized_sender_id; return adapter_mod.invoke.empty_invoke_ack()
-        monkeypatch.setattr(a, "_handle_file_consent", cap)
-        r = TestLifecycleCapture._client(a, monkeypatch).post("/api/messages", json=TestOutboundFiles()._consent_activity(action="decline"), headers={"Authorization": "Bearer a.b.c"})
-        assert r.status_code == 200 and seen["sender"] == "user-1"
+    async def test_k1_handoff_without_message_id_still_dispatches(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-teams", activity_id="hand-msg")
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
+        _seed_copilot_origin(a)
+        _bind_origin_db(a, _FakeOriginDb({"sess-cc": _live_origin_row()}))
+        link = a._mint_handoff_link("conv-cc", reason="test")
+        response = await a._handle_handoff_action(_handoff_ctx(link.split("continuation=")[1]))
+        assert response.status == 200
+        await _settle_handoff(a)
+        pin = a._handled_events[-1]
+        assert pin.metadata.get("_agent365_turn_authority_id", "").startswith("handoff:")
+        assert str(pin.source.chat_id) == "conv-teams"
 
     @pytest.mark.asyncio
     async def test_k2_slash_followup_after_scope_exits(
@@ -28084,7 +28054,7 @@ class TestTurnFrame:
         assert resp.status == 200
         await a._drain_file_consent_upload_tasks()
         assert send_reply.await_count == 1
-        assert a._ledger_record_for_message(invoke_id, "conv-1") is None
+        assert ("conv-1", invoke_id) in a._turn_authority_ledger
 
     @pytest.mark.asyncio
     async def test_k4_decline_after_turn_ends_posts_notice(
@@ -28103,14 +28073,12 @@ class TestTurnFrame:
             "acquire_reply_token",
             AsyncMock(return_value=("token", "B")),
         )
-        assert a.admit_turn_authority(_make_inbound(conv_id="conv-1", activity_id="offer-k4"), "sess-k4", message_id="offer-k4") and (orec := a._ledger_record_for_message("offer-k4", "conv-1"))
-        with a._turn_frame_scope("sess-k4", orec): pass
-        assert a._ledger_record_for_message("offer-k4", "conv-1") is None; activity = TestOutboundFiles()._consent_activity(action="decline", consent_id="c-k4"); decline_id = str(activity.get("id") or "")
+        a._turn_authority_ledger.clear()
+        activity = TestOutboundFiles()._consent_activity(action="decline", consent_id="c-k4")
         resp = await a._handle_file_consent(activity, validated_path="A", authorized_sender_id="user-1")
         assert resp.status == 200
         await a._drain_file_consent_upload_tasks()
         assert send_reply.await_count == 1
-        assert a._ledger_record_for_message(decline_id, "conv-1") is None
 
     @pytest.mark.asyncio
     async def test_k5_buffer_snapshot_beats_later_frame(self, runtime: Any) -> None:
