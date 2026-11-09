@@ -260,6 +260,7 @@ class TurnAuthorityRecord:
     session_key: str
     message_id: str
     reply_activity: dict[str, Any]
+    adapter_id: int
 
 
 class _UnboundTurnFrameType:
@@ -2024,6 +2025,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._coalesced_turn_targets: dict[tuple[str, str], tuple[dict[str, Any], str, float]] = {}
         self._coalesced_turn_target_order_by_chat: dict[str, dict[tuple[str, str], None]] = {}
         self._coalesced_turn_target_count_by_chat: dict[str, int] = {}
+        self._coalesced_turn_authority: dict[tuple[str, str], TurnAuthorityRecord] = {}
 
         # #123 live retest: Hermes cancels the stream-consumer task at turn
         # end while a non-personal ``send()`` is still awaiting its POST.
@@ -3071,6 +3073,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._release_media_paths(request_media_leases)
                 self._release_agent_turn_admission(admission_key)
                 return JSONResponse({"status": "acked", "reason": "unroutable"})
+            activity_id = str(activity.get("id") or "")
+            if activity_id:
+                admitted = self._ledger_record_for_message(activity_id, ref.conversation_id)
+                if admitted is not None:
+                    self._coalesced_turn_authority[
+                        self._coalesced_reply_turn_key(ref.conversation_id, activity_id)
+                    ] = admitted
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -4399,6 +4408,7 @@ class Agent365Adapter(BasePlatformAdapter):
             session_key=sk,
             message_id=mid,
             reply_activity=copy.deepcopy(activity if reply_activity is None else reply_activity),
+            adapter_id=id(self),
         )
         self._turn_authority_ledger[(conv_id, mid)] = record
         return True
@@ -4501,6 +4511,32 @@ class Agent365Adapter(BasePlatformAdapter):
             if not stack:
                 self._turn_frame_stack_tokens.pop(key, None)
             self._retire_turn_authorities()
+
+    def _is_own_turn_authority(self, record: TurnAuthorityRecord) -> bool:
+        return record.adapter_id == id(self)
+
+    def _own_record_for_outbound(self, chat_id: str = "") -> TurnAuthorityRecord | None:
+        frame = _AGENT_TURN_FRAME.get()
+        if (
+            isinstance(frame, TurnAuthorityRecord)
+            and self._is_own_turn_authority(frame)
+            and (not chat_id or frame.conversation_id == chat_id)
+        ):
+            return frame
+        if chat_id:
+            resolved = self._resolve_turn_frame("", conversation_id=chat_id)
+            if isinstance(resolved, TurnAuthorityRecord) and self._is_own_turn_authority(resolved):
+                return resolved
+        return None
+
+    def _inbound_for_record(
+        self, record: TurnAuthorityRecord | None, chat_id: str = ""
+    ) -> dict[str, Any] | None:
+        if not isinstance(record, TurnAuthorityRecord) or not self._is_own_turn_authority(record):
+            return None
+        if chat_id and record.conversation_id != chat_id:
+            return None
+        return copy.deepcopy(record.reply_activity)
 
     def _resolve_turn_frame(
         self, session_key: str, *, conversation_id: str = ""
@@ -5582,8 +5618,15 @@ class Agent365Adapter(BasePlatformAdapter):
 
         turn_key: tuple[str, str] | None = None
         turn_validated_path: str | None = None
+        coalesced_origin: TurnAuthorityRecord | None = None
         if reply_to is not None:
             turn_key = self._coalesced_reply_turn_key(chat_id, reply_to)
+            coalesced_origin = self._coalesced_turn_authority.get(turn_key)
+            if coalesced_origin is None or not self._is_own_turn_authority(coalesced_origin):
+                return SendResult(
+                    success=False,
+                    error=(f"agent365 send: no turn authority for exact turn chat_id={chat_id!r}"),
+                )
             target = self._coalesced_turn_target(turn_key)
             if target is None:
                 return SendResult(
@@ -5756,6 +5799,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 validated_path=turn_validated_path,
                 finalize=self._metadata_requests_stream_final(metadata),
                 reply_to=reply_to,
+                authority_record=coalesced_origin or self._own_record_for_outbound(chat_id),
             )
             if stream_result is not None:
                 return stream_result
@@ -5780,6 +5824,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 inbound=inbound,
                 turn_key=turn_key,
                 validated_path=str(turn_validated_path or ""),
+                authority_record=coalesced_origin,
             )
 
         result = await self._send_reply_activity(
@@ -5813,26 +5858,36 @@ class Agent365Adapter(BasePlatformAdapter):
         citations: Any = None,
         validated_path: str | None = None,
         turn_buffer_flush: tuple[str, dict[str, Any], tuple[str, ...]] | None = None,
+        reply_origin: TurnAuthorityRecord | None = None,
     ) -> SendResult:
         bridge = _import_bridge()
         generation = self._lifecycle_generation
         chat_id = str((inbound.get("conversation") or {}).get("id") or "")
-        frame = self._resolve_turn_frame("", conversation_id=chat_id)
-        if frame is _UNBOUND_TURN_FRAME:
+        origin = reply_origin
+        if origin is None:
+            frame = self._resolve_turn_frame("", conversation_id=chat_id)
+            if frame is _UNBOUND_TURN_FRAME:
+                return SendResult(
+                    success=False,
+                    error=f"agent365 {log_context}: unbound turn frame",
+                )
+            if isinstance(frame, TurnAuthorityRecord):
+                origin = frame
+        elif not isinstance(origin, TurnAuthorityRecord) or not self._is_own_turn_authority(origin):
             return SendResult(
                 success=False,
-                error=f"agent365 {log_context}: unbound turn frame",
+                error=f"agent365 {log_context}: invalid reply_origin",
             )
-        if isinstance(frame, TurnAuthorityRecord):
-            if chat_id and chat_id != frame.conversation_id:
+        if isinstance(origin, TurnAuthorityRecord):
+            if chat_id and chat_id != origin.conversation_id:
                 return SendResult(
                     success=False,
                     error=(
                         f"agent365 {log_context}: conversation mismatch "
-                        f"chat_id={chat_id!r} frame={frame.conversation_id!r}"
+                        f"chat_id={chat_id!r} frame={origin.conversation_id!r}"
                     ),
                 )
-            inbound = copy.deepcopy(frame.reply_activity)
+            inbound = copy.deepcopy(origin.reply_activity)
             chat_id = str((inbound.get("conversation") or {}).get("id") or chat_id)
         if self._turn_reply_blocked(chat_id):
             return SendResult(
@@ -5962,15 +6017,13 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             activity_id = str(getattr(event, "message_id", "") or "")
             record = self._event_turn_authority(event)
-            inbound = (
-                copy.deepcopy(record.reply_activity)
-                if record is not None
-                else self._cached_inbound_for(chat_id)
-            )
+            inbound = copy.deepcopy(record.reply_activity) if record is not None else None
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
             if inbound and chat_type and chat_type != "personal":
-                self._open_or_nest_turn_buffer(chat_id, inbound, activity_id=activity_id)
+                self._open_or_nest_turn_buffer(
+                    chat_id, inbound, activity_id=activity_id, authority_record=record
+                )
             elif inbound and chat_type == "personal":
                 # A new turn gets its own held follow-up. The
                 # already-completed guard stays keyed to the landed
@@ -5986,7 +6039,12 @@ class Agent365Adapter(BasePlatformAdapter):
             await parent(event)
 
     def _open_or_nest_turn_buffer(
-        self, chat_id: str, inbound: dict[str, Any], *, activity_id: str
+        self,
+        chat_id: str,
+        inbound: dict[str, Any],
+        *,
+        activity_id: str,
+        authority_record: TurnAuthorityRecord | None = None,
     ) -> None:
         """Open a buffer, or append a turn inside the one already open."""
         if self._turn_reply_blocked(chat_id):
@@ -6003,6 +6061,7 @@ class Agent365Adapter(BasePlatformAdapter):
             "activity_id": str(snapshot.get("id") or ""),
             "open": True,
             "started_mono": time.monotonic(),
+            "authority_record": authority_record,
         }
         self._apply_copilot_member_added_to_turn(chat_id, turn)
         if buf is None:
@@ -9681,6 +9740,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     link_alone = True
             validated_path = turn.get("validated_path")
             path = validated_path if isinstance(validated_path, str) else None
+            origin = turn.get("authority_record")
+            reply_origin = origin if isinstance(origin, TurnAuthorityRecord) else None
             stream_record = self._delivery_record(buf, turn)
             first_chunk_on_stream = not stream_record.get("answer_final_settled")
             for chunk_segments, content in chunks:
@@ -9725,6 +9786,7 @@ class Agent365Adapter(BasePlatformAdapter):
                             content=content,
                             log_context="turn buffer",
                             validated_path=path,
+                            reply_origin=reply_origin,
                             turn_buffer_flush=(
                                 chat_id,
                                 buf,
@@ -9798,6 +9860,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     content=content,
                     log_context="turn buffer",
                     validated_path=path,
+                    reply_origin=reply_origin,
                     turn_buffer_flush=(
                         chat_id,
                         buf,
@@ -10104,6 +10167,7 @@ class Agent365Adapter(BasePlatformAdapter):
         inbound: dict[str, Any],
         turn_key: tuple[str, str],
         validated_path: str,
+        authority_record: TurnAuthorityRecord | None = None,
     ) -> SendResult:
         loop = asyncio.get_event_loop()
         now = loop.time()
@@ -10143,13 +10207,20 @@ class Agent365Adapter(BasePlatformAdapter):
                     success=False,
                     error="agent365 send: global coalesced reply backlog full",
                 )
+            auth = authority_record or self._coalesced_turn_authority.get(turn_key)
+            if auth is None or not self._is_own_turn_authority(auth):
+                return SendResult(
+                    success=False,
+                    error=f"agent365 send: no turn authority for coalesced chat_id={chat_id!r}",
+                )
             delivered = asyncio.Event()
             state = {
                 "chat_id": chat_id,
                 "turn_key": turn_key,
                 "content": "",
-                "inbound": copy.deepcopy(inbound),
+                "inbound": copy.deepcopy(auth.reply_activity),
                 "validated_path": validated_path,
+                "authority_record": auth,
                 "opened_ts": now,
                 "last_update_ts": now,
                 "lifecycle_generation": self._lifecycle_generation,
@@ -10323,12 +10394,20 @@ class Agent365Adapter(BasePlatformAdapter):
             # groups are wire-indistinguishable here). Offer a policy-gated
             # "continue in Teams" link.
             final_content = self._maybe_append_handoff_link(chat_id, final_content)
-            result = await self._send_reply_activity(
-                inbound=inbound,
-                content=final_content,
-                log_context="coalesced edit_message",
-                validated_path=str(state.get("validated_path") or ""),
-            )
+            origin = state.get("authority_record")
+            if not isinstance(origin, TurnAuthorityRecord):
+                result = SendResult(
+                    success=False,
+                    error="agent365 edit_message: coalesced reply has no authority record",
+                )
+            else:
+                result = await self._send_reply_activity(
+                    inbound=inbound,
+                    content=final_content,
+                    log_context="coalesced edit_message",
+                    validated_path=str(state.get("validated_path") or ""),
+                    reply_origin=origin,
+                )
         if self._coalesced_replies.get(message_id) is not state:
             return SendResult(
                 success=False,
@@ -10523,8 +10602,14 @@ class Agent365Adapter(BasePlatformAdapter):
             )
         now = asyncio.get_event_loop().time()
         line = _strip_streaming_cursor(content).strip()[:_MAX_STATUS_LINE_CHARS]
+        record = self._own_record_for_outbound(chat_id)
         state = self._coalesced_status.get(key)
         if state is None:
+            if record is None:
+                return SendResult(
+                    success=False,
+                    error=f"agent365 status: no turn authority for chat_id={chat_id!r}",
+                )
             live_status_count = sum(
                 1
                 for item in self._coalesced_status.values()
@@ -10553,7 +10638,8 @@ class Agent365Adapter(BasePlatformAdapter):
             state = {
                 "chat_id": chat_id,
                 "lines": [],
-                "inbound": inbound,
+                "inbound": copy.deepcopy(record.reply_activity),
+                "authority_record": record,
                 "opened_ts": now,
                 "last_update_ts": now,
                 "lifecycle_generation": self._lifecycle_generation,
@@ -10571,7 +10657,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 error="agent365 status: coalesced status buffer full",
             )
         lines.append(line)
-        state["inbound"] = inbound
         state["last_update_ts"] = now
         self._ensure_coalesced_status_task(key)
         return SendResult(success=True, message_id=key)
@@ -10678,10 +10763,16 @@ class Agent365Adapter(BasePlatformAdapter):
             self._drop_coalesced_status_state(key)
             return False
         sent_count = len(lines)
+        origin = state.get("authority_record")
+        reply_origin = origin if isinstance(origin, TurnAuthorityRecord) else None
+        if reply_origin is None:
+            self._drop_coalesced_status_state(key)
+            return False
         result = await self._send_reply_activity(
             inbound=inbound,
             content=content,
             log_context="coalesced status",
+            reply_origin=reply_origin,
         )
         if (
             self._coalesced_status.get(key) is not state
@@ -10908,6 +10999,7 @@ class Agent365Adapter(BasePlatformAdapter):
         validated_path: str | None = None,
         finalize: bool = False,
         reply_to: Any | None = None,
+        authority_record: TurnAuthorityRecord | None = None,
     ) -> SendResult | None:
         """Slice 19s-bis: open a new BF stream from ``send()``.
 
@@ -10925,12 +11017,24 @@ class Agent365Adapter(BasePlatformAdapter):
         only when that final activity is accepted. A streaming start alone
         is not success — Teams keeps the Stop button until the final lands.
         """
+        record = authority_record or self._own_record_for_outbound(chat_id)
+        inbound = self._inbound_for_record(record, chat_id)
+        if inbound is None:
+            return SendResult(
+                success=False,
+                error=f"agent365 stream-start: no turn authority for chat_id={chat_id!r}",
+            )
         bridge = _import_bridge()
         conv = inbound.get("conversation") or {}
         service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
         conv_id = conv.get("id")
         if not service_url or not conv_id:
             return None
+        path_at_open = (
+            validated_path
+            if validated_path is not None
+            else self._validated_path_for(chat_id)
+        )
         generation = self._lifecycle_generation
         chat_generation = self._chat_generation(chat_id)
         client = self._http_client
@@ -11048,6 +11152,8 @@ class Agent365Adapter(BasePlatformAdapter):
             "lifecycle_generation": generation,
             "chat_generation": chat_generation,
             "reply_anchor": self._personal_reply_anchor(reply_to, inbound),
+            "authority_record": record,
+            "validated_path": path_at_open,
             # Track last-sent content so auto-finalize-stale-stream has
             # something non-empty to POST as the close (BF rejects
             # empty-text final activities with 400 BadSyntax).
@@ -13789,7 +13895,9 @@ class Agent365Adapter(BasePlatformAdapter):
         anchors = self._personal_final_landed.get(str(chat_id))
         return bool(anchors) and token in anchors
 
-    def _nested_personal_hold(self, chat_id: str) -> dict[str, Any]:
+    def _nested_personal_hold(
+        self, chat_id: str, *, record: TurnAuthorityRecord | None = None
+    ) -> dict[str, Any]:
         """Return the buffered follow-up for this chat, creating it."""
         key = str(chat_id)
         hold = self._nested_personal_reply.get(key)
@@ -13800,6 +13908,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 "text": "",
                 "posted": False,
             }
+            if record is not None:
+                hold["authority_record"] = record
             self._nested_personal_reply[key] = hold
         return hold
 
@@ -13818,7 +13928,14 @@ class Agent365Adapter(BasePlatformAdapter):
         that final text has been sent, so a later edit is not stuck on
         the preview.
         """
-        hold = self._nested_personal_hold(chat_id)
+        record = self._own_record_for_outbound(chat_id)
+        if record is None:
+            return SendResult(
+                success=False,
+                error=f"agent365 send: no turn authority for nested chat_id={chat_id!r}",
+            )
+        hold = self._nested_personal_hold(chat_id, record=record)
+        hold["validated_path"] = validated_path or self._validated_path_for(chat_id)
         hold["text"] = _strip_streaming_cursor(content)
         if not self._metadata_requests_stream_final(metadata):
             return SendResult(success=True, message_id=str(hold["id"]))
@@ -13845,17 +13962,20 @@ class Agent365Adapter(BasePlatformAdapter):
         hold["text"] = _strip_streaming_cursor(content)
         if not finalize:
             return SendResult(success=True, message_id=str(hold["id"]))
-        inbound = self._cached_inbound_for(chat_id)
-        if not isinstance(inbound, dict):
+        inbound = self._inbound_for_record(hold.get("authority_record"), chat_id)
+        if inbound is None:
             return SendResult(
                 success=False,
-                error=(f"agent365 edit_message: no cached inbound for chat_id={chat_id!r}"),
+                error=(f"agent365 edit_message: no turn authority for chat_id={chat_id!r}"),
             )
+        validated_path = hold.get("validated_path")
+        if not isinstance(validated_path, str):
+            validated_path = self._validated_path_for(chat_id)
         return await self._flush_nested_personal_reply(
             chat_id,
             hold,
             inbound=inbound,
-            validated_path=self._validated_path_for(chat_id),
+            validated_path=validated_path,
         )
 
     async def _flush_nested_personal_reply(
@@ -13874,12 +13994,20 @@ class Agent365Adapter(BasePlatformAdapter):
         text = hold.get("text") if isinstance(hold.get("text"), str) else ""
         if not text:
             text = " "
+        origin = hold.get("authority_record")
+        reply_origin = origin if isinstance(origin, TurnAuthorityRecord) else None
+        if reply_origin is None:
+            return SendResult(
+                success=False,
+                error=f"agent365 send: nested hold has no authority for chat_id={chat_id!r}",
+            )
         result = await self._send_reply_activity(
             inbound=inbound,
             content=text,
             log_context="send",
             citations=citations,
             validated_path=validated_path,
+            reply_origin=reply_origin,
         )
         if not result.success:
             return result
@@ -14191,6 +14319,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 error="agent365 edit_message: stream lifecycle expired",
             )
         if state is None:
+            record = self._own_record_for_outbound(chat_id)
+            inbound = self._inbound_for_record(record, chat_id)
+            if inbound is None:
+                return SendResult(
+                    success=False,
+                    error=f"agent365 edit_message: no turn authority for chat_id={chat_id!r}",
+                )
+            conv = inbound.get("conversation") or {}
             state = {
                 "bf_stream_id": None,
                 "sequence": 0,
@@ -14201,8 +14337,14 @@ class Agent365Adapter(BasePlatformAdapter):
                 "lifecycle_generation": generation,
                 "chat_generation": chat_generation,
                 "reply_anchor": self._personal_reply_anchor(None, inbound),
+                "authority_record": record,
+                "validated_path": self._validated_path_for(chat_id),
             }
             self._streams[stream_key] = state
+        auth_inbound = self._inbound_for_record(state.get("authority_record"), chat_id)
+        if auth_inbound is not None:
+            inbound = auth_inbound
+            conv = inbound.get("conversation") or {}
 
         # Throttle — Microsoft recommends 1.5-2 s pacing even though the
         # hard limit is 1 req/s. Adapter-side rather than relying on the
@@ -14279,6 +14421,12 @@ class Agent365Adapter(BasePlatformAdapter):
         last_error = "agent365 edit_message failed"
         for attempt in range(1, _STREAM_EDIT_MAX_ATTEMPTS + 1):
             try:
+                stream_path = state.get("validated_path")
+                token_path = (
+                    stream_path
+                    if isinstance(stream_path, str)
+                    else self._validated_path_for_inbound(inbound)
+                )
                 token, _path = await self._await_outbound(
                     chat_id,
                     bridge.acquire_reply_token(
@@ -14288,7 +14436,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         fmi_cache=self._fmi_cache,
                         user_cache=self._user_cache,
                         bf_cache=self._bf_token_cache,
-                        validated_path=self._validated_path_for_inbound(inbound),  # L4 (#100)
+                        validated_path=token_path,  # L4 (#100)
                     ),
                 )
                 if not self._lifecycle_is_current(
@@ -14555,6 +14703,9 @@ class Agent365Adapter(BasePlatformAdapter):
             # Microsoft (stream-start failed). Just drop the slot.
             self._drop_stream_state(chat_id, message_id)
             return True
+        auth_inbound = self._inbound_for_record(state.get("authority_record"), chat_id)
+        if auth_inbound is not None:
+            inbound = auth_inbound
         generation = self._lifecycle_generation
         chat_generation = self._chat_generation(chat_id)
         client = self._http_client

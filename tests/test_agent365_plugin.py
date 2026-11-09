@@ -309,6 +309,30 @@ def _make_inbound(
     }
 
 
+def _admit_wire_turn_authority(a: Any, inbound: dict[str, Any]) -> None:
+    ref = adapter_mod.ConversationRef.from_activity(inbound)
+    if ref is None:
+        return
+    a._capture_coalesced_turn_target(ref)
+    activity_id = str(inbound.get("id") or "")
+    if not activity_id:
+        return
+    session = f"wire-{ref.conversation_id}"
+    if a.admit_turn_authority(inbound, session, message_id=activity_id):
+        record = a._ledger_record_for_message(activity_id, ref.conversation_id)
+        if record is not None:
+            a._coalesced_turn_authority[(ref.conversation_id, activity_id)] = record
+            adapter_mod._AGENT_TURN_FRAME.set(record)
+
+
+def _prime_personal_inbound(a: Any, inbound: dict[str, Any]) -> None:
+    ref = adapter_mod.ConversationRef.from_activity(inbound)
+    assert ref is not None
+    a._conversations.upsert(ref)
+    a._seen_inbounds_this_lifetime.add(ref.conversation_id)
+    _admit_wire_turn_authority(a, inbound)
+
+
 def _seed_card_capability(
     adapter: Any,
     activity: dict[str, Any],
@@ -7519,6 +7543,7 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(ref)
         a._conversations.upsert(ref)
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _admit_wire_turn_authority(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -21864,8 +21889,7 @@ class TestSendStreamStart:
         inbound = _make_inbound(
             conv_id="conv-S1", activity_id="inbound-id-1"
         )  # personal by default
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -21924,8 +21948,7 @@ class TestSendStreamStart:
         # continues it without starting a new stream. Single growing bubble.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-S2", activity_id="inbound-id-1")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -21987,8 +22010,7 @@ class TestSendStreamStart:
         # ``reply_to=event_message_id``.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-C")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -22021,8 +22043,7 @@ class TestSendStreamStart:
         # continue to its normal finalize=True close.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-X")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -22061,8 +22082,7 @@ class TestSendStreamStart:
         # after the adapter sends streamType=final for the previous one.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-X2", activity_id="inbound-id-1")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -22114,8 +22134,7 @@ class TestSendStreamStart:
     ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-X3", activity_id="inbound-id-1")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -22157,8 +22176,7 @@ class TestSendStreamStart:
         # stream id must not wedge the chat forever.
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-X4", activity_id="inbound-id-1")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -22206,8 +22224,7 @@ class TestSendStreamStart:
     ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-X5", activity_id="inbound-id-1")
-        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
-        a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])  # 19x-e
+        _prime_personal_inbound(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -22564,6 +22581,8 @@ class TestSendStreamStart:
         opened = await a.send(chat_id="conv-nest", content="Hello", reply_to="act-1")
         assert opened.success is True
         assert post_mock.await_count == 1
+        follow_inbound = _make_inbound(conv_id="conv-nest", activity_id="act-follow")
+        a.admit_turn_authority(follow_inbound, "wire-conv-nest", message_id="act-follow")
         await a.on_processing_start(follow)
         # The follow-up send runs before its complete, while the outer
         # consumer is still live. It must not close that stream.
@@ -22627,6 +22646,8 @@ class TestSendStreamStart:
         opened = await a.send(chat_id="conv-prev", content="Hello", reply_to="act-1")
         assert opened.success is True
         assert post_mock.await_count == 1
+        follow_inbound = _make_inbound(conv_id="conv-prev", activity_id="act-follow")
+        a.admit_turn_authority(follow_inbound, "wire-conv-prev", message_id="act-follow")
         await a.on_processing_start(follow)
 
         preview = await a.send(
@@ -27591,6 +27612,106 @@ class TestTurnFrame:
             assert list(a._pending_turn_fifo[sk]) == [events[1]]
         finally:
             await a.disconnect()
+
+    async def test_g4_explicit_record_beats_other_frame(self, runtime: Any) -> None:
+        a = runtime.adapter
+        fresh_act = _make_inbound(activity_id="fresh")
+        assert a.admit_turn_authority(fresh_act, "sess-g4", message_id="fresh")
+        fresh = a._ledger_record_for_message("fresh", "conv-1")
+        frame_act = _make_inbound(activity_id="frame-act")
+        assert a.admit_turn_authority(frame_act, "sess-g4", message_id="frame-act")
+        frame = a._ledger_record_for_message("frame-act", "conv-1")
+        with a._turn_frame_scope("sess-g4", frame):
+            assert (
+                await a._send_reply_activity(
+                    inbound=copy.deepcopy(fresh_act),
+                    content="explicit",
+                    log_context="g4",
+                    reply_origin=fresh,
+                )
+            ).success
+            assert runtime.posted.await_args.kwargs["inbound"]["id"] == "fresh"
+            runtime.posted.reset_mock()
+            assert (
+                await a._send_reply_activity(
+                    inbound=copy.deepcopy(frame_act),
+                    content="ambient",
+                    log_context="g4",
+                )
+            ).success
+            assert runtime.posted.await_args.kwargs["inbound"]["id"] == "frame-act"
+
+    async def test_k5_flush_posts_start_snapshot(self, runtime: Any) -> None:
+        a = runtime.adapter
+        start = _make_inbound(activity_id="snap-start")
+        start["conversation"]["conversationType"] = "groupChat"
+        a._conversations.upsert(adapter_mod.ConversationRef.from_activity(start))
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        assert a.admit_turn_authority(start, "sess-k5", message_id="snap-start")
+        record = a._ledger_record_for_message("snap-start", "conv-1")
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-1"),
+            message_id="snap-start",
+        )
+        with a._turn_frame_scope("sess-k5", record):
+            await a.on_processing_start(event)
+            a._append_turn_buffer_segment("conv-1", "answer bit", reply_to=None)
+        buf = a._turn_buffers["conv-1"]
+        buf["turns"][0]["open"] = False
+        later = _make_inbound(activity_id="later-frame")
+        assert a.admit_turn_authority(later, "sess-k5", message_id="later-frame")
+        with a._turn_frame_scope("sess-k5", a._ledger_record_for_message("later-frame", "conv-1")):
+            await a._flush_turn_buffer("conv-1")
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "snap-start"
+
+    async def test_c3_coalesced_posts_open_record(self, runtime: Any) -> None:
+        a = runtime.adapter
+        coal = _make_inbound(conv_id="conv-1", activity_id="coal")
+        coal["conversation"]["conversationType"] = "groupChat"
+        ref = adapter_mod.ConversationRef.from_activity(coal)
+        a._capture_coalesced_turn_target(ref)
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        assert a.admit_turn_authority(coal, "sess-c3", message_id="coal")
+        record = a._ledger_record_for_message("coal", "conv-1")
+        a._coalesced_turn_authority[("conv-1", "coal")] = record
+        with a._turn_frame_scope("sess-c3", record):
+            first = await a.send("conv-1", "chunk", reply_to="coal")
+        assert first.success
+        later = _make_inbound(activity_id="later-c3")
+        assert a.admit_turn_authority(later, "sess-c3", message_id="later-c3")
+        with a._turn_frame_scope("sess-c3", a._ledger_record_for_message("later-c3", "conv-1")):
+            final = await a._finalize_coalesced_reply(str(first.message_id))
+        assert final.success
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "coal"
+
+    async def test_veto_mapped_sentinel_stays_unbound(self, runtime: Any) -> None:
+        a = runtime.adapter
+        a._turn_frame_stack_tokens["map-sess"] = [adapter_mod._UNBOUND_TURN_FRAME]
+        assert a._resolve_turn_frame("map-sess", conversation_id="conv-1") is (
+            adapter_mod._UNBOUND_TURN_FRAME
+        )
+        own = _make_inbound(activity_id="own-veto")
+        assert a.admit_turn_authority(own, "map-sess", message_id="own-veto")
+        rec = a._ledger_record_for_message("own-veto", "conv-1")
+        a._turn_frame_stack_tokens["map-sess"] = [adapter_mod._UNBOUND_TURN_FRAME, rec]
+        assert a._resolve_turn_frame("map-sess", conversation_id="conv-1") is (
+            adapter_mod._UNBOUND_TURN_FRAME
+        )
+
+    async def test_g1_in_frame_card_posts_frame_activity(self, runtime: Any) -> None:
+        a = runtime.adapter
+        with self._card_turn(a):
+            assert (
+                await a._send_card(
+                    "conv-1",
+                    a._action_submit_card("ok", []),
+                    log_context="g1a",
+                    session_key="sess-1",
+                )
+            ).success
+            assert runtime.posted.await_args.kwargs["inbound"]["id"] == "act-card-turn"
 
 
 class TestHandoff:
