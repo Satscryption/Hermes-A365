@@ -265,7 +265,9 @@ class TestBuildRegisterPlan:
         assert bot.argv == ["a365", "setup", "permissions", "bot", "--agent-name", "x"]
 
 
-def test_register_help_omits_removed_aiteammate() -> None:
+def test_register_help_omits_removed_aiteammate(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     help_text = build_parser().format_help()
     assert "--aiteammate" not in help_text
     assert "--aiteammate" not in build_parser()._option_string_actions
@@ -273,10 +275,17 @@ def test_register_help_omits_removed_aiteammate() -> None:
     with pytest.raises(SystemExit) as exc:
         standalone_cli.main(["register", "--help"])
     assert exc.value.code == 0
+    captured_cli = capsys.readouterr()
+    assert "--aiteammate" not in captured_cli.out
+    assert "--aiteammate" not in captured_cli.err
+
     plugin_parent = _build_plugin_parent_parser()
     with pytest.raises(SystemExit) as exc_plugin:
         plugin_parent.parse_args(["a365", "register", "--help"])
     assert exc_plugin.value.code == 0
+    captured_plugin = capsys.readouterr()
+    assert "--aiteammate" not in captured_plugin.out
+    assert "--aiteammate" not in captured_plugin.err
 
 
 @pytest.mark.parametrize(
@@ -319,6 +328,7 @@ def test_removed_aiteammate_exits_2_on_both_entry_points(
     assert exc_plugin.value.code == 2
     captured_plugin = capsys.readouterr()
     assert captured_plugin.err == expected_err
+    assert "a365 setup blueprint" not in captured_plugin.out
 
     capsys.readouterr()
     cli_argv = ["register", *argv]
@@ -327,6 +337,7 @@ def test_removed_aiteammate_exits_2_on_both_entry_points(
     assert exc_cli.value.code == 2
     captured_cli = capsys.readouterr()
     assert captured_cli.err == expected_err
+    assert "a365 setup blueprint" not in captured_cli.out
 
 
 @pytest.mark.parametrize(
@@ -343,21 +354,24 @@ def test_other_unknown_register_flag_stays_argparse(
 ) -> None:
     removed_snippet = "was removed in 1.0"
 
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc:
         build_parser().parse_args(argv)
+    assert exc.value.code == 2
     err = capsys.readouterr().err
     assert removed_snippet not in err
 
     capsys.readouterr()
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc_cli:
         standalone_cli.main(["register", *argv])
+    assert exc_cli.value.code == 2
     err_cli = capsys.readouterr().err
     assert removed_snippet not in err_cli
 
     capsys.readouterr()
     plugin_parent = _build_plugin_parent_parser()
-    with pytest.raises(SystemExit):
+    with pytest.raises(SystemExit) as exc_plugin:
         plugin_parent.parse_args(["a365", "register", *argv])
+    assert exc_plugin.value.code == 2
     err_plugin = capsys.readouterr().err
     assert removed_snippet not in err_plugin
 
@@ -365,6 +379,9 @@ def test_other_unknown_register_flag_stays_argparse(
         assert "the following arguments are required: --agent-name" in err
         assert "the following arguments are required: --agent-name" in err_cli
         assert "the following arguments are required: --agent-name" in err_plugin
+        assert "unrecognized arguments" not in err
+        assert "unrecognized arguments" not in err_cli
+        assert "unrecognized arguments" not in err_plugin
     else:
         unknown = "--nope" if "--nope" in argv else "--aiteammate-foo"
         assert f"unrecognized arguments: {unknown}" in err

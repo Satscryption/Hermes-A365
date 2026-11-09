@@ -135,16 +135,19 @@ def test_product_http_routes(snapshot: dict) -> None:
     }
 
 
+def _action_has_aiteammate(action: dict) -> bool:
+    return "--aiteammate" in action.get("option_strings", [])
+
+
 def test_register_aiteammate_refusal_text(snapshot: dict) -> None:
     assert REGISTER_AITEAMMATE_REMOVED == EXPECTED_REGISTER_AITEAMMATE_REMOVED
     assert snapshot["register_aiteammate_refusal"] == EXPECTED_REGISTER_AITEAMMATE_REMOVED
     assert snapshot["exit_codes"]["register_aiteammate"] == 2
-    plugin_register = snapshot["cli"]["plugin"]["subparsers"]["register"]["actions"]
-    standalone_register = snapshot["cli"]["standalone"]["subparsers"]["register"]["actions"]
-    assert not any(a.get("option_strings") == ["--aiteammate"] for a in plugin_register)
-    assert not any(a.get("option_strings") == ["--aiteammate"] for a in standalone_register)
-    plugin_publish = snapshot["cli"]["plugin"]["subparsers"]["publish"]["actions"]
-    assert any(a.get("option_strings") == ["--aiteammate"] for a in plugin_publish)
+    for tree_key in ("plugin", "standalone"):
+        register_actions = snapshot["cli"][tree_key]["subparsers"]["register"]["actions"]
+        publish_actions = snapshot["cli"][tree_key]["subparsers"]["publish"]["actions"]
+        assert not any(_action_has_aiteammate(a) for a in register_actions)
+        assert any(_action_has_aiteammate(a) for a in publish_actions)
 
 
 def test_publish_default_scopes_match_d2() -> None:
@@ -294,18 +297,37 @@ def _tracked_text_files() -> list[Path]:
     return paths
 
 
-def _logical_lines(text: str) -> list[str]:
+def _source_spans(text: str) -> list[tuple[str, int, int]]:
     physical = text.splitlines()
-    logical: list[str] = []
+    spans: list[tuple[str, int, int]] = []
     i = 0
     while i < len(physical):
+        start = i + 1
         parts = [physical[i].rstrip("\\").rstrip()]
         while physical[i].rstrip().endswith("\\") and i + 1 < len(physical):
             i += 1
             parts.append(physical[i].rstrip("\\").rstrip())
-        logical.append(" ".join(parts))
+        end = i + 1
+        spans.append((" ".join(parts), start, end))
         i += 1
-    return logical
+    return spans
+
+
+def _stray_aiteammate_lines(text: str, const_range: tuple[int, int]) -> list[int]:
+    start_const, end_const = const_range
+    stray: list[int] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        if "--aiteammate" not in line:
+            continue
+        if start_const <= line_no <= end_const:
+            continue
+        if (
+            '== "--aiteammate"' in line
+            or 'startswith("--aiteammate=")' in line
+        ) and "register" not in line.lower():
+            continue
+        stray.append(line_no)
+    return stray
 
 
 def _register_constant_line_range(register_py: Path) -> tuple[int, int]:
@@ -338,15 +360,20 @@ def test_no_current_register_aiteammate_reference() -> None:
         text = path.read_text(encoding="utf-8")
         if path == json_path:
             assert refusal.count("register") and refusal.count("--aiteammate")
-        for line_no, line in enumerate(_logical_lines(text), start=1):
-            if not _PAIRING.search(line):
+        for span_text, span_start, span_end in _source_spans(text):
+            if not _PAIRING.search(span_text):
                 continue
-            if path == json_path and "register_aiteammate_refusal" in line:
+            if path == json_path and "register_aiteammate_refusal" in span_text:
                 continue
             allowed = allowlist_ranges.get(path, set())
-            if any(start <= line_no <= end for start, end in allowed):
+            if any(
+                start <= span_start and span_end <= end for start, end in allowed
+            ):
                 continue
-            raise AssertionError(f"pairing hit at {path.relative_to(REPO_ROOT)}:{line_no}: {line!r}")
+            raise AssertionError(
+                f"pairing hit at {path.relative_to(REPO_ROOT)}:"
+                f"{span_start}-{span_end}: {span_text!r}"
+            )
 
     text = register_py.read_text(encoding="utf-8")
     predicate_lines = [
@@ -361,6 +388,7 @@ def test_no_current_register_aiteammate_reference() -> None:
     ]
     assert len(predicate_lines) <= 2
     assert 'add_argument("--aiteammate"' not in text
+    assert _stray_aiteammate_lines(text, const_range) == []
 
 
 def test_changelog_records_register_aiteammate_removal() -> None:
@@ -385,6 +413,10 @@ def test_changelog_records_register_aiteammate_removal() -> None:
         "`publish --aiteammate` is unchanged",
     ):
         assert needle in bullet
+    tail_after_removed = unreleased[removed_start + len(removed_section) :]
+    assert not any(
+        line.startswith("#") for line in tail_after_removed.splitlines() if line.strip()
+    )
     start_073 = changelog.index("## [0.7.3]")
     rest_073 = changelog[start_073:]
     end_073 = rest_073.find("\n## [", len("## [0.7.3]"))
