@@ -2109,6 +2109,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # clarify, independent of the session guard.
         self._session_key_to_conv: dict[str, str] = {}
         self._pending_turn_fifo: dict[str, deque[Any]] = {}
+        self._pending_queue_full_origins: dict[int, TurnAuthorityRecord] = {}
         extra_cfg = getattr(config, "extra", None) or {}
         try:
             fifo_max = int(extra_cfg.get("pending_turn_fifo_max", _DEFAULT_PENDING_TURN_FIFO_MAX))
@@ -3976,6 +3977,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for session_key in set(self._pending_messages) | set(self._pending_turn_fifo):
             self._clear_session_pending_turn_state(session_key)
         self._unregister_pending_merge_guard()
+        self._coalesced_turn_authority.clear()
         self._retire_turn_authorities()
         self._agent_turn_guards.clear()
         self._session_key_to_conv.clear()
@@ -4413,6 +4415,14 @@ class Agent365Adapter(BasePlatformAdapter):
         self._turn_authority_ledger[(conv_id, mid)] = record
         return True
 
+    def _attach_coalesced_turn_authority(self, record: TurnAuthorityRecord) -> None:
+        anchor = str(record.reply_activity.get("id") or "").strip()
+        if not anchor:
+            return
+        self._coalesced_turn_authority[
+            self._coalesced_reply_turn_key(record.conversation_id, anchor)
+        ] = record
+
     def _ledger_record_for_message(
         self, message_id: str, conversation_id: str
     ) -> TurnAuthorityRecord | None:
@@ -4735,6 +4745,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if len(fifo) >= self._pending_turn_fifo_max:
             record = self._event_turn_authority(event)
             if record is not None:
+                self._pending_queue_full_origins[id(event)] = record
                 self._release_turn_authority_owner(record)
             return False
         fifo.append(event)
@@ -4757,29 +4768,59 @@ class Agent365Adapter(BasePlatformAdapter):
             _HERMES_MERGE_PENDING_ORIGINAL(self._pending_messages, session_key, next_event)
         return True
 
-    def _schedule_pending_turn_queue_full_reply(self, event: Any, session_key: str) -> None:
+    def _schedule_pending_turn_queue_full_reply(
+        self,
+        event: Any,
+        session_key: str,
+        *,
+        reply_origin: TurnAuthorityRecord | None = None,
+    ) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        reply_task = loop.create_task(self._send_pending_turn_queue_full_reply(event, session_key))
+        reply_task = loop.create_task(
+            self._send_pending_turn_queue_full_reply(
+                event, session_key, reply_origin=reply_origin
+            )
+        )
         reply_task.add_done_callback(lambda _task: None)
 
-    async def _send_pending_turn_queue_full_reply(self, event: Any, session_key: str) -> None:
+    async def _send_pending_turn_queue_full_reply(
+        self,
+        event: Any,
+        session_key: str,
+        *,
+        reply_origin: TurnAuthorityRecord | None = None,
+    ) -> None:
         chat_id = self._session_key_to_conv.get(session_key) or self._chat_id_from_processing_event(
             event
         )
         if not chat_id or self._turn_reply_blocked(str(chat_id)):
             return
+        if reply_origin is None:
+            logger.warning(
+                "agent365 pending queue-full notice skipped: no turn authority record"
+            )
+            return
         text = "This conversation is busy with earlier messages. Please try again in a moment."
         with contextlib.suppress(Exception):
-            await self.send(str(chat_id), text)
+            await self._send_reply_activity(
+                inbound={},
+                content=text,
+                log_context="queue-full",
+                reply_origin=reply_origin,
+            )
 
     def _agent365_merge_pending_message_event(
         self, session_key: str, event: Any, *, merge_text: bool = False
     ) -> None:
         if not self._agent365_admit_pending_turn_event(session_key, event, merge_text=merge_text):
-            self._schedule_pending_turn_queue_full_reply(event, session_key)
+            reply_origin = self._pending_queue_full_origins.pop(id(event), None)
+            if reply_origin is not None:
+                self._schedule_pending_turn_queue_full_reply(
+                    event, session_key, reply_origin=reply_origin
+                )
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event | None) -> None:
         if self._session_turn_dispatch_frozen(session_key):
@@ -5835,6 +5876,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # render_reply_activity converts them to Teams citation entities.
             citations=(metadata or {}).get("citations"),
             validated_path=turn_validated_path,
+            reply_origin=coalesced_origin,
         )
         # The plain reply is already on screen. Hermes still calls
         # edit_message(finalize=True) because REQUIRES_EDIT_FINALIZE is
@@ -6017,6 +6059,8 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             activity_id = str(getattr(event, "message_id", "") or "")
             record = self._event_turn_authority(event)
+            if record is not None:
+                self._attach_coalesced_turn_authority(record)
             inbound = copy.deepcopy(record.reply_activity) if record is not None else None
             conv = (inbound or {}).get("conversation") or {}
             chat_type = str(conv.get("conversationType") or "")
@@ -9925,6 +9969,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     content=suffix.strip(),
                     log_context="turn buffer",
                     validated_path=path,
+                    reply_origin=reply_origin,
                     turn_buffer_flush=(
                         chat_id,
                         buf,
@@ -12490,6 +12535,9 @@ class Agent365Adapter(BasePlatformAdapter):
             ):
                 self._release_agent_turn_admission(admission_key)
                 continue
+            admitted_record = self._ledger_record_for_message(authority_id, conv_id)
+            if admitted_record is not None:
+                self._attach_coalesced_turn_authority(admitted_record)
             if sk is not None:
                 self._session_key_to_conv[sk] = conv_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -13055,6 +13103,9 @@ class Agent365Adapter(BasePlatformAdapter):
             self._release_agent_turn_admission(admission_key)
             logger.warning("agent365 handoff pin skipped: no turn authority")
             return
+        handoff_record = self._ledger_record_for_message(authority_id, chat_id)
+        if handoff_record is not None:
+            self._attach_coalesced_turn_authority(handoff_record)
         if sk is not None:
             self._session_key_to_conv[sk] = chat_id
             turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -15371,6 +15422,9 @@ class Agent365Adapter(BasePlatformAdapter):
         await self._retire_chat_agent_turns(chat_id)
 
         self._retire_turn_authorities(conversation_id=chat_id)
+        for auth_key in list(self._coalesced_turn_authority):
+            if auth_key[0] == chat_id:
+                self._coalesced_turn_authority.pop(auth_key, None)
 
         task_chats: dict[asyncio.Task[Any], str] = {
             task: owner_chat_id

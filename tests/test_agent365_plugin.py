@@ -321,7 +321,7 @@ def _admit_wire_turn_authority(a: Any, inbound: dict[str, Any]) -> None:
     if a.admit_turn_authority(inbound, session, message_id=activity_id):
         record = a._ledger_record_for_message(activity_id, ref.conversation_id)
         if record is not None:
-            a._coalesced_turn_authority[(ref.conversation_id, activity_id)] = record
+            a._attach_coalesced_turn_authority(record)
             adapter_mod._AGENT_TURN_FRAME.set(record)
 
 
@@ -21279,6 +21279,7 @@ class TestSendOrUpdateStatus:
         a._capture_coalesced_turn_target(ref)
         a._conversations.upsert(ref)
         a._seen_inbounds_this_lifetime.add(inbound["conversation"]["id"])
+        _admit_wire_turn_authority(a, inbound)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
         a._fmi_cache = MagicMock()
@@ -21601,6 +21602,7 @@ class TestSendOrUpdateStatus:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-status-bounds")
         inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire(a, inbound)
 
         first = a._buffer_coalesced_status(
             chat_id="conv-status-bounds",
