@@ -49,7 +49,7 @@ For single-agent Path B, stay on the default: **do not** set multiplex to `true`
 1. **Install the package** into the active Hermes Python environment ([`README.md`](../README.md) → **Install** — `pipx` for standalone CLI, or `uv pip install 'hermes-a365[bridge]'` for the gateway plugin).
 2. **Confirm discovery:** `hermes plugins list` should show `agent365` ([`SKILL.md`](../SKILL.md) → **Prerequisites**).
 3. **Seed operator config:** copy `a365.config.json.example` to `a365.config.json` in your working directory (`A365Config` field summary: [`docs/SURFACE.md`](SURFACE.md)).
-4. **Optional for registration only:** you may seed `A365_TENANT_ID=<tenant-id>` in `~/.hermes/.env` before first apply because `register` below passes `--tenant-id` ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **0. Local bootstrap**). That optionality does **not** make the parent `~/.hermes/.env` optional for `instance create` — both required parent keys are documented before instance creation.
+4. **Optional for registration only:** you may seed `A365_TENANT_ID=<tenant-id>` in `~/.hermes/.env` before first apply because `register` below passes `--tenant-id` ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **0. Local bootstrap**). That optionality does **not** make the parent `~/.hermes/.env` optional for `hermes a365 consent` or `instance create` — both required parent keys are documented before consent.
 5. Run **`hermes a365 doctor --human`** — exit `0` means OK, `1` means warnings, `2` means errors. The installed `a365` CLI probe currently always warns, so expect exit `1` when no errors are present; resolve errors before continuing ([`SKILL.md`](../SKILL.md) → **`hermes a365 doctor`**).
 6. **`az account set --subscription <subscription-id>`** and confirm tenant alignment: `az account show --query "{tenantId:tenantId, name:name}" -o table` ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.2**).
 7. Run the upstream prereq check: `yes y | a365 setup requirements` — pass criteria in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **1. doctor**.
@@ -84,6 +84,19 @@ hermes a365 register \
   --apply
 ```
 
+## Parent `~/.hermes/.env` before consent and instance creation
+
+Before `hermes a365 consent` or `instance create`, the selected profile's parent `~/.hermes/.env` must include nonempty `A365_TENANT_ID` (the same tenant pin used for registration) and `A365_APP_ID` copied from **`agentBlueprintId`** in `a365.generated.config.json` — **not** the separate BF app id. Set file mode `0600`. Registration writes its ownership anchor under `agents/<slug>/.env`, not in this parent file ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **0. Local bootstrap**).
+
+```bash
+# append or update ~/.hermes/.env (chmod 600)
+echo "A365_TENANT_ID=<tenant-id>" >> ~/.hermes/.env
+echo "A365_APP_ID=<agentBlueprintId-from-generated-config>" >> ~/.hermes/.env
+chmod 600 ~/.hermes/.env
+```
+
+Complete this checkpoint **before** consent below; keep both parent identifiers and the blueprint secret above available **before** the BF steps and `instance create`.
+
 If `register` reports **deferred admin consent**, run:
 
 ```bash
@@ -93,19 +106,6 @@ hermes a365 consent "<display-name>"
 …or `hermes a365 consent "<display-name>" --no-open` ([`SKILL.md`](../SKILL.md) → **`hermes a365 consent`**; runbook **§4**).
 
 **Checkpoint:** `register --apply` completes the blueprint + permission plan, `a365.generated.config.json` exists (gitignored), `A365_BLUEPRINT_CLIENT_SECRET` is saved in the profile `~/.hermes/.env`, and `consent` exits `0` once scopes are granted — checkboxes in runbook **§3** and **§4**. You have **not** run Path A `publish --aiteammate` or admin-centre activation; those are out of scope for Path B.
-
-## Parent `~/.hermes/.env` before instance creation
-
-Before `instance create`, the selected profile's parent `~/.hermes/.env` must include nonempty `A365_TENANT_ID` (the same tenant pin used for registration) and `A365_APP_ID` copied from **`agentBlueprintId`** in `a365.generated.config.json` — **not** the separate BF app id. Set file mode `0600`. Registration writes its ownership anchor under `agents/<slug>/.env`, not in this parent file ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **0. Local bootstrap**).
-
-```bash
-# append or update ~/.hermes/.env (chmod 600)
-echo "A365_TENANT_ID=<tenant-id>" >> ~/.hermes/.env
-echo "A365_APP_ID=<agentBlueprintId-from-generated-config>" >> ~/.hermes/.env
-chmod 600 ~/.hermes/.env
-```
-
-Complete this checkpoint together with the blueprint secret above **before** the BF steps and `instance create` below.
 
 ## Register Path B Bot Framework identity and local instance
 
