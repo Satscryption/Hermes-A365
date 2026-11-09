@@ -15,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_a365 import cli as standalone_cli
 from hermes_a365._common import write_owner_only_text_atomic
 from hermes_a365.a365_config import CONFIG_FILENAME
 from hermes_a365.entra_state import RegistrationDecision, record_ownership_anchor
@@ -26,7 +27,6 @@ from hermes_a365.mutator import (
     CliInvocationError,
     RunResult,
 )
-from hermes_a365 import cli as standalone_cli
 from hermes_a365.plugin import cli as plugin_cli
 from hermes_a365.register import (
     DEFAULT_BACKOFF_SECONDS,

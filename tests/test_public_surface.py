@@ -12,12 +12,12 @@ from argparse import Namespace
 from pathlib import Path
 
 import pytest
+from test_register import EXPECTED_REGISTER_AITEAMMATE_REMOVED
 
 from hermes_a365 import surface as surface_mod
 from hermes_a365.instance_create import _DEPRECATED_OTLP_ENV_KEY, _MANAGED_AGENT_ENV_KEYS
 from hermes_a365.plugin.conversations import ConversationRegistry
 from hermes_a365.register import REGISTER_AITEAMMATE_REMOVED
-from test_register import EXPECTED_REGISTER_AITEAMMATE_REMOVED
 from hermes_a365.surface_collect import (
     _module_has_main_guard,
     collect_adapter_public_members,
