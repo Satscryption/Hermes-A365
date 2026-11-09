@@ -304,13 +304,29 @@ def _source_spans(text: str) -> list[tuple[str, int, int]]:
     while i < len(physical):
         start = i + 1
         parts = [physical[i].rstrip("\\").rstrip()]
+        group_indices = [i]
         while physical[i].rstrip().endswith("\\") and i + 1 < len(physical):
             i += 1
             parts.append(physical[i].rstrip("\\").rstrip())
+            group_indices.append(i)
         end = i + 1
-        spans.append((" ".join(parts), start, end))
+        for idx in group_indices:
+            n = idx + 1
+            spans.append((physical[idx].rstrip("\\").rstrip(), n, n))
+        if len(group_indices) >= 2:
+            spans.append((" ".join(parts), start, end))
         i += 1
     return spans
+
+
+_ATX_HEADING = re.compile(r"^ {0,3}(#{1,6})(?:[ ](.*))?$")
+
+
+def _atx_level(line: str) -> int | None:
+    match = _ATX_HEADING.match(line)
+    if not match:
+        return None
+    return len(match.group(1))
 
 
 def _stray_aiteammate_lines(text: str, const_range: tuple[int, int]) -> list[int]:
@@ -390,17 +406,89 @@ def test_no_current_register_aiteammate_reference() -> None:
     assert 'add_argument("--aiteammate"' not in text
     assert _stray_aiteammate_lines(text, const_range) == []
 
+    def _span_coords(sample: str) -> set[tuple[int, int]]:
+        return {(start, end) for _, start, end in _source_spans(sample)}
+
+    def _pairing_outside_allow(
+        sample: str, allow_start: int, allow_end: int
+    ) -> set[tuple[int, int]]:
+        outside: set[tuple[int, int]] = set()
+        for span_text, span_start, span_end in _source_spans(sample):
+            if not _PAIRING.search(span_text):
+                continue
+            if allow_start <= span_start and span_end <= allow_end:
+                continue
+            outside.add((span_start, span_end))
+        return outside
+
+    def _pairing_inside_allow(
+        sample: str, allow_start: int, allow_end: int
+    ) -> set[tuple[int, int]]:
+        inside: set[tuple[int, int]] = set()
+        for span_text, span_start, span_end in _source_spans(sample):
+            if not _PAIRING.search(span_text):
+                continue
+            if allow_start <= span_start and span_end <= allow_end:
+                inside.add((span_start, span_end))
+        return inside
+
+    fixture_a = "\n".join(
+        [
+            "note \\",
+            "kept",
+            'TOKEN = "register --aiteammate"',
+            "register --aiteammate",
+        ]
+    )
+    assert {(1, 1), (2, 2), (1, 2), (3, 3), (4, 4)} <= _span_coords(fixture_a)
+    assert _pairing_outside_allow(fixture_a, 3, 3) == {(4, 4)}
+    assert (3, 3) in _pairing_inside_allow(fixture_a, 3, 3)
+
+    fixture_b = "\n".join(
+        [
+            "register \\",
+            "--aiteammate",
+            "safe",
+        ]
+    )
+    assert {(1, 1), (2, 2), (1, 2), (3, 3)} <= _span_coords(fixture_b)
+    assert _pairing_outside_allow(fixture_b, 3, 3) == {(1, 2)}
+    for coord in ((1, 1), (2, 2)):
+        line_text = next(
+            t for t, s, e in _source_spans(fixture_b) if (s, e) == coord
+        )
+        assert not _PAIRING.search(line_text)
+
+    stray_fixture = "\n".join(
+        [
+            'REGISTER_AITEAMMATE_REMOVED = "--aiteammate"',
+            'return token == "--aiteammate" or token.startswith("--aiteammate=")',
+            'OTHER = "--aiteammate"',
+        ]
+    )
+    assert _stray_aiteammate_lines(stray_fixture, (1, 1)) == [3]
+
 
 def test_changelog_records_register_aiteammate_removal() -> None:
     changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    all_lines = changelog.splitlines()
     unreleased_start = changelog.index("## [Unreleased]")
     next_section = changelog.index("## [0.9.6]", unreleased_start)
     unreleased = changelog[unreleased_start:next_section]
+    unreleased_lines = unreleased.splitlines()
     assert "### Removed" in unreleased
-    removed_start = unreleased.index("### Removed")
-    removed_body = unreleased[removed_start:]
-    next_heading = removed_body.find("\n### ", len("### Removed"))
-    removed_section = removed_body if next_heading < 0 else removed_body[:next_heading]
+    removed_idx = next(
+        i
+        for i, line in enumerate(unreleased_lines)
+        if line.strip() == "### Removed"
+    )
+    section_end_idx = len(unreleased_lines)
+    for i in range(removed_idx + 1, len(unreleased_lines)):
+        level = _atx_level(unreleased_lines[i])
+        if level is not None and 3 <= level <= 6:
+            section_end_idx = i
+            break
+    removed_section = "\n".join(unreleased_lines[removed_idx:section_end_idx])
     bullets = [line for line in removed_section.splitlines() if line.strip().startswith("- ")]
     assert len(bullets) == 1
     bullet = bullets[0]
@@ -413,10 +501,29 @@ def test_changelog_records_register_aiteammate_removal() -> None:
         "`publish --aiteammate` is unchanged",
     ):
         assert needle in bullet
-    tail_after_removed = unreleased[removed_start + len(removed_section) :]
-    assert not any(
-        line.startswith("#") for line in tail_after_removed.splitlines() if line.strip()
-    )
+    tail_lines = unreleased_lines[section_end_idx:]
+    assert all(_atx_level(line) is None for line in tail_lines)
+    global_removed_idx = None
+    past_unreleased_heading = False
+    for i, line in enumerate(all_lines):
+        if line.startswith("## [Unreleased]"):
+            past_unreleased_heading = True
+            continue
+        if past_unreleased_heading and line.startswith("## [0.9.6]"):
+            break
+        if past_unreleased_heading and line.strip() == "### Removed":
+            global_removed_idx = i
+            break
+    assert global_removed_idx is not None
+    next_heading_line: str | None = None
+    for j in range(global_removed_idx + 1, len(all_lines)):
+        level = _atx_level(all_lines[j])
+        if level is not None:
+            next_heading_line = all_lines[j]
+            break
+    assert next_heading_line is not None
+    remainder = re.sub(r"^ {0,3}", "", next_heading_line)
+    assert remainder.startswith("## [0.9.6]")
     start_073 = changelog.index("## [0.7.3]")
     rest_073 = changelog[start_073:]
     end_073 = rest_073.find("\n## [", len("## [0.7.3]"))
