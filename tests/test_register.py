@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import shlex
@@ -14,6 +15,7 @@ from pathlib import Path
 
 import pytest
 
+from hermes_a365 import cli as standalone_cli
 from hermes_a365._common import write_owner_only_text_atomic
 from hermes_a365.a365_config import CONFIG_FILENAME
 from hermes_a365.entra_state import RegistrationDecision, record_ownership_anchor
@@ -25,10 +27,11 @@ from hermes_a365.mutator import (
     CliInvocationError,
     RunResult,
 )
+from hermes_a365.plugin import cli as plugin_cli
 from hermes_a365.register import (
-    AITEAMMATE_REGISTER_UNSUPPORTED,
     DEFAULT_BACKOFF_SECONDS,
     DEFAULT_RETRIES,
+    REGISTER_AITEAMMATE_REMOVED,
     ApplyResult,
     RegisterError,
     RegisterInputs,
@@ -53,6 +56,23 @@ _TEST_TENANT = "aaaa1111-0000-0000-0000-000000000001"
 # Keep apply() off the real ~/.hermes so a developer anchor cannot change
 # the create-path tests. The directory is empty: no per-agent A365_APP_ID.
 _REGISTER_TEST_HOME = Path(tempfile.mkdtemp(prefix="a365-register-home-"))
+
+EXPECTED_REGISTER_AITEAMMATE_REMOVED = (
+    "`register --aiteammate` was removed in 1.0. Register only runs "
+    "`a365 setup blueprint` plus MCP/Bot permission setup; the AI Teammate "
+    "agentic user is created/activated after `publish --aiteammate` via "
+    "M365 Admin Centre upload and per-user activation."
+)
+
+
+def _build_plugin_parent_parser() -> argparse.ArgumentParser:
+    import argparse
+
+    parent = argparse.ArgumentParser(prog="hermes")
+    subs = parent.add_subparsers(dest="cmd")
+    a365_p = subs.add_parser("a365")
+    plugin_cli.register_cli(a365_p)
+    return parent
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -174,12 +194,7 @@ class TestRegisterInputs:
         assert inp.agent_name == "inbox-helper"
         assert inp.tenant_id is None
         assert inp.m365 is False
-        assert inp.aiteammate is False
         assert inp.authmode == "obo"
-
-    def test_aiteammate_rejected_with_real_flow_hint(self) -> None:
-        with pytest.raises(ValueError, match="publish --aiteammate"):
-            RegisterInputs(agent_name="x", aiteammate=True)
 
     def test_empty_agent_name_rejected(self) -> None:
         with pytest.raises(ValueError, match="agent_name"):
@@ -250,36 +265,144 @@ class TestBuildRegisterPlan:
         assert bot.argv == ["a365", "setup", "permissions", "bot", "--agent-name", "x"]
 
 
-class TestCliAiteammateUnsupported:
-    def test_help_marks_aiteammate_as_unsupported(self) -> None:
-        help_text = build_parser().format_help()
-        assert "--aiteammate" in help_text
-        assert "deprecated/unsupported on register" in help_text
-        assert "publish --aiteammate" in help_text
+def test_register_help_omits_removed_aiteammate(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    help_text = build_parser().format_help()
+    assert "--aiteammate" not in help_text
+    assert "--aiteammate" not in build_parser()._option_string_actions
 
-    def test_run_rejects_aiteammate_before_plan_or_apply(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        args = build_parser().parse_args(["--agent-name", "x", "--aiteammate", "--apply"])
+    with pytest.raises(SystemExit) as exc:
+        standalone_cli.main(["register", "--help"])
+    assert exc.value.code == 0
+    captured_cli = capsys.readouterr()
+    assert "--aiteammate" not in captured_cli.out
+    assert "--aiteammate" not in captured_cli.err
 
-        rc = run(args)
+    plugin_parent = _build_plugin_parent_parser()
+    with pytest.raises(SystemExit) as exc_plugin:
+        plugin_parent.parse_args(["a365", "register", "--help"])
+    assert exc_plugin.value.code == 0
+    captured_plugin = capsys.readouterr()
+    assert "--aiteammate" not in captured_plugin.out
+    assert "--aiteammate" not in captured_plugin.err
 
-        assert rc == 2
-        captured = capsys.readouterr()
-        assert AITEAMMATE_REGISTER_UNSUPPORTED in captured.err
-        assert "a365 setup blueprint" not in captured.out
 
-    def test_dry_run_rejects_aiteammate_before_plan_render(
-        self, capsys: pytest.CaptureFixture[str]
-    ) -> None:
-        args = build_parser().parse_args(["--agent-name", "x", "--aiteammate"])
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--aiteammate"],
+        ["--agent-name", "x", "--aiteammate", "--apply"],
+        ["--aiteammate=true"],
+    ],
+)
+def test_removed_aiteammate_exits_2_on_both_entry_points(
+    argv: list[str],
+    capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected_err = "ERROR: " + EXPECTED_REGISTER_AITEAMMATE_REMOVED + "\n"
 
-        rc = run(args)
+    def _boom() -> object:
+        raise AssertionError("get_mutator must not run for removed flag")
 
-        assert rc == 2
-        captured = capsys.readouterr()
-        assert AITEAMMATE_REGISTER_UNSUPPORTED in captured.err
-        assert "a365 setup blueprint" not in captured.out
+    monkeypatch.setattr("hermes_a365.register.get_mutator", _boom)
+
+    register_py = Path(__file__).resolve().parents[1] / "src" / "hermes_a365" / "register.py"
+    text = register_py.read_text(encoding="utf-8")
+    assert "AITEAMMATE_REGISTER_UNSUPPORTED" not in text
+    assert REGISTER_AITEAMMATE_REMOVED == EXPECTED_REGISTER_AITEAMMATE_REMOVED
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(argv)
+    assert exc.value.code == 2
+    captured = capsys.readouterr()
+    assert captured.err == expected_err
+    assert "a365 setup blueprint" not in captured.out
+
+    capsys.readouterr()
+    plugin_argv = ["a365", "register", *argv]
+    plugin_parent = _build_plugin_parent_parser()
+    with pytest.raises(SystemExit) as exc_plugin:
+        plugin_parent.parse_args(plugin_argv)
+    assert exc_plugin.value.code == 2
+    captured_plugin = capsys.readouterr()
+    assert captured_plugin.err == expected_err
+    assert "a365 setup blueprint" not in captured_plugin.out
+
+    capsys.readouterr()
+    cli_argv = ["register", *argv]
+    with pytest.raises(SystemExit) as exc_cli:
+        standalone_cli.main(cli_argv)
+    assert exc_cli.value.code == 2
+    captured_cli = capsys.readouterr()
+    assert captured_cli.err == expected_err
+    assert "a365 setup blueprint" not in captured_cli.out
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--nope"],
+        ["--aiteammate-foo"],
+        ["--agent-name", "x", "--nope"],
+        ["--agent-name", "x", "--aiteammate-foo"],
+    ],
+)
+def test_other_unknown_register_flag_stays_argparse(
+    argv: list[str], capsys: pytest.CaptureFixture[str]
+) -> None:
+    removed_snippet = "was removed in 1.0"
+
+    with pytest.raises(SystemExit) as exc:
+        build_parser().parse_args(argv)
+    assert exc.value.code == 2
+    err = capsys.readouterr().err
+    assert removed_snippet not in err
+
+    capsys.readouterr()
+    with pytest.raises(SystemExit) as exc_cli:
+        standalone_cli.main(["register", *argv])
+    assert exc_cli.value.code == 2
+    err_cli = capsys.readouterr().err
+    assert removed_snippet not in err_cli
+
+    capsys.readouterr()
+    plugin_parent = _build_plugin_parent_parser()
+    with pytest.raises(SystemExit) as exc_plugin:
+        plugin_parent.parse_args(["a365", "register", *argv])
+    assert exc_plugin.value.code == 2
+    err_plugin = capsys.readouterr().err
+    assert removed_snippet not in err_plugin
+
+    if "--agent-name" not in argv:
+        assert "the following arguments are required: --agent-name" in err
+        assert "the following arguments are required: --agent-name" in err_cli
+        assert "the following arguments are required: --agent-name" in err_plugin
+        assert "unrecognized arguments" not in err
+        assert "unrecognized arguments" not in err_cli
+        assert "unrecognized arguments" not in err_plugin
+    else:
+        unknown = "--nope" if "--nope" in argv else "--aiteammate-foo"
+        assert f"unrecognized arguments: {unknown}" in err
+        assert f"unrecognized arguments: {unknown}" in err_cli
+        assert f"unrecognized arguments: {unknown}" in err_plugin
+
+
+def test_register_inputs_has_no_aiteammate_field() -> None:
+    from dataclasses import fields
+
+    field_names = tuple(f.name for f in fields(RegisterInputs))
+    assert field_names == (
+        "agent_name",
+        "tenant_id",
+        "m365",
+        "authmode",
+        "no_endpoint",
+        "skip_requirements",
+    )
+    with pytest.raises(TypeError):
+        RegisterInputs(agent_name="x", aiteammate=True)  # type: ignore[call-arg]
 
 
 class TestSkippedBlueprintSecret:

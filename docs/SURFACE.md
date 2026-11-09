@@ -25,7 +25,7 @@ Status: **accepted** (recorded in `src/hermes_a365/surface.py`).
 
 ## CLI
 
-Verbs: `doctor`, `license`, `register`, `consent`, `instance create`, `publish`, `status`, `cleanup`, `activity-bridge` (`verify` / `serve` / `update-endpoint`), `bot-service` (`create` / `enable-channel` / `update-endpoint` / `cleanup` / `verify`). Both `hermes-a365` and `hermes a365` share identical argparse trees (see JSON). Help strings are not frozen except `register --aiteammate` refusal (exit 2).
+Verbs: `doctor`, `license`, `register`, `consent`, `instance create`, `publish`, `status`, `cleanup`, `activity-bridge` (`verify` / `serve` / `update-endpoint`), `bot-service` (`create` / `enable-channel` / `update-endpoint` / `cleanup` / `verify`). Both `hermes-a365` and `hermes a365` share identical argparse trees (see JSON). Help strings are not frozen.
 
 ### Exit codes
 
