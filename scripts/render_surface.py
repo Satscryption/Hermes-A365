@@ -92,11 +92,11 @@ def build_snapshot() -> dict[str, Any]:
     import asyncio
 
     from hermes_a365 import __version__
-    from hermes_a365.register import AITEAMMATE_REGISTER_UNSUPPORTED
+    from hermes_a365.register import REGISTER_AITEAMMATE_REMOVED
 
     scanned_env = scan_env_literals()
     constants = _load_surface_constants()
-    constants["register_aiteammate_refusal"] = AITEAMMATE_REGISTER_UNSUPPORTED
+    constants["register_aiteammate_refusal"] = REGISTER_AITEAMMATE_REMOVED
     constants["python_modules"] = collect_python_module_surface()
     constants["keychain_cli"] = collect_keychain_cli_surface()
     constants["invoke"]["task_fetch_card"] = asyncio.run(collect_task_fetch_card_from_invoke())
@@ -147,7 +147,7 @@ def render_markdown(snapshot: dict[str, Any]) -> str:
             "`status`, `cleanup`, `activity-bridge` (`verify` / `serve` / `update-endpoint`), "
             "`bot-service` (`create` / `enable-channel` / `update-endpoint` / `cleanup` / `verify`). "
             "Both `hermes-a365` and `hermes a365` share identical argparse trees (see JSON). "
-            "Help strings are not frozen except `register --aiteammate` refusal (exit 2).",
+            "Help strings are not frozen.",
             "",
             "### Exit codes",
             "",

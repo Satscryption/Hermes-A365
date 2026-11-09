@@ -218,10 +218,9 @@ and is not used as the pin.
 `--m365` is forwarded to `a365 setup blueprint`. Current a365 CLI builds do
 not register the messaging endpoint from that flag alone; after the tunnel
 exists, run `activity-bridge update-endpoint`.
-`--aiteammate` is intentionally unsupported on `register`: the wrapper
-only runs blueprint + permission setup. Use
-`hermes a365 publish --aiteammate --apply`, then upload and activate the
-zip in M365 Admin Centre, to create/bind the AI Teammate agentic user.
+`register` runs blueprint + permission setup only. The agentic user is
+still created by `hermes a365 publish --aiteammate --apply`, then M365
+Admin Centre upload and per-user activation.
 `--no-endpoint` and `--skip-requirements` are passthroughs to
 `a365 setup blueprint`.
 

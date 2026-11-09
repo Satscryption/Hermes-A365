@@ -6,6 +6,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Removed
+
+- **#85:** `register --aiteammate` is gone from `hermes-a365 register` and `hermes a365 register`, and from `--help`. Passing it exits 2 with the redirect and does not build or apply a plan. `publish --aiteammate` is unchanged.
+
 ### Added
 
 - **#191 — Client secret expiry in `doctor` / `status`.** Read

@@ -208,3 +208,57 @@ def test_documented_hermes_pins_do_not_satisfy_our_floors() -> None:
     assert Version("2.15.0") in pyjwt
     assert Version("0.133.1") not in fastapi
     assert Version("0.141.1") in fastapi
+
+
+def test_development_status_production_stable() -> None:
+    classifiers = _project()["classifiers"]
+    assert classifiers[0] == "Development Status :: 5 - Production/Stable"
+    assert classifiers[1] == "Programming Language :: Python :: 3"
+    dev_status = [c for c in classifiers if c.startswith("Development Status ::")]
+    assert len(dev_status) == 1
+
+
+def test_part2_preserved_surfaces() -> None:
+    import hashlib
+    from dataclasses import fields
+
+    from hermes_a365 import __version__
+    from hermes_a365.register import RegisterInputs
+
+    assert _project()["version"] == "0.9.6"
+    assert __version__ == "0.9.6"
+    names = tuple(f.name for f in fields(RegisterInputs))
+    assert names == (
+        "agent_name",
+        "tenant_id",
+        "m365",
+        "authmode",
+        "no_endpoint",
+        "skip_requirements",
+    )
+
+    from hermes_a365 import surface as surface_mod
+
+    sidecar_hash = hashlib.sha256(surface_mod.SIDECAR_MIGRATION_POLICY.encode()).hexdigest()
+    security_hash = hashlib.sha256(surface_mod.SECURITY_SUPPORT_AFTER_V1.encode()).hexdigest()
+    assert sidecar_hash == "316d4c14dc46a41e854a5c025f8adca745052e153e02307d170d7e1f7090882c"
+    assert security_hash == "b30d768f844b9e576e007f671d62ed66023ec1fe4b2b9b600b60a656820c3715"
+
+    preserved = {
+        "SECURITY.md": "a4f0322f247e582d6f2c4fe412b9d4ff0df6ba3f76ca8d553ff0e24ace14e550",
+        "references/v1-compatibility-matrix.md": (
+            "63fca921fad16fe50a8dfcbcb25c2b329f314abe56309172a0f0aa26ffe5a6ce"
+        ),
+        "src/hermes_a365/surface.py": (
+            "9443c4b4c8408851bd610fa708814239e65c91adad85e08a9d0f4ea465be185b"
+        ),
+        "src/hermes_a365/publish.py": (
+            "f31e81442dbafaf81ae98a5edaeaaec9f018e261967a9111e3a30d6740b2b251"
+        ),
+        "references/a365-cli-reference.md": (
+            "4023e7e8c6af398a0cfa09bc974aba2002effbd41d6e4393500c375f28ac8957"
+        ),
+    }
+    for rel, expected in preserved.items():
+        digest = hashlib.sha256((ROOT / rel).read_bytes()).hexdigest()
+        assert digest == expected

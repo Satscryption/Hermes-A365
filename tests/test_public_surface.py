@@ -5,6 +5,8 @@ from __future__ import annotations
 import ast
 import asyncio
 import json
+import re
+import subprocess
 import textwrap
 from argparse import Namespace
 from pathlib import Path
@@ -14,7 +16,8 @@ import pytest
 from hermes_a365 import surface as surface_mod
 from hermes_a365.instance_create import _DEPRECATED_OTLP_ENV_KEY, _MANAGED_AGENT_ENV_KEYS
 from hermes_a365.plugin.conversations import ConversationRegistry
-from hermes_a365.register import AITEAMMATE_REGISTER_UNSUPPORTED, RegisterInputs
+from hermes_a365.register import REGISTER_AITEAMMATE_REMOVED
+from test_register import EXPECTED_REGISTER_AITEAMMATE_REMOVED
 from hermes_a365.surface_collect import (
     _module_has_main_guard,
     collect_adapter_public_members,
@@ -133,9 +136,15 @@ def test_product_http_routes(snapshot: dict) -> None:
 
 
 def test_register_aiteammate_refusal_text(snapshot: dict) -> None:
-    assert snapshot["register_aiteammate_refusal"] == AITEAMMATE_REGISTER_UNSUPPORTED
-    with pytest.raises(ValueError, match="register --aiteammate"):
-        RegisterInputs(agent_name="demo", aiteammate=True)
+    assert REGISTER_AITEAMMATE_REMOVED == EXPECTED_REGISTER_AITEAMMATE_REMOVED
+    assert snapshot["register_aiteammate_refusal"] == EXPECTED_REGISTER_AITEAMMATE_REMOVED
+    assert snapshot["exit_codes"]["register_aiteammate"] == 2
+    plugin_register = snapshot["cli"]["plugin"]["subparsers"]["register"]["actions"]
+    standalone_register = snapshot["cli"]["standalone"]["subparsers"]["register"]["actions"]
+    assert not any(a.get("option_strings") == ["--aiteammate"] for a in plugin_register)
+    assert not any(a.get("option_strings") == ["--aiteammate"] for a in standalone_register)
+    plugin_publish = snapshot["cli"]["plugin"]["subparsers"]["publish"]["actions"]
+    assert any(a.get("option_strings") == ["--aiteammate"] for a in plugin_publish)
 
 
 def test_publish_default_scopes_match_d2() -> None:
@@ -251,3 +260,134 @@ def test_security_md_documents_d4_window() -> None:
     text = (REPO_ROOT / "SECURITY.md").read_text(encoding="utf-8")
     assert surface_mod.SECURITY_SUPPORT_AFTER_V1 in text
     assert "reviewed at v1.0" not in text
+
+
+_PAIRING = re.compile(
+    r"(?i)register.{0,80}--aiteammate|--aiteammate.{0,80}register"
+)
+
+
+def _tracked_text_files() -> list[Path]:
+    proc = subprocess.run(
+        ["git", "ls-files"],
+        cwd=REPO_ROOT,
+        capture_output=True,
+        text=True,
+        check=True,
+    )
+    paths: list[Path] = []
+    for line in proc.stdout.splitlines():
+        path = REPO_ROOT / line
+        if not path.is_file():
+            continue
+        try:
+            raw = path.read_bytes()
+        except OSError:
+            continue
+        if b"\0" in raw[:8192]:
+            continue
+        try:
+            raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+        paths.append(path)
+    return paths
+
+
+def _logical_lines(text: str) -> list[str]:
+    physical = text.splitlines()
+    logical: list[str] = []
+    i = 0
+    while i < len(physical):
+        parts = [physical[i].rstrip("\\").rstrip()]
+        while physical[i].rstrip().endswith("\\") and i + 1 < len(physical):
+            i += 1
+            parts.append(physical[i].rstrip("\\").rstrip())
+        logical.append(" ".join(parts))
+        i += 1
+    return logical
+
+
+def _register_constant_line_range(register_py: Path) -> tuple[int, int]:
+    tree = ast.parse(register_py.read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign):
+            for target in node.targets:
+                if isinstance(target, ast.Name) and target.id == "REGISTER_AITEAMMATE_REMOVED":
+                    assert hasattr(node, "lineno") and hasattr(node, "end_lineno")
+                    return (node.lineno, node.end_lineno or node.lineno)
+    raise AssertionError("REGISTER_AITEAMMATE_REMOVED assignment missing")
+
+
+def test_no_current_register_aiteammate_reference() -> None:
+    register_py = REPO_ROOT / "src" / "hermes_a365" / "register.py"
+    const_range = _register_constant_line_range(register_py)
+    allowlist_ranges = {register_py: {const_range}}
+    json_path = REPO_ROOT / "docs" / "surface" / "public-surface.json"
+    json_payload = json.loads(json_path.read_text(encoding="utf-8"))
+    refusal = json_payload["register_aiteammate_refusal"]
+
+    for path in _tracked_text_files():
+        if path == REPO_ROOT / "CHANGELOG.md":
+            continue
+        if path in (
+            REPO_ROOT / "tests" / "test_register.py",
+            REPO_ROOT / "tests" / "test_public_surface.py",
+        ):
+            continue
+        text = path.read_text(encoding="utf-8")
+        if path == json_path:
+            assert refusal.count("register") and refusal.count("--aiteammate")
+        for line_no, line in enumerate(_logical_lines(text), start=1):
+            if not _PAIRING.search(line):
+                continue
+            if path == json_path and "register_aiteammate_refusal" in line:
+                continue
+            allowed = allowlist_ranges.get(path, set())
+            if any(start <= line_no <= end for start, end in allowed):
+                continue
+            raise AssertionError(f"pairing hit at {path.relative_to(REPO_ROOT)}:{line_no}: {line!r}")
+
+    text = register_py.read_text(encoding="utf-8")
+    predicate_lines = [
+        line
+        for line in text.splitlines()
+        if "--aiteammate" in line
+        and "register" not in line.lower()
+        and (
+            '== "--aiteammate"' in line
+            or 'startswith("--aiteammate=")' in line
+        )
+    ]
+    assert len(predicate_lines) <= 2
+    assert 'add_argument("--aiteammate"' not in text
+
+
+def test_changelog_records_register_aiteammate_removal() -> None:
+    changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    unreleased_start = changelog.index("## [Unreleased]")
+    next_section = changelog.index("## [0.9.6]", unreleased_start)
+    unreleased = changelog[unreleased_start:next_section]
+    assert "### Removed" in unreleased
+    removed_start = unreleased.index("### Removed")
+    removed_body = unreleased[removed_start:]
+    next_heading = removed_body.find("\n### ", len("### Removed"))
+    removed_section = removed_body if next_heading < 0 else removed_body[:next_heading]
+    bullets = [line for line in removed_section.splitlines() if line.strip().startswith("- ")]
+    assert len(bullets) == 1
+    bullet = bullets[0]
+    for needle in (
+        "#85",
+        "`register --aiteammate`",
+        "exits 2",
+        "--help",
+        "does not build or apply a plan",
+        "`publish --aiteammate` is unchanged",
+    ):
+        assert needle in bullet
+    start_073 = changelog.index("## [0.7.3]")
+    rest_073 = changelog[start_073:]
+    end_073 = rest_073.find("\n## [", len("## [0.7.3]"))
+    section_073 = rest_073 if end_073 < 0 else rest_073[:end_073]
+    assert "unsupported/deprecated" in section_073
+    assert "`hermes a365 register --aiteammate`" in section_073
