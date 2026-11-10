@@ -555,7 +555,7 @@ section below covers the two remaining manual config edits.
 ## Quick start
 
 The canonical end-to-end walkthrough is
-[`references/live-tenant-test.md`](references/live-tenant-test.md). A shorter Path A (AI Teammate) guide is [`docs/quickstart-path-a.md`](docs/quickstart-path-a.md). At a
+[`references/live-tenant-test.md`](references/live-tenant-test.md). A shorter Path A (AI Teammate) guide is [`docs/quickstart-path-a.md`](docs/quickstart-path-a.md). The Path B (Custom Engine Agent / Copilot Chat) guide is [`docs/quickstart-path-b.md`](docs/quickstart-path-b.md). At a
 glance, against a Frontier-Preview-enrolled M365 tenant where you hold
 Global Admin and a `MICROSOFT_AGENT_365_TIER_3` license:
 
@@ -644,11 +644,7 @@ hermes a365 cleanup --agent-name "Inbox Helper" \
 
 ### Quick start — Path B (Custom Engine Agent / Copilot Chat)
 
-Path B layers Azure Bot Service + a CEA manifest on the same Path A
-blueprint. Prerequisites: Path A steps 1–5 above (blueprint +
-`instance create`), plus an **Azure subscription**, the separate
-non-agentic BF app (`A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET`), and a
-public HTTPS tunnel to `/api/messages`. Full walk:
+Operator entry: [`docs/quickstart-path-b.md`](docs/quickstart-path-b.md) — blueprint, separate BF identity, tunnel-first Bot Service, CEA publish, and MAC upload. Path B does **not** require Path A `publish --aiteammate` or admin-centre activation. The compressed bash below is a reminder only; canonical detail is the quickstart and
 [`references/live-tenant-test.md`](references/live-tenant-test.md) §11
 (CEA contract in §11.0).
 
