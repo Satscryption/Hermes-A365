@@ -4,6 +4,8 @@ All notable changes to the `hermes-a365` skill / plugin live here. Format
 follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/); versions
 follow [SemVer](https://semver.org/spec/v2.0.0.html).
 
+From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/SURFACE.md. A 1.x release does not remove or retarget a frozen CLI verb, flag, exit code, public env key, HTTP route, or sidecar shape. 1.x keeps the sidecar migration promise in docs/SURFACE.md and does not widen it. Breaking changes are major-only. Security fixes after 1.0 follow SECURITY.md: the latest 1.x minor only.
+
 ## [Unreleased]
 
 ### Added

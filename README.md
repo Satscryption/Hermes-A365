@@ -482,6 +482,8 @@ Linux; Windows is explicitly unsupported for end-to-end flows), Hermes
 gateway floors, and Microsoft tooling pins are documented in
 [`references/v1-compatibility-matrix.md`](references/v1-compatibility-matrix.md).
 
+From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/SURFACE.md. A 1.x release does not remove or retarget a frozen CLI verb, flag, exit code, public env key, HTTP route, or sidecar shape. 1.x keeps the sidecar migration promise in docs/SURFACE.md and does not widen it. Breaking changes are major-only. Security fixes after 1.0 follow SECURITY.md: the latest 1.x minor only.
+
 `hermes-a365` ships as a PyPI package. There are two install paths,
 depending on what you want:
 
