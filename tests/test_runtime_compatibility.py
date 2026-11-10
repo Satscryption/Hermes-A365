@@ -249,8 +249,9 @@ def test_part2_preserved_surfaces() -> None:
         "references/v1-compatibility-matrix.md": (
             "63fca921fad16fe50a8dfcbcb25c2b329f314abe56309172a0f0aa26ffe5a6ce"
         ),
+        # Intended: admit_turn_authority, cancel_session_processing, handle_message.
         "src/hermes_a365/surface.py": (
-            "9443c4b4c8408851bd610fa708814239e65c91adad85e08a9d0f4ea465be185b"
+            "22d1231171ef751abc61db841400eebf64d7b5c05735ee157eebe52e5b15a19f"
         ),
         "src/hermes_a365/publish.py": (
             "f31e81442dbafaf81ae98a5edaeaaec9f018e261967a9111e3a30d6740b2b251"
