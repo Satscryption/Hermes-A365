@@ -113,12 +113,35 @@ DEFAULT_RETRIES = 3
 DEFAULT_BACKOFF_SECONDS = 30.0
 
 VALID_AUTH_MODES: frozenset[str] = frozenset({"obo", "s2s", "both"})
-AITEAMMATE_REGISTER_UNSUPPORTED = (
-    "`register --aiteammate` is unsupported. Register only runs "
+REGISTER_AITEAMMATE_REMOVED = (
+    "`register --aiteammate` was removed in 1.0. Register only runs "
     "`a365 setup blueprint` plus MCP/Bot permission setup; the AI Teammate "
     "agentic user is created/activated after `publish --aiteammate` via "
     "M365 Admin Centre upload and per-user activation."
 )
+
+
+def _removed_aiteammate_token(token: str) -> bool:
+    return token == "--aiteammate" or token.startswith("--aiteammate=")
+
+
+def _wrap_removed_aiteammate_guard(parser: argparse.ArgumentParser) -> None:
+    if getattr(parser, "_removed_aiteammate_wrapped", False):
+        return
+    original = parser.parse_known_args
+
+    def parse_known_args(
+        args: list[str] | None = None,
+        namespace: argparse.Namespace | None = None,
+    ) -> tuple[argparse.Namespace, list[str]]:
+        argv = list(sys.argv[1:]) if args is None else list(args)
+        for token in argv:
+            if _removed_aiteammate_token(token):
+                parser.exit(2, "ERROR: " + REGISTER_AITEAMMATE_REMOVED + "\n")
+        return original(args, namespace)
+
+    parser.parse_known_args = parse_known_args  # type: ignore[method-assign]
+    parser._removed_aiteammate_wrapped = True
 
 GENERATED_CONFIG_FILENAME = "a365.generated.config.json"
 
@@ -144,7 +167,6 @@ class RegisterInputs:
     agent_name: str
     tenant_id: str | None = None  # None → --apply refuses; not an az auto-detect
     m365: bool = False  # forwarded to `a365 setup blueprint`; does not set the endpoint
-    aiteammate: bool = False  # Parser back-compat; rejected in __post_init__.
     authmode: str = "obo"  # obo / s2s / both — only used by `setup all`, kept here for config
     no_endpoint: bool = False  # blueprint-only; skip endpoint registration
     skip_requirements: bool = False  # pass --skip-requirements to setup blueprint
@@ -152,8 +174,6 @@ class RegisterInputs:
     def __post_init__(self) -> None:
         if not self.agent_name:
             raise ValueError("agent_name must be non-empty")
-        if self.aiteammate:
-            raise ValueError(AITEAMMATE_REGISTER_UNSUPPORTED)
         if self.authmode not in VALID_AUTH_MODES:
             raise ValueError(
                 f"authmode must be one of {sorted(VALID_AUTH_MODES)}, got {self.authmode!r}"
@@ -862,14 +882,6 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
         ),
     )
     parser.add_argument(
-        "--aiteammate",
-        action="store_true",
-        help=(
-            "deprecated/unsupported on register; AI Teammate activation happens "
-            "after `publish --aiteammate` via M365 Admin Centre"
-        ),
-    )
-    parser.add_argument(
         "--authmode",
         choices=sorted(VALID_AUTH_MODES),
         default="obo",
@@ -933,6 +945,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
             "the flag the wrapper just prints a paste-ready hint."
         ),
     )
+    _wrap_removed_aiteammate_guard(parser)
     return parser
 
 
@@ -947,7 +960,6 @@ def run(args: argparse.Namespace) -> int:
             agent_name=args.agent_name,
             tenant_id=pinned_tenant,
             m365=args.m365,
-            aiteammate=args.aiteammate,
             authmode=args.authmode,
             no_endpoint=args.no_endpoint,
             skip_requirements=args.skip_requirements,

@@ -55,6 +55,10 @@ follow [SemVer](https://semver.org/spec/v2.0.0.html).
   blueprint. Refs
   [#292](https://github.com/Satscryption/Hermes-A365/issues/292).
 
+### Removed
+
+- **#85:** `register --aiteammate` is gone from `hermes-a365 register` and `hermes a365 register`, and from `--help`. Passing it exits 2 with the redirect and does not build or apply a plan. `publish --aiteammate` is unchanged.
+
 ## [0.9.6] — 2026-11-03
 
 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry follow-ups (#244),

@@ -16,6 +16,7 @@ authors = [
 # CI tests 3.11–3.14; 3.15+ is not capped (untested in CI).
 requires-python = ">=3.11"
 classifiers = [
+  "Development Status :: 5 - Production/Stable",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",

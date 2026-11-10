@@ -16121,7 +16121,7 @@ def _probe_secret_at_rest(
 def interactive_setup() -> None:
     """``hermes gateway setup --platform agent365`` wizard.
 
-    Assumes ``hermes a365 register --apply --m365 --aiteammate`` has
+    Assumes ``hermes a365 register --apply --m365`` has
     already been run (the blueprint Entra app + permissions are set
     up). This wizard wires the platform side: bootstraps env vars in
     ``~/.hermes/.env``, ensures ``agent365`` is in ``plugins.enabled``
