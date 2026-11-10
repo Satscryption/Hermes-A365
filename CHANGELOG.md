@@ -45,6 +45,11 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
   can be retried without calling the operator webhook again. Ambiguous and terminal
   reply outcomes stop further sends; cached replies have payload and attempt limits.
 - Sidecar read errors during bot-service create now identify the create step.
+- **#303 — Sticky `retry_exhausted` plain reason.** A failed rotation close in
+  answer delivery keeps a stored `retry_exhausted` `plain_reason`. The later
+  plain-fallback log and returned reason stay `retry_exhausted` at warning. A
+  failed close that did not already store `retry_exhausted` still records
+  `rotated` and the later log stays info.
 
 ### Changed
 

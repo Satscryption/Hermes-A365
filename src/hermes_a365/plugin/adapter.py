@@ -8657,7 +8657,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     if not closed:
                         record["plain_due"] = True
-                        record["plain_reason"] = "rotated"
+                        if record.get("plain_reason") != "retry_exhausted":
+                            record["plain_reason"] = "rotated"
                         return ("retry", None)
             else:
                 stream["stream_id"] = ""

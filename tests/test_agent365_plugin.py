@@ -13464,6 +13464,117 @@ class TestEditMessage:
         await a._drop_turn_buffer(chat)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "param_id",
+        ["retry_exhausted", "empty", "age_budget", "missing"],
+    )
+    async def test_answer_delivery_rotation_close_failure_plain_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        param_id: str,
+    ) -> None:
+        """Failed answer-delivery rotation close keeps retry_exhausted (#303)."""
+        import logging
+
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-303-close-fail-{param_id}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Answer", reply_to="act-1")
+        buf = a._turn_buffers[chat]
+        await self._cancel_scheduled_turn_buffer_keepalive(buf)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        stream_id = f"ka-303-{param_id}"
+        buf["keepalive"] = {
+            "stream_id": stream_id,
+            "sequence": 1,
+            "opened_mono": time.monotonic() - 100,
+        }
+        buf["keepalive_rotated"] = True
+        record["plain_due"] = param_id != "empty"
+        record["force_plain"] = True
+        record["state"] = "FORCED_PLAIN"
+        record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+        record["plain_attempts"] = 0
+        record["force_plain_exhausted"] = False
+        if param_id == "missing":
+            record.pop("plain_reason", None)
+        elif param_id == "empty":
+            record["plain_reason"] = ""
+        else:
+            record["plain_reason"] = param_id
+        snap = {
+            "force_plain": True,
+            "state": "FORCED_PLAIN",
+            "deferral_count": record["deferral_count"],
+            "plain_attempts": 0,
+            "force_plain_exhausted": False,
+        }
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            entity = body["entities"][0]
+            if entity.get("streamType") == "final" and entity.get("streamId") == stream_id:
+                return self._http_result(500)
+            return self._http_result(202)
+
+        a._http_client.post = post
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert route == ("retry", None)
+        assert not any("answer plain fallback" in r.message for r in caplog.records)
+        assert buf["keepalive"].get("stream_id") == stream_id
+        assert record.get("plain_due") is True
+        assert record.get("force_plain") is snap["force_plain"]
+        assert record.get("state") == snap["state"]
+        assert record.get("deferral_count") == snap["deferral_count"]
+        assert record.get("plain_attempts") == snap["plain_attempts"]
+        assert record.get("force_plain_exhausted") is snap["force_plain_exhausted"]
+        if param_id == "retry_exhausted":
+            assert record.get("plain_reason") == "retry_exhausted"
+        else:
+            assert record.get("plain_reason") == "rotated"
+
+        buf["keepalive"]["stream_id"] = ""
+        assert buf.get("keepalive_rotated") is True
+        caplog.clear()
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            follow = a._answer_deliver_pre_post(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        if param_id == "retry_exhausted":
+            assert follow == ("fallback", "retry_exhausted")
+            assert logs[0].levelno == logging.WARNING
+            assert logs[0].message == (
+                "agent365 turn buffer answer plain fallback: "
+                f"chat_id={chat} reason=retry_exhausted"
+            )
+        else:
+            assert follow == ("fallback", "rotated")
+            assert logs[0].levelno == logging.INFO
+            assert logs[0].message == (
+                f"agent365 turn buffer answer plain fallback: chat_id={chat} reason=rotated"
+            )
+            assert "stream retry exhausted" not in logs[0].message
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
     async def test_issue247_failed_rotation_close_stays_plain_no_answer_stream_final(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
