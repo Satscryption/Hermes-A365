@@ -26695,6 +26695,38 @@ class TestInteractiveCards:
         assert "conv-1" in a._awaiting_text_chats
 
     @pytest.mark.asyncio
+    async def test_open_clarify_uses_selected_session_origin_in_group(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        conv_id = "conv-grp"
+        a._seen_inbounds_this_lifetime.add(conv_id)
+        act_a = _make_inbound(activity_id="a-turn", conv_id=conv_id)
+        act_b = _make_inbound(activity_id="b-turn", conv_id=conv_id)
+        act_a["conversation"]["conversationType"] = "groupChat"
+        act_b["conversation"]["conversationType"] = "groupChat"
+        act_b["from"]["id"] = "user-b"
+        assert a.admit_turn_authority(act_a, "sess-a", message_id="a-turn")
+        assert a.admit_turn_authority(act_b, "sess-b", message_id="b-turn")
+        record_a = a._ledger_record_for_message("a-turn", conv_id)
+        record_b = a._ledger_record_for_message("b-turn", conv_id)
+        a._turn_frame_stack_tokens["sess-a"] = [record_a]
+        a._turn_frame_stack_tokens["sess-b"] = [record_b]
+        a._session_key_to_conv["sess-a"] = conv_id
+        a._session_key_to_conv["sess-b"] = conv_id
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        mark = MagicMock()
+        monkeypatch.setattr(a, "_gw_mark_awaiting_text", mark)
+
+        result = await a.send_clarify(conv_id, "Which detail?", None, "clr-grp", "sess-a")
+        assert result.success is True
+        assert send_reply.await_args.kwargs["inbound"]["id"] == "a-turn"
+        mark.assert_called_once_with("clr-grp")
+
+    @pytest.mark.asyncio
     async def test_send_exec_approval_no_inbound_falls_back(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

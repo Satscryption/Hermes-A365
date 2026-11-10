@@ -13478,8 +13478,12 @@ class Agent365Adapter(BasePlatformAdapter):
                 msg = f"agent365 clarify: no cached inbound for {chat_id!r}"
                 logger.warning(msg)
                 return SendResult(success=False, error=msg)
+            clarify_origin = frame if isinstance(frame, TurnAuthorityRecord) else None
             result = await self._send_reply_activity(
-                inbound=inbound, content=question, log_context="clarify"
+                inbound=inbound,
+                content=question,
+                log_context="clarify",
+                reply_origin=clarify_origin,
             )
             if result.success:
                 # #130: keep this chat in the registry until the typed answer
