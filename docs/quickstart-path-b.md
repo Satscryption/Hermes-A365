@@ -35,6 +35,7 @@ Define placeholders before you run commands (align with the runbook tables in [`
 | `<azure-bot-name>` | `<bot-name>` | Azure Bot resource name (4–42 chars; see runbook **§11.2**) |
 | `<bf-app-id>` | `<guid>` | Separate non-agentic Entra app for Bot Framework S2S |
 | `<tunnel-url>` | `https://<tunnel-host>` | Public HTTPS base for `/api/messages` (record before `bot-service create`) |
+| `<arm-resource-id>` | `/subscriptions/<sub>/resourceGroups/<rg>/providers/Microsoft.BotService/botServices/<bot>` | Sidecar ARM resource id for `--confirm-bot-target` (copy from dry-run output) |
 
 ## Gateway mode, Hermes floors, and profile ownership
 
@@ -212,12 +213,15 @@ hermes a365 publish \
 
 ## Endpoint changes; stop or clean up (C2.2)
 
-**When the tunnel URL changes** (common with quick tunnels), update the Bot Service ARM endpoint; optionally update the MCP Platform messaging endpoint if you use Path A's `update-endpoint` path:
+**When the tunnel URL changes** (common with quick tunnels), update the Bot Service ARM endpoint; optionally update the MCP Platform messaging endpoint if you use Path A's `update-endpoint` path.
+
+Apply-mode `bot-service update-endpoint` and `bot-service cleanup` require **`--confirm-bot-target` to exactly match** the sidecar ARM resource id. Run the same command **without** `--apply` first, then copy that id from the dry-run **Re-run with ...** line (it includes `--confirm-bot-target=` and the ARM resource id). On cleanup, **`--confirm "<display-name>"` is still required and does not replace** `--confirm-bot-target`.
 
 ```bash
 hermes a365 bot-service update-endpoint \
   --agent-name "<display-name>" \
   --url "<new-tunnel-url>/api/messages" \
+  --confirm-bot-target <arm-resource-id> \
   --apply
 
 # Optional — MCP Platform (Path A messaging registration), not required for Path-B-only:
@@ -235,7 +239,8 @@ hermes a365 activity-bridge update-endpoint \
 hermes a365 bot-service cleanup \
   --agent-name "<display-name>" \
   --apply \
-  --confirm "<display-name>"
+  --confirm "<display-name>" \
+  --confirm-bot-target <arm-resource-id>
 ```
 
 **Sidecar / migration contract (read-only):** [`docs/SURFACE.md`](SURFACE.md) → **Sidecars** (D6). Full-tenant teardown with blueprint cleanup gates remains [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§10**.
