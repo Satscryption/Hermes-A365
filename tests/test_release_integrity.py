@@ -396,6 +396,81 @@ def test_live_0_9_5_section_still_parses() -> None:
     assert "2026-10-27" in body
 
 
+_STABLE_CLASSIFIER = "Development Status :: 5 - Production/Stable"
+
+
+def _staged_release_repo(
+    tmp_path: Path,
+    version: str,
+    *,
+    classifiers: list[str] | None = None,
+    register_removal: bool = True,
+) -> Path:
+    chosen = [_STABLE_CLASSIFIER] if classifiers is None else classifiers
+    lines = "\n".join(f'  "{item}",' for item in chosen)
+    changelog = f"# Changelog\n\n## [{version}] \u2014 2026-01-02\n\nStaging guard test.\n"
+    root = tmp_path / f"staged-{version.replace('.', '-')}"
+    package = root / "src" / "hermes_a365"
+    package.mkdir(parents=True)
+    (root / "pyproject.toml").write_text(
+        "[project]\n"
+        'name = "hermes-a365"\n'
+        f'version = "{version}"\n'
+        "classifiers = [\n"
+        f"{lines}\n"
+        "]\n",
+        encoding="utf-8",
+    )
+    (package / "__init__.py").write_text(f'__version__ = "{version}"\n', encoding="utf-8")
+    if register_removal:
+        (package / "register.py").write_text(
+            'REGISTER_AITEAMMATE_REMOVED = "removed in 1.0"\n',
+            encoding="utf-8",
+        )
+    (root / "CHANGELOG.md").write_text(changelog, encoding="utf-8")
+    return root
+
+
+def test_staged_v1_combination_is_not_a_zero_release(tmp_path: Path) -> None:
+    only_stable = mod.staged_zero_release_problem("0.9.6", [_STABLE_CLASSIFIER], False)
+    assert only_stable is not None
+    assert "Production/Stable" in only_stable
+    assert "REGISTER_AITEAMMATE_REMOVED" not in only_stable
+    assert "refusing 0.x release" in only_stable
+    assert "0.9.6" in only_stable
+    assert "--aiteammate" not in only_stable
+
+    only_removal = mod.staged_zero_release_problem("0.9.6", [], True)
+    assert only_removal is not None
+    assert "REGISTER_AITEAMMATE_REMOVED" in only_removal
+    assert "Production/Stable" not in only_removal
+
+    both = mod.staged_zero_release_problem("0.9.6", [_STABLE_CLASSIFIER], True)
+    assert both is not None
+    assert "Production/Stable" in both
+    assert "REGISTER_AITEAMMATE_REMOVED" in both
+
+    assert mod.staged_zero_release_problem("1.0.0", [_STABLE_CLASSIFIER], True) is None
+    assert mod.staged_zero_release_problem("0.9.6", [], False) is None
+
+    assert mod.evaluate(_ROOT, "refs/tags/v0.9.6").version == "0.9.6"
+
+    with pytest.raises(mod.ReleaseIntegrityError) as live_check:
+        mod.check(_ROOT, "refs/tags/v0.9.6")
+    live_message = str(live_check.value)
+    assert "0.9.6" in live_message
+    assert "Production/Stable" in live_message
+    assert "REGISTER_AITEAMMATE_REMOVED" in live_message
+
+    v1_root = _staged_release_repo(tmp_path, "1.0.0")
+    notes = mod.check(v1_root, "refs/tags/v1.0.0")
+    assert notes.version == "1.0.0"
+
+    v096_root = _staged_release_repo(tmp_path, "0.9.6")
+    with pytest.raises(mod.ReleaseIntegrityError):
+        mod.check(v096_root, "refs/tags/v0.9.6")
+
+
 def test_live_0_9_6_section_still_parses() -> None:
     notes = mod.evaluate(_ROOT, "refs/tags/v0.9.6")
 
