@@ -210,6 +210,50 @@ def test_documented_hermes_pins_do_not_satisfy_our_floors() -> None:
     assert Version("0.141.1") in fastapi
 
 
+S1 = "From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/SURFACE.md."
+S2 = (
+    "A 1.x release does not remove or retarget a frozen CLI verb, flag, exit"
+    " code, public env key, HTTP route, or sidecar shape."
+)
+S3 = "1.x keeps the sidecar migration promise in docs/SURFACE.md and does not widen it."
+S4 = "Breaking changes are major-only."
+S5 = "Security fixes after 1.0 follow SECURITY.md: the latest 1.x minor only."
+_SEMVER_SENTENCES = (S1, S2, S3, S4, S5)
+
+
+def _assert_sentences_in_order(
+    text: str, sentences: tuple[str, ...], end: int | None = None
+) -> None:
+    limit = len(text) if end is None else end
+    order_start = 0
+    for sentence in sentences:
+        pos = text.find(sentence, order_start)
+        assert pos != -1 and pos < limit
+        order_start = pos + len(sentence)
+
+
+def test_semver_commitment_sentences() -> None:
+    readme = README.read_text()
+    matrix_para_end = readme.index("](references/v1-compatibility-matrix.md).") + len(
+        "](references/v1-compatibility-matrix.md)."
+    )
+    s1_idx = readme.find(S1, matrix_para_end)
+    assert s1_idx != -1
+    gap = readme[matrix_para_end:s1_idx].strip()
+    assert gap == ""
+    assert "\n## " not in readme[matrix_para_end:s1_idx]
+    ships_idx = readme.index("`hermes-a365` ships", s1_idx)
+    _assert_sentences_in_order(readme, _SEMVER_SENTENCES, end=ships_idx)
+
+    changelog = CHANGELOG.read_text()
+    semver_url = "follow [SemVer](https://semver.org/spec/v2.0.0.html)."
+    unreleased = changelog.index("## [Unreleased]")
+    after_url = changelog.index(semver_url) + len(semver_url)
+    gap_cl = changelog[after_url : changelog.find(S1, after_url)].strip()
+    assert gap_cl == ""
+    _assert_sentences_in_order(changelog, _SEMVER_SENTENCES, end=unreleased)
+
+
 def test_development_status_production_stable() -> None:
     classifiers = _project()["classifiers"]
     assert classifiers[0] == "Development Status :: 5 - Production/Stable"
