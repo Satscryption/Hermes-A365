@@ -323,7 +323,21 @@ def _admit_wire_turn_authority(a: Any, inbound: dict[str, Any], *, capture: bool
         record = a._ledger_record_for_message(activity_id, ref.conversation_id)
         if record is not None:
             a._attach_coalesced_turn_authority(record)
-            adapter_mod._AGENT_TURN_FRAME.set(record)
+
+
+def _prime_processing_turn(
+    a: Any,
+    inbound: dict[str, Any],
+    event: Any,
+    *,
+    capture: bool = True,
+) -> None:
+    """Admit ledger/coalesced authority for a stub processing turn (§8 wire fixtures)."""
+    message_id = str(getattr(event, "message_id", "") or "")
+    activity = dict(inbound)
+    if message_id:
+        activity["id"] = message_id
+    _admit_wire_turn_authority(a, activity, capture=capture)
 
 
 def _prime_personal_inbound(a: Any, inbound: dict[str, Any]) -> None:
@@ -7189,9 +7203,10 @@ class TestSendTyping:
     ) -> None:
         a = _make_adapter(monkeypatch)
         chat_id = "conv-next-turn"
-        inbound = _make_inbound(conv_id=chat_id)
+        inbound = _make_inbound(conv_id=chat_id, activity_id="act-new")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(inbound))
         a._seen_inbounds_this_lifetime.add(chat_id)
+        _admit_wire_turn_authority(a, inbound)
         a._personal_stream_final_posted.add(chat_id)
         a._http_client = MagicMock()
         a._bridge_cfg = MagicMock()
@@ -7955,6 +7970,8 @@ class TestEditMessage:
         await a._teardown_chat_state_impl("conv-G-buf")
         assert "conv-G-buf" not in a._turn_buffers
 
+        inbound["id"] = "act-1"
+        _prime_processing_turn(a, inbound, event)
         await a.on_processing_start(event)
         assert "conv-G-buf" in a._turn_buffers
         await a._finish_disconnect(None, None)
@@ -8126,6 +8143,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-nest"),
             message_id="act-followup",
         )
+        _prime_processing_turn(a, inbound, follow_event)
         await a.on_processing_start(follow_event)
         turns = a._turn_buffers["conv-G-nest"]["turns"]
         assert [turn["inbound"]["id"] for turn in turns] == [
@@ -8414,6 +8432,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-hold"),
             message_id="act-followup",
         )
+        _prime_processing_turn(a, inbound, follow)
         await a.on_processing_start(follow)
         await a.send(chat_id="conv-G-hold", content="Follow-up reply", reply_to="act-followup")
         await a.on_processing_complete(follow, outcome="success")
@@ -9392,6 +9411,7 @@ class TestEditMessage:
                 source=_StubSessionSource(platform=None, chat_id=chat),
                 message_id=activity_id,
             )
+            _prime_processing_turn(a, inbound, event)
             await a.on_processing_start(event)
             await a.send(chat_id=chat, content=answer, reply_to=activity_id)
             await a.on_processing_complete(event, outcome="success")
@@ -10224,6 +10244,7 @@ class TestEditMessage:
             message_id="act-2",
         )
         inbound["id"] = "act-2"
+        _prime_processing_turn(a, inbound, event2)
         await a.on_processing_start(event2)
         turn2 = a._turn_buffers[chat]["turns"][-1]
         turn2["started_mono"] = clock["t"] - 10.0
@@ -14577,6 +14598,8 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id=chat),
             message_id="act-2",
         )
+        inbound["id"] = "act-2"
+        _prime_processing_turn(a, inbound, event2)
         await a.on_processing_start(event2)
         gate.set()
         await emit_task
@@ -16421,6 +16444,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-two-turn"),
             message_id="act-2",
         )
+        _prime_processing_turn(a, inbound, event2)
         await a.on_processing_start(event2)
         buf = a._turn_buffers["conv-G-two-turn"]
         buf["keepalive"] = {
@@ -17556,6 +17580,7 @@ class TestEditMessage:
             return self._http_result(202)
 
         a._http_client.post = post_inner
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         await a.send(chat_id="conv-G-r5-key", content="Inner final", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
@@ -18565,6 +18590,7 @@ class TestEditMessage:
         personal_ref.validated_path = "A"
         a._conversations.upsert(personal_ref)
         a._seen_inbounds_this_lifetime.add("conv-notice-personal")
+        _admit_wire_turn_authority(a, personal)
 
         bridge = adapter_mod._import_bridge()
         send_reply_mock = AsyncMock(return_value=None)
@@ -19410,6 +19436,7 @@ class TestEditMessage:
         await delivery
         await asyncio.sleep(0)
         assert a._coalesced_reply_survivors == {}
+        _admit_wire_turn_authority(a, inbound, capture=False)
         accepted = await a.send(chat_id="conv-survivor-budget", content="Second", reply_to="act-1")
         assert accepted.success is True
         a._drop_coalesced_reply_state(str(accepted.message_id))
@@ -19709,8 +19736,20 @@ class TestEditMessage:
             ]
         )
 
-        start_a = await a._send_stream_start(chat_id="conv-equal-A", content="A", inbound=inbound_a)
-        start_b = await a._send_stream_start(chat_id="conv-equal-B", content="B", inbound=inbound_b)
+        record_a = a._ledger_record_for_message("act-A", "conv-equal-A")
+        record_b = a._ledger_record_for_message("act-B", "conv-equal-B")
+        start_a = await a._send_stream_start(
+            chat_id="conv-equal-A",
+            content="A",
+            inbound=inbound_a,
+            authority_record=record_a,
+        )
+        start_b = await a._send_stream_start(
+            chat_id="conv-equal-B",
+            content="B",
+            inbound=inbound_b,
+            authority_record=record_b,
+        )
         assert start_a is not None and start_a.success
         assert start_b is not None and start_b.success
         assert ("conv-equal-A", "bf-shared") in a._streams
@@ -20311,7 +20350,10 @@ class TestEditMessage:
             reply_to="act-before-restart",
         )
         assert result.success is False
-        assert "no cached inbound for exact turn" in str(result.error)
+        assert (
+            "no cached inbound for exact turn" in str(result.error)
+            or "no turn authority" in str(result.error)
+        )
         assert a._coalesced_replies == {}
 
     @pytest.mark.asyncio
