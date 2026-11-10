@@ -51,6 +51,8 @@ _VERSION_ASSIGN = re.compile(
     r"^__version__\s*=\s*(?P<quote>['\"])(?P<version>.*?)(?P=quote)\s*$",
     re.MULTILINE,
 )
+_PRODUCTION_STABLE_CLASSIFIER = "Development Status :: 5 - Production/Stable"
+_REGISTER_REMOVAL_LINE = re.compile(r"^REGISTER_AITEAMMATE_REMOVED\s*=")
 # Strict semver, no build metadata. Leading zeros are rejected.
 _SEMVER = re.compile(
     r"^(?P<major>0|[1-9]\d*)\.(?P<minor>0|[1-9]\d*)\.(?P<patch>0|[1-9]\d*)"
@@ -204,6 +206,61 @@ def project_version(repo: Path) -> str:
     if not isinstance(version, str) or not version:
         raise ReleaseIntegrityError("project.version must be a non-empty string")
     return version
+
+
+def project_classifiers(repo: Path) -> list[str]:
+    path = repo / "pyproject.toml"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise ReleaseIntegrityError(f"could not read {path}: {exc}") from exc
+    try:
+        import tomllib
+    except ModuleNotFoundError as exc:  # pragma: no cover - CI is 3.11+
+        raise ReleaseIntegrityError("reading pyproject.toml requires Python 3.11+") from exc
+    try:
+        data = tomllib.loads(text)
+        raw = data.get("project", {}).get("classifiers", [])
+    except tomllib.TOMLDecodeError as exc:
+        raise ReleaseIntegrityError(f"pyproject.toml is not valid TOML: {exc}") from exc
+    if not isinstance(raw, list):
+        raise ReleaseIntegrityError("project.classifiers must be a list")
+    classifiers: list[str] = []
+    for item in raw:
+        if not isinstance(item, str):
+            raise ReleaseIntegrityError("project.classifiers must contain only strings")
+        classifiers.append(item)
+    return classifiers
+
+
+def register_removal_present(repo: Path) -> bool:
+    path = repo / "src" / "hermes_a365" / "register.py"
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    return any(_REGISTER_REMOVAL_LINE.match(line) for line in text.splitlines())
+
+
+def staged_zero_release_problem(
+    version: str,
+    classifiers: Sequence[str],
+    removal_present: bool,
+) -> str | None:
+    if parse_semver(version).major >= 1:
+        return None
+    has_stable = _PRODUCTION_STABLE_CLASSIFIER in classifiers
+    if not has_stable and not removal_present:
+        return None
+    markers: list[str] = []
+    if has_stable:
+        markers.append("Production/Stable")
+    if removal_present:
+        markers.append("REGISTER_AITEAMMATE_REMOVED")
+    return (
+        f"refusing 0.x release for version {version} "
+        f"while staged 1.0 markers are present: {', '.join(markers)}"
+    )
 
 
 def module_version(repo: Path) -> str:
@@ -393,6 +450,14 @@ def check(repo: Path, tag_ref: str, sha: str | None = None) -> ReleaseNotes:
         notes = evaluate(repo, tag_ref)
     except ReleaseIntegrityError as exc:
         problems.extend(exc.problems)
+    if notes is not None:
+        staged = staged_zero_release_problem(
+            notes.version,
+            project_classifiers(repo),
+            register_removal_present(repo),
+        )
+        if staged is not None:
+            problems.append(staged)
     if sha is not None:
         try:
             assert_worktree(repo, sha)
