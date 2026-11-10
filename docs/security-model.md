@@ -8,7 +8,7 @@ Hermes-A365 bridges Microsoft Agent 365 / Bot Framework ingress to an operator-c
 | --- | --- |
 | **Microsoft platform** | Agent 365 connector and Microsoft Entra ID issue and validate platform tokens; Entra mints outbound exchange tokens at the tenant v2.0 token endpoint (`https://login.microsoftonline.com/<tenant-id>/oauth2/v2.0/token`). |
 | **Operator HTTPS ingress** | A TLS-terminated URL the operator exposes (tunnel, reverse proxy, or App Service) that reaches the bridge process. |
-| **Gateway or secondary bridge** | `Agent365Adapter` inside Hermes gateway (`build_app`), or standalone `hermes a365 activity-bridge serve`. Both expose the same product routes; Path A and Path B choose different outbound token chains from inbound activity shape. |
+| **Gateway or secondary bridge** | `Agent365Adapter` inside Hermes gateway (`build_app`), or standalone `hermes a365 activity-bridge serve`. Both expose the same product routes; for authenticated ingress, successful JWT validation binds outbound Path A vs Path B (`validated_path`), and `acquire_reply_token` honors that binding instead of re-deriving the path from the unauthenticated activity body. |
 | **Agent / responder** | Hermes gateway plugin drives the conversational agent. In **secondary bridge** mode, `activity-bridge serve` forwards each validated activity to an operator-configured HTTPS webhook responder while the bridge keeps Bot Framework wire handling ([`references/webhook-contract.md`](../references/webhook-contract.md) documents that split — see its opening scope at line 5). |
 | **Local configuration / secret store** | Instance keys in operator `.env`, optional keychain/file provider, and gateway `platforms.agent365.extra` fields (inventory: [`docs/SURFACE.md`](SURFACE.md) → **Gateway config**). Blueprint and optional separate Bot Framework app credentials supply client secrets consumed at runtime. |
 
@@ -45,9 +45,11 @@ flowchart LR
   ING --> API
   API --> AG
   API -.->|"optional contract v1"| WH
-  AG -->|"outbound reply"| ENTRA
-  WH -->|"outbound reply"| ENTRA
-  ENTRA -->|"platform token"| CONN
+  AG -->|"reply content"| API
+  WH -->|"reply content"| API
+  API -->|"token exchange"| ENTRA
+  ENTRA -->|"bearer"| API
+  API -->|"reply Activity"| CONN
   CFG --> BRIDGE
 ```
 
@@ -55,7 +57,9 @@ Trust boundaries: Microsoft signs inbound connector traffic; the bridge verifies
 
 ## Path A outbound: T1 → T2 → user-FIC
 
-Path A applies when the activity recipient carries Agent 365 agentic identity fields. Outbound replies to the connector use a **three-stage** Entra exchange (not classic Bot Framework app-only `client_credentials` against `api.botframework.com`), implemented in `src/hermes_a365/activity_bridge.py`.
+For **authenticated** inbound traffic, when JWT validation succeeds and binds `validated_path` to `"A"`, outbound replies use Path A even if the activity also carries Bot Framework–shaped fields; recipient and `serviceUrl` shape do not override that binding. Classification from activity shape (`_inbound_path_tag`: agentic ids on the recipient) applies only when validation is skipped (development) or the caller opts into decoupled routing (`None` / `"DECOUPLED"`).
+
+Outbound replies to the connector use a **three-stage** Entra exchange (not classic Bot Framework app-only `client_credentials` against `api.botframework.com`), implemented in `src/hermes_a365/activity_bridge.py` (`acquire_reply_token` forwards the validated path).
 
 All stages POST form-encoded requests to `TENANT_TOKEN_URL_TEMPLATE` for the configured tenant.
 
@@ -69,7 +73,9 @@ The messaging access token from the final stage authorizes HTTPS calls back to t
 
 ## Path B outbound: BF S2S
 
-Path B applies for classic Bot Framework **serviceUrl** shapes (Copilot Chat / separate BF registration). Outbound auth uses **Bot Framework server-to-server** minting via `acquire_bf_s2s_token`: **client_credentials** against the same per-tenant token endpoint, with scope `https://api.botframework.com/.default` (Bot Connector resource).
+For **authenticated** inbound traffic, when JWT validation succeeds and binds `validated_path` to `"B"` (for example inbound JWT issuer is the Bot Framework issuer), outbound replies use Path B even when the activity carries agentic recipient fields. Shape-only classification (agentic ids absent and `serviceUrl` matching classic BF suffixes) is the fallback when validation is skipped or routing is explicitly decoupled.
+
+Outbound auth uses **Bot Framework server-to-server** minting via `acquire_bf_s2s_token`: **client_credentials** against the same per-tenant token endpoint, with scope `https://api.botframework.com/.default` (Bot Connector resource).
 
 Credentials:
 
