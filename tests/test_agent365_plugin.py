@@ -309,11 +309,12 @@ def _make_inbound(
     }
 
 
-def _admit_wire_turn_authority(a: Any, inbound: dict[str, Any]) -> None:
+def _admit_wire_turn_authority(a: Any, inbound: dict[str, Any], *, capture: bool = True) -> None:
     ref = adapter_mod.ConversationRef.from_activity(inbound)
     if ref is None:
         return
-    a._capture_coalesced_turn_target(ref)
+    if capture:
+        a._capture_coalesced_turn_target(ref)
     activity_id = str(inbound.get("id") or "")
     if not activity_id:
         return
@@ -18968,6 +18969,7 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(ref_b)
         a._conversations.upsert(ref_b)
         a._seen_inbounds_this_lifetime.add("conv-B")
+        _admit_wire_turn_authority(a, inbound_b, capture=False)
 
         first_a = await a.send(chat_id="conv-A", content="A", reply_to="act-A")
         first_b = await a.send(chat_id="conv-B", content="B", reply_to="act-B")
@@ -19000,6 +19002,7 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(other_ref)
         a._conversations.upsert(other_ref)
         a._seen_inbounds_this_lifetime.add("conv-evict-other")
+        _admit_wire_turn_authority(a, other, capture=False)
         bridge = adapter_mod._import_bridge()
 
         started = asyncio.Event()
@@ -19681,8 +19684,10 @@ class TestEditMessage:
         ref_b = adapter_mod.ConversationRef.from_activity(inbound_b)
         assert ref_b is not None
         ref_b.validated_path = "A"
+        a._capture_coalesced_turn_target(ref_b)
         a._conversations.upsert(ref_b)
         a._seen_inbounds_this_lifetime.add("conv-equal-B")
+        _admit_wire_turn_authority(a, inbound_b, capture=False)
         self._patch_token_mint(monkeypatch)
         self._no_sleep(monkeypatch)
         a._http_client.post = AsyncMock(
@@ -19992,6 +19997,7 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(replacement_ref)
         a._conversations.upsert(replacement_ref)
         a._seen_inbounds_this_lifetime.add("conv-rollover-replacement")
+        _admit_wire_turn_authority(a, replacement, capture=False)
         accepted = await a.send(
             chat_id="conv-rollover-replacement",
             content="Second",
@@ -20086,6 +20092,7 @@ class TestEditMessage:
         ref_b.validated_path = "B"
         a._capture_coalesced_turn_target(ref_b)
         a._conversations.upsert(ref_b)
+        _admit_wire_turn_authority(a, inbound_b, capture=False)
 
         # Turn B is now the latest durable registry entry before delayed turn A
         # asks to send. Exact turn-target capture must still route A to A.
@@ -20152,6 +20159,7 @@ class TestEditMessage:
             a._capture_coalesced_turn_target(ref)
             a._conversations.upsert(ref)
             a._seen_inbounds_this_lifetime.add(chat_id)
+            _admit_wire_turn_authority(a, inbound, capture=False)
             result = await a.send(
                 chat_id=chat_id, content=f"Reply {index}", reply_to=f"act-{index}"
             )
@@ -20166,6 +20174,7 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(third_ref)
         a._conversations.upsert(third_ref)
         a._seen_inbounds_this_lifetime.add("conv-global-3")
+        _admit_wire_turn_authority(a, third_inbound, capture=False)
         rejected = await a.send(chat_id="conv-global-3", content="Reply 3", reply_to="act-3")
 
         assert rejected.success is False
@@ -20364,6 +20373,7 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(ref_b)
         a._conversations.upsert(ref_b)
         a._seen_inbounds_this_lifetime.add("conv-target-B")
+        _admit_wire_turn_authority(a, inbound_b, capture=False)
 
         await a._teardown_chat_state("conv-target-A")
         assert generation_a.message_id not in a._coalesced_replies
@@ -21071,6 +21081,7 @@ class TestEditMessage:
         assert ref is not None
         ref.validated_path = "A"
         a._capture_coalesced_turn_target(ref)
+        _admit_wire_turn_authority(a, follow_in, capture=False)
         follow_up = await a.send(
             chat_id="conv-follow",
             content="Follow up.",

@@ -5663,6 +5663,8 @@ class Agent365Adapter(BasePlatformAdapter):
         if reply_to is not None:
             turn_key = self._coalesced_reply_turn_key(chat_id, reply_to)
             coalesced_origin = self._coalesced_turn_authority.get(turn_key)
+            if coalesced_origin is None:
+                coalesced_origin = self._ledger_record_for_message(str(reply_to), str(chat_id))
             if coalesced_origin is None or not self._is_own_turn_authority(coalesced_origin):
                 return SendResult(
                     success=False,
