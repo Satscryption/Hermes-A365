@@ -86,6 +86,11 @@ def install_gateway_stubs() -> None:
     base.SendResult = _StubSendResult
     base.MessageEvent = _StubMessageEvent
     base.MessageType = _StubMessageType
+
+    def merge_pending_message_event(*_args: Any, **_kwargs: Any) -> None:
+        raise AssertionError("Surface collection must not dispatch pending messages")
+
+    base.merge_pending_message_event = merge_pending_message_event
     config.Platform = _StubPlatform
     config.PlatformConfig = _StubPlatformConfig
     session.SessionSource = _StubSessionSource
