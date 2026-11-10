@@ -1,6 +1,6 @@
-# Path B quickstart (Custom Engine Agent) — round C2.1
+# Path B quickstart (Custom Engine Agent)
 
-Path B covers **Custom Engine Agent** surfacing in **M365 Copilot Chat** (and related Copilot fabric entry points) via Azure Bot Service — not the Path A AI Teammate admin-centre upload/activation flow. This document covers **C2.1 only**: prerequisites, install/preflight, **shared blueprint** registration and consent, a **separate non-agentic Bot Framework identity**, and **local instance configuration**. Gateway/tunnel, Bot Service provisioning, `publish --copilot-chat`, MAC upload, and reply verification are **C2.2** (same file, later sections). The full numbered runbook remains [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11**. Product contract (CLI, env, HTTP): [`docs/SURFACE.md`](SURFACE.md).
+Path B covers **Custom Engine Agent** surfacing in **M365 Copilot Chat** (and related Copilot fabric entry points) via Azure Bot Service — not the Path A AI Teammate admin-centre upload/activation flow. This document is the complete Path B quickstart (**C2.1 and C2.2**): shared blueprint and consent, a **separate non-agentic Bot Framework identity**, gateway and tunnel, Bot Service provisioning, `publish --copilot-chat`, MAC upload, and Copilot Chat reply verification. Path B does **not** require Path A `publish --aiteammate` or admin-centre activation. The full numbered runbook remains [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11**. Product contract (CLI, env, HTTP): [`docs/SURFACE.md`](SURFACE.md).
 
 Path B does **not** ask you to complete Path A publish or activation; it **does** use the same agentic **blueprint** Entra app from `register --m365` as Path A's messaging stack. See [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.0** for the canonical shape.
 
@@ -32,7 +32,9 @@ Define placeholders before you run commands (align with the runbook tables in [`
 | `<owner-aad-id>` | `<guid>` | That user's Entra object id |
 | `<subscription-id>` | `<guid>` | Azure subscription for this preflight (`az account set`) and Bot Service in C2.2 |
 | `<azure-rg>` | `<rg-name>` | Resource group name (C2.2) |
-| `<bf-app-id>` | `<guid>` | Separate non-agentic Entra app for Bot Framework S2S (this round) |
+| `<azure-bot-name>` | `<bot-name>` | Azure Bot resource name (4–42 chars; see runbook **§11.2**) |
+| `<bf-app-id>` | `<guid>` | Separate non-agentic Entra app for Bot Framework S2S |
+| `<tunnel-url>` | `https://<tunnel-host>` | Public HTTPS base for `/api/messages` (record before `bot-service create`) |
 
 ## Gateway mode, Hermes floors, and profile ownership
 
@@ -136,6 +138,104 @@ The blueprint Entra app is **agentic** and cannot mint Bot Framework app-only to
 
 5. **Configure gateway sender policy** before C2.2 exposes `/api/messages`: run **`hermes gateway setup --platform agent365`**, then set `A365_ALLOW_ALL_USERS=true` or `A365_ALLOWED_USERS=<csv>` in `~/.hermes/.env` ([`README.md`](../README.md) → **Operator setup**). Leave **`gateway.multiplex_profiles` at the default (`false`)** for single-agent Path B.
 
-**C2.1 exit criteria:** blueprint + consent green; BF app registered with `Bot.Connector` consent; `A365_BLUEPRINT_CLIENT_SECRET` and both parent identifiers in profile env; `A365_BF_*` in operator and per-agent env; instance `.env` present; doctor shows no errors (warnings reviewed). **Next (C2.2):** start gateway, establish tunnel **before** `bot-service create`, provision Bot Service with `--endpoint`, `publish --copilot-chat`, MAC upload, and Copilot Chat reply check — [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.3** onward (tunnel-first ordering per spec).
+**C2.1 exit criteria:** blueprint + consent green; BF app registered with `Bot.Connector` consent; `A365_BLUEPRINT_CLIENT_SECRET` and both parent identifiers in profile env; `A365_BF_*` in operator and per-agent env; instance `.env` present; doctor shows no errors (warnings reviewed).
 
-Round **C2.2** continues this file below with those steps.
+## Configure gateway and establish tunnel (C2.2)
+
+Tunnel-first ordering is frozen: record a working **public HTTPS** URL for `/api/messages` **before** `bot-service create`. Reuse the same mode/floor/ownership rules as [Gateway mode, Hermes floors, and profile ownership](#gateway-mode-hermes-floors-and-profile-ownership). HTTPS and reachability constraints: [`references/exposing-the-bot-endpoint.md`](../references/exposing-the-bot-endpoint.md) → **What Microsoft requires** and **Options** (quick-tunnel examples in the runbook).
+
+**Typical layout (two terminals):**
+
+1. **Gateway —** load profile env, then start the gateway ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§9d.3**):
+
+   ```bash
+   set -a
+   . ~/.hermes/.env
+   . ~/.hermes/agents/<slug>/.env
+   set +a
+   hermes gateway run
+   # or: hermes gateway run --profile <slug>  # if refused, see runbook §9d.3 (gateway.standalone)
+   ```
+
+   **Sanity:** `hermes gateway status` shows `agent365` connected; `curl -fsS http://127.0.0.1:3978/healthz` returns `"ok": true`.
+
+2. **Tunnel —** publish `http://localhost:3978` to a public URL and note the base as `<tunnel-url>` (trailing path is `/api/messages`). Quick-tunnel example in [`references/exposing-the-bot-endpoint.md`](../references/exposing-the-bot-endpoint.md) → **Cloudflare quick tunnel**.
+
+3. **Checkpoint:** you have a stable-enough URL for this session, gateway health is green, and you will pass **`https://<tunnel-host>/api/messages`** (or equivalent) to `bot-service create --endpoint` next. Do **not** run `bot-service create` until this URL is recorded.
+
+## Provision Bot Service using the established endpoint (C2.2)
+
+`bot-service create` requires **`--endpoint`** (wrapper appends `/api/messages` when omitted — see `src/hermes_a365/bot_service.py` parser). It binds the **BF app** (`<bf-app-id>` / `A365_BF_APP_ID`), not the blueprint app id.
+
+```bash
+hermes a365 bot-service create \
+  --agent-name "<display-name>" \
+  --resource-group "<azure-rg>" \
+  --endpoint "<tunnel-url>/api/messages" \
+  --tenant-id "<tenant-id>" \
+  --subscription-id "<subscription-id>" \
+  --appid "<bf-app-id>" \
+  --bot-name "<azure-bot-name>" \
+  --apply
+```
+
+Omitted `--appid`, `--tenant-id`, or `--subscription-id` are read from `~/.hermes/.env` and `az` context when set. The wrapper registers `Microsoft.BotService`, creates or reconciles the bot resource, enables the Microsoft Teams channel, and applies publishing terms — detail in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.3–§11.4**.
+
+**Verify:**
+
+```bash
+hermes a365 bot-service verify --agent-name "<display-name>"
+```
+
+**Expected:** `properties.endpoint` matches your tunnel URL; `properties.msaAppId` is `<bf-app-id>`. Path A operators may also run `activity-bridge update-endpoint` for the MCP Platform messaging endpoint; that step is **optional for Path-B-only** Copilot Chat surfacing and is independent of ARM registration ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.0**, **§11.5**).
+
+## Publish CEA package (C2.2)
+
+Emit the Custom Engine Agent zip with **`--copilot-chat` only** (no `--aiteammate`) and **`--bot-id <bf-app-id>`** so `bots[]` references the Bot Service identity:
+
+```bash
+hermes a365 publish \
+  --agent-name "<display-name>" \
+  --tenant-id "<tenant-id>" \
+  --copilot-chat \
+  --bot-id "<bf-app-id>" \
+  --apply
+```
+
+**Expected:** Path-B-only output at `<cwd>/manifest/manifest.zip`. For MAC **Update in store** later, keep a stable catalog `manifest.id`; reserve `--manifest-id auto` for combined Path A+B publishes. Version bump rules: [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.0**, **§11.6**.
+
+## Upload in MAC and verify Copilot Chat (C2.2)
+
+**Upload (operator UI):** [Microsoft Admin Centre](https://admin.microsoft.com) → **Agents** → **Upload custom agent** → select `manifest.zip` from the publish step. First test: scope **Just me** — walkthrough in [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.7**. **Re-uploads:** open the agent → **Update in store** (no assignment step on update).
+
+**Verify Copilot Chat (UI evidence):** after propagation (~5–15 min), open [M365 Copilot Chat](https://m365.cloud.microsoft). Under **Agents**, find the agent under **Available to add** → **Add**, then send a **distinctive test prompt** and confirm a **visible assistant reply** in the thread. Cowork `@` mentions may show manifest text **without** calling the bot — use Copilot Chat for end-to-end routing ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.8**). Gateway logs (`inbound path=B`, `Agent365Adapter.handle_message`) are diagnostics, not a substitute for UI reply evidence.
+
+## Endpoint changes; stop or clean up (C2.2)
+
+**When the tunnel URL changes** (common with quick tunnels), update the Bot Service ARM endpoint; optionally update the MCP Platform messaging endpoint if you use Path A's `update-endpoint` path:
+
+```bash
+hermes a365 bot-service update-endpoint \
+  --agent-name "<display-name>" \
+  --url "<new-tunnel-url>/api/messages" \
+  --apply
+
+# Optional — MCP Platform (Path A messaging registration), not required for Path-B-only:
+hermes a365 activity-bridge update-endpoint \
+  --agent-name "<display-name>" \
+  --url "<new-tunnel-url>/api/messages" \
+  --apply
+```
+
+**Stop runtime:** stop the gateway process and tunnel in the terminals you started above.
+
+**Path B Azure cleanup (leaves blueprint for reuse):** read dry-run output first — [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§11.9**:
+
+```bash
+hermes a365 bot-service cleanup \
+  --agent-name "<display-name>" \
+  --apply \
+  --confirm "<display-name>"
+```
+
+**Sidecar / migration contract (read-only):** [`docs/SURFACE.md`](SURFACE.md) → **Sidecars** (D6). Full-tenant teardown with blueprint cleanup gates remains [`references/live-tenant-test.md`](../references/live-tenant-test.md) → **§10**.
