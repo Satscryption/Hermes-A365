@@ -26806,6 +26806,40 @@ class TestInteractiveCards:
         assert send_reply.await_args.kwargs["reply"]["text"] == "Command ran."
 
     @pytest.mark.asyncio
+    async def test_slash_confirm_followup_uses_click_reply_origin(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        self._connect(a)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(a, "_gw_resolve_slash_confirm", AsyncMock(return_value="Done."))
+        conv_id = "conv-grp"
+        other = _make_inbound(activity_id="other-turn", conv_id=conv_id)
+        other["conversation"]["conversationType"] = "groupChat"
+        assert a.admit_turn_authority(other, "sess-other", message_id="other-turn")
+        other_record = a._ledger_record_for_message("other-turn", conv_id)
+        click = _make_inbound(activity_id="click-slash", conv_id=conv_id)
+        click["conversation"]["conversationType"] = "groupChat"
+        click["from"]["id"] = "user-a"
+        value = _seed_card_capability(
+            a,
+            click,
+            kind="slash_confirm",
+            choice="once",
+            resolver={"session_key": "sess-a", "confirm_id": "cfm-1"},
+        )
+        with a._turn_frame_scope("sess-other", other_record):
+            resp = await a._handle_card_action(click, value, authorized_sender_id="user-a")
+        assert resp.status_code == 200
+        for _ in range(50):
+            if send_reply.await_count:
+                break
+            await asyncio.sleep(0)
+        assert send_reply.await_args.kwargs["inbound"]["id"] == "click-slash"
+
+    @pytest.mark.asyncio
     async def test_inflight_card_action_cannot_post_after_chat_teardown(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:

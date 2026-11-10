@@ -13716,12 +13716,27 @@ class Agent365Adapter(BasePlatformAdapter):
                     # Post the follow-up after the HTTP ack so connector retries
                     # cannot hit a consumed capability while send_reply is slow.
                     follow_text = str(follow)
+                    click_id = str(activity.get("id") or "").strip()
+                    slash_session_key = str(resolver.get("session_key") or "")
+                    slash_origin = self._ledger_record_for_message(click_id, conv_id)
+                    if slash_origin is None or not self._is_own_turn_authority(slash_origin):
+                        admission_key = slash_session_key or f"agent365:{conv_id}"
+                        self.admit_turn_authority(
+                            activity,
+                            admission_key,
+                            message_id=click_id,
+                            authorized_user_id=authorized_user_id or user_id,
+                        )
+                        slash_origin = self._ledger_record_for_message(click_id, conv_id)
+                        if slash_origin is None or not self._is_own_turn_authority(slash_origin):
+                            slash_origin = None
 
                     async def _post_slash_confirm_follow() -> None:
                         await self._send_reply_activity(
                             inbound=activity,
                             content=follow_text,
                             log_context="slash_confirm",
+                            reply_origin=slash_origin,
                         )
 
                     self._spawn_slash_confirm_followup(conv_id, _post_slash_confirm_follow())
