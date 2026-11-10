@@ -323,6 +323,8 @@ def _admit_wire_turn_authority(a: Any, inbound: dict[str, Any], *, capture: bool
         record = a._ledger_record_for_message(activity_id, ref.conversation_id)
         if record is not None:
             a._attach_coalesced_turn_authority(record)
+            a._session_key_to_conv[session] = ref.conversation_id
+            a._turn_frame_stack_tokens[session] = [record]
 
 
 def _prime_processing_turn(
@@ -13929,6 +13931,8 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id=chat),
             message_id="act-inner",
         )
+        inbound["id"] = "act-inner"
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         buf = a._turn_buffers[chat]
         assert buf["depth"] == 2
@@ -15059,6 +15063,8 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-ka-nest"),
             message_id="act-followup",
         )
+        inbound["id"] = "act-followup"
+        _prime_processing_turn(a, inbound, follow_event)
         await a.on_processing_start(follow_event)
         await a.send(chat_id="conv-G-ka-nest", content="Follow-up answer", reply_to="act-followup")
         await a.on_processing_complete(follow_event, outcome="success")
@@ -16219,6 +16225,8 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-ka-race"),
             message_id="act-followup",
         )
+        inbound["id"] = "act-followup"
+        _prime_processing_turn(a, inbound, follow_event)
         await a.on_processing_start(follow_event)
         await a.send(
             chat_id="conv-G-ka-race",
@@ -16490,6 +16498,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-nest-latch"),
             message_id="act-inner",
         )
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         assert buf["delivery_by_turn"][outer_key]["may_have_landed"] is True
         before = dict(buf["delivery_by_turn"][outer_key])
@@ -16542,6 +16551,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-inner-land"),
             message_id="act-inner",
         )
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         await a.send(chat_id="conv-G-inner-land", content="Inner lands", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
@@ -17275,6 +17285,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-outer-no"),
             message_id="act-inner",
         )
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         await a.send(chat_id="conv-G-outer-no", content="Inner lands", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
@@ -17331,6 +17342,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-in-ac"),
             message_id="act-inner",
         )
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         await a.send(chat_id="conv-G-in-ac", content="Inner ac", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
@@ -17386,6 +17398,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-inv5"),
             message_id="act-inner",
         )
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         await a.send(chat_id="conv-G-inv5", content="Inner", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
@@ -17531,6 +17544,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-r5-plain"),
             message_id="act-inner",
         )
+        _prime_processing_turn(a, inbound, inner_event)
         await a.on_processing_start(inner_event)
         await a.send(chat_id="conv-G-r5-plain", content="Inner final", reply_to="act-inner")
         await a.on_processing_complete(inner_event, outcome="success")
@@ -17572,6 +17586,7 @@ class TestEditMessage:
             source=_StubSessionSource(platform=None, chat_id="conv-G-r5-key"),
             message_id="act-inner",
         )
+        _prime_processing_turn(a, inbound, inner_event)
 
         async def post_inner(*_args: Any, **kwargs: Any) -> MagicMock:
             entity = kwargs["json"]["entities"][0]
@@ -21297,6 +21312,7 @@ class TestEditMessage:
 
         adapter_mod._AGENT_TURN_FRAME.set(None)
         a._coalesced_turn_authority.pop((conv, "stream-admit"), None)
+        a._turn_authority_ledger.pop((conv, "stream-admit"), None)
         streams_before = len(a._streams)
         unowned = await a.send(chat_id=conv, content="No auth", reply_to="stream-admit")
         assert unowned.success is False
