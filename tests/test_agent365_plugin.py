@@ -21777,6 +21777,10 @@ class TestPersonalChatStreamCompletion:
         )
         assert coalesced.success is True
         assert post_mock.await_count == 0
+        message_id = str(coalesced.message_id)
+        assert message_id in a._coalesced_reply_tasks
+        a._drop_coalesced_reply_state(message_id)
+        assert message_id not in a._coalesced_reply_tasks
 
         a2 = _make_adapter(monkeypatch)
         inbound_p = _make_inbound(conv_id="conv-P", activity_id="act-p")
@@ -21799,7 +21803,7 @@ class TestPersonalChatStreamCompletion:
         a3 = _make_adapter(monkeypatch)
         inbound_c = _make_inbound(conv_id="conv-C", activity_id="act-c")
         inbound_c["conversation"]["conversationType"] = "groupChat"
-        TestEditMessage._wire_adapter(a3, inbound_c, post_responses=None)
+        TestEditMessage._wire_adapter(a3, inbound=inbound_c, post_responses=None)
         TestEditMessage._patch_token_mint(monkeypatch)
         event = _StubMessageEvent(
             text="hi",
