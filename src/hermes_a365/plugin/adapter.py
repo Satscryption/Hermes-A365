@@ -1397,6 +1397,16 @@ _MAX_COALESCED_TURN_TARGETS_PER_CHAT = 64
 _MAX_COALESCED_TURN_TARGETS = 2048
 _COALESCED_TURN_TARGET_TTL_SEC = 300.0
 _MAX_RECENTLY_FINALIZED = 4096
+_PERSONAL_STREAM_BF_ERROR_CODES = frozenset(
+    {
+        "ContentStreamNotAllowed",
+        "ContentStreamSequenceOrderPreConditionFailed",
+        "TooManyRequests",
+        "BadGateway",
+        "BadSyntax",
+        "ServiceUnavailable",
+    }
+)
 _COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC = 10.0
 # Hermes ``interrupt()`` can block in CompressionCommitFence with no
 # timeout. Uninstall waits at most this long, off the event loop, then
@@ -2147,6 +2157,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # can't outlive 2 minutes; 5 covers slow-clock skew).
         self._recently_finalized: dict[tuple[str, str], float] = {}
         self._recently_finalized_ttl_sec = 300.0
+        self._terminal_stream_failure_markers: dict[tuple[str, str], float] = {}
 
         # #53 — gateway status/lifecycle callbacks (retry/fallback traces,
         # terminal-failure summaries) are routed through
@@ -11105,7 +11116,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     "type": "streaminfo",
                     "streamType": "streaming",
                     "streamSequence": 1,
-                }
+                },
+                dict(bridge.AI_GENERATED_CONTENT_ENTITY),
             ],
         }
         url = _conversations_activities_url(service_url, conv_id)
@@ -13839,24 +13851,29 @@ class Agent365Adapter(BasePlatformAdapter):
         bf_error_body: str,
         attempt: int,
     ) -> None:
-        """Log a personal-stream failure with the connector's own detail.
-
-        Hermes flattens a failed edit to ``Edit failed`` and
-        ``content_delivered`` is not a delivery signal (#63, #83). The
-        HTTP status and BF body have to be on our log line.
-        """
+        del chat_id, message_id, bf_error_body
+        phase_out = (
+            phase if phase in {"stream-start", "edit", "auto-finalize", "other"} else "other"
+        )
+        status_out = (
+            http_status
+            if isinstance(http_status, int) and 100 <= http_status <= 599
+            else "none"
+        )
+        attempt_out = (
+            attempt
+            if isinstance(attempt, int) and 1 <= attempt <= _STREAM_EDIT_MAX_ATTEMPTS
+            else 0
+        )
+        code_out = bf_error_code if bf_error_code in _PERSONAL_STREAM_BF_ERROR_CODES else "other"
         logger.warning(
-            "agent365 personal stream edit failed: phase=%s chat_id=%s "
-            "message_id=%s finalize=%s http_status=%s bf_error_code=%s "
-            "bf_error_body=%s attempt=%s",
-            phase,
-            chat_id,
-            message_id,
+            "agent365 personal stream edit failed: phase=%s finalize=%s "
+            "http_status=%s attempt=%s bf_error_code=%s",
+            phase_out,
             finalize,
-            http_status,
-            bf_error_code,
-            bf_error_body,
-            attempt,
+            status_out,
+            attempt_out,
+            code_out,
         )
 
     def _stream_edit_should_retry(
@@ -14236,12 +14253,10 @@ class Agent365Adapter(BasePlatformAdapter):
         ``streamType=final`` on turn end (#182). Personal chats keep
         the ``streamType=streaming`` sequence above.
 
-        Returns ``SendResult(success=False, ...)`` and falls back to
-        ``send()`` on:
-        - missing cached inbound (proactive sends with no prior turn),
-        - terminal 403 ``ContentStreamNotAllowed`` (2-min timeout,
-          stop-button cancel, oversize message),
-        - non-2xx HTTP responses.
+        Returns ``SendResult(success=False, ...)`` on missing inbound,
+        disconnect, or rejected wire activities. A completed personal
+        wire-final may return success without another post; plain-reply
+        fallback after a failed stream open belongs to ``send()``.
 
         Soft path (``202 ContentStreamSequenceOrderPreConditionFailed``):
         out-of-order requests get dropped server-side; we log and
@@ -14339,7 +14354,17 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_generation = self._chat_generation(chat_id)
         client = self._http_client
 
-        requested_stream_key = (str(chat_id), str(message_id))
+        requested_message_id = str(message_id)
+        requested_stream_key = (str(chat_id), requested_message_id)
+        if (
+            not finalize
+            and requested_stream_key not in self._streams
+            and (str(chat_id), requested_message_id) in self._terminal_stream_failure_markers
+        ):
+            return SendResult(
+                success=False,
+                error="agent365 edit_message: stream retired after terminal failure",
+            )
         if requested_stream_key not in self._streams and any(
             other_message_id == str(message_id)
             for other_chat_id, other_message_id in self._streams
@@ -14472,15 +14497,9 @@ class Agent365Adapter(BasePlatformAdapter):
         }
 
         bridge = _import_bridge()
-        if wire_finalize:
-            # #73(a): the finalized, user-visible message is AI-generated
-            # content — append the label alongside the streaminfo entity.
-            # Intermediate (typing) chunks are NOT labelled.
-            activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
-            # #73(c): feedback loop only on the FINAL streamed message
-            # (streaming-UX rule — feedback/label are final-only).
-            if self._feedback_enabled:
-                activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
+        activity["entities"].append(dict(bridge.AI_GENERATED_CONTENT_ENTITY))
+        if wire_finalize and self._feedback_enabled:
+            activity["channelData"] = dict(bridge.FEEDBACK_LOOP_CHANNEL_DATA)
         service_url = str(inbound.get("serviceUrl") or "").rstrip("/")
         conv_id = conv.get("id")
         if not service_url or not conv_id:
@@ -14675,14 +14694,9 @@ class Agent365Adapter(BasePlatformAdapter):
                 # above keeps the HTTP status and BF body (#83).
                 err_msg = self._extract_error_message(resp)
                 low = err_msg.lower()
-                # A retry of the final can learn the previous attempt
-                # already closed the stream (timeout or 502, then 403
-                # "already completed"). That final landed. Returning
-                # failure makes the gateway open another stream.
-                # "canceled by user" stays a failure.
                 if (
-                    finalize
-                    and attempt > 1
+                    wire_finalize
+                    and code == "ContentStreamNotAllowed"
                     and state.get("bf_stream_id")
                     and "already completed" in low
                     and "canceled by user" not in low
@@ -14693,10 +14707,22 @@ class Agent365Adapter(BasePlatformAdapter):
                     if not anchor:
                         anchor = self._personal_reply_anchor(None, inbound)
                     self._drop_stream_state(chat_id, message_id)
-                    self._record_recently_finalized(message_id, chat_id, loop_now)
+                    for tomb_id in {requested_message_id, str(message_id), landed_id}:
+                        if tomb_id:
+                            self._record_recently_finalized(tomb_id, chat_id, loop_now)
                     self._remember_personal_final_anchor(chat_id, anchor)
                     self._mark_personal_stream_final_posted(chat_id)
                     return SendResult(success=True, message_id=landed_id)
+                for raw in (
+                    requested_message_id,
+                    str(message_id),
+                    str(state.get("bf_stream_id") or ""),
+                ):
+                    token = str(raw or "").strip()
+                    if token:
+                        self._terminal_stream_failure_markers[(str(chat_id), token)] = loop_now
+                while len(self._terminal_stream_failure_markers) > _MAX_RECENTLY_FINALIZED:
+                    self._terminal_stream_failure_markers.pop(next(iter(self._terminal_stream_failure_markers)))
                 self._drop_stream_state(chat_id, message_id)
                 short = err_msg
                 if "exceeded streaming time" in low:
@@ -14803,6 +14829,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # what becomes the visible bubble's final state, so this is
         # also what the user reads.
         final_text = state.get("last_content") or " "
+        bridge = _import_bridge()
         activity = {
             "type": "message",
             "text": final_text,
@@ -14814,12 +14841,12 @@ class Agent365Adapter(BasePlatformAdapter):
                     "type": "streaminfo",
                     "streamId": bf_stream_id,
                     "streamType": "final",
-                }
+                },
+                dict(bridge.AI_GENERATED_CONTENT_ENTITY),
             ],
         }
         url = _conversations_activities_url(service_url, conv_id)
         try:
-            bridge = _import_bridge()
             token, _path = await self._await_outbound(
                 chat_id,
                 bridge.acquire_reply_token(
@@ -14922,15 +14949,8 @@ class Agent365Adapter(BasePlatformAdapter):
             state["opened_ts"] = opened_ts
         age = loop_now - float(opened_ts)
         if failures >= _STREAMING_FINALIZE_MAX_FAILURES or age >= _STREAMING_FORCE_DROP_AFTER_SEC:
-            logger.warning(
-                "agent365 force-dropping stale stream after failed finalize: "
-                "chat_id=%s message_id=%s failures=%s age=%.1fs reason=%s",
-                chat_id,
-                message_id,
-                failures,
-                age,
-                reason,
-            )
+            del reason
+            logger.warning("agent365 stale stream force-dropped after finalize failure")
             self._drop_stream_state(chat_id, message_id)
             self._record_recently_finalized(message_id, chat_id, loop_now)
             return True
@@ -14949,13 +14969,12 @@ class Agent365Adapter(BasePlatformAdapter):
             self._recently_finalized.pop(next(iter(self._recently_finalized)))
 
     def _prune_recently_finalized(self, now: float) -> None:
-        """Drop ``_recently_finalized`` entries older than the TTL."""
+        """Drop expired personal-stream tombstones and failure markers."""
         cutoff = now - self._recently_finalized_ttl_sec
-        stale = [
-            key for key, finalized_at in self._recently_finalized.items() if finalized_at < cutoff
-        ]
-        for k in stale:
-            self._recently_finalized.pop(k, None)
+        for store in (self._recently_finalized, self._terminal_stream_failure_markers):
+            for key, marked_at in list(store.items()):
+                if marked_at < cutoff:
+                    store.pop(key, None)
 
     def _drop_stream_state(self, chat_id: str, message_id: str) -> None:
         """Clear ``self._streams[(chat_id, message_id)]`` and its chat slot.
@@ -15547,9 +15566,10 @@ class Agent365Adapter(BasePlatformAdapter):
         self._copilot_member_added_pending.pop(str(chat_id), None)
         self._copilot_member_added_claims.pop(str(chat_id), None)
         await self._drop_turn_buffer(chat_id)
-        for key in list(self._recently_finalized):
-            if key[0] == chat_id:
-                self._recently_finalized.pop(key, None)
+        for store in (self._recently_finalized, self._terminal_stream_failure_markers):
+            for key in list(store):
+                if key[0] == chat_id:
+                    store.pop(key, None)
         self._personal_processing_depth.pop(chat_id, None)
         self._personal_stream_final_posted.discard(chat_id)
         self._reset_stream_overflow_limit_for_task()
