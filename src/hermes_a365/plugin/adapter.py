@@ -287,6 +287,29 @@ _PERSIST_STATE_GUARD = threading.Lock()
 _PERSIST_STATES: dict[str, dict[str, Any]] = {}
 _MEDIA_STATE_GUARD = threading.Lock()
 _MEDIA_STATES: dict[str, dict[str, Any]] = {}
+_BRIDGE_PID_GUARD = threading.Lock()
+_BRIDGE_PID_OWNERS: dict[str, str] = {}
+
+
+def _bridge_pid_owner_key(path: Path) -> str:
+    return str(path.expanduser().resolve(strict=False))
+
+
+def _claim_bridge_pid_owner(path: Path, token: str) -> None:
+    with _BRIDGE_PID_GUARD:
+        _BRIDGE_PID_OWNERS[_bridge_pid_owner_key(path)] = token
+
+
+def _bridge_pid_owner_current(path: Path) -> str | None:
+    with _BRIDGE_PID_GUARD:
+        return _BRIDGE_PID_OWNERS.get(_bridge_pid_owner_key(path))
+
+
+def _release_bridge_pid_owner(path: Path, token: str) -> None:
+    with _BRIDGE_PID_GUARD:
+        key = _bridge_pid_owner_key(path)
+        if _BRIDGE_PID_OWNERS.get(key) == token:
+            _BRIDGE_PID_OWNERS.pop(key, None)
 
 
 def _persist_state(path: Path) -> dict[str, Any]:
@@ -1954,6 +1977,8 @@ class Agent365Adapter(BasePlatformAdapter):
         self._app: Any = None
         self._uvicorn_server: Any = None
         self._uvicorn_task: asyncio.Task | None = None
+        self._bridge_pid_path: Path | None = None
+        self._bridge_pid_owner_token: str | None = None
         self._lifecycle_lock = asyncio.Lock()
         self._disconnecting = False
         self._disconnect_cleanup_active = False
@@ -3552,6 +3577,72 @@ class Agent365Adapter(BasePlatformAdapter):
             media_types=media_types,
         )
 
+    def _prepare_bridge_pid_publication(self) -> None:
+        cfg = self._bridge_cfg
+        if cfg is None:
+            self._bridge_pid_path = None
+            self._bridge_pid_owner_token = None
+            return
+        self._bridge_pid_path = Path(cfg.pid_path)
+        self._bridge_pid_owner_token = secrets.token_hex(16)
+
+    def _publish_bridge_pid_if_ready(self) -> None:
+        path = self._bridge_pid_path
+        token = self._bridge_pid_owner_token
+        task = self._uvicorn_task
+        if path is None or token is None or task is None or task.done():
+            return
+        bridge = _import_bridge()
+        try:
+            _claim_bridge_pid_owner(path, token)
+            bridge.write_pid_file(path)
+        except OSError as exc:
+            self._retire_bridge_pid_file()
+            if _bridge_pid_owner_current(path) == token:
+                _release_bridge_pid_owner(path, token)
+            logger.warning(
+                "agent365 bridge pid publish failed at %s: %s",
+                path,
+                type(exc).__name__,
+            )
+
+    def _retire_bridge_pid_file(self) -> None:
+        path = self._bridge_pid_path
+        token = self._bridge_pid_owner_token
+        if path is None or token is None:
+            return
+        if _bridge_pid_owner_current(path) != token:
+            return
+        try:
+            if path.is_file():
+                try:
+                    recorded = int(path.read_text().strip())
+                except OSError as exc:
+                    logger.warning(
+                        "agent365 bridge pid retire failed at %s: %s",
+                        path,
+                        type(exc).__name__,
+                    )
+                    return
+                except ValueError:
+                    return
+                if recorded != os.getpid():
+                    return
+            bridge = _import_bridge()
+            bridge.remove_pid_file(path)
+        except OSError as exc:
+            logger.warning(
+                "agent365 bridge pid retire failed at %s: %s",
+                path,
+                type(exc).__name__,
+            )
+        else:
+            _release_bridge_pid_owner(path, token)
+
+    def _bridge_pid_uvicorn_done(self, task: asyncio.Task[Any]) -> None:
+        with contextlib.suppress(Exception):
+            self._retire_bridge_pid_file()
+
     # ── Connection lifecycle ──────────────────────────────────────────────
 
     async def connect(self, *, is_reconnect: bool = False) -> bool:
@@ -3597,6 +3688,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # shared gateway loop so other platforms and the gateway connect
             # watchdog continue to run.
             self._bridge_cfg = await asyncio.to_thread(self._make_bridge_config)
+            self._prepare_bridge_pid_publication()
         except RuntimeError as e:
             logger.error("agent365 adapter config error: %s", e)
             self._set_fatal_error("config_error", str(e), retryable=False)
@@ -3627,6 +3719,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._connect_failed = False
         self._connect_ready.clear()
         self._uvicorn_task = asyncio.create_task(self._uvicorn_server.serve())
+        self._uvicorn_task.add_done_callback(self._bridge_pid_uvicorn_done)
 
         # Wait for uvicorn to flip its ``started`` flag before we
         # report ready — otherwise the gateway's status check could
@@ -3674,6 +3767,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._set_fatal_error("persistence_activation_failed", str(e), retryable=True)
             return False
         self._commit_persist_owner()
+        self._publish_bridge_pid_if_ready()
         self._mark_connected()
         self._connect_starting = False
         self._connect_ready.set()
@@ -3741,6 +3835,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 raise asyncio.CancelledError()
 
     async def _disconnect(self, http_client: Any) -> None:
+        self._retire_bridge_pid_file()
         current = asyncio.current_task()
         try:
             await self._stop_uvicorn()
