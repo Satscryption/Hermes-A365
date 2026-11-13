@@ -13865,12 +13865,16 @@ class Agent365Adapter(BasePlatformAdapter):
             if isinstance(attempt, int) and 1 <= attempt <= _STREAM_EDIT_MAX_ATTEMPTS
             else 0
         )
-        code_out = bf_error_code if bf_error_code in _PERSONAL_STREAM_BF_ERROR_CODES else "other"
+        code_out = (
+            bf_error_code
+            if isinstance(bf_error_code, str) and bf_error_code in _PERSONAL_STREAM_BF_ERROR_CODES
+            else "other"
+        )
         logger.warning(
             "agent365 personal stream edit failed: phase=%s finalize=%s "
             "http_status=%s attempt=%s bf_error_code=%s",
             phase_out,
-            finalize,
+            bool(finalize),
             status_out,
             attempt_out,
             code_out,
@@ -14251,12 +14255,16 @@ class Agent365Adapter(BasePlatformAdapter):
 
         Non-personal chats buffer locally and post one
         ``streamType=final`` on turn end (#182). Personal chats keep
-        the ``streamType=streaming`` sequence above.
+        the ``streamType=streaming`` sequence above. Every streaming
+        POST carries the AI-generated label; feedback ``channelData`` is
+        final-only when enabled.
 
         Returns ``SendResult(success=False, ...)`` on missing inbound,
         disconnect, or rejected wire activities. A completed personal
         wire-final may return success without another post; plain-reply
-        fallback after a failed stream open belongs to ``send()``.
+        fallback after a failed stream open belongs to ``send()``. After
+        a terminal 403 on an open stream, further non-finalize edits on
+        that message id are refused until the tombstone expires.
 
         Soft path (``202 ContentStreamSequenceOrderPreConditionFailed``):
         out-of-order requests get dropped server-side; we log and
@@ -14713,16 +14721,19 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._remember_personal_final_anchor(chat_id, anchor)
                     self._mark_personal_stream_final_posted(chat_id)
                     return SendResult(success=True, message_id=landed_id)
-                for raw in (
-                    requested_message_id,
-                    str(message_id),
-                    str(state.get("bf_stream_id") or ""),
-                ):
-                    token = str(raw or "").strip()
-                    if token:
-                        self._terminal_stream_failure_markers[(str(chat_id), token)] = loop_now
-                while len(self._terminal_stream_failure_markers) > _MAX_RECENTLY_FINALIZED:
-                    self._terminal_stream_failure_markers.pop(next(iter(self._terminal_stream_failure_markers)))
+                if state.get("bf_stream_id"):
+                    for raw in (
+                        requested_message_id,
+                        str(message_id),
+                        str(state["bf_stream_id"]),
+                    ):
+                        token = str(raw or "").strip()
+                        if token:
+                            self._terminal_stream_failure_markers[(str(chat_id), token)] = loop_now
+                    while len(self._terminal_stream_failure_markers) > _MAX_RECENTLY_FINALIZED:
+                        self._terminal_stream_failure_markers.pop(
+                            next(iter(self._terminal_stream_failure_markers))
+                        )
                 self._drop_stream_state(chat_id, message_id)
                 short = err_msg
                 if "exceeded streaming time" in low:
