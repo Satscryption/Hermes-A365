@@ -1217,6 +1217,12 @@ def _home_tree_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
     return snap
 
 
+def _hermes_and_cwd_tree_snapshot(
+    home: Path, cwd: Path
+) -> dict[str, dict[str, tuple[int, bytes]]]:
+    return {"home": _home_tree_snapshot(home), "cwd": _home_tree_snapshot(cwd)}
+
+
 def _path_a_profile(*, bf: bool = False, identity: str = "") -> str:
     lines = [
         f"A365_TENANT_ID={_T1_TENANT}",
@@ -1390,6 +1396,44 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         report = _run_linux_keychain_report(monkeypatch, _linux_home)
         assert _keychain_probe(report).state == "skipped"
 
+    def test_profile_nonempty_beats_invalid_extra_app_id_type(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile())
+        cfg = (
+            "gateway:\n  platforms:\n    agent365:\n      enabled: true\n      extra:\n"
+            f"        tenant_id: {_T1_TENANT}\n"
+            "        app_id: 1\n"
+            f"        blueprint_client_secret: {_T1_BP_SECRET}\n"
+        )
+        _write_mode(_linux_home / "config.yaml", cfg)
+        report = _run_linux_keychain_report(monkeypatch, _linux_home)
+        assert _keychain_probe(report).state == "skipped"
+
+    @pytest.mark.parametrize(
+        "profile_path_line",
+        [
+            'A365_GENERATED_CONFIG_PATH=" real.json "\n',
+            'A365_GENERATED_CONFIG_PATH="   "\n',
+        ],
+        ids=["padded_profile_path", "spaces_only_profile_path"],
+    )
+    def test_profile_generated_path_not_stripped_before_path(
+        self,
+        _linux_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        profile_path_line: str,
+    ) -> None:
+        work = tmp_path / "gw-cwd"
+        work.mkdir(exist_ok=True)
+        _write_mode(work / "real.json", _generated_json())
+        _write_mode(work / "a365.generated.config.json", _generated_json())
+        profile = f"A365_TENANT_ID={_T1_TENANT}\nA365_APP_ID={_T1_APP}\n{profile_path_line}"
+        _write_mode(_linux_home / ".env", profile)
+        report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=work)
+        assert _keychain_probe(report).state == "error"
+
     @pytest.mark.parametrize(
         "path_setup",
         [
@@ -1474,6 +1518,22 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         _write_mode(_linux_home / "config.yaml", _agent365_config(extra=extra or None))
         report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=work)
         assert _keychain_probe(report).state == "error"
+
+    def test_generated_whitespace_only_blueprint_secret_counts_as_present(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        work = tmp_path / "gw-cwd"
+        work.mkdir(exist_ok=True)
+        _write_mode(
+            work / "a365.generated.config.json",
+            '{"agentBlueprintClientSecret": "   "}\n',
+        )
+        _write_mode(
+            _linux_home / ".env",
+            f"A365_TENANT_ID={_T1_TENANT}\nA365_APP_ID={_T1_APP}\n",
+        )
+        report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=work)
+        assert _keychain_probe(report).state == "skipped"
 
     def test_per_agent_file_has_no_effect_on_complete_coverage(
         self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1598,6 +1658,28 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         _write_mode(_linux_home / ".env", _path_a_profile(identity="../escape"))
         report = _run_linux_keychain_report(monkeypatch, _linux_home)
         assert _keychain_probe(report).state == "error"
+
+    def test_invalid_extra_slug_beats_profile_agents_identity(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile(identity="good-agent"))
+        _write_mode(
+            _linux_home / "config.yaml",
+            _agent365_config(extra={"slug": "../escape"}),
+        )
+        report = _run_linux_keychain_report(monkeypatch, _linux_home)
+        assert _keychain_probe(report).state == "error"
+
+    def test_extra_slug_beats_invalid_profile_agents_identity(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile(identity="../escape"))
+        _write_mode(
+            _linux_home / "config.yaml",
+            _agent365_config(extra={"slug": "good-agent"}),
+        )
+        report = _run_linux_keychain_report(monkeypatch, _linux_home)
+        assert _keychain_probe(report).state == "skipped"
 
     def test_doctor_process_agent_identity_does_not_override_profile(
         self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
@@ -1969,7 +2051,7 @@ class TestPlaintextKeychainDiagnosticIsReadOnlyAndRedacted:
             "default",
             f"A365_BLUEPRINT_CLIENT_SECRET={_T1_BP_SECRET}-per-agent-only\n",
         )
-        tree_before = _home_tree_snapshot(home)
+        tree_before = _hermes_and_cwd_tree_snapshot(home, work)
 
         def _fail_provider(*_a: object, **_k: object) -> str:
             raise AssertionError("provider must not be consulted")
@@ -2015,7 +2097,36 @@ class TestPlaintextKeychainDiagnosticIsReadOnlyAndRedacted:
         for record in caplog.records:
             assert _T1_BP_SECRET not in (record.getMessage() + str(record.exc_text or ""))
 
-        assert _home_tree_snapshot(home) == tree_before
+        assert _hermes_and_cwd_tree_snapshot(home, work) == tree_before
+
+    def test_cwd_and_home_unchanged_after_failed_coverage(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        home = tmp_path / "home"
+        work = tmp_path / "cwd"
+        home.mkdir()
+        work.mkdir()
+        gen = work / "a365.generated.config.json"
+        _write_mode(gen, "{not-json")
+        _write_mode(home / "config.yaml", _agent365_config())
+        _write_mode(
+            home / ".env",
+            f"A365_TENANT_ID={_T1_TENANT}\nA365_APP_ID={_T1_APP}\n",
+        )
+        before = _hermes_and_cwd_tree_snapshot(home, work)
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        monkeypatch.chdir(work)
+        stack = ExitStack()
+        stack.enter_context(patch("hermes_a365.doctor.sys.platform", "linux"))
+        stack.enter_context(patch("hermes_a365.doctor.shutil.which", return_value=None))
+        for p in _stub_ok_probes():
+            stack.enter_context(p)
+        with stack:
+            report = run_all_probes(no_network=True)
+        assert _keychain_probe(report).state == "error"
+        assert _hermes_and_cwd_tree_snapshot(home, work) == before
 
     def test_classification_never_constructs_keychain_provider(
         self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
