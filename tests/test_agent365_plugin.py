@@ -18,6 +18,7 @@ import importlib
 import json
 import logging
 import os
+import stat
 import sys
 import time
 import types
@@ -31741,3 +31742,390 @@ class TestMessageReaction:
         assert rec["feedback"] is None
         assert rec["conversation_id"] == "conv-1"
         assert rec["native_reactions"]["user-1"]["like"]["action"] == "added"
+
+
+# ---------------------------------------------------------------------------
+# Gateway activity-bridge PID publication (#321)
+# ---------------------------------------------------------------------------
+
+
+def _reserve_local_port() -> int:
+    import socket
+
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _gateway_bound_port(adapter: Any) -> int:
+    server = adapter._uvicorn_server
+    for srv in server.servers:
+        for sock in srv.sockets or []:
+            return int(sock.getsockname()[1])
+    raise AssertionError("adapter has no bound listen socket")
+
+
+def _seed_gateway_status_env(home: Path, slug: str) -> Path:
+    home.mkdir(parents=True, exist_ok=True)
+    profile_env = home / ".env"
+    profile_env.write_text(
+        "A365_TENANT_ID=11111111-1111-1111-1111-111111111111\n"
+        "A365_APP_ID=22222222-2222-2222-2222-222222222222\n"
+    )
+    profile_env.chmod(0o600)
+    agent_dir = home / "agents" / slug
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    agent_env = agent_dir / ".env"
+    agent_env.write_text("AA_INSTANCE_ID=test-instance\n")
+    agent_env.chmod(0o600)
+    return agent_dir / "bridge.pid"
+
+
+async def _assert_healthz(adapter: Any) -> None:
+    import httpx
+
+    url = f"http://{adapter.host}:{adapter.port}/healthz"
+    client = adapter._http_client
+    if client is None:
+        async with httpx.AsyncClient() as ephemeral:
+            resp = await ephemeral.get(url, timeout=5.0)
+    else:
+        resp = await client.get(url, timeout=5.0)
+    assert resp.status_code == 200
+    assert resp.json() == {"ok": True}
+
+
+class TestGatewayBridgePidPublication:
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_pid_tracks_serving_lifecycle(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      from hermes_a365.status import _UnavailableQuerySource, collect_status, overall_to_exit_code
+
+      slug = "gateway-bridge-agent"
+      monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      assert not pid_path.exists()
+
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter.connect() is True
+      try:
+          await _assert_healthz(adapter)
+          assert pid_path.exists()
+          assert pid_path.read_text().strip() == str(os.getpid())
+          assert stat.S_IMODE(pid_path.stat().st_mode) == 0o600
+
+          report = collect_status(
+              slug,
+              hermes_home=home,
+              query_source=_UnavailableQuerySource(),
+          )
+          bridge = next(c for c in report.components if c.name == "activity_bridge")
+          assert bridge.state == "ok"
+          assert report.overall == "ok"
+          assert overall_to_exit_code(report.overall) == 0
+      finally:
+          await adapter.disconnect()
+
+      assert not pid_path.exists()
+      report = collect_status(
+          slug,
+          hermes_home=home,
+          query_source=_UnavailableQuerySource(),
+      )
+      bridge = next(c for c in report.components if c.name == "activity_bridge")
+      assert bridge.state == "missing"
+      assert report.overall == "partial"
+      assert overall_to_exit_code(report.overall) == 1
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_no_pid_without_credentials(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      slug = "no-creds-agent"
+      home = Path(os.environ["HERMES_HOME"])
+      _seed_gateway_status_env(home, slug)
+      pid_path = home / "agents" / slug / "bridge.pid"
+      monkeypatch.delenv("A365_TENANT_ID", raising=False)
+      monkeypatch.delenv("A365_APP_ID", raising=False)
+      monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+      monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+      cfg = _StubPlatformConfig(extra={"slug": slug, "port": _reserve_local_port()})
+      adapter = adapter_mod.Agent365Adapter(cfg)
+      assert await adapter.connect() is False
+      assert not pid_path.exists()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_no_pid_on_persist_failure(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      slug = "persist-fail-agent"
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+
+      async def fail_persist(*, tentative: bool = False) -> int:
+          if tentative:
+              raise RuntimeError("persistence activation blocked")
+          return 1
+
+      monkeypatch.setattr(adapter, "_activate_persist_owner", fail_persist)
+      assert await adapter.connect() is False
+      assert not pid_path.exists()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_no_pid_when_server_dies_before_commit(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      slug = "pre-commit-death"
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      original = adapter._activate_persist_owner
+
+      async def stop_before_commit(*, tentative: bool = False) -> int:
+          if tentative:
+              if adapter._uvicorn_task is not None:
+                  adapter._uvicorn_server.should_exit = True
+                  with contextlib.suppress(Exception):
+                      await asyncio.wait_for(adapter._uvicorn_task, timeout=2.0)
+              raise RuntimeError("blocked before persistence commit")
+          return await original(tentative=tentative)
+
+      monkeypatch.setattr(adapter, "_activate_persist_owner", stop_before_commit)
+      assert await adapter.connect() is False
+      assert not pid_path.exists()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_pid_owner_survives_old_task_cleanup(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      from hermes_a365.status import _UnavailableQuerySource, collect_status
+
+      slug = "owner-survival"
+      monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      older = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await older.connect() is True
+      newer = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await newer.connect() is True
+      try:
+          report = collect_status(
+              slug, hermes_home=home, query_source=_UnavailableQuerySource()
+          )
+          assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
+          older_task = older._uvicorn_task
+          assert older_task is not None
+          older._uvicorn_server.should_exit = True
+          await asyncio.wait_for(older_task, timeout=5.0)
+          assert pid_path.exists()
+          await older.disconnect()
+          assert pid_path.exists()
+
+          newer_task = newer._uvicorn_task
+          assert newer_task is not None
+          newer._uvicorn_server.should_exit = True
+          await asyncio.wait_for(newer_task, timeout=5.0)
+          await asyncio.sleep(0.05)
+          assert not pid_path.exists()
+          report = collect_status(
+              slug, hermes_home=home, query_source=_UnavailableQuerySource()
+          )
+          assert (
+              next(c for c in report.components if c.name == "activity_bridge").state == "missing"
+          )
+      finally:
+          await newer.disconnect()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_pid_cleanup_preserves_foreign_pid(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      import subprocess
+
+      slug = "foreign-pid"
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter.connect() is True
+      child = subprocess.Popen(["sleep", "30"])
+      try:
+          pid_path.write_text(str(child.pid))
+          await adapter.disconnect()
+          assert pid_path.read_text().strip() == str(child.pid)
+      finally:
+          child.terminate()
+          child.wait(timeout=5)
+
+  @pytest.mark.asyncio
+  async def test_gateway_publication_preserves_status_pid_contract(
+      self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+  ) -> None:
+      from hermes_a365._common import slugify
+      from hermes_a365.status import (
+          _UnavailableQuerySource,
+          collect_status,
+          gather_activity_bridge,
+      )
+
+      slug = "status-contract"
+      monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+      home = Path(os.environ["HERMES_HOME"])
+      _seed_gateway_status_env(home, slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter.connect() is True
+      try:
+          report = collect_status(
+              slug, hermes_home=home, query_source=_UnavailableQuerySource()
+          )
+          assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
+
+          display = "Status Contract"
+          assert slugify(display) == slug
+          display_report = collect_status(
+              display,
+              hermes_home=home,
+              query_source=_UnavailableQuerySource(),
+          )
+          assert (
+              next(c for c in display_report.components if c.name == "activity_bridge").state
+              == "missing"
+          )
+
+          other_home = tmp_path / "other-hermes"
+          other_home.mkdir()
+          other_profile = other_home / ".env"
+          other_profile.write_text((home / ".env").read_text())
+          other_profile.chmod(0o600)
+          other_agent = other_home / "agents" / slug
+          other_agent.mkdir(parents=True)
+          other_agent_env = other_agent / ".env"
+          other_agent_env.write_text("AA_INSTANCE_ID=other\n")
+          other_agent_env.chmod(0o600)
+          other_report = collect_status(
+              slug,
+              hermes_home=other_home,
+              query_source=_UnavailableQuerySource(),
+          )
+          assert (
+              next(c for c in other_report.components if c.name == "activity_bridge").state
+              == "missing"
+          )
+
+          other_slug_home = home / "agents" / "other-bridge"
+          other_slug_home.mkdir(parents=True)
+          other_slug_env = other_slug_home / ".env"
+          other_slug_env.write_text("AA_INSTANCE_ID=x\n")
+          other_slug_env.chmod(0o600)
+          assert gather_activity_bridge(home, "other-bridge").state == "missing"
+
+          monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+          _write_matching_allow_all_profile()
+          default_adapter = adapter_mod.Agent365Adapter(
+              _StubPlatformConfig(extra={"port": _reserve_local_port()})
+          )
+          assert default_adapter.slug == ""
+          _seed_gateway_status_env(home, "default")
+          assert await default_adapter.connect() is True
+          default_slug_report = collect_status(
+              "default",
+              hermes_home=home,
+              query_source=_UnavailableQuerySource(),
+          )
+          assert (
+              next(
+                  c for c in default_slug_report.components if c.name == "activity_bridge"
+              ).state
+              == "ok"
+          )
+          await default_adapter.disconnect()
+
+          skill_report = collect_status(
+              None, hermes_home=home, query_source=_UnavailableQuerySource()
+          )
+          assert "activity_bridge" not in [c.name for c in skill_report.components]
+      finally:
+          await adapter.disconnect()
+
+      assert gather_activity_bridge(home, slug).state == "missing"
+      (home / "agents" / slug / "bridge.pid").write_text(str(os.getpid()))
+      assert gather_activity_bridge(home, slug).state == "ok"
+      (home / "agents" / slug / "bridge.pid").write_text("99999999")
+      assert gather_activity_bridge(home, slug).state == "error"
+      assert gather_activity_bridge(home, "bad/name").state == "missing"
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_pid_io_errors_do_not_break_lifecycle(
+      self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+  ) -> None:
+      from hermes_a365 import activity_bridge as ab
+      from hermes_a365.status import _UnavailableQuerySource, collect_status
+
+      slug = "pid-io"
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter.connect() is True
+      assert pid_path.exists()
+      await adapter.disconnect()
+      assert not pid_path.exists()
+
+      canary = "CANARY_NOT_IN_WARNING"
+      original_write = ab.write_pid_file
+
+      def flaky_write(path: Path) -> None:
+          if path == pid_path:
+              path.parent.mkdir(parents=True, exist_ok=True)
+              path.write_text("partial")
+              raise OSError(canary)
+          original_write(path)
+
+      monkeypatch.setattr(ab, "write_pid_file", flaky_write)
+      adapter2 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter2.connect() is True
+      await _assert_healthz(adapter2)
+      assert not pid_path.exists() or pid_path.read_text().strip() != str(os.getpid())
+
+      caplog.clear()
+      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+          await adapter2.disconnect()
+      assert canary not in caplog.text
+      for record in caplog.records:
+          if "bridge pid" in record.message:
+              assert canary not in record.message
+
+      read_calls = {"count": 0}
+      original_read_text = Path.read_text
+
+      def flaky_read(self: Path, *args: Any, **kwargs: Any) -> str:
+          if self == pid_path:
+              read_calls["count"] += 1
+              if read_calls["count"] == 1:
+                  raise OSError(canary)
+          return original_read_text(self, *args, **kwargs)
+
+      original_unlink = Path.unlink
+
+      def flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+          if self == pid_path:
+              raise OSError(canary)
+          original_unlink(self, *args, **kwargs)
+
+      monkeypatch.setattr(ab, "write_pid_file", original_write)
+      adapter3 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter3.connect() is True
+      report = collect_status(
+          slug, hermes_home=home, query_source=_UnavailableQuerySource()
+      )
+      assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
+      monkeypatch.setattr(Path, "read_text", flaky_read)
+      monkeypatch.setattr(Path, "unlink", flaky_unlink)
+      caplog.clear()
+      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+          adapter3._uvicorn_server.should_exit = True
+          await asyncio.wait_for(adapter3._uvicorn_task, timeout=5.0)
+          await asyncio.sleep(0.05)
+          await adapter3.disconnect()
+      assert canary not in caplog.text
