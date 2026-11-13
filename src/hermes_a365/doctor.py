@@ -752,23 +752,43 @@ def probe_host_platform() -> ProbeResult:
     )
 
 
-def _extra_plaintext(extra: dict[str, Any], key: str) -> str | None:
-    """Return stripped extra string, ``""`` if absent, ``None`` if wrong type."""
+def _extra_str(extra: dict[str, Any], key: str) -> str | None:
+    """Return extra string unmodified, ``""`` if absent, ``None`` if wrong type."""
     raw = extra.get(key)
     if raw is None:
         return ""
     if not isinstance(raw, str):
         return None
-    return raw.strip()
+    return raw
 
 
 def _profile_then_extra(
     profile_vals: dict[str, str], extra: dict[str, Any], env_key: str, extra_key: str
 ) -> str | None:
     pv = profile_vals.get(env_key, "")
-    if isinstance(pv, str) and pv.strip():
-        return pv.strip()
-    return _extra_plaintext(extra, extra_key)
+    if isinstance(pv, str) and pv:
+        return pv
+    extra_val = _extra_str(extra, extra_key)
+    if extra_val is None:
+        return None
+    return extra_val
+
+
+def _selected_generated_config_path(
+    profile_vals: dict[str, str], extra: dict[str, Any]
+) -> Path | None:
+    """Mirror ``adapter`` Path(extra … or profile … or cwd default); ``None`` if indeterminate."""
+    gen_default = Path.cwd() / "a365.generated.config.json"
+    raw_extra = extra.get("generated_config_path")
+    if raw_extra is not None:
+        if not isinstance(raw_extra, str):
+            return None
+        if raw_extra:
+            return Path(raw_extra)
+    profile_raw = profile_vals.get("A365_GENERATED_CONFIG_PATH", "")
+    if isinstance(profile_raw, str) and profile_raw:
+        return Path(profile_raw)
+    return gen_default
 
 
 def _gateway_has_plaintext_secret_coverage() -> bool:
@@ -823,11 +843,9 @@ def _gateway_has_plaintext_secret_coverage() -> bool:
     if bp_secret is None:
         return False
     if not bp_secret:
-        gen_hint = _extra_plaintext(extra, "generated_config_path")
-        if gen_hint is None:
+        gen_path = _selected_generated_config_path(profile_vals, extra)
+        if gen_path is None:
             return False
-        gen_path_s = gen_hint or (profile_vals.get("A365_GENERATED_CONFIG_PATH") or "").strip()
-        gen_path = Path(gen_path_s) if gen_path_s else Path.cwd() / "a365.generated.config.json"
         try:
             generated = load_generated_config(gen_path)
         except BridgeConfigError:
@@ -835,9 +853,9 @@ def _gateway_has_plaintext_secret_coverage() -> bool:
         secret = (
             generated.get("agentBlueprintClientSecret") if isinstance(generated, dict) else None
         )
-        if not isinstance(secret, str) or not secret.strip():
+        if not isinstance(secret, str) or not secret:
             return False
-        bp_secret = secret.strip()
+        bp_secret = secret
     bf_id = _profile_then_extra(profile_vals, extra, "A365_BF_APP_ID", "bf_app_id")
     if bf_id is None:
         return False

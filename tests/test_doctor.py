@@ -20,6 +20,7 @@ from hermes_a365.doctor import (
     FRONTIER_PROGRAM_URL,
     DoctorReport,
     ProbeResult,
+    _gateway_has_plaintext_secret_coverage,
     overall_to_exit_code,
     parse_a365_cli_version,
     parse_az_cli_release,
@@ -40,6 +41,7 @@ from hermes_a365.doctor import (
     render_json,
     run_all_probes,
 )
+from hermes_a365.secrets_provider import KeychainSecretsProvider
 
 # ---------------------------------------------------------------------------
 # probe_a365_cli
@@ -621,6 +623,22 @@ class TestProbeKeychain:
         assert r.state == "ok"
         assert "libsecret" in r.detail
 
+    def test_linux_secret_tool_present_runs_despite_plaintext_coverage(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        _write_mode(home / "config.yaml", _agent365_config())
+        _write_mode(home / ".env", _path_a_profile())
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with (
+            patch("hermes_a365.doctor.sys.platform", "linux"),
+            patch("hermes_a365.doctor.shutil.which", return_value="/usr/bin/secret-tool"),
+        ):
+            r = probe_keychain()
+        assert r.state == "ok"
+        assert r.state != "skipped"
+
     def test_unsupported_platform_errors(self) -> None:
         with patch("hermes_a365.doctor.sys.platform", "win32"):
             r = probe_keychain()
@@ -1132,7 +1150,7 @@ class TestRunAllProbes:
 
 
 # ---------------------------------------------------------------------------
-# #320 — Linux keychain skipped when gateway has plaintext coverage (T1/T2)
+# #320 — Linux keychain skipped when gateway has plaintext coverage
 # ---------------------------------------------------------------------------
 
 _T1_TENANT = "11111111-1111-1111-1111-111111111111"
@@ -1170,9 +1188,13 @@ def _agent365_config(
     multiplex: bool = False,
     extra: dict[str, object] | None = None,
     plugins_only: bool = False,
+    plugins_with_agent365: bool = False,
 ) -> str:
     if plugins_only:
         return yaml.safe_dump({"plugins": {"enabled": ["agent365"]}})
+    data: dict[str, object] = {}
+    if plugins_with_agent365:
+        data["plugins"] = {"enabled": ["agent365"]}
     gw: dict[str, object] = {}
     if multiplex:
         gw["multiplex_profiles"] = True
@@ -1180,7 +1202,19 @@ def _agent365_config(
     if extra:
         agent365["extra"] = extra
     gw["platforms"] = {"agent365": agent365}
-    return yaml.safe_dump({"gateway": gw})
+    data["gateway"] = gw
+    return yaml.safe_dump(data)
+
+
+def _home_tree_snapshot(root: Path) -> dict[str, tuple[int, bytes]]:
+    snap: dict[str, tuple[int, bytes]] = {}
+    for path in sorted(root.rglob("*")):
+        rel = str(path.relative_to(root))
+        if path.is_file():
+            snap[rel] = (path.stat().st_mode & 0o777, path.read_bytes())
+        elif path.is_dir():
+            snap[rel + "/"] = (path.stat().st_mode & 0o777, b"")
+    return snap
 
 
 def _path_a_profile(*, bf: bool = False, identity: str = "") -> str:
@@ -1342,6 +1376,20 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         report = _run_linux_keychain_report(monkeypatch, _linux_home)
         assert _keychain_probe(report).state == "skipped"
 
+    def test_profile_nonempty_beats_invalid_extra_tenant_type(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile())
+        cfg = (
+            "gateway:\n  platforms:\n    agent365:\n      enabled: true\n      extra:\n"
+            "        tenant_id: 1\n"
+            f"        app_id: {_T1_APP}\n"
+            f"        blueprint_client_secret: {_T1_BP_SECRET}\n"
+        )
+        _write_mode(_linux_home / "config.yaml", cfg)
+        report = _run_linux_keychain_report(monkeypatch, _linux_home)
+        assert _keychain_probe(report).state == "skipped"
+
     @pytest.mark.parametrize(
         "path_setup",
         [
@@ -1373,7 +1421,59 @@ class TestLinuxPlaintextCoverageControlsReadiness:
             extra = dict(spec)  # type: ignore[arg-type]
         _write_mode(_linux_home / "config.yaml", _agent365_config(extra=extra or None))
         report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=tmp_path / "gw-cwd")
-        assert _keychain_probe(report).state == "skipped"
+        kc = _keychain_probe(report)
+        assert kc.state == "skipped"
+        assert kc.detail == _KEYCHAIN_SKIP_DETAIL
+        assert _T1_GEN_SECRET not in kc.detail
+        assert _T1_BP_SECRET not in kc.detail
+
+    @pytest.mark.parametrize(
+        "whitespace_case",
+        [
+            "profile_bf_app_id_spaces",
+            "extra_bf_app_id_spaces",
+            "extra_generated_path_padded",
+            "extra_generated_path_spaces_only",
+        ],
+    )
+    def test_whitespace_does_not_count_as_adapter_present(
+        self,
+        _linux_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        whitespace_case: str,
+    ) -> None:
+        work = tmp_path / "gw-cwd"
+        work.mkdir(exist_ok=True)
+        base = f"A365_TENANT_ID={_T1_TENANT}\nA365_APP_ID={_T1_APP}\n"
+        extra: dict[str, object] = {}
+        if whitespace_case == "profile_bf_app_id_spaces":
+            _write_mode(
+                _linux_home / ".env",
+                base
+                + f"A365_BLUEPRINT_CLIENT_SECRET={_T1_BP_SECRET}\n"
+                + 'A365_BF_APP_ID="   "\n',
+            )
+        elif whitespace_case == "extra_bf_app_id_spaces":
+            _write_mode(
+                _linux_home / ".env",
+                base + f"A365_BLUEPRINT_CLIENT_SECRET={_T1_BP_SECRET}\n",
+            )
+            extra = {"bf_app_id": "   "}
+        elif whitespace_case == "extra_generated_path_padded":
+            _write_mode(work / "real.json", _generated_json())
+            _write_mode(_linux_home / ".env", base)
+            extra = {"generated_config_path": " real.json "}
+        elif whitespace_case == "extra_generated_path_spaces_only":
+            _write_mode(work / "profile-fallback.json", _generated_json())
+            _write_mode(
+                _linux_home / ".env",
+                base + "A365_GENERATED_CONFIG_PATH=profile-fallback.json\n",
+            )
+            extra = {"generated_config_path": "   "}
+        _write_mode(_linux_home / "config.yaml", _agent365_config(extra=extra or None))
+        report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=work)
+        assert _keychain_probe(report).state == "error"
 
     def test_per_agent_file_has_no_effect_on_complete_coverage(
         self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
@@ -1395,7 +1495,25 @@ class TestLinuxPlaintextCoverageControlsReadiness:
             + "\n",
             mode=0o600,
         )
-        report = _run_linux_keychain_report(monkeypatch, _linux_home)
+        agent_env = _linux_home / "agents" / "my-agent" / ".env"
+        real_read_text = Path.read_text
+        real_stat = Path.stat
+
+        def _guard_stat(self: Path, *args: object, **kwargs: object) -> object:
+            if self == agent_env:
+                raise AssertionError("per-agent .env must not be stat'd")
+            return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        def _guard_read_text(self: Path, *args: object, **kwargs: object) -> str:
+            if self == agent_env:
+                raise AssertionError("per-agent .env must not be read")
+            return real_read_text(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        with (
+            patch.object(Path, "stat", _guard_stat),
+            patch.object(Path, "read_text", _guard_read_text),
+        ):
+            report = _run_linux_keychain_report(monkeypatch, _linux_home)
         assert _keychain_probe(report).state == "skipped"
 
     def test_unreadable_per_agent_does_not_veto_coverage(
@@ -1405,13 +1523,43 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         agent_dir = _linux_home / "agents" / "locked-agent"
         agent_dir.mkdir(parents=True)
         bad = agent_dir / ".env"
-        bad.write_text("A365_BLUEPRINT_CLIENT_SECRET=steal-me\n")
+        bad.write_text(f"A365_BLUEPRINT_CLIENT_SECRET={_T1_BP_SECRET}-steal-me\n")
         bad.chmod(0o000)
+        agent_env = bad
+        real_stat = Path.stat
+
+        def _guard_stat(self: Path, *args: object, **kwargs: object) -> object:
+            if self == agent_env:
+                raise AssertionError("per-agent .env must not be stat'd even when unreadable")
+            return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
         try:
-            report = _run_linux_keychain_report(monkeypatch, _linux_home)
+            with patch.object(Path, "stat", _guard_stat):
+                report = _run_linux_keychain_report(monkeypatch, _linux_home)
             assert _keychain_probe(report).state == "skipped"
         finally:
             bad.chmod(0o600)
+
+    def test_group_readable_per_agent_does_not_veto_coverage(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile(identity="leaky-agent"))
+        agent_env = _per_agent_env(
+            _linux_home,
+            "leaky-agent",
+            f"A365_BLUEPRINT_CLIENT_SECRET={_T1_BP_SECRET}-only-here\n",
+            mode=0o644,
+        )
+        real_stat = Path.stat
+
+        def _guard_stat(self: Path, *args: object, **kwargs: object) -> object:
+            if self == agent_env:
+                raise AssertionError("per-agent .env must not be stat'd")
+            return real_stat(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        with patch.object(Path, "stat", _guard_stat):
+            report = _run_linux_keychain_report(monkeypatch, _linux_home)
+        assert _keychain_probe(report).state == "skipped"
 
     @pytest.mark.parametrize(
         "slug_source,expected_slug",
@@ -1441,6 +1589,24 @@ class TestLinuxPlaintextCoverageControlsReadiness:
             monkeypatch,
             _linux_home,
             doctor_env={"AGENT_IDENTITY": "doctor-process-override"},
+        )
+        assert _keychain_probe(report).state == "skipped"
+
+    def test_invalid_slug_from_profile_agents_identity_errors(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile(identity="../escape"))
+        report = _run_linux_keychain_report(monkeypatch, _linux_home)
+        assert _keychain_probe(report).state == "error"
+
+    def test_doctor_process_agent_identity_does_not_override_profile(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile(identity="good-agent"))
+        report = _run_linux_keychain_report(
+            monkeypatch,
+            _linux_home,
+            doctor_env={"AGENT_IDENTITY": "../escape"},
         )
         assert _keychain_probe(report).state == "skipped"
 
@@ -1560,26 +1726,16 @@ class TestLinuxPlaintextCoverageControlsReadiness:
     def test_doctor_process_identities_only_stays_error(
         self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        _write_mode(_linux_home / ".env", _path_a_profile())
-        report = _run_linux_keychain_report(
-            monkeypatch,
-            _linux_home,
-            doctor_env={
-                "A365_TENANT_ID": _T1_TENANT,
-                "A365_APP_ID": _T1_APP,
-                "AGENT_IDENTITY": "env-only-identity",
-            },
+        _write_mode(
+            _linux_home / ".env",
+            f"A365_BLUEPRINT_CLIENT_SECRET={_T1_BP_SECRET}\n",
         )
-        # Profile still has coverage — doctor identity must not change slug negatively;
-        # this case is tenant/app supplied only via doctor env without on-disk blueprint.
-        _write_mode(_linux_home / ".env", "A365_BLUEPRINT_CLIENT_SECRET=\n")
         report = _run_linux_keychain_report(
             monkeypatch,
             _linux_home,
             doctor_env={
                 "A365_TENANT_ID": _T1_TENANT,
                 "A365_APP_ID": _T1_APP,
-                "A365_BLUEPRINT_CLIENT_SECRET": _T1_BP_SECRET,
             },
         )
         assert _keychain_probe(report).state == "error"
@@ -1595,7 +1751,10 @@ class TestLinuxPlaintextCoverageControlsReadiness:
                 yaml.safe_dump({"plugins": {"enabled": ["agent365"]}}),
             )
         else:
-            _write_mode(_linux_home / "config.yaml", _agent365_config(enabled=False))
+            _write_mode(
+                _linux_home / "config.yaml",
+                _agent365_config(enabled=False, plugins_with_agent365=True),
+            )
         report = _run_linux_keychain_report(monkeypatch, _linux_home)
         assert _keychain_probe(report).state == "error"
 
@@ -1693,6 +1852,7 @@ class TestLinuxPlaintextCoverageControlsReadiness:
             "insecure",
             "non_mapping",
             "empty_secret",
+            "numeric_secret",
         ],
     )
     def test_bad_generated_fallback(
@@ -1721,6 +1881,8 @@ class TestLinuxPlaintextCoverageControlsReadiness:
             _write_mode(gen, "[]\n")
         elif gen_fixture == "empty_secret":
             _write_mode(gen, _generated_json(secret=""))
+        elif gen_fixture == "numeric_secret":
+            _write_mode(gen, '{"agentBlueprintClientSecret": 99999}\n')
         report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=work)
         assert _keychain_probe(report).state == "error"
 
@@ -1802,10 +1964,12 @@ class TestPlaintextKeychainDiagnosticIsReadOnlyAndRedacted:
         config = home / "config.yaml"
         _write_mode(config, _agent365_config())
         _write_mode(profile, _path_a_profile())
-        before_profile = profile.read_bytes()
-        before_config = config.read_bytes()
-        profile_mode = profile.stat().st_mode
-        config_mode = config.stat().st_mode
+        _per_agent_env(
+            home,
+            "default",
+            f"A365_BLUEPRINT_CLIENT_SECRET={_T1_BP_SECRET}-per-agent-only\n",
+        )
+        tree_before = _home_tree_snapshot(home)
 
         def _fail_provider(*_a: object, **_k: object) -> str:
             raise AssertionError("provider must not be consulted")
@@ -1827,6 +1991,13 @@ class TestPlaintextKeychainDiagnosticIsReadOnlyAndRedacted:
         stack.enter_context(
             patch("hermes_a365.secrets_provider.resolve_secret", side_effect=_fail_provider)
         )
+        stack.enter_context(
+            patch.object(
+                KeychainSecretsProvider,
+                "__init__",
+                side_effect=AssertionError("KeychainSecretsProvider must not be constructed"),
+            )
+        )
         for p in _stub_ok_probes():
             stack.enter_context(p)
         with stack:
@@ -1844,10 +2015,26 @@ class TestPlaintextKeychainDiagnosticIsReadOnlyAndRedacted:
         for record in caplog.records:
             assert _T1_BP_SECRET not in (record.getMessage() + str(record.exc_text or ""))
 
-        assert profile.read_bytes() == before_profile
-        assert config.read_bytes() == before_config
-        assert profile.stat().st_mode == profile_mode
-        assert config.stat().st_mode == config_mode
+        assert _home_tree_snapshot(home) == tree_before
+
+    def test_classification_never_constructs_keychain_provider(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        home = tmp_path / "home"
+        home.mkdir()
+        _write_mode(home / "config.yaml", _agent365_config())
+        _write_mode(home / ".env", _path_a_profile())
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        with (
+            patch.object(
+                KeychainSecretsProvider,
+                "__init__",
+                side_effect=AssertionError("KeychainSecretsProvider must not be constructed"),
+            ),
+            patch("hermes_a365.doctor.sys.platform", "linux"),
+            patch("hermes_a365.doctor.shutil.which", return_value=None),
+        ):
+            assert _gateway_has_plaintext_secret_coverage() is True
 
     def test_malformed_generated_errors_without_leaks(
         self,
@@ -1889,13 +2076,50 @@ class TestPlaintextKeychainDiagnosticIsReadOnlyAndRedacted:
 
         kc = _keychain_probe(report)
         assert kc.state == "error"
+        assert kc.detail == (
+            "Linux `secret-tool` not found (install libsecret-tools / libsecret-1-0)"
+        )
+        assert "{not-json" not in kc.detail
         assert _T1_BP_SECRET not in kc.detail
         assert _T1_GEN_SECRET not in kc.detail
         assert canary_path.read_bytes() == before
+        human = render_human(report)
+        payload = render_json(report)
+        assert "{not-json" not in human
+        assert "{not-json" not in payload
         for record in caplog.records:
             joined = record.getMessage() + str(record.exc_text or "")
             assert _T1_BP_SECRET not in joined
             assert _T1_GEN_SECRET not in joined
+            assert "{not-json" not in joined
+
+    def test_malformed_generated_json_fixed_error_detail_no_leak(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        home = tmp_path / "profile-home"
+        home.mkdir()
+        work = tmp_path / "gw-cwd"
+        work.mkdir()
+        gen = work / "a365.generated.config.json"
+        _write_mode(gen, "{not-json")
+        _write_mode(home / "config.yaml", _agent365_config())
+        _write_mode(
+            home / ".env",
+            f"A365_TENANT_ID={_T1_TENANT}\nA365_APP_ID={_T1_APP}\n",
+        )
+        caplog.set_level(logging.DEBUG)
+        report = _run_linux_keychain_report(monkeypatch, home, cwd=work)
+        kc = _keychain_probe(report)
+        assert kc.state == "error"
+        assert kc.detail == (
+            "Linux `secret-tool` not found (install libsecret-tools / libsecret-1-0)"
+        )
+        assert "{not-json" not in kc.detail
+        for record in caplog.records:
+            assert "{not-json" not in (record.getMessage() + str(record.exc_text or ""))
 
 
 # ---------------------------------------------------------------------------
