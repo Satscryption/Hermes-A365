@@ -3597,7 +3597,9 @@ class Agent365Adapter(BasePlatformAdapter):
             _claim_bridge_pid_owner(path, token)
             bridge.write_pid_file(path)
         except OSError as exc:
-            _release_bridge_pid_owner(path, token)
+            self._retire_bridge_pid_file()
+            if _bridge_pid_owner_current(path) == token:
+                _release_bridge_pid_owner(path, token)
             logger.warning(
                 "agent365 bridge pid publish failed at %s: %s",
                 path,
@@ -3615,7 +3617,14 @@ class Agent365Adapter(BasePlatformAdapter):
             if path.is_file():
                 try:
                     recorded = int(path.read_text().strip())
-                except (OSError, ValueError):
+                except OSError as exc:
+                    logger.warning(
+                        "agent365 bridge pid retire failed at %s: %s",
+                        path,
+                        type(exc).__name__,
+                    )
+                    return
+                except ValueError:
                     return
                 if recorded != os.getpid():
                     return

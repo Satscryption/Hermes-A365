@@ -32052,9 +32052,177 @@ class TestGatewayBridgePidPublication:
       assert gather_activity_bridge(home, slug).state == "missing"
       (home / "agents" / slug / "bridge.pid").write_text(str(os.getpid()))
       assert gather_activity_bridge(home, slug).state == "ok"
-      (home / "agents" / slug / "bridge.pid").write_text("99999999")
+      malformed_path = home / "agents" / slug / "bridge.pid"
+      malformed_path.write_text("not-a-pid")
+      assert gather_activity_bridge(home, slug).state == "error"
+      malformed_path.write_text("99999999")
       assert gather_activity_bridge(home, slug).state == "error"
       assert gather_activity_bridge(home, "bad/name").state == "missing"
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_publish_chmod_failure_cleans_pid(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      from hermes_a365.status import _UnavailableQuerySource, collect_status
+
+      slug = "chmod-fail-agent"
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      real_chmod = os.chmod
+
+      def chmod_fail(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+          if Path(path) == pid_path:
+              raise OSError("chmod denied after write")
+          real_chmod(path, mode, *args, **kwargs)
+
+      monkeypatch.setattr(os, "chmod", chmod_fail)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter.connect() is True
+      try:
+          assert not pid_path.exists()
+          bridge = next(
+              c
+              for c in collect_status(
+                  slug, hermes_home=home, query_source=_UnavailableQuerySource()
+              ).components
+              if c.name == "activity_bridge"
+          )
+          assert bridge.state == "missing"
+      finally:
+          await adapter.disconnect()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_disconnect_retires_without_uvicorn_callback(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      slug = "disconnect-only-retire"
+      pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter.connect() is True
+      task = adapter._uvicorn_task
+      assert task is not None
+      with contextlib.suppress(ValueError):
+          task.remove_done_callback(adapter._bridge_pid_uvicorn_done)
+      await adapter.disconnect()
+      assert not pid_path.exists()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_skips_publish_when_serve_task_done(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      slug = "dead-serve-task"
+      pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      done_task = asyncio.create_task(asyncio.sleep(0))
+      await done_task
+      adapter._bridge_pid_path = pid_path
+      adapter._bridge_pid_owner_token = "dead-task-token"
+      adapter._uvicorn_task = done_task
+      adapter._publish_bridge_pid_if_ready()
+      assert not pid_path.exists()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_published_only_after_commit(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      slug = "publish-order"
+      _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+      order: list[str] = []
+      orig_commit = adapter_mod.Agent365Adapter._commit_persist_owner
+      orig_publish = adapter_mod.Agent365Adapter._publish_bridge_pid_if_ready
+
+      def track_commit(self: Any) -> None:
+          order.append("commit")
+          orig_commit(self)
+
+      def track_publish(self: Any) -> None:
+          order.append("publish")
+          orig_publish(self)
+
+      monkeypatch.setattr(adapter_mod.Agent365Adapter, "_commit_persist_owner", track_commit)
+      monkeypatch.setattr(
+          adapter_mod.Agent365Adapter, "_publish_bridge_pid_if_ready", track_publish
+      )
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter.connect() is True
+      assert order == ["commit", "publish"]
+      await adapter.disconnect()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_no_pid_when_commit_raises(
+      self, monkeypatch: pytest.MonkeyPatch
+  ) -> None:
+      slug = "commit-raise"
+      pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+
+      def boom(self: Any) -> None:
+          raise RuntimeError("commit blocked before publish")
+
+      monkeypatch.setattr(adapter_mod.Agent365Adapter, "_commit_persist_owner", boom)
+      with pytest.raises(RuntimeError, match="commit blocked"):
+          await adapter.connect()
+      assert not pid_path.exists()
+
+  @pytest.mark.asyncio
+  async def test_gateway_bridge_pid_warnings_redact_contents(
+      self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+  ) -> None:
+      from hermes_a365 import activity_bridge as ab
+
+      slug = "warn-redact"
+      home = Path(os.environ["HERMES_HOME"])
+      pid_path = _seed_gateway_status_env(home, slug)
+      canary = "CANARY_SECRET_VALUE"
+      real_chmod = os.chmod
+
+      def chmod_fail(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+          if Path(path) == pid_path:
+              raise OSError(canary)
+          real_chmod(path, mode, *args, **kwargs)
+
+      caplog.clear()
+      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+          monkeypatch.setattr(os, "chmod", chmod_fail)
+          adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+          assert await adapter.connect() is True
+          await adapter.disconnect()
+      assert any("bridge pid publish failed" in r.message for r in caplog.records)
+      assert canary not in caplog.text
+      assert str(os.getpid()) not in caplog.text
+
+      original_read = Path.read_text
+
+      def flaky_read(self: Path, *args: Any, **kwargs: Any) -> str:
+          if self == pid_path:
+              raise OSError(canary)
+          return original_read(self, *args, **kwargs)
+
+      caplog.clear()
+      monkeypatch.setattr(os, "chmod", real_chmod)
+      adapter2 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter2.connect() is True
+      monkeypatch.setattr(Path, "read_text", flaky_read)
+      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+          adapter2._retire_bridge_pid_file()
+      assert any("bridge pid retire failed" in r.message for r in caplog.records)
+      assert canary not in caplog.text
+
+      original_remove = ab.remove_pid_file
+
+      def flaky_remove(path: Path) -> None:
+          if path == pid_path:
+              raise OSError(canary)
+          original_remove(path)
+
+      caplog.clear()
+      adapter3 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+      assert await adapter3.connect() is True
+      monkeypatch.setattr(ab, "remove_pid_file", flaky_remove)
+      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+          await adapter3.disconnect()
+      assert any("bridge pid retire failed" in r.message for r in caplog.records)
+      assert canary not in caplog.text
 
   @pytest.mark.asyncio
   async def test_gateway_bridge_pid_io_errors_do_not_break_lifecycle(
