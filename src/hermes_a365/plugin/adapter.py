@@ -14249,8 +14249,9 @@ class Agent365Adapter(BasePlatformAdapter):
         omits ``streamSequence`` per the Microsoft spec. A finalize
         that does not yet have a ``streamId`` opens the stream first
         and then posts the final; success requires that final to be
-        accepted (#161). Failures log ``http_status`` and the BF error
-        body. Transient failures on an open stream are retried; other
+        accepted (#161). Failures log bounded diagnostics (HTTP status and
+        BF error code, not the raw body). Transient failures on an open stream
+        are retried; other
         intermediate failures keep the stream (#83).
 
         Non-personal chats buffer locally and post one

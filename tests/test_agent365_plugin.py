@@ -21374,6 +21374,58 @@ class TestEditMessage:
         assert send_reply.await_count == 0
 
     @pytest.mark.asyncio
+    async def test_wire_final_403_already_completed_requires_stream_error_code(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        cases = (
+            (
+                "BadArgument",
+                {
+                    "error": {
+                        "code": "BadArgument",
+                        "message": "Content stream is already completed.",
+                    }
+                },
+            ),
+            (
+                "missing",
+                {"error": {"message": "Content stream is already completed."}},
+            ),
+        )
+        for label, body in cases:
+            conv_id = f"conv-bad-code-{label}"
+            case_inbound = _make_inbound(conv_id=conv_id, activity_id=f"act-{label}")
+            responses = [
+                MagicMock(
+                    status_code=201,
+                    text="",
+                    json=lambda label=label: {"id": f"bf-{label}"},
+                ),
+                MagicMock(status_code=202, text="", json=lambda: {}),
+                MagicMock(status_code=403, text="", json=lambda body=body: body),
+            ]
+            adapter = _make_adapter(monkeypatch)
+            post_mock = self._wire_adapter(
+                adapter, inbound=case_inbound, post_responses=responses
+            )
+            self._patch_token_mint(monkeypatch)
+            self._no_sleep(monkeypatch)
+            bridge = adapter_mod._import_bridge()
+            send_reply = AsyncMock(return_value=None)
+            monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+            await adapter.edit_message(conv_id, f"m-{label}", "A")
+            await adapter.edit_message(conv_id, f"m-{label}", "A B", finalize=False)
+            result = await adapter.edit_message(conv_id, f"m-{label}", "A B", finalize=True)
+            assert result.success is False, label
+            assert result.error == "streaming already completed", label
+            assert f"act-{label}" not in (
+                adapter._personal_final_landed.get(conv_id) or set()
+            ), label
+            assert post_mock.await_count == 3, label
+            assert send_reply.await_count == 0, label
+
+    @pytest.mark.asyncio
     async def test_retried_final_403_canceled_by_user_stays_a_failure(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
