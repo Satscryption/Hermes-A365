@@ -1691,6 +1691,31 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         )
         assert _keychain_probe(report).state == "skipped"
 
+    @pytest.mark.parametrize(
+        "doctor_identity",
+        ["../escape", "good-agent"],
+        ids=["invalid", "valid"],
+    )
+    def test_doctor_process_agents_identity_not_slug_fallback(
+        self,
+        _linux_home: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        doctor_identity: str,
+    ) -> None:
+        _write_mode(_linux_home / ".env", _path_a_profile())
+        _write_mode(_linux_home / "config.yaml", _agent365_config())
+        baseline = _keychain_probe(
+            _run_linux_keychain_report(monkeypatch, _linux_home, doctor_env={})
+        )
+        report = _run_linux_keychain_report(
+            monkeypatch,
+            _linux_home,
+            doctor_env={"AGENT_IDENTITY": doctor_identity},
+        )
+        kc = _keychain_probe(report)
+        assert kc.state == baseline.state
+        assert kc.detail == baseline.detail
+
     def test_unrelated_warning_still_exit_1(
         self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
     ) -> None:
