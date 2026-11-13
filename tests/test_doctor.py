@@ -1382,31 +1382,25 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         report = _run_linux_keychain_report(monkeypatch, _linux_home)
         assert _keychain_probe(report).state == "skipped"
 
-    def test_profile_nonempty_beats_invalid_extra_tenant_type(
-        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
+    @pytest.mark.parametrize(
+        "extra_key",
+        [
+            "tenant_id",
+            "app_id",
+            "blueprint_client_secret",
+            "bf_app_id",
+            "bf_client_secret",
+        ],
+    )
+    def test_profile_beats_invalid_extra_non_string_type(
+        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch, extra_key: str
     ) -> None:
-        _write_mode(_linux_home / ".env", _path_a_profile())
-        cfg = (
-            "gateway:\n  platforms:\n    agent365:\n      enabled: true\n      extra:\n"
-            "        tenant_id: 1\n"
-            f"        app_id: {_T1_APP}\n"
-            f"        blueprint_client_secret: {_T1_BP_SECRET}\n"
+        needs_bf = extra_key in ("bf_app_id", "bf_client_secret")
+        _write_mode(_linux_home / ".env", _path_a_profile(bf=needs_bf))
+        _write_mode(
+            _linux_home / "config.yaml",
+            _agent365_config(extra={extra_key: 1}),
         )
-        _write_mode(_linux_home / "config.yaml", cfg)
-        report = _run_linux_keychain_report(monkeypatch, _linux_home)
-        assert _keychain_probe(report).state == "skipped"
-
-    def test_profile_nonempty_beats_invalid_extra_app_id_type(
-        self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
-        _write_mode(_linux_home / ".env", _path_a_profile())
-        cfg = (
-            "gateway:\n  platforms:\n    agent365:\n      enabled: true\n      extra:\n"
-            f"        tenant_id: {_T1_TENANT}\n"
-            "        app_id: 1\n"
-            f"        blueprint_client_secret: {_T1_BP_SECRET}\n"
-        )
-        _write_mode(_linux_home / "config.yaml", cfg)
         report = _run_linux_keychain_report(monkeypatch, _linux_home)
         assert _keychain_probe(report).state == "skipped"
 
@@ -1454,7 +1448,8 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         gen_name = "via-extra.json" if _kind == "extra" else "via-profile.json"
         if _kind == "cwd_default":
             gen_name = "a365.generated.config.json"
-        gen_path = tmp_path / "gw-cwd" / gen_name
+        work = tmp_path / "gw-cwd"
+        gen_path = work / gen_name
         _write_mode(gen_path, _generated_json())
         profile = f"A365_TENANT_ID={_T1_TENANT}\nA365_APP_ID={_T1_APP}\n"
         if _kind == "profile":
@@ -1464,12 +1459,14 @@ class TestLinuxPlaintextCoverageControlsReadiness:
         if _kind == "extra":
             extra = dict(spec)  # type: ignore[arg-type]
         _write_mode(_linux_home / "config.yaml", _agent365_config(extra=extra or None))
-        report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=tmp_path / "gw-cwd")
+        before = _hermes_and_cwd_tree_snapshot(_linux_home, work)
+        report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=work)
         kc = _keychain_probe(report)
         assert kc.state == "skipped"
         assert kc.detail == _KEYCHAIN_SKIP_DETAIL
         assert _T1_GEN_SECRET not in kc.detail
         assert _T1_BP_SECRET not in kc.detail
+        assert _hermes_and_cwd_tree_snapshot(_linux_home, work) == before
 
     @pytest.mark.parametrize(
         "whitespace_case",
@@ -1532,8 +1529,10 @@ class TestLinuxPlaintextCoverageControlsReadiness:
             _linux_home / ".env",
             f"A365_TENANT_ID={_T1_TENANT}\nA365_APP_ID={_T1_APP}\n",
         )
+        before = _hermes_and_cwd_tree_snapshot(_linux_home, work)
         report = _run_linux_keychain_report(monkeypatch, _linux_home, cwd=work)
         assert _keychain_probe(report).state == "skipped"
+        assert _hermes_and_cwd_tree_snapshot(_linux_home, work) == before
 
     def test_per_agent_file_has_no_effect_on_complete_coverage(
         self, _linux_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
