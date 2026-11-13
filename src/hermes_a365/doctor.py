@@ -49,8 +49,13 @@ from typing import Any, Literal
 from uuid import UUID
 
 from . import bot_service, bot_service_diagnostics
-from ._common import parse_env, safe_run, tcp_reachable
-from .activity_bridge import parse_agent_identity_ids
+from ._common import parse_env, safe_run, tcp_reachable, validate_slug
+from .activity_bridge import (
+    BridgeConfigError,
+    load_generated_config,
+    load_profile_env,
+    parse_agent_identity_ids,
+)
 from .client_secret_expiry import (
     DEFAULT_CLIENT_SECRET_EXPIRY_WARN_DAYS,
     gather_client_secret_expiry_checks,
@@ -747,6 +752,129 @@ def probe_host_platform() -> ProbeResult:
     )
 
 
+def _extra_str(extra: dict[str, Any], key: str) -> str | None:
+    """Return extra string unmodified, ``""`` if absent, ``None`` if wrong type."""
+    raw = extra.get(key)
+    if raw is None:
+        return ""
+    if not isinstance(raw, str):
+        return None
+    return raw
+
+
+def _profile_then_extra(
+    profile_vals: dict[str, str], extra: dict[str, Any], env_key: str, extra_key: str
+) -> str | None:
+    pv = profile_vals.get(env_key, "")
+    if isinstance(pv, str) and pv:
+        return pv
+    extra_val = _extra_str(extra, extra_key)
+    if extra_val is None:
+        return None
+    return extra_val
+
+
+def _selected_generated_config_path(
+    profile_vals: dict[str, str], extra: dict[str, Any]
+) -> Path | None:
+    """Mirror ``adapter`` Path(extra … or profile … or cwd default); ``None`` if indeterminate."""
+    gen_default = Path.cwd() / "a365.generated.config.json"
+    raw_extra = extra.get("generated_config_path")
+    if raw_extra is not None:
+        if not isinstance(raw_extra, str):
+            return None
+        if raw_extra:
+            return Path(raw_extra)
+    profile_raw = profile_vals.get("A365_GENERATED_CONFIG_PATH", "")
+    if isinstance(profile_raw, str) and profile_raw:
+        return Path(profile_raw)
+    return gen_default
+
+
+def _gateway_has_plaintext_secret_coverage() -> bool:
+    home = Path(os.path.expanduser(os.environ.get(_HERMES_HOME_ENV) or _HERMES_HOME_DEFAULT))
+    cfg_path = home / "config.yaml"
+    if not cfg_path.is_file():
+        return False
+    try:
+        import yaml
+
+        data = yaml.safe_load(cfg_path.read_text())
+    except Exception:
+        return False
+    if not isinstance(data, dict):
+        return False
+    gw = data.get("gateway")
+    if not isinstance(gw, dict) or gw.get("multiplex_profiles"):
+        return False
+    platforms = gw.get("platforms")
+    if not isinstance(platforms, dict):
+        return False
+    agent365 = platforms.get("agent365")
+    if not isinstance(agent365, dict) or not agent365.get("enabled"):
+        return False
+    extra_raw = agent365.get("extra")
+    if extra_raw is None:
+        extra: dict[str, Any] = {}
+    elif not isinstance(extra_raw, dict):
+        return False
+    else:
+        extra = extra_raw
+    try:
+        profile = load_profile_env(home)
+    except BridgeConfigError:
+        return False
+    profile_vals = profile.values if profile.exists else {}
+    slug_raw = str(extra.get("slug") or profile_vals.get("AGENT_IDENTITY") or "")
+    if slug_raw:
+        try:
+            validate_slug(slug_raw)
+        except ValueError:
+            return False
+    tenant = _profile_then_extra(profile_vals, extra, "A365_TENANT_ID", "tenant_id")
+    if tenant is None:
+        return False
+    app_id = _profile_then_extra(profile_vals, extra, "A365_APP_ID", "app_id")
+    if app_id is None:
+        return False
+    bp_secret = _profile_then_extra(
+        profile_vals, extra, "A365_BLUEPRINT_CLIENT_SECRET", "blueprint_client_secret"
+    )
+    if bp_secret is None:
+        return False
+    if not bp_secret:
+        gen_path = _selected_generated_config_path(profile_vals, extra)
+        if gen_path is None:
+            return False
+        try:
+            generated = load_generated_config(gen_path)
+        except BridgeConfigError:
+            return False
+        secret = (
+            generated.get("agentBlueprintClientSecret") if isinstance(generated, dict) else None
+        )
+        if not isinstance(secret, str) or not secret:
+            return False
+        bp_secret = secret
+    bf_id = _profile_then_extra(profile_vals, extra, "A365_BF_APP_ID", "bf_app_id")
+    if bf_id is None:
+        return False
+    bf_secret = _profile_then_extra(
+        profile_vals, extra, "A365_BF_CLIENT_SECRET", "bf_client_secret"
+    )
+    if bf_secret is None:
+        return False
+    if bool(bf_id) != bool(bf_secret):
+        return False
+    return bool(tenant and app_id and bp_secret)
+
+
+_KEYCHAIN_SKIP_PLAINTEXT_DETAIL = (
+    "Linux `secret-tool` not found (install libsecret-tools / libsecret-1-0); "
+    "configured gateway credentials have plaintext coverage; provider lookup is not required"
+)
+
+
 def probe_keychain() -> ProbeResult:
     if sys.platform == "darwin":
         binary = shutil.which("security")
@@ -765,6 +893,8 @@ def probe_keychain() -> ProbeResult:
     if sys.platform.startswith("linux"):
         binary = shutil.which("secret-tool")
         if not binary:
+            if _gateway_has_plaintext_secret_coverage():
+                return ProbeResult("keychain", _SKIPPED, _KEYCHAIN_SKIP_PLAINTEXT_DETAIL)
             return ProbeResult(
                 "keychain",
                 _ERROR,
