@@ -21126,6 +21126,7 @@ class TestEditMessage:
         await a.edit_message("conv-code", "m1", "A")
         result = await a.edit_message("conv-code", "m1", "A B", finalize=False)
         assert result.success is False
+        assert post_mock.await_count == 1 + adapter_mod._STREAM_EDIT_MAX_ATTEMPTS
         assert any(
             record.message
             == "agent365 personal stream edit failed: phase=edit finalize=False "
@@ -21240,6 +21241,11 @@ class TestEditMessage:
         assert ("conv-landed", "m1") not in a._streams
         assert "conv-landed" not in a._active_stream_by_chat
         assert ("conv-landed", "m1") in a._recently_finalized
+        assert ("conv-landed", "bf-landed") in a._recently_finalized
+        assert post_mock.await_count == 4
+        for key in ("m1", "bf-landed"):
+            cleanup = await a.edit_message("conv-landed", key, "noop", finalize=False)
+            assert cleanup.success is True
         assert post_mock.await_count == 4
 
         again = await a.send(
