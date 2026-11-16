@@ -1,6 +1,6 @@
 # Security model (design reference)
 
-Hermes-A365 bridges Microsoft Agent 365 / Bot Framework ingress to an operator-controlled HTTPS endpoint and an optional downstream responder. The authoritative **public HTTP contract** is [`docs/SURFACE.md`](SURFACE.md) → **HTTP (product)**. This document describes the implemented design for outbound authentication and trust boundaries; inbound validation, routing, idempotency, secret storage detail, and rotation links are completed in later rounds. Residual inbound limits remain in [`README.md`](../README.md) → **Inbound webhook accepted residuals (#86)** — they are not duplicated here.
+Hermes-A365 bridges Microsoft Agent 365 / Bot Framework ingress to an operator-controlled HTTPS endpoint and an optional downstream responder. The authoritative **public HTTP contract** is [`docs/SURFACE.md`](SURFACE.md) → **HTTP (product)**. This document describes the implemented design for outbound authentication, inbound validation, routing, secret storage, and trust boundaries. Residual inbound limits remain in [`README.md`](../README.md) → **Inbound webhook accepted residuals (#86)** — they are not duplicated here.
 
 ## Components, routes and trust boundaries
 
@@ -84,4 +84,50 @@ Credentials:
 
 This path is **application-only** S2S: one cached token serves all conversations on the process. It is **not** delegated end-user on-behalf-of (OBO): there is no step that exchanges a user refresh token or presents a user session to Entra; identity is the registered bot application.
 
-Later rounds extend this file with inbound JWT branches, authorization and routing gates, idempotency, secret inventory, and links to rotation and [`SECURITY.md`](../SECURITY.md).
+## Inbound validation and authorization
+
+Both runtimes read the bearer JWT's unverified `iss` claim (`peek_unverified_iss`) and dispatch to exactly one validator. The peek is a routing hint only; the chosen branch performs a full RS256 signature check. BF issuer `https://api.botframework.com` selects Path B validation and binds `validated_path` to `"B"`; any other peek result (including parse failure) selects Path A and binds `"A"`. That binding drives outbound `acquire_reply_token` instead of re-deriving the path from the activity body.
+
+| Inbound branch | Signing keys (JWKS) | Algorithm | Issuer / audience / time | Additional checks | `validated_path` |
+| --- | --- | --- | --- | --- | --- |
+| **Path A** — A365 / MCP platform (AAD v2) | Tenant OpenID discovery → JWKS URI (`_fetch_aad_v2_keys`) | RS256 | `iss` = `https://login.microsoftonline.com/<tenant-id>/v2.0`; `aud` = blueprint Entra app id; `exp` / `nbf` required (300s leeway) | `azp` must appear in `inbound_azp_allowlist` (empty list fails closed). No `serviceUrl` claim check on this branch. | `"A"` |
+| **Path B** — Bot Framework connector S2S | Static BF OpenID config at `login.botframework.com` (`_fetch_bf_jwks_keys`) | RS256 | `iss` = `https://api.botframework.com`; `aud` = `bf_app_id` when configured, else blueprint app id; `exp` / `nbf` required (300s leeway) | If the token carries a non-empty `serviceUrl` claim, it must equal the activity's `serviceUrl`. JWKS `endorsements` vs `channelId` are not checked (documented residual in README). No `azp` check. | `"B"` |
+
+After JWT validation, both runtimes reject unsupported `channelId` values (`_inbound_channel_rejection_reason`). Optional client Bot Framework channels require explicit enablement.
+
+**End-user authorization** runs on activities that require a user principal. Candidate senders are built in preference order: delegated JWT `oid` when present, then — on Microsoft 365 authenticated channels only — lowercase-normalized aliases from the activity body's `from` object (`aadObjectId`, `id`, `userPrincipalName`, `email`). On client or unknown channels, body `from` fields are never treated as Entra identities; only a validated JWT oid may match the allowlist. The gateway additionally evaluates body-only aliases through Hermes sender pairing (`_activity_body_user_candidates`) before the bridge allowlist check; standalone `activity-bridge serve` uses the bridge allowlist directly. Authorization succeeds when any candidate matches the configured user list or allow-all is enabled.
+
+Aliases live in the **activity body**; inbound platform authenticity is established by JWT validation, not by calling the activity "signed."
+
+## Routing gate and delivery idempotency
+
+**Trusted `serviceUrl`.** Before JWT handling, both runtimes reject activities whose `serviceUrl` is not HTTPS or whose hostname fails `_is_trusted_service_url`. Allowlist entries are shape-sensitive: a leading-dot entry (for example `.botframework.com`) matches host suffixes in Microsoft's non-registrable zones; a bare hostname (for example `smba.trafficmanager.net`) matches exactly so registrable zones cannot be suffix-matched. An empty allowlist is a configuration error and yields `403`.
+
+**Scoped delivery identity.** Dedupe keys are built by `_activity_delivery_id` from `tenant_id`, `validated_path`, canonical sender, `recipient.id`, `conversation.id`, `activity.id`, and activity `type`, with length-prefixed segments so Teams conversation ids cannot collide across parses. Missing conversation or activity ids yield `None` (not dedupable).
+
+**Gateway plugin** (`Agent365Adapter` route): invoke activities bypass the message dedupe so Bot Framework retries receive a valid invoke response, not `{"status":"duplicate"}`. For messages, when a key exists the cache's `is_duplicate` returns `{"status":"duplicate"}`; certain lifecycle or backlog-full paths call `forget` so a retriable failure can be re-attempted. Capacity and TTL are operator-tunable via gateway `extra.idempotency_max_entries`.
+
+**Secondary bridge** (`activity-bridge serve`): uses the same key function with `claim` state transitions (`new`, `inflight`, `done`, `busy`) and HTTP `503` backpressure while work is in flight. Channel-control types without routable ids, or dedupe disabled (`max_entries <= 0`), use a per-request ephemeral cache so nothing is retained after the request. Completed duplicates return `{"status":"duplicate"}` except invoke, which replays an empty invoke ack.
+
+## Secret inventory and storage
+
+Hermes owns the profile **runtime, config, skills, memory, and secrets**. Hermes-A365 consumes the selected Hermes profile and instance keys; it does not take over profile ownership.
+
+| Secret / cache | Purpose | Consumer | Persistence | Storage owner |
+| --- | --- | --- | --- | --- |
+| Blueprint client id + secret | Path A inbound `aud`, Path A outbound T1/T2/FIC | Gateway adapter, `activity-bridge serve` | At rest until rotated | Operator: profile `.env` / gateway `extra` / `a365.generated.config.json` (runtime-specific precedence below), optional OS keychain via `secrets_provider` on miss only |
+| BF app id + client secret (`A365_BF_*`) | Path B inbound `aud` (when set), Path B outbound S2S | Same runtimes | At rest until rotated | Operator per-agent `.env` (serve) or profile `.env` / `extra` (gateway); keychain fill-on-miss same contract as blueprint |
+| T1 / T2 FMI pair | Path A outbound exchange | Bridge token mint | In-process TTL cache (`_FmiCache`) | Process memory |
+| Per-user messaging token | Path A reply bearer | Bridge reply POST | In-process TTL cache (`_UserTokenCache`) | Process memory |
+| BF S2S access token | Path B reply bearer | Bridge reply POST | In-process TTL cache (`_BfTokenCache`) | Process memory |
+| Inbound JWKS material | JWT signature verification | Both runtimes | In-process refresh cache (`_JwksCache`, separate BF vs AAD instances) | Process memory |
+| Delivery idempotency records | Connector retry suppression | Gateway cache / serve cache | In-process TTL + entry cap | Process memory |
+| `a365` CLI MSAL token cache | Upstream `a365` operator tool auth | Operator workstation CLI | Persistent file under the CLI app data path (see [`references/a365-cli-reference.md`](../references/a365-cli-reference.md) auth model) | Operator host |
+
+**Plaintext-before-provider precedence** (documented in [`README.md`](../README.md) → **Secrets at rest**): the active plaintext tier for the selected runtime and multiplex mode always wins; `resolve_secret` / `resolve_secret_state` consults the pluggable provider only on a miss, so a freshly rotated generated-config secret cannot be shadowed by a stale keychain entry. Gateway reads profile-scoped `A365_*` and optional `gateway.platforms.agent365.extra` secrets; with multiplex enabled, only the active `HERMES_HOME` scope applies. `activity-bridge serve` reads blueprint secret from `a365.generated.config.json` (not operator `.env`) and BF secret from the per-agent `.env`. Generated config, profile `.env`, and agent `.env` files must be mode `0600` (enforced on gateway load). Optional macOS/Linux keychain storage uses `python -m hermes_a365.keychain store` when the plaintext tier is cleared.
+
+## Rotation and reporting
+
+Client secret rotation, overlap windows, and restart expectations are documented in [`references/client-secret-rotation.md`](../references/client-secret-rotation.md). Report suspected vulnerabilities privately per [`SECURITY.md`](../SECURITY.md) (GitHub private advisories preferred).
+
+Deliberate inbound authentication and dedupe limits (M3, F6, F7) stay in [`README.md`](../README.md) → **Inbound webhook accepted residuals (#86)**; they are not expanded here.
