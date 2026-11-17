@@ -1485,6 +1485,258 @@ class TestApplyPublishPlanCopilotChat:
             )
         assert not state_path.is_file()
 
+    @pytest.mark.parametrize("app_version", ["1.0.1", "1.0.0", None])
+    @pytest.mark.parametrize("manifest_id", [None, "AABBCCDD112233445566778899AABBCC"])
+    def test_preflight_apply_refuses_before_mutation(
+        self, tmp_path, monkeypatch, app_version, manifest_id
+    ):
+        from hermes_a365.publish import _copilot_chat_publish_state_path
+
+        monkeypatch.chdir(tmp_path)
+        catalog_id = "aabbccdd-1122-3344-5566-778899aabbcc"
+        manifest_dir = self._seed_manifest_dir(
+            tmp_path,
+            {
+                "id": catalog_id,
+                "version": "1.0.0",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        zp = self._seed_manifest_zip(
+            manifest_dir, {"id": catalog_id, "version": "1.0.1", "manifestVersion": "1.27"}
+        )
+        package_before = zp.read_bytes()
+        hermes = tmp_path / "hermes"
+        state_path = _copilot_chat_publish_state_path(hermes, "x")
+        if app_version is not None:
+            _write_publish_state(
+                state_path, manifest_id=catalog_id, app_version="1.0.1", hermes_home=hermes
+            )
+        record_before = state_path.read_bytes() if state_path.exists() else None
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                app_version=app_version,
+                manifest_id=manifest_id,
+                profile=_PUBLISH_STATE_PROFILE,
+            )
+        )
+        mutator = self._scripted_template_extract(manifest_dir)
+
+        with pytest.raises(PublishError) as exc:
+            apply_publish_plan(plan, mutator=mutator, hermes_home=hermes)
+
+        if app_version is not None:
+            assert str(exc.value) == (
+                f"--app-version {app_version} must be strictly greater than the last "
+                "published app version 1.0.1"
+            )
+            assert state_path.read_bytes() == record_before
+        else:
+            catalog = f" for catalog manifest.id {catalog_id}" if manifest_id else ""
+            assert str(exc.value) == (
+                f"no Copilot Chat publish record{catalog}; pass --app-version "
+                "strictly greater than the app version shown in "
+                "Microsoft Admin Center (required for MAC updates when "
+                "the package was installed outside Hermes or local state is missing)"
+            )
+            assert not state_path.exists()
+            assert not hermes.exists()
+        assert zp.read_bytes() == package_before
+        assert mutator.calls == []
+
+    @pytest.mark.parametrize(
+        ("has_record", "app_version", "expected_rc"),
+        [
+            (True, "1.0.1", 2),
+            (True, "1.0.0", 2),
+            (False, None, 2),
+            (True, "1.0.2", 0),
+            (True, None, 0),
+            (False, "1.0.2", 0),
+        ],
+    )
+    @pytest.mark.parametrize("manifest_id", [None, "AABBCCDD112233445566778899AABBCC"])
+    def test_preflight_dry_run_checks_without_mutation(
+        self, tmp_path, monkeypatch, capsys, has_record, app_version, expected_rc, manifest_id
+    ):
+        from unittest.mock import Mock
+
+        from hermes_a365.publish import _copilot_chat_publish_state_path, build_parser, run
+
+        hermes = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(hermes))
+        monkeypatch.chdir(tmp_path)
+        state_path = _copilot_chat_publish_state_path(hermes, "x")
+        if has_record:
+            _write_publish_state(
+                state_path,
+                manifest_id="aabbccdd-1122-3344-5566-778899aabbcc",
+                app_version="1.0.1",
+                hermes_home=hermes,
+            )
+        manifest_dir = tmp_path / "manifest"
+        manifest_dir.mkdir()
+        (manifest_dir / "manifest.zip").write_bytes(b"existing published package")
+        before = {
+            p.relative_to(tmp_path): (p.read_bytes(), p.stat().st_mtime_ns)
+            for p in tmp_path.rglob("*")
+            if p.is_file()
+        }
+        get_mutator = Mock(side_effect=AssertionError("dry-run constructed a mutator"))
+        monkeypatch.setattr("hermes_a365.publish.get_mutator", get_mutator)
+        argv = [
+            "--agent-name",
+            "X",
+            "--copilot-chat",
+            "--tenant-id",
+            _TEST_TENANT,
+            "--profile",
+            _PUBLISH_STATE_PROFILE,
+        ]
+        if app_version is not None:
+            argv += ["--app-version", app_version]
+        if manifest_id is not None:
+            argv += ["--manifest-id", manifest_id]
+
+        assert run(build_parser().parse_args(argv)) == expected_rc
+
+        captured = capsys.readouterr()
+        if expected_rc == 2:
+            assert captured.err.startswith("ERROR: ")
+            expected = "strictly greater" if has_record else "no Copilot Chat publish record"
+            assert expected in captured.err
+            assert "No mutations." not in captured.out
+        else:
+            assert captured.err == ""
+            assert "No mutations." in captured.out
+        get_mutator.assert_not_called()
+        assert {
+            p.relative_to(tmp_path): (p.read_bytes(), p.stat().st_mtime_ns)
+            for p in tmp_path.rglob("*")
+            if p.is_file()
+        } == before
+        if not has_record:
+            assert not hermes.exists()
+
+    @pytest.mark.parametrize("mode", ["auto", "combined"])
+    @pytest.mark.parametrize("has_record", [False, True])
+    @pytest.mark.parametrize("app_version", [None, "1.0.0"])
+    def test_preflight_dry_run_generated_id_is_not_refused(
+        self, tmp_path, monkeypatch, capsys, mode, has_record, app_version
+    ):
+        from unittest.mock import Mock
+
+        from hermes_a365.publish import _copilot_chat_publish_state_path, build_parser, run
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        if has_record:
+            _write_publish_state(
+                state_path,
+                manifest_id="11111111-1111-1111-1111-111111111111",
+                app_version="1.0.1",
+                hermes_home=tmp_path,
+                cea_catalog_id_minted=False,
+            )
+        before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+        get_mutator = Mock(side_effect=AssertionError("dry-run constructed a mutator"))
+        monkeypatch.setattr("hermes_a365.publish.get_mutator", get_mutator)
+        argv = [
+            "--agent-name",
+            "X",
+            "--copilot-chat",
+            "--tenant-id",
+            _TEST_TENANT,
+            "--profile",
+            _PUBLISH_STATE_PROFILE,
+        ]
+        argv += ["--manifest-id", "auto"] if mode == "auto" else ["--aiteammate"]
+        if app_version is not None:
+            argv += ["--app-version", app_version]
+
+        assert run(build_parser().parse_args(argv)) == 0
+
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert "No mutations." in captured.out
+        get_mutator.assert_not_called()
+        assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+    @pytest.mark.parametrize("different_catalog", [False, True])
+    def test_preflight_allows_version_for_target_catalog(
+        self, tmp_path, monkeypatch, capsys, different_catalog
+    ):
+        import zipfile
+        from unittest.mock import Mock
+
+        from hermes_a365.publish import _copilot_chat_publish_state_path, build_parser, run
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        stored_id = "11111111-1111-1111-1111-111111111111"
+        target_id = "22222222-2222-2222-2222-222222222222" if different_catalog else stored_id
+        requested = "1.0.0" if different_catalog else "1.0.2"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            state_path, manifest_id=stored_id, app_version="1.0.1", hermes_home=tmp_path
+        )
+        before = state_path.read_bytes()
+        get_mutator = Mock(side_effect=AssertionError("dry-run constructed a mutator"))
+        monkeypatch.setattr("hermes_a365.publish.get_mutator", get_mutator)
+        argv = [
+            "--agent-name",
+            "X",
+            "--copilot-chat",
+            "--tenant-id",
+            _TEST_TENANT,
+            "--profile",
+            _PUBLISH_STATE_PROFILE,
+            "--app-version",
+            requested,
+            "--manifest-id",
+            target_id,
+        ]
+        args = build_parser().parse_args(argv)
+        assert run(args) == 0
+        captured = capsys.readouterr()
+        assert captured.err == ""
+        assert "No mutations." in captured.out
+        get_mutator.assert_not_called()
+        assert state_path.read_bytes() == before
+
+        zp = self._seed_manifest_zip(
+            tmp_path,
+            {
+                "id": stored_id,
+                "version": "1.0.0",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                tenant_id=_TEST_TENANT,
+                copilot_chat=True,
+                manifest_id=target_id,
+                app_version=requested,
+                profile=_PUBLISH_STATE_PROFILE,
+            )
+        )
+        mutator = self._scripted_zip_emit(zp)
+        apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert any(call[:3] == ["az", "account", "show"] for call in mutator.calls)
+        assert any(call[:2] == ["a365", "publish"] for call in mutator.calls)
+        record = json.loads(state_path.read_text())
+        assert record["lastAppVersion"] == requested
+        assert record["manifestId"] == target_id
+        with zipfile.ZipFile(zp) as zf:
+            manifest = json.loads(zf.read("manifest.json"))
+        assert manifest["id"] == target_id
+        assert manifest["version"] == requested
+
     def test_manifest_id_auto_reuses_catalog_id_and_bumps_version(self, tmp_path):
         import json
         import zipfile
@@ -1725,7 +1977,9 @@ class TestApplyPublishPlanCopilotChat:
         d.mkdir()
         (d / "not-a-manifest.txt").write_text("no manifest")
         plan = build_publish_plan(
-            PublishInputs(agent_name="X", copilot_chat=True, bot_id="bot-id")
+            PublishInputs(
+                agent_name="X", copilot_chat=True, bot_id="bot-id", app_version="1.0.0"
+            )
         )
 
         with pytest.raises(PublishError, match="could not be packaged safely"):
@@ -1977,7 +2231,9 @@ class TestApplyPublishPlanCopilotChat:
             tmp_path,
             {"version": "1.0.0", "name": {"short": "X", "full": "X"}},
         )
-        plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
+        plan = build_publish_plan(
+            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.0.0")
+        )
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
         )
@@ -2260,6 +2516,7 @@ class TestApplyPublishPlanCopilotChat:
                 aiteammate=True,
                 copilot_chat=True,
                 manifest_id=template_id,
+                app_version="1.0.0",
             )
         )
         with pytest.raises(PublishError, match="matches the AI Teammate catalog id"):

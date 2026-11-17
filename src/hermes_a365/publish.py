@@ -1145,6 +1145,45 @@ def _copilot_chat_mints_catalog_id(inputs: PublishInputs) -> bool:
     )
 
 
+def _copilot_chat_publish_preflight(
+    inputs: PublishInputs,
+    *,
+    hermes_home: Path,
+    tenant_id: str,
+    profile: str,
+) -> None:
+    """Refuse known local record/version failures before publish can mutate files."""
+    if not inputs.copilot_chat or _copilot_chat_mints_catalog_id(inputs):
+        return
+    state_path = _copilot_chat_publish_state_path(hermes_home, _require_copilot_chat_slug(inputs))
+    record = _load_copilot_chat_publish_state_record(
+        state_path, hermes_home=hermes_home, tenant_id=tenant_id, profile=profile
+    )
+    if record is None:
+        if inputs.app_version is None:
+            catalog = f" for catalog manifest.id {inputs.manifest_id}" if inputs.manifest_id else ""
+            raise PublishError(
+                f"no Copilot Chat publish record{catalog}; pass --app-version "
+                "strictly greater than the app version shown in "
+                "Microsoft Admin Center (required for MAC updates when "
+                "the package was installed outside Hermes or local "
+                "state is missing)"
+            )
+        return
+    if inputs.app_version is not None and (
+        inputs.manifest_id is None
+        or record["manifestId"] == _canonical_manifest_guid(inputs.manifest_id)
+    ):
+        try:
+            _resolve_next_copilot_chat_app_version(
+                template_version=None,
+                last_published=str(record["lastAppVersion"]),
+                override=inputs.app_version,
+            )
+        except ValueError as exc:
+            raise PublishError(str(exc)) from exc
+
+
 def _resolve_copilot_chat_manifest_id_for_apply(
     inputs: PublishInputs,
     *,
@@ -1514,6 +1553,14 @@ def apply_publish_plan(
             "no canonical tenant pin was resolved; pass --tenant-id or set "
             "A365_TENANT_ID before publishing"
         )
+    publish_tenant_id = _normalize_publish_state_tenant_id(expected_tenant)
+    publish_profile = _resolve_hermes_profile_name(plan.inputs.profile)
+    _copilot_chat_publish_preflight(
+        plan.inputs,
+        hermes_home=hermes_home,
+        tenant_id=publish_tenant_id,
+        profile=publish_profile,
+    )
     # The a365 mutator refuses every argv, including `az account show`, when
     # the a365 binary is missing. That used to surface as a tenant-verification
     # failure (#123 F5).
@@ -1536,8 +1583,6 @@ def apply_publish_plan(
         raise PublishError("active Azure tenant does not match the publish tenant pin")
     if plan.inputs.copilot_chat:
         _require_copilot_chat_slug(plan.inputs)
-    publish_tenant_id = _normalize_publish_state_tenant_id(expected_tenant)
-    publish_profile = _resolve_hermes_profile_name(plan.inputs.profile)
     run = mutator.run(plan.step.argv, timeout=_PUBLISH_APPLY_TIMEOUT_SECONDS)
     package_path: str | None = None
     copilot_chat_package_path: str | None = None
@@ -1857,7 +1902,9 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
             "manifest.id (MAC updates without local state). Must be strictly "
             "greater than the last published version recorded in "
             f"$HERMES_HOME/agents/<slug>/{_COPILOT_CHAT_PUBLISH_STATE_FILENAME} "
-            "for the same tenant, profile, and manifest.id"
+            "for the same tenant, profile, and manifest.id. "
+            "Local record and version gates are also checked during dry-run "
+            "when the catalog id is not generated."
         ),
     )
     parser.add_argument(
@@ -1944,6 +1991,16 @@ def run(args: argparse.Namespace) -> int:
     sys.stdout.write(plan.render_human() + "\n")
 
     if not args.apply:
+        try:
+            _copilot_chat_publish_preflight(
+                inputs,
+                hermes_home=hermes_home,
+                tenant_id=_normalize_publish_state_tenant_id(tenant_id),
+                profile=_resolve_hermes_profile_name(inputs.profile),
+            )
+        except PublishError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         sys.stdout.write("\nNo mutations. Re-run with --apply to package.\n")
         return 0
 
