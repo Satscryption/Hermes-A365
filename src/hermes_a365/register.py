@@ -78,6 +78,7 @@ from .entra_state import (
     load_anchor_app_id,
     read_registration_snapshot,
     record_ownership_anchor,
+    unique_created_app_id_by_name,
 )
 from .mutator import (
     AADSTS_CONSENT_REQUIRED,
@@ -403,6 +404,7 @@ def _bind_created_blueprint(
     hermes_home: Path,
     agent_name: str,
     generated_config_path: Path,
+    allow_display_name_lookup: bool = False,
 ) -> str:
     """Record A365_APP_ID only when Graph confirms the app this run created."""
     expected = blueprint_display_name(agent_name)
@@ -412,6 +414,8 @@ def _bind_created_blueprint(
             generated_config_path,
             expected_display_name=expected,
         )
+        if not app_id and allow_display_name_lookup:
+            app_id = unique_created_app_id_by_name(graph_get, expected)
         if app_id:
             record_ownership_anchor(hermes_home, agent_name, app_id)
     except EntraStateError as exc:
@@ -493,6 +497,9 @@ def apply_register_plan(
                 sensitive=step.name == "blueprint",
             )
         except ConsentWaitTimeout:
+            generated = generated_config_path or Path(GENERATED_CONFIG_FILENAME)
+            if generated.exists() or generated.is_symlink():
+                _harden_generated_config(generated)
             result.consent_deferred = True
             result.not_run = [s.name for s in plan.steps[i:]]
             result.messages.append(
@@ -506,8 +513,8 @@ def apply_register_plan(
                             graph_get=getter,
                             hermes_home=home,
                             agent_name=plan.inputs.agent_name,
-                            generated_config_path=generated_config_path
-                            or Path(GENERATED_CONFIG_FILENAME),
+                            generated_config_path=generated,
+                            allow_display_name_lookup=decision.action == "create",
                         )
                     )
                 except RegisterError as e:
@@ -1077,7 +1084,7 @@ def run(args: argparse.Namespace) -> int:
             update_permissions=args.update_permissions,
         )
     except subprocess.TimeoutExpired as e:
-        command = shlex.join(e.cmd[:3])
+        command = next((s.name for s in plan.steps if s.argv == e.cmd), shlex.join(e.cmd[:3]))
         print(f"ERROR: a365 step timed out after {e.timeout:g} s ({command})", file=sys.stderr)
         return 2
     except AADSTSError as e:

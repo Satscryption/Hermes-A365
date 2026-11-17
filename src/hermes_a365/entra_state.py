@@ -1037,6 +1037,20 @@ def _permission_state(
     return "absent", "", False, False
 
 
+def unique_created_app_id_by_name(graph_get: GraphGet, display_name: str) -> str | None:
+    """Confirm a unique name match only after this run created the blueprint."""
+    apps = _apps_by_name(graph_get, display_name)
+    if len(apps) != 1:
+        return None
+    app = _confirm_blueprint(graph_get, apps[0])
+    if not app.is_agent_blueprint:
+        raise EntraStateError(
+            f"application {app.app_id} is not an agent identity blueprint. "
+            "Refusing to record A365_APP_ID."
+        )
+    return app.app_id
+
+
 def confirmed_created_app_id(
     graph_get: GraphGet,
     generated_config_path: Path,

@@ -1202,6 +1202,158 @@ class TestApplyAADSTSConsentDeferred:
 
 
 class TestConsentWaitTimeout:
+    @staticmethod
+    def _graph_result(payload):
+        return RunResult(argv=["az", "rest"], returncode=0, stdout=json.dumps(payload), stderr="")
+
+    @pytest.fixture
+    def blueprint_app(self):
+        return {
+            "appId": "bbbb1111-0000-0000-0000-000000000001",
+            "id": "cccc1111-0000-0000-0000-000000000001",
+            "displayName": "Inbox Helper Blueprint",
+            "signInAudience": "AzureADMultipleOrgs",
+        }
+
+    @pytest.mark.parametrize("matches", [0, 1, 2])
+    @pytest.mark.parametrize("existing_env", [False, True])
+    def test_created_blueprint_timeout_recovers_unique_match_and_resumes(
+        self, tmp_path, monkeypatch, capsys, blueprint_app, matches, existing_env
+    ):
+        from urllib.parse import parse_qs, urlsplit
+
+        from hermes_a365.entra_state import assert_registration_read_url
+        from hermes_a365.mutator import ConsentWaitTimeout
+
+        monkeypatch.chdir(tmp_path)
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        generated = _write_generated(tmp_path, {"agentBlueprintClientSecret": "PRIVATE-SECRET"})
+        generated.chmod(0o644)
+        original_generated = generated.read_bytes()
+        env = home / "agents" / "inbox-helper" / ".env"
+        if existing_env:
+            env.parent.mkdir(parents=True)
+            env.write_text("A365_BF_CLIENT_SECRET=PRIVATE-EXISTING-SECRET\n")
+            env.chmod(0o600)
+        original_env = env.read_bytes() if existing_env else b""
+        rows = [
+            blueprint_app,
+            {**blueprint_app, "appId": _TEST_TENANT, "id": _TEST_TENANT},
+        ][:matches]
+        argv = ["--agent-name", "Inbox Helper", "--tenant-id", _TEST_TENANT]
+        plan = build_register_plan(RegisterInputs("Inbox Helper", tenant_id=_TEST_TENANT))
+        graph = self._graph_result
+        mutator = FakeMutator(
+            scripted=[
+                graph({"value": []}),  # run's preflight
+                graph({"value": []}),  # apply's preflight: this run creates the app
+                ConsentWaitTimeout(plan.steps[0].argv, 900.0),
+                graph({"value": rows}),
+                *([graph(blueprint_app)] if matches == 1 else []),  # blueprint cast
+            ]
+        )
+        monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
+        assert run(build_parser().parse_args([*argv, "--apply"])) == 1
+        out, err = capsys.readouterr()
+        assert err == ""
+        assert "[apply] blueprint: deferred" in out
+        assert "Next: run `hermes a365 consent`" in out
+        assert "PRIVATE-" not in out
+        assert generated.read_bytes() == original_generated
+        if matches == 1:
+            assert "recorded per-agent A365_APP_ID" in out
+            assert env.read_text() == original_env.decode() + (
+                f"A365_APP_ID={blueprint_app['appId']}\n"
+            )
+            assert stat.S_IMODE(env.stat().st_mode) == 0o600
+        assert stat.S_IMODE(generated.stat().st_mode) == 0o600
+        assert [c for c in mutator.calls if c[0] == "a365"] == [plan.steps[0].argv]
+        assert not mutator.scripted
+        reads = [c[c.index("--uri") + 1] for c in mutator.calls if c[:2] == ["az", "rest"]]
+        for url in reads:
+            assert_registration_read_url(url)
+        assert parse_qs(urlsplit(reads[2]).query)["$filter"] == [
+            "(displayName eq 'Inbox Helper Blueprint')"
+        ]
+        if matches != 1:
+            assert "ownership anchor was not recorded (agentBlueprintId missing" in out
+            if existing_env:
+                assert env.read_bytes() == original_env
+                assert stat.S_IMODE(env.stat().st_mode) == 0o600
+            else:
+                assert not env.exists()
+            assert len(reads) == 3
+            return
+
+        # Run the actual dry-run reconciliation using the anchor just written.
+        mutator.scripted.extend(
+            [
+                graph({"value": [blueprint_app]}),
+                graph(blueprint_app),  # anchor appId
+                graph(blueprint_app),  # blueprint cast
+                graph({"value": [{"id": _TEST_TENANT, "appId": blueprint_app["appId"]}]}),
+                graph({"value": []}),  # app role assignments
+                graph({"value": []}),  # delegated grants
+            ]
+        )
+        assert run(build_parser().parse_args(argv)) == 0
+        out, err = capsys.readouterr()
+        assert err == ""
+        assert "permissions-mcp" in out and "permissions-bot" in out
+        assert "$ a365 setup blueprint" not in out
+        assert "No mutations" in out
+        assert [c for c in mutator.calls if c[0] == "a365"] == [plan.steps[0].argv]
+        assert not mutator.scripted
+
+    @pytest.mark.parametrize("owned", [False, True])
+    def test_preexisting_blueprint_never_uses_timeout_name_fallback(
+        self, tmp_path, monkeypatch, capsys, blueprint_app, owned
+    ):
+        from hermes_a365.mutator import ConsentWaitTimeout
+
+        monkeypatch.chdir(tmp_path)
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        generated = _write_generated(tmp_path, {})
+        env = home / "agents" / "inbox-helper" / ".env"
+        if owned:
+            record_ownership_anchor(home, "Inbox Helper", blueprint_app["appId"])
+        before = env.read_bytes() if owned else None
+        graph = self._graph_result
+        snapshot = [graph({"value": [blueprint_app]})]
+        if owned:
+            snapshot += [graph(blueprint_app), graph(blueprint_app), graph({"value": []})]
+        plan = build_register_plan(RegisterInputs("Inbox Helper", tenant_id=_TEST_TENANT))
+        mutator = FakeMutator(scripted=list(snapshot))
+        if owned:
+            mutator.scripted.extend([*snapshot, ConsentWaitTimeout(plan.steps[0].argv, 900.0)])
+        monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
+        args = build_parser().parse_args(
+            [
+                "--agent-name",
+                "Inbox Helper",
+                "--tenant-id",
+                _TEST_TENANT,
+                "--apply",
+                "--update-permissions",
+            ]
+        )
+        assert run(args) == (1 if owned else 2)
+        out, err = capsys.readouterr()
+        if owned:
+            assert err == ""
+            assert "ownership anchor was not recorded (agentBlueprintId missing" in out
+            assert env.read_bytes() == before
+            assert [c for c in mutator.calls if c[0] == "a365"] == [plan.steps[0].argv]
+            assert stat.S_IMODE(generated.stat().st_mode) == 0o600
+        else:
+            assert "no per-agent A365_APP_ID" in err
+            assert not env.exists()
+            assert not any(c[0] == "a365" for c in mutator.calls)
+        assert len([c for c in mutator.calls if c[:2] == ["az", "rest"]]) == (8 if owned else 1)
+        assert not mutator.scripted
+
     @pytest.mark.parametrize("binding", ["missing", "created", "refused"])
     def test_blueprint_timeout_defers_and_binds_created_blueprint(
         self, tmp_path, monkeypatch, binding
@@ -1232,7 +1384,8 @@ class TestConsentWaitTimeout:
         monkeypatch.setattr(
             "hermes_a365.register.resolve_registration",
             lambda *args, **kwargs: RegistrationDecision(
-                action="create",
+                # Missing config during repair must not trigger name recovery.
+                action="repair" if binding == "missing" else "create",
                 step_names=tuple(s.name for s in plan.steps),
                 reason=None,
                 messages=(),
@@ -1294,6 +1447,36 @@ class TestConsentWaitTimeout:
             assert err == "ERROR: a365 step timed out after 900 s (a365 setup blueprint)\n"
             assert "Next: run `hermes a365 consent`" not in out
         assert len([call for call in mutator.calls if call[0] == "a365"]) == 1
+
+    @pytest.mark.parametrize("step_name", ["permissions-mcp", "permissions-bot"])
+    def test_permissions_timeout_label_uses_step_name(
+        self, tmp_path, monkeypatch, capsys, step_name
+    ):
+        plan = build_register_plan(RegisterInputs("Inbox Helper", tenant_id=_TEST_TENANT))
+        step = next(s for s in plan.steps if s.name == step_name)
+        successes = [RunResult(argv=[], returncode=0, stdout="", stderr="")] * (
+            1 if step_name == "permissions-mcp" else 2
+        )
+        mutator = FakeMutator(
+            scripted=[
+                *successes,
+                subprocess.TimeoutExpired(step.argv, 900.0),
+            ]
+        )
+        monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
+        args = build_parser().parse_args(
+            [
+                "--agent-name",
+                "Inbox Helper",
+                "--tenant-id",
+                _TEST_TENANT,
+                "--apply",
+            ]
+        )
+        assert run(args) == 2
+        out, err = capsys.readouterr()
+        assert err == f"ERROR: a365 step timed out after 900 s ({step_name})\n"
+        assert "Traceback" not in out + err
 
 
 class TestApplyAADSTS500011Retry:

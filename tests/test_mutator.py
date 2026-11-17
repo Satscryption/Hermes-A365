@@ -495,6 +495,57 @@ class TestSensitiveAdminConsent:
         assert "`hermes a365 consent <agent-name>`" in _ADMIN_CONSENT_WAIT_NOTICE
         assert "`hermes a365 consent --print-url-only`" in _ADMIN_CONSENT_WAIT_NOTICE
 
+    def test_consent_deadline_recovers_register_anchor(
+        self, tmp_path, monkeypatch, fake_sensitive_child, capsys
+    ):
+        from hermes_a365.entra_state import RegistrationDecision, load_anchor_app_id
+        from hermes_a365.register import (
+            RegisterInputs,
+            apply_register_plan,
+            build_register_plan,
+        )
+
+        plan = build_register_plan(
+            RegisterInputs("Inbox Helper", tenant_id="aaaa1111-0000-0000-0000-000000000001")
+        )
+        monkeypatch.setattr("hermes_a365.register._require_matching_tenant", lambda *a: "pin OK")
+        monkeypatch.setattr(
+            "hermes_a365.register.resolve_registration",
+            lambda *a, **kw: RegistrationDecision(
+                action="create",
+                step_names=tuple(s.name for s in plan.steps),
+                reason=None,
+                messages=(),
+            ),
+        )
+        generated = tmp_path / "a365.generated.config.json"
+        generated.write_text("{}")
+        generated.chmod(0o644)
+        app = {
+            "appId": "bbbb1111-0000-0000-0000-000000000001",
+            "id": "cccc1111-0000-0000-0000-000000000001",
+            "displayName": "Inbox Helper Blueprint",
+            "signInAudience": "AzureADMultipleOrgs",
+        }
+        getter = MagicMock(side_effect=[{"value": [app]}, app])
+        fake_sensitive_child("Opening browser for admin consent... SECRET\n", deadline=True)
+        mutator = A365CliMutator()
+        mutator.available = True
+        result = apply_register_plan(
+            plan,
+            mutator=mutator,
+            graph_get=getter,
+            hermes_home=tmp_path / "hermes",
+            generated_config_path=generated,
+        )
+        assert result.consent_deferred
+        assert result.completed == []
+        assert result.not_run == [s.name for s in plan.steps]
+        assert load_anchor_app_id(tmp_path / "hermes", "Inbox Helper") == app["appId"]
+        assert generated.stat().st_mode & 0o777 == 0o600
+        assert getter.call_count == 2
+        assert capsys.readouterr() == (self._NOTICE, "")
+
     @pytest.mark.parametrize("stream", ["stdout", "stderr"])
     @pytest.mark.parametrize("ending", ["\n", ""])
     def test_sensitive_consent_wait_emits_fixed_notice_once(
