@@ -508,6 +508,7 @@ def apply_register_plan(
             )
             if step.name == "blueprint":
                 try:
+                    _require_matching_tenant(mutator, expected_tenant)
                     result.messages.append(
                         _bind_created_blueprint(
                             graph_get=getter,

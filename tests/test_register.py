@@ -1215,6 +1215,79 @@ class TestConsentWaitTimeout:
             "signInAudience": "AzureADMultipleOrgs",
         }
 
+    @pytest.mark.parametrize("tenant_after_wait", ["switched", "read-error", "same"])
+    @pytest.mark.parametrize("existing_env", [False, True])
+    def test_timeout_rechecks_tenant_before_name_recovery(
+        self, tmp_path, monkeypatch, capsys, blueprint_app, tenant_after_wait, existing_env
+    ):
+        from hermes_a365.mutator import ConsentWaitTimeout
+
+        class WaitMutator(FakeMutator):
+            wait_finished = False
+
+            def run(self, argv, **kwargs):
+                if argv[:3] == ["az", "account", "show"] and self.wait_finished:
+                    self.calls.append(list(argv))
+                    if tenant_after_wait == "read-error":
+                        raise RuntimeError("PRIVATE-account-read-error")
+                    tenant = _TEST_TENANT if tenant_after_wait == "same" else blueprint_app["id"]
+                    return _account_show_result(tenant)
+                if argv[0] == "a365":
+                    self.wait_finished = True
+                return super().run(argv, **kwargs)
+
+        monkeypatch.chdir(tmp_path)
+        home = tmp_path / "hermes"
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        generated = _write_generated(tmp_path, {"agentBlueprintClientSecret": "PRIVATE-secret"})
+        original_generated = generated.read_bytes()
+        env = home / "agents" / "inbox-helper" / ".env"
+        original_env = "A365_BF_CLIENT_SECRET=PRIVATE-existing\n" if existing_env else ""
+        if existing_env:
+            env.parent.mkdir(parents=True)
+            env.write_text(original_env)
+            env.chmod(0o600)
+        plan = build_register_plan(RegisterInputs("Inbox Helper", tenant_id=_TEST_TENANT))
+        graph = self._graph_result
+        mutator = WaitMutator(scripted=[
+            graph({"value": []}),  # run preflight
+            graph({"value": []}),  # apply preflight
+            ConsentWaitTimeout(plan.steps[0].argv, 900.0),
+            graph({"value": [blueprint_app]}),
+            graph(blueprint_app),
+        ])
+        monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
+        args = build_parser().parse_args([
+            "--agent-name", "Inbox Helper", "--tenant-id", _TEST_TENANT, "--apply",
+        ])
+        assert run(args) == 1
+        out, err = capsys.readouterr()
+        assert err == ""
+        assert "[apply] blueprint: deferred" in out
+        assert "Next: run `hermes a365 consent`" in out
+        assert "PRIVATE-" not in out
+        assert generated.read_bytes() == original_generated
+        assert [c for c in mutator.calls if c[0] == "a365"] == [plan.steps[0].argv]
+        reads = [c for c in mutator.calls if c[:2] == ["az", "rest"]]
+        if tenant_after_wait == "same":
+            assert env.read_text() == original_env + f"A365_APP_ID={blueprint_app['appId']}\n"
+            assert "recorded per-agent A365_APP_ID" in out
+            assert len(reads) == 4
+            assert not mutator.scripted
+        else:
+            assert "recorded per-agent A365_APP_ID" not in out
+            explanation = (
+                "could not verify the active az tenant" if tenant_after_wait == "read-error"
+                else "does not match the pinned tenant"
+            )
+            assert sum(explanation in line for line in out.splitlines()) == 1
+            assert len(reads) == 2
+            if existing_env:
+                assert env.read_text() == original_env
+            else:
+                assert not env.exists()
+            assert len([c for c in mutator.calls if c[:3] == ["az", "account", "show"]]) == 3
+
     @pytest.mark.parametrize("matches", [0, 1, 2])
     @pytest.mark.parametrize("existing_env", [False, True])
     def test_created_blueprint_timeout_recovers_unique_match_and_resumes(

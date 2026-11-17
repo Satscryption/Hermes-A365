@@ -488,6 +488,49 @@ class TestSensitiveAdminConsent:
             _assert_marker_absent_from_failure_artifacts(exc, "SECRET")
             assert capsys.readouterr() == (self._NOTICE if saw_wait else "", "")
 
+    @pytest.mark.parametrize("stream", ["stdout", "stderr"])
+    @pytest.mark.parametrize("saw_wait", [True, False])
+    def test_deadline_captures_and_scans_unterminated_fragment(
+        self, monkeypatch, capsys, stream, saw_wait
+    ):
+        import hermes_a365.mutator as mod
+
+        fragment = (
+            "Opening browser for admin consent... PRIVATE-tail" if saw_wait else "PRIVATE-tail"
+        )
+        output = "PRIVATE-complete\n" + fragment
+        events = queue.Queue()
+        events.put((stream, output.encode()))  # No EOF event before the deadline.
+        pump = _Pump(
+            proc=MagicMock(returncode=None),
+            argv=["a365", "setup", "blueprint"],
+            timeout=900.0,
+            streams=("stdout", "stderr"),
+            echo="device_login",
+            sensitive=True,
+            stop=threading.Event(),
+            out_q=events,
+            threads=[],
+            buffers={name: _LineBuffer() for name in ("stdout", "stderr")},
+            eof_seen={"stdout": False, "stderr": False},
+            emitted_logins=set(),
+            captured=[],
+            deadline=1.0,
+        )
+        clock = iter([0.0, 2.0])
+        monkeypatch.setattr(mod.time, "monotonic", lambda: next(clock))
+        monkeypatch.setattr(mod, "_run_child_output", lambda *a, **kw: mod._run_pumped_output(pump))
+        mutator = A365CliMutator()
+        mutator.available = True
+        with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+            mutator.run(pump.argv, timeout=pump.timeout, sensitive=True)
+        expected_type = mod.ConsentWaitTimeout if saw_wait else subprocess.TimeoutExpired
+        assert type(excinfo.value) is expected_type
+        assert "".join(pump.captured) == output
+        assert excinfo.value.output is excinfo.value.stderr is None
+        _assert_marker_absent_from_failure_artifacts(excinfo.value, "PRIVATE-")
+        assert capsys.readouterr() == (self._NOTICE if saw_wait else "", "")
+
     def test_notice_shows_required_consent_argument(self) -> None:
         from hermes_a365.mutator import _ADMIN_CONSENT_WAIT_NOTICE
 

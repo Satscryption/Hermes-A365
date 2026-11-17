@@ -801,7 +801,7 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
         elif echo == "device_login":
             _emit_sensitive_notice(line, eof=False)
 
-    def _flush_eof_tail(name: str) -> None:
+    def _flush_eof_tail(name: str, *, eof: bool = True) -> None:
         buffer = buffers[name]
         previous = buffer.total_bytes
         tail = buffer.flush_eof()
@@ -813,7 +813,7 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
             sys.stdout.write(tail)
             sys.stdout.flush()
         elif echo == "device_login":
-            _emit_sensitive_notice(tail, eof=True)
+            _emit_sensitive_notice(tail, eof=eof)
 
     def _count_bytes(size: int) -> None:
         pump.capture_bytes += size
@@ -866,6 +866,8 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
             break
 
     if hit_deadline or pump.stdin_truncated:
+        for name in streams:
+            _flush_eof_tail(name, eof=False)
         if consent_notice_emitted:
             raise ConsentWaitTimeout(cmd=list(pump.argv), timeout=pump.timeout)
         raise _Deadline()
