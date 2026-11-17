@@ -1486,7 +1486,7 @@ class TestApplyPublishPlanCopilotChat:
         assert not state_path.is_file()
 
     @pytest.mark.parametrize("app_version", ["1.0.1", "1.0.0", None])
-    @pytest.mark.parametrize("manifest_id", [None, "AABBCCDD112233445566778899AABBCC"])
+    @pytest.mark.parametrize("manifest_id", ["AABBCCDD112233445566778899AABBCC"])
     def test_preflight_apply_refuses_before_mutation(
         self, tmp_path, monkeypatch, app_version, manifest_id
     ):
@@ -1507,6 +1507,8 @@ class TestApplyPublishPlanCopilotChat:
             manifest_dir, {"id": catalog_id, "version": "1.0.1", "manifestVersion": "1.27"}
         )
         package_before = zp.read_bytes()
+        cwd_package = self._seed_manifest_zip(tmp_path, {"version": "1.0.0"})
+        cwd_package_before = cwd_package.read_bytes()
         hermes = tmp_path / "hermes"
         state_path = _copilot_chat_publish_state_path(hermes, "x")
         if app_version is not None:
@@ -1535,9 +1537,9 @@ class TestApplyPublishPlanCopilotChat:
             )
             assert state_path.read_bytes() == record_before
         else:
-            catalog = f" for catalog manifest.id {catalog_id}" if manifest_id else ""
             assert str(exc.value) == (
-                f"no Copilot Chat publish record{catalog}; pass --app-version "
+                f"no Copilot Chat publish record for catalog manifest.id {catalog_id}; "
+                "pass --app-version "
                 "strictly greater than the app version shown in "
                 "Microsoft Admin Center (required for MAC updates when "
                 "the package was installed outside Hermes or local state is missing)"
@@ -1545,10 +1547,65 @@ class TestApplyPublishPlanCopilotChat:
             assert not state_path.exists()
             assert not hermes.exists()
         assert zp.read_bytes() == package_before
+        assert cwd_package.read_bytes() == cwd_package_before
         assert mutator.calls == []
 
     @pytest.mark.parametrize(
-        ("has_record", "app_version", "expected_rc"),
+        ("has_record", "app_version"),
+        [(False, None), (True, "1.0.1"), (True, "1.0.0")],
+    )
+    @pytest.mark.parametrize("package_id", [None, ""])
+    def test_preflight_apply_omitted_id_is_not_refused(
+        self, tmp_path, has_record, app_version, package_id
+    ):
+        import zipfile
+
+        from hermes_a365.publish import _copilot_chat_publish_state_path
+
+        hermes = tmp_path / "hermes"
+        state_path = _copilot_chat_publish_state_path(hermes, "x")
+        if has_record:
+            _write_publish_state(
+                state_path,
+                manifest_id="aabbccdd-1122-3344-5566-778899aabbcc",
+                app_version="1.0.1",
+                hermes_home=hermes,
+            )
+        record_before = state_path.read_bytes() if has_record else None
+        manifest = {
+            "version": "1.0.0",
+            "webApplicationInfo": {"id": "the-bot"},
+            "name": {"short": "X", "full": "X"},
+        }
+        if package_id is not None:
+            manifest["id"] = package_id
+        zp = self._seed_manifest_zip(tmp_path, manifest)
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                app_version=app_version,
+                profile=_PUBLISH_STATE_PROFILE,
+            )
+        )
+        mutator = self._scripted_zip_emit(zp)
+
+        result = apply_publish_plan(plan, mutator=mutator, hermes_home=hermes)
+
+        assert any(call[:3] == ["az", "account", "show"] for call in mutator.calls)
+        assert any(call[:2] == ["a365", "publish"] for call in mutator.calls)
+        assert result.copilot_chat_package_path == str(zp)
+        with zipfile.ZipFile(zp) as zf:
+            transformed = json.loads(zf.read("manifest.json"))
+        assert transformed.get("id") == package_id
+        assert transformed["version"] == (app_version or "1.0.0")
+        if has_record:
+            assert state_path.read_bytes() == record_before
+        else:
+            assert not state_path.exists()
+
+    @pytest.mark.parametrize(
+        ("has_record", "app_version", "explicit_rc"),
         [
             (True, "1.0.1", 2),
             (True, "1.0.0", 2),
@@ -1560,7 +1617,7 @@ class TestApplyPublishPlanCopilotChat:
     )
     @pytest.mark.parametrize("manifest_id", [None, "AABBCCDD112233445566778899AABBCC"])
     def test_preflight_dry_run_checks_without_mutation(
-        self, tmp_path, monkeypatch, capsys, has_record, app_version, expected_rc, manifest_id
+        self, tmp_path, monkeypatch, capsys, has_record, app_version, explicit_rc, manifest_id
     ):
         from unittest.mock import Mock
 
@@ -1601,6 +1658,7 @@ class TestApplyPublishPlanCopilotChat:
         if manifest_id is not None:
             argv += ["--manifest-id", manifest_id]
 
+        expected_rc = explicit_rc if manifest_id is not None else 0
         assert run(build_parser().parse_args(argv)) == expected_rc
 
         captured = capsys.readouterr()
@@ -1977,9 +2035,7 @@ class TestApplyPublishPlanCopilotChat:
         d.mkdir()
         (d / "not-a-manifest.txt").write_text("no manifest")
         plan = build_publish_plan(
-            PublishInputs(
-                agent_name="X", copilot_chat=True, bot_id="bot-id", app_version="1.0.0"
-            )
+            PublishInputs(agent_name="X", copilot_chat=True, bot_id="bot-id")
         )
 
         with pytest.raises(PublishError, match="could not be packaged safely"):
@@ -2232,7 +2288,7 @@ class TestApplyPublishPlanCopilotChat:
             {"version": "1.0.0", "name": {"short": "X", "full": "X"}},
         )
         plan = build_publish_plan(
-            PublishInputs(agent_name="X", copilot_chat=True, app_version="1.0.0")
+            PublishInputs(agent_name="X", copilot_chat=True)
         )
         result = apply_publish_plan(
             plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path

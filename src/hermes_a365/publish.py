@@ -1152,8 +1152,8 @@ def _copilot_chat_publish_preflight(
     tenant_id: str,
     profile: str,
 ) -> None:
-    """Refuse known local record/version failures before publish can mutate files."""
-    if not inputs.copilot_chat or _copilot_chat_mints_catalog_id(inputs):
+    """Refuse explicit catalog record/version failures before publish can mutate files."""
+    if not inputs.copilot_chat or inputs.manifest_id in (None, "auto"):
         return
     state_path = _copilot_chat_publish_state_path(hermes_home, _require_copilot_chat_slug(inputs))
     record = _load_copilot_chat_publish_state_record(
@@ -1161,9 +1161,9 @@ def _copilot_chat_publish_preflight(
     )
     if record is None:
         if inputs.app_version is None:
-            catalog = f" for catalog manifest.id {inputs.manifest_id}" if inputs.manifest_id else ""
             raise PublishError(
-                f"no Copilot Chat publish record{catalog}; pass --app-version "
+                "no Copilot Chat publish record for catalog "
+                f"manifest.id {inputs.manifest_id}; pass --app-version "
                 "strictly greater than the app version shown in "
                 "Microsoft Admin Center (required for MAC updates when "
                 "the package was installed outside Hermes or local "
@@ -1171,8 +1171,7 @@ def _copilot_chat_publish_preflight(
             )
         return
     if inputs.app_version is not None and (
-        inputs.manifest_id is None
-        or record["manifestId"] == _canonical_manifest_guid(inputs.manifest_id)
+        record["manifestId"] == _canonical_manifest_guid(inputs.manifest_id)
     ):
         try:
             _resolve_next_copilot_chat_app_version(
