@@ -18732,7 +18732,67 @@ class TestEditMessage:
         assert "withholding operational notice" in caplog.text
         assert "groupChat" in caplog.text
 
+        notice = "Background task failed: example"
         sent = await a.send_private_notice("conv-notice-personal", "user-1", notice)
+        assert sent.success is True
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == notice
+
+    @pytest.mark.asyncio
+    async def test_home_channel_notice_withheld_on_personal_and_group(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        caplog.set_level("INFO", logger=adapter_mod.logger.name)
+        notice = "Aucun canal de notification. Tapez /sethome pour en choisir un."
+
+        for chat_type, log_line in (
+            ("personal", "agent365 withholding home-channel notice on personal chat"),
+            ("groupChat", "agent365 withholding operational notice on non-personal chat"),
+        ):
+            chat_id = f"conv-home-notice-{chat_type}"
+            inbound = _make_inbound(conv_id=chat_id)
+            inbound["conversation"]["conversationType"] = chat_type
+            self._wire_adapter(a, inbound=inbound)
+            caplog.clear()
+
+            result = await a.send_private_notice(chat_id, "notice-user-secret", notice)
+
+            assert result.success is True
+            assert result.message_id == ""
+            assert send_reply_mock.await_count == 0
+            records = [r for r in caplog.records if r.name == adapter_mod.logger.name]
+            assert len(records) == 1
+            assert records[0].levelno == logging.INFO
+            assert log_line in records[0].getMessage()
+            assert f"chat_id={chat_id}" in records[0].getMessage()
+            assert notice not in caplog.text
+            assert "notice-user-secret" not in caplog.text
+            if chat_type == "personal":
+                assert "run /sethome in the chat that should receive notifications" in caplog.text
+            else:
+                assert "chat_type=groupChat" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_personal_operational_notice_sent_unchanged_after_home_notice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-personal-operational-notice"
+        self._wire_adapter(a, inbound=_make_inbound(conv_id=chat_id))
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        # Withholding the setup hint must not suppress later operational notices.
+        home = await a.send_private_notice(chat_id, "user-1", "Configure with /sethome.")
+        notice = "Background task failed: example"
+        sent = await a.send_private_notice(chat_id, "user-1", notice)
+
+        assert home.success is True
         assert sent.success is True
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == notice
