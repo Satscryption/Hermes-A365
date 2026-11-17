@@ -9830,6 +9830,52 @@ class TestEditMessage:
         assert chat not in a._copilot_member_added_pending
         assert chat not in a._copilot_member_added_claims
 
+    @pytest.mark.parametrize("activity_id", ["act-2", "act-1"], ids=["new-message", "retry"])
+    @pytest.mark.asyncio
+    async def test_copilot_existing_thread_after_restart_streams(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, activity_id: str
+    ) -> None:
+        previous = _make_adapter(monkeypatch)
+        prior_inbound = _make_inbound(conv_id="19:first-contact@thread.v2", path="B")
+        prior_inbound["conversation"]["conversationType"] = "groupChat"
+        ref = adapter_mod.ConversationRef.from_activity(prior_inbound)
+        assert ref is not None
+        previous._conversations.upsert(ref)
+        previous._conversations.save(previous._conversations_path)
+
+        # A fresh adapter loads the prior thread, with no inbound seen this lifetime.
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        assert a is not previous
+        assert a._conversations.get(chat) is not None
+        assert chat not in a._seen_inbounds_this_lifetime
+        inbound["id"] = activity_id
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._receive_first_contact_activity(a, inbound)
+            clock["t"] += 1.0
+            await self._answer_first_contact_turn(a)
+
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "informative",
+            "streamSequence": 1,
+        }
+        assert final["type"] == "message"
+        assert final["text"] == "Hello."
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [3.0]
+        assert "reason=first contact" not in caplog.text
+        assert chat not in a._turn_buffers
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+
     @pytest.mark.asyncio
     async def test_copilot_member_added_during_min_stream_age_wait_applies_to_current_turn(
         self, monkeypatch: pytest.MonkeyPatch

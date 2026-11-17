@@ -3017,6 +3017,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     status_code=503,
                 )
             try:
+                # Check the durable registry before recording this inbound.
+                first_inbound_for_conversation = ref.conversation_id not in self._conversations
                 self._capture_coalesced_turn_target(ref)
                 self._conversations.upsert(ref)
                 # Slice 19x-e (#27): record that this gateway lifetime
@@ -3025,7 +3027,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 # sendToConversation. Per-lifetime, not persisted.
                 seen = self._seen_inbounds_this_lifetime
                 first_inbound_this_lifetime = not seen
-                first_inbound_for_conversation = ref.conversation_id not in seen
                 seen.add(ref.conversation_id)
                 if first_inbound_this_lifetime:
                     _configure_plugin_logging()
