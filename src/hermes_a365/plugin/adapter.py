@@ -10152,10 +10152,9 @@ class Agent365Adapter(BasePlatformAdapter):
         ``notice_delivery: private`` routes the ``/sethome`` home-channel
         prompt here. Copilot Chat arrives as ``groupChat`` and has no
         private surface, so posting the notice makes it the turn's visible
-        bubble. Withhold it there (INFO) and send normally in personal
-        chats. Success is reported on a withhold: the gateway treats a
-        failure as "fall back to a public send", which would post the
-        notice into the shared chat.
+        bubble. Withhold it there (INFO); in personal chats withhold only
+        the home-channel prompt. Report success so the gateway does not
+        fall back to a public send and post the withheld notice.
         """
         del user_id  # Bot Framework has no per-user ephemeral channel.
         inbound = self._cached_inbound_for(str(chat_id))
@@ -10167,6 +10166,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 "chat_id=%s chat_type=%s",
                 chat_id,
                 chat_type,
+            )
+            return SendResult(success=True, message_id="")
+        if chat_type == "personal" and "/sethome" in content:
+            # This operator hint would add a second bubble for end users.
+            # Deferring still adds a bubble; folding it in needs stream/buffer edits.
+            logger.info(
+                "agent365 withholding home-channel notice on personal chat: "
+                "chat_id=%s (run /sethome in the chat that should receive notifications)",
+                chat_id,
             )
             return SendResult(success=True, message_id="")
         return await self.send(
