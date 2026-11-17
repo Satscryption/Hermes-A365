@@ -767,10 +767,10 @@ as `ok`.
 > directory states a different policy. If neither file sets a policy, both
 > runtimes deny every end user. The profile file must be owner-only
 > (`chmod 600`); a group- or world-readable file is refused without printing
-> its contents. Allowlist
-> entries may be
-> AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
-> includes those aliases in the signed activity. Bot Framework `personal` /
+> its contents. Path B senders are matched by Entra object ID (`aadObjectId`),
+> so list those IDs in `A365_ALLOWED_USERS`. UPN/email entries match only when
+> the activity carries them; Path B Teams and Copilot activities do not.
+> Bot Framework `personal` /
 > `groupChat` / `channel` values
 > are normalized to Hermes `dm` / `group` / `channel`; JWT-authenticated
 > lifecycle/control activities are acknowledged without pretending their

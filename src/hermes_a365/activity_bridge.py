@@ -1601,6 +1601,24 @@ class SenderAllowlist:
     configured: bool = False
 
 
+def sender_allowlist_path_b_warning(policy: SenderAllowlist) -> str | None:
+    """Describe UPN/email entries unavailable on Path B, without exposing values."""
+    if policy.allow_all_users or not policy.allowed_users:
+        return None
+    alias_count = sum("@" in entry for entry in policy.allowed_users)
+    if not alias_count:
+        return None
+    if alias_count == len(policy.allowed_users):
+        prefix = "A365_ALLOWED_USERS contains only UPN/email entries"
+    else:
+        prefix = f"A365_ALLOWED_USERS contains {alias_count} UPN/email entries"
+    return (
+        f"{prefix}; these entries cannot match Path B Teams or Copilot senders "
+        "because those activities carry object IDs (aadObjectId), not UPN/email aliases. "
+        "A365_ALLOWED_USERS should list Entra object IDs for Path B."
+    )
+
+
 def _allowlist_env_view(env: Mapping[str, str]) -> dict[str, str]:
     return {key: env[key] for key in SENDER_ALLOWLIST_ENV_KEYS if key in env}
 
@@ -1922,6 +1940,8 @@ def load_bridge_config(
             "sender allowlist is not configured; denying every end user. "
             "Set A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS in ~/.hermes/.env"
         )
+    if warning := sender_allowlist_path_b_warning(sender_policy):
+        logger.warning(warning)
     allow_client_bf_channels = resolve_allow_client_bf_channels(
         hermes_home,
         process_env=os.environ,

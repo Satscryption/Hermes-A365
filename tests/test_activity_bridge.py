@@ -2965,6 +2965,41 @@ class TestRenderReply:
 # ---------------------------------------------------------------------------
 
 
+class TestSenderAllowlistPathBWarning:
+    @pytest.mark.parametrize(
+        ("users", "allow_all", "expected_prefix"),
+        [
+            (("one@example.test", "two@example.test"), False, "contains only UPN/email entries"),
+            (
+                ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "one@example.test", "two@example.test"),
+                False,
+                "contains 2 UPN/email entries",
+            ),
+            (("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",), False, None),
+            ((), False, None),
+            ((), True, None),
+            (("one@example.test",), True, None),
+        ],
+        ids=["all-upn", "mixed", "oid-only", "empty", "allow-all", "allow-all-with-upn"],
+    )
+    def test_classification(
+        self, users: tuple[str, ...], allow_all: bool, expected_prefix: str | None
+    ) -> None:
+        from hermes_a365.activity_bridge import SenderAllowlist, sender_allowlist_path_b_warning
+
+        policy = SenderAllowlist(users, allow_all, configured=True)
+        warning = sender_allowlist_path_b_warning(policy)
+        if expected_prefix is None:
+            assert warning is None
+        else:
+            assert warning is not None
+            assert expected_prefix in warning
+            assert "cannot match Path B Teams or Copilot senders" in warning
+            assert "activities carry object IDs (aadObjectId)" in warning
+            assert "A365_ALLOWED_USERS should list Entra object IDs" in warning
+            assert all(entry not in warning for entry in users)
+
+
 class TestLoadBridgeConfig:
     def test_missing_secret_errors_with_actionable_hint(self, tmp_path: Path) -> None:
         """Slice 19e: secret missing usually means `a365 publish`

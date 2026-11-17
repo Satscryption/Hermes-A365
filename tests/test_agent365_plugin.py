@@ -30541,6 +30541,86 @@ class TestGatewaySecretsProviderWiring:
         assert (found, reachable, label) == (False, False, "exploding")
 
 
+class TestSenderAllowlistPathBStartupWarning:
+    @pytest.mark.parametrize("runtime", ["gateway", "serve"])
+    @pytest.mark.parametrize(
+        ("policy_text", "expected_fragment"),
+        [
+            (
+                "A365_ALLOWED_USERS=one@example.test,two@example.test\n",
+                "contains only UPN/email entries",
+            ),
+            (
+                "A365_ALLOWED_USERS=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,"
+                "one@example.test,two@example.test\n",
+                "contains 2 UPN/email entries",
+            ),
+            ("A365_ALLOWED_USERS=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n", None),
+            ("A365_ALLOWED_USERS=\n", None),
+            ("A365_ALLOW_ALL_USERS=true\n", None),
+        ],
+        ids=["all-upn", "mixed", "oid-only", "empty", "allow-all"],
+    )
+    def test_startup_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        runtime: str,
+        policy_text: str,
+        expected_fragment: str | None,
+    ) -> None:
+        from hermes_a365.activity_bridge import load_bridge_config
+
+        monkeypatch.delenv("A365_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        profile = home / ".env"
+        profile.write_text(policy_text)
+        profile.chmod(0o600)
+        agent_dir = home / "agents" / "test-agent"
+        agent_dir.mkdir(parents=True)
+        agent_env = agent_dir / ".env"
+        agent_env.write_text("A365_TENANT_ID=11111111-1111-1111-1111-111111111111\n")
+        agent_env.chmod(0o600)
+        generated = home / "a365.generated.config.json"
+        generated.write_text('{"agentBlueprintId":"bp","agentBlueprintClientSecret":"secret"}')
+        generated.chmod(0o600)
+
+        with caplog.at_level(logging.WARNING):
+            if runtime == "gateway":
+                adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"slug": "test-agent"}))
+            else:
+                load_bridge_config(
+                    slug="test-agent",
+                    webhook_url="https://hook.test/responder",
+                    hermes_home=home,
+                    generated_config_path=generated,
+                )
+
+        logger_name = (
+            "hermes_a365.plugin.adapter" if runtime == "gateway" else "hermes_a365.activity_bridge"
+        )
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == logger_name and record.levelno >= logging.WARNING
+        ]
+        if expected_fragment is None:
+            assert warnings == []
+        else:
+            assert len(warnings) == 1
+            assert expected_fragment in warnings[0]
+            assert "cannot match Path B Teams or Copilot senders" in warnings[0]
+            assert "activities carry object IDs (aadObjectId)" in warnings[0]
+            assert "A365_ALLOWED_USERS should list Entra object IDs" in warnings[0]
+            assert "one@example.test" not in caplog.text
+            assert "two@example.test" not in caplog.text
+            assert "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" not in caplog.text
+
+
 class TestSenderAllowlistAgreement:
     """#160: the adapter resolves the same profile policy as ``serve``."""
 
