@@ -1919,6 +1919,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 "end user until A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS "
                 "is set in the profile env"
             )
+        if warning := _import_bridge().sender_allowlist_path_b_warning(sender_policy):
+            logger.warning(warning)
 
         # Slice 19o — durable conversation registry keyed on
         # `conversation.id`. Persists to
@@ -16638,8 +16640,9 @@ def interactive_setup() -> None:
     print_info("🔒 Access control")
     print_info("Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user.")
     print_info(
-        "Production: set A365_ALLOWED_USERS to AAD object IDs, activity user IDs, "
-        "or UPN/email aliases present in the signed activity."
+        "Production: set A365_ALLOWED_USERS to Entra object IDs (aadObjectId) for "
+        "Path B senders. UPN/email entries match only when the activity carries them; "
+        "Path B Teams and Copilot activities do not."
     )
     allow_all = prompt_yes_no(
         "Allow all users (testing only)?",
@@ -16652,7 +16655,7 @@ def interactive_setup() -> None:
     else:
         save_env_value("A365_ALLOW_ALL_USERS", "false")
         allowed = prompt(
-            "Allowed users (comma-separated OIDs, activity IDs, or activity UPNs/emails; "
+            "Allowed users (comma-separated Entra object IDs for Path B; "
             "blank = deny everyone)",
             default=get_env_value("A365_ALLOWED_USERS") or "",
         )
