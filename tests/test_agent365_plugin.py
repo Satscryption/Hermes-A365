@@ -9640,6 +9640,242 @@ class TestEditMessage:
         )
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
+    def _first_contact_adapter(self, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+        a = _make_adapter(monkeypatch)
+        # Another conversation has already been seen; first contact is per chat.
+        post_mock = self._wire_adapter(a, inbound=_make_inbound(conv_id="other-chat"))
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _token: bridge.BF_ISSUER)
+        monkeypatch.setattr(
+            bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"iss": bridge.BF_ISSUER})
+        )
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("bearer-test", "B"))
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        monkeypatch.setattr(a, "handle_message", AsyncMock(side_effect=a.on_processing_start))
+
+        async def persist(reservation: Any = None) -> None:
+            adapter_mod._complete_persist_mutation(reservation[0], reservation[1])
+
+        monkeypatch.setattr(a, "_persist_conversations", persist)
+        inbound = _make_inbound(conv_id="19:first-contact@thread.v2", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        return a, inbound, post_mock, sleep_mock, clock
+
+    @staticmethod
+    async def _receive_first_contact_activity(a: Any, activity: dict[str, Any]) -> None:
+        import httpx
+
+        transport = httpx.ASGITransport(app=a.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+            )
+        assert response.status_code == 200
+        expected = "dispatched" if activity["type"] == "message" else "acked"
+        assert response.json()["status"] == expected
+
+    @staticmethod
+    async def _answer_first_contact_turn(a: Any) -> None:
+        event = a.handle_message.call_args.args[0]
+        chat = event.source.chat_id
+        record = a._event_turn_authority(event)
+        assert record is not None
+        with a._turn_frame_scope(record.session_key, record):
+            result = await a.send(chat_id=chat, content="Hello.", reply_to=event.message_id)
+            assert result.success
+            await a.on_processing_complete(event, outcome="success")
+
+    @staticmethod
+    def _first_contact_member_added(inbound: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **inbound,
+            "type": "conversationUpdate",
+            "id": "members-added",
+            "membersAdded": [{"id": inbound["recipient"]["id"]}],
+        }
+
+    @pytest.mark.parametrize("late_marker", [True, False])
+    @pytest.mark.asyncio
+    async def test_copilot_first_contact_answer_plain_without_stream(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, late_marker: bool
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, inbound)
+        turn = a._turn_buffers[chat]["turns"][0]
+        clock["t"] += 0.143
+        if late_marker:
+            await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+            assert a._copilot_member_added_pending[chat] > turn["started_mono"]
+        clock["t"] += 5.157
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 1
+        plain = post_mock.await_args.kwargs["json"]
+        assert plain["type"] == "message"
+        assert plain["text"] == "Hello."
+        assert not any(e.get("type") == "streaminfo" for e in plain.get("entities", []))
+        assert not [call for call in sleep_mock.await_args_list if call.args[0] > 0]
+        logs = [r for r in caplog.records if "reason=first contact" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=open rejected" not in caplog.text
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+        assert chat not in a._turn_buffers
+        # Repeated completion must not produce a duplicate plain reply.
+        await a.on_processing_complete(a.handle_message.call_args.args[0], outcome="success")
+        assert post_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_copilot_bot_add_before_first_message_opens_and_holds_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 0.83
+        await self._receive_first_contact_activity(a, inbound)
+        clock["t"] += 4.3
+        await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "informative",
+            "streamSequence": 1,
+        }
+        assert final["type"] == "message"
+        assert final["text"] == "Hello."
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [10.0]
+        assert chat not in a._copilot_member_added_pending
+
+    @pytest.mark.asyncio
+    async def test_copilot_first_contact_open_stream_keeps_late_marker_timing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, inbound)
+        buf = a._turn_buffers[chat]
+        async with a._turn_buffer_lock(buf):
+            await a._post_informative_locked(
+                chat, buf, allow_restart=False, text_override="Checking the answer."
+            )
+        assert post_mock.await_count == 1
+        opened = clock["t"]
+
+        async def sleep_with_marker(delay: float) -> None:
+            if chat not in a._copilot_member_added_pending:
+                clock["t"] += 1.0
+                await self._receive_first_contact_activity(
+                    a, self._first_contact_member_added(inbound)
+                )
+                clock["t"] += delay - 1.0
+            else:
+                clock["t"] += delay
+
+        sleep_mock.side_effect = sleep_with_marker
+        await self._answer_first_contact_turn(a)
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [
+            3.0,
+            7.0,
+        ]
+        assert clock["t"] - opened == 10.0
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["entities"][0]["streamType"] == "informative"
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+
+    @pytest.mark.asyncio
+    async def test_copilot_second_turn_after_first_contact_uses_ordinary_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, inbound)
+        clock["t"] += 0.143
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        await self._answer_first_contact_turn(a)
+        clock["t"] += 1.0
+        inbound["id"] = "act-2"
+        await self._receive_first_contact_activity(a, inbound)
+        await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 3
+        plain, opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert not any(e.get("type") == "streaminfo" for e in plain.get("entities", []))
+        assert opener["entities"][0]["streamType"] == "informative"
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [3.0]
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+
+    @pytest.mark.parametrize("activity_id", ["act-2", "act-1"], ids=["new-message", "retry"])
+    @pytest.mark.asyncio
+    async def test_copilot_existing_thread_after_restart_streams(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, activity_id: str
+    ) -> None:
+        previous = _make_adapter(monkeypatch)
+        prior_inbound = _make_inbound(conv_id="19:first-contact@thread.v2", path="B")
+        prior_inbound["conversation"]["conversationType"] = "groupChat"
+        ref = adapter_mod.ConversationRef.from_activity(prior_inbound)
+        assert ref is not None
+        previous._conversations.upsert(ref)
+        previous._conversations.save(previous._conversations_path)
+
+        # A fresh adapter loads the prior thread, with no inbound seen this lifetime.
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        assert a is not previous
+        assert a._conversations.get(chat) is not None
+        assert chat not in a._seen_inbounds_this_lifetime
+        inbound["id"] = activity_id
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._receive_first_contact_activity(a, inbound)
+            clock["t"] += 1.0
+            await self._answer_first_contact_turn(a)
+
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "informative",
+            "streamSequence": 1,
+        }
+        assert final["type"] == "message"
+        assert final["text"] == "Hello."
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [3.0]
+        assert "reason=first contact" not in caplog.text
+        assert chat not in a._turn_buffers
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+
     @pytest.mark.asyncio
     async def test_copilot_member_added_during_min_stream_age_wait_applies_to_current_turn(
         self, monkeypatch: pytest.MonkeyPatch

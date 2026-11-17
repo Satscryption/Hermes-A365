@@ -261,6 +261,7 @@ class TurnAuthorityRecord:
     message_id: str
     reply_activity: dict[str, Any]
     adapter_id: int
+    first_inbound_for_conversation: bool = False
 
 
 class _UnboundTurnFrameType:
@@ -3016,6 +3017,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     status_code=503,
                 )
             try:
+                # Check the durable registry before recording this inbound.
+                first_inbound_for_conversation = ref.conversation_id not in self._conversations
                 self._capture_coalesced_turn_target(ref)
                 self._conversations.upsert(ref)
                 # Slice 19x-e (#27): record that this gateway lifetime
@@ -3106,6 +3109,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 origin_key,
                 message_id=str(getattr(event, "message_id", "") or activity.get("id") or ""),
                 authorized_user_id=authorized_sender_id,
+                first_inbound_for_conversation=first_inbound_for_conversation,
             ):
                 self._release_media_paths(request_media_leases)
                 self._release_agent_turn_admission(admission_key)
@@ -4496,6 +4500,7 @@ class Agent365Adapter(BasePlatformAdapter):
         message_id: str | None = None,
         reply_activity: dict[str, Any] | None = None,
         authorized_user_id: str | None = None,
+        first_inbound_for_conversation: bool = False,
     ) -> bool:
         mid = str(message_id or activity.get("id") or "").strip()
         conv = activity.get("conversation")
@@ -4517,6 +4522,7 @@ class Agent365Adapter(BasePlatformAdapter):
             message_id=mid,
             reply_activity=copy.deepcopy(activity if reply_activity is None else reply_activity),
             adapter_id=id(self),
+            first_inbound_for_conversation=first_inbound_for_conversation,
         )
         self._turn_authority_ledger[(conv_id, mid)] = record
         return True
@@ -6215,6 +6221,13 @@ class Agent365Adapter(BasePlatformAdapter):
             "started_mono": time.monotonic(),
             "authority_record": authority_record,
         }
+        noted = self._copilot_member_added_pending.get(str(chat_id))
+        turn["copilot_first_contact"] = bool(
+            authority_record is not None
+            and authority_record.first_inbound_for_conversation
+            and self._is_copilot_turn_buffer_turn(turn)
+            and (noted is None or noted > turn["started_mono"])
+        )
         self._apply_copilot_member_added_to_turn(chat_id, turn)
         if buf is None:
             self._turn_buffers[chat_id] = {
@@ -8668,6 +8681,16 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return ("fallback", "open rejected")
+        if not stream_id and turn.get("copilot_first_contact"):
+            # Claim a late marker exactly as stream delivery would, so plain
+            # delivery releases it for this turn rather than pacing the next.
+            self._copilot_needs_min_stream_age_before_final(chat_id, turn)
+            turn["copilot_member_added_decided"] = True
+            logger.info(
+                "agent365 turn buffer answer plain fallback: chat_id=%s reason=first contact",
+                chat_id,
+            )
+            return ("fallback", "first contact")
         return None
 
     async def _post_answer_final(
