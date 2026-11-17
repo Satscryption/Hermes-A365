@@ -30613,9 +30613,12 @@ class TestSenderAllowlistPathBStartupWarning:
         else:
             assert len(warnings) == 1
             assert expected_fragment in warnings[0]
-            assert "cannot match Path B Teams or Copilot senders" in warnings[0]
+            assert (
+                "are resolved through Microsoft Graph with User.ReadBasic.All (application)"
+                in warnings[0]
+            )
             assert "activities carry object IDs (aadObjectId)" in warnings[0]
-            assert "A365_ALLOWED_USERS should list Entra object IDs" in warnings[0]
+            assert "otherwise they match nobody on Path B" in warnings[0]
             assert "one@example.test" not in caplog.text
             assert "two@example.test" not in caplog.text
             assert "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" not in caplog.text
@@ -32673,3 +32676,230 @@ class TestGatewayBridgePidPublication:
           await asyncio.sleep(0.05)
           await adapter3.disconnect()
       assert canary not in caplog.text
+
+
+class TestUpnObjectIdAllowlist:
+    UPN = "private+tag@example.test"
+    OID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    OTHER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    TOKEN = "private-graph-bearer"
+
+    @pytest.fixture
+    def runtime(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+        import threading
+        from io import BytesIO
+
+        import httpx
+        from fastapi.testclient import TestClient
+
+        bridge = adapter_mod._import_bridge()
+        caplog.set_level(logging.INFO)
+        loop_thread = threading.get_ident()
+        token = MagicMock(return_value={"access_token": self.TOKEN})
+        fetch = MagicMock(
+            side_effect=lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID.upper()}).encode())
+        )
+        monkeypatch.setattr(bridge, "acquire_token", token)
+        monkeypatch.setattr(bridge.urllib.request, "urlopen", fetch)
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _: bridge.BF_ISSUER)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"aud": "x"}))
+        clock = [100.0]
+        resolver_type = getattr(bridge, "UpnObjectIdResolver", None)
+        created = []
+
+        def resolver(cfg):
+            assert threading.get_ident() == loop_thread
+            result = resolver_type(cfg, clock=lambda: clock[0])
+            original_refresh = result.refresh
+
+            def refresh():
+                assert threading.get_ident() != loop_thread
+                original_refresh()
+
+            result.refresh = refresh
+            created.append(result)
+            return result
+
+        if resolver_type is not None:
+            monkeypatch.setattr(bridge, "UpnObjectIdResolver", resolver)
+
+        class Server:
+            def __init__(self, _config):
+                self.started = True
+                self.should_exit = False
+
+            async def serve(self):
+                while not self.should_exit:
+                    await asyncio.sleep(0.01)
+
+        monkeypatch.setitem(
+            sys.modules, "uvicorn", SimpleNamespace(Config=lambda *a, **kw: None, Server=Server)
+        )
+
+        @contextlib.asynccontextmanager
+        async def start(users, *, allow_all=False, bf=False):
+            a = _make_adapter(monkeypatch)
+            a._allowed_users, a._allow_all_users = users, allow_all
+            if bf:
+                a.bf_app_id, a.bf_client_secret = "bf-app", "bf-secret"
+            a._http_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200, json={}))
+            )
+            a._is_sender_authorized = lambda *_a: True
+            assert await a.connect() is True
+            try:
+                with TestClient(a._app) as client:
+                    yield SimpleNamespace(
+                        adapter=a,
+                        client=client,
+                        token=token,
+                        fetch=fetch,
+                        clock=clock,
+                        created=created,
+                    )
+            finally:
+                await a.disconnect()
+
+        yield start
+        for record in caplog.records:
+            assert self.UPN not in repr(record.__dict__)
+            assert self.TOKEN not in repr(record.__dict__)
+
+    def post(self, rt, oid=None, *, activity_id="act-1"):
+        activity = _make_inbound(path="B", activity_id=activity_id)
+        activity["from"] = {"id": "29:opaque", "aadObjectId": oid or self.OID}
+        return rt.client.post(
+            "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+        )
+
+    @pytest.mark.parametrize("bf", [False, True], ids=["blueprint", "bf"])
+    async def test_resolves_path_b_sender_and_selects_listed_alias(self, runtime, caplog, bf):
+        async with runtime((self.UPN,), bf=bf) as rt:
+            assert self.post(rt).status_code == 200
+            assert rt.adapter._handled_events[-1].source.user_id == self.OID
+            assert rt.adapter._allowed_users == (self.UPN,)
+            assert rt.adapter._bridge_cfg.allowed_users == (self.UPN,)
+            assert rt.adapter._allow_all_users is False
+            assert self.post(rt, activity_id="act-2").status_code == 200
+            rt.token.assert_called_once_with(
+                tenant_id=rt.adapter.tenant_id,
+                client_id="bf-app" if bf else rt.adapter.blueprint_app_id,
+                client_secret="bf-secret" if bf else "fake-secret",
+                resource="https://graph.microsoft.com",
+            )
+            rt.fetch.assert_called_once()
+            req = rt.fetch.call_args.args[0]
+            assert (
+                req.full_url
+                == "https://graph.microsoft.com/v1.0/users/private%2Btag%40example.test?$select=id"
+            )
+            assert req.get_header("Authorization") == f"Bearer {self.TOKEN}"
+            assert req.get_method() == "GET"
+            assert "resolved 1 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+
+    @pytest.mark.parametrize("failure", [404, 403, "token", "timeout", "network", "malformed"])
+    @pytest.mark.parametrize("mixed", [False, True], ids=["upn-only", "mixed"])
+    async def test_unresolved_denied_without_widening(
+        self, runtime, monkeypatch, caplog, failure, mixed
+    ):
+        import urllib.error
+
+        bridge = adapter_mod._import_bridge()
+        # Include sensitive text in error details to verify it is never logged.
+        detail = f"{self.UPN} {self.TOKEN}"
+        async with contextlib.AsyncExitStack() as stack:
+            # Mocks are installed by the fixture before connect runs.
+            token = bridge.acquire_token
+            fetch = bridge.urllib.request.urlopen
+            if isinstance(failure, int):
+                fetch.side_effect = urllib.error.HTTPError(
+                    f"https://graph/{detail}", failure, detail, {}, None
+                )
+            elif failure == "token":
+                token.side_effect = bridge.TokenAcquisitionError("AADSTS7000215", detail)
+            elif failure == "timeout":
+                fetch.side_effect = TimeoutError(detail)
+            elif failure == "network":
+                fetch.side_effect = urllib.error.URLError(detail)
+            else:
+                from io import BytesIO
+
+                fetch.side_effect = lambda *_a, **_kw: BytesIO(json.dumps({"id": detail}).encode())
+            users = (self.UPN, self.OTHER) if mixed else (self.UPN,)
+            rt = await stack.enter_async_context(runtime(users))
+            response = self.post(rt)
+            assert response.status_code == 403
+            assert response.json() == {"detail": "end user is not authorized"}
+            assert "inbound 403 reason=unauthorized-end-user" in caplog.text
+            assert rt.adapter._allow_all_users is False
+            assert rt.adapter._upn_resolver.effective_allowed_users() == users
+            assert rt.adapter._handled_events == []
+            if mixed:
+                assert self.post(rt, self.OTHER, activity_id="mixed").status_code == 200
+            token.assert_called_once()
+            assert fetch.call_count == (0 if failure == "token" else 1)
+            assert "resolved 0 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+            if failure == "token":
+                assert "status=AADSTS7000215" in caplog.text
+            elif isinstance(failure, int):
+                assert f"status={failure}" in caplog.text
+
+    @pytest.mark.parametrize("allow_all", [False, True], ids=["oid-only", "allow-all"])
+    async def test_no_resolver_or_graph_for_oid_only_and_allow_all(
+        self, runtime, caplog, allow_all
+    ):
+        users = () if allow_all else (self.OID,)
+        async with runtime(users, allow_all=allow_all) as rt:
+            assert self.post(rt).status_code == 200
+            assert getattr(rt.adapter, "_upn_resolver", None) is None
+            assert rt.created == []
+            rt.token.assert_not_called()
+            rt.fetch.assert_not_called()
+            assert "UPN/email" not in caplog.text
+            assert "allowlist Graph resolution" not in caplog.text
+
+    async def test_expiry_denies_during_single_background_refresh_and_after_failure(
+        self, runtime, caplog
+    ):
+        import threading
+        import urllib.error
+        from io import BytesIO
+
+        bridge = adapter_mod._import_bridge()
+        entered, release = threading.Event(), threading.Event()
+        async with runtime((self.UPN,)) as rt:
+            assert self.post(rt).status_code == 200
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+
+            def blocked(*_a, **_kw):
+                entered.set()
+                assert release.wait(5)
+                raise urllib.error.HTTPError("https://graph/", 403, self.UPN, {}, None)
+
+            rt.fetch.side_effect = blocked
+            try:
+                # The request completes even while Graph is blocked in another thread.
+                assert self.post(rt, activity_id="expired").status_code == 403
+                assert await asyncio.to_thread(entered.wait, 2)
+                for i in range(3):
+                    assert self.post(rt, activity_id=f"refreshing-{i}").status_code == 403
+                assert rt.fetch.call_count == 2
+                assert rt.token.call_count == 2
+            finally:
+                release.set()
+
+            async def wait_refresh():
+                await rt.adapter._upn_resolver._refresh_task
+
+            rt.client.portal.call(wait_refresh)
+            assert rt.adapter._upn_resolver.effective_allowed_users() == (self.UPN,)
+            assert self.post(rt, activity_id="failed-refresh").status_code == 403
+            assert rt.fetch.call_count == 2
+            assert "resolved 0 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+            rt.fetch.side_effect = lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode())
+            assert self.post(rt, activity_id="retry").status_code == 403
+            rt.client.portal.call(wait_refresh)
+            assert self.post(rt, activity_id="recovered").status_code == 200
+            assert rt.fetch.call_count == 3
+            assert rt.token.call_count == 3

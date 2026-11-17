@@ -98,7 +98,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1602,7 +1604,7 @@ class SenderAllowlist:
 
 
 def sender_allowlist_path_b_warning(policy: SenderAllowlist) -> str | None:
-    """Describe UPN/email entries unavailable on Path B, without exposing values."""
+    """Describe Path B UPN/email resolution requirements without exposing values."""
     if policy.allow_all_users or not policy.allowed_users:
         return None
     alias_count = sum("@" in entry for entry in policy.allowed_users)
@@ -1613,10 +1615,89 @@ def sender_allowlist_path_b_warning(policy: SenderAllowlist) -> str | None:
     else:
         prefix = f"A365_ALLOWED_USERS contains {alias_count} UPN/email entries"
     return (
-        f"{prefix}; these entries cannot match Path B Teams or Copilot senders "
-        "because those activities carry object IDs (aadObjectId), not UPN/email aliases. "
-        "A365_ALLOWED_USERS should list Entra object IDs for Path B."
+        f"{prefix}; Path B activities carry object IDs (aadObjectId). UPN/email entries "
+        "are resolved through Microsoft Graph with User.ReadBasic.All (application); "
+        "otherwise they match nobody on Path B."
     )
+
+
+UPN_OBJECT_ID_TTL_SECONDS = 3600
+
+
+class UpnObjectIdResolver:
+    """Cache Graph aliases separately from the configured sender policy."""
+
+    def __init__(self, cfg: BridgeConfig, *, fetch: Any = None, clock: Any = time.monotonic):
+        self._cfg, self._fetch, self._clock = cfg, fetch or urllib.request.urlopen, clock
+        self._cache = {entry: (None, 0.0) for entry in cfg.allowed_users if "@" in entry}
+        self._refresh_task: asyncio.Task | None = None
+
+    @staticmethod
+    def _log_error(exc: Exception) -> None:
+        code = str(getattr(exc, "code", ""))
+        safe_code = code if re.fullmatch(r"(?:[1-5][0-9]{2}|AADSTS[0-9]+)", code) else "unavailable"
+        logger.warning("allowlist Graph resolution failed status=%s", safe_code)
+
+    def refresh(self) -> None:
+        due = [entry for entry, (_, expiry) in self._cache.items() if expiry <= self._clock()]
+        if not due:
+            return
+        token = None
+        try:
+            token = acquire_token(
+                tenant_id=self._cfg.tenant_id,
+                client_id=self._cfg.bf_app_id or self._cfg.blueprint_client_id,
+                client_secret=self._cfg.bf_client_secret or self._cfg.blueprint_client_secret,
+                resource=GRAPH_RESOURCE,
+            )["access_token"]
+        except Exception as exc:
+            self._log_error(exc)
+        updates = {}
+        for entry in due:
+            oid = None
+            if token:
+                try:
+                    encoded = urllib.parse.quote(entry, safe="")
+                    url = f"{GRAPH_RESOURCE}/v1.0/users/{encoded}?$select=id"
+                    request = urllib.request.Request(
+                        url, headers={"Authorization": f"Bearer {token}"}
+                    )
+                    with self._fetch(request, timeout=15) as response:
+                        raw = json.loads(response.read())["id"]
+                    if not isinstance(raw, str) or not re.fullmatch(
+                        r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", raw.lower()
+                    ):
+                        raise ValueError("invalid object ID")
+                    oid = raw.lower()
+                except Exception as exc:
+                    self._log_error(exc)
+            updates[entry] = (oid, self._clock() + UPN_OBJECT_ID_TTL_SECONDS)
+        self._cache = {**self._cache, **updates}
+        resolved = sum(
+            oid is not None and expiry > self._clock() for oid, expiry in self._cache.values()
+        )
+        log = logger.info if resolved == len(self._cache) else logger.warning
+        log(
+            "resolved %d of %d UPN/email allowlist entries to object IDs; "
+            "%d unresolved entries match no Path B sender "
+            "(Graph User.ReadBasic.All application permission required)",
+            resolved,
+            len(self._cache),
+            len(self._cache) - resolved,
+        )
+
+    def effective_allowed_users(self) -> tuple[str, ...]:
+        return self._cfg.allowed_users + tuple(
+            oid
+            for oid, expiry in self._cache.values()
+            if oid is not None and expiry > self._clock()
+        )
+
+    def refresh_in_background(self) -> None:
+        if (self._refresh_task is None or self._refresh_task.done()) and any(
+            expiry <= self._clock() for _, expiry in self._cache.values()
+        ):
+            self._refresh_task = asyncio.create_task(asyncio.to_thread(self.refresh))
 
 
 def _allowlist_env_view(env: Mapping[str, str]) -> dict[str, str]:
@@ -4058,8 +4139,14 @@ def make_app(
             max_entries=cfg.idempotency_max_entries,
         )
 
+    upn_resolver = None
+
     @asynccontextmanager
     async def _serve_lifespan(_app: Any):
+        nonlocal upn_resolver
+        if not cfg.allow_all_users and any("@" in entry for entry in cfg.allowed_users):
+            upn_resolver = UpnObjectIdResolver(cfg)
+            await asyncio.to_thread(upn_resolver.refresh)
         try:
             yield
         finally:
@@ -4188,9 +4275,13 @@ def make_app(
         # side effect. JWT-authenticated platform lifecycle/control activities do
         # not carry an end-user principal and are acknowledged separately.
         if _activity_requires_end_user_auth(activity):
+            allowed_users = cfg.allowed_users
+            if upn_resolver is not None:
+                allowed_users = upn_resolver.effective_allowed_users()
+                upn_resolver.refresh_in_background()
             if not _activity_user_authorized(
                 activity,
-                allowed_users=cfg.allowed_users,
+                allowed_users=allowed_users,
                 allow_all=cfg.allow_all_users,
                 claims=inbound_claims,
             ):

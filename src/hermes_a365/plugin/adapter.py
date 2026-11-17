@@ -1908,6 +1908,7 @@ class Agent365Adapter(BasePlatformAdapter):
         sender_policy = self._load_sender_allowlist()
         self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
         self._allow_all_users = sender_policy.allow_all_users
+        self._upn_resolver: Any = None
         self._sender_allowlist_configured = sender_policy.configured
         self._allow_client_bf_channels = self._load_allow_client_bf_channels(extra)
         self._reactions_dispatch_agent_turn = _extra_bool(
@@ -2693,9 +2694,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 # AAD object id or UPN, and that sender is still admitted.
                 # The event identity is then the listed alias. On allow-all,
                 # the Hermes-true alias chosen above stays the event identity.
+                allowed_users = self._allowed_users
+                if self._upn_resolver is not None:
+                    allowed_users = self._upn_resolver.effective_allowed_users()
+                    self._upn_resolver.refresh_in_background()
                 local_ok = bridge._activity_user_authorized(
                     activity,
-                    allowed_users=self._allowed_users,
+                    allowed_users=allowed_users,
                     allow_all=self._allow_all_users,
                     claims=claims,
                 )
@@ -2705,7 +2710,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     decision = True
                     if not self._allow_all_users:
                         allowed = {
-                            value.strip().lower() for value in self._allowed_users if value.strip()
+                            value.strip().lower() for value in allowed_users if value.strip()
                         }
                         listed = [sender_id for sender_id in sender_ids if sender_id in allowed]
                         if listed:
@@ -3694,6 +3699,9 @@ class Agent365Adapter(BasePlatformAdapter):
             # shared gateway loop so other platforms and the gateway connect
             # watchdog continue to run.
             self._bridge_cfg = await asyncio.to_thread(self._make_bridge_config)
+            if not self._allow_all_users and any("@" in entry for entry in self._allowed_users):
+                self._upn_resolver = bridge.UpnObjectIdResolver(self._bridge_cfg)
+                await asyncio.to_thread(self._upn_resolver.refresh)
             self._prepare_bridge_pid_publication()
         except RuntimeError as e:
             logger.error("agent365 adapter config error: %s", e)
@@ -16641,8 +16649,9 @@ def interactive_setup() -> None:
     print_info("Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user.")
     print_info(
         "Production: set A365_ALLOWED_USERS to Entra object IDs (aadObjectId) for "
-        "Path B senders. UPN/email entries match only when the activity carries them; "
-        "Path B Teams and Copilot activities do not."
+        "Path B senders. UPN/email entries resolve through Graph with User.ReadBasic.All "
+        "(application, admin consent) on A365_BF_APP_ID when set, else the blueprint; "
+        "without it they match no Path B sender."
     )
     allow_all = prompt_yes_no(
         "Allow all users (testing only)?",
@@ -16655,7 +16664,7 @@ def interactive_setup() -> None:
     else:
         save_env_value("A365_ALLOW_ALL_USERS", "false")
         allowed = prompt(
-            "Allowed users (comma-separated Entra object IDs for Path B; "
+            "Allowed users (comma-separated Entra object IDs or UPN/email; "
             "blank = deny everyone)",
             default=get_env_value("A365_ALLOWED_USERS") or "",
         )
