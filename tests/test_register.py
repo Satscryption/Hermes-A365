@@ -12,6 +12,7 @@ import sys
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -73,6 +74,7 @@ def _build_plugin_parent_parser() -> argparse.ArgumentParser:
     a365_p = subs.add_parser("a365")
     plugin_cli.register_cli(a365_p)
     return parent
+
 
 # ---------------------------------------------------------------------------
 # Fakes
@@ -1197,6 +1199,101 @@ class TestApplyAADSTSConsentDeferred:
         with pytest.raises(AADSTSError) as excinfo:
             apply_register_plan(plan, mutator=mutator)
         assert excinfo.value.code == "AADSTS65001"
+
+
+class TestConsentWaitTimeout:
+    @pytest.mark.parametrize("binding", ["missing", "created", "refused"])
+    def test_blueprint_timeout_defers_and_binds_created_blueprint(
+        self, tmp_path, monkeypatch, binding
+    ):
+        from hermes_a365.mutator import ConsentWaitTimeout
+
+        plan = build_register_plan(
+            RegisterInputs(agent_name="Inbox Helper", tenant_id=_TEST_TENANT)
+        )
+        mutator = FakeMutator(scripted=[ConsentWaitTimeout(plan.steps[0].argv, 900.0)])
+        generated = tmp_path / "generated.json"
+        home = tmp_path / "hermes"
+        getter = MagicMock()
+        app_id = "bbbb1111-0000-0000-0000-000000000001"
+        if binding == "missing":
+            generated.write_text("{}")
+        elif binding == "refused":
+            generated.write_text("[]")
+        else:
+            generated.write_text(json.dumps({"agentBlueprintId": app_id}))
+            getter.return_value = {
+                "appId": app_id,
+                "id": app_id,
+                "displayName": "Inbox Helper Blueprint",
+                "signInAudience": "AzureADMyOrg",
+                "@odata.type": "#microsoft.graph.agentIdentityBlueprint",
+            }
+        monkeypatch.setattr(
+            "hermes_a365.register.resolve_registration",
+            lambda *args, **kwargs: RegistrationDecision(
+                action="create",
+                step_names=tuple(s.name for s in plan.steps),
+                reason=None,
+                messages=(),
+            ),
+        )
+        result = apply_register_plan(
+            plan,
+            mutator=mutator,
+            hermes_home=home,
+            graph_get=getter,
+            generated_config_path=generated,
+        )
+        assert result.consent_deferred is True
+        assert result.completed == []
+        assert result.raw_outputs == {}
+        assert result.not_run == ["blueprint", "permissions-mcp", "permissions-bot"]
+        assert result.messages[-2] == (
+            "[apply] blueprint: deferred — admin consent was not completed before "
+            "the a365 wait timed out. Run `hermes a365 consent`, then re-run."
+        )
+        assert [argv for argv in mutator.calls if argv[0] == "a365"] == [plan.steps[0].argv]
+        if binding == "created":
+            from hermes_a365.entra_state import load_anchor_app_id
+
+            assert load_anchor_app_id(home, "Inbox Helper") == app_id
+            assert "recorded per-agent A365_APP_ID" in result.messages[-1]
+            assert getter.call_count == 2
+        else:
+            getter.assert_not_called()
+            assert ("not recorded" if binding == "missing" else "not a JSON object") in (
+                result.messages[-1]
+            )
+
+    @pytest.mark.parametrize("consent_wait", [True, False])
+    def test_run_apply_timeout_exits_cleanly(self, tmp_path, monkeypatch, capsys, consent_wait):
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "hermes"))
+        argv = ["a365", "setup", "blueprint", "--private-argument"]
+        error_type = subprocess.TimeoutExpired
+        if consent_wait:
+            from hermes_a365.mutator import ConsentWaitTimeout
+
+            error_type = ConsentWaitTimeout
+        mutator = FakeMutator(scripted=[error_type(argv, 900.0, output="PRIVATE-OUTPUT")])
+        monkeypatch.setattr("hermes_a365.register.get_mutator", lambda: mutator)
+        args = build_parser().parse_args(
+            ["--agent-name", "Inbox Helper", "--tenant-id", _TEST_TENANT, "--apply"]
+        )
+        assert run(args) == (1 if consent_wait else 2)
+        out, err = capsys.readouterr()
+        assert "Traceback" not in out + err
+        assert "PRIVATE-OUTPUT" not in out + err
+        assert "private-argument" not in out + err
+        if consent_wait:
+            assert "Next: run `hermes a365 consent`" in out
+            assert "[apply] blueprint: deferred" in out
+            assert err == ""
+        else:
+            assert err == "ERROR: a365 step timed out after 900 s (a365 setup blueprint)\n"
+            assert "Next: run `hermes a365 consent`" not in out
+        assert len([call for call in mutator.calls if call[0] == "a365"]) == 1
 
 
 class TestApplyAADSTS500011Retry:

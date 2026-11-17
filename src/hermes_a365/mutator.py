@@ -76,6 +76,10 @@ class AADSTSError(RuntimeError):
         self.message = message
 
 
+class ConsentWaitTimeout(subprocess.TimeoutExpired):
+    """Raised when a sensitive CLI run times out after announcing admin consent."""
+
+
 class CliInvocationError(RuntimeError):
     """Raised on a non-zero CLI exit that doesn't surface an AADSTS code."""
 
@@ -292,6 +296,8 @@ def _release(exc: BaseException) -> None:
 
 
 def _classify(exc: BaseException) -> tuple[str, int | None]:
+    if isinstance(exc, ConsentWaitTimeout):
+        return ("consent_wait_timeout", None)
     if isinstance(exc, (_Deadline, subprocess.TimeoutExpired)):
         return ("timeout", None)
     if isinstance(exc, _CaptureLimit):
@@ -326,6 +332,8 @@ def _raise_clean(
     graph_error: tuple[str, str] | None = None,
     aadsts_code: str | None = None,
 ) -> None:
+    if action == "consent_wait_timeout":
+        raise ConsentWaitTimeout(cmd=list(argv), timeout=timeout)
     if action == "timeout":
         raise subprocess.TimeoutExpired(cmd=list(argv), timeout=timeout)
     if action == "keyboard_interrupt":
@@ -367,7 +375,7 @@ def _raise_clean(
     raise RuntimeError(f"unknown clean-raise action: {action!r}")
 
 
-_ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;?0-9;]*[ -/]*[@-~]")
+_ANSI_ESCAPE_RE = re.compile(r"\x1b(?:\[[0-9;?0-9;]*[ -/]*[@-~]|[=>])")
 
 _DEVICE_LOGIN_LINE_RE = re.compile(
     r"^To sign in, use a web browser to open (?:the page )?"
@@ -379,7 +387,7 @@ _DEVICE_LOGIN_LINE_RE = re.compile(
 )
 
 # Recognize only the CLI's consent-wait prefix; never echo its trailing data.
-_ADMIN_CONSENT_WAIT_RE = re.compile(r"^Opening browser for admin consent(?:\.{3}|\s|$)")
+_ADMIN_CONSENT_WAIT_RE = re.compile(r"^\s*Opening browser for admin consent(?:\.{3}|\s|$)")
 _ADMIN_CONSENT_WAIT_NOTICE = (
     "a365 is waiting for admin consent (a browser may open). Complete consent, "
     "or run `hermes a365 consent <agent-name>` from another shell "
@@ -858,6 +866,8 @@ def _run_pumped_output(pump: _Pump) -> tuple[int, str]:
             break
 
     if hit_deadline or pump.stdin_truncated:
+        if consent_notice_emitted:
+            raise ConsentWaitTimeout(cmd=list(pump.argv), timeout=pump.timeout)
         raise _Deadline()
 
     with contextlib.suppress(subprocess.TimeoutExpired):

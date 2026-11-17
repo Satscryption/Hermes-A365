@@ -48,6 +48,7 @@ import json
 import os
 import shlex
 import stat
+import subprocess
 import sys
 import time
 from collections.abc import Callable
@@ -83,6 +84,7 @@ from .mutator import (
     AADSTS_LICENSE_NOT_PROPAGATED,
     AADSTSError,
     CliInvocationError,
+    ConsentWaitTimeout,
     Mutator,
     RunResult,
     get_mutator,
@@ -142,6 +144,7 @@ def _wrap_removed_aiteammate_guard(parser: argparse.ArgumentParser) -> None:
 
     parser.parse_known_args = parse_known_args  # type: ignore[method-assign]
     parser._removed_aiteammate_wrapped = True
+
 
 GENERATED_CONFIG_FILENAME = "a365.generated.config.json"
 
@@ -489,6 +492,27 @@ def apply_register_plan(
                 sleep_fn=sleep_fn,
                 sensitive=step.name == "blueprint",
             )
+        except ConsentWaitTimeout:
+            result.consent_deferred = True
+            result.not_run = [s.name for s in plan.steps[i:]]
+            result.messages.append(
+                f"[apply] {step.name}: deferred — admin consent was not completed "
+                "before the a365 wait timed out. Run `hermes a365 consent`, then re-run."
+            )
+            if step.name == "blueprint":
+                try:
+                    result.messages.append(
+                        _bind_created_blueprint(
+                            graph_get=getter,
+                            hermes_home=home,
+                            agent_name=plan.inputs.agent_name,
+                            generated_config_path=generated_config_path
+                            or Path(GENERATED_CONFIG_FILENAME),
+                        )
+                    )
+                except RegisterError as e:
+                    result.messages.append(str(e))
+            return result
         except AADSTSError as e:
             if e.code == AADSTS_CONSENT_REQUIRED:
                 result.consent_deferred = True
@@ -1052,6 +1076,10 @@ def run(args: argparse.Namespace) -> int:
             hermes_home=home,
             update_permissions=args.update_permissions,
         )
+    except subprocess.TimeoutExpired as e:
+        command = shlex.join(e.cmd[:3])
+        print(f"ERROR: a365 step timed out after {e.timeout:g} s ({command})", file=sys.stderr)
+        return 2
     except AADSTSError as e:
         print(f"ERROR {e.code}: {e.message}", file=sys.stderr)
         return 2

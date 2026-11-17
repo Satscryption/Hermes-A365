@@ -418,6 +418,76 @@ class TestSensitiveAdminConsent:
         "details are in the a365 setup log.\n"
     )
 
+    @pytest.fixture
+    def fake_sensitive_child(self, monkeypatch: pytest.MonkeyPatch):
+        import hermes_a365.mutator as mod
+
+        def install(output: str, *, deadline: bool = False) -> None:
+            def child(argv, *, timeout, **kwargs):
+                proc = MagicMock(returncode=0)
+                proc.poll.return_value = 0
+                events = queue.Queue()
+                events.put(("stdout", output.encode()))
+                events.put(("stdout", None))
+                pump = _Pump(
+                    proc=proc,
+                    argv=argv,
+                    timeout=timeout,
+                    streams=("stdout",),
+                    echo="device_login",
+                    sensitive=True,
+                    stop=threading.Event(),
+                    out_q=events,
+                    threads=[],
+                    buffers={"stdout": _LineBuffer()},
+                    eof_seen={"stdout": False},
+                    emitted_logins=set(),
+                    captured=[],
+                    deadline=1.0,
+                )
+                clock = iter([0.0, 2.0] if deadline else [0.0, 0.0])
+                monkeypatch.setattr(mod.time, "monotonic", lambda: next(clock))
+                return mod._run_pumped_output(pump)
+
+            monkeypatch.setattr(mod, "_run_child_output", child)
+
+        return install
+
+    @pytest.mark.parametrize("prefix", ["    ", "\x1b[?1h\x1b=    ", "\x1b>    "])
+    def test_indented_consent_wait_emits_only_fixed_notice(
+        self, fake_sensitive_child, capsys, prefix
+    ):
+        line = prefix + "Opening browser for admin consent... PRIVATE-URL SECRET\n"
+        fake_sensitive_child(line * 2 + "PRIVATE-SCOPE\n")
+        m = A365CliMutator()
+        m.available = True
+        for _ in range(2):
+            m.run(["a365", "setup", "blueprint"], sensitive=True)
+            assert capsys.readouterr() == (self._NOTICE, "")
+
+    def test_consent_deadline_subclass_and_unmarked_timeout(self, fake_sensitive_child, capsys):
+        import hermes_a365.mutator as mod
+
+        argv = ["a365", "setup", "blueprint"]
+        m = A365CliMutator()
+        m.available = True
+        for saw_wait in (True, False):
+            output = "Opening browser for admin consent... SECRET\n" if saw_wait else "SECRET\n"
+            fake_sensitive_child(output, deadline=True)
+            with pytest.raises(subprocess.TimeoutExpired) as excinfo:
+                m.run(argv, timeout=900.0, sensitive=True)
+            exc = excinfo.value
+            assert type(exc).__name__ == ("ConsentWaitTimeout" if saw_wait else "TimeoutExpired")
+            if saw_wait:
+                assert isinstance(exc, mod.ConsentWaitTimeout)
+            else:
+                assert not isinstance(exc, mod.ConsentWaitTimeout)
+            assert exc.cmd == argv
+            assert exc.timeout == 900.0
+            assert exc.output is exc.stderr is None
+            _assert_marker_absent_from_failure_artifacts(exc, "SECRET")
+            assert capsys.readouterr() == (self._NOTICE if saw_wait else "", "")
+
     def test_notice_shows_required_consent_argument(self) -> None:
         from hermes_a365.mutator import _ADMIN_CONSENT_WAIT_NOTICE
 
