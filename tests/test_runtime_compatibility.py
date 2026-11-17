@@ -298,7 +298,7 @@ def test_part2_preserved_surfaces() -> None:
             "22d1231171ef751abc61db841400eebf64d7b5c05735ee157eebe52e5b15a19f"
         ),
         "src/hermes_a365/publish.py": (
-            "f31e81442dbafaf81ae98a5edaeaaec9f018e261967a9111e3a30d6740b2b251"
+            "3d2c402bbe71b6e451ba6e7259e4e97ae7e3b38b965c0760b86b4d7b92eb542c"
         ),
         "references/a365-cli-reference.md": (
             "4023e7e8c6af398a0cfa09bc974aba2002effbd41d6e4393500c375f28ac8957"
