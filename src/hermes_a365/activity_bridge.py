@@ -1546,6 +1546,8 @@ class BridgeConfig:
     # Their app id may be minted under only when the operator listed it.
     # Empty means "blueprint id only" (deny-by-default).
     agent_identity_ids: tuple[str, ...] = ()
+    # Original UPN/email spelling for Hermes core authorization.
+    allowed_user_aliases: tuple[str, ...] = field(default=(), repr=False)
 
 
 def parse_agent_identity_ids(raw: Any) -> tuple[str, ...]:
@@ -1601,6 +1603,7 @@ class SenderAllowlist:
     allowed_users: tuple[str, ...] = ()
     allow_all_users: bool = False
     configured: bool = False
+    allowed_user_aliases: tuple[str, ...] = field(default=(), repr=False, compare=False)
 
 
 def sender_allowlist_path_b_warning(policy: SenderAllowlist) -> str | None:
@@ -1693,6 +1696,15 @@ class UpnObjectIdResolver:
             if oid is not None and expiry > self._clock()
         )
 
+    def resolved_aliases(self) -> dict[str, str]:
+        """Map live resolved object IDs to the configured UPN/email spelling."""
+        aliases = {entry.lower(): entry for entry in self._cfg.allowed_user_aliases}
+        return {
+            oid: aliases.get(entry.lower(), entry)
+            for entry, (oid, expiry) in self._cache.items()
+            if oid is not None and expiry > self._clock()
+        }
+
     def refresh_in_background(self) -> None:
         if (self._refresh_task is None or self._refresh_task.done()) and any(
             expiry <= self._clock() for _, expiry in self._cache.values()
@@ -1756,6 +1768,7 @@ def parse_sender_allowlist(env: Mapping[str, str], *, source: str) -> SenderAllo
         allowed_users=users,
         allow_all_users=allow_all,
         configured=True,
+        allowed_user_aliases=tuple(part.strip() for part in users_raw.split(",") if "@" in part),
     )
 
 
@@ -2039,6 +2052,7 @@ def load_bridge_config(
         bf_app_id=bf_app_id,
         bf_client_secret=bf_client_secret,
         allowed_users=sender_policy.allowed_users,
+        allowed_user_aliases=sender_policy.allowed_user_aliases,
         allow_all_users=sender_policy.allow_all_users,
         sender_allowlist_configured=sender_policy.configured,
         allow_client_bf_channels=allow_client_bf_channels,

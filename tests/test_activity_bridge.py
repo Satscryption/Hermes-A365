@@ -5309,6 +5309,34 @@ class TestUpnObjectIdResolver:
     UPN = "private+tag/alias#x@example.test"
     OID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
 
+    @pytest.mark.parametrize("state", ["resolved", "expired", "unresolved"])
+    def test_resolved_alias_mapping_preserves_configured_spelling(self, monkeypatch, state):
+        from hermes_a365 import activity_bridge as bridge
+
+        configured = self.UPN.upper()
+        policy = bridge.parse_sender_allowlist(
+            {"A365_ALLOWED_USERS": configured}, source="test env"
+        )
+        cfg = _cfg()
+        cfg.allowed_users = policy.allowed_users
+        cfg.allowed_user_aliases = getattr(policy, "allowed_user_aliases", ())
+        clock = [10.0]
+        monkeypatch.setattr(bridge, "acquire_token", lambda **_kw: {"access_token": "token"})
+        resolver = bridge.UpnObjectIdResolver(
+            cfg,
+            fetch=lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode()),
+            clock=lambda: clock[0],
+        )
+        if state != "unresolved":
+            resolver.refresh()
+        if state == "expired":
+            clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+        expected = {self.OID: configured} if state == "resolved" else {}
+        assert resolver.resolved_aliases() == expected
+        # Callers receive a snapshot and cannot mutate the cache through it.
+        resolver.resolved_aliases().clear()
+        assert resolver.resolved_aliases() == expected
+
     def test_partial_resolution_caches_each_entry_and_preserves_literals(self, monkeypatch, caplog):
         import logging
 

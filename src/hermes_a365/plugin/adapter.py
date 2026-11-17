@@ -1907,6 +1907,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # gateway has no slug.
         sender_policy = self._load_sender_allowlist()
         self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
+        self._allowed_user_aliases = sender_policy.allowed_user_aliases
         self._allow_all_users = sender_policy.allow_all_users
         self._upn_resolver: Any = None
         self._sender_allowlist_configured = sender_policy.configured
@@ -2459,6 +2460,7 @@ class Agent365Adapter(BasePlatformAdapter):
             idempotency_max_entries=self._idempotency_max_entries,
             agent_identity_ids=bridge.parse_agent_identity_ids(raw_identity_ids),
             allowed_users=self._allowed_users,
+            allowed_user_aliases=self._allowed_user_aliases,
             allow_all_users=self._allow_all_users,
             sender_allowlist_configured=self._sender_allowlist_configured,
             allow_client_bf_channels=self._allow_client_bf_channels,
@@ -2695,8 +2697,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 # The event identity is then the listed alias. On allow-all,
                 # the Hermes-true alias chosen above stays the event identity.
                 allowed_users = self._allowed_users
+                aliases = {}
                 if self._upn_resolver is not None:
-                    allowed_users = self._upn_resolver.effective_allowed_users()
+                    aliases = self._upn_resolver.resolved_aliases()
+                    allowed_users += tuple(aliases)
                     self._upn_resolver.refresh_in_background()
                 local_ok = bridge._activity_user_authorized(
                     activity,
@@ -2710,11 +2714,17 @@ class Agent365Adapter(BasePlatformAdapter):
                     decision = True
                     if not self._allow_all_users:
                         allowed = {
-                            value.strip().lower() for value in allowed_users if value.strip()
+                            value.strip().lower() for value in self._allowed_users if value.strip()
                         }
                         listed = [sender_id for sender_id in sender_ids if sender_id in allowed]
                         if listed:
                             authorized_sender_id = listed[0]
+                        elif aliases:
+                            authorized_sender_id = next(
+                                aliases[sender_id]
+                                for sender_id in sender_ids
+                                if sender_id in aliases
+                            )
                 if not decision:
                     logger.warning("inbound 403 reason=unauthorized-end-user")
                     raise HTTPException(status_code=403, detail="end user is not authorized")
@@ -12949,6 +12959,13 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         return bool(str(row.get("id") or ""))
 
+    def _core_user_identity(self, user_id: str) -> str:
+        """Use the configured alias only for a resolver-only object ID match."""
+        upn = self._upn_resolver
+        if upn is not None and not self._allow_all_users and user_id not in self._allowed_users:
+            return upn.resolved_aliases().get(user_id, user_id)
+        return user_id
+
     def _lookup_live_origin_session(
         self,
         *,
@@ -12965,6 +12982,7 @@ class Agent365Adapter(BasePlatformAdapter):
         """
         if not conversation_id or not user_id:
             return None
+        user_id = self._core_user_identity(user_id)
         platform = str(getattr(self.platform, "value", "") or "")
         if not platform:
             return None
@@ -13162,7 +13180,7 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_name=chat_id,
             chat_type=_import_bridge()._activity_chat_type(activity),
-            user_id=_normalized_token(record.get("user_aad")),
+            user_id=self._core_user_identity(_normalized_token(record.get("user_aad"))),
             user_name=str(sender.get("name") or ""),
             message_id=reply_activity_id,
         )

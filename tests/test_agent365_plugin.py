@@ -32739,7 +32739,15 @@ class TestUpnObjectIdAllowlist:
         @contextlib.asynccontextmanager
         async def start(users, *, allow_all=False, bf=False):
             a = _make_adapter(monkeypatch)
-            a._allowed_users, a._allow_all_users = users, allow_all
+            monkeypatch.setenv("A365_ALLOWED_USERS", ",".join(users))
+            monkeypatch.setenv("A365_ALLOW_ALL_USERS", str(allow_all).lower())
+            (a._hermes_home / ".env").write_text(
+                f"A365_ALLOWED_USERS={','.join(users)}\n"
+                f"A365_ALLOW_ALL_USERS={str(allow_all).lower()}\n"
+            )
+            policy = a._load_sender_allowlist()
+            a._allowed_users, a._allow_all_users = policy.allowed_users, policy.allow_all_users
+            a._allowed_user_aliases = getattr(policy, "allowed_user_aliases", ())
             if bf:
                 a.bf_app_id, a.bf_client_secret = "bf-app", "bf-secret"
             a._http_client = httpx.AsyncClient(
@@ -32763,6 +32771,9 @@ class TestUpnObjectIdAllowlist:
         yield start
         for record in caplog.records:
             assert self.UPN not in repr(record.__dict__)
+            assert self.UPN.upper() not in repr(record.__dict__)
+            assert self.OID not in repr(record.__dict__)
+            assert self.OID.upper() not in repr(record.__dict__)
             assert self.TOKEN not in repr(record.__dict__)
 
     def post(self, rt, oid=None, *, activity_id="act-1"):
@@ -32776,7 +32787,7 @@ class TestUpnObjectIdAllowlist:
     async def test_resolves_path_b_sender_and_selects_listed_alias(self, runtime, caplog, bf):
         async with runtime((self.UPN,), bf=bf) as rt:
             assert self.post(rt).status_code == 200
-            assert rt.adapter._handled_events[-1].source.user_id == self.OID
+            assert rt.adapter._handled_events[-1].source.user_id == self.UPN
             assert rt.adapter._allowed_users == (self.UPN,)
             assert rt.adapter._bridge_cfg.allowed_users == (self.UPN,)
             assert rt.adapter._allow_all_users is False
@@ -32796,6 +32807,32 @@ class TestUpnObjectIdAllowlist:
             assert req.get_header("Authorization") == f"Bearer {self.TOKEN}"
             assert req.get_method() == "GET"
             assert "resolved 1 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("users", "expected"),
+        [
+            ((UPN.upper(),), UPN.upper()),
+            ((UPN, OID), OID),
+            ((OID, UPN), OID),
+            ((UPN, "29:opaque"), "29:opaque"),
+        ],
+        ids=["configured-spelling", "mixed-upn-first", "mixed-oid-first", "direct-candidate"],
+    )
+    async def test_core_identity_matches_raw_allowlist(self, runtime, monkeypatch, users, expected):
+        raw = ",".join(users)
+        async with runtime(users) as rt:
+            # The route's Hermes check returns True; core checks the resulting event again.
+            core_turns = []
+
+            async def core_gate(event):
+                if event.source.user_id in os.environ["A365_ALLOWED_USERS"].split(","):
+                    core_turns.append(event)
+
+            monkeypatch.setattr(rt.adapter, "handle_message", core_gate)
+            assert os.environ["A365_ALLOWED_USERS"] == raw
+            assert self.post(rt).status_code == 200
+            assert len(core_turns) == 1
+            assert core_turns[0].source.user_id == expected
 
     @pytest.mark.parametrize("failure", [404, 403, "token", "timeout", "network", "malformed"])
     @pytest.mark.parametrize("mixed", [False, True], ids=["upn-only", "mixed"])
@@ -32844,6 +32881,54 @@ class TestUpnObjectIdAllowlist:
             elif isinstance(failure, int):
                 assert f"status={failure}" in caplog.text
 
+    async def test_path_b_reaction_turn_uses_configured_alias(self, runtime):
+        async with runtime((self.UPN.upper(),)) as rt:
+            assert self.post(rt).status_code == 200
+            rt.adapter._reactions_dispatch_agent_turn = True
+            rt.adapter._remember_bot_reply("reply-1", conversation_id="conv-1")
+            activity = _reaction_activity()
+            activity["from"] = {"id": "29:opaque", "aadObjectId": self.OID}
+            activity["recipient"] = {"id": "bot-1"}
+            response = rt.client.post(
+                "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+            )
+            assert response.status_code == 200
+            assert response.json() == {"status": "acked", "reactions": 1}
+            assert len(rt.adapter._handled_events) == 2
+            event = rt.adapter._handled_events[-1]
+            assert event.text == "reaction:added:like"
+            assert event.source.user_id == self.UPN.upper()
+
+    @pytest.mark.parametrize("direct_oid", [False, True], ids=["resolved-alias", "direct-oid"])
+    async def test_path_b_handoff_event_uses_listed_identity(
+        self, runtime, monkeypatch, direct_oid
+    ):
+        users = (self.UPN.upper(), self.OID) if direct_oid else (self.UPN.upper(),)
+        async with runtime(users) as rt:
+            activity = _make_inbound(path="B")
+            activity["from"] = {"id": "29:opaque", "aadObjectId": self.OID}
+            ctx = SimpleNamespace(activity=activity, conv=activity["conversation"], path_tag="B")
+            event = rt.adapter._build_handoff_message_event(
+                ctx, {"user_aad": self.OID, "hermes_session_id": "session-1"}, reply_activity_id=""
+            )
+            assert event.source.user_id == (self.OID if direct_oid else self.UPN.upper())
+            assert event.source.user_id in users
+            db = MagicMock()
+            db.find_session_by_origin.return_value = "session-1"
+            db.get_session.return_value = {
+                "id": "session-1",
+                "source": rt.adapter.platform.value,
+                "chat_id": ctx.conv["id"],
+                "user_id": event.source.user_id,
+                "session_key": "origin-key",
+            }
+            monkeypatch.setattr(rt.adapter, "_open_handoff_session_db", lambda: db)
+            monkeypatch.setattr(rt.adapter, "_close_handoff_session_db", lambda _db: None)
+            assert rt.adapter._lookup_live_origin_session(
+                conversation_id=ctx.conv["id"], user_id=self.OID
+            ) == "session-1"
+            assert db.find_session_by_origin.call_args.kwargs["user_id"] == event.source.user_id
+
     @pytest.mark.parametrize("allow_all", [False, True], ids=["oid-only", "allow-all"])
     async def test_no_resolver_or_graph_for_oid_only_and_allow_all(
         self, runtime, caplog, allow_all
@@ -32851,6 +32936,7 @@ class TestUpnObjectIdAllowlist:
         users = () if allow_all else (self.OID,)
         async with runtime(users, allow_all=allow_all) as rt:
             assert self.post(rt).status_code == 200
+            assert rt.adapter._handled_events[-1].source.user_id == self.OID
             assert getattr(rt.adapter, "_upn_resolver", None) is None
             assert rt.created == []
             rt.token.assert_not_called()
