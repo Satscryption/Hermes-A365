@@ -32929,6 +32929,56 @@ class TestUpnObjectIdAllowlist:
             ) == "session-1"
             assert db.find_session_by_origin.call_args.kwargs["user_id"] == event.source.user_id
 
+    @pytest.mark.parametrize(
+        ("users", "expected"),
+        [
+            ((UPN.upper(),), UPN.upper()),
+            ((UPN, OID), OID),
+            ((UPN, "29:opaque"), "29:opaque"),
+        ],
+        ids=["upn-only", "upn-plus-oid", "upn-plus-opaque"],
+    )
+    async def test_origin_lookup_matches_message_route_identity(
+        self, runtime, monkeypatch, users, expected
+    ):
+        async with runtime(users) as rt:
+            assert self.post(rt).status_code == 200
+            message_user_id = rt.adapter._handled_events[-1].source.user_id
+            assert message_user_id == expected
+            conv_id = rt.adapter._handled_events[-1].source.chat_id
+            db = MagicMock()
+            db.find_session_by_origin.return_value = "session-1"
+            db.get_session.return_value = {
+                "id": "session-1",
+                "source": rt.adapter.platform.value,
+                "chat_id": conv_id,
+                "user_id": message_user_id,
+                "session_key": "origin-key",
+            }
+            monkeypatch.setattr(rt.adapter, "_open_handoff_session_db", lambda: db)
+            monkeypatch.setattr(rt.adapter, "_close_handoff_session_db", lambda _db: None)
+            assert (
+                rt.adapter._lookup_live_origin_session(
+                    conversation_id=conv_id, user_id=self.OID
+                )
+                == "session-1"
+            )
+            assert db.find_session_by_origin.call_args.kwargs["user_id"] == message_user_id
+
+    async def test_direct_body_upn_keeps_configured_spelling(self, runtime, monkeypatch):
+        async with runtime((self.UPN.upper(),)) as rt:
+            activity = _make_inbound(path="B", activity_id="direct-upn-spelling")
+            activity["from"] = {
+                "id": "29:body-only",
+                "userPrincipalName": self.UPN.upper(),
+            }
+            response = rt.client.post(
+                "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+            )
+            assert response.status_code == 200
+            assert len(rt.adapter._handled_events) == 1
+            assert rt.adapter._handled_events[0].source.user_id == self.UPN.upper()
+
     @pytest.mark.parametrize("allow_all", [False, True], ids=["oid-only", "allow-all"])
     async def test_no_resolver_or_graph_for_oid_only_and_allow_all(
         self, runtime, caplog, allow_all
@@ -32987,5 +33037,6 @@ class TestUpnObjectIdAllowlist:
             assert self.post(rt, activity_id="retry").status_code == 403
             rt.client.portal.call(wait_refresh)
             assert self.post(rt, activity_id="recovered").status_code == 200
+            assert rt.adapter._handled_events[-1].source.user_id == self.UPN
             assert rt.fetch.call_count == 3
             assert rt.token.call_count == 3
