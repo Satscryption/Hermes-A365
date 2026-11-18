@@ -927,12 +927,13 @@ def _publish_state_manifest_id_mismatch_message(
     combined = bool(inputs.aiteammate and inputs.copilot_chat)
     if combined and not state_cea_catalog_id_minted:
         return (
-            base + "The stored id is the AI Teammate catalog id — do not pass "
-            "--manifest-id with that value on combined publishes. Omit "
+            base + "On combined --aiteammate --copilot-chat publishes, do not "
+            "reuse the AI Teammate catalog id; do not pass --manifest-id with "
+            "that value — the Copilot Chat catalog id must be distinct. Omit "
             "--manifest-id to mint a distinct CEA catalog id, remove or rename "
             "the state file, or pass a new --manifest-id with --app-version."
         )
-    if not combined and state_cea_catalog_id_minted:
+    if state_cea_catalog_id_minted:
         return (
             base + "Remove or rename the state file, or pass a new --manifest-id "
             "with --app-version for a separate catalog entry."

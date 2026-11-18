@@ -2806,11 +2806,6 @@ class TestApplyPublishPlanCopilotChat:
         def via_assert(source_id: str | None, **input_kw) -> str:
             inputs = PublishInputs(agent_name="X", manifest_id=target, **input_kw)
             assert inputs.copilot_chat
-            known_source = (
-                None
-                if source_id is None
-                else (aiteammate if source_id in (stored, aiteammate) else source_id)
-            )
             try:
                 _assert_publish_state_matches_catalog_id(
                     state_path,
@@ -2820,12 +2815,13 @@ class TestApplyPublishPlanCopilotChat:
                     profile=_PUBLISH_STATE_PROFILE,
                     inputs=inputs,
                     manifest_id_resolution=None,
-                    aiteammate_catalog_id=known_source,
+                    aiteammate_catalog_id=source_id,
                 )
             except PublishError as exc:
                 return str(exc)
             raise AssertionError("assert did not refuse")
 
+        unverified_collision = "The stored id is the AI Teammate catalog id"
         cases = [
             ({"copilot_chat": True}, False, path_b_stored),
             ({"copilot_chat": True}, True, path_b_stored),
@@ -2839,6 +2835,11 @@ class TestApplyPublishPlanCopilotChat:
                 True,
                 path_b_stored,
             ),
+            (
+                {"aiteammate": True, "copilot_chat": True},
+                True,
+                aiteammate,
+            ),
         ]
         for input_kw, minted, stored in cases:
             state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -2851,11 +2852,14 @@ class TestApplyPublishPlanCopilotChat:
                 profile=_PUBLISH_STATE_PROFILE,
                 cea_catalog_id_minted=minted,
             )
+            combined = bool(input_kw.get("aiteammate") and input_kw.get("copilot_chat"))
             for source_id in (None, stored, aiteammate, target):
                 pre = via_preflight(**input_kw)
                 post = via_assert(source_id, **input_kw)
                 assert pre == post
                 assert f"Pass --manifest-id {aiteammate}" not in pre
+                if combined:
+                    assert unverified_collision not in pre
 
     def test_legacy_v1_explicit_manifest_id_refused_before_mutation(self, tmp_path):
         from hermes_a365.publish import (
