@@ -272,9 +272,9 @@ class PublishInputs:
             raise ValueError("--use-blueprint is only meaningful with --aiteammate false")
         if self.use_blueprint and self.copilot_chat:
             raise ValueError("--use-blueprint is incompatible with --copilot-chat")
-        if self.manifest_id and not self.copilot_chat:
+        if self.manifest_id is not None and not self.copilot_chat:
             raise ValueError("--manifest-id is only meaningful with --copilot-chat")
-        if self.manifest_id and self.manifest_id != "auto":
+        if self.manifest_id is not None and self.manifest_id != "auto":
             try:
                 self.manifest_id = _canonical_manifest_guid(self.manifest_id)
             except ValueError as e:
@@ -919,23 +919,23 @@ def _publish_state_manifest_id_mismatch_message(
     inputs: PublishInputs,
     state_cea_catalog_id_minted: bool,
 ) -> str:
+    del aiteammate_catalog_id  # guidance is source-independent; post-run ignores zip id
     base = (
         f"Copilot Chat publish state at {path} records manifestId {stored_id}, "
         f"but this publish targets {catalog_manifest_id}. "
     )
-    combined_or_auto_state = (
-        inputs.aiteammate and inputs.copilot_chat
-    ) or state_cea_catalog_id_minted
-    if (
-        combined_or_auto_state
-        and aiteammate_catalog_id
-        and stored_id == _canonical_manifest_guid(aiteammate_catalog_id)
-    ):
+    combined = bool(inputs.aiteammate and inputs.copilot_chat)
+    if combined and not state_cea_catalog_id_minted:
         return (
             base + "The stored id is the AI Teammate catalog id — do not pass "
             "--manifest-id with that value on combined publishes. Omit "
             "--manifest-id to mint a distinct CEA catalog id, remove or rename "
             "the state file, or pass a new --manifest-id with --app-version."
+        )
+    if not combined and state_cea_catalog_id_minted:
+        return (
+            base + "Remove or rename the state file, or pass a new --manifest-id "
+            "with --app-version for a separate catalog entry."
         )
     return (
         base + f"Pass --manifest-id {stored_id} to match the stored id, remove or "
@@ -1170,9 +1170,23 @@ def _copilot_chat_publish_preflight(
                 "state is missing)"
             )
         return
-    if inputs.app_version is not None and (
-        record["manifestId"] == _canonical_manifest_guid(inputs.manifest_id)
-    ):
+    _refuse_unscoped_v1_publish_state(
+        record,
+        path=state_path,
+        app_version_override=inputs.app_version,
+    )
+    canonical_manifest_id = _canonical_manifest_guid(inputs.manifest_id)
+    _assert_publish_state_matches_catalog_id(
+        state_path,
+        catalog_manifest_id=canonical_manifest_id,
+        hermes_home=hermes_home,
+        tenant_id=tenant_id,
+        profile=profile,
+        inputs=inputs,
+        manifest_id_resolution=None,
+        aiteammate_catalog_id=None,
+    )
+    if inputs.app_version is not None and record["manifestId"] == canonical_manifest_id:
         try:
             _resolve_next_copilot_chat_app_version(
                 template_version=None,
@@ -1903,7 +1917,7 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
             f"$HERMES_HOME/agents/<slug>/{_COPILOT_CHAT_PUBLISH_STATE_FILENAME} "
             "for the same tenant, profile, and manifest.id. "
             "Local record and version gates are also checked during dry-run "
-            "when the catalog id is not generated."
+            "when --manifest-id is an explicit GUID."
         ),
     )
     parser.add_argument(

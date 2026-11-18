@@ -1478,15 +1478,22 @@ class TestApplyPublishPlanCopilotChat:
         state_path = _copilot_chat_publish_state_path(hermes, "x")
         assert not state_path.is_file()
 
+        mutator = self._scripted_zip_emit(zp)
         plan = build_publish_plan(PublishInputs(agent_name="X", copilot_chat=True))
         with pytest.raises(PublishError, match="no Copilot Chat publish record"):
-            apply_publish_plan(
-                plan, mutator=self._scripted_zip_emit(zp), hermes_home=hermes
-            )
+            apply_publish_plan(plan, mutator=mutator, hermes_home=hermes)
+        assert any(call[:2] == ["a365", "publish"] for call in mutator.calls)
         assert not state_path.is_file()
 
     @pytest.mark.parametrize("app_version", ["1.0.1", "1.0.0", None])
-    @pytest.mark.parametrize("manifest_id", ["AABBCCDD112233445566778899AABBCC"])
+    @pytest.mark.parametrize(
+        "manifest_id",
+        [
+            "AABBCCDD112233445566778899AABBCC",
+            "AABBCCDD-1122-3344-5566-778899AABBCC",
+            "aabbccdd-1122-3344-5566-778899aabbcc",
+        ],
+    )
     def test_preflight_apply_refuses_before_mutation(
         self, tmp_path, monkeypatch, app_version, manifest_id
     ):
@@ -1546,6 +1553,55 @@ class TestApplyPublishPlanCopilotChat:
             )
             assert not state_path.exists()
             assert not hermes.exists()
+        assert zp.read_bytes() == package_before
+        assert cwd_package.read_bytes() == cwd_package_before
+        assert mutator.calls == []
+
+    def test_preflight_apply_manifest_id_mismatch_refuses_before_mutation(
+        self, tmp_path, monkeypatch
+    ):
+        from hermes_a365.publish import _copilot_chat_publish_state_path
+
+        monkeypatch.chdir(tmp_path)
+        catalog_id = "aabbccdd-1122-3344-5566-778899aabbcc"
+        other_id = "22222222-2222-2222-2222-222222222222"
+        manifest_dir = self._seed_manifest_dir(
+            tmp_path,
+            {
+                "id": catalog_id,
+                "version": "1.0.0",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        zp = self._seed_manifest_zip(
+            manifest_dir, {"id": catalog_id, "version": "1.0.1", "manifestVersion": "1.27"}
+        )
+        package_before = zp.read_bytes()
+        cwd_package = self._seed_manifest_zip(tmp_path, {"version": "1.0.0"})
+        cwd_package_before = cwd_package.read_bytes()
+        hermes = tmp_path / "hermes"
+        state_path = _copilot_chat_publish_state_path(hermes, "x")
+        _write_publish_state(
+            state_path, manifest_id=catalog_id, app_version="1.0.1", hermes_home=hermes
+        )
+        record_before = state_path.read_bytes()
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                manifest_id=other_id,
+                profile=_PUBLISH_STATE_PROFILE,
+            )
+        )
+        mutator = self._scripted_template_extract(manifest_dir)
+
+        with pytest.raises(PublishError) as exc:
+            apply_publish_plan(plan, mutator=mutator, hermes_home=hermes)
+
+        assert "records manifestId" in str(exc.value)
+        assert f"Pass --manifest-id {catalog_id}" in str(exc.value)
+        assert state_path.read_bytes() == record_before
         assert zp.read_bytes() == package_before
         assert cwd_package.read_bytes() == cwd_package_before
         assert mutator.calls == []
@@ -2410,13 +2466,13 @@ class TestApplyPublishPlanCopilotChat:
                 "name": {"short": "X", "full": "X"},
             },
         )
+        mutator = self._scripted_zip_emit(zp)
         plan = build_publish_plan(
             PublishInputs(agent_name="X", copilot_chat=True, app_version="1.1.5")
         )
         with pytest.raises(PublishError, match="records manifestId"):
-            apply_publish_plan(
-                plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
-            )
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert any(call[:2] == ["a365", "publish"] for call in mutator.calls)
         record = json.loads(state_path.read_text(encoding="utf-8"))
         assert record["manifestId"] == stored_id
         assert record["lastAppVersion"] == "1.1.4"
@@ -2581,13 +2637,14 @@ class TestApplyPublishPlanCopilotChat:
             )
 
     def test_path_b_manifest_id_mismatch_suggests_pass_stored_id(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         from hermes_a365.publish import (
             _copilot_chat_publish_state_path,
             build_publish_plan,
         )
 
+        monkeypatch.chdir(tmp_path)
         template_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         other_id = "22222222-2222-2222-2222-222222222222"
         state_path = _copilot_chat_publish_state_path(tmp_path, "x")
@@ -2598,37 +2655,45 @@ class TestApplyPublishPlanCopilotChat:
             hermes_home=tmp_path,
             cea_catalog_id_minted=False,
         )
-        manifest = {
-            "id": template_id,
-            "version": "1.1.4",
-            "webApplicationInfo": {"id": "the-bot"},
-            "name": {"short": "X", "full": "X"},
-        }
-        zp = self._seed_manifest_zip(tmp_path, manifest)
+        record_before = state_path.read_bytes()
+        manifest_dir = self._seed_manifest_dir(
+            tmp_path,
+            {
+                "id": template_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        manifest_json_before = (manifest_dir / "manifest.json").read_bytes()
         plan = build_publish_plan(
             PublishInputs(
                 agent_name="X",
                 copilot_chat=True,
                 manifest_id=other_id,
+                profile=_PUBLISH_STATE_PROFILE,
             )
         )
+        mutator = self._scripted_template_extract(manifest_dir)
         with pytest.raises(PublishError) as exc:
-            apply_publish_plan(
-                plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
-            )
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
         message = str(exc.value)
         assert f"Pass --manifest-id {template_id}" in message
         assert "do not pass --manifest-id" not in message
         assert "mint a distinct CEA catalog id" not in message
+        assert mutator.calls == []
+        assert state_path.read_bytes() == record_before
+        assert (manifest_dir / "manifest.json").read_bytes() == manifest_json_before
 
     def test_mismatch_hint_never_suggests_aiteammate_catalog_id(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         from hermes_a365.publish import (
             _copilot_chat_publish_state_path,
             build_publish_plan,
         )
 
+        monkeypatch.chdir(tmp_path)
         template_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
         other_id = "22222222-2222-2222-2222-222222222222"
         state_path = _copilot_chat_publish_state_path(tmp_path, "x")
@@ -2638,8 +2703,181 @@ class TestApplyPublishPlanCopilotChat:
             app_version="1.1.4",
             hermes_home=tmp_path,
         )
+        record_before = state_path.read_bytes()
+        manifest_dir = self._seed_manifest_dir(
+            tmp_path,
+            {
+                "id": template_id,
+                "version": "1.1.4",
+                "webApplicationInfo": {"id": "the-bot"},
+                "name": {"short": "X", "full": "X"},
+            },
+        )
+        manifest_json_before = (manifest_dir / "manifest.json").read_bytes()
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                aiteammate=True,
+                copilot_chat=True,
+                manifest_id=other_id,
+                profile=_PUBLISH_STATE_PROFILE,
+            )
+        )
+        mutator = self._scripted_template_extract(manifest_dir)
+        with pytest.raises(PublishError) as exc:
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        message = str(exc.value)
+        assert template_id not in message or "do not pass --manifest-id" in message
+        assert f"Pass --manifest-id {template_id}" not in message
+        assert mutator.calls == []
+        assert state_path.read_bytes() == record_before
+        assert (manifest_dir / "manifest.json").read_bytes() == manifest_json_before
+
+    def test_preflight_dry_run_explicit_manifest_id_mismatch(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from unittest.mock import Mock
+
+        from hermes_a365.publish import _copilot_chat_publish_state_path, build_parser, run
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.chdir(tmp_path)
+        stored_id = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        other_id = "22222222-2222-2222-2222-222222222222"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        _write_publish_state(
+            state_path,
+            manifest_id=stored_id,
+            app_version="1.1.4",
+            hermes_home=tmp_path,
+        )
+        before = {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()}
+        get_mutator = Mock(side_effect=AssertionError("dry-run constructed a mutator"))
+        monkeypatch.setattr("hermes_a365.publish.get_mutator", get_mutator)
+        argv = [
+            "--agent-name",
+            "X",
+            "--copilot-chat",
+            "--tenant-id",
+            _TEST_TENANT,
+            "--profile",
+            _PUBLISH_STATE_PROFILE,
+            "--manifest-id",
+            other_id,
+        ]
+        assert run(build_parser().parse_args(argv)) == 2
+        captured = capsys.readouterr()
+        assert captured.err.startswith("ERROR: ")
+        assert "records manifestId" in captured.err
+        assert f"Pass --manifest-id {stored_id}" in captured.err
+        assert "No mutations." not in captured.out
+        get_mutator.assert_not_called()
+        assert {p: p.read_bytes() for p in tmp_path.rglob("*") if p.is_file()} == before
+
+    def test_publish_state_manifest_id_mismatch_message_parity(self, tmp_path):
+        from hermes_a365.publish import (
+            PublishInputs,
+            _assert_publish_state_matches_catalog_id,
+            _copilot_chat_publish_preflight,
+            _copilot_chat_publish_state_path,
+            _write_copilot_chat_publish_state,
+        )
+
+        path_b_stored = "11111111-1111-1111-1111-111111111111"
+        target = "22222222-2222-2222-2222-222222222222"
+        aiteammate = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        hermes = tmp_path / "hermes"
+        state_path = _copilot_chat_publish_state_path(hermes, "x")
+
+        def via_preflight(**input_kw) -> str:
+            inputs = PublishInputs(agent_name="X", manifest_id=target, **input_kw)
+            assert inputs.copilot_chat
+            try:
+                _copilot_chat_publish_preflight(
+                    inputs,
+                    hermes_home=hermes,
+                    tenant_id=_TEST_TENANT,
+                    profile=_PUBLISH_STATE_PROFILE,
+                )
+            except PublishError as exc:
+                return str(exc)
+            raise AssertionError("preflight did not refuse")
+
+        def via_assert(source_id: str | None, **input_kw) -> str:
+            inputs = PublishInputs(agent_name="X", manifest_id=target, **input_kw)
+            assert inputs.copilot_chat
+            known_source = (
+                None
+                if source_id is None
+                else (aiteammate if source_id in (stored, aiteammate) else source_id)
+            )
+            try:
+                _assert_publish_state_matches_catalog_id(
+                    state_path,
+                    catalog_manifest_id=target,
+                    hermes_home=hermes,
+                    tenant_id=_TEST_TENANT,
+                    profile=_PUBLISH_STATE_PROFILE,
+                    inputs=inputs,
+                    manifest_id_resolution=None,
+                    aiteammate_catalog_id=known_source,
+                )
+            except PublishError as exc:
+                return str(exc)
+            raise AssertionError("assert did not refuse")
+
+        cases = [
+            ({"copilot_chat": True}, False, path_b_stored),
+            ({"copilot_chat": True}, True, path_b_stored),
+            (
+                {"aiteammate": True, "copilot_chat": True},
+                False,
+                aiteammate,
+            ),
+            (
+                {"aiteammate": True, "copilot_chat": True},
+                True,
+                path_b_stored,
+            ),
+        ]
+        for input_kw, minted, stored in cases:
+            state_path.parent.mkdir(parents=True, exist_ok=True)
+            _write_copilot_chat_publish_state(
+                state_path,
+                manifest_id=stored,
+                app_version="1.0.0",
+                hermes_home=hermes,
+                tenant_id=_TEST_TENANT,
+                profile=_PUBLISH_STATE_PROFILE,
+                cea_catalog_id_minted=minted,
+            )
+            for source_id in (None, stored, aiteammate, target):
+                pre = via_preflight(**input_kw)
+                post = via_assert(source_id, **input_kw)
+                assert pre == post
+                assert f"Pass --manifest-id {aiteammate}" not in pre
+
+    def test_legacy_v1_explicit_manifest_id_refused_before_mutation(self, tmp_path):
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        manifest_id = "44444444-4444-4444-4444-444444444444"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "manifestId": manifest_id,
+                    "lastAppVersion": "1.1.4",
+                }
+            ),
+            encoding="utf-8",
+        )
         manifest = {
-            "id": template_id,
+            "id": manifest_id,
             "version": "1.1.4",
             "webApplicationInfo": {"id": "the-bot"},
             "name": {"short": "X", "full": "X"},
@@ -2648,18 +2886,67 @@ class TestApplyPublishPlanCopilotChat:
         plan = build_publish_plan(
             PublishInputs(
                 agent_name="X",
-                aiteammate=True,
                 copilot_chat=True,
-                manifest_id=other_id,
+                manifest_id=manifest_id,
+                profile=_PUBLISH_STATE_PROFILE,
             )
         )
-        with pytest.raises(PublishError) as exc:
-            apply_publish_plan(
-                plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
+        mutator = self._scripted_zip_emit(zp)
+        with pytest.raises(PublishError, match="legacy schema v1"):
+            apply_publish_plan(plan, mutator=mutator, hermes_home=tmp_path)
+        assert mutator.calls == []
+
+    def test_legacy_v1_explicit_manifest_id_app_version_allows_migration(
+        self, tmp_path
+    ):
+        import zipfile
+
+        from hermes_a365.publish import (
+            _copilot_chat_publish_state_path,
+            build_publish_plan,
+        )
+
+        manifest_id = "44444444-4444-4444-4444-444444444444"
+        state_path = _copilot_chat_publish_state_path(tmp_path, "x")
+        state_path.parent.mkdir(parents=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "schemaVersion": 1,
+                    "manifestId": manifest_id,
+                    "lastAppVersion": "1.1.4",
+                }
+            ),
+            encoding="utf-8",
+        )
+        manifest = {
+            "id": manifest_id,
+            "version": "1.1.4",
+            "webApplicationInfo": {"id": "the-bot"},
+            "name": {"short": "X", "full": "X"},
+        }
+        zp = self._seed_manifest_zip(tmp_path, manifest)
+        plan = build_publish_plan(
+            PublishInputs(
+                agent_name="X",
+                copilot_chat=True,
+                manifest_id=manifest_id,
+                app_version="2.0.0",
+                profile=_PUBLISH_STATE_PROFILE,
             )
-        message = str(exc.value)
-        assert template_id not in message or "do not pass --manifest-id" in message
-        assert f"Pass --manifest-id {template_id}" not in message
+        )
+        apply_publish_plan(
+            plan, mutator=self._scripted_zip_emit(zp), hermes_home=tmp_path
+        )
+        record = json.loads(state_path.read_text(encoding="utf-8"))
+        assert record["schemaVersion"] == 2
+        assert record["manifestId"] == manifest_id
+        with zipfile.ZipFile(zp) as zf:
+            assert json.loads(zf.read("manifest.json"))["version"] == "2.0.0"
+
+    def test_publish_inputs_rejects_empty_manifest_id(self):
+        with pytest.raises(ValueError, match="--manifest-id must be 'auto' or a GUID"):
+            PublishInputs(agent_name="X", copilot_chat=True, manifest_id="")
 
     def test_legacy_v1_publish_state_requires_app_version_to_apply(
         self, tmp_path
