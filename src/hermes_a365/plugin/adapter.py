@@ -2021,6 +2021,10 @@ class Agent365Adapter(BasePlatformAdapter):
         # ``on_processing_complete`` (#185). Suppress ``send_typing`` for
         # the rest of that turn once a final has landed.
         self._personal_stream_final_posted: set[str] = set()
+        # Personal streams stopped via connector user-cancel 403: suppress
+        # adapter typing pulses and fresh stream opens until the next outer
+        # personal turn starts (#326 M2).
+        self._personal_stream_cancelled: set[str] = set()
         # Personal turns nest when Hermes runs an in-band follow-up before
         # the outer stream consumer is cancelled. The outer 1:1 stream is
         # finalized only when this count returns to 0 (#161).
@@ -4058,6 +4062,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._streams.clear()
         self._active_stream_by_chat.clear()
         self._personal_stream_final_posted.clear()
+        self._personal_stream_cancelled.clear()
         self._personal_processing_depth.clear()
         self._personal_final_landed.clear()
         self._nested_personal_reply.clear()
@@ -5939,6 +5944,15 @@ class Agent365Adapter(BasePlatformAdapter):
         if (
             chat_type == "personal"
             and reply_to is not None
+            and chat_id in self._personal_stream_cancelled
+        ):
+            return SendResult(
+                success=False,
+                error="agent365 send: personal stream suppressed after user cancellation",
+            )
+        if (
+            chat_type == "personal"
+            and reply_to is not None
             and chat_id not in self._active_stream_by_chat
         ):
             stream_result = await self._send_stream_start(
@@ -6186,6 +6200,26 @@ class Agent365Adapter(BasePlatformAdapter):
                 self._personal_processing_depth[chat_id] = prev_depth + 1
                 if prev_depth == 0:
                     self._clear_personal_typing_suppression(chat_id)
+                    self._personal_stream_cancelled.discard(str(chat_id))
+                    if record is not None:
+                        session_key = str(record.session_key or "").strip()
+                        if session_key:
+                            session_ref = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+                            turn_ref = self._personal_turn_ref_digest(
+                                str(record.conversation_id or ""),
+                                str(record.message_id or ""),
+                            )
+                            ref = self._conversations.get(chat_id)
+                            validated_path = (
+                                str(ref.validated_path or "") if ref is not None else ""
+                            )
+                            logger.info(
+                                "agent365 personal turn start: session_ref=%s "
+                                "turn_ref=%s validated_path=%s",
+                                session_ref,
+                                turn_ref,
+                                validated_path,
+                            )
         parent = getattr(super(), "on_processing_start", None)
         if callable(parent):
             await parent(event)
@@ -11632,7 +11666,11 @@ class Agent365Adapter(BasePlatformAdapter):
         # #185: BF has no "stop typing" activity. While a personal stream is
         # open, typing is redundant; after ``streamType=final`` Hermes may still
         # pulse until ``on_processing_complete`` — skip those late ticks.
-        if chat_id in self._active_stream_by_chat or chat_id in self._personal_stream_final_posted:
+        if (
+            chat_id in self._active_stream_by_chat
+            or chat_id in self._personal_stream_final_posted
+            or chat_id in self._personal_stream_cancelled
+        ):
             return None
         # Slice 19x-d (#4): bump last_used_at on typing too.
         self._conversations.mark_used(chat_id)
@@ -14236,6 +14274,15 @@ class Agent365Adapter(BasePlatformAdapter):
     def _clear_personal_typing_suppression(self, chat_id: str) -> None:
         self._personal_stream_final_posted.discard(str(chat_id))
 
+    @staticmethod
+    def _personal_turn_ref_digest(conversation_id: str, message_id: str) -> str:
+        def _len_prefixed(text: str) -> bytes:
+            raw = text.encode("utf-8")
+            return len(raw).to_bytes(4, "big") + raw
+
+        payload = _len_prefixed(conversation_id) + _len_prefixed(message_id)
+        return hashlib.sha256(payload).hexdigest()
+
     def _personal_conversation_type_for_chat(self, chat_id: str) -> str:
         inbound = self._cached_inbound_for(chat_id)
         conv = (inbound or {}).get("conversation") or {}
@@ -14461,8 +14508,7 @@ class Agent365Adapter(BasePlatformAdapter):
         requested_message_id = str(message_id)
         requested_stream_key = (str(chat_id), requested_message_id)
         if (
-            not finalize
-            and requested_stream_key not in self._streams
+            requested_stream_key not in self._streams
             and (str(chat_id), requested_message_id) in self._terminal_stream_failure_markers
         ):
             return SendResult(
@@ -14836,6 +14882,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     short = "streaming timeout"
                 elif "canceled by user" in low or "cancelled by user" in low:
                     short = "streaming canceled by user"
+                    cancel_key = str(chat_id)
+                    if cancel_key:
+                        self._personal_stream_cancelled.add(cancel_key)
                 elif "message size too large" in low:
                     short = "streaming message too large"
                 elif "already completed" in low:
@@ -15679,6 +15728,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     store.pop(key, None)
         self._personal_processing_depth.pop(chat_id, None)
         self._personal_stream_final_posted.discard(chat_id)
+        self._personal_stream_cancelled.discard(str(chat_id))
         self._reset_stream_overflow_limit_for_task()
         self._personal_final_landed.pop(chat_id, None)
         self._nested_personal_reply.pop(chat_id, None)

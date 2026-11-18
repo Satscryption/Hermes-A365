@@ -20831,7 +20831,16 @@ class TestEditMessage:
         )
 
     @pytest.mark.asyncio
-    async def test_403_stop_button_returns_terminal(self, monkeypatch: pytest.MonkeyPatch) -> None:
+    @pytest.mark.parametrize(
+        "cancel_message",
+        [
+            "Content stream was canceled by user.",
+            "Content stream was cancelled by user.",
+        ],
+    )
+    async def test_403_stop_button_returns_terminal(
+        self, monkeypatch: pytest.MonkeyPatch, cancel_message: str
+    ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-Y")
         first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-y"})
@@ -20841,7 +20850,7 @@ class TestEditMessage:
             json=lambda: {
                 "error": {
                     "code": "ContentStreamNotAllowed",
-                    "message": "Content stream was canceled by user.",
+                    "message": cancel_message,
                 }
             },
         )
@@ -27763,6 +27772,477 @@ class TestInteractiveCards:
         resolver.assert_called_once_with("sess-1", "deny", request_id="request-a")
         assert pending == []
         assert a._handled_events == []
+
+
+# ---------------------------------------------------------------------------
+# Path B personal M2-r1 — cancellation, retirement, FIFO burst, session line
+# ---------------------------------------------------------------------------
+
+
+class TestPathBM2R1:
+    @staticmethod
+    def _path_b_setup(monkeypatch: pytest.MonkeyPatch) -> Any:
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _token: bridge.BF_ISSUER)
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt_bf",
+            AsyncMock(return_value={"iss": bridge.BF_ISSUER}),
+        )
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-path-b", "B")),
+        )
+        return bridge
+
+    @staticmethod
+    def _loop_clock(
+        monkeypatch: pytest.MonkeyPatch, start: float = 2_000_000.0
+    ) -> dict[str, float]:
+        clock = {"t": start}
+
+        async def fake_sleep(delay: float) -> None:
+            clock["t"] += float(delay)
+            loop = asyncio.get_running_loop()
+            done = loop.create_future()
+            loop.call_soon(done.set_result, None)
+            await done
+
+        monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+        monkeypatch.setattr(adapter_mod.asyncio, "sleep", fake_sleep)
+
+        def bind_loop_time() -> None:
+            loop = asyncio.get_running_loop()
+            monkeypatch.setattr(loop, "time", lambda: clock["t"], raising=False)
+
+        clock["bind"] = bind_loop_time  # type: ignore[index]
+        return clock
+
+    @staticmethod
+    def _processing_event(conv_id: str, activity_id: str, text: str = "hi") -> _StubMessageEvent:
+        inbound = _make_inbound(conv_id=conv_id, activity_id=activity_id, text=text, path="B")
+        return _StubMessageEvent(
+            text=text,
+            source=_StubSessionSource(platform=None, chat_id=conv_id),
+            message_id=activity_id,
+            raw_message=inbound,
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "cancel_message",
+        [
+            "Content stream was canceled by user.",
+            "Content stream was cancelled by user.",
+        ],
+    )
+    @pytest.mark.parametrize("use_connector_id", [False, True])
+    async def test_personal_late_final_after_nonfinal_user_cancel_adds_no_post(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        cancel_message: str,
+        use_connector_id: bool,
+    ) -> None:
+        edit = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-late-final", activity_id="act-late", path="B")
+        stop_body = {
+            "error": {
+                "code": "ContentStreamNotAllowed",
+                "message": cancel_message,
+            }
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-late"}),
+            MagicMock(status_code=403, text="", json=lambda body=stop_body: body),
+        ]
+        post_mock = edit._wire_adapter(a, inbound=inbound, post_responses=responses)
+        edit._patch_token_mint(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bearer-b", "B")),
+        )
+        edit._no_sleep(monkeypatch)
+        await a.edit_message("conv-late-final", "m-late", "Part", finalize=False)
+        cancelled = await a.edit_message("conv-late-final", "m-late", "Part 2", finalize=False)
+        assert cancelled.success is False
+        assert ("conv-late-final", "m-late") not in a._streams
+        posts_before = post_mock.await_count
+        retired_id = "bf-late" if use_connector_id else "m-late"
+        late = await a.edit_message(
+            "conv-late-final",
+            retired_id,
+            "STOPPED TEXT",
+            finalize=True,
+        )
+        assert late.success is False
+        assert post_mock.await_count == posts_before
+        assert "conv-late-final" not in a._personal_stream_final_posted
+        blocked_nonfinal = await a.edit_message(
+            "conv-late-final", retired_id, "cleanup", finalize=False
+        )
+        assert blocked_nonfinal.success is False
+        assert post_mock.await_count == posts_before
+
+    @pytest.mark.asyncio
+    async def test_personal_late_final_after_timeout_marked_403_adds_no_post(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        edit = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-late-timeout", path="B")
+        timeout_body = {
+            "error": {
+                "code": "ContentStreamNotAllowed",
+                "message": "Content stream finished due to exceeded streaming time.",
+            }
+        }
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-timeout"}),
+            MagicMock(status_code=403, text="", json=lambda body=timeout_body: body),
+        ]
+        post_mock = edit._wire_adapter(a, inbound=inbound, post_responses=responses)
+        edit._patch_token_mint(monkeypatch)
+        edit._no_sleep(monkeypatch)
+        await a.edit_message("conv-late-timeout", "m-timeout", "Part", finalize=False)
+        timeout = await a.edit_message("conv-late-timeout", "m-timeout", "Part 2", finalize=False)
+        assert timeout.success is False
+        posts_before = post_mock.await_count
+        late = await a.edit_message(
+            "conv-late-timeout", "m-timeout", "Tail", finalize=True
+        )
+        assert late.success is False
+        assert post_mock.await_count == posts_before
+
+    @pytest.mark.asyncio
+    async def test_path_b_personal_stop_recovery_suppresses_typing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        edit = TestEditMessage()
+        self._path_b_setup(monkeypatch)
+        a = _make_adapter(monkeypatch)
+        conv_id = "conv-recover"
+        act_cancel = "act-cancel"
+        act_recovery = "act-recovery"
+        inbound = _make_inbound(conv_id=conv_id, activity_id=act_cancel, path="B")
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        assert ref is not None
+        ref.validated_path = "B"
+        stop_body = {
+            "error": {
+                "code": "ContentStreamNotAllowed",
+                "message": "Content stream was canceled by user.",
+            }
+        }
+        stream_posts = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-recover"}),
+            MagicMock(status_code=403, text="", json=lambda body=stop_body: body),
+        ]
+        post_mock = edit._wire_adapter(a, inbound=inbound, post_responses=stream_posts)
+        edit._no_sleep(monkeypatch)
+
+        cancel_event = self._processing_event(conv_id, act_cancel)
+        await a.on_processing_start(cancel_event)
+        await a.edit_message(conv_id, "m-recover", "Growing", finalize=False)
+        stopped = await a.edit_message(conv_id, "m-recover", "Growing more", finalize=False)
+        assert stopped.success is False
+        assert conv_id in a._personal_stream_cancelled
+        posts_after_cancel = post_mock.await_count
+
+        await a.send_typing(conv_id)
+        assert post_mock.await_count == posts_after_cancel
+
+        assert conv_id not in a._personal_stream_final_posted
+
+        nested = self._processing_event(conv_id, "act-nested")
+        _admit_wire_turn_authority(a, nested.raw_message)
+        await a.on_processing_start(nested)
+        assert conv_id in a._personal_stream_cancelled
+        await a.on_processing_complete(nested)
+
+        await a.send_typing(conv_id)
+        assert post_mock.await_count == posts_after_cancel
+
+        send_blocked = await a.send(
+            conv_id,
+            content="STOPPED TEXT",
+            reply_to=act_cancel,
+            metadata={"notify": True},
+        )
+        assert send_blocked.success is False
+        assert post_mock.await_count == posts_after_cancel
+
+        await a.on_processing_complete(cancel_event)
+        assert conv_id in a._personal_stream_cancelled
+
+        await a.send_typing(conv_id)
+        assert post_mock.await_count == posts_after_cancel
+
+        recovery_inbound = _make_inbound(conv_id=conv_id, activity_id=act_recovery, path="B")
+        _admit_wire_turn_authority(a, recovery_inbound)
+        recovery_event = self._processing_event(conv_id, act_recovery, text="next")
+        stream_posts.extend(
+            [
+                MagicMock(status_code=200, text="", json=lambda: {}),
+                MagicMock(status_code=201, text="", json=lambda: {"id": "bf-new"}),
+                MagicMock(status_code=202, text="", json=lambda: {}),
+                MagicMock(status_code=202, text="", json=lambda: {}),
+            ]
+        )
+        await a.on_processing_start(recovery_event)
+        assert conv_id not in a._personal_stream_cancelled
+
+        await a.send_typing(conv_id)
+        assert post_mock.await_count == posts_after_cancel + 1
+
+        await a.edit_message(conv_id, "m-new", "Fresh", finalize=False)
+        await a.edit_message(conv_id, "m-new", "Fresh final", finalize=True)
+        assert post_mock.await_count > posts_after_cancel + 1
+        bodies = [
+            call.kwargs.get("json", {}).get("text", "")
+            for call in post_mock.await_args_list
+        ]
+        assert not any("STOPPED TEXT" in str(text) for text in bodies)
+
+    @pytest.mark.asyncio
+    async def test_personal_turn_start_log_line(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        conv_id = "conv-log"
+        session_key = "sess-log-line"
+        outer = _make_inbound(conv_id=conv_id, activity_id="act-outer", path="B")
+        ref = adapter_mod.ConversationRef.from_activity(outer)
+        assert ref is not None
+        ref.validated_path = "B"
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add(conv_id)
+        assert a.admit_turn_authority(outer, session_key, message_id="act-outer")
+        record = a._ledger_record_for_message("act-outer", conv_id)
+        assert record is not None
+        a._attach_coalesced_turn_authority(record)
+        caplog.set_level(logging.INFO, logger="hermes_a365.plugin.adapter")
+
+        event = self._processing_event(conv_id, "act-outer")
+        await a.on_processing_start(event)
+        outer_lines = [
+            r.message
+            for r in caplog.records
+            if r.message.startswith("agent365 personal turn start:")
+        ]
+        assert len(outer_lines) == 1
+        assert conv_id not in outer_lines[0]
+        assert "act-outer" not in outer_lines[0]
+        session_ref = hashlib.sha256(session_key.encode("utf-8")).hexdigest()
+        turn_ref = adapter_mod.Agent365Adapter._personal_turn_ref_digest(conv_id, "act-outer")
+        assert f"session_ref={session_ref}" in outer_lines[0]
+        assert f"turn_ref={turn_ref}" in outer_lines[0]
+        assert "validated_path=B" in outer_lines[0]
+
+        caplog.clear()
+        a._personal_processing_depth[conv_id] = 1
+        nested = self._processing_event(conv_id, "act-nested")
+        await a.on_processing_start(nested)
+        assert not any(
+            r.message.startswith("agent365 personal turn start:") for r in caplog.records
+        )
+
+        alt_a = "a:b"
+        alt_b = "c"
+        alt_turn_ref = adapter_mod.Agent365Adapter._personal_turn_ref_digest(alt_a, alt_b)
+        split_turn_ref = adapter_mod.Agent365Adapter._personal_turn_ref_digest("a", "b:c")
+        assert alt_turn_ref != split_turn_ref
+
+        another_session = "sess-log-line-2"
+        assert a.admit_turn_authority(outer, another_session, message_id="act-outer-2")
+        record2 = a._ledger_record_for_message("act-outer-2", conv_id)
+        assert record2 is not None
+        assert hashlib.sha256(another_session.encode("utf-8")).hexdigest() != session_ref
+
+    @pytest.mark.asyncio
+    @pytest.mark.timeout(15)
+    async def test_path_b_personal_wire_burst_preserves_admission_fifo_and_pacing(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        import httpx
+        from httpx import ASGITransport
+
+        self._path_b_setup(monkeypatch)
+        clock = self._loop_clock(monkeypatch)
+        caplog.set_level(logging.INFO, logger="hermes_a365.plugin.adapter")
+        a = _make_adapter(monkeypatch)
+        conv_id = "conv-burst"
+        owner = asyncio.create_task(asyncio.Event().wait())
+        admitted_events: list[Any] = []
+        activities: list[dict[str, Any]] = []
+
+        async def capture_handle(event: Any) -> None:
+            admitted_events.append(event)
+            sk = a._session_key_for(event)
+            if sk:
+                a._session_tasks[sk] = owner
+
+        monkeypatch.setattr(a, "handle_message", capture_handle)
+
+        transport = ASGITransport(app=a.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            for idx in range(1, 51):
+                act_id = f"burst-{idx:03d}"
+                body = _make_inbound(
+                    conv_id=conv_id,
+                    activity_id=act_id,
+                    text=f"prompt {idx:03d}",
+                    path="B",
+                )
+                activities.append(body)
+                response = await client.post(
+                    "/api/messages",
+                    json=body,
+                    headers={"Authorization": "Bearer a.b.c"},
+                )
+                assert response.status_code == 200, response.text
+                assert response.json()["status"] == "dispatched"
+
+        assert len(admitted_events) == 50
+        sk = a._session_key_for(admitted_events[0])
+        assert sk
+
+        fifo_wave = admitted_events[20:23]
+        a._pending_messages.pop(sk, None)
+        a._pending_turn_fifo.pop(sk, None)
+        a._pending_messages[sk] = fifo_wave[0]
+        fifo = a._pending_turn_fifo_for(sk)
+        fifo.append(fifo_wave[1])
+        fifo.append(fifo_wave[2])
+        assert [str(ev.message_id) for ev in fifo] == [
+            str(fifo_wave[1].message_id),
+            str(fifo_wave[2].message_id),
+        ]
+        a._pending_messages.pop(sk)
+        assert a._agent365_promote_fifo_head_to_slot(sk)
+        assert str(a._pending_messages[sk].message_id) == str(fifo_wave[1].message_id)
+        a._pending_messages.pop(sk)
+        assert a._agent365_promote_fifo_head_to_slot(sk)
+        assert str(a._pending_messages[sk].message_id) == str(fifo_wave[2].message_id)
+        assert sk not in a._pending_turn_fifo
+
+        dup_body = activities[0]
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            dup = await client.post(
+                "/api/messages",
+                json=dup_body,
+                headers={"Authorization": "Bearer a.b.c"},
+            )
+        assert dup.json()["status"] == "duplicate"
+        assert len(admitted_events) == 50
+
+        ref = a._conversations.get(conv_id)
+        assert ref is not None
+        assert ref.validated_path == "B"
+
+        post_times: list[float] = []
+        connector_queue: list[Any] = []
+
+        class _FakeConnectorResponse:
+            __slots__ = ("_json", "status_code", "text")
+
+            def __init__(self, status_code: int, body: dict[str, Any]) -> None:
+                self.status_code = status_code
+                self.text = ""
+                self._json = body
+
+            def json(self) -> dict[str, Any]:
+                return self._json
+
+        def _enqueue_stream_responses(act_id: str) -> None:
+            connector_queue.clear()
+            connector_queue.extend(
+                [
+                    _FakeConnectorResponse(201, {"id": f"bf-{act_id}"}),
+                    _FakeConnectorResponse(202, {}),
+                    _FakeConnectorResponse(202, {}),
+                ]
+            )
+
+        async def connector_post(*_args: Any, **kwargs: Any) -> Any:
+            clock["bind"]()
+            post_times.append(clock["t"])
+            if not connector_queue:
+                return _FakeConnectorResponse(202, {})
+            return connector_queue.pop(0)
+
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        post_mock = AsyncMock(side_effect=connector_post)
+        a._http_client.post = post_mock
+
+        session_ref_logged: str | None = None
+        turn_refs: set[str] = set()
+        completed_bodies: list[str] = []
+        seen_log_records = 0
+
+        for idx, event in enumerate(admitted_events, start=1):
+            clock["bind"]()
+            activity_id = str(event.message_id)
+            raw_activity = event.raw_message if isinstance(event.raw_message, dict) else None
+            session = a._session_key_for(event) or sk
+            if raw_activity and a._ledger_record_for_message(activity_id, conv_id) is None:
+                a.admit_turn_authority(raw_activity, session, message_id=activity_id)
+            record = a._ledger_record_for_message(activity_id, conv_id)
+            assert record is not None, activity_id
+            a._attach_coalesced_turn_authority(record)
+            marker = f"ANS-{idx:03d}"
+            a._personal_processing_depth.pop(conv_id, None)
+            a._active_stream_by_chat.pop(conv_id, None)
+            with a._turn_frame_scope(record.session_key, record):
+                await a.on_processing_start(event)
+                new_logs = caplog.records[seen_log_records:]
+                seen_log_records = len(caplog.records)
+                start_lines = [
+                    r.message
+                    for r in new_logs
+                    if r.message.startswith("agent365 personal turn start:")
+                ]
+                assert len(start_lines) == 1
+                line = start_lines[0]
+                if idx == 1:
+                    session_ref_logged = line.split("session_ref=", 1)[1].split()[0]
+                turn_refs.add(line.split("turn_ref=", 1)[1].split()[0])
+                _enqueue_stream_responses(activity_id)
+                opened = await a.edit_message(conv_id, activity_id, marker, finalize=False)
+                assert opened.success is True, opened.error
+                clock["bind"]()
+                growing = await a.edit_message(
+                    conv_id, activity_id, f"{marker} …", finalize=False
+                )
+                assert growing.success is True, growing.error
+                clock["bind"]()
+                final = await a.edit_message(conv_id, activity_id, f"{marker} END", finalize=True)
+                assert final.success is True, final.error
+                completed_bodies.append(f"{marker} END")
+                await a.on_processing_complete(event)
+            assert conv_id not in a._active_stream_by_chat
+
+        assert session_ref_logged is not None
+        assert len(turn_refs) == 50
+        assert completed_bodies == [f"ANS-{i:03d} END" for i in range(1, 51)]
+
+        min_gap = adapter_mod._STREAMING_MIN_GAP_SEC
+        for chunk in range(0, len(post_times), 3):
+            triple = post_times[chunk : chunk + 3]
+            if len(triple) < 3:
+                continue
+            for delta in (triple[1] - triple[0], triple[2] - triple[1]):
+                assert delta + 0.01 >= min_gap, f"in-stream gap {delta} below {min_gap}"
+
+        owner.cancel()
+        await asyncio.gather(owner, return_exceptions=True)
 
 
 # ---------------------------------------------------------------------------
