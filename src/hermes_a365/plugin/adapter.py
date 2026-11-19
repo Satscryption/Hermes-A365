@@ -1907,7 +1907,9 @@ class Agent365Adapter(BasePlatformAdapter):
         # gateway has no slug.
         sender_policy = self._load_sender_allowlist()
         self._allowed_users: tuple[str, ...] = sender_policy.allowed_users
+        self._allowed_user_aliases = sender_policy.allowed_user_aliases
         self._allow_all_users = sender_policy.allow_all_users
+        self._upn_resolver: Any = None
         self._sender_allowlist_configured = sender_policy.configured
         self._allow_client_bf_channels = self._load_allow_client_bf_channels(extra)
         self._reactions_dispatch_agent_turn = _extra_bool(
@@ -2458,6 +2460,7 @@ class Agent365Adapter(BasePlatformAdapter):
             idempotency_max_entries=self._idempotency_max_entries,
             agent_identity_ids=bridge.parse_agent_identity_ids(raw_identity_ids),
             allowed_users=self._allowed_users,
+            allowed_user_aliases=self._allowed_user_aliases,
             allow_all_users=self._allow_all_users,
             sender_allowlist_configured=self._sender_allowlist_configured,
             allow_client_bf_channels=self._allow_client_bf_channels,
@@ -2693,9 +2696,15 @@ class Agent365Adapter(BasePlatformAdapter):
                 # AAD object id or UPN, and that sender is still admitted.
                 # The event identity is then the listed alias. On allow-all,
                 # the Hermes-true alias chosen above stays the event identity.
+                allowed_users = self._allowed_users
+                aliases = {}
+                if self._upn_resolver is not None:
+                    aliases = self._upn_resolver.resolved_aliases()
+                    allowed_users += tuple(aliases)
+                    self._upn_resolver.refresh_in_background()
                 local_ok = bridge._activity_user_authorized(
                     activity,
-                    allowed_users=self._allowed_users,
+                    allowed_users=allowed_users,
                     allow_all=self._allow_all_users,
                     claims=claims,
                 )
@@ -2704,12 +2713,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 else:
                     decision = True
                     if not self._allow_all_users:
-                        allowed = {
-                            value.strip().lower() for value in self._allowed_users if value.strip()
-                        }
-                        listed = [sender_id for sender_id in sender_ids if sender_id in allowed]
-                        if listed:
-                            authorized_sender_id = listed[0]
+                        listed_identity = self._listed_allowlist_user_identity(
+                            activity, sender_ids=sender_ids, aliases=aliases
+                        )
+                        if listed_identity is not None:
+                            authorized_sender_id = listed_identity
                 if not decision:
                     logger.warning("inbound 403 reason=unauthorized-end-user")
                     raise HTTPException(status_code=403, detail="end user is not authorized")
@@ -3694,6 +3702,9 @@ class Agent365Adapter(BasePlatformAdapter):
             # shared gateway loop so other platforms and the gateway connect
             # watchdog continue to run.
             self._bridge_cfg = await asyncio.to_thread(self._make_bridge_config)
+            if not self._allow_all_users and any("@" in entry for entry in self._allowed_users):
+                self._upn_resolver = bridge.UpnObjectIdResolver(self._bridge_cfg)
+                await asyncio.to_thread(self._upn_resolver.refresh)
             self._prepare_bridge_pid_publication()
         except RuntimeError as e:
             logger.error("agent365 adapter config error: %s", e)
@@ -12941,6 +12952,72 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
         return bool(str(row.get("id") or ""))
 
+    def _core_user_identity(self, user_id: str) -> str:
+        """Use the configured alias only for a resolver-only object ID match."""
+        upn = self._upn_resolver
+        if upn is not None and not self._allow_all_users and user_id not in self._allowed_users:
+            return upn.resolved_aliases().get(user_id, user_id)
+        return user_id
+
+    def _allowed_users_by_lower(self) -> dict[str, str]:
+        configured: dict[str, str] = {
+            value.strip().lower(): value.strip()
+            for value in self._allowed_users
+            if value.strip()
+        }
+        for entry in self._allowed_user_aliases:
+            token = entry.strip()
+            if token:
+                configured[token.lower()] = token
+        return configured
+
+    def _listed_allowlist_user_identity(
+        self,
+        activity: dict[str, Any],
+        *,
+        sender_ids: tuple[str, ...] | None = None,
+        aliases: dict[str, str] | None = None,
+    ) -> str | None:
+        """Return the configured allowlist entry the message route would pin.
+
+        Direct allowlist hits restore the operator's configured spelling.
+        Resolver hits keep the configured alias spelling. ``None`` when
+        no allowlisted candidate matched.
+        """
+        if self._allow_all_users:
+            return None
+        bridge = _import_bridge()
+        if sender_ids is None:
+            sender_ids = bridge._activity_user_candidates(activity)
+        allowed_by_lower = self._allowed_users_by_lower()
+        listed = [sender_id for sender_id in sender_ids if sender_id in allowed_by_lower]
+        if listed:
+            return allowed_by_lower[listed[0]]
+        if aliases is None and self._upn_resolver is not None:
+            aliases = self._upn_resolver.resolved_aliases()
+        if aliases:
+            for sender_id in sender_ids:
+                if sender_id in aliases:
+                    return aliases[sender_id]
+        return None
+
+    def _origin_lookup_user_id(self, conversation_id: str, token_user_id: str) -> str:
+        """Listed event identity for an origin chat, bound to ``token_user_id``."""
+        token_user_id = _normalized_token(token_user_id)
+        if not conversation_id or not token_user_id:
+            return self._core_user_identity(token_user_id)
+        ref = self._conversations.get(conversation_id)
+        activity = ref.raw if ref is not None and isinstance(ref.raw, dict) else None
+        if activity is None:
+            return self._core_user_identity(token_user_id)
+        sender = activity.get("from")
+        sender = sender if isinstance(sender, dict) else {}
+        activity_oid = _normalized_token(sender.get("aadObjectId"))
+        if not activity_oid or activity_oid != token_user_id:
+            return self._core_user_identity(token_user_id)
+        listed = self._listed_allowlist_user_identity(activity)
+        return listed if listed is not None else self._core_user_identity(token_user_id)
+
     def _lookup_live_origin_session(
         self,
         *,
@@ -12957,6 +13034,7 @@ class Agent365Adapter(BasePlatformAdapter):
         """
         if not conversation_id or not user_id:
             return None
+        user_id = self._origin_lookup_user_id(conversation_id, user_id)
         platform = str(getattr(self.platform, "value", "") or "")
         if not platform:
             return None
@@ -13154,7 +13232,10 @@ class Agent365Adapter(BasePlatformAdapter):
             chat_id=chat_id,
             chat_name=chat_id,
             chat_type=_import_bridge()._activity_chat_type(activity),
-            user_id=_normalized_token(record.get("user_aad")),
+            user_id=self._origin_lookup_user_id(
+                str(record.get("conversation_id") or ""),
+                _normalized_token(record.get("user_aad")),
+            ),
             user_name=str(sender.get("name") or ""),
             message_id=reply_activity_id,
         )
@@ -16641,8 +16722,9 @@ def interactive_setup() -> None:
     print_info("Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user.")
     print_info(
         "Production: set A365_ALLOWED_USERS to Entra object IDs (aadObjectId) for "
-        "Path B senders. UPN/email entries match only when the activity carries them; "
-        "Path B Teams and Copilot activities do not."
+        "Path B senders. UPN/email entries resolve through Graph with User.ReadBasic.All "
+        "(application, admin consent) on A365_BF_APP_ID when set, else the blueprint; "
+        "without it they match no Path B sender."
     )
     allow_all = prompt_yes_no(
         "Allow all users (testing only)?",
@@ -16655,7 +16737,7 @@ def interactive_setup() -> None:
     else:
         save_env_value("A365_ALLOW_ALL_USERS", "false")
         allowed = prompt(
-            "Allowed users (comma-separated Entra object IDs for Path B; "
+            "Allowed users (comma-separated Entra object IDs or UPN/email; "
             "blank = deny everyone)",
             default=get_env_value("A365_ALLOWED_USERS") or "",
         )

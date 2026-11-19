@@ -530,3 +530,16 @@ def test_changelog_records_register_aiteammate_removal() -> None:
     section_073 = rest_073 if end_073 < 0 else rest_073[:end_073]
     assert "unsupported/deprecated" in section_073
     assert "`hermes a365 register --aiteammate`" in section_073
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    ["README.md", "docs/quickstart-path-b.md", "src/hermes_a365/plugin/adapter.py"],
+)
+def test_path_b_allowlist_documents_graph_application_permission(relative_path: str) -> None:
+    text = (REPO_ROOT / relative_path).read_text()
+    assert "User.ReadBasic.All" in text
+    assert "application, admin consent" in text
+    assert "A365_BF_APP_ID" in text
+    assert "else the blueprint" in text
+    assert "match no Path B sender" in text
