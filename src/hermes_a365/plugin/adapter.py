@@ -14406,8 +14406,9 @@ class Agent365Adapter(BasePlatformAdapter):
         disconnect, or rejected wire activities. A completed personal
         wire-final may return success without another post; plain-reply
         fallback after a failed stream open belongs to ``send()``. After
-        a terminal 403 on an open stream, further non-finalize edits on
-        that message id are refused until the tombstone expires.
+        a terminal 403 on an open stream, further edits and finals
+        (``finalize=True``) on that message id are refused until the
+        terminal-failure marker expires.
 
         Soft path (``202 ContentStreamSequenceOrderPreConditionFailed``):
         out-of-order requests get dropped server-side; we log and
