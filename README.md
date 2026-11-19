@@ -767,10 +767,12 @@ as `ok`.
 > directory states a different policy. If neither file sets a policy, both
 > runtimes deny every end user. The profile file must be owner-only
 > (`chmod 600`); a group- or world-readable file is refused without printing
-> its contents. Allowlist
-> entries may be
-> AAD object IDs, opaque activity user IDs, or UPN/email aliases when Microsoft
-> includes those aliases in the signed activity. Bot Framework `personal` /
+> its contents. Path B senders are matched by Entra object ID (`aadObjectId`).
+> UPN/email entries in `A365_ALLOWED_USERS` resolve through Graph and require
+> User.ReadBasic.All (application, admin consent) on the app minting the Path B
+> Graph token (`A365_BF_APP_ID` when set, else the blueprint); without it they
+> match no Path B sender.
+> Bot Framework `personal` /
 > `groupChat` / `channel` values
 > are normalized to Hermes `dm` / `group` / `channel`; JWT-authenticated
 > lifecycle/control activities are acknowledged without pretending their

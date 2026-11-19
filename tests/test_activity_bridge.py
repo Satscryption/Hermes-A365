@@ -2965,6 +2965,44 @@ class TestRenderReply:
 # ---------------------------------------------------------------------------
 
 
+class TestSenderAllowlistPathBWarning:
+    @pytest.mark.parametrize(
+        ("users", "allow_all", "expected_prefix"),
+        [
+            (("one@example.test", "two@example.test"), False, "contains only UPN/email entries"),
+            (
+                ("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa", "one@example.test", "two@example.test"),
+                False,
+                "contains 2 UPN/email entries",
+            ),
+            (("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",), False, None),
+            ((), False, None),
+            ((), True, None),
+            (("one@example.test",), True, None),
+        ],
+        ids=["all-upn", "mixed", "oid-only", "empty", "allow-all", "allow-all-with-upn"],
+    )
+    def test_classification(
+        self, users: tuple[str, ...], allow_all: bool, expected_prefix: str | None
+    ) -> None:
+        from hermes_a365.activity_bridge import SenderAllowlist, sender_allowlist_path_b_warning
+
+        policy = SenderAllowlist(users, allow_all, configured=True)
+        warning = sender_allowlist_path_b_warning(policy)
+        if expected_prefix is None:
+            assert warning is None
+        else:
+            assert warning is not None
+            assert expected_prefix in warning
+            assert (
+                "are resolved through Microsoft Graph with User.ReadBasic.All (application)"
+                in warning
+            )
+            assert "activities carry object IDs (aadObjectId)" in warning
+            assert "otherwise they match nobody on Path B" in warning
+            assert all(entry not in warning for entry in users)
+
+
 class TestLoadBridgeConfig:
     def test_missing_secret_errors_with_actionable_hint(self, tmp_path: Path) -> None:
         """Slice 19e: secret missing usually means `a365 publish`
@@ -5265,3 +5303,145 @@ class TestSecurityRequestBoundary:
         cfg.skip_jwt_validation = True
         app = make_app(cfg, http_client=MagicMock())
         assert app is not None
+
+
+class TestUpnObjectIdResolver:
+    UPN = "private+tag/alias#x@example.test"
+    OID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+
+    @pytest.mark.parametrize("state", ["resolved", "expired", "unresolved"])
+    def test_resolved_alias_mapping_preserves_configured_spelling(self, monkeypatch, state):
+        from hermes_a365 import activity_bridge as bridge
+
+        configured = self.UPN.upper()
+        policy = bridge.parse_sender_allowlist(
+            {"A365_ALLOWED_USERS": configured}, source="test env"
+        )
+        cfg = _cfg()
+        cfg.allowed_users = policy.allowed_users
+        cfg.allowed_user_aliases = getattr(policy, "allowed_user_aliases", ())
+        clock = [10.0]
+        monkeypatch.setattr(bridge, "acquire_token", lambda **_kw: {"access_token": "token"})
+        resolver = bridge.UpnObjectIdResolver(
+            cfg,
+            fetch=lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode()),
+            clock=lambda: clock[0],
+        )
+        if state != "unresolved":
+            resolver.refresh()
+        if state == "expired":
+            clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+        expected = {self.OID: configured} if state == "resolved" else {}
+        assert resolver.resolved_aliases() == expected
+        # Callers receive a snapshot and cannot mutate the cache through it.
+        resolver.resolved_aliases().clear()
+        assert resolver.resolved_aliases() == expected
+
+    def test_partial_resolution_caches_each_entry_and_preserves_literals(self, monkeypatch, caplog):
+        import logging
+
+        from hermes_a365 import activity_bridge as bridge
+
+        cfg = _cfg()
+        cfg.allowed_users = bridge._parse_allowed_user_list(
+            f"{self.UPN.upper()},missing@example.test,opaque-id"
+        )
+        cfg.allow_all_users = False
+        clock = [10.0]
+        calls = []
+        token = MagicMock(return_value={"access_token": "sensitive-token"})
+        monkeypatch.setattr(bridge, "acquire_token", token)
+
+        def fetch(req, *, timeout):
+            calls.append(req.full_url)
+            assert timeout == 15
+            if "missing%40" in req.full_url:
+                raise urllib.error.HTTPError(req.full_url, 404, self.UPN, {}, None)
+            assert (
+                req.full_url
+                == "https://graph.microsoft.com/v1.0/users/private%2Btag%2Falias%23x%40example.test?$select=id"
+            )
+            return BytesIO(json.dumps({"id": self.OID.upper()}).encode())
+
+        resolver = bridge.UpnObjectIdResolver(cfg, fetch=fetch, clock=lambda: clock[0])
+        with caplog.at_level(logging.INFO):
+            resolver.refresh()
+            resolver.refresh()
+        assert len(calls) == 2
+        token.assert_called_once()
+        assert resolver.effective_allowed_users() == (*cfg.allowed_users, self.OID)
+        assert cfg.allowed_users == (self.UPN, "missing@example.test", "opaque-id")
+        assert "resolved 1 of 2 UPN/email allowlist entries to object IDs" in caplog.text
+        assert "1 unresolved entries match no Path B sender" in caplog.text
+        activity = _inbound_message_activity()
+        activity["from"] = {"id": "opaque", "email": "missing@example.test"}
+        assert bridge._activity_user_authorized(
+            activity, allowed_users=resolver.effective_allowed_users(), allow_all=False
+        )
+        clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+        assert resolver.effective_allowed_users() == cfg.allowed_users
+        with caplog.at_level(logging.INFO):
+            resolver.refresh()
+        assert len(calls) == 4
+        assert token.call_count == 2
+        for record in caplog.records:
+            assert self.UPN not in repr(record.__dict__)
+            assert "missing@example.test" not in repr(record.__dict__)
+            assert "sensitive-token" not in repr(record.__dict__)
+
+    @pytest.mark.parametrize(
+        "raw",
+        [None, 123, {}, [], "", "not-an-id", "a" * 32, "{aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa}"],
+    )
+    def test_rejects_malformed_guid(self, monkeypatch, raw):
+        from hermes_a365 import activity_bridge as bridge
+
+        cfg = _cfg()
+        cfg.allowed_users = (self.UPN,)
+        cfg.allow_all_users = False
+        token = MagicMock(return_value={"access_token": "sensitive-token"})
+        monkeypatch.setattr(bridge, "acquire_token", token)
+        resolver = bridge.UpnObjectIdResolver(
+            cfg, fetch=lambda *_a, **_kw: BytesIO(json.dumps({"id": raw}).encode())
+        )
+        resolver.refresh()
+        assert resolver.effective_allowed_users() == (self.UPN,)
+        assert cfg.allow_all_users is False
+
+    @pytest.mark.parametrize("allow_all", [False, True], ids=["resolve", "allow-all"])
+    def test_serve_lifespan_uses_resolution_without_changing_policy(self, monkeypatch, allow_all):
+        from hermes_a365 import activity_bridge as bridge
+
+        cfg = _cfg()
+        cfg.allowed_users = (self.UPN,) if not allow_all else ()
+        cfg.allow_all_users = allow_all
+        token = MagicMock(return_value={"access_token": "sensitive-token"})
+        fetch = MagicMock(
+            side_effect=lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode())
+        )
+        monkeypatch.setattr(bridge, "acquire_token", token)
+        monkeypatch.setattr(bridge.urllib.request, "urlopen", fetch)
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _: bridge.BF_ISSUER)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"aud": "x"}))
+        reply = AsyncMock()
+        monkeypatch.setattr(bridge, "forward_to_webhook", reply)
+        activity = _inbound_message_activity()
+        activity["from"] = {"id": "29:opaque", "aadObjectId": self.OID}
+        activity["recipient"] = {"id": "bot"}
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json={}))
+        )
+        with TestClient(bridge.make_app(cfg, http_client=client)) as tc:
+            response = tc.post(
+                "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+            )
+            assert response.status_code == 200
+            reply.assert_awaited_once()
+            assert cfg.allowed_users == ((self.UPN,) if not allow_all else ())
+            assert cfg.allow_all_users is allow_all
+            if allow_all:
+                token.assert_not_called()
+                fetch.assert_not_called()
+            else:
+                token.assert_called_once()
+                fetch.assert_called_once()

@@ -138,6 +138,7 @@ The blueprint Entra app is **agentic** and cannot mint Bot Framework app-only to
    **Expected:** `~/.hermes/agents/<slug>/.env` includes `AA_INSTANCE_ID` and carries `A365_BF_APP_ID` / `A365_BF_CLIENT_SECRET` from operator `~/.hermes/.env` ([`references/live-tenant-test.md`](../references/live-tenant-test.md) → **5. instance**, **§11.2.5** step 4).
 
 5. **Configure gateway sender policy** before C2.2 exposes `/api/messages`: run **`hermes gateway setup --platform agent365`**, then set `A365_ALLOW_ALL_USERS=true` or `A365_ALLOWED_USERS=<csv>` in `~/.hermes/.env` ([`README.md`](../README.md) → **Operator setup**). Leave **`gateway.multiplex_profiles` at the default (`false`)** for single-agent Path B.
+   Path B senders are matched by Entra object ID (`aadObjectId`). UPN/email entries in `A365_ALLOWED_USERS` resolve through Graph and require User.ReadBasic.All (application, admin consent) on the app minting the Path B Graph token (`A365_BF_APP_ID` when set, else the blueprint); without it they match no Path B sender.
 
 **C2.1 exit criteria:** blueprint + consent green; BF app registered with `Bot.Connector` consent; `A365_BLUEPRINT_CLIENT_SECRET` and both parent identifiers in profile env; `A365_BF_*` in operator and per-agent env; instance `.env` present; doctor shows no errors (warnings reviewed).
 

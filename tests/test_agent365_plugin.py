@@ -9640,6 +9640,242 @@ class TestEditMessage:
         )
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
+    def _first_contact_adapter(self, monkeypatch: pytest.MonkeyPatch) -> tuple[Any, ...]:
+        a = _make_adapter(monkeypatch)
+        # Another conversation has already been seen; first contact is per chat.
+        post_mock = self._wire_adapter(a, inbound=_make_inbound(conv_id="other-chat"))
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _token: bridge.BF_ISSUER)
+        monkeypatch.setattr(
+            bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"iss": bridge.BF_ISSUER})
+        )
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("bearer-test", "B"))
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        sleep_mock, clock = self._advance_monotonic_sleep(monkeypatch)
+        monkeypatch.setattr(a, "handle_message", AsyncMock(side_effect=a.on_processing_start))
+
+        async def persist(reservation: Any = None) -> None:
+            adapter_mod._complete_persist_mutation(reservation[0], reservation[1])
+
+        monkeypatch.setattr(a, "_persist_conversations", persist)
+        inbound = _make_inbound(conv_id="19:first-contact@thread.v2", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        return a, inbound, post_mock, sleep_mock, clock
+
+    @staticmethod
+    async def _receive_first_contact_activity(a: Any, activity: dict[str, Any]) -> None:
+        import httpx
+
+        transport = httpx.ASGITransport(app=a.build_app())
+        async with httpx.AsyncClient(transport=transport, base_url="http://testserver") as client:
+            response = await client.post(
+                "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+            )
+        assert response.status_code == 200
+        expected = "dispatched" if activity["type"] == "message" else "acked"
+        assert response.json()["status"] == expected
+
+    @staticmethod
+    async def _answer_first_contact_turn(a: Any) -> None:
+        event = a.handle_message.call_args.args[0]
+        chat = event.source.chat_id
+        record = a._event_turn_authority(event)
+        assert record is not None
+        with a._turn_frame_scope(record.session_key, record):
+            result = await a.send(chat_id=chat, content="Hello.", reply_to=event.message_id)
+            assert result.success
+            await a.on_processing_complete(event, outcome="success")
+
+    @staticmethod
+    def _first_contact_member_added(inbound: dict[str, Any]) -> dict[str, Any]:
+        return {
+            **inbound,
+            "type": "conversationUpdate",
+            "id": "members-added",
+            "membersAdded": [{"id": inbound["recipient"]["id"]}],
+        }
+
+    @pytest.mark.parametrize("late_marker", [True, False])
+    @pytest.mark.asyncio
+    async def test_copilot_first_contact_answer_plain_without_stream(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, late_marker: bool
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, inbound)
+        turn = a._turn_buffers[chat]["turns"][0]
+        clock["t"] += 0.143
+        if late_marker:
+            await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+            assert a._copilot_member_added_pending[chat] > turn["started_mono"]
+        clock["t"] += 5.157
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 1
+        plain = post_mock.await_args.kwargs["json"]
+        assert plain["type"] == "message"
+        assert plain["text"] == "Hello."
+        assert not any(e.get("type") == "streaminfo" for e in plain.get("entities", []))
+        assert not [call for call in sleep_mock.await_args_list if call.args[0] > 0]
+        logs = [r for r in caplog.records if "reason=first contact" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.INFO
+        assert "reason=open rejected" not in caplog.text
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+        assert chat not in a._turn_buffers
+        # Repeated completion must not produce a duplicate plain reply.
+        await a.on_processing_complete(a.handle_message.call_args.args[0], outcome="success")
+        assert post_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_copilot_bot_add_before_first_message_opens_and_holds_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 0.83
+        await self._receive_first_contact_activity(a, inbound)
+        clock["t"] += 4.3
+        await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "informative",
+            "streamSequence": 1,
+        }
+        assert final["type"] == "message"
+        assert final["text"] == "Hello."
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [10.0]
+        assert chat not in a._copilot_member_added_pending
+
+    @pytest.mark.asyncio
+    async def test_copilot_first_contact_open_stream_keeps_late_marker_timing(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, inbound)
+        buf = a._turn_buffers[chat]
+        async with a._turn_buffer_lock(buf):
+            await a._post_informative_locked(
+                chat, buf, allow_restart=False, text_override="Checking the answer."
+            )
+        assert post_mock.await_count == 1
+        opened = clock["t"]
+
+        async def sleep_with_marker(delay: float) -> None:
+            if chat not in a._copilot_member_added_pending:
+                clock["t"] += 1.0
+                await self._receive_first_contact_activity(
+                    a, self._first_contact_member_added(inbound)
+                )
+                clock["t"] += delay - 1.0
+            else:
+                clock["t"] += delay
+
+        sleep_mock.side_effect = sleep_with_marker
+        await self._answer_first_contact_turn(a)
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [
+            3.0,
+            7.0,
+        ]
+        assert clock["t"] - opened == 10.0
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["entities"][0]["streamType"] == "informative"
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+
+    @pytest.mark.asyncio
+    async def test_copilot_second_turn_after_first_contact_uses_ordinary_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, inbound)
+        clock["t"] += 0.143
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        await self._answer_first_contact_turn(a)
+        clock["t"] += 1.0
+        inbound["id"] = "act-2"
+        await self._receive_first_contact_activity(a, inbound)
+        await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 3
+        plain, opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert not any(e.get("type") == "streaminfo" for e in plain.get("entities", []))
+        assert opener["entities"][0]["streamType"] == "informative"
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [3.0]
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+
+    @pytest.mark.parametrize("activity_id", ["act-2", "act-1"], ids=["new-message", "retry"])
+    @pytest.mark.asyncio
+    async def test_copilot_existing_thread_after_restart_streams(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, activity_id: str
+    ) -> None:
+        previous = _make_adapter(monkeypatch)
+        prior_inbound = _make_inbound(conv_id="19:first-contact@thread.v2", path="B")
+        prior_inbound["conversation"]["conversationType"] = "groupChat"
+        ref = adapter_mod.ConversationRef.from_activity(prior_inbound)
+        assert ref is not None
+        previous._conversations.upsert(ref)
+        previous._conversations.save(previous._conversations_path)
+
+        # A fresh adapter loads the prior thread, with no inbound seen this lifetime.
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        assert a is not previous
+        assert a._conversations.get(chat) is not None
+        assert chat not in a._seen_inbounds_this_lifetime
+        inbound["id"] = activity_id
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._receive_first_contact_activity(a, inbound)
+            clock["t"] += 1.0
+            await self._answer_first_contact_turn(a)
+
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["type"] == "typing"
+        assert opener["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "informative",
+            "streamSequence": 1,
+        }
+        assert final["type"] == "message"
+        assert final["text"] == "Hello."
+        assert final["entities"][0] == {
+            "type": "streaminfo",
+            "streamType": "final",
+            "streamId": "stream-default",
+        }
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [3.0]
+        assert "reason=first contact" not in caplog.text
+        assert chat not in a._turn_buffers
+        assert chat not in a._copilot_member_added_pending
+        assert chat not in a._copilot_member_added_claims
+
     @pytest.mark.asyncio
     async def test_copilot_member_added_during_min_stream_age_wait_applies_to_current_turn(
         self, monkeypatch: pytest.MonkeyPatch
@@ -18732,7 +18968,67 @@ class TestEditMessage:
         assert "withholding operational notice" in caplog.text
         assert "groupChat" in caplog.text
 
+        notice = "Background task failed: example"
         sent = await a.send_private_notice("conv-notice-personal", "user-1", notice)
+        assert sent.success is True
+        assert send_reply_mock.await_count == 1
+        assert send_reply_mock.await_args.kwargs["reply"]["text"] == notice
+
+    @pytest.mark.asyncio
+    async def test_home_channel_notice_withheld_on_personal_and_group(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        caplog.set_level("INFO", logger=adapter_mod.logger.name)
+        notice = "Aucun canal de notification. Tapez /sethome pour en choisir un."
+
+        for chat_type, log_line in (
+            ("personal", "agent365 withholding home-channel notice on personal chat"),
+            ("groupChat", "agent365 withholding operational notice on non-personal chat"),
+        ):
+            chat_id = f"conv-home-notice-{chat_type}"
+            inbound = _make_inbound(conv_id=chat_id)
+            inbound["conversation"]["conversationType"] = chat_type
+            self._wire_adapter(a, inbound=inbound)
+            caplog.clear()
+
+            result = await a.send_private_notice(chat_id, "notice-user-secret", notice)
+
+            assert result.success is True
+            assert result.message_id == ""
+            assert send_reply_mock.await_count == 0
+            records = [r for r in caplog.records if r.name == adapter_mod.logger.name]
+            assert len(records) == 1
+            assert records[0].levelno == logging.INFO
+            assert log_line in records[0].getMessage()
+            assert f"chat_id={chat_id}" in records[0].getMessage()
+            assert notice not in caplog.text
+            assert "notice-user-secret" not in caplog.text
+            if chat_type == "personal":
+                assert "run /sethome in the chat that should receive notifications" in caplog.text
+            else:
+                assert "chat_type=groupChat" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_personal_operational_notice_sent_unchanged_after_home_notice(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat_id = "conv-personal-operational-notice"
+        self._wire_adapter(a, inbound=_make_inbound(conv_id=chat_id))
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        # Withholding the setup hint must not suppress later operational notices.
+        home = await a.send_private_notice(chat_id, "user-1", "Configure with /sethome.")
+        notice = "Background task failed: example"
+        sent = await a.send_private_notice(chat_id, "user-1", notice)
+
+        assert home.success is True
         assert sent.success is True
         assert send_reply_mock.await_count == 1
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == notice
@@ -30245,6 +30541,89 @@ class TestGatewaySecretsProviderWiring:
         assert (found, reachable, label) == (False, False, "exploding")
 
 
+class TestSenderAllowlistPathBStartupWarning:
+    @pytest.mark.parametrize("runtime", ["gateway", "serve"])
+    @pytest.mark.parametrize(
+        ("policy_text", "expected_fragment"),
+        [
+            (
+                "A365_ALLOWED_USERS=one@example.test,two@example.test\n",
+                "contains only UPN/email entries",
+            ),
+            (
+                "A365_ALLOWED_USERS=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa,"
+                "one@example.test,two@example.test\n",
+                "contains 2 UPN/email entries",
+            ),
+            ("A365_ALLOWED_USERS=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa\n", None),
+            ("A365_ALLOWED_USERS=\n", None),
+            ("A365_ALLOW_ALL_USERS=true\n", None),
+        ],
+        ids=["all-upn", "mixed", "oid-only", "empty", "allow-all"],
+    )
+    def test_startup_warning(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        tmp_path: Path,
+        caplog: pytest.LogCaptureFixture,
+        runtime: str,
+        policy_text: str,
+        expected_fragment: str | None,
+    ) -> None:
+        from hermes_a365.activity_bridge import load_bridge_config
+
+        monkeypatch.delenv("A365_ALLOWED_USERS", raising=False)
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        home = tmp_path / "hermes"
+        home.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(home))
+        profile = home / ".env"
+        profile.write_text(policy_text)
+        profile.chmod(0o600)
+        agent_dir = home / "agents" / "test-agent"
+        agent_dir.mkdir(parents=True)
+        agent_env = agent_dir / ".env"
+        agent_env.write_text("A365_TENANT_ID=11111111-1111-1111-1111-111111111111\n")
+        agent_env.chmod(0o600)
+        generated = home / "a365.generated.config.json"
+        generated.write_text('{"agentBlueprintId":"bp","agentBlueprintClientSecret":"secret"}')
+        generated.chmod(0o600)
+
+        with caplog.at_level(logging.WARNING):
+            if runtime == "gateway":
+                adapter_mod.Agent365Adapter(_StubPlatformConfig(extra={"slug": "test-agent"}))
+            else:
+                load_bridge_config(
+                    slug="test-agent",
+                    webhook_url="https://hook.test/responder",
+                    hermes_home=home,
+                    generated_config_path=generated,
+                )
+
+        logger_name = (
+            "hermes_a365.plugin.adapter" if runtime == "gateway" else "hermes_a365.activity_bridge"
+        )
+        warnings = [
+            record.getMessage()
+            for record in caplog.records
+            if record.name == logger_name and record.levelno >= logging.WARNING
+        ]
+        if expected_fragment is None:
+            assert warnings == []
+        else:
+            assert len(warnings) == 1
+            assert expected_fragment in warnings[0]
+            assert (
+                "are resolved through Microsoft Graph with User.ReadBasic.All (application)"
+                in warnings[0]
+            )
+            assert "activities carry object IDs (aadObjectId)" in warnings[0]
+            assert "otherwise they match nobody on Path B" in warnings[0]
+            assert "one@example.test" not in caplog.text
+            assert "two@example.test" not in caplog.text
+            assert "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" not in caplog.text
+
+
 class TestSenderAllowlistAgreement:
     """#160: the adapter resolves the same profile policy as ``serve``."""
 
@@ -32297,3 +32676,367 @@ class TestGatewayBridgePidPublication:
           await asyncio.sleep(0.05)
           await adapter3.disconnect()
       assert canary not in caplog.text
+
+
+class TestUpnObjectIdAllowlist:
+    UPN = "private+tag@example.test"
+    OID = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    OTHER = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    TOKEN = "private-graph-bearer"
+
+    @pytest.fixture
+    def runtime(self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture):
+        import threading
+        from io import BytesIO
+
+        import httpx
+        from fastapi.testclient import TestClient
+
+        bridge = adapter_mod._import_bridge()
+        caplog.set_level(logging.INFO)
+        loop_thread = threading.get_ident()
+        token = MagicMock(return_value={"access_token": self.TOKEN})
+        fetch = MagicMock(
+            side_effect=lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID.upper()}).encode())
+        )
+        monkeypatch.setattr(bridge, "acquire_token", token)
+        monkeypatch.setattr(bridge.urllib.request, "urlopen", fetch)
+        monkeypatch.setattr(bridge, "peek_unverified_iss", lambda _: bridge.BF_ISSUER)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"aud": "x"}))
+        clock = [100.0]
+        resolver_type = getattr(bridge, "UpnObjectIdResolver", None)
+        created = []
+
+        def resolver(cfg):
+            assert threading.get_ident() == loop_thread
+            result = resolver_type(cfg, clock=lambda: clock[0])
+            original_refresh = result.refresh
+
+            def refresh():
+                assert threading.get_ident() != loop_thread
+                original_refresh()
+
+            result.refresh = refresh
+            created.append(result)
+            return result
+
+        if resolver_type is not None:
+            monkeypatch.setattr(bridge, "UpnObjectIdResolver", resolver)
+
+        class Server:
+            def __init__(self, _config):
+                self.started = True
+                self.should_exit = False
+
+            async def serve(self):
+                while not self.should_exit:
+                    await asyncio.sleep(0.01)
+
+        monkeypatch.setitem(
+            sys.modules, "uvicorn", SimpleNamespace(Config=lambda *a, **kw: None, Server=Server)
+        )
+
+        @contextlib.asynccontextmanager
+        async def start(users, *, allow_all=False, bf=False):
+            a = _make_adapter(monkeypatch)
+            monkeypatch.setenv("A365_ALLOWED_USERS", ",".join(users))
+            monkeypatch.setenv("A365_ALLOW_ALL_USERS", str(allow_all).lower())
+            (a._hermes_home / ".env").write_text(
+                f"A365_ALLOWED_USERS={','.join(users)}\n"
+                f"A365_ALLOW_ALL_USERS={str(allow_all).lower()}\n"
+            )
+            policy = a._load_sender_allowlist()
+            a._allowed_users, a._allow_all_users = policy.allowed_users, policy.allow_all_users
+            a._allowed_user_aliases = getattr(policy, "allowed_user_aliases", ())
+            if bf:
+                a.bf_app_id, a.bf_client_secret = "bf-app", "bf-secret"
+            a._http_client = httpx.AsyncClient(
+                transport=httpx.MockTransport(lambda _: httpx.Response(200, json={}))
+            )
+            a._is_sender_authorized = lambda *_a: True
+            assert await a.connect() is True
+            try:
+                with TestClient(a._app) as client:
+                    yield SimpleNamespace(
+                        adapter=a,
+                        client=client,
+                        token=token,
+                        fetch=fetch,
+                        clock=clock,
+                        created=created,
+                    )
+            finally:
+                await a.disconnect()
+
+        yield start
+        for record in caplog.records:
+            assert self.UPN not in repr(record.__dict__)
+            assert self.UPN.upper() not in repr(record.__dict__)
+            assert self.OID not in repr(record.__dict__)
+            assert self.OID.upper() not in repr(record.__dict__)
+            assert self.TOKEN not in repr(record.__dict__)
+
+    def post(self, rt, oid=None, *, activity_id="act-1"):
+        activity = _make_inbound(path="B", activity_id=activity_id)
+        activity["from"] = {"id": "29:opaque", "aadObjectId": oid or self.OID}
+        return rt.client.post(
+            "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+        )
+
+    @pytest.mark.parametrize("bf", [False, True], ids=["blueprint", "bf"])
+    async def test_resolves_path_b_sender_and_selects_listed_alias(self, runtime, caplog, bf):
+        async with runtime((self.UPN,), bf=bf) as rt:
+            assert self.post(rt).status_code == 200
+            assert rt.adapter._handled_events[-1].source.user_id == self.UPN
+            assert rt.adapter._allowed_users == (self.UPN,)
+            assert rt.adapter._bridge_cfg.allowed_users == (self.UPN,)
+            assert rt.adapter._allow_all_users is False
+            assert self.post(rt, activity_id="act-2").status_code == 200
+            rt.token.assert_called_once_with(
+                tenant_id=rt.adapter.tenant_id,
+                client_id="bf-app" if bf else rt.adapter.blueprint_app_id,
+                client_secret="bf-secret" if bf else "fake-secret",
+                resource="https://graph.microsoft.com",
+            )
+            rt.fetch.assert_called_once()
+            req = rt.fetch.call_args.args[0]
+            assert (
+                req.full_url
+                == "https://graph.microsoft.com/v1.0/users/private%2Btag%40example.test?$select=id"
+            )
+            assert req.get_header("Authorization") == f"Bearer {self.TOKEN}"
+            assert req.get_method() == "GET"
+            assert "resolved 1 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+
+    @pytest.mark.parametrize(
+        ("users", "expected"),
+        [
+            ((UPN.upper(),), UPN.upper()),
+            ((UPN, OID), OID),
+            ((OID, UPN), OID),
+            ((UPN, "29:opaque"), "29:opaque"),
+        ],
+        ids=["configured-spelling", "mixed-upn-first", "mixed-oid-first", "direct-candidate"],
+    )
+    async def test_core_identity_matches_raw_allowlist(self, runtime, monkeypatch, users, expected):
+        raw = ",".join(users)
+        async with runtime(users) as rt:
+            # The route's Hermes check returns True; core checks the resulting event again.
+            core_turns = []
+
+            async def core_gate(event):
+                if event.source.user_id in os.environ["A365_ALLOWED_USERS"].split(","):
+                    core_turns.append(event)
+
+            monkeypatch.setattr(rt.adapter, "handle_message", core_gate)
+            assert os.environ["A365_ALLOWED_USERS"] == raw
+            assert self.post(rt).status_code == 200
+            assert len(core_turns) == 1
+            assert core_turns[0].source.user_id == expected
+
+    @pytest.mark.parametrize("failure", [404, 403, "token", "timeout", "network", "malformed"])
+    @pytest.mark.parametrize("mixed", [False, True], ids=["upn-only", "mixed"])
+    async def test_unresolved_denied_without_widening(
+        self, runtime, monkeypatch, caplog, failure, mixed
+    ):
+        import urllib.error
+
+        bridge = adapter_mod._import_bridge()
+        # Include sensitive text in error details to verify it is never logged.
+        detail = f"{self.UPN} {self.TOKEN}"
+        async with contextlib.AsyncExitStack() as stack:
+            # Mocks are installed by the fixture before connect runs.
+            token = bridge.acquire_token
+            fetch = bridge.urllib.request.urlopen
+            if isinstance(failure, int):
+                fetch.side_effect = urllib.error.HTTPError(
+                    f"https://graph/{detail}", failure, detail, {}, None
+                )
+            elif failure == "token":
+                token.side_effect = bridge.TokenAcquisitionError("AADSTS7000215", detail)
+            elif failure == "timeout":
+                fetch.side_effect = TimeoutError(detail)
+            elif failure == "network":
+                fetch.side_effect = urllib.error.URLError(detail)
+            else:
+                from io import BytesIO
+
+                fetch.side_effect = lambda *_a, **_kw: BytesIO(json.dumps({"id": detail}).encode())
+            users = (self.UPN, self.OTHER) if mixed else (self.UPN,)
+            rt = await stack.enter_async_context(runtime(users))
+            response = self.post(rt)
+            assert response.status_code == 403
+            assert response.json() == {"detail": "end user is not authorized"}
+            assert "inbound 403 reason=unauthorized-end-user" in caplog.text
+            assert rt.adapter._allow_all_users is False
+            assert rt.adapter._upn_resolver.effective_allowed_users() == users
+            assert rt.adapter._handled_events == []
+            if mixed:
+                assert self.post(rt, self.OTHER, activity_id="mixed").status_code == 200
+            token.assert_called_once()
+            assert fetch.call_count == (0 if failure == "token" else 1)
+            assert "resolved 0 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+            if failure == "token":
+                assert "status=AADSTS7000215" in caplog.text
+            elif isinstance(failure, int):
+                assert f"status={failure}" in caplog.text
+
+    async def test_path_b_reaction_turn_uses_configured_alias(self, runtime):
+        async with runtime((self.UPN.upper(),)) as rt:
+            assert self.post(rt).status_code == 200
+            rt.adapter._reactions_dispatch_agent_turn = True
+            rt.adapter._remember_bot_reply("reply-1", conversation_id="conv-1")
+            activity = _reaction_activity()
+            activity["from"] = {"id": "29:opaque", "aadObjectId": self.OID}
+            activity["recipient"] = {"id": "bot-1"}
+            response = rt.client.post(
+                "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+            )
+            assert response.status_code == 200
+            assert response.json() == {"status": "acked", "reactions": 1}
+            assert len(rt.adapter._handled_events) == 2
+            event = rt.adapter._handled_events[-1]
+            assert event.text == "reaction:added:like"
+            assert event.source.user_id == self.UPN.upper()
+
+    @pytest.mark.parametrize("direct_oid", [False, True], ids=["resolved-alias", "direct-oid"])
+    async def test_path_b_handoff_event_uses_listed_identity(
+        self, runtime, monkeypatch, direct_oid
+    ):
+        users = (self.UPN.upper(), self.OID) if direct_oid else (self.UPN.upper(),)
+        async with runtime(users) as rt:
+            activity = _make_inbound(path="B")
+            activity["from"] = {"id": "29:opaque", "aadObjectId": self.OID}
+            ctx = SimpleNamespace(activity=activity, conv=activity["conversation"], path_tag="B")
+            event = rt.adapter._build_handoff_message_event(
+                ctx, {"user_aad": self.OID, "hermes_session_id": "session-1"}, reply_activity_id=""
+            )
+            assert event.source.user_id == (self.OID if direct_oid else self.UPN.upper())
+            assert event.source.user_id in users
+            db = MagicMock()
+            db.find_session_by_origin.return_value = "session-1"
+            db.get_session.return_value = {
+                "id": "session-1",
+                "source": rt.adapter.platform.value,
+                "chat_id": ctx.conv["id"],
+                "user_id": event.source.user_id,
+                "session_key": "origin-key",
+            }
+            monkeypatch.setattr(rt.adapter, "_open_handoff_session_db", lambda: db)
+            monkeypatch.setattr(rt.adapter, "_close_handoff_session_db", lambda _db: None)
+            assert rt.adapter._lookup_live_origin_session(
+                conversation_id=ctx.conv["id"], user_id=self.OID
+            ) == "session-1"
+            assert db.find_session_by_origin.call_args.kwargs["user_id"] == event.source.user_id
+
+    @pytest.mark.parametrize(
+        ("users", "expected"),
+        [
+            ((UPN.upper(),), UPN.upper()),
+            ((UPN, OID), OID),
+            ((UPN, "29:opaque"), "29:opaque"),
+        ],
+        ids=["upn-only", "upn-plus-oid", "upn-plus-opaque"],
+    )
+    async def test_origin_lookup_matches_message_route_identity(
+        self, runtime, monkeypatch, users, expected
+    ):
+        async with runtime(users) as rt:
+            assert self.post(rt).status_code == 200
+            message_user_id = rt.adapter._handled_events[-1].source.user_id
+            assert message_user_id == expected
+            conv_id = rt.adapter._handled_events[-1].source.chat_id
+            db = MagicMock()
+            db.find_session_by_origin.return_value = "session-1"
+            db.get_session.return_value = {
+                "id": "session-1",
+                "source": rt.adapter.platform.value,
+                "chat_id": conv_id,
+                "user_id": message_user_id,
+                "session_key": "origin-key",
+            }
+            monkeypatch.setattr(rt.adapter, "_open_handoff_session_db", lambda: db)
+            monkeypatch.setattr(rt.adapter, "_close_handoff_session_db", lambda _db: None)
+            assert (
+                rt.adapter._lookup_live_origin_session(
+                    conversation_id=conv_id, user_id=self.OID
+                )
+                == "session-1"
+            )
+            assert db.find_session_by_origin.call_args.kwargs["user_id"] == message_user_id
+
+    async def test_direct_body_upn_keeps_configured_spelling(self, runtime, monkeypatch):
+        async with runtime((self.UPN.upper(),)) as rt:
+            activity = _make_inbound(path="B", activity_id="direct-upn-spelling")
+            activity["from"] = {
+                "id": "29:body-only",
+                "userPrincipalName": self.UPN.upper(),
+            }
+            response = rt.client.post(
+                "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+            )
+            assert response.status_code == 200
+            assert len(rt.adapter._handled_events) == 1
+            assert rt.adapter._handled_events[0].source.user_id == self.UPN.upper()
+
+    @pytest.mark.parametrize("allow_all", [False, True], ids=["oid-only", "allow-all"])
+    async def test_no_resolver_or_graph_for_oid_only_and_allow_all(
+        self, runtime, caplog, allow_all
+    ):
+        users = () if allow_all else (self.OID,)
+        async with runtime(users, allow_all=allow_all) as rt:
+            assert self.post(rt).status_code == 200
+            assert rt.adapter._handled_events[-1].source.user_id == self.OID
+            assert getattr(rt.adapter, "_upn_resolver", None) is None
+            assert rt.created == []
+            rt.token.assert_not_called()
+            rt.fetch.assert_not_called()
+            assert "UPN/email" not in caplog.text
+            assert "allowlist Graph resolution" not in caplog.text
+
+    async def test_expiry_denies_during_single_background_refresh_and_after_failure(
+        self, runtime, caplog
+    ):
+        import threading
+        import urllib.error
+        from io import BytesIO
+
+        bridge = adapter_mod._import_bridge()
+        entered, release = threading.Event(), threading.Event()
+        async with runtime((self.UPN,)) as rt:
+            assert self.post(rt).status_code == 200
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+
+            def blocked(*_a, **_kw):
+                entered.set()
+                assert release.wait(5)
+                raise urllib.error.HTTPError("https://graph/", 403, self.UPN, {}, None)
+
+            rt.fetch.side_effect = blocked
+            try:
+                # The request completes even while Graph is blocked in another thread.
+                assert self.post(rt, activity_id="expired").status_code == 403
+                assert await asyncio.to_thread(entered.wait, 2)
+                for i in range(3):
+                    assert self.post(rt, activity_id=f"refreshing-{i}").status_code == 403
+                assert rt.fetch.call_count == 2
+                assert rt.token.call_count == 2
+            finally:
+                release.set()
+
+            async def wait_refresh():
+                await rt.adapter._upn_resolver._refresh_task
+
+            rt.client.portal.call(wait_refresh)
+            assert rt.adapter._upn_resolver.effective_allowed_users() == (self.UPN,)
+            assert self.post(rt, activity_id="failed-refresh").status_code == 403
+            assert rt.fetch.call_count == 2
+            assert "resolved 0 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+            rt.fetch.side_effect = lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode())
+            assert self.post(rt, activity_id="retry").status_code == 403
+            rt.client.portal.call(wait_refresh)
+            assert self.post(rt, activity_id="recovered").status_code == 200
+            assert rt.adapter._handled_events[-1].source.user_id == self.UPN
+            assert rt.fetch.call_count == 3
+            assert rt.token.call_count == 3

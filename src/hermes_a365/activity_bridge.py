@@ -98,7 +98,9 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -1544,6 +1546,8 @@ class BridgeConfig:
     # Their app id may be minted under only when the operator listed it.
     # Empty means "blueprint id only" (deny-by-default).
     agent_identity_ids: tuple[str, ...] = ()
+    # Original UPN/email spelling for Hermes core authorization.
+    allowed_user_aliases: tuple[str, ...] = field(default=(), repr=False)
 
 
 def parse_agent_identity_ids(raw: Any) -> tuple[str, ...]:
@@ -1599,6 +1603,113 @@ class SenderAllowlist:
     allowed_users: tuple[str, ...] = ()
     allow_all_users: bool = False
     configured: bool = False
+    allowed_user_aliases: tuple[str, ...] = field(default=(), repr=False, compare=False)
+
+
+def sender_allowlist_path_b_warning(policy: SenderAllowlist) -> str | None:
+    """Describe Path B UPN/email resolution requirements without exposing values."""
+    if policy.allow_all_users or not policy.allowed_users:
+        return None
+    alias_count = sum("@" in entry for entry in policy.allowed_users)
+    if not alias_count:
+        return None
+    if alias_count == len(policy.allowed_users):
+        prefix = "A365_ALLOWED_USERS contains only UPN/email entries"
+    else:
+        prefix = f"A365_ALLOWED_USERS contains {alias_count} UPN/email entries"
+    return (
+        f"{prefix}; Path B activities carry object IDs (aadObjectId). UPN/email entries "
+        "are resolved through Microsoft Graph with User.ReadBasic.All (application); "
+        "otherwise they match nobody on Path B."
+    )
+
+
+UPN_OBJECT_ID_TTL_SECONDS = 3600
+
+
+class UpnObjectIdResolver:
+    """Cache Graph aliases separately from the configured sender policy."""
+
+    def __init__(self, cfg: BridgeConfig, *, fetch: Any = None, clock: Any = time.monotonic):
+        self._cfg, self._fetch, self._clock = cfg, fetch or urllib.request.urlopen, clock
+        self._cache = {entry: (None, 0.0) for entry in cfg.allowed_users if "@" in entry}
+        self._refresh_task: asyncio.Task | None = None
+
+    @staticmethod
+    def _log_error(exc: Exception) -> None:
+        code = str(getattr(exc, "code", ""))
+        safe_code = code if re.fullmatch(r"(?:[1-5][0-9]{2}|AADSTS[0-9]+)", code) else "unavailable"
+        logger.warning("allowlist Graph resolution failed status=%s", safe_code)
+
+    def refresh(self) -> None:
+        due = [entry for entry, (_, expiry) in self._cache.items() if expiry <= self._clock()]
+        if not due:
+            return
+        token = None
+        try:
+            token = acquire_token(
+                tenant_id=self._cfg.tenant_id,
+                client_id=self._cfg.bf_app_id or self._cfg.blueprint_client_id,
+                client_secret=self._cfg.bf_client_secret or self._cfg.blueprint_client_secret,
+                resource=GRAPH_RESOURCE,
+            )["access_token"]
+        except Exception as exc:
+            self._log_error(exc)
+        updates = {}
+        for entry in due:
+            oid = None
+            if token:
+                try:
+                    encoded = urllib.parse.quote(entry, safe="")
+                    url = f"{GRAPH_RESOURCE}/v1.0/users/{encoded}?$select=id"
+                    request = urllib.request.Request(
+                        url, headers={"Authorization": f"Bearer {token}"}
+                    )
+                    with self._fetch(request, timeout=15) as response:
+                        raw = json.loads(response.read())["id"]
+                    if not isinstance(raw, str) or not re.fullmatch(
+                        r"[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}", raw.lower()
+                    ):
+                        raise ValueError("invalid object ID")
+                    oid = raw.lower()
+                except Exception as exc:
+                    self._log_error(exc)
+            updates[entry] = (oid, self._clock() + UPN_OBJECT_ID_TTL_SECONDS)
+        self._cache = {**self._cache, **updates}
+        resolved = sum(
+            oid is not None and expiry > self._clock() for oid, expiry in self._cache.values()
+        )
+        log = logger.info if resolved == len(self._cache) else logger.warning
+        log(
+            "resolved %d of %d UPN/email allowlist entries to object IDs; "
+            "%d unresolved entries match no Path B sender "
+            "(Graph User.ReadBasic.All application permission required)",
+            resolved,
+            len(self._cache),
+            len(self._cache) - resolved,
+        )
+
+    def effective_allowed_users(self) -> tuple[str, ...]:
+        return self._cfg.allowed_users + tuple(
+            oid
+            for oid, expiry in self._cache.values()
+            if oid is not None and expiry > self._clock()
+        )
+
+    def resolved_aliases(self) -> dict[str, str]:
+        """Map live resolved object IDs to the configured UPN/email spelling."""
+        aliases = {entry.lower(): entry for entry in self._cfg.allowed_user_aliases}
+        return {
+            oid: aliases.get(entry.lower(), entry)
+            for entry, (oid, expiry) in self._cache.items()
+            if oid is not None and expiry > self._clock()
+        }
+
+    def refresh_in_background(self) -> None:
+        if (self._refresh_task is None or self._refresh_task.done()) and any(
+            expiry <= self._clock() for _, expiry in self._cache.values()
+        ):
+            self._refresh_task = asyncio.create_task(asyncio.to_thread(self.refresh))
 
 
 def _allowlist_env_view(env: Mapping[str, str]) -> dict[str, str]:
@@ -1657,6 +1768,7 @@ def parse_sender_allowlist(env: Mapping[str, str], *, source: str) -> SenderAllo
         allowed_users=users,
         allow_all_users=allow_all,
         configured=True,
+        allowed_user_aliases=tuple(part.strip() for part in users_raw.split(",") if "@" in part),
     )
 
 
@@ -1922,6 +2034,8 @@ def load_bridge_config(
             "sender allowlist is not configured; denying every end user. "
             "Set A365_ALLOWED_USERS or A365_ALLOW_ALL_USERS in ~/.hermes/.env"
         )
+    if warning := sender_allowlist_path_b_warning(sender_policy):
+        logger.warning(warning)
     allow_client_bf_channels = resolve_allow_client_bf_channels(
         hermes_home,
         process_env=os.environ,
@@ -1938,6 +2052,7 @@ def load_bridge_config(
         bf_app_id=bf_app_id,
         bf_client_secret=bf_client_secret,
         allowed_users=sender_policy.allowed_users,
+        allowed_user_aliases=sender_policy.allowed_user_aliases,
         allow_all_users=sender_policy.allow_all_users,
         sender_allowlist_configured=sender_policy.configured,
         allow_client_bf_channels=allow_client_bf_channels,
@@ -4038,8 +4153,14 @@ def make_app(
             max_entries=cfg.idempotency_max_entries,
         )
 
+    upn_resolver = None
+
     @asynccontextmanager
     async def _serve_lifespan(_app: Any):
+        nonlocal upn_resolver
+        if not cfg.allow_all_users and any("@" in entry for entry in cfg.allowed_users):
+            upn_resolver = UpnObjectIdResolver(cfg)
+            await asyncio.to_thread(upn_resolver.refresh)
         try:
             yield
         finally:
@@ -4168,9 +4289,13 @@ def make_app(
         # side effect. JWT-authenticated platform lifecycle/control activities do
         # not carry an end-user principal and are acknowledged separately.
         if _activity_requires_end_user_auth(activity):
+            allowed_users = cfg.allowed_users
+            if upn_resolver is not None:
+                allowed_users = upn_resolver.effective_allowed_users()
+                upn_resolver.refresh_in_background()
             if not _activity_user_authorized(
                 activity,
-                allowed_users=cfg.allowed_users,
+                allowed_users=allowed_users,
                 allow_all=cfg.allow_all_users,
                 claims=inbound_claims,
             ):
