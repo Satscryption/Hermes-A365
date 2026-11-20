@@ -272,9 +272,9 @@ class PublishInputs:
             raise ValueError("--use-blueprint is only meaningful with --aiteammate false")
         if self.use_blueprint and self.copilot_chat:
             raise ValueError("--use-blueprint is incompatible with --copilot-chat")
-        if self.manifest_id and not self.copilot_chat:
+        if self.manifest_id is not None and not self.copilot_chat:
             raise ValueError("--manifest-id is only meaningful with --copilot-chat")
-        if self.manifest_id and self.manifest_id != "auto":
+        if self.manifest_id is not None and self.manifest_id != "auto":
             try:
                 self.manifest_id = _canonical_manifest_guid(self.manifest_id)
             except ValueError as e:
@@ -919,23 +919,24 @@ def _publish_state_manifest_id_mismatch_message(
     inputs: PublishInputs,
     state_cea_catalog_id_minted: bool,
 ) -> str:
+    del aiteammate_catalog_id  # guidance is source-independent; post-run ignores zip id
     base = (
         f"Copilot Chat publish state at {path} records manifestId {stored_id}, "
         f"but this publish targets {catalog_manifest_id}. "
     )
-    combined_or_auto_state = (
-        inputs.aiteammate and inputs.copilot_chat
-    ) or state_cea_catalog_id_minted
-    if (
-        combined_or_auto_state
-        and aiteammate_catalog_id
-        and stored_id == _canonical_manifest_guid(aiteammate_catalog_id)
-    ):
+    combined = bool(inputs.aiteammate and inputs.copilot_chat)
+    if combined and not state_cea_catalog_id_minted:
         return (
-            base + "The stored id is the AI Teammate catalog id — do not pass "
-            "--manifest-id with that value on combined publishes. Omit "
+            base + "On combined --aiteammate --copilot-chat publishes, do not "
+            "reuse the AI Teammate catalog id; do not pass --manifest-id with "
+            "that value — the Copilot Chat catalog id must be distinct. Omit "
             "--manifest-id to mint a distinct CEA catalog id, remove or rename "
             "the state file, or pass a new --manifest-id with --app-version."
+        )
+    if state_cea_catalog_id_minted:
+        return (
+            base + "Remove or rename the state file, or pass a new --manifest-id "
+            "with --app-version for a separate catalog entry."
         )
     return (
         base + f"Pass --manifest-id {stored_id} to match the stored id, remove or "
@@ -1143,6 +1144,58 @@ def _copilot_chat_mints_catalog_id(inputs: PublishInputs) -> bool:
     return inputs.manifest_id == "auto" or (
         inputs.manifest_id is None and inputs.aiteammate and inputs.copilot_chat
     )
+
+
+def _copilot_chat_publish_preflight(
+    inputs: PublishInputs,
+    *,
+    hermes_home: Path,
+    tenant_id: str,
+    profile: str,
+) -> None:
+    """Refuse explicit catalog record/version failures before publish can mutate files."""
+    if not inputs.copilot_chat or inputs.manifest_id in (None, "auto"):
+        return
+    state_path = _copilot_chat_publish_state_path(hermes_home, _require_copilot_chat_slug(inputs))
+    record = _load_copilot_chat_publish_state_record(
+        state_path, hermes_home=hermes_home, tenant_id=tenant_id, profile=profile
+    )
+    if record is None:
+        if inputs.app_version is None:
+            raise PublishError(
+                "no Copilot Chat publish record for catalog "
+                f"manifest.id {inputs.manifest_id}; pass --app-version "
+                "strictly greater than the app version shown in "
+                "Microsoft Admin Center (required for MAC updates when "
+                "the package was installed outside Hermes or local "
+                "state is missing)"
+            )
+        return
+    _refuse_unscoped_v1_publish_state(
+        record,
+        path=state_path,
+        app_version_override=inputs.app_version,
+    )
+    canonical_manifest_id = _canonical_manifest_guid(inputs.manifest_id)
+    _assert_publish_state_matches_catalog_id(
+        state_path,
+        catalog_manifest_id=canonical_manifest_id,
+        hermes_home=hermes_home,
+        tenant_id=tenant_id,
+        profile=profile,
+        inputs=inputs,
+        manifest_id_resolution=None,
+        aiteammate_catalog_id=None,
+    )
+    if inputs.app_version is not None and record["manifestId"] == canonical_manifest_id:
+        try:
+            _resolve_next_copilot_chat_app_version(
+                template_version=None,
+                last_published=str(record["lastAppVersion"]),
+                override=inputs.app_version,
+            )
+        except ValueError as exc:
+            raise PublishError(str(exc)) from exc
 
 
 def _resolve_copilot_chat_manifest_id_for_apply(
@@ -1514,6 +1567,14 @@ def apply_publish_plan(
             "no canonical tenant pin was resolved; pass --tenant-id or set "
             "A365_TENANT_ID before publishing"
         )
+    publish_tenant_id = _normalize_publish_state_tenant_id(expected_tenant)
+    publish_profile = _resolve_hermes_profile_name(plan.inputs.profile)
+    _copilot_chat_publish_preflight(
+        plan.inputs,
+        hermes_home=hermes_home,
+        tenant_id=publish_tenant_id,
+        profile=publish_profile,
+    )
     # The a365 mutator refuses every argv, including `az account show`, when
     # the a365 binary is missing. That used to surface as a tenant-verification
     # failure (#123 F5).
@@ -1536,8 +1597,6 @@ def apply_publish_plan(
         raise PublishError("active Azure tenant does not match the publish tenant pin")
     if plan.inputs.copilot_chat:
         _require_copilot_chat_slug(plan.inputs)
-    publish_tenant_id = _normalize_publish_state_tenant_id(expected_tenant)
-    publish_profile = _resolve_hermes_profile_name(plan.inputs.profile)
     run = mutator.run(plan.step.argv, timeout=_PUBLISH_APPLY_TIMEOUT_SECONDS)
     package_path: str | None = None
     copilot_chat_package_path: str | None = None
@@ -1857,7 +1916,9 @@ def build_parser(parser: argparse.ArgumentParser | None = None) -> argparse.Argu
             "manifest.id (MAC updates without local state). Must be strictly "
             "greater than the last published version recorded in "
             f"$HERMES_HOME/agents/<slug>/{_COPILOT_CHAT_PUBLISH_STATE_FILENAME} "
-            "for the same tenant, profile, and manifest.id"
+            "for the same tenant, profile, and manifest.id. "
+            "Local record and version gates are also checked during dry-run "
+            "when --manifest-id is an explicit GUID."
         ),
     )
     parser.add_argument(
@@ -1944,6 +2005,16 @@ def run(args: argparse.Namespace) -> int:
     sys.stdout.write(plan.render_human() + "\n")
 
     if not args.apply:
+        try:
+            _copilot_chat_publish_preflight(
+                inputs,
+                hermes_home=hermes_home,
+                tenant_id=_normalize_publish_state_tenant_id(tenant_id),
+                profile=_resolve_hermes_profile_name(inputs.profile),
+            )
+        except PublishError as exc:
+            print(f"ERROR: {exc}", file=sys.stderr)
+            return 2
         sys.stdout.write("\nNo mutations. Re-run with --apply to package.\n")
         return 0
 
