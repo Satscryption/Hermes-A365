@@ -254,14 +254,6 @@ def test_semver_commitment_sentences() -> None:
     _assert_sentences_in_order(changelog, _SEMVER_SENTENCES, end=unreleased)
 
 
-def test_development_status_production_stable() -> None:
-    classifiers = _project()["classifiers"]
-    assert classifiers[0] == "Development Status :: 5 - Production/Stable"
-    assert classifiers[1] == "Programming Language :: Python :: 3"
-    dev_status = [c for c in classifiers if c.startswith("Development Status ::")]
-    assert len(dev_status) == 1
-
-
 def test_part2_preserved_surfaces() -> None:
     import hashlib
     from dataclasses import fields
@@ -276,6 +268,7 @@ def test_part2_preserved_surfaces() -> None:
         "agent_name",
         "tenant_id",
         "m365",
+        "aiteammate",
         "authmode",
         "no_endpoint",
         "skip_requirements",

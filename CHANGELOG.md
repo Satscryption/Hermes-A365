@@ -8,10 +8,12 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
+- Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
+
 ## [0.9.7] — 2026-11-20
 
 Client secret expiry (#191), turn authority (#278), reply delivery (#282), register
-hardening, ``register --aiteammate`` removal (#85), GA docs (#87), Path B fixes,
+hardening, GA docs (#87), Path B fixes,
 and status / ``doctor`` probes.
 Ships from ``main`` via PRs #266, #275, #278, #282, #283, #284, #294, #295, #296, #297, #298, #299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, #323, #324, #333, #334, #335, and the release bump.
 
@@ -78,15 +80,7 @@ Ships from ``main`` via PRs #266, #275, #278, #282, #283, #284, #294, #295, #296
   [#319](https://github.com/Satscryption/Hermes-A365/pull/319),
   [#333](https://github.com/Satscryption/Hermes-A365/pull/333),
   [#334](https://github.com/Satscryption/Hermes-A365/pull/334),
-  [#335](https://github.com/Satscryption/Hermes-A365/pull/335).
-
-### Removed
-
-- **#85 — `register --aiteammate` (#305).** Passing it exits 2 with the redirect and
-  does not build or apply a plan; removed from register entry points and ``--help``.
-  `publish --aiteammate` is unchanged. Refs
-  [#85](https://github.com/Satscryption/Hermes-A365/issues/85),
-  [#305](https://github.com/Satscryption/Hermes-A365/pull/305).
+      [#335](https://github.com/Satscryption/Hermes-A365/pull/335).
 
 ### Docs
 

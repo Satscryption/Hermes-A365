@@ -455,12 +455,8 @@ def test_staged_v1_combination_is_not_a_zero_release(tmp_path: Path) -> None:
 
     assert mod.evaluate(_ROOT, "refs/tags/v0.9.7").version == "0.9.7"
 
-    with pytest.raises(mod.ReleaseIntegrityError) as live_check:
-        mod.check(_ROOT, "refs/tags/v0.9.7")
-    live_message = str(live_check.value)
-    assert "0.9.7" in live_message
-    assert "Production/Stable" in live_message
-    assert "REGISTER_AITEAMMATE_REMOVED" in live_message
+    live_notes = mod.check(_ROOT, "refs/tags/v0.9.7")
+    assert live_notes.version == "0.9.7"
 
     v1_root = _staged_release_repo(tmp_path, "1.0.0")
     notes = mod.check(v1_root, "refs/tags/v1.0.0")
@@ -494,8 +490,8 @@ def test_live_0_9_7_section_still_parses() -> None:
     assert notes.version == "0.9.7"
     assert notes.title == (
         "v0.9.7 \u2014 Client secret expiry (#191), turn authority (#278), reply delivery "
-        "(#282), register hardening, ``register --aiteammate`` removal (#85), GA docs (#87), "
-        "Path B fixes, and status / ``doctor`` probes."
+        "(#282), register hardening, GA docs (#87), Path B fixes, and status / "
+        "``doctor`` probes."
     )
     assert len(notes.title) <= mod.TITLE_LIMIT
     assert (
