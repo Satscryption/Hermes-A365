@@ -499,9 +499,9 @@ def test_live_0_9_7_section_still_parses() -> None:
     )
     assert len(notes.title) <= mod.TITLE_LIMIT
     assert (
-        "Ships from ``main`` via PRs #266, #278, #282, #283, #284, #294, #295, #297, #298, "
-        "#299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, #323, #324, "
-        "#333, #334, #335, and the release bump."
+        "Ships from ``main`` via PRs #266, #275, #278, #282, #283, #284, #294, #295, #296, "
+        "#297, #298, #299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, "
+        "#323, #324, #333, #334, #335, and the release bump."
     ) in notes.body
     assert "2026-11-20" in notes.body
 

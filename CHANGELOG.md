@@ -13,7 +13,7 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 Client secret expiry (#191), turn authority (#278), reply delivery (#282), register
 hardening, ``register --aiteammate`` removal (#85), GA docs (#87), Path B fixes,
 and status / ``doctor`` probes.
-Ships from ``main`` via PRs #266, #278, #282, #283, #284, #294, #295, #297, #298, #299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, #323, #324, #333, #334, #335, and the release bump.
+Ships from ``main`` via PRs #266, #275, #278, #282, #283, #284, #294, #295, #296, #297, #298, #299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, #323, #324, #333, #334, #335, and the release bump.
 
 ### Added
 
@@ -32,7 +32,7 @@ Ships from ``main`` via PRs #266, #278, #282, #283, #284, #294, #295, #297, #298
 - **#278 — Turn authority and card binding.** Origins bind approval cards and replies
   to their creating turn. Refs [#278](https://github.com/Satscryption/Hermes-A365/pull/278).
 
-- **#291 — Plain-fallback log reason (#295).** Refs [#291](https://github.com/Satscryption/Hermes-A365/issues/291), [#295](https://github.com/Satscryption/Hermes-A365/pull/295).
+- **#291 — Plain-fallback log reason (#295).** The plain-fallback log names ``age_budget``, ``rotated``, or ``retry_exhausted``; age-budget and rotation log at info, and ``retry_exhausted`` logs at warning. Refs [#291](https://github.com/Satscryption/Hermes-A365/issues/291), [#295](https://github.com/Satscryption/Hermes-A365/pull/295).
 
 - **#85 — SemVer and release integrity (#306, #308).** Refs
   [#85](https://github.com/Satscryption/Hermes-A365/issues/85),
@@ -65,15 +65,16 @@ Ships from ``main`` via PRs #266, #278, #282, #283, #284, #294, #295, #297, #298
 
 - **#284, #320, #283.** Bot-service create names sidecar read errors; ``doctor``
   skips keychain when plaintext secrets suffice (#324); subprocess overflow test
-  tolerates slower runners. Refs
+  tolerates slower runners; ruff-format ``tests/test_invoke.py`` (#296). Refs
   [#283](https://github.com/Satscryption/Hermes-A365/pull/283),
   [#284](https://github.com/Satscryption/Hermes-A365/pull/284),
   [#320](https://github.com/Satscryption/Hermes-A365/issues/320),
   [#324](https://github.com/Satscryption/Hermes-A365/pull/324).
 
-- **#319, #333–#335 — Path B and personal-chat delivery.** Wire-final completion,
-  AI-generated labels, validation-walk allowlist and first-contact fixes, publish
-  manifest-id guard, stream retirement and cancel suppression. Refs
+- **#319, #333–#335 — Path B and personal-chat delivery.** Personal-chat stream
+  completion and AI-generated labels; withhold home-channel setup notices, use plain
+  first-contact replies, and resolve allowlist identities; refuse publish updates on
+  manifest-id mismatch; retire personal streams and suppress cancel. Refs
   [#319](https://github.com/Satscryption/Hermes-A365/pull/319),
   [#333](https://github.com/Satscryption/Hermes-A365/pull/333),
   [#334](https://github.com/Satscryption/Hermes-A365/pull/334),
@@ -90,11 +91,7 @@ Ships from ``main`` via PRs #266, #278, #282, #283, #284, #294, #295, #297, #298
 ### Docs
 
 - **#87 — GA docs (#299, #304, #307, #310, #311, #322).** Path A and Path B
-  quickstarts and ``docs/security-model.md``. Refs
-  [#87](https://github.com/Satscryption/Hermes-A365/issues/87),
-  [#299](https://github.com/Satscryption/Hermes-A365/pull/299),
-  [#311](https://github.com/Satscryption/Hermes-A365/pull/311),
-  [#322](https://github.com/Satscryption/Hermes-A365/pull/322).
+  quickstarts, ``docs/security-model.md``; #275 records Copilot Chat keep-alive timing notes. Refs [#87](https://github.com/Satscryption/Hermes-A365/issues/87), [#275](https://github.com/Satscryption/Hermes-A365/pull/275), [#299](https://github.com/Satscryption/Hermes-A365/pull/299), [#304](https://github.com/Satscryption/Hermes-A365/pull/304), [#307](https://github.com/Satscryption/Hermes-A365/pull/307), [#310](https://github.com/Satscryption/Hermes-A365/pull/310), [#311](https://github.com/Satscryption/Hermes-A365/pull/311), [#322](https://github.com/Satscryption/Hermes-A365/pull/322).
 
 ### Known issues
 
