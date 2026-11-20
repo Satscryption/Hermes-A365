@@ -371,6 +371,7 @@ def test_no_current_register_aiteammate_reference() -> None:
         if path in (
             REPO_ROOT / "tests" / "test_register.py",
             REPO_ROOT / "tests" / "test_public_surface.py",
+            REPO_ROOT / "tests" / "test_release_integrity.py",
         ):
             continue
         text = path.read_text(encoding="utf-8")
@@ -473,25 +474,29 @@ def test_changelog_records_register_aiteammate_removal() -> None:
     changelog = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
     all_lines = changelog.splitlines()
     unreleased_start = changelog.index("## [Unreleased]")
-    next_section = changelog.index("## [0.9.6]", unreleased_start)
-    unreleased = changelog[unreleased_start:next_section]
+    release_start = changelog.index("## [0.9.7]", unreleased_start)
+    next_section = changelog.index("## [0.9.6]", release_start)
+    unreleased = changelog[unreleased_start:release_start]
     unreleased_lines = unreleased.splitlines()
-    assert "### Removed" in unreleased
-    removed_idx = next(
-        i
-        for i, line in enumerate(unreleased_lines)
-        if line.strip() == "### Removed"
+    assert "### Removed" not in unreleased
+    assert all(
+        _atx_level(line) is None or line.startswith("## [Unreleased]")
+        for line in unreleased_lines
     )
-    section_end_idx = len(unreleased_lines)
-    for i in range(removed_idx + 1, len(unreleased_lines)):
-        level = _atx_level(unreleased_lines[i])
+    release_lines = changelog[release_start:next_section].splitlines()
+    assert "### Removed" in "\n".join(release_lines)
+    removed_idx = next(
+        i for i, line in enumerate(release_lines) if line.strip() == "### Removed"
+    )
+    section_end_idx = len(release_lines)
+    for i in range(removed_idx + 1, len(release_lines)):
+        level = _atx_level(release_lines[i])
         if level is not None and 3 <= level <= 6:
             section_end_idx = i
             break
-    removed_section = "\n".join(unreleased_lines[removed_idx:section_end_idx])
+    removed_section = "\n".join(release_lines[removed_idx:section_end_idx])
     bullets = [line for line in removed_section.splitlines() if line.strip().startswith("- ")]
     assert len(bullets) == 1
-    bullet = bullets[0]
     for needle in (
         "#85",
         "`register --aiteammate`",
@@ -500,9 +505,7 @@ def test_changelog_records_register_aiteammate_removal() -> None:
         "does not build or apply a plan",
         "`publish --aiteammate` is unchanged",
     ):
-        assert needle in bullet
-    tail_lines = unreleased_lines[section_end_idx:]
-    assert all(_atx_level(line) is None for line in tail_lines)
+        assert needle in removed_section
     global_removed_idx = None
     past_unreleased_heading = False
     for i, line in enumerate(all_lines):
@@ -515,15 +518,13 @@ def test_changelog_records_register_aiteammate_removal() -> None:
             global_removed_idx = i
             break
     assert global_removed_idx is not None
-    next_heading_line: str | None = None
+    next_version_heading: str | None = None
     for j in range(global_removed_idx + 1, len(all_lines)):
-        level = _atx_level(all_lines[j])
-        if level is not None:
-            next_heading_line = all_lines[j]
+        if all_lines[j].startswith("## ["):
+            next_version_heading = all_lines[j]
             break
-    assert next_heading_line is not None
-    remainder = re.sub(r"^ {0,3}", "", next_heading_line)
-    assert remainder.startswith("## [0.9.6]")
+    assert next_version_heading is not None
+    assert next_version_heading.startswith("## [0.9.6]")
     start_073 = changelog.index("## [0.7.3]")
     rest_073 = changelog[start_073:]
     end_073 = rest_073.find("\n## [", len("## [0.7.3]"))

@@ -453,12 +453,12 @@ def test_staged_v1_combination_is_not_a_zero_release(tmp_path: Path) -> None:
     assert mod.staged_zero_release_problem("1.0.0", [_STABLE_CLASSIFIER], True) is None
     assert mod.staged_zero_release_problem("0.9.6", [], False) is None
 
-    assert mod.evaluate(_ROOT, "refs/tags/v0.9.6").version == "0.9.6"
+    assert mod.evaluate(_ROOT, "refs/tags/v0.9.7").version == "0.9.7"
 
     with pytest.raises(mod.ReleaseIntegrityError) as live_check:
-        mod.check(_ROOT, "refs/tags/v0.9.6")
+        mod.check(_ROOT, "refs/tags/v0.9.7")
     live_message = str(live_check.value)
-    assert "0.9.6" in live_message
+    assert "0.9.7" in live_message
     assert "Production/Stable" in live_message
     assert "REGISTER_AITEAMMATE_REMOVED" in live_message
 
@@ -472,21 +472,38 @@ def test_staged_v1_combination_is_not_a_zero_release(tmp_path: Path) -> None:
 
 
 def test_live_0_9_6_section_still_parses() -> None:
-    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.6")
+    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    heading, body = mod.changelog_section(text, "0.9.6")
 
-    assert notes.version == "0.9.6"
-    assert notes.title == (
+    assert heading.startswith("## [0.9.6] \u2014 2026-11-03")
+    assert "2026-11-03" in heading
+    assert mod.release_title("v0.9.6", body) == (
         "v0.9.6 \u2014 Copilot Chat streaming polish (#249, #251, #255), plain-flush retry "
         "follow-ups (#244), per-kid JWKS refresh (#218), sensitive output handling for "
         "blueprint setup (#256), Direct Line probe 401 attribution (#250), sidecar schema "
         "versioning..."
     )
-    assert len(notes.title) <= mod.TITLE_LIMIT
     assert (
         "Ships from ``main`` via PRs #257, #258, #260, #261, #262, #263, #264, #265, "
         "#267, #268, #269, and #272 (release bump)."
+    ) in body
+
+def test_live_0_9_7_section_still_parses() -> None:
+    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.7")
+
+    assert notes.version == "0.9.7"
+    assert notes.title == (
+        "v0.9.7 \u2014 Client secret expiry (#191), turn authority (#278), reply delivery "
+        "(#282), register hardening, ``register --aiteammate`` removal (#85), GA docs (#87), "
+        "Path B fixes, and status / ``doctor`` probes."
+    )
+    assert len(notes.title) <= mod.TITLE_LIMIT
+    assert (
+        "Ships from ``main`` via PRs #266, #278, #282, #283, #284, #294, #295, #297, #298, "
+        "#299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, #323, #324, "
+        "#333, #334, #335, and the release bump."
     ) in notes.body
-    assert "2026-11-03" in notes.body
+    assert "2026-11-20" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:

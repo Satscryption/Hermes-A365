@@ -269,8 +269,8 @@ def test_part2_preserved_surfaces() -> None:
     from hermes_a365 import __version__
     from hermes_a365.register import RegisterInputs
 
-    assert _project()["version"] == "0.9.6"
-    assert __version__ == "0.9.6"
+    assert _project()["version"] == "0.9.7"
+    assert __version__ == "0.9.7"
     names = tuple(f.name for f in fields(RegisterInputs))
     assert names == (
         "agent_name",

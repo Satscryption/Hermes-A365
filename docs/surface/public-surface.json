@@ -2206,7 +2206,7 @@
     },
     "status": "accepted"
   },
-  "package_version": "0.9.6",
+  "package_version": "0.9.7",
   "packaging": {
     "classifiers": [
       "Development Status :: 5 - Production/Stable",
@@ -2243,7 +2243,7 @@
       "Homepage": "https://github.com/satscryption/Hermes-A365",
       "Issues": "https://github.com/satscryption/Hermes-A365/issues"
     },
-    "version": "0.9.6"
+    "version": "0.9.7"
   },
   "plugin_requires_env": [
     "A365_TENANT_ID",
