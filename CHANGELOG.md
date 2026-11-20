@@ -8,63 +8,102 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
+## [0.9.7] — 2026-11-20
+
+Client secret expiry (#191), turn authority (#278), reply delivery (#282), register
+hardening, ``register --aiteammate`` removal (#85), GA docs (#87), Path B fixes,
+and status / ``doctor`` probes.
+Ships from ``main`` via PRs #266, #275, #278, #282, #283, #284, #294, #295, #296, #297, #298, #299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, #323, #324, #333, #334, #335, and the release bump.
+
 ### Added
 
-- **#191 — Client secret expiry in `doctor` / `status`.** Read
-  ``passwordCredentials`` ``endDateTime`` metadata (never secret values) for
-  the blueprint app and Path B Bot Framework app via the existing ``az rest`` /
-  mutator Graph path. **Warn** within 30 days by default
-  (``--secret-expiry-warn-days N``); **fail** when expired or no active secret;
-  degrade to a clear “could not check” notice on permission or parse errors.
-  Rotation runbook: ``references/client-secret-rotation.md``. Refs
-  [#191](https://github.com/Satscryption/Hermes-A365/issues/191).
+- **#191 — Client secret expiry in `doctor` / `status` (#266).** Warn, fail, or
+  degrade on secret ``endDateTime`` metadata; rotation runbook in
+  ``references/client-secret-rotation.md``; Graph depth capped at 64. Refs
+  [#191](https://github.com/Satscryption/Hermes-A365/issues/191),
+  [#266](https://github.com/Satscryption/Hermes-A365/pull/266).
+
+- **#321 — `status` in-process bridge PID (#323).** Writes ``bridge.pid`` after
+  gateway connect. Refs [#321](https://github.com/Satscryption/Hermes-A365/issues/321),
+  [#323](https://github.com/Satscryption/Hermes-A365/pull/323).
 
 ### Changed
 
-- Bind interactive approval cards and replies to the turn that created them.
-- Retain turn origins across callbacks and reconnects, and release completed turn records.
-- **#291 — Plain-fallback log reason.** The plain fallback log now names its reason (`age_budget`, `rotated`, `retry_exhausted`); expected age-budget and rotation fallbacks log at info instead of warning.
-- Client secret expiry Graph responses enforce a JSON nesting depth limit of 64 before decoding.
+- **#278 — Turn authority and card binding.** Origins bind approval cards and replies
+  to their creating turn. Refs [#278](https://github.com/Satscryption/Hermes-A365/pull/278).
+
+- **#291 — Plain-fallback log reason (#295).** The plain-fallback log names ``age_budget``, ``rotated``, or ``retry_exhausted``; age-budget and rotation log at info, and ``retry_exhausted`` logs at warning. Refs [#291](https://github.com/Satscryption/Hermes-A365/issues/291), [#295](https://github.com/Satscryption/Hermes-A365/pull/295).
+
+- **#85 — SemVer and release integrity (#306, #308).** Refs
+  [#85](https://github.com/Satscryption/Hermes-A365/issues/85),
+  [#306](https://github.com/Satscryption/Hermes-A365/pull/306),
+  [#308](https://github.com/Satscryption/Hermes-A365/pull/308).
 
 ### Fixed
 
-- **``register`` secret check after ``a365 setup blueprint`` (#289).** When
-  the generated config has no blueprint secret after the blueprint step,
-  ``register`` now checks ``A365_BLUEPRINT_CLIENT_SECRET`` (process and profile
-  env) and the secrets provider first, as the skipped-blueprint path already
-  does. A configured secret skips the missing-secret notice and recovery; an
-  unreachable provider prints a notice and skips recovery.
-- Test suite: made a subprocess overflow test independent of runner speed.
-- Keep late first-turn timing scoped to its own turn during the minimum-age wait.
-- **Copilot first-turn timing when the add notice arrives late (refs #290).** The
-  first-turn marker is now recorded when the conversation-add activity is
-  received, before it is persisted, and a marker that arrives during the final
-  minimum-age wait now applies to the current turn instead of carrying over to
-  the next one. Activity payloads are unchanged.
-- Retain bridge delivery state across inbound retries so a definitely unsent reply
-  can be retried without calling the operator webhook again. Ambiguous and terminal
-  reply outcomes stop further sends; cached replies have payload and attempt limits.
-- Sidecar read errors during bot-service create now identify the create step.
-- **#303 — Sticky `retry_exhausted` plain reason.** A failed rotation close in
-  answer delivery keeps a stored `retry_exhausted` `plain_reason`. The later
-  plain-fallback log and returned reason stay `retry_exhausted` at warning. A
-  failed close that did not already store `retry_exhausted` still records
-  `rotated` and the later log stays info.
+- **#282 — Bounded bridge reply delivery.** One record per inbound activity with
+  retry only when a reply is definitely unsent. Refs
+  [#282](https://github.com/Satscryption/Hermes-A365/pull/282).
 
-### Changed
+- **#289, #292 — `register` blueprint secret checks (#297, #294).** After blueprint
+  setup, consult configured secret sources; on skipped blueprint, match blueprint ID
+  to ``A365_APP_ID`` before checking another agent's config. Refs
+  [#289](https://github.com/Satscryption/Hermes-A365/issues/289),
+  [#292](https://github.com/Satscryption/Hermes-A365/issues/292),
+  [#297](https://github.com/Satscryption/Hermes-A365/pull/297),
+  [#294](https://github.com/Satscryption/Hermes-A365/pull/294).
 
-- **``register`` re-run with a generated config for a different agent.** When
-  a re-run skips ``a365 setup blueprint``, the blueprint secret check now runs
-  only if the generated config's blueprint ID matches this agent's recorded
-  ``A365_APP_ID`` (or no ID is recorded). Otherwise ``register`` prints a
-  warning that the generated config refers to a different blueprint and skips
-  the check, instead of exiting 2 or attempting recovery for that other
-  blueprint. Refs
-  [#292](https://github.com/Satscryption/Hermes-A365/issues/292).
+- **#290 — Copilot first-turn marker timing (#298).** Record on conversation-add
+  before persist; apply late markers to the current turn. Refs
+  [#290](https://github.com/Satscryption/Hermes-A365/issues/290),
+  [#298](https://github.com/Satscryption/Hermes-A365/pull/298).
+
+- **#303 — Sticky `retry_exhausted` plain reason (#313).** Failed rotation close
+  keeps `retry_exhausted` at warning. Refs
+  [#303](https://github.com/Satscryption/Hermes-A365/issues/303),
+  [#313](https://github.com/Satscryption/Hermes-A365/pull/313).
+
+- **#284, #320, #283.** Bot-service create names sidecar read errors; ``doctor``
+  skips keychain when plaintext secrets suffice (#324); subprocess overflow test
+  tolerates slower runners; ruff-format ``tests/test_invoke.py`` (#296). Refs
+  [#283](https://github.com/Satscryption/Hermes-A365/pull/283),
+  [#284](https://github.com/Satscryption/Hermes-A365/pull/284),
+  [#320](https://github.com/Satscryption/Hermes-A365/issues/320),
+  [#324](https://github.com/Satscryption/Hermes-A365/pull/324).
+
+- **#319, #333–#335 — Path B and personal-chat delivery.** Personal-chat stream
+  completion and AI-generated labels; withhold home-channel setup notices, use plain
+  first-contact replies, and resolve allowlist identities; refuse publish updates on
+  manifest-id mismatch; retire personal streams and suppress cancel. Refs
+  [#319](https://github.com/Satscryption/Hermes-A365/pull/319),
+  [#333](https://github.com/Satscryption/Hermes-A365/pull/333),
+  [#334](https://github.com/Satscryption/Hermes-A365/pull/334),
+  [#335](https://github.com/Satscryption/Hermes-A365/pull/335).
 
 ### Removed
 
-- **#85:** `register --aiteammate` is gone from `hermes-a365 register` and `hermes a365 register`, and from `--help`. Passing it exits 2 with the redirect and does not build or apply a plan. `publish --aiteammate` is unchanged.
+- **#85 — `register --aiteammate` (#305).** Passing it exits 2 with the redirect and
+  does not build or apply a plan; removed from register entry points and ``--help``.
+  `publish --aiteammate` is unchanged. Refs
+  [#85](https://github.com/Satscryption/Hermes-A365/issues/85),
+  [#305](https://github.com/Satscryption/Hermes-A365/pull/305).
+
+### Docs
+
+- **#87 — GA docs (#299, #304, #307, #310, #311, #322).** Path A and Path B
+  quickstarts, ``docs/security-model.md``; #275 records Copilot Chat keep-alive timing notes. Refs [#87](https://github.com/Satscryption/Hermes-A365/issues/87), [#275](https://github.com/Satscryption/Hermes-A365/pull/275), [#299](https://github.com/Satscryption/Hermes-A365/pull/299), [#304](https://github.com/Satscryption/Hermes-A365/pull/304), [#307](https://github.com/Satscryption/Hermes-A365/pull/307), [#310](https://github.com/Satscryption/Hermes-A365/pull/310), [#311](https://github.com/Satscryption/Hermes-A365/pull/311), [#322](https://github.com/Satscryption/Hermes-A365/pull/322).
+
+### Known issues
+
+- [#290](https://github.com/Satscryption/Hermes-A365/issues/290): in Copilot Chat,
+  the first reply in a new conversation is sometimes not shown until the
+  conversation is reloaded.
+- [#337](https://github.com/Satscryption/Hermes-A365/issues/337): Teams may show a
+  long streamed reply all at once instead of progressively.
+- [#338](https://github.com/Satscryption/Hermes-A365/issues/338): Teams does not show
+  a Stop control for streamed replies.
+- [#339](https://github.com/Satscryption/Hermes-A365/issues/339): ``doctor`` reports
+  an available update for the external a365 CLI as an overall warning.
 
 ## [0.9.6] — 2026-11-03
 
@@ -3072,7 +3111,8 @@ Microsoft.Agents.A365.DevTools.Cli **1.1.171** (round-5 walkthrough,
   operators (only "blocked" via the M365 Admin Centre). Microsoft
   platform limitation; not a wrapper bug.
 
-[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.6...HEAD
+[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.7...HEAD
+[0.9.7]: https://github.com/satscryption/Hermes-A365/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/satscryption/Hermes-A365/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/satscryption/Hermes-A365/compare/v0.9.4...v0.9.5
 [0.9.4]: https://github.com/satscryption/Hermes-A365/compare/v0.9.3...v0.9.4
