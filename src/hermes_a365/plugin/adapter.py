@@ -3132,9 +3132,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if activity_id:
                 admitted = self._ledger_record_for_message(activity_id, ref.conversation_id)
                 if admitted is not None:
-                    self._coalesced_turn_authority[
-                        self._coalesced_reply_turn_key(ref.conversation_id, activity_id)
-                    ] = admitted
+                    self._attach_coalesced_turn_authority(admitted)
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -4545,13 +4543,70 @@ class Agent365Adapter(BasePlatformAdapter):
         self._turn_authority_ledger[(conv_id, mid)] = record
         return True
 
+    def _turn_authority_claims_reply_to(self, record: TurnAuthorityRecord, reply_to: str) -> bool:
+        anchor = str(reply_to or "").strip()
+        if not anchor:
+            return False
+        if str(record.message_id or "").strip() == anchor:
+            return True
+        reply_anchor = str(record.reply_activity.get("id") or "").strip()
+        return bool(reply_anchor and reply_anchor == anchor)
+
+    def _origin_for_reply_to(self, chat_id: str, reply_to: str) -> TurnAuthorityRecord | None:
+        anchor = str(reply_to or "").strip()
+        if not anchor:
+            return None
+        chat_id = str(chat_id)
+        turn_key = self._coalesced_reply_turn_key(chat_id, anchor)
+        frame = _AGENT_TURN_FRAME.get()
+        if isinstance(frame, TurnAuthorityRecord) and self._is_own_turn_authority(frame):
+            ledger_obj = self._ledger_record_for_message(frame.message_id, chat_id)
+            map_obj = self._coalesced_turn_authority.get(turn_key)
+            if (
+                frame.conversation_id == chat_id
+                and self._turn_authority_claims_reply_to(frame, anchor)
+                and (ledger_obj is frame or map_obj is frame)
+            ):
+                return frame
+        claimants = [
+            record
+            for (conv_id, _message_id), record in self._turn_authority_ledger.items()
+            if conv_id == chat_id
+            and self._is_own_turn_authority(record)
+            and self._turn_authority_claims_reply_to(record, anchor)
+        ]
+        if len(claimants) == 1:
+            return claimants[0]
+        if len(claimants) == 0:
+            mapped = self._coalesced_turn_authority.get(turn_key)
+            if (
+                mapped is not None
+                and self._is_own_turn_authority(mapped)
+                and self._turn_authority_claims_reply_to(mapped, anchor)
+            ):
+                ledger_obj = self._ledger_record_for_message(mapped.message_id, chat_id)
+                if ledger_obj is mapped:
+                    return mapped
+                if isinstance(frame, TurnAuthorityRecord) and frame is mapped:
+                    return mapped
+                if self._ledger_record_for_message(mapped.message_id, chat_id) is None:
+                    return mapped
+        return None
+
     def _attach_coalesced_turn_authority(self, record: TurnAuthorityRecord) -> None:
         anchor = str(record.reply_activity.get("id") or "").strip()
         if not anchor:
             return
-        self._coalesced_turn_authority[
-            self._coalesced_reply_turn_key(record.conversation_id, anchor)
-        ] = record
+        key = self._coalesced_reply_turn_key(record.conversation_id, anchor)
+        existing = self._coalesced_turn_authority.get(key)
+        if (
+            existing is not None
+            and existing is not record
+            and self._ledger_record_for_message(existing.message_id, existing.conversation_id)
+            is existing
+        ):
+            return
+        self._coalesced_turn_authority[key] = record
 
     def _ledger_record_for_message(
         self, message_id: str, conversation_id: str
@@ -4715,7 +4770,22 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             return current
         record = self._ledger_record_for_message(message_id, conversation_id)
-        return record if record is not None else _UNBOUND_TURN_FRAME
+        if record is not None:
+            return record
+        anchor = str(message_id or "").strip()
+        if not anchor:
+            return _UNBOUND_TURN_FRAME
+        claimants = [
+            entry
+            for (conv_id, ledger_id), entry in self._turn_authority_ledger.items()
+            if conv_id == conversation_id
+            and self._is_own_turn_authority(entry)
+            and str(ledger_id or "").strip() != anchor
+            and str(entry.reply_activity.get("id") or "").strip() == anchor
+        ]
+        if len(claimants) == 1:
+            return claimants[0]
+        return _UNBOUND_TURN_FRAME
 
     def _install_run_agent_turn_frame_wrapper(self) -> None:
         global _RUN_AGENT_FRAME_PATCHED
@@ -4910,9 +4980,7 @@ class Agent365Adapter(BasePlatformAdapter):
         except RuntimeError:
             return
         reply_task = loop.create_task(
-            self._send_pending_turn_queue_full_reply(
-                event, session_key, reply_origin=reply_origin
-            )
+            self._send_pending_turn_queue_full_reply(event, session_key, reply_origin=reply_origin)
         )
         reply_task.add_done_callback(lambda _task: None)
 
@@ -4929,9 +4997,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if not chat_id or self._turn_reply_blocked(str(chat_id)):
             return
         if reply_origin is None:
-            logger.warning(
-                "agent365 pending queue-full notice skipped: no turn authority record"
-            )
+            logger.warning("agent365 pending queue-full notice skipped: no turn authority record")
             return
         text = "This conversation is busy with earlier messages. Please try again in a moment."
         with contextlib.suppress(Exception):
@@ -5792,9 +5858,7 @@ class Agent365Adapter(BasePlatformAdapter):
         coalesced_origin: TurnAuthorityRecord | None = None
         if reply_to is not None:
             turn_key = self._coalesced_reply_turn_key(chat_id, reply_to)
-            coalesced_origin = self._coalesced_turn_authority.get(turn_key)
-            if coalesced_origin is None:
-                coalesced_origin = self._ledger_record_for_message(str(reply_to), str(chat_id))
+            coalesced_origin = self._origin_for_reply_to(chat_id, str(reply_to))
             if coalesced_origin is None or not self._is_own_turn_authority(coalesced_origin):
                 return SendResult(
                     success=False,
@@ -11266,9 +11330,7 @@ class Agent365Adapter(BasePlatformAdapter):
         if not service_url or not conv_id:
             return None
         path_at_open = (
-            validated_path
-            if validated_path is not None
-            else self._validated_path_for(chat_id)
+            validated_path if validated_path is not None else self._validated_path_for(chat_id)
         )
         generation = self._lifecycle_generation
         chat_generation = self._chat_generation(chat_id)
@@ -13002,9 +13064,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
     def _allowed_users_by_lower(self) -> dict[str, str]:
         configured: dict[str, str] = {
-            value.strip().lower(): value.strip()
-            for value in self._allowed_users
-            if value.strip()
+            value.strip().lower(): value.strip() for value in self._allowed_users if value.strip()
         }
         for entry in self._allowed_user_aliases:
             token = entry.strip()
@@ -14106,14 +14166,10 @@ class Agent365Adapter(BasePlatformAdapter):
             phase if phase in {"stream-start", "edit", "auto-finalize", "other"} else "other"
         )
         status_out = (
-            http_status
-            if isinstance(http_status, int) and 100 <= http_status <= 599
-            else "none"
+            http_status if isinstance(http_status, int) and 100 <= http_status <= 599 else "none"
         )
         attempt_out = (
-            attempt
-            if isinstance(attempt, int) and 1 <= attempt <= _STREAM_EDIT_MAX_ATTEMPTS
-            else 0
+            attempt if isinstance(attempt, int) and 1 <= attempt <= _STREAM_EDIT_MAX_ATTEMPTS else 0
         )
         code_out = (
             bf_error_code
@@ -16791,8 +16847,7 @@ def interactive_setup() -> None:
     else:
         save_env_value("A365_ALLOW_ALL_USERS", "false")
         allowed = prompt(
-            "Allowed users (comma-separated Entra object IDs or UPN/email; "
-            "blank = deny everyone)",
+            "Allowed users (comma-separated Entra object IDs or UPN/email; blank = deny everyone)",
             default=get_env_value("A365_ALLOWED_USERS") or "",
         )
         save_env_value(
