@@ -8680,12 +8680,13 @@ class Agent365Adapter(BasePlatformAdapter):
             ):
                 stream["stream_id"] = ""
             buf["keepalive"] = stream
+            reason = str(record.get("plain_reason") or "retry_exhausted")
             logger.warning(
-                "agent365 turn buffer answer plain fallback: chat_id=%s "
-                "reason=stream retry exhausted",
+                "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
                 chat_id,
+                reason,
             )
-            return ("fallback", "stream retry exhausted")
+            return ("fallback", reason)
         if stream.get("stopped"):
             return self._apply_user_cancel(
                 chat_id, buf, turn, record, chunk_segment_ids=chunk_segment_ids
@@ -9230,13 +9231,15 @@ class Agent365Adapter(BasePlatformAdapter):
                     stream = self._keepalive_stream(buf)
                     stream["stream_id"] = ""
                     buf["keepalive"] = stream
+                    reason = str(record.get("plain_reason") or "retry_exhausted")
                     logger.warning(
                         "agent365 turn buffer answer plain fallback: chat_id=%s "
-                        "status=%s reason=stream retry exhausted",
+                        "status=%s reason=%s",
                         chat_id,
                         result.status,
+                        reason,
                     )
-                    return ("fallback", "stream retry exhausted")
+                    return ("fallback", reason)
                 record["state"] = "DEFERRED"
                 return ("retry", None)
             return ("retry", None)
