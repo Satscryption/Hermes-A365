@@ -14018,7 +14018,7 @@ class TestEditMessage:
         caplog: pytest.LogCaptureFixture,
         plain_reason_setup: str,
     ) -> None:
-        a, chat, inbound, finals = self._harness_in_call_retry_exhaustion(
+        a, chat, _inbound, finals = self._harness_in_call_retry_exhaustion(
             monkeypatch,
             chat_suffix=plain_reason_setup,
         )
@@ -14060,7 +14060,7 @@ class TestEditMessage:
         logs = [r for r in caplog.records if "answer plain fallback" in r.message]
         assert len(logs) == 1
         assert logs[0].levelno == logging.WARNING
-        assert f"status=503" in logs[0].message
+        assert "status=503" in logs[0].message
         assert "reason=retry_exhausted" in logs[0].message
         assert "stream retry exhausted" not in logs[0].message
         assert buf["keepalive"]["stream_id"] == ""
@@ -14084,7 +14084,7 @@ class TestEditMessage:
         caplog: pytest.LogCaptureFixture,
         stored_reason: str,
     ) -> None:
-        a, chat, inbound, finals = self._harness_in_call_retry_exhaustion(
+        a, chat, _inbound, finals = self._harness_in_call_retry_exhaustion(
             monkeypatch,
             chat_suffix=stored_reason,
         )
@@ -14123,7 +14123,7 @@ class TestEditMessage:
         logs = [r for r in caplog.records if "answer plain fallback" in r.message]
         assert len(logs) == 1
         assert logs[0].levelno == logging.WARNING
-        assert f"status=503" in logs[0].message
+        assert "status=503" in logs[0].message
         assert f"reason={stored_reason}" in logs[0].message
         assert record.get("plain_reason") == snap_reason
         assert finals["n"] == adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
