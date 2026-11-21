@@ -22166,6 +22166,8 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(other_ref)
         other_rec = a._ledger_record_for_message("other-admit", conv)
         a._coalesced_turn_authority[(conv, "other-admit")] = other_rec
+        other_owner = asyncio.create_task(asyncio.Event().wait())
+        a._own_turn_authority(other_rec, other_owner)
         with a._turn_frame_scope(f"wire-{conv}", record):
             await a.send(chat_id=conv, content="Stale", reply_to="stream-admit")
         posts_before_stale = len(post_bodies)
@@ -22175,6 +22177,9 @@ class TestEditMessage:
         assert len(post_bodies) > posts_before_stale
         stale_final = post_bodies[posts_before_stale]
         assert_post_uses_admitted(stale_final)
+        a._release_turn_authority_owner(other_rec)
+        other_owner.cancel()
+        await asyncio.gather(other_owner, return_exceptions=True)
 
         adapter_mod._AGENT_TURN_FRAME.set(None)
         a._coalesced_turn_authority.pop((conv, "stream-admit"), None)
@@ -22184,6 +22189,7 @@ class TestEditMessage:
         assert unowned.success is False
         assert len(a._streams) == streams_before
         a._coalesced_turn_authority[(conv, "stream-admit")] = record
+        a._turn_authority_ledger[(conv, "stream-admit")] = record
 
         with a._turn_frame_scope(f"wire-{conv}", record):
             life_open = await a.send(chat_id=conv, content="Life", reply_to="stream-admit")
@@ -30038,6 +30044,102 @@ class TestTurnFrame:
         solo = await a.send("conv-1", "reaction only", reply_to="user-act")
         assert solo.success is True
         assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "reactor"
+
+    async def test_f312_retired_frame_send_is_rejected(
+        self, runtime: Any,
+    ) -> None:
+        a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
+        a._release_turn_authority_owner(user_record)
+        assert a._ledger_record_for_message("user-act", "conv-1") is None
+        assert a._coalesced_turn_authority[("conv-1", "user-act")] is user_record
+        posted_before = runtime.posted.await_count
+
+        with a._turn_frame_scope("sess-stale-frame", user_record):
+            framed = await a.send("conv-1", "must use reaction authority", reply_to="user-act")
+        assert framed.success is True
+        assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "reactor"
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "user-act"
+        runtime.posted.reset_mock()
+
+        a._release_turn_authority_owner(reaction_record)
+        assert not [
+            record
+            for (_conv, _mid), record in a._turn_authority_ledger.items()
+            if record.conversation_id == "conv-1"
+            and a._turn_authority_claims_reply_to(record, "user-act")
+        ]
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        unscoped = await a.send("conv-1", "no ledger row", reply_to="user-act")
+        assert unscoped.success is False
+        assert runtime.posted.await_count == posted_before
+
+        live = _make_inbound(activity_id="live-anchor")
+        live["from"]["id"] = "user-two"
+        assert a.admit_turn_authority(live, "sess-live", message_id="live-anchor")
+        live_rec = a._ledger_record_for_message("live-anchor", "conv-1")
+        assert live_rec is not None
+        with a._turn_frame_scope("sess-live", live_rec):
+            other_frame = await a.send("conv-1", "other user frame", reply_to="user-act")
+        assert other_frame.success is False
+        assert runtime.posted.await_count == posted_before
+
+    async def test_f312_pending_merge_keeps_queued_event_ledger_authority(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from collections import deque
+
+        a = runtime.adapter
+        same_user = "user-merge"
+        first = _make_inbound(activity_id="merge-a")
+        first["from"]["id"] = same_user
+        second = _make_inbound(activity_id="merge-b")
+        second["from"]["id"] = same_user
+        sk = "sess-merge-coalesce"
+        a._session_key_to_conv[sk] = "conv-1"
+        assert a.admit_turn_authority(first, sk, message_id="merge-a")
+        assert a.admit_turn_authority(second, sk, message_id="merge-b")
+        head = a._activity_to_event(
+            first, media=([], [], adapter_mod.MessageType.TEXT), authorized_user_id=same_user
+        )
+        queued = a._activity_to_event(
+            second, media=([], [], adapter_mod.MessageType.TEXT), authorized_user_id=same_user
+        )
+        queued.message_id = "merge-b"
+        a._pending_messages[sk] = head
+        a._pending_turn_fifo[sk] = deque([queued])
+        head_record = a._event_turn_authority(head)
+        queued_record = a._event_turn_authority(queued)
+        assert head_record is not None and queued_record is not None
+        a._release_turn_authority_owner(head_record)
+        a._release_turn_authority_owner(queued_record)
+        assert a._event_turn_authority(queued) is not None
+        handled: list[Any] = []
+
+        async def dispatch(_base: Any, event: Any) -> None:
+            handled.append(event)
+
+        monkeypatch.setattr(_StubBasePlatformAdapter, "handle_message", dispatch)
+        a._pending_messages.pop(sk)
+        assert a._agent365_promote_fifo_head_to_slot(sk)
+        promoted = a._pending_messages[sk]
+        await a.handle_message(promoted)
+        assert handled == [promoted]
+
+    async def test_f312_teardown_clears_ledger_after_coalesced_attach(
+        self, runtime: Any,
+    ) -> None:
+        a = runtime.adapter
+        inbound = _make_inbound(activity_id="teardown-ledger")
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        assert ref is not None
+        assert a.admit_turn_authority(inbound, "sess-teardown", message_id="teardown-ledger")
+        record = a._ledger_record_for_message("teardown-ledger", "conv-1")
+        assert record is not None
+        a._attach_coalesced_turn_authority(record)
+        a._retire_turn_authorities(conversation_id="conv-1")
+        assert ("conv-1", "teardown-ledger") not in a._turn_authority_ledger
+        await a._teardown_chat_state("conv-1")
+        assert ("conv-1", "teardown-ledger") not in a._turn_authority_ledger
 
     async def test_f312_runner_frame_binds_synthetic_authority(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch
