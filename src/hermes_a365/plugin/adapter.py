@@ -2703,9 +2703,11 @@ class Agent365Adapter(BasePlatformAdapter):
                 allowed_users = self._allowed_users
                 aliases = {}
                 if self._upn_resolver is not None:
-                    aliases = self._upn_resolver.resolved_aliases()
-                    allowed_users += tuple(aliases)
                     self._upn_resolver.refresh_in_background()
+                    aliases = self._upn_resolver.resolved_aliases(
+                        allow_stale=validated_path == "B"
+                    )
+                    allowed_users += tuple(aliases)
                 local_ok = bridge._activity_user_authorized(
                     activity,
                     allowed_users=allowed_users,
