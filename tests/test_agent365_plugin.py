@@ -34132,12 +34132,115 @@ class TestUpnObjectIdAllowlist:
             assert "UPN/email" not in caplog.text
             assert "allowlist Graph resolution" not in caplog.text
 
-    async def test_expiry_denies_during_single_background_refresh_and_after_failure(
-        self, runtime, caplog
+    async def test_path_b_listed_sender_admitted_while_expired_refresh_in_flight(
+        self, runtime
     ):
         import threading
         import urllib.error
+
+        bridge = adapter_mod._import_bridge()
+        entered, release = threading.Event(), threading.Event()
+        async with runtime((self.UPN,)) as rt:
+            assert self.post(rt).status_code == 200
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+
+            def blocked(*_a, **_kw):
+                entered.set()
+                assert release.wait(5)
+                raise urllib.error.HTTPError("https://graph/", 403, self.UPN, {}, None)
+
+            rt.fetch.side_effect = blocked
+            assert self.post(rt, activity_id="expired-grace").status_code == 200
+            assert await asyncio.to_thread(entered.wait, 2)
+            release.set()
+
+    async def test_unlisted_sender_denied_across_cache_states(self, runtime, caplog):
+        import threading
+        import urllib.error
         from io import BytesIO
+
+        bridge = adapter_mod._import_bridge()
+        entered, release = threading.Event(), threading.Event()
+        async with runtime((self.UPN,)) as rt:
+            assert self.post(rt).status_code == 200
+            assert self.post(rt, self.OTHER, activity_id="fresh-unlisted").status_code == 403
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+
+            def blocked(*_a, **_kw):
+                entered.set()
+                assert release.wait(5)
+                raise urllib.error.HTTPError("https://graph/", 403, self.UPN, {}, None)
+
+            rt.fetch.side_effect = blocked
+            try:
+                assert self.post(rt, activity_id="start-grace").status_code == 200
+                assert await asyncio.to_thread(entered.wait, 2)
+                assert (
+                    self.post(rt, self.OTHER, activity_id="grace-unlisted").status_code == 403
+                )
+                grace_start = (
+                    rt.adapter._upn_resolver._stale_until - bridge.UPN_OBJECT_ID_GRACE_SECONDS
+                )
+                rt.clock[0] = grace_start + bridge.UPN_OBJECT_ID_GRACE_SECONDS
+                assert self.post(rt, activity_id="past-grace").status_code == 403
+                assert (
+                    self.post(rt, self.OTHER, activity_id="past-grace-unlisted").status_code
+                    == 403
+                )
+            finally:
+                release.set()
+
+            async def wait_refresh():
+                await rt.adapter._upn_resolver._refresh_task
+
+            rt.client.portal.call(wait_refresh)
+            assert self.post(rt, activity_id="failed-refresh").status_code == 403
+            assert (
+                self.post(rt, self.OTHER, activity_id="failed-unlisted").status_code == 403
+            )
+            assert rt.fetch.call_count == 2
+            assert "resolved 0 of 1 UPN/email allowlist entries to object IDs" in caplog.text
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+            rt.fetch.side_effect = lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode())
+            assert self.post(rt, activity_id="retry").status_code == 403
+            rt.client.portal.call(wait_refresh)
+            assert self.post(rt, activity_id="recovered").status_code == 200
+            assert rt.adapter._handled_events[-1].source.user_id == self.UPN
+            assert rt.fetch.call_count == 3
+
+    async def test_grace_deadline_denies_while_graph_still_blocked(self, runtime):
+        import threading
+        import urllib.error
+
+        bridge = adapter_mod._import_bridge()
+        assert bridge.UPN_OBJECT_ID_GRACE_SECONDS == 15
+        entered, release = threading.Event(), threading.Event()
+        async with runtime((self.UPN,)) as rt:
+            assert self.post(rt).status_code == 200
+            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+
+            def blocked(*_a, **_kw):
+                entered.set()
+                assert release.wait(5)
+                raise urllib.error.HTTPError("https://graph/", 403, self.UPN, {}, None)
+
+            rt.fetch.side_effect = blocked
+            try:
+                assert self.post(rt, activity_id="grace-start").status_code == 200
+                assert await asyncio.to_thread(entered.wait, 2)
+                grace_start = (
+                    rt.adapter._upn_resolver._stale_until - bridge.UPN_OBJECT_ID_GRACE_SECONDS
+                )
+                rt.clock[0] = grace_start + 14
+                assert self.post(rt, activity_id="grace-14").status_code == 200
+                rt.clock[0] = grace_start + 15
+                assert self.post(rt, activity_id="grace-15").status_code == 403
+            finally:
+                release.set()
+
+    async def test_refresh_stays_single_flight_and_does_not_extend_grace(self, runtime):
+        import threading
+        import urllib.error
 
         bridge = adapter_mod._import_bridge()
         entered, release = threading.Event(), threading.Event()
@@ -34152,29 +34255,13 @@ class TestUpnObjectIdAllowlist:
 
             rt.fetch.side_effect = blocked
             try:
-                # The request completes even while Graph is blocked in another thread.
-                assert self.post(rt, activity_id="expired").status_code == 403
+                assert self.post(rt, activity_id="expired").status_code == 200
                 assert await asyncio.to_thread(entered.wait, 2)
+                anchor = rt.adapter._upn_resolver._stale_until
                 for i in range(3):
-                    assert self.post(rt, activity_id=f"refreshing-{i}").status_code == 403
+                    assert self.post(rt, activity_id=f"extra-{i}").status_code == 200
+                    assert rt.adapter._upn_resolver._stale_until == anchor
                 assert rt.fetch.call_count == 2
                 assert rt.token.call_count == 2
             finally:
                 release.set()
-
-            async def wait_refresh():
-                await rt.adapter._upn_resolver._refresh_task
-
-            rt.client.portal.call(wait_refresh)
-            assert rt.adapter._upn_resolver.effective_allowed_users() == (self.UPN,)
-            assert self.post(rt, activity_id="failed-refresh").status_code == 403
-            assert rt.fetch.call_count == 2
-            assert "resolved 0 of 1 UPN/email allowlist entries to object IDs" in caplog.text
-            rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
-            rt.fetch.side_effect = lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode())
-            assert self.post(rt, activity_id="retry").status_code == 403
-            rt.client.portal.call(wait_refresh)
-            assert self.post(rt, activity_id="recovered").status_code == 200
-            assert rt.adapter._handled_events[-1].source.user_id == self.UPN
-            assert rt.fetch.call_count == 3
-            assert rt.token.call_count == 3

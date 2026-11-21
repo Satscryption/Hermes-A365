@@ -8,6 +8,7 @@ contract is validated against documentation.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import time as _time
@@ -5388,6 +5389,140 @@ class TestUpnObjectIdResolver:
             assert self.UPN not in repr(record.__dict__)
             assert "missing@example.test" not in repr(record.__dict__)
             assert "sensitive-token" not in repr(record.__dict__)
+
+    def test_removed_upn_object_id_dropped_immediately(self, monkeypatch):
+        from hermes_a365 import activity_bridge as bridge
+
+        cfg = _cfg()
+        cfg.allowed_users = (self.UPN,)
+        clock = [10.0]
+        monkeypatch.setattr(bridge, "acquire_token", lambda **_kw: {"access_token": "token"})
+        resolver = bridge.UpnObjectIdResolver(
+            cfg,
+            fetch=lambda *_a, **_kw: BytesIO(json.dumps({"id": self.OID}).encode()),
+            clock=lambda: clock[0],
+        )
+        resolver.refresh()
+        cfg.allowed_users = ("other@example.test",)
+        assert resolver.effective_allowed_users() == ("other@example.test",)
+        assert resolver.resolved_aliases() == {}
+        task = MagicMock(done=MagicMock(return_value=False))
+        resolver._refresh_task = task
+        resolver._stale_until = clock[0] + bridge.UPN_OBJECT_ID_GRACE_SECONDS
+        assert resolver.effective_allowed_users(allow_stale=True) == ("other@example.test",)
+        assert resolver.resolved_aliases(allow_stale=True) == {}
+
+    def test_graph_miss_or_different_object_id_drops_previous(self, monkeypatch):
+        import urllib.error
+
+        from hermes_a365 import activity_bridge as bridge
+
+        other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+        cfg = _cfg()
+        cfg.allowed_users = (self.UPN,)
+        clock = [10.0]
+        monkeypatch.setattr(bridge, "acquire_token", lambda **_kw: {"access_token": "token"})
+
+        def hit(*_a, **_kw):
+            return BytesIO(json.dumps({"id": self.OID}).encode())
+
+        resolver = bridge.UpnObjectIdResolver(cfg, fetch=hit, clock=lambda: clock[0])
+        resolver.refresh()
+        clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+
+        def miss(req, *, timeout):
+            raise urllib.error.HTTPError(req.full_url, 404, "x", {}, None)
+
+        resolver._fetch = miss
+        resolver._refresh_task = MagicMock(done=MagicMock(return_value=False))
+        resolver._stale_until = clock[0] + bridge.UPN_OBJECT_ID_GRACE_SECONDS
+        resolver.refresh()
+        assert resolver.effective_allowed_users(allow_stale=True) == (self.UPN,)
+        assert resolver.resolved_aliases(allow_stale=True) == {}
+
+        resolver = bridge.UpnObjectIdResolver(cfg, fetch=hit, clock=lambda: clock[0])
+        resolver.refresh()
+        clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+        resolver._fetch = lambda *_a, **_kw: BytesIO(json.dumps({"id": other}).encode())
+        resolver._refresh_task = MagicMock(done=MagicMock(return_value=False))
+        resolver._stale_until = clock[0] + bridge.UPN_OBJECT_ID_GRACE_SECONDS
+        resolver.refresh()
+        assert self.OID not in resolver.effective_allowed_users(allow_stale=True)
+        assert self.OID not in resolver.resolved_aliases(allow_stale=True)
+
+    def test_serve_path_b_grace_and_path_a_strict(self, monkeypatch):
+        import threading
+        import urllib.error
+        from io import BytesIO
+
+        from hermes_a365 import activity_bridge as bridge
+
+        cfg = _cfg()
+        cfg.allowed_users = (self.UPN,)
+        cfg.allow_all_users = False
+        clock = [100.0]
+        entered, release = threading.Event(), threading.Event()
+        created = []
+        warmups = [0]
+
+        def fetch(req, *, timeout):
+            if warmups[0] == 0:
+                warmups[0] += 1
+                return BytesIO(json.dumps({"id": self.OID}).encode())
+            entered.set()
+            assert release.wait(5)
+            raise urllib.error.HTTPError(req.full_url, 503, "x", {}, None)
+
+        resolver_cls = bridge.UpnObjectIdResolver
+
+        def factory(conf):
+            result = resolver_cls(conf, fetch=fetch, clock=lambda: clock[0])
+            created.append(result)
+            return result
+
+        monkeypatch.setattr(bridge, "UpnObjectIdResolver", factory)
+        monkeypatch.setattr(bridge, "acquire_token", lambda **_kw: {"access_token": "token"})
+        monkeypatch.setattr(bridge.urllib.request, "urlopen", fetch)
+        monkeypatch.setattr(bridge, "validate_inbound_jwt_bf", AsyncMock(return_value={"aud": "x"}))
+        monkeypatch.setattr(bridge, "validate_inbound_jwt", AsyncMock(return_value={"aud": "x"}))
+        reply = AsyncMock()
+        monkeypatch.setattr(bridge, "forward_to_webhook", reply)
+        activity = _inbound_message_activity()
+        activity["from"] = {"id": "29:opaque", "aadObjectId": self.OID}
+        client = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _: httpx.Response(200, json={}))
+        )
+        issuers = iter([bridge.BF_ISSUER, "https://sts.windows.net/tenant"])
+
+        def peek(_token):
+            return next(issuers, bridge.BF_ISSUER)
+
+        monkeypatch.setattr(bridge, "peek_unverified_iss", peek)
+        with TestClient(bridge.make_app(cfg, http_client=client)) as tc:
+            clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS
+            assert (
+                tc.post(
+                    "/api/messages", json=activity, headers={"Authorization": "Bearer a.b.c"}
+                ).status_code
+                == 200
+            )
+
+            async def wait_for_graph():
+                await asyncio.to_thread(entered.wait, 5)
+
+            tc.portal.call(wait_for_graph)
+            resolver = created[-1]
+            assert resolver.effective_allowed_users() == (self.UPN,)
+            assert resolver.resolved_aliases() == {}
+            assert (
+                tc.post(
+                    "/api/messages",
+                    json={**activity, "id": "path-a"},
+                    headers={"Authorization": "Bearer a.b.c"},
+                ).status_code
+                == 403
+            )
+        release.set()
 
     @pytest.mark.parametrize(
         "raw",
