@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 from unittest.mock import patch
 
@@ -104,6 +104,109 @@ class TestProbeA365Cli:
             r = probe_a365_cli()
         assert r.state == "warn"
         assert "could not confirm" in r.detail
+
+
+_FIXTURE_A_VERSION = (
+    "A newer version is available with bug fixes and improvements.\n"
+    "Current: 1.1.182\n"
+    "Latest:  1.1.214\n"
+    "What's new: Example release notes\n"
+    "To update, run: dotnet tool update -g Microsoft.Agents.A365.DevTools.Cli\n"
+    "1.1.182+abcdef"
+)
+_FIXTURE_B_VERSION = (
+    "A preview release is also available: 1.1.999-preview\n"
+    "To try it: dotnet tool update -g Microsoft.Agents.A365.DevTools.Cli --prerelease\n"
+    "1.1.181+abcdef"
+)
+_FIXTURE_C_VERSION = (
+    "A newer version is available with bug fixes and improvements.\n"
+    "Current: 1.1.171\n"
+    "Latest:  1.1.214\n"
+    "To update, run: dotnet tool update -g Microsoft.Agents.A365.DevTools.Cli\n"
+    "Agent 365 CLI"
+)
+
+
+@contextmanager
+def _patch_a365_version(stdout: str):
+    with (
+        patch("hermes_a365.doctor.shutil.which", return_value="/Users/x/.dotnet/tools/a365"),
+        patch("hermes_a365.doctor.safe_run", return_value=stdout),
+    ):
+        yield
+
+
+def test_update_notice_alone_is_ok() -> None:
+    with _patch_a365_version(_FIXTURE_A_VERSION):
+        noticed = probe_a365_cli()
+    ok_probe = ProbeResult(
+        "a365_cli",
+        "ok",
+        "present at /Users/x/.dotnet/tools/a365; version ok",
+        notice=noticed.notice,
+    )
+    report = DoctorReport([ok_probe])
+    assert report.overall == "ok"
+    assert overall_to_exit_code(report.overall) == 0
+    human = render_human(report)
+    assert "overall: ok" in human
+    assert "note: A newer version is available" in human
+    assert "[WARN]" not in human
+
+
+def test_update_block_does_not_replace_newer_unverified_warn() -> None:
+    body_only = "1.1.182+abcdef"
+    with _patch_a365_version(body_only):
+        baseline = probe_a365_cli()
+    with _patch_a365_version(_FIXTURE_A_VERSION):
+        with_block = probe_a365_cli()
+    assert with_block.state == baseline.state
+    assert with_block.detail == baseline.detail
+    assert with_block.data["version"] == "1.1.182"
+    assert "A newer version is available" not in with_block.detail
+    assert "A newer version is available" in with_block.notice
+    assert with_block.data["version_raw"] == _FIXTURE_A_VERSION
+    report = DoctorReport([with_block])
+    assert report.overall == "warn"
+    assert overall_to_exit_code(report.overall) == 1
+
+
+def test_preview_notice_does_not_hide_affected_warn() -> None:
+    with _patch_a365_version(_FIXTURE_B_VERSION):
+        r = probe_a365_cli()
+    assert r.state == "warn"
+    assert "Microsoft#408" in r.detail
+    assert "live-verified affected" in r.detail
+    assert "1.1.181" in r.detail
+    assert "--auto-recover-secret" in r.detail
+    assert "1.1.999" not in r.detail
+    assert "not yet verified fixed" not in r.detail
+    assert "A preview release is also available:" in r.notice
+
+
+def test_unparseable_body_stays_unparseable_with_notice() -> None:
+    with _patch_a365_version(_FIXTURE_C_VERSION):
+        r = probe_a365_cli()
+    assert r.state == "warn"
+    assert "could not confirm" in r.detail
+    assert "A newer version is available" not in r.detail
+    assert r.notice
+
+
+def test_notice_does_not_mask_a_warn() -> None:
+    with _patch_a365_version(_FIXTURE_A_VERSION):
+        noticed = probe_a365_cli()
+    ok_probe = ProbeResult(
+        "a365_cli",
+        "ok",
+        "present",
+        notice=noticed.notice,
+    )
+    warn_probe = ProbeResult("az_cli", "warn", "not signed in")
+    report = DoctorReport([ok_probe, warn_probe])
+    assert report.overall == "warn"
+    assert overall_to_exit_code(report.overall) == 1
 
 
 class TestParseA365CliVersion:
