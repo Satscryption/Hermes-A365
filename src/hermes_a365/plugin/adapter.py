@@ -4557,18 +4557,13 @@ class Agent365Adapter(BasePlatformAdapter):
         if not anchor:
             return None
         chat_id = str(chat_id)
-        turn_key = self._coalesced_reply_turn_key(chat_id, anchor)
         frame = _AGENT_TURN_FRAME.get()
         if isinstance(frame, TurnAuthorityRecord) and self._is_own_turn_authority(frame):
             ledger_obj = self._ledger_record_for_message(frame.message_id, chat_id)
-            map_obj = self._coalesced_turn_authority.get(turn_key)
             if (
                 frame.conversation_id == chat_id
                 and self._turn_authority_claims_reply_to(frame, anchor)
-                and (
-                    ledger_obj is frame
-                    or (ledger_obj is None and map_obj is frame)
-                )
+                and ledger_obj is frame
             ):
                 return frame
         claimants = [
@@ -4620,18 +4615,6 @@ class Agent365Adapter(BasePlatformAdapter):
         for fifo in self._pending_turn_fifo.values():
             pending.extend(fifo)
         retained.update(id(self._event_turn_authority(event)) for event in pending)
-        for record in self._coalesced_turn_authority.values():
-            if not isinstance(record, TurnAuthorityRecord) or not self._is_own_turn_authority(
-                record
-            ):
-                continue
-            if conversation_id is not None and record.conversation_id != conversation_id:
-                continue
-            if (
-                self._ledger_record_for_message(record.message_id, record.conversation_id)
-                is record
-            ):
-                retained.add(id(record))
         for key, record in list(self._turn_authority_ledger.items()):
             if conversation_id is not None and record.conversation_id != conversation_id:
                 continue
@@ -4645,8 +4628,7 @@ class Agent365Adapter(BasePlatformAdapter):
         key = (record.conversation_id, record.message_id)
         if self._turn_authority_ledger.get(key) is record:
             self._turn_authority_owners.pop(key, None)
-            self._turn_authority_ledger.pop(key, None)
-        self._retire_turn_authorities(conversation_id=record.conversation_id)
+            self._retire_turn_authorities(conversation_id=record.conversation_id)
 
     def _turn_authority_owner_done(self, task: asyncio.Task[Any]) -> None:
         for key, owner in list(self._turn_authority_owners.items()):
