@@ -30039,6 +30039,38 @@ class TestTurnFrame:
         assert solo.success is True
         assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "reactor"
 
+    async def test_f312_stale_coalesced_map_ignored_without_ledger_row(
+        self, runtime: Any,
+    ) -> None:
+        a = runtime.adapter
+        first = _make_inbound(activity_id="retire-anchor")
+        await self._admit(runtime, first)
+        retired = a._ledger_record_for_message("retire-anchor", "conv-1")
+        assert retired is not None
+        turn_key = ("conv-1", "retire-anchor")
+        assert a._coalesced_turn_authority[turn_key] is retired
+        a._release_turn_authority_owner(retired)
+        assert a._ledger_record_for_message("retire-anchor", "conv-1") is None
+        assert a._coalesced_turn_authority[turn_key] is retired
+        posted_before = runtime.posted.await_count
+
+        second = _make_inbound(activity_id="live-anchor")
+        second["from"]["id"] = "user-two"
+        assert a.admit_turn_authority(second, "sess-live", message_id="live-anchor")
+        live = a._ledger_record_for_message("live-anchor", "conv-1")
+        assert live is not None
+        self._hold_authority_owner(a, live)
+
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        unscoped = await a.send("conv-1", "no ledger row", reply_to="retire-anchor")
+        assert unscoped.success is False
+        assert runtime.posted.await_count == posted_before
+
+        with a._turn_frame_scope("sess-live", live):
+            framed = await a.send("conv-1", "other user frame", reply_to="retire-anchor")
+        assert framed.success is False
+        assert runtime.posted.await_count == posted_before
+
     async def test_f312_runner_frame_binds_synthetic_authority(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:

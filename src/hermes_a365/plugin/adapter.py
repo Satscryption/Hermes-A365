@@ -4565,7 +4565,10 @@ class Agent365Adapter(BasePlatformAdapter):
             if (
                 frame.conversation_id == chat_id
                 and self._turn_authority_claims_reply_to(frame, anchor)
-                and (ledger_obj is frame or map_obj is frame)
+                and (
+                    ledger_obj is frame
+                    or (ledger_obj is None and map_obj is frame)
+                )
             ):
                 return frame
         claimants = [
@@ -4577,20 +4580,6 @@ class Agent365Adapter(BasePlatformAdapter):
         ]
         if len(claimants) == 1:
             return claimants[0]
-        if len(claimants) == 0:
-            mapped = self._coalesced_turn_authority.get(turn_key)
-            if (
-                mapped is not None
-                and self._is_own_turn_authority(mapped)
-                and self._turn_authority_claims_reply_to(mapped, anchor)
-            ):
-                ledger_obj = self._ledger_record_for_message(mapped.message_id, chat_id)
-                if ledger_obj is mapped:
-                    return mapped
-                if isinstance(frame, TurnAuthorityRecord) and frame is mapped:
-                    return mapped
-                if self._ledger_record_for_message(mapped.message_id, chat_id) is None:
-                    return mapped
         return None
 
     def _attach_coalesced_turn_authority(self, record: TurnAuthorityRecord) -> None:
@@ -4631,6 +4620,18 @@ class Agent365Adapter(BasePlatformAdapter):
         for fifo in self._pending_turn_fifo.values():
             pending.extend(fifo)
         retained.update(id(self._event_turn_authority(event)) for event in pending)
+        for record in self._coalesced_turn_authority.values():
+            if not isinstance(record, TurnAuthorityRecord) or not self._is_own_turn_authority(
+                record
+            ):
+                continue
+            if conversation_id is not None and record.conversation_id != conversation_id:
+                continue
+            if (
+                self._ledger_record_for_message(record.message_id, record.conversation_id)
+                is record
+            ):
+                retained.add(id(record))
         for key, record in list(self._turn_authority_ledger.items()):
             if conversation_id is not None and record.conversation_id != conversation_id:
                 continue
@@ -4644,7 +4645,8 @@ class Agent365Adapter(BasePlatformAdapter):
         key = (record.conversation_id, record.message_id)
         if self._turn_authority_ledger.get(key) is record:
             self._turn_authority_owners.pop(key, None)
-            self._retire_turn_authorities(conversation_id=record.conversation_id)
+            self._turn_authority_ledger.pop(key, None)
+        self._retire_turn_authorities(conversation_id=record.conversation_id)
 
     def _turn_authority_owner_done(self, task: asyncio.Task[Any]) -> None:
         for key, owner in list(self._turn_authority_owners.items()):
@@ -4980,7 +4982,9 @@ class Agent365Adapter(BasePlatformAdapter):
         except RuntimeError:
             return
         reply_task = loop.create_task(
-            self._send_pending_turn_queue_full_reply(event, session_key, reply_origin=reply_origin)
+            self._send_pending_turn_queue_full_reply(
+                event, session_key, reply_origin=reply_origin
+            )
         )
         reply_task.add_done_callback(lambda _task: None)
 
@@ -4997,7 +5001,9 @@ class Agent365Adapter(BasePlatformAdapter):
         if not chat_id or self._turn_reply_blocked(str(chat_id)):
             return
         if reply_origin is None:
-            logger.warning("agent365 pending queue-full notice skipped: no turn authority record")
+            logger.warning(
+                "agent365 pending queue-full notice skipped: no turn authority record"
+            )
             return
         text = "This conversation is busy with earlier messages. Please try again in a moment."
         with contextlib.suppress(Exception):
@@ -11330,7 +11336,9 @@ class Agent365Adapter(BasePlatformAdapter):
         if not service_url or not conv_id:
             return None
         path_at_open = (
-            validated_path if validated_path is not None else self._validated_path_for(chat_id)
+            validated_path
+            if validated_path is not None
+            else self._validated_path_for(chat_id)
         )
         generation = self._lifecycle_generation
         chat_generation = self._chat_generation(chat_id)
@@ -13064,7 +13072,9 @@ class Agent365Adapter(BasePlatformAdapter):
 
     def _allowed_users_by_lower(self) -> dict[str, str]:
         configured: dict[str, str] = {
-            value.strip().lower(): value.strip() for value in self._allowed_users if value.strip()
+            value.strip().lower(): value.strip()
+            for value in self._allowed_users
+            if value.strip()
         }
         for entry in self._allowed_user_aliases:
             token = entry.strip()
@@ -14166,10 +14176,14 @@ class Agent365Adapter(BasePlatformAdapter):
             phase if phase in {"stream-start", "edit", "auto-finalize", "other"} else "other"
         )
         status_out = (
-            http_status if isinstance(http_status, int) and 100 <= http_status <= 599 else "none"
+            http_status
+            if isinstance(http_status, int) and 100 <= http_status <= 599
+            else "none"
         )
         attempt_out = (
-            attempt if isinstance(attempt, int) and 1 <= attempt <= _STREAM_EDIT_MAX_ATTEMPTS else 0
+            attempt
+            if isinstance(attempt, int) and 1 <= attempt <= _STREAM_EDIT_MAX_ATTEMPTS
+            else 0
         )
         code_out = (
             bf_error_code
@@ -16847,7 +16861,8 @@ def interactive_setup() -> None:
     else:
         save_env_value("A365_ALLOW_ALL_USERS", "false")
         allowed = prompt(
-            "Allowed users (comma-separated Entra object IDs or UPN/email; blank = deny everyone)",
+            "Allowed users (comma-separated Entra object IDs or UPN/email; "
+            "blank = deny everyone)",
             default=get_env_value("A365_ALLOWED_USERS") or "",
         )
         save_env_value(
