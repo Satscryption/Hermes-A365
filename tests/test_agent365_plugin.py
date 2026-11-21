@@ -13812,6 +13812,323 @@ class TestEditMessage:
             assert "stream retry exhausted" not in logs[0].message
         await a._drop_turn_buffer(chat)
 
+    @pytest.mark.parametrize(
+        "stored_reason",
+        ["retry_exhausted", "age_budget"],
+    )
+    def test_forced_plain_due_warns_and_returns_stored_plain_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        stored_reason: str,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-site1-stored-{stored_reason}"
+        turn = {"seq": 1, "activity_id": "act-1"}
+        buf = {
+            "turns": [turn],
+            "keepalive": {"stream_id": "", "closed_by": ""},
+            "keepalive_rotated": False,
+        }
+        record = a._delivery_record(buf, turn)
+        record["force_plain"] = True
+        record["plain_due"] = True
+        record["plain_reason"] = stored_reason
+        record["force_plain_exhausted"] = False
+        record["may_have_landed"] = False
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
+
+        assert route == ("fallback", stored_reason)
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.WARNING
+        assert logs[0].message == (
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
+            f"reason={stored_reason}"
+        )
+        assert "stream retry exhausted" not in logs[0].message
+        assert record.get("plain_reason") == stored_reason
+
+    @pytest.mark.parametrize(
+        "plain_reason_setup",
+        ["empty", "missing", "none"],
+    )
+    def test_forced_plain_due_empty_plain_reason_maps_to_retry_exhausted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        plain_reason_setup: str,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-site1-empty-{plain_reason_setup}"
+        turn = {"seq": 1, "activity_id": "act-1"}
+        buf = {
+            "turns": [turn],
+            "keepalive": {"stream_id": "", "closed_by": ""},
+            "keepalive_rotated": False,
+        }
+        record = a._delivery_record(buf, turn)
+        record["force_plain"] = True
+        record["plain_due"] = True
+        record["force_plain_exhausted"] = False
+        record["may_have_landed"] = False
+        if plain_reason_setup == "empty":
+            record["plain_reason"] = ""
+        elif plain_reason_setup == "missing":
+            record.pop("plain_reason", None)
+        else:
+            record["plain_reason"] = None
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
+
+        assert route == ("fallback", "retry_exhausted")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.WARNING
+        assert logs[0].message == (
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
+            "reason=retry_exhausted"
+        )
+        if plain_reason_setup == "empty":
+            assert record.get("plain_reason") == ""
+        elif plain_reason_setup == "missing":
+            assert "plain_reason" not in record
+        else:
+            assert record.get("plain_reason") is None
+
+    def test_pre_post_force_plain_exhausted_returns_retry_and_leaves_stream(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-f001a-exhausted"
+        turn = {"seq": 1, "activity_id": "act-1"}
+        buf = {
+            "turns": [turn],
+            "keepalive": {
+                "stream_id": "same-id",
+                "closed_by": "",
+            },
+            "keepalive_rotated": False,
+        }
+        record = a._delivery_record(buf, turn)
+        record["force_plain_exhausted"] = True
+        record["force_plain"] = True
+        record["plain_due"] = True
+        record["plain_reason"] = "retry_exhausted"
+        record["may_have_landed"] = False
+        record["bound_stream_id"] = "same-id"
+        snap_exhausted = record.get("force_plain_exhausted")
+        snap_reason = record.get("plain_reason")
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
+
+        assert route == ("retry", None)
+        assert not any("answer plain fallback" in r.message for r in caplog.records)
+        assert buf["keepalive"]["stream_id"] == "same-id"
+        assert record.get("plain_reason") == snap_reason
+        assert record.get("force_plain_exhausted") == snap_exhausted
+
+    def test_pre_post_clears_stream_closed_by_turn_when_id_differs_from_bound(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-f001b-clear-turn"
+        turn = {"seq": 1, "activity_id": "act-1"}
+        buf = {
+            "turns": [turn],
+            "keepalive": {
+                "stream_id": "open-other",
+                "closed_by": "",
+            },
+            "keepalive_rotated": False,
+        }
+        record = a._delivery_record(buf, turn)
+        turn_key = str(record["turn_key"])
+        record["force_plain"] = True
+        record["plain_due"] = True
+        record["plain_reason"] = "retry_exhausted"
+        record["force_plain_exhausted"] = False
+        record["may_have_landed"] = False
+        record["bound_stream_id"] = "bound-different"
+        buf["keepalive"]["closed_by"] = f"turn:{turn_key}"
+        snap_closed_by = buf["keepalive"]["closed_by"]
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            route = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
+
+        assert route == ("fallback", "retry_exhausted")
+        assert buf["keepalive"]["stream_id"] == ""
+        assert buf["keepalive"]["closed_by"] == snap_closed_by
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.WARNING
+        assert logs[0].message == (
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
+            "reason=retry_exhausted"
+        )
+
+    @staticmethod
+    def _harness_in_call_retry_exhaustion(
+        monkeypatch: pytest.MonkeyPatch,
+        *,
+        chat_suffix: str,
+    ) -> tuple[Any, str, dict[str, Any], dict[str, int]]:
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-site2-{chat_suffix}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        finals = {"n": 0}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "final":
+                finals["n"] += 1
+                return MagicMock(
+                    status_code=503,
+                    text="",
+                    headers={"Retry-After": "0"},
+                    json=lambda: {},
+                )
+            return TestEditMessage._http_result(201, f"ka-{chat_suffix}")
+
+        a._http_client.post = post
+        TestEditMessage._no_sleep(monkeypatch)
+        return a, chat, inbound, finals
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "plain_reason_setup",
+        ["empty", "missing"],
+    )
+    async def test_in_call_stream_retry_exhaustion_maps_empty_plain_reason_to_retry_exhausted(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        plain_reason_setup: str,
+    ) -> None:
+        a, chat, inbound, finals = self._harness_in_call_retry_exhaustion(
+            monkeypatch,
+            chat_suffix=plain_reason_setup,
+        )
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Plain via 503", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": f"ka-{plain_reason_setup}",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        buf["keepalive_rotated"] = False
+        buf["keepalive_first_interval_elapsed"] = True
+        turn = buf["turns"][0]
+        record = a._delivery_record(buf, turn)
+        record["plain_due"] = False
+        record["force_plain"] = False
+        record["may_have_landed"] = False
+        snap_closed_by = str(buf["keepalive"].get("closed_by") or "")
+        if plain_reason_setup == "empty":
+            record["plain_reason"] = ""
+        else:
+            record.pop("plain_reason", None)
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            outcome = await a._deliver_turn_answer_locked(
+                chat,
+                turn,
+                "Plain via 503",
+                ["turnbuf:1"],
+            )
+
+        assert outcome == ("fallback", "retry_exhausted")
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.WARNING
+        assert f"status=503" in logs[0].message
+        assert "reason=retry_exhausted" in logs[0].message
+        assert "stream retry exhausted" not in logs[0].message
+        assert buf["keepalive"]["stream_id"] == ""
+        assert str(buf["keepalive"].get("closed_by") or "") == snap_closed_by
+        assert record.get("may_have_landed") is False
+        if plain_reason_setup == "empty":
+            assert record.get("plain_reason") == ""
+        else:
+            assert "plain_reason" not in record
+        assert finals["n"] == adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "stored_reason",
+        ["kept_token", "retry_exhausted"],
+    )
+    async def test_in_call_stream_retry_exhaustion_returns_stored_plain_reason(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        caplog: pytest.LogCaptureFixture,
+        stored_reason: str,
+    ) -> None:
+        a, chat, inbound, finals = self._harness_in_call_retry_exhaustion(
+            monkeypatch,
+            chat_suffix=stored_reason,
+        )
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="Stored token", reply_to=None)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": f"ka-{stored_reason}",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        buf["keepalive_rotated"] = False
+        buf["keepalive_first_interval_elapsed"] = True
+        turn = buf["turns"][0]
+        record = a._delivery_record(buf, turn)
+        record["plain_due"] = False
+        record["force_plain"] = False
+        record["may_have_landed"] = False
+        record["plain_reason"] = stored_reason
+        snap_reason = record["plain_reason"]
+
+        with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
+            outcome = await a._deliver_turn_answer_locked(
+                chat,
+                turn,
+                "Stored token",
+                ["turnbuf:1"],
+            )
+
+        assert outcome == ("fallback", stored_reason)
+        logs = [r for r in caplog.records if "answer plain fallback" in r.message]
+        assert len(logs) == 1
+        assert logs[0].levelno == logging.WARNING
+        assert f"status=503" in logs[0].message
+        assert f"reason={stored_reason}" in logs[0].message
+        assert record.get("plain_reason") == snap_reason
+        assert finals["n"] == adapter_mod._ANSWER_FINAL_MAX_ATTEMPTS
+        await a._drop_turn_buffer(chat)
+
     @pytest.mark.asyncio
     async def test_issue247_failed_rotation_close_stays_plain_no_answer_stream_final(
         self, monkeypatch: pytest.MonkeyPatch
