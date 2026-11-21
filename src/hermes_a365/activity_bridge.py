@@ -1625,6 +1625,7 @@ def sender_allowlist_path_b_warning(policy: SenderAllowlist) -> str | None:
 
 
 UPN_OBJECT_ID_TTL_SECONDS = 3600
+UPN_OBJECT_ID_GRACE_SECONDS = 15
 
 
 class UpnObjectIdResolver:
@@ -1634,6 +1635,7 @@ class UpnObjectIdResolver:
         self._cfg, self._fetch, self._clock = cfg, fetch or urllib.request.urlopen, clock
         self._cache = {entry: (None, 0.0) for entry in cfg.allowed_users if "@" in entry}
         self._refresh_task: asyncio.Task | None = None
+        self._stale_until = 0.0
 
     @staticmethod
     def _log_error(exc: Exception) -> None:
@@ -1689,26 +1691,43 @@ class UpnObjectIdResolver:
             len(self._cache) - resolved,
         )
 
-    def effective_allowed_users(self) -> tuple[str, ...]:
+    def _configured_entries(self) -> set[str]:
+        return {entry.strip().lower() for entry in self._cfg.allowed_users}
+
+    def _include_cached_oid(
+        self, entry: str, oid: str | None, expiry: float, *, allow_stale: bool
+    ) -> bool:
+        if oid is None or entry.strip().lower() not in self._configured_entries():
+            return False
+        now = self._clock()
+        if expiry > now:
+            return True
+        if not allow_stale:
+            return False
+        task = self._refresh_task
+        return task is not None and not task.done() and now < self._stale_until
+
+    def effective_allowed_users(self, *, allow_stale: bool = False) -> tuple[str, ...]:
         return self._cfg.allowed_users + tuple(
             oid
-            for oid, expiry in self._cache.values()
-            if oid is not None and expiry > self._clock()
+            for entry, (oid, expiry) in self._cache.items()
+            if self._include_cached_oid(entry, oid, expiry, allow_stale=allow_stale)
         )
 
-    def resolved_aliases(self) -> dict[str, str]:
+    def resolved_aliases(self, *, allow_stale: bool = False) -> dict[str, str]:
         """Map live resolved object IDs to the configured UPN/email spelling."""
         aliases = {entry.lower(): entry for entry in self._cfg.allowed_user_aliases}
         return {
             oid: aliases.get(entry.lower(), entry)
             for entry, (oid, expiry) in self._cache.items()
-            if oid is not None and expiry > self._clock()
+            if self._include_cached_oid(entry, oid, expiry, allow_stale=allow_stale)
         }
 
     def refresh_in_background(self) -> None:
         if (self._refresh_task is None or self._refresh_task.done()) and any(
             expiry <= self._clock() for _, expiry in self._cache.values()
         ):
+            self._stale_until = self._clock() + UPN_OBJECT_ID_GRACE_SECONDS
             self._refresh_task = asyncio.create_task(asyncio.to_thread(self.refresh))
 
 
@@ -4291,8 +4310,10 @@ def make_app(
         if _activity_requires_end_user_auth(activity):
             allowed_users = cfg.allowed_users
             if upn_resolver is not None:
-                allowed_users = upn_resolver.effective_allowed_users()
                 upn_resolver.refresh_in_background()
+                allowed_users = upn_resolver.effective_allowed_users(
+                    allow_stale=validated_path == "B"
+                )
             if not _activity_user_authorized(
                 activity,
                 allowed_users=allowed_users,
