@@ -29,6 +29,10 @@ Exit codes:
 - 0 — all probes ``ok``
 - 1 — at least one ``warn``, no ``error``
 - 2 — at least one ``error``
+
+An upstream CLI update notice (``note:`` in human output) is informational
+only: it does not by itself change ``overall`` or the exit code. The
+Microsoft#408 ``a365`` CLI version warns remain ``warn`` probes.
 """
 
 from __future__ import annotations
@@ -132,6 +136,7 @@ class ProbeResult:
     state: ProbeState
     detail: str
     data: dict[str, Any] = field(default_factory=dict)
+    notice: str = ""
 
 
 # ---------------------------------------------------------------------------
@@ -139,8 +144,72 @@ class ProbeResult:
 # ---------------------------------------------------------------------------
 
 
+_A365_UPDATE_NOTICE_START = "A newer version is available with bug fixes and improvements."
+_A365_PREVIEW_NOTICE_PREFIX = "A preview release is also available:"
+_A365_NOTICE_INNER_PREFIXES = (
+    "Current:",
+    "Latest:",
+    "What's new:",
+    "To update, run:",
+    "To try it:",
+)
+
+
+def _split_a365_cli_version_notice(version_text: str) -> tuple[str, str]:
+    """Return ``(version_body, notice)`` from ``a365 --version`` stdout."""
+    if not version_text:
+        return "", ""
+    notice_lines: list[str] = []
+    body_lines: list[str] = []
+    in_block = False
+    block_lines: list[str] = []
+
+    def close_block() -> None:
+        nonlocal in_block, block_lines
+        if block_lines:
+            notice_lines.extend(block_lines)
+            block_lines = []
+        in_block = False
+
+    for line in version_text.splitlines():
+        stripped = line.strip()
+        if not in_block:
+            if stripped == _A365_UPDATE_NOTICE_START or stripped.startswith(
+                _A365_PREVIEW_NOTICE_PREFIX
+            ):
+                in_block = True
+                block_lines = [line]
+            else:
+                body_lines.append(line)
+            continue
+        if not stripped:
+            block_lines.append(line)
+            continue
+        if any(stripped.startswith(prefix) for prefix in _A365_NOTICE_INNER_PREFIXES):
+            block_lines.append(line)
+            if stripped.startswith("To update, run:") or stripped.startswith("To try it:"):
+                close_block()
+            continue
+        close_block()
+        body_lines.append(line)
+
+    if in_block:
+        close_block()
+
+    if not body_lines:
+        return version_text, ""
+    body = "\n".join(body_lines)
+    notice = "\n".join(notice_lines).strip()
+    return body, notice
+
+
 def probe_a365_cli() -> ProbeResult:
-    """v0.2 only ships the .NET CLI; no variant detection."""
+    """v0.2 only ships the .NET CLI; no variant detection.
+
+    An upstream update notice in ``--version`` output is stored on
+    :attr:`ProbeResult.notice` and does not by itself change probe ``state``,
+    ``overall``, or the exit code. Microsoft#408 version warns remain ``warn``.
+    """
     binary = shutil.which("a365")
     if not binary:
         return ProbeResult(
@@ -150,8 +219,14 @@ def probe_a365_cli() -> ProbeResult:
             "`dotnet tool install -g Microsoft.Agents.A365.DevTools.Cli --prerelease`)",
         )
     version_text = safe_run([binary, "--version"], timeout=10.0) or ""
-    version_first = version_text.splitlines()[0] if version_text else "version unknown"
-    parsed = parse_a365_cli_version(version_text)
+    body, notice = _split_a365_cli_version_notice(version_text)
+    if notice:
+        health_text = body
+    else:
+        health_text = version_text
+        notice = ""
+    version_first = health_text.splitlines()[0] if health_text else "version unknown"
+    parsed = parse_a365_cli_version(health_text)
     data: dict[str, Any] = {"path": binary, "version_raw": version_text}
     if parsed is None:
         return ProbeResult(
@@ -164,6 +239,7 @@ def probe_a365_cli() -> ProbeResult:
                 "enabled for live setup"
             ),
             data,
+            notice,
         )
     data["version"] = ".".join(str(part) for part in parsed)
     if parsed <= A365_CLI_SECRET_LATEST_AFFECTED_VERSION:
@@ -184,6 +260,7 @@ def probe_a365_cli() -> ProbeResult:
                 ),
                 "nuget": A365_CLI_NUGET_URL,
             },
+            notice,
         )
     return ProbeResult(
         "a365_cli",
@@ -199,6 +276,7 @@ def probe_a365_cli() -> ProbeResult:
             **data,
             "latest_known_affected_version": A365_CLI_SECRET_LATEST_AFFECTED_VERSION_TEXT,
         },
+        notice,
     )
 
 
@@ -1460,6 +1538,7 @@ class DoctorReport:
 
     @property
     def overall(self) -> ProbeState:
+        # ``ProbeResult.notice`` is informational only; aggregation uses ``state``.
         if any(p.state == _ERROR for p in self.probes):
             return _ERROR
         if any(p.state == _WARN for p in self.probes):
@@ -1564,6 +1643,9 @@ def render_human(report: DoctorReport) -> str:
             _SKIPPED: "[SKIP]",
         }[p.state]
         lines.append(f"  {marker}  {p.name:<{name_w}}  {p.detail}")
+        if p.notice:
+            note_line = " ".join(p.notice.split())
+            lines.append(f"    note: {note_line}")
     lines.append("")
     lines.append(f"overall: {report.overall}")
     lines.append("")
