@@ -708,6 +708,113 @@ def test_payload_total_tracks_every_release_path(release):
     assert cache.result_bytes == 0
 
 
+def _arm_open_subject(cache: bridge._IdempotencyCache, stage: str, *, target_first: bool) -> tuple:
+    def prepare_target() -> Any:
+        assert cache.claim("target", now=100.0) == "new"
+        record = cache.record("target")
+        if stage == "webhook_running":
+            assert cache.enter_webhook("target", record)
+        elif stage == "inflight":
+            assert cache.enter_webhook("target", record)
+            cache.store_result("target", record, {"text": "retained"})
+            assert cache.begin_reply("target", record)
+        return record
+
+    def prepare_sibling() -> Any:
+        assert cache.claim("live", now=105.0) == "new"
+        sibling = cache.record("live")
+        assert cache.enter_webhook("live", sibling)
+        cache.store_result("live", sibling, {"text": "sibling"})
+
+    if target_first:
+        old = prepare_target()
+        prepare_sibling()
+    else:
+        prepare_sibling()
+        old = prepare_target()
+    sibling = cache.record("live")
+    if stage == "received":
+        assert old.state == "received"
+        assert old.reply == "none"
+        assert old.result is None
+        assert old.result_bytes == 0
+    elif stage == "webhook_running":
+        assert old.state == "webhook_running"
+        assert old.reply == "none"
+        assert old.result is None
+    else:
+        assert old.state == "webhook_done"
+        assert old.reply == "inflight"
+        assert old.result is not None
+        assert old.result_bytes > 0
+    return old, sibling
+
+
+@pytest.mark.parametrize(
+    ("stage", "path"),
+    [
+        ("inflight", "sweep"),
+        ("inflight", "per_key"),
+        ("received", "sweep"),
+        ("received", "per_key"),
+        ("webhook_running", "sweep"),
+        ("webhook_running", "per_key"),
+    ],
+)
+def test_claim_reclaims_expired_open_record(stage, path):
+    cache = bridge._IdempotencyCache(ttl_seconds=10.0)
+    old, sibling = _arm_open_subject(cache, stage, target_first=(path == "sweep"))
+    held_bytes = old.result_bytes
+    bytes_before = cache.result_bytes
+    sibling_body = sibling.result
+
+    pre_expiry = math.nextafter(110.0, -math.inf)
+    assert cache.claim("target", now=pre_expiry) == "inflight"
+    assert cache.record("target") is old
+    assert cache.result_bytes == bytes_before
+
+    if path == "sweep":
+        assert cache.claim("probe", now=110.0) == "new"
+        assert cache.record("target") is None
+        assert cache.record("live") is sibling
+        assert cache.claim("target", now=110.0) == "new"
+        fresh = cache.record("target")
+    else:
+        assert cache.claim("target", now=110.0) == "new"
+        assert cache.record("live") is sibling
+        fresh = cache.record("target")
+
+    assert old.result is None
+    assert old.result_bytes == 0
+    assert old not in cache.seen.values()
+    assert cache.result_bytes == bytes_before - held_bytes
+    assert cache.result_bytes == sum(r.result_bytes for r in cache.seen.values())
+    assert sibling.result == sibling_body
+
+    assert fresh is not old
+    assert fresh.state == "received"
+    assert fresh.reply == "none"
+    assert fresh.result is None
+
+    fresh_snapshot = asdict(fresh)
+    bytes_after = cache.result_bytes
+    old_state = old.state
+    old_reply = old.reply
+
+    cache.complete("target", old, "done")
+    cache.finish_reply("target", old, "sent")
+    cache.store_result("target", old, {"text": "stale"})
+    cache.enter_webhook("target", old)
+    cache.begin_reply("target", old)
+    cache.release_if_received("target", old)
+
+    assert asdict(fresh) == fresh_snapshot
+    assert cache.result_bytes == bytes_after
+    assert old.state == old_state
+    assert old.reply == old_reply
+    assert cache.record("target") is fresh
+
+
 @pytest.mark.parametrize("later_post", [False, True])
 async def test_cancellation_during_429_retry(delivery, monkeypatch, later_post):
     d = delivery(replies=[429, 200])
