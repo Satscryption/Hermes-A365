@@ -30141,6 +30141,103 @@ class TestTurnFrame:
         await a._teardown_chat_state("conv-1")
         assert ("conv-1", "teardown-ledger") not in a._turn_authority_ledger
 
+    async def test_f312_stream_authority_record_keeps_ledger_after_scope_retire(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T9 (R6): ledger row survives scope retire only via open stream authority_record."""
+        a = runtime.adapter
+        conv = "conv-f312-t9"
+        admitted = _make_inbound(conv_id=conv, activity_id="t9-admit")
+        ref = adapter_mod.ConversationRef.from_activity(admitted)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add(conv)
+        assert a.admit_turn_authority(admitted, f"wire-{conv}", message_id="t9-admit")
+        record = a._ledger_record_for_message("t9-admit", conv)
+        assert record is not None
+        a._capture_coalesced_turn_target(ref)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        post_mock = AsyncMock(
+            side_effect=[
+                MagicMock(status_code=201, text="", json=lambda: {"id": "bf-t9"}),
+                MagicMock(status_code=202, text="", json=lambda: {}),
+            ]
+        )
+        a._http_client.post = post_mock
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        token_calls: list[dict[str, Any]] = []
+
+        async def capture_token(**kwargs: Any) -> tuple[str, str]:
+            token_calls.append(kwargs)
+            return ("bearer-t9", "A")
+
+        monkeypatch.setattr(bridge, "acquire_reply_token", capture_token)
+
+        with a._turn_frame_scope(f"wire-{conv}", record):
+            opened = await a.send(chat_id=conv, content="Stream", reply_to="t9-admit")
+        assert opened.success is True
+        stream_id = str(opened.message_id)
+        stream_state = a._streams.get((conv, stream_id))
+        assert stream_state is not None
+        assert stream_state.get("authority_record") is record
+        key = (conv, "t9-admit")
+        owner = a._turn_authority_owners.get(key)
+        assert owner is None or owner.done()
+        assert a._ledger_record_for_message("t9-admit", conv) is record
+
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        edited = await a.edit_message(conv, stream_id, "More", finalize=False)
+        assert edited.success is True
+        assert token_calls[-1]["activity"]["id"] == "t9-admit"
+
+    async def test_f312_teardown_drops_stream_retained_ledger_row(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T10 (R6): teardown clears a ledger row held only by an open stream."""
+        a = runtime.adapter
+        conv = "conv-f312-t10"
+        admitted = _make_inbound(conv_id=conv, activity_id="t10-admit")
+        ref = adapter_mod.ConversationRef.from_activity(admitted)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add(conv)
+        assert a.admit_turn_authority(admitted, f"wire-{conv}", message_id="t10-admit")
+        record = a._ledger_record_for_message("t10-admit", conv)
+        assert record is not None
+        a._capture_coalesced_turn_target(ref)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        a._http_client.post = AsyncMock(
+            return_value=MagicMock(status_code=201, text="", json=lambda: {"id": "bf-t10"})
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+
+        with a._turn_frame_scope(f"wire-{conv}", record):
+            opened = await a.send(chat_id=conv, content="Hold", reply_to="t10-admit")
+        assert opened.success is True
+        stream_id = str(opened.message_id)
+        assert a._streams.get((conv, stream_id), {}).get("authority_record") is record
+        assert a._ledger_record_for_message("t10-admit", conv) is record
+
+        await a._teardown_chat_state(conv)
+        assert (conv, "t10-admit") not in a._turn_authority_ledger
+        assert (conv, stream_id) not in a._streams
+
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        blocked = await a.send(conv, "after teardown", reply_to="t10-admit")
+        assert blocked.success is False
+        assert "no turn authority" in (blocked.error or "")
+
     async def test_f312_runner_frame_binds_synthetic_authority(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
