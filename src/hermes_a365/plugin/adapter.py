@@ -3134,9 +3134,7 @@ class Agent365Adapter(BasePlatformAdapter):
             if activity_id:
                 admitted = self._ledger_record_for_message(activity_id, ref.conversation_id)
                 if admitted is not None:
-                    self._coalesced_turn_authority[
-                        self._coalesced_reply_turn_key(ref.conversation_id, activity_id)
-                    ] = admitted
+                    self._attach_coalesced_turn_authority(admitted)
             if sk is not None:
                 self._session_key_to_conv[sk] = ref.conversation_id
                 turn_guard = self._agent_turn_guards.setdefault(sk, turn_guard)
@@ -4547,13 +4545,54 @@ class Agent365Adapter(BasePlatformAdapter):
         self._turn_authority_ledger[(conv_id, mid)] = record
         return True
 
+    def _turn_authority_claims_reply_to(self, record: TurnAuthorityRecord, reply_to: str) -> bool:
+        anchor = str(reply_to or "").strip()
+        if not anchor:
+            return False
+        if str(record.message_id or "").strip() == anchor:
+            return True
+        reply_anchor = str(record.reply_activity.get("id") or "").strip()
+        return bool(reply_anchor and reply_anchor == anchor)
+
+    def _origin_for_reply_to(self, chat_id: str, reply_to: str) -> TurnAuthorityRecord | None:
+        anchor = str(reply_to or "").strip()
+        if not anchor:
+            return None
+        chat_id = str(chat_id)
+        frame = _AGENT_TURN_FRAME.get()
+        if isinstance(frame, TurnAuthorityRecord) and self._is_own_turn_authority(frame):
+            ledger_obj = self._ledger_record_for_message(frame.message_id, chat_id)
+            if (
+                frame.conversation_id == chat_id
+                and self._turn_authority_claims_reply_to(frame, anchor)
+                and ledger_obj is frame
+            ):
+                return frame
+        claimants = [
+            record
+            for (conv_id, _message_id), record in self._turn_authority_ledger.items()
+            if conv_id == chat_id
+            and self._is_own_turn_authority(record)
+            and self._turn_authority_claims_reply_to(record, anchor)
+        ]
+        if len(claimants) == 1:
+            return claimants[0]
+        return None
+
     def _attach_coalesced_turn_authority(self, record: TurnAuthorityRecord) -> None:
         anchor = str(record.reply_activity.get("id") or "").strip()
         if not anchor:
             return
-        self._coalesced_turn_authority[
-            self._coalesced_reply_turn_key(record.conversation_id, anchor)
-        ] = record
+        key = self._coalesced_reply_turn_key(record.conversation_id, anchor)
+        existing = self._coalesced_turn_authority.get(key)
+        if (
+            existing is not None
+            and existing is not record
+            and self._ledger_record_for_message(existing.message_id, existing.conversation_id)
+            is existing
+        ):
+            return
+        self._coalesced_turn_authority[key] = record
 
     def _ledger_record_for_message(
         self, message_id: str, conversation_id: str
@@ -4578,6 +4617,15 @@ class Agent365Adapter(BasePlatformAdapter):
         for fifo in self._pending_turn_fifo.values():
             pending.extend(fifo)
         retained.update(id(self._event_turn_authority(event)) for event in pending)
+        for state in self._streams.values():
+            auth = state.get("authority_record")
+            if not isinstance(auth, TurnAuthorityRecord) or not self._is_own_turn_authority(auth):
+                continue
+            if (
+                self._ledger_record_for_message(auth.message_id, auth.conversation_id) is auth
+                and (conversation_id is None or auth.conversation_id == conversation_id)
+            ):
+                retained.add(id(auth))
         for key, record in list(self._turn_authority_ledger.items()):
             if conversation_id is not None and record.conversation_id != conversation_id:
                 continue
@@ -4717,7 +4765,22 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             return current
         record = self._ledger_record_for_message(message_id, conversation_id)
-        return record if record is not None else _UNBOUND_TURN_FRAME
+        if record is not None:
+            return record
+        anchor = str(message_id or "").strip()
+        if not anchor:
+            return _UNBOUND_TURN_FRAME
+        claimants = [
+            entry
+            for (conv_id, ledger_id), entry in self._turn_authority_ledger.items()
+            if conv_id == conversation_id
+            and self._is_own_turn_authority(entry)
+            and str(ledger_id or "").strip() != anchor
+            and str(entry.reply_activity.get("id") or "").strip() == anchor
+        ]
+        if len(claimants) == 1:
+            return claimants[0]
+        return _UNBOUND_TURN_FRAME
 
     def _install_run_agent_turn_frame_wrapper(self) -> None:
         global _RUN_AGENT_FRAME_PATCHED
@@ -5794,9 +5857,7 @@ class Agent365Adapter(BasePlatformAdapter):
         coalesced_origin: TurnAuthorityRecord | None = None
         if reply_to is not None:
             turn_key = self._coalesced_reply_turn_key(chat_id, reply_to)
-            coalesced_origin = self._coalesced_turn_authority.get(turn_key)
-            if coalesced_origin is None:
-                coalesced_origin = self._ledger_record_for_message(str(reply_to), str(chat_id))
+            coalesced_origin = self._origin_for_reply_to(chat_id, str(reply_to))
             if coalesced_origin is None or not self._is_own_turn_authority(coalesced_origin):
                 return SendResult(
                     success=False,
@@ -15796,6 +15857,7 @@ class Agent365Adapter(BasePlatformAdapter):
         for stream_key in list(self._streams):
             if stream_key[0] == chat_id:
                 self._streams.pop(stream_key, None)
+        self._retire_turn_authorities(conversation_id=chat_id)
         # Every coalesced-reply generation for this chat, including a detached
         # generation whose finalize POST is currently in flight.
         active_mid = self._active_coalesced_reply_by_chat.pop(chat_id, None)

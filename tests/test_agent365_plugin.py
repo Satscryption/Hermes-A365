@@ -22166,6 +22166,8 @@ class TestEditMessage:
         a._capture_coalesced_turn_target(other_ref)
         other_rec = a._ledger_record_for_message("other-admit", conv)
         a._coalesced_turn_authority[(conv, "other-admit")] = other_rec
+        other_owner = asyncio.create_task(asyncio.Event().wait())
+        a._own_turn_authority(other_rec, other_owner)
         with a._turn_frame_scope(f"wire-{conv}", record):
             await a.send(chat_id=conv, content="Stale", reply_to="stream-admit")
         posts_before_stale = len(post_bodies)
@@ -22175,6 +22177,9 @@ class TestEditMessage:
         assert len(post_bodies) > posts_before_stale
         stale_final = post_bodies[posts_before_stale]
         assert_post_uses_admitted(stale_final)
+        a._release_turn_authority_owner(other_rec)
+        other_owner.cancel()
+        await asyncio.gather(other_owner, return_exceptions=True)
 
         adapter_mod._AGENT_TURN_FRAME.set(None)
         a._coalesced_turn_authority.pop((conv, "stream-admit"), None)
@@ -22184,6 +22189,7 @@ class TestEditMessage:
         assert unowned.success is False
         assert len(a._streams) == streams_before
         a._coalesced_turn_authority[(conv, "stream-admit")] = record
+        a._turn_authority_ledger[(conv, "stream-admit")] = record
 
         with a._turn_frame_scope(f"wire-{conv}", record):
             life_open = await a.send(chat_id=conv, content="Life", reply_to="stream-admit")
@@ -29972,6 +29978,438 @@ class TestTurnFrame:
                 )
             ).success
             assert runtime.posted.await_args.kwargs["inbound"]["id"] == "act-card-turn"
+
+    @staticmethod
+    def _hold_authority_owner(a: Any, record: Any) -> asyncio.Task[Any]:
+        task = asyncio.create_task(asyncio.Event().wait())
+        a._own_turn_authority(record, task)
+        return task
+
+    async def _f312_seed_reaction_turn(self, runtime: Any) -> tuple[Any, Any, Any]:
+        a = runtime.adapter
+        a._reactions_dispatch_agent_turn = True
+        TestMessageReaction()._seed(a)
+        user = _make_inbound(activity_id="user-act")
+        await self._admit(runtime, user)
+        user_record = a._ledger_record_for_message("user-act", "conv-1")
+        assert user_record is not None
+        reaction = _reaction_activity(added=[{"type": "like"}])
+        reaction["from"]["id"] = "reactor"
+        import httpx
+
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=a.build_app()), base_url="http://testserver"
+        ) as client:
+            response = await client.post(
+                "/api/messages", json=reaction, headers={"Authorization": "Bearer a.b.c"}
+            )
+        assert response.status_code == 200
+        reaction_rows = [
+            record
+            for (conv_id, mid), record in a._turn_authority_ledger.items()
+            if conv_id == "conv-1" and str(mid).startswith("reaction:")
+        ]
+        assert len(reaction_rows) == 1
+        reaction_record = reaction_rows[0]
+        self._hold_authority_owner(a, reaction_record)
+        return a, user_record, reaction_record
+
+    async def test_f312_reaction_does_not_replace_inflight_reply_origin(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
+        assert a._coalesced_turn_authority[("conv-1", "user-act")] is user_record
+
+        with a._turn_frame_scope("sess-frame", user_record):
+            first = await a.send("conv-1", "bound to user", reply_to="user-act")
+        assert first.success is True
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "user-act"
+        assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "user-1"
+        runtime.posted.reset_mock()
+
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        blocked = await a.send("conv-1", "ambiguous", reply_to="user-act")
+        assert blocked.success is False
+        runtime.posted.assert_not_awaited()
+
+        with a._turn_frame_scope("sess-frame", reaction_record):
+            reactor_send = await a.send("conv-1", "reaction scope", reply_to="user-act")
+        assert reactor_send.success is True
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "user-act"
+        assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "reactor"
+        runtime.posted.reset_mock()
+
+        a._release_turn_authority_owner(user_record)
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        solo = await a.send("conv-1", "reaction only", reply_to="user-act")
+        assert solo.success is True
+        assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "reactor"
+
+    async def test_f312_retired_frame_send_is_rejected(
+        self, runtime: Any,
+    ) -> None:
+        a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
+        a._release_turn_authority_owner(user_record)
+        assert a._ledger_record_for_message("user-act", "conv-1") is None
+        assert a._coalesced_turn_authority[("conv-1", "user-act")] is user_record
+        posted_before = runtime.posted.await_count
+
+        with a._turn_frame_scope("sess-stale-frame", user_record):
+            framed = await a.send("conv-1", "must use reaction authority", reply_to="user-act")
+        assert framed.success is True
+        assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "reactor"
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "user-act"
+        runtime.posted.reset_mock()
+
+        a._release_turn_authority_owner(reaction_record)
+        assert not [
+            record
+            for (_conv, _mid), record in a._turn_authority_ledger.items()
+            if record.conversation_id == "conv-1"
+            and a._turn_authority_claims_reply_to(record, "user-act")
+        ]
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        unscoped = await a.send("conv-1", "no ledger row", reply_to="user-act")
+        assert unscoped.success is False
+        assert runtime.posted.await_count == posted_before
+
+        live = _make_inbound(activity_id="live-anchor")
+        live["from"]["id"] = "user-two"
+        assert a.admit_turn_authority(live, "sess-live", message_id="live-anchor")
+        live_rec = a._ledger_record_for_message("live-anchor", "conv-1")
+        assert live_rec is not None
+        with a._turn_frame_scope("sess-live", live_rec):
+            other_frame = await a.send("conv-1", "other user frame", reply_to="user-act")
+        assert other_frame.success is False
+        assert runtime.posted.await_count == posted_before
+
+    async def test_f312_pending_merge_keeps_queued_event_ledger_authority(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from collections import deque
+
+        a = runtime.adapter
+        same_user = "user-merge"
+        first = _make_inbound(activity_id="merge-a")
+        first["from"]["id"] = same_user
+        second = _make_inbound(activity_id="merge-b")
+        second["from"]["id"] = same_user
+        sk = "sess-merge-coalesce"
+        a._session_key_to_conv[sk] = "conv-1"
+        assert a.admit_turn_authority(first, sk, message_id="merge-a")
+        assert a.admit_turn_authority(second, sk, message_id="merge-b")
+        head = a._activity_to_event(
+            first, media=([], [], adapter_mod.MessageType.TEXT), authorized_user_id=same_user
+        )
+        queued = a._activity_to_event(
+            second, media=([], [], adapter_mod.MessageType.TEXT), authorized_user_id=same_user
+        )
+        queued.message_id = "merge-b"
+        a._pending_messages[sk] = head
+        a._pending_turn_fifo[sk] = deque([queued])
+        head_record = a._event_turn_authority(head)
+        queued_record = a._event_turn_authority(queued)
+        assert head_record is not None and queued_record is not None
+        a._release_turn_authority_owner(head_record)
+        a._release_turn_authority_owner(queued_record)
+        assert a._event_turn_authority(queued) is not None
+        handled: list[Any] = []
+
+        async def dispatch(_base: Any, event: Any) -> None:
+            handled.append(event)
+
+        monkeypatch.setattr(_StubBasePlatformAdapter, "handle_message", dispatch)
+        a._pending_messages.pop(sk)
+        assert a._agent365_promote_fifo_head_to_slot(sk)
+        promoted = a._pending_messages[sk]
+        await a.handle_message(promoted)
+        assert handled == [promoted]
+
+    async def test_f312_teardown_clears_ledger_after_coalesced_attach(
+        self, runtime: Any,
+    ) -> None:
+        a = runtime.adapter
+        inbound = _make_inbound(activity_id="teardown-ledger")
+        ref = adapter_mod.ConversationRef.from_activity(inbound)
+        assert ref is not None
+        assert a.admit_turn_authority(inbound, "sess-teardown", message_id="teardown-ledger")
+        record = a._ledger_record_for_message("teardown-ledger", "conv-1")
+        assert record is not None
+        a._attach_coalesced_turn_authority(record)
+        a._retire_turn_authorities(conversation_id="conv-1")
+        assert ("conv-1", "teardown-ledger") not in a._turn_authority_ledger
+        await a._teardown_chat_state("conv-1")
+        assert ("conv-1", "teardown-ledger") not in a._turn_authority_ledger
+
+    async def test_f312_stream_authority_record_keeps_ledger_after_scope_retire(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T9 (R6): ledger row survives scope retire only via open stream authority_record."""
+        a = runtime.adapter
+        conv = "conv-f312-t9"
+        admitted = _make_inbound(conv_id=conv, activity_id="t9-admit")
+        ref = adapter_mod.ConversationRef.from_activity(admitted)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add(conv)
+        assert a.admit_turn_authority(admitted, f"wire-{conv}", message_id="t9-admit")
+        record = a._ledger_record_for_message("t9-admit", conv)
+        assert record is not None
+        a._capture_coalesced_turn_target(ref)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        post_mock = AsyncMock(
+            side_effect=[
+                MagicMock(status_code=201, text="", json=lambda: {"id": "bf-t9"}),
+                MagicMock(status_code=202, text="", json=lambda: {}),
+            ]
+        )
+        a._http_client.post = post_mock
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        token_calls: list[dict[str, Any]] = []
+
+        async def capture_token(**kwargs: Any) -> tuple[str, str]:
+            token_calls.append(kwargs)
+            return ("bearer-t9", "A")
+
+        monkeypatch.setattr(bridge, "acquire_reply_token", capture_token)
+
+        with a._turn_frame_scope(f"wire-{conv}", record):
+            opened = await a.send(chat_id=conv, content="Stream", reply_to="t9-admit")
+        assert opened.success is True
+        stream_id = str(opened.message_id)
+        stream_state = a._streams.get((conv, stream_id))
+        assert stream_state is not None
+        assert stream_state.get("authority_record") is record
+        key = (conv, "t9-admit")
+        owner = a._turn_authority_owners.get(key)
+        assert owner is None or owner.done()
+        assert a._ledger_record_for_message("t9-admit", conv) is record
+
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        edited = await a.edit_message(conv, stream_id, "More", finalize=False)
+        assert edited.success is True
+        assert token_calls[-1]["activity"]["id"] == "t9-admit"
+
+    async def test_f312_teardown_drops_stream_retained_ledger_row(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """T10 (R6): teardown clears a ledger row held only by an open stream."""
+        a = runtime.adapter
+        conv = "conv-f312-t10"
+        admitted = _make_inbound(conv_id=conv, activity_id="t10-admit")
+        ref = adapter_mod.ConversationRef.from_activity(admitted)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add(conv)
+        assert a.admit_turn_authority(admitted, f"wire-{conv}", message_id="t10-admit")
+        record = a._ledger_record_for_message("t10-admit", conv)
+        assert record is not None
+        a._capture_coalesced_turn_target(ref)
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        a._http_client.post = AsyncMock(
+            return_value=MagicMock(status_code=201, text="", json=lambda: {"id": "bf-t10"})
+        )
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+
+        with a._turn_frame_scope(f"wire-{conv}", record):
+            opened = await a.send(chat_id=conv, content="Hold", reply_to="t10-admit")
+        assert opened.success is True
+        stream_id = str(opened.message_id)
+        assert a._streams.get((conv, stream_id), {}).get("authority_record") is record
+        assert a._ledger_record_for_message("t10-admit", conv) is record
+
+        await a._teardown_chat_state(conv)
+        assert (conv, "t10-admit") not in a._turn_authority_ledger
+        assert (conv, stream_id) not in a._streams
+
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        blocked = await a.send(conv, "after teardown", reply_to="t10-admit")
+        assert blocked.success is False
+        assert "no turn authority" in (blocked.error or "")
+
+    async def test_f312_runner_frame_binds_synthetic_authority(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
+        event = a._handled_events[-1]
+        sk = a._session_key_for(event)
+        assert sk
+
+        class Runner:
+            def _delivery_adapter_for(self, source: Any) -> Any:
+                return a
+
+            def _session_key_for_source(self, source: Any) -> str:
+                return sk
+
+            async def _run_agent_inner(
+                self, source: Any, *, session_key: str | None, inbound_message_id: str
+            ) -> Any:
+                return await a.send_slash_confirm("conv-1", "Confirm", "Run?", sk, "cfm")
+
+        module = types.ModuleType("gateway.run_turn")
+        module.GatewayRunner = Runner
+        monkeypatch.setitem(sys.modules, "gateway.run_turn", module)
+        monkeypatch.setattr(adapter_mod, "_RUN_AGENT_FRAME_PATCHED", False, raising=False)
+        a._install_run_agent_turn_frame_wrapper()
+        runner = Runner()
+
+        a._release_turn_authority_owner(user_record)
+        assert a._ledger_record_for_message("user-act", "conv-1") is None
+        result = await runner._run_agent_inner(
+            event.source,
+            session_key=sk,
+            inbound_message_id="user-act",
+        )
+        assert result.success is True
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "user-act"
+        assert next(reversed(a._card_capabilities.values()))["user_id"] == "reactor"
+        a._card_capabilities.clear()
+        runtime.posted.reset_mock()
+
+        reply_activity = copy.deepcopy(reaction_record.reply_activity)
+        assert a.admit_turn_authority(
+            _make_inbound(activity_id="react-2"),
+            sk,
+            message_id="reaction:duplicate",
+            reply_activity=reply_activity,
+        )
+        reaction_two = a._ledger_record_for_message("reaction:duplicate", "conv-1")
+        assert reaction_two is not None
+        self._hold_authority_owner(a, reaction_two)
+        fail = await runner._run_agent_inner(
+            event.source,
+            session_key=sk,
+            inbound_message_id="user-act",
+        )
+        assert fail.success is False
+        runtime.posted.assert_not_awaited()
+
+        assert a.admit_turn_authority(
+            _make_inbound(activity_id="user-act"),
+            sk,
+            message_id="user-act",
+        )
+        user_again = a._ledger_record_for_message("user-act", "conv-1")
+        assert user_again is not None
+        beats = await runner._run_agent_inner(
+            event.source,
+            session_key=sk,
+            inbound_message_id="user-act",
+        )
+        assert beats.success is True
+        assert next(reversed(a._card_capabilities.values()))["user_id"] == "user-1"
+
+    async def test_f312_personal_plain_fallback_keeps_coalesced_origin(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = runtime.adapter
+        conv = "conv-f312-plain"
+        admitted = _make_inbound(conv_id=conv, activity_id="plain-admit")
+        ref = adapter_mod.ConversationRef.from_activity(admitted)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add(conv)
+        assert a.admit_turn_authority(admitted, f"wire-{conv}", message_id="plain-admit")
+        record = a._ledger_record_for_message("plain-admit", conv)
+        assert record is not None
+        a._capture_coalesced_turn_target(ref)
+        a._coalesced_turn_authority[(conv, "plain-admit")] = record
+        a._http_client = MagicMock()
+        a._bridge_cfg = MagicMock()
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+
+        async def failed_stream_post(*_args: Any, **_kwargs: Any) -> MagicMock:
+            return MagicMock(status_code=500, text="", json=lambda: {})
+
+        a._http_client.post = AsyncMock(side_effect=failed_stream_post)
+        TestEditMessage._patch_token_mint(monkeypatch)
+
+        other = _make_inbound(conv_id=conv, activity_id="plain-other")
+        assert a.admit_turn_authority(other, f"wire-{conv}", message_id="plain-other")
+        other_rec = a._ledger_record_for_message("plain-other", conv)
+        adapter_mod._AGENT_TURN_FRAME.set(None)
+        with a._turn_frame_scope(f"wire-{conv}", other_rec):
+            result = await a.send(chat_id=conv, content="plain body", reply_to="plain-admit")
+        assert result.success is True
+        assert runtime.posted.await_args.kwargs["inbound"]["id"] == "plain-admit"
+
+    async def test_f312_handoff_link_post_keeps_turn_origin(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("A365_HANDOFF_LINK", "1")
+        a = runtime.adapter
+        a._handoff_link_enabled = True
+        start = _make_inbound(activity_id="handoff-snap")
+        start["conversation"]["conversationType"] = "groupChat"
+        start["from"]["aadObjectId"] = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        ref = adapter_mod.ConversationRef.from_activity(start)
+        assert ref is not None
+        a._conversations.upsert(ref)
+        a._seen_inbounds_this_lifetime.add("conv-1")
+        assert a.admit_turn_authority(start, "sess-handoff", message_id="handoff-snap")
+        record = a._ledger_record_for_message("handoff-snap", "conv-1")
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id="conv-1"),
+            message_id="handoff-snap",
+        )
+        with a._turn_frame_scope("sess-handoff", record):
+            await a.on_processing_start(event)
+        a._append_turn_buffer_segment(
+            "conv-1",
+            "x" * a.MAX_MESSAGE_LENGTH,
+            reply_to="handoff-snap",
+        )
+        buf = a._turn_buffers["conv-1"]
+        buf["turns"][0]["open"] = False
+
+        async def deliver_plain(
+            _self: Any,
+            _chat_id: str,
+            _turn: dict[str, Any],
+            _content: str,
+            _chunk_segment_ids: list[str],
+        ) -> tuple[str, str | None]:
+            return "delivered", "turn-answer"
+
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter, "_deliver_turn_answer_locked", deliver_plain
+        )
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter,
+            "_close_turn_buffer_keepalive_locked",
+            AsyncMock(return_value=True),
+        )
+
+        later = _make_inbound(activity_id="handoff-later")
+        later["conversation"]["conversationType"] = "groupChat"
+        assert a.admit_turn_authority(later, "sess-handoff", message_id="handoff-later")
+        with a._turn_frame_scope(
+            "sess-handoff",
+            a._ledger_record_for_message("handoff-later", "conv-1"),
+        ):
+            await a._flush_turn_buffer("conv-1")
+        link_calls = [
+            call
+            for call in runtime.posted.await_args_list
+            if "Continue in Teams" in str((call.kwargs.get("reply") or {}).get("text") or "")
+        ]
+        assert link_calls
+        assert link_calls[-1].kwargs["inbound"]["id"] == "handoff-snap"
 
 
 class TestHandoff:
