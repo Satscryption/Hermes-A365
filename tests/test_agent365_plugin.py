@@ -30051,7 +30051,7 @@ class TestTurnFrame:
         a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
         a._release_turn_authority_owner(user_record)
         assert a._ledger_record_for_message("user-act", "conv-1") is None
-        assert a._coalesced_turn_authority[("conv-1", "user-act")] is user_record
+        assert a._coalesced_turn_authority.get(("conv-1", "user-act")) is not user_record
         posted_before = runtime.posted.await_count
 
         with a._turn_frame_scope("sess-stale-frame", user_record):
@@ -30193,6 +30193,43 @@ class TestTurnFrame:
         a._http_client.aclose = AsyncMock()
         await a.disconnect()
         assert a._coalesced_turn_authority == {}
+
+    async def test_f312_coalesced_shared_anchor_pop_drops_entry(
+        self, runtime: Any,
+    ) -> None:
+        a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
+        key = ("conv-1", "user-act")
+        assert a._coalesced_turn_authority[key] is user_record
+        assert a._turn_authority_claims_reply_to(user_record, "user-act")
+        assert a._turn_authority_claims_reply_to(reaction_record, "user-act")
+        a._release_turn_authority_owner(user_record)
+        assert a._ledger_record_for_message("user-act", "conv-1") is None
+        assert a._coalesced_turn_authority.get(key) is not user_record
+        assert (
+            a._ledger_record_for_message(reaction_record.message_id, "conv-1") is reaction_record
+        )
+
+    async def test_f312_coalesced_global_cap_evicts(
+        self, runtime: Any, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        global_cap = 6
+        per_chat_cap = 3
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_TURN_TARGETS", global_cap)
+        monkeypatch.setattr(
+            adapter_mod, "_MAX_COALESCED_TURN_TARGETS_PER_CHAT", per_chat_cap
+        )
+        a = runtime.adapter
+        for chat_idx in range(3):
+            conv = f"conv-global-{chat_idx}"
+            sk = f"sess-global-{chat_idx}"
+            for act_idx in range(per_chat_cap):
+                activity_id = f"act-{chat_idx}-{act_idx}"
+                inbound = _make_inbound(conv_id=conv, activity_id=activity_id)
+                assert a.admit_turn_authority(inbound, sk, message_id=activity_id)
+                record = a._ledger_record_for_message(activity_id, conv)
+                assert record is not None
+                a._attach_coalesced_turn_authority(record)
+        assert len(a._coalesced_turn_authority) <= global_cap
 
     async def test_f312_stream_authority_record_keeps_ledger_after_scope_retire(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch

@@ -4653,14 +4653,6 @@ class Agent365Adapter(BasePlatformAdapter):
                 break
 
     def _drop_coalesced_turn_authority_record(self, record: TurnAuthorityRecord) -> None:
-        anchor = str(record.reply_activity.get("id") or "").strip()
-        if anchor and any(
-            other.conversation_id == record.conversation_id
-            and self._is_own_turn_authority(other)
-            and self._turn_authority_claims_reply_to(other, anchor)
-            for other in self._turn_authority_ledger.values()
-        ):
-            return
         for key in list(self._coalesced_turn_authority):
             if self._coalesced_turn_authority[key] is record:
                 self._coalesced_turn_authority.pop(key, None)
