@@ -4593,6 +4593,69 @@ class Agent365Adapter(BasePlatformAdapter):
         ):
             return
         self._coalesced_turn_authority[key] = record
+        self._prune_coalesced_turn_authority(record.conversation_id)
+
+    def _retained_turn_authority_record_ids(
+        self, *, conversation_id: str | None = None
+    ) -> set[int]:
+        retained = {
+            id(frame) for stack in self._turn_frame_stack_tokens.values() for frame in stack
+        }
+        pending = list(self._pending_messages.values())
+        for fifo in self._pending_turn_fifo.values():
+            pending.extend(fifo)
+        retained.update(id(self._event_turn_authority(event)) for event in pending)
+        for state in self._streams.values():
+            auth = state.get("authority_record")
+            if not isinstance(auth, TurnAuthorityRecord) or not self._is_own_turn_authority(auth):
+                continue
+            if (
+                self._ledger_record_for_message(auth.message_id, auth.conversation_id) is auth
+                and (conversation_id is None or auth.conversation_id == conversation_id)
+            ):
+                retained.add(id(auth))
+        return retained
+
+    def _coalesced_turn_authority_still_retained(self, record: TurnAuthorityRecord) -> bool:
+        if id(record) in self._retained_turn_authority_record_ids():
+            return True
+        owner = self._turn_authority_owners.get((record.conversation_id, record.message_id))
+        return owner is not None and not owner.done()
+
+    def _prune_coalesced_turn_authority(self, chat_id: str) -> None:
+        chat_id = str(chat_id or "")
+        while True:
+            chat_count = sum(1 for key in self._coalesced_turn_authority if key[0] == chat_id)
+            if chat_count <= _MAX_COALESCED_TURN_TARGETS_PER_CHAT:
+                break
+            dropped = False
+            for key in list(self._coalesced_turn_authority):
+                if key[0] != chat_id:
+                    continue
+                record = self._coalesced_turn_authority[key]
+                if self._coalesced_turn_authority_still_retained(record):
+                    continue
+                self._coalesced_turn_authority.pop(key, None)
+                dropped = True
+                break
+            if not dropped:
+                break
+        while len(self._coalesced_turn_authority) > _MAX_COALESCED_TURN_TARGETS:
+            dropped = False
+            for key in list(self._coalesced_turn_authority):
+                record = self._coalesced_turn_authority[key]
+                if self._coalesced_turn_authority_still_retained(record):
+                    continue
+                self._coalesced_turn_authority.pop(key, None)
+                dropped = True
+                break
+            if not dropped:
+                break
+
+    def _drop_coalesced_turn_authority_record(self, record: TurnAuthorityRecord) -> None:
+        for key in list(self._coalesced_turn_authority):
+            if self._coalesced_turn_authority[key] is record:
+                self._coalesced_turn_authority.pop(key, None)
 
     def _ledger_record_for_message(
         self, message_id: str, conversation_id: str
@@ -4610,22 +4673,7 @@ class Agent365Adapter(BasePlatformAdapter):
 
     def _retire_turn_authorities(self, *, conversation_id: str | None = None) -> None:
         """Release records once dispatch, queued work and active scopes release them."""
-        retained = {
-            id(frame) for stack in self._turn_frame_stack_tokens.values() for frame in stack
-        }
-        pending = list(self._pending_messages.values())
-        for fifo in self._pending_turn_fifo.values():
-            pending.extend(fifo)
-        retained.update(id(self._event_turn_authority(event)) for event in pending)
-        for state in self._streams.values():
-            auth = state.get("authority_record")
-            if not isinstance(auth, TurnAuthorityRecord) or not self._is_own_turn_authority(auth):
-                continue
-            if (
-                self._ledger_record_for_message(auth.message_id, auth.conversation_id) is auth
-                and (conversation_id is None or auth.conversation_id == conversation_id)
-            ):
-                retained.add(id(auth))
+        retained = self._retained_turn_authority_record_ids(conversation_id=conversation_id)
         for key, record in list(self._turn_authority_ledger.items()):
             if conversation_id is not None and record.conversation_id != conversation_id:
                 continue
@@ -4634,6 +4682,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 continue
             self._turn_authority_ledger.pop(key, None)
             self._turn_authority_owners.pop(key, None)
+            self._drop_coalesced_turn_authority_record(record)
 
     def _release_turn_authority_owner(self, record: TurnAuthorityRecord) -> None:
         key = (record.conversation_id, record.message_id)
