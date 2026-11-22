@@ -30141,6 +30141,59 @@ class TestTurnFrame:
         await a._teardown_chat_state("conv-1")
         assert ("conv-1", "teardown-ledger") not in a._turn_authority_ledger
 
+    async def test_f312_coalesced_authority_retires_and_stays_capped(
+        self, runtime: Any,
+    ) -> None:
+        a = runtime.adapter
+        conv = "conv-f312-cap"
+        sk = "sess-f312-cap"
+        per_chat_cap = adapter_mod._MAX_COALESCED_TURN_TARGETS_PER_CHAT
+        first_inbound = _make_inbound(conv_id=conv, activity_id="cap-first")
+        assert a.admit_turn_authority(first_inbound, sk, message_id="cap-first")
+        first_record = a._ledger_record_for_message("cap-first", conv)
+        assert first_record is not None
+        a._attach_coalesced_turn_authority(first_record)
+        first_key = a._coalesced_reply_turn_key(conv, "cap-first")
+
+        with a._turn_frame_scope(sk, first_record):
+            for index in range(per_chat_cap):
+                activity_id = f"cap-{index}"
+                inbound = _make_inbound(conv_id=conv, activity_id=activity_id)
+                assert a.admit_turn_authority(inbound, sk, message_id=activity_id)
+                record = a._ledger_record_for_message(activity_id, conv)
+                assert record is not None
+                a._attach_coalesced_turn_authority(record)
+            chat_size = sum(1 for key in a._coalesced_turn_authority if key[0] == conv)
+            assert chat_size <= per_chat_cap
+            assert first_key in a._coalesced_turn_authority
+            assert a._coalesced_turn_authority[first_key] is first_record
+
+        assert sum(1 for key in a._coalesced_turn_authority if key[0] == conv) == 0
+        assert not [ledger_key for ledger_key in a._turn_authority_ledger if ledger_key[0] == conv]
+
+        orphan_inbound = _make_inbound(conv_id="conv-f312-orphan", activity_id="orphan-act")
+        assert a.admit_turn_authority(orphan_inbound, "sess-orphan", message_id="orphan-act")
+        orphan_record = a._ledger_record_for_message("orphan-act", "conv-f312-orphan")
+        assert orphan_record is not None
+        a._attach_coalesced_turn_authority(orphan_record)
+        orphan_key = a._coalesced_reply_turn_key("conv-f312-orphan", "orphan-act")
+        assert orphan_key in a._coalesced_turn_authority
+        a._turn_authority_ledger.pop(("conv-f312-orphan", "orphan-act"), None)
+        await a._teardown_chat_state("conv-f312-orphan")
+        assert orphan_key not in a._coalesced_turn_authority
+
+        disc_inbound = _make_inbound(conv_id="conv-f312-disc", activity_id="disc-act")
+        assert a.admit_turn_authority(disc_inbound, "sess-disc", message_id="disc-act")
+        disc_record = a._ledger_record_for_message("disc-act", "conv-f312-disc")
+        assert disc_record is not None
+        a._attach_coalesced_turn_authority(disc_record)
+        disc_key = a._coalesced_reply_turn_key("conv-f312-disc", "disc-act")
+        a._turn_authority_ledger.pop(("conv-f312-disc", "disc-act"), None)
+        assert disc_key in a._coalesced_turn_authority
+        a._http_client.aclose = AsyncMock()
+        await a.disconnect()
+        assert a._coalesced_turn_authority == {}
+
     async def test_f312_stream_authority_record_keeps_ledger_after_scope_retire(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch
     ) -> None:
