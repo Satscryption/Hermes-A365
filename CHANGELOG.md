@@ -10,6 +10,66 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 
+## [0.9.8] — 2026-11-23
+
+Turn-buffer reason tokens (#300), delivery-cache reclaim tests (#301),
+coalesced reply-origin binding (#312), Path B allowlist admission during
+UPN object-ID refresh (#336), and a separate doctor notice for upstream
+CLI updates (#339).
+Ships from ``main`` via PRs #344, #345, #346, #347, #348, and #349.
+
+### Fixed
+
+- **#300 — Forced-plain fallback uses the stored ``retry_exhausted`` reason (#344).**
+  The turn buffer's forced-plain path logs and returns the stored
+  ``plain_reason``, and uses the ``retry_exhausted`` token when that field is
+  empty. Refs [#300](https://github.com/Satscryption/Hermes-A365/issues/300),
+  [#344](https://github.com/Satscryption/Hermes-A365/pull/344).
+
+- **#312 — Coalesced reply origins stay bound to their turn (#348, #349).**
+  Reply-origin resolution keeps in-flight user authority from being replaced
+  by reaction coalescing, and a run-agent turn frame can bind a synthetic
+  ledger row by reply activity id. When turn authority is retired, matching
+  coalesced reply-target entries are dropped, and the existing per-chat and
+  global caps still apply. Refs
+  [#312](https://github.com/Satscryption/Hermes-A365/issues/312),
+  [#348](https://github.com/Satscryption/Hermes-A365/pull/348),
+  [#349](https://github.com/Satscryption/Hermes-A365/pull/349).
+
+### Changed
+
+- **#336 — Path B allowlist admission during UPN object-ID refresh (#347).**
+  A listed UPN sender remains admitted for a short window while a background
+  object-ID refresh is in flight, instead of being denied until the refresh
+  returns. Unlisted senders stay denied. Refs
+  [#336](https://github.com/Satscryption/Hermes-A365/issues/336),
+  [#347](https://github.com/Satscryption/Hermes-A365/pull/347).
+
+- **#339 — Doctor reports an upstream CLI update notice separately from health warnings (#345).**
+  An available update for the external a365 CLI is no longer treated as an
+  overall doctor warning. Refs
+  [#339](https://github.com/Satscryption/Hermes-A365/issues/339),
+  [#345](https://github.com/Satscryption/Hermes-A365/pull/345).
+
+### Tests
+
+- **#301 — Delivery cache reclaim of expired open records (#346).**
+  A parametrized test covers ``claim`` reclaiming expired received,
+  webhook_running, and inflight records, including body drop and a fresh
+  replacement record, with no production change. Refs
+  [#301](https://github.com/Satscryption/Hermes-A365/issues/301),
+  [#346](https://github.com/Satscryption/Hermes-A365/pull/346).
+
+### Known issues
+
+- [#290](https://github.com/Satscryption/Hermes-A365/issues/290): in Copilot Chat,
+  the first reply in a new conversation is sometimes not shown until the
+  conversation is reloaded.
+- [#337](https://github.com/Satscryption/Hermes-A365/issues/337): Teams may show a
+  long streamed reply all at once instead of progressively.
+- [#338](https://github.com/Satscryption/Hermes-A365/issues/338): Teams does not show
+  a Stop control for streamed replies.
+
 ## [0.9.7] — 2026-11-20
 
 Client secret expiry (#191), turn authority (#278), reply delivery (#282), register
@@ -96,8 +156,6 @@ Ships from ``main`` via PRs #266, #275, #278, #282, #283, #284, #294, #295, #296
   long streamed reply all at once instead of progressively.
 - [#338](https://github.com/Satscryption/Hermes-A365/issues/338): Teams does not show
   a Stop control for streamed replies.
-- [#339](https://github.com/Satscryption/Hermes-A365/issues/339): ``doctor`` reports
-  an available update for the external a365 CLI as an overall warning.
 
 ## [0.9.6] — 2026-11-03
 
@@ -3105,7 +3163,8 @@ Microsoft.Agents.A365.DevTools.Cli **1.1.171** (round-5 walkthrough,
   operators (only "blocked" via the M365 Admin Centre). Microsoft
   platform limitation; not a wrapper bug.
 
-[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.7...HEAD
+[Unreleased]: https://github.com/satscryption/Hermes-A365/compare/v0.9.8...HEAD
+[0.9.8]: https://github.com/satscryption/Hermes-A365/compare/v0.9.7...v0.9.8
 [0.9.7]: https://github.com/satscryption/Hermes-A365/compare/v0.9.6...v0.9.7
 [0.9.6]: https://github.com/satscryption/Hermes-A365/compare/v0.9.5...v0.9.6
 [0.9.5]: https://github.com/satscryption/Hermes-A365/compare/v0.9.4...v0.9.5

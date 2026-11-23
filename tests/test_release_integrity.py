@@ -453,10 +453,10 @@ def test_staged_v1_combination_is_not_a_zero_release(tmp_path: Path) -> None:
     assert mod.staged_zero_release_problem("1.0.0", [_STABLE_CLASSIFIER], True) is None
     assert mod.staged_zero_release_problem("0.9.6", [], False) is None
 
-    assert mod.evaluate(_ROOT, "refs/tags/v0.9.7").version == "0.9.7"
+    assert mod.evaluate(_ROOT, "refs/tags/v0.9.8").version == "0.9.8"
 
-    live_notes = mod.check(_ROOT, "refs/tags/v0.9.7")
-    assert live_notes.version == "0.9.7"
+    live_notes = mod.check(_ROOT, "refs/tags/v0.9.8")
+    assert live_notes.version == "0.9.8"
 
     v1_root = _staged_release_repo(tmp_path, "1.0.0")
     notes = mod.check(v1_root, "refs/tags/v1.0.0")
@@ -484,22 +484,38 @@ def test_live_0_9_6_section_still_parses() -> None:
         "#267, #268, #269, and #272 (release bump)."
     ) in body
 
-def test_live_0_9_7_section_still_parses() -> None:
-    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.7")
 
-    assert notes.version == "0.9.7"
-    assert notes.title == (
+def test_live_0_9_7_section_still_parses() -> None:
+    text = (_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+    heading, body = mod.changelog_section(text, "0.9.7")
+
+    assert heading.startswith("## [0.9.7] \u2014 2026-11-20")
+    assert "2026-11-20" in heading
+    assert mod.release_title("v0.9.7", body) == (
         "v0.9.7 \u2014 Client secret expiry (#191), turn authority (#278), reply delivery "
         "(#282), register hardening, GA docs (#87), Path B fixes, and status / "
         "``doctor`` probes."
     )
-    assert len(notes.title) <= mod.TITLE_LIMIT
     assert (
         "Ships from ``main`` via PRs #266, #275, #278, #282, #283, #284, #294, #295, #296, "
         "#297, #298, #299, #304, #305, #306, #307, #308, #310, #311, #313, #319, #322, "
         "#323, #324, #333, #334, #335, and the release bump."
-    ) in notes.body
-    assert "2026-11-20" in notes.body
+    ) in body
+
+
+def test_live_0_9_8_section_still_parses() -> None:
+    notes = mod.evaluate(_ROOT, "refs/tags/v0.9.8")
+
+    assert notes.version == "0.9.8"
+    assert notes.title == (
+        "v0.9.8 \u2014 Turn-buffer reason tokens (#300), delivery-cache reclaim tests "
+        "(#301), coalesced reply-origin binding (#312), Path B allowlist admission during "
+        "UPN object-ID refresh (#336), and a separate doctor notice for upstream CLI "
+        "updates (#339)."
+    )
+    assert len(notes.title) <= mod.TITLE_LIMIT
+    assert ("Ships from ``main`` via PRs #344, #345, #346, #347, #348, and #349.") in notes.body
+    assert "2026-11-23" in notes.body
 
 
 def test_unreleased_heading_is_not_a_release_section(tmp_path: Path) -> None:
