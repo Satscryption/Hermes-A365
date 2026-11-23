@@ -91,7 +91,7 @@ Both runtimes read the bearer JWT's unverified `iss` claim (`peek_unverified_iss
 | Inbound branch | Signing keys (JWKS) | Algorithm | Issuer / audience / time | Additional checks | `validated_path` |
 | --- | --- | --- | --- | --- | --- |
 | **Path A** — A365 / MCP platform (AAD v2) | Tenant OpenID discovery → JWKS URI (`_fetch_aad_v2_keys`) | RS256 | `iss` = `https://login.microsoftonline.com/<tenant-id>/v2.0`; `aud` = blueprint Entra app id; `exp` / `nbf` required (300s leeway) | `azp` must appear in `inbound_azp_allowlist` (empty list fails closed). No `serviceUrl` claim check on this branch. | `"A"` |
-| **Path B** — Bot Framework connector S2S | Static BF OpenID config at `login.botframework.com` (`_fetch_bf_jwks_keys`) | RS256 | `iss` = `https://api.botframework.com`; `aud` = `bf_app_id` when configured, else blueprint app id; `exp` / `nbf` required (300s leeway) | If the token carries a non-empty `serviceUrl` claim, it must equal the activity's `serviceUrl`. JWKS `endorsements` vs `channelId` are not checked (documented residual in README). No `azp` check. | `"B"` |
+| **Path B** — Bot Framework connector S2S | Static BF OpenID config at `login.botframework.com` (`_fetch_bf_jwks_keys`) | RS256 | `iss` = `https://api.botframework.com`; `aud` = `bf_app_id` when configured, else blueprint app id; `exp` / `nbf` required (300s leeway) | If the token carries a non-empty `serviceUrl` claim, it must equal the activity's `serviceUrl`. The verified signing key's JWKS `endorsements` must include the activity's `channelId` (trimmed, case-insensitive); a missing or non-matching list fails closed. No `azp` check. | `"B"` |
 
 After JWT validation, both runtimes reject unsupported `channelId` values (`_inbound_channel_rejection_reason`). Optional client Bot Framework channels require explicit enablement.
 
@@ -130,4 +130,4 @@ Hermes owns the profile **runtime, config, skills, memory, and secrets**. Hermes
 
 Client secret rotation, overlap windows, and restart expectations are documented in [`references/client-secret-rotation.md`](../references/client-secret-rotation.md). Report suspected vulnerabilities privately per [`SECURITY.md`](../SECURITY.md) (GitHub private advisories preferred).
 
-Deliberate inbound authentication and dedupe limits (M3, F6, F7) stay in [`README.md`](../README.md) → **Inbound webhook accepted residuals (#86)**; they are not expanded here.
+Deliberate inbound authentication and dedupe limits (M3, F7) stay in [`README.md`](../README.md) → **Inbound webhook accepted residuals (#86)**; they are not expanded here.

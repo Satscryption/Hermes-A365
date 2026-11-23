@@ -2623,6 +2623,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         token=token,
                         expected_app_id=bf_expected_aud,
                         expected_service_url=service_url,
+                        channel_id=activity.get("channelId"),
                         client=self._http_client,
                         cache=self._bf_jwks_cache,
                     )

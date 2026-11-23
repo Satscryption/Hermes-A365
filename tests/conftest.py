@@ -117,3 +117,9 @@ def rsa_keypair() -> tuple[rsa.RSAPrivateKey, dict]:
         "e": _b64u(pub_numbers.e),
     }
     return priv, jwk
+
+
+@pytest.fixture
+def bf_rsa_keypair(rsa_keypair: tuple[rsa.RSAPrivateKey, dict]) -> tuple[rsa.RSAPrivateKey, dict]:
+    priv, jwk = rsa_keypair
+    return priv, {**jwk, "endorsements": ["msteams"]}

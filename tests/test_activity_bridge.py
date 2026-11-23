@@ -15,6 +15,7 @@ import time as _time
 import urllib.error
 import urllib.parse
 from collections.abc import Callable
+from contextlib import nullcontext
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -49,6 +50,7 @@ from hermes_a365.activity_bridge import (
     _activity_user_authorized,
     _agentic_ids_from_activity,
     _BfTokenCache,
+    _ensure_bf_jwks_loaded,
     _FmiCache,
     _IdempotencyCache,
     _inbound_path_tag,
@@ -1749,13 +1751,15 @@ class TestValidateInboundJwtBf:
     - issuer is ``https://api.botframework.com`` (static, not tenant)
     - JWKS via BF discovery URL (not AAD-v2)
     - ``serviceUrl`` claim must match activity.serviceUrl
+    - the signing key must endorse activity.channelId
     - no ``azp`` allowlist (issuer pin is the strong identity signal)
     """
 
+    @pytest.mark.parametrize("channel_id", ["msteams", " MSTeams "])
     async def test_valid_token_returns_claims(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]], channel_id: str
     ) -> None:
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="bot-app-id",
@@ -1767,6 +1771,7 @@ class TestValidateInboundJwtBf:
                 token=token,
                 expected_app_id="bot-app-id",
                 expected_service_url=BF_TEST_SERVICE_URL,
+                channel_id=channel_id,
                 client=client,
                 cache=_JwksCache(),
             )
@@ -1774,10 +1779,77 @@ class TestValidateInboundJwtBf:
         assert claims["iss"] == BF_ISSUER
         assert claims["serviceUrl"] == BF_TEST_SERVICE_URL
 
-    async def test_wrong_audience_rejected(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    @pytest.mark.parametrize(
+        ("key_fields", "channel_id"),
+        [
+            pytest.param({"endorsements": ["directline"]}, "msteams", id="other-channel"),
+            pytest.param({}, "msteams", id="missing-endorsements"),
+            pytest.param({"endorsements": []}, "msteams", id="empty-endorsements"),
+            pytest.param({"endorsements": "msteams"}, "msteams", id="non-list-endorsements"),
+            pytest.param({"endorsements": ["msteams", ""]}, " \t", id="blank-channel"),
+            pytest.param({"endorsements": ["msteams"]}, None, id="missing-channel"),
+        ],
+    )
+    async def test_missing_channel_endorsement_rejected(
+        self,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+        key_fields: dict[str, Any],
+        channel_id: str | None,
     ) -> None:
         priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)
+        transport = _bf_jwks_transport({**jwk, **key_fields})
+        async with httpx.AsyncClient(transport=transport) as client:
+            with pytest.raises(JwtValidationError, match="signing key not endorsed for channel"):
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id=channel_id,
+                    client=client,
+                    cache=_JwksCache(),
+                )
+
+    @pytest.mark.parametrize(
+        ("endorsement", "outcome"),
+        [
+            ("msteams", nullcontext()),
+            ("directline", pytest.raises(JwtValidationError, match="not endorsed for channel")),
+        ],
+    )
+    async def test_last_known_good_keys_keep_endorsements(
+        self,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+        endorsement: str,
+        outcome: Any,
+    ) -> None:
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)
+        cache = _JwksCache()
+        now = 1000.0
+        transport = _bf_jwks_transport({**jwk, "endorsements": [endorsement]})
+        async with httpx.AsyncClient(transport=transport) as client:
+            await _ensure_bf_jwks_loaded(client, cache, now=now)
+
+        unavailable = httpx.MockTransport(lambda _: httpx.Response(503))
+        async with httpx.AsyncClient(transport=unavailable) as client:
+            with outcome:
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
+                    client=client,
+                    cache=cache,
+                    now=now + cache.ttl_seconds + 1,
+                )
+        assert cache.failure_count == 1
+        assert cache.fetched_at == now
+
+    async def test_wrong_audience_rejected(
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="other-app",
@@ -1790,19 +1862,20 @@ class TestValidateInboundJwtBf:
                     token=token,
                     expected_app_id="bot-app-id",
                     expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
                     client=client,
                     cache=_JwksCache(),
                 )
 
     async def test_wrong_issuer_rejected(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
         """A token issued by an AAD tenant (Path A shape) must NOT
         pass the BF validator — even if the signature happens to be
         verifiable. The dispatcher in adapter.py routes by issuer so
         this branch shouldn't normally fire, but the validator must
         still defence-in-depth check."""
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="bot-app-id",
@@ -1815,12 +1888,13 @@ class TestValidateInboundJwtBf:
                     token=token,
                     expected_app_id="bot-app-id",
                     expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
                     client=client,
                     cache=_JwksCache(),
                 )
 
     async def test_missing_service_url_claim_accepted(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
         """Microsoft's BF docs say the token MUST carry a serviceUrl
         claim, but real Connector→Bot tokens issued for Direct Line +
@@ -1831,13 +1905,14 @@ class TestValidateInboundJwtBf:
         Microsoft signed it. If Microsoft tightens the protocol
         later, ``test_mismatched_service_url_rejected`` still pins
         the defence-in-depth path."""
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)  # no serviceUrl extra
         async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
             claims = await validate_inbound_jwt_bf(
                 token=token,
                 expected_app_id="bot-app-id",
                 expected_service_url=BF_TEST_SERVICE_URL,
+                channel_id="msteams",
                 client=client,
                 cache=_JwksCache(),
             )
@@ -1846,13 +1921,13 @@ class TestValidateInboundJwtBf:
         assert "serviceUrl" not in claims
 
     async def test_mismatched_service_url_rejected(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
         """When the serviceUrl claim IS present but doesn't match the
         activity's serviceUrl, that's a replay against a different
         bot — 403 (defence-in-depth even though real BF tokens
         observed 2026-05-15 don't carry the claim)."""
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="bot-app-id",
@@ -1865,14 +1940,15 @@ class TestValidateInboundJwtBf:
                     token=token,
                     expected_app_id="bot-app-id",
                     expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
                     client=client,
                     cache=_JwksCache(),
                 )
 
     async def test_unknown_kid_rejected(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
-        priv, good_jwk = rsa_keypair
+        priv, good_jwk = bf_rsa_keypair
         bad_jwk = {**good_jwk, "kid": "different-kid"}
         token = _make_token(
             priv,
@@ -1886,14 +1962,15 @@ class TestValidateInboundJwtBf:
                     token=token,
                     expected_app_id="bot-app-id",
                     expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
                     client=client,
                     cache=_JwksCache(),
                 )
 
     async def test_unknown_kid_triggers_refresh_from_warm_cache(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
-        priv, good_jwk = rsa_keypair
+        priv, good_jwk = bf_rsa_keypair
         stale_jwk = {**good_jwk, "kid": "stale-kid"}
         token = _make_token(
             priv,
@@ -1902,22 +1979,23 @@ class TestValidateInboundJwtBf:
             extra={"serviceUrl": BF_TEST_SERVICE_URL},
         )
         cache = _JwksCache()
-        cache.keys_by_kid = {"stale-kid": _jwt.PyJWK(stale_jwk)}
-        cache.fetched_at = _time.time()
+        async with httpx.AsyncClient(transport=_bf_jwks_transport(stale_jwk)) as stale_client:
+            await _ensure_bf_jwks_loaded(stale_client, cache)
         async with httpx.AsyncClient(transport=_bf_jwks_transport(good_jwk)) as client:
             claims = await validate_inbound_jwt_bf(
                 token=token,
                 expected_app_id="bot-app-id",
                 expected_service_url=BF_TEST_SERVICE_URL,
+                channel_id="msteams",
                 client=client,
                 cache=cache,
             )
         assert claims["aud"] == "bot-app-id"
 
     async def test_jwks_cache_hits_on_second_call(
-        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
     ) -> None:
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="bot-app-id",
@@ -1946,6 +2024,7 @@ class TestValidateInboundJwtBf:
                     token=token,
                     expected_app_id="bot-app-id",
                     expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
                     client=client,
                     cache=cache,
                 )
@@ -4653,6 +4732,7 @@ class TestServeDualJwtDispatch:
         bf.assert_awaited_once()
         a365.assert_not_awaited()
         assert bf.await_args.kwargs["expected_service_url"] == activity["serviceUrl"]
+        assert bf.await_args.kwargs["channel_id"] == activity["channelId"]
         # Parity with the plugin adapter: expected_app_id falls back to the
         # blueprint id when bf_app_id is unset.
         assert bf.await_args.kwargs["expected_app_id"] == (cfg.bf_app_id or cfg.blueprint_client_id)
@@ -4661,6 +4741,25 @@ class TestServeDualJwtDispatch:
         a365, bf, _, _ = self._run(monkeypatch, "https://login.microsoftonline.com/tid/v2.0")
         a365.assert_awaited_once()
         bf.assert_not_awaited()
+
+    def test_serve_rejects_unendorsed_channel(
+        self, rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]]
+    ) -> None:
+        priv, jwk = rsa_keypair
+        cfg = _cfg()
+        activity = {**_inbound_message_activity(), "type": "conversationUpdate"}
+        token = _make_token(priv, aud=cfg.blueprint_client_id, iss=BF_ISSUER)
+        http_client = httpx.AsyncClient(
+            transport=_bf_jwks_transport({**jwk, "endorsements": ["directline"]})
+        )
+        with TestClient(make_app(cfg, http_client=http_client)) as client:
+            response = client.post(
+                "/api/messages",
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "invalid bearer token"
 
 
 class TestTokenFactory:
