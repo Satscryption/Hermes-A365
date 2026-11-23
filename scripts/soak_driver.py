@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import sys
-import time
 from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
@@ -15,7 +14,6 @@ from typing import Any
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 
 # fmt: off
-
 def format_marker(*, now: datetime | None = None, surface: str | None = None) -> str:
     when = now or datetime.now(UTC)
     token = surface or os.environ.get("SOAK84_SURFACE") or "proactive"
@@ -75,7 +73,7 @@ async def execute_prune_probe(adapter: Any, *, registry_path: Path, pinned_chat:
     log.addHandler(drop_h)
     try:
         dropped = await adapter.prune_conversations()
-        cur, summaries = time.time(), {}
+        cur, summaries = datetime.now(UTC).timestamp(), {}
         for alias, cid in ((pinned_alias, pinned_chat), (unpinned_alias, unpinned_chat)):
             ref = adapter._conversations.get(cid)
             age = None if ref is None or ref.last_used_at is None else max(0.0, cur - ref.last_used_at)
