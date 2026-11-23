@@ -368,11 +368,6 @@ forged identity). **Prerequisites:** a valid platform/connector bearer for
 this blueprint and tenant, plus the victim's channel-assigned activity id
 and the other body fields in the key.
 
-**Bot Framework JWKS endorsements (F6).** Path B inbound validation checks
-issuer, audience, signature, and optional `serviceUrl` claim match. It does
-**not** check signing-key `endorsements` against `channelId` when a channel
-requires endorsement; the signer is still Microsoft's connector keys.
-
 **Per-process dedupe (F7).** Idempotency state lives on the `serve` app or
 gateway adapter instance. `activity-bridge serve` starts a single uvicorn
 process; a restart or a second worker treats a retry inside the TTL as new.

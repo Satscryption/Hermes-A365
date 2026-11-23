@@ -2911,12 +2911,16 @@ BF_OPENID_CONFIG_URL = "https://login.botframework.com/v1/.well-known/openidconf
 BF_ISSUER = "https://api.botframework.com"
 
 
-async def _fetch_bf_jwks_keys(client: Any) -> dict[str, Any]:
+@dataclass(frozen=True)
+class _BfSigningKey:
+    jwk: Any
+    endorsements: list[str]
+
+
+async def _fetch_bf_jwks_keys(client: Any) -> dict[str, _BfSigningKey]:
     """Fetch the Bot Framework Connector JWKS via OpenID discovery.
 
-    Returns ``{kid: PyJWK}``. Pure function — caching handled by the
-    caller so tests can substitute a fixed JWKS via httpx MockTransport
-    the same way slice 19f's A365 fetcher tests do.
+    Returns each signing key with its normalized channel endorsements.
 
     Unlike the A365 path, the BF discovery URL is static (not
     tenant-scoped) and the issuer is hard-coded
@@ -2930,12 +2934,18 @@ async def _fetch_bf_jwks_keys(client: Any) -> dict[str, Any]:
     jwks_uri = config_resp.json()["jwks_uri"]
     jwks_resp = await client.get(jwks_uri, timeout=10.0)
     jwks_resp.raise_for_status()
-    keys: dict[str, Any] = {}
+    keys: dict[str, _BfSigningKey] = {}
     for jwk in jwks_resp.json().get("keys", []):
         kid = jwk.get("kid")
         if not kid:
             continue
-        keys[kid] = _jwt.PyJWK(jwk)
+        raw_endorsements = jwk.get("endorsements")
+        endorsements = (
+            [entry.strip().casefold() for entry in raw_endorsements if isinstance(entry, str)]
+            if isinstance(raw_endorsements, list)
+            else []
+        )
+        keys[kid] = _BfSigningKey(_jwt.PyJWK(jwk), endorsements)
     return keys
 
 
@@ -2944,7 +2954,7 @@ async def _ensure_bf_jwks_loaded(
     cache: _JwksCache,
     *,
     now: float | None = None,
-) -> dict[str, Any]:
+) -> dict[str, _BfSigningKey]:
     """Mirror of ``_ensure_jwks_loaded`` for the BF JWKS. Separate cache
     instance because BF and AAD-v2 have different issuers + tenants and
     we don't want to merge two key sources behind one ``kid``-keyed
@@ -2993,6 +3003,7 @@ async def validate_inbound_jwt_bf(
     token: str,
     expected_app_id: str,
     expected_service_url: str,
+    channel_id: str | None,
     client: Any,
     cache: _JwksCache,
     now: float | None = None,
@@ -3031,10 +3042,11 @@ async def validate_inbound_jwt_bf(
         )
     if kid not in keys:
         raise JwtValidationError(f"signing key (kid={kid!r}) not in BF JWKS")
+    signing_key = keys[kid]
     try:
         claims = _jwt.decode(
             token,
-            key=keys[kid].key,
+            key=signing_key.jwk.key,
             algorithms=["RS256"],
             audience=expected_app_id,
             issuer=BF_ISSUER,
@@ -3043,12 +3055,6 @@ async def validate_inbound_jwt_bf(
         )
     except _jwt.PyJWTError as e:
         raise JwtValidationError(f"BF signature/aud/iss check failed: {e}") from e
-    # **Accepted residual (#86 F6):** JWKS entries may carry channel
-    # ``endorsements`` that should be checked against ``channelId`` when a
-    # channel requires endorsement. This validator does not read
-    # ``endorsements``; the signer is still Microsoft's connector keys.
-    # See README → Security model → Inbound webhook accepted residuals.
-    #
     # Microsoft's BF docs (requirement 7 at
     # /azure/bot-service/rest-api/bot-framework-rest-connector-authentication)
     # say "the token contains a 'serviceUrl' claim with value that
@@ -3078,6 +3084,10 @@ async def validate_inbound_jwt_bf(
             f"BF token serviceUrl {token_service_url!r} does not match "
             f"activity serviceUrl {expected_service_url!r}"
         )
+    # The verified signing key must endorse the activity's channelId.
+    channel = channel_id.strip().casefold() if isinstance(channel_id, str) else ""
+    if not channel or channel not in signing_key.endorsements:
+        raise JwtValidationError("signing key not endorsed for channel")
     _debug_jwt_validated(cache, kid=kid)
     return claims
 
@@ -4333,6 +4343,7 @@ def make_app(
                         token=token,
                         expected_app_id=cfg.bf_app_id or cfg.blueprint_client_id,
                         expected_service_url=service_url,
+                        channel_id=activity.get("channelId"),
                         client=http_client,
                         cache=bf_jwks_cache,
                     )
