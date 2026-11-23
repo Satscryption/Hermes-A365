@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time as _time
 import urllib.error
@@ -49,6 +50,7 @@ from hermes_a365.activity_bridge import (
     _activity_delivery_id,
     _activity_user_authorized,
     _agentic_ids_from_activity,
+    _BfSigningKey,
     _BfTokenCache,
     _ensure_bf_jwks_loaded,
     _FmiCache,
@@ -1719,6 +1721,58 @@ class TestJwksRefreshTaskCoordination:
 
 BF_TEST_SERVICE_URL = "https://smba.trafficmanager.net/emea/"
 
+_SOAK_DIAG_SENTINELS = (
+    "SENTINEL_TENANT_84",
+    "SENTINEL_CLIENT_84",
+    "SENTINEL_KID_84",
+    "SENTINEL_DELIVERY_84",
+    "sek",
+    "BF-S2S",
+)
+
+
+def _token_cache_fill_line(
+    *,
+    tenant_id: str,
+    scope: str,
+    previous_expiry: float | None,
+    eligibility_at: float,
+    replacement_expiry: float,
+) -> str:
+    import hashlib
+
+    key_material = f"{tenant_id}\x1e{scope}"
+    key_digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:12]
+    prev = "cold" if previous_expiry is None else f"{previous_expiry:.3f}"
+    return (
+        f"token_cache_fill cache_kind=bf_s2s key_digest={key_digest} "
+        f"prev_expiry={prev} eligibility_at={eligibility_at:.3f} "
+        f"replacement_expiry={replacement_expiry:.3f}"
+    )
+
+
+def _jwt_validated_line(*, fetched_at: float, jwks_keys: int, kid: str) -> str:
+    import hashlib
+
+    kid_digest = hashlib.sha256(str(kid).encode("utf-8")).hexdigest()[:12]
+    return (
+        f"jwt_validated validator=bf jwks_fetched_at={fetched_at:.3f} "
+        f"jwks_keys={jwks_keys} kid_digest={kid_digest}"
+    )
+
+
+def _idempotency_size_line(cache: _IdempotencyCache) -> str:
+    return (
+        f"idempotency_size entries={len(cache.seen)} cap={cache.max_entries} "
+        f"ttl_seconds={cache.ttl_seconds:.3f} result_bytes={cache.result_bytes}"
+    )
+
+
+def _assert_soak_diagnostic_record(record: logging.LogRecord, *, expected: str) -> None:
+    assert record.getMessage() == expected
+    for needle in _SOAK_DIAG_SENTINELS:
+        assert needle not in record.getMessage()
+
 
 def _bf_jwks_transport(jwk: dict[str, Any]) -> httpx.MockTransport:
     """httpx transport that serves a fixed JWKS at the BF discovery URLs.
@@ -1778,6 +1832,221 @@ class TestValidateInboundJwtBf:
         assert claims["aud"] == "bot-app-id"
         assert claims["iss"] == BF_ISSUER
         assert claims["serviceUrl"] == BF_TEST_SERVICE_URL
+
+    async def test_jwt_validated_debug_record(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+    ) -> None:
+        priv, jwk = rsa_keypair
+        jwk = {**jwk, "endorsements": ["msteams"]}
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        cache = _JwksCache()
+        cache.keys_by_kid = {
+            jwk["kid"]: _BfSigningKey(_jwt.PyJWK(jwk), ["msteams"]),
+        }
+        cache.fetched_at = 1234.5
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
+                    client=client,
+                    cache=cache,
+                    now=2000.0,
+                )
+        validated = [r for r in caplog.records if r.getMessage().startswith("jwt_validated")]
+        assert len(validated) == 1
+        _assert_soak_diagnostic_record(
+            validated[0],
+            expected=_jwt_validated_line(
+                fetched_at=1234.5,
+                jwks_keys=1,
+                kid=jwk["kid"],
+            ),
+        )
+        assert "test-kid-1" not in validated[0].getMessage()
+
+    async def test_jwt_validated_two_keys_distinct_digests(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+    ) -> None:
+        priv, jwk_a = rsa_keypair
+        jwk_a = {**jwk_a, "endorsements": ["msteams"]}
+        jwk_b = {**jwk_a, "kid": "SENTINEL_KID_84"}
+        pem = priv.private_bytes(
+            encoding=serialization.Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        token_a = _jwt.encode(
+            {
+                "aud": "bot-app-id",
+                "iss": BF_ISSUER,
+                "nbf": int(_time.time()),
+                "exp": int(_time.time()) + 600,
+            },
+            pem,
+            algorithm="RS256",
+            headers={"kid": jwk_a["kid"]},
+        )
+        token_b = _jwt.encode(
+            {
+                "aud": "bot-app-id",
+                "iss": BF_ISSUER,
+                "nbf": int(_time.time()),
+                "exp": int(_time.time()) + 600,
+            },
+            pem,
+            algorithm="RS256",
+            headers={"kid": jwk_b["kid"]},
+        )
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk_a)) as client:
+                await validate_inbound_jwt_bf(
+                    token=token_a,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+            async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk_b)) as client:
+                await validate_inbound_jwt_bf(
+                    token=token_b,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+        validated = [r for r in caplog.records if r.getMessage().startswith("jwt_validated")]
+        assert len(validated) == 2
+        digests = {r.getMessage().split("kid_digest=")[-1] for r in validated}
+        assert len(digests) == 2
+        for record in validated:
+            assert "SENTINEL_KID_84" not in record.getMessage()
+
+    async def test_jwt_validated_fetched_at_advances_after_unknown_kid_refresh(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+    ) -> None:
+        priv, good_jwk = rsa_keypair
+        good_jwk = {**good_jwk, "endorsements": ["msteams"]}
+        stale_jwk = {**good_jwk, "kid": "stale-kid"}
+        token = _make_token(
+            priv,
+            aud="bot-app-id",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        cache = _JwksCache()
+        cache.keys_by_kid = {
+            "stale-kid": _BfSigningKey(_jwt.PyJWK(stale_jwk), []),
+        }
+        before = 500.0
+        cache.fetched_at = before
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(transport=_bf_jwks_transport(good_jwk)) as client:
+                await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
+                    client=client,
+                    cache=cache,
+                    now=900.0,
+                )
+        assert cache.fetched_at > before
+        validated = [r for r in caplog.records if r.getMessage().startswith("jwt_validated")]
+        assert len(validated) == 1
+        assert f"jwks_fetched_at={cache.fetched_at:.3f}" in validated[0].getMessage()
+
+    async def test_jwt_validated_fetched_at_stable_on_cache_hit(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+    ) -> None:
+        priv, jwk = rsa_keypair
+        jwk = {**jwk, "endorsements": ["msteams"]}
+        token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)
+        cache = _JwksCache()
+        cache.keys_by_kid = {
+            jwk["kid"]: _BfSigningKey(_jwt.PyJWK(jwk), ["msteams"]),
+        }
+        cache.fetched_at = 2222.0
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+                for _ in range(2):
+                    await validate_inbound_jwt_bf(
+                        token=token,
+                        expected_app_id="bot-app-id",
+                        expected_service_url=BF_TEST_SERVICE_URL,
+                        channel_id="msteams",
+                        client=client,
+                        cache=cache,
+                        now=3000.0,
+                    )
+        validated = [r for r in caplog.records if r.getMessage().startswith("jwt_validated")]
+        assert len(validated) == 2
+        assert validated[0].getMessage() == validated[1].getMessage()
+        assert cache.fetched_at == 2222.0
+
+    async def test_jwt_validated_absent_on_rejection(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+    ) -> None:
+        priv, jwk = rsa_keypair
+        jwk = {**jwk, "endorsements": ["msteams"]}
+        token = _make_token(
+            priv,
+            aud="other-app",
+            iss=BF_ISSUER,
+            extra={"serviceUrl": BF_TEST_SERVICE_URL},
+        )
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+                with pytest.raises(JwtValidationError, match="BF signature/aud/iss"):
+                    await validate_inbound_jwt_bf(
+                        token=token,
+                        expected_app_id="bot-app-id",
+                        expected_service_url=BF_TEST_SERVICE_URL,
+                        channel_id="msteams",
+                        client=client,
+                        cache=_JwksCache(),
+                    )
+        assert not any(r.getMessage().startswith("jwt_validated") for r in caplog.records)
+
+    async def test_jwt_validated_omitted_when_debug_disabled(
+        self,
+        caplog: pytest.LogCaptureFixture,
+        rsa_keypair: tuple[rsa.RSAPrivateKey, dict[str, Any]],
+    ) -> None:
+        priv, jwk = rsa_keypair
+        jwk = {**jwk, "endorsements": ["msteams"]}
+        token = _make_token(priv, aud="bot-app-id", iss=BF_ISSUER)
+        with caplog.at_level(logging.WARNING):
+            async with httpx.AsyncClient(transport=_bf_jwks_transport(jwk)) as client:
+                claims = await validate_inbound_jwt_bf(
+                    token=token,
+                    expected_app_id="bot-app-id",
+                    expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
+                    client=client,
+                    cache=_JwksCache(),
+                )
+        assert claims["aud"] == "bot-app-id"
+        assert not any("jwt_validated" in r.getMessage() for r in caplog.records)
 
     @pytest.mark.parametrize(
         ("key_fields", "channel_id"),
@@ -2490,6 +2759,142 @@ class TestAcquireBfS2sToken:
         # POSTs against the tenant-scoped endpoint (SingleTenant bot).
         assert req["url"] == TENANT_TOKEN_URL_TEMPLATE.format(tenant_id="tenant-1")
 
+    async def test_token_cache_fill_cold_fill_record(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tenant = "SENTINEL_TENANT_84"
+        capture: list[dict[str, Any]] = []
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture))
+            ) as client:
+                await acquire_bf_s2s_token(
+                    client=client,
+                    tenant_id=tenant,
+                    blueprint_client_id="SENTINEL_CLIENT_84",
+                    blueprint_client_secret="sek",
+                    bf_cache=_BfTokenCache(),
+                    now=1000.0,
+                )
+        fills = [r for r in caplog.records if r.getMessage().startswith("token_cache_fill")]
+        assert len(fills) == 1
+        _assert_soak_diagnostic_record(
+            fills[0],
+            expected=_token_cache_fill_line(
+                tenant_id=tenant,
+                scope=BF_S2S_SCOPE,
+                previous_expiry=None,
+                eligibility_at=1000.0,
+                replacement_expiry=4600.0,
+            ),
+        )
+
+    async def test_token_cache_fill_debug_matches_info_behavior(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        tenant = "SENTINEL_TENANT_84"
+        scenarios = (
+            (1000.0, 3600, None, 4600.0),
+            (2000.0, 3600, 2100.0, 5600.0),
+        )
+        for eligibility_at, expires_in, prev, replacement in scenarios:
+            cache_debug = _BfTokenCache()
+            cache_info = _BfTokenCache()
+            if prev is not None:
+                cache_debug.by_key[(tenant, BF_S2S_SCOPE)] = ("cached", prev)
+                cache_info.by_key[(tenant, BF_S2S_SCOPE)] = ("cached", prev)
+            cap_dbg: list[dict[str, Any]] = []
+            cap_inf: list[dict[str, Any]] = []
+            with caplog.at_level(logging.DEBUG):
+                caplog.clear()
+                async with httpx.AsyncClient(
+                    transport=httpx.MockTransport(
+                        _bf_s2s_token_handler(capture=cap_dbg, expires_in=expires_in)
+                    )
+                ) as client:
+                    tok_debug = await acquire_bf_s2s_token(
+                        client=client,
+                        tenant_id=tenant,
+                        blueprint_client_id="SENTINEL_CLIENT_84",
+                        blueprint_client_secret="sek",
+                        bf_cache=cache_debug,
+                        now=eligibility_at,
+                    )
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(
+                    _bf_s2s_token_handler(capture=cap_inf, expires_in=expires_in)
+                )
+            ) as client:
+                tok_info = await acquire_bf_s2s_token(
+                    client=client,
+                    tenant_id=tenant,
+                    blueprint_client_id="SENTINEL_CLIENT_84",
+                    blueprint_client_secret="sek",
+                    bf_cache=cache_info,
+                    now=eligibility_at,
+                )
+            assert tok_debug == tok_info == "BF-S2S"
+            assert len(cap_dbg) == len(cap_inf) == 1
+            assert cache_debug.by_key == cache_info.by_key
+            fills = [r for r in caplog.records if r.getMessage().startswith("token_cache_fill")]
+            assert len(fills) == 1
+            _assert_soak_diagnostic_record(
+                fills[0],
+                expected=_token_cache_fill_line(
+                    tenant_id=tenant,
+                    scope=BF_S2S_SCOPE,
+                    previous_expiry=prev,
+                    eligibility_at=eligibility_at,
+                    replacement_expiry=replacement,
+                ),
+            )
+
+    async def test_token_cache_fill_omitted_on_cache_hit(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        capture: list[dict[str, Any]] = []
+        cache = _BfTokenCache()
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture))
+            ) as client:
+                await acquire_bf_s2s_token(
+                    client=client,
+                    tenant_id="tenant-1",
+                    blueprint_client_id="blueprint-app-id",
+                    blueprint_client_secret="sek",
+                    bf_cache=cache,
+                    now=1000.0,
+                )
+                caplog.clear()
+                await acquire_bf_s2s_token(
+                    client=client,
+                    tenant_id="tenant-1",
+                    blueprint_client_id="blueprint-app-id",
+                    blueprint_client_secret="sek",
+                    bf_cache=cache,
+                    now=1001.0,
+                )
+        assert not any("token_cache_fill" in r.getMessage() for r in caplog.records)
+
+    async def test_token_cache_fill_omitted_when_debug_disabled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        capture: list[dict[str, Any]] = []
+        with caplog.at_level(logging.INFO):
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture))
+            ) as client:
+                tok = await acquire_bf_s2s_token(
+                    client=client,
+                    tenant_id="tenant-1",
+                    blueprint_client_id="blueprint-app-id",
+                    blueprint_client_secret="sek",
+                    bf_cache=_BfTokenCache(),
+                )
+        assert tok == "BF-S2S"
+        assert not any("token_cache_fill" in r.getMessage() for r in caplog.records)
+
     async def test_caches_token_per_tenant_and_scope(self) -> None:
         """One POST then one cache hit — second call doesn't re-mint."""
         capture: list[dict[str, Any]] = []
@@ -2507,38 +2912,50 @@ class TestAcquireBfS2sToken:
                 )
         assert len(capture) == 1
 
-    async def test_refreshes_when_within_skew_of_expiry(self) -> None:
+    async def test_refreshes_when_within_skew_of_expiry(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
         """If the cached entry is within ``TOKEN_REFRESH_SKEW_SECONDS``
         of expiry, we re-mint rather than serve a stale token."""
         from hermes_a365.activity_bridge import TOKEN_REFRESH_SKEW_SECONDS
 
+        tenant = "SENTINEL_TENANT_84"
         capture: list[dict[str, Any]] = []
         cache = _BfTokenCache()
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture, expires_in=1))
-        ) as client:
-            # First call mints at now=0, expires at 1.
-            await acquire_bf_s2s_token(
-                client=client,
-                tenant_id="tenant-1",
-                blueprint_client_id="blueprint-app-id",
-                blueprint_client_secret="sek",
-                bf_cache=cache,
-                now=0.0,
-            )
-            # Second call at now=0 should be cached (within freshness).
-            # ...but the skew window is 5 min, so it should refresh
-            # immediately because exp - skew < now.
-            await acquire_bf_s2s_token(
-                client=client,
-                tenant_id="tenant-1",
-                blueprint_client_id="blueprint-app-id",
-                blueprint_client_secret="sek",
-                bf_cache=cache,
-                now=0.0,
-            )
-        # 1s ttl < 300s skew → refresh on every call.
+        with caplog.at_level(logging.DEBUG):
+            async with httpx.AsyncClient(
+                transport=httpx.MockTransport(_bf_s2s_token_handler(capture=capture, expires_in=1))
+            ) as client:
+                await acquire_bf_s2s_token(
+                    client=client,
+                    tenant_id=tenant,
+                    blueprint_client_id="SENTINEL_CLIENT_84",
+                    blueprint_client_secret="sek",
+                    bf_cache=cache,
+                    now=0.0,
+                )
+                caplog.clear()
+                await acquire_bf_s2s_token(
+                    client=client,
+                    tenant_id=tenant,
+                    blueprint_client_id="SENTINEL_CLIENT_84",
+                    blueprint_client_secret="sek",
+                    bf_cache=cache,
+                    now=0.0,
+                )
         assert len(capture) == 2
+        fills = [r for r in caplog.records if r.getMessage().startswith("token_cache_fill")]
+        assert len(fills) == 1
+        _assert_soak_diagnostic_record(
+            fills[0],
+            expected=_token_cache_fill_line(
+                tenant_id=tenant,
+                scope=BF_S2S_SCOPE,
+                previous_expiry=1.0,
+                eligibility_at=0.0,
+                replacement_expiry=1.0,
+            ),
+        )
         _ = TOKEN_REFRESH_SKEW_SECONDS  # silence unused-import lint
 
     async def test_aadsts82001_re_raises_with_operator_hint(self) -> None:
@@ -4073,6 +4490,72 @@ class TestIdempotencyCache:
         assert "conv-1:abc" not in cache.seen
         assert len(cache.seen) == 1
         assert len(next(iter(cache.seen))) == 64
+
+    def test_idempotency_size_debug_record(self, caplog: pytest.LogCaptureFixture) -> None:
+        cache = _IdempotencyCache(max_entries=5)
+        with caplog.at_level(logging.DEBUG):
+            cache.claim("SENTINEL_DELIVERY_84", now=100.0, activity_type="message")
+        sizes = [r for r in caplog.records if r.getMessage().startswith("idempotency_size")]
+        assert len(sizes) == 1
+        _assert_soak_diagnostic_record(sizes[0], expected=_idempotency_size_line(cache))
+        assert any("delivery_claim" in r.getMessage() for r in caplog.records)
+        assert "SENTINEL_DELIVERY_84" not in sizes[0].getMessage()
+
+    def test_idempotency_size_on_ttl_prune(self, caplog: pytest.LogCaptureFixture) -> None:
+        cache = _IdempotencyCache(ttl_seconds=60.0)
+        cache.is_duplicate("old", now=100.0)
+        cache.is_duplicate("fresh", now=190.0)
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            cache.is_duplicate("probe", now=200.0)
+        size_logs = [r for r in caplog.records if r.getMessage().startswith("idempotency_size")]
+        assert size_logs
+        _assert_soak_diagnostic_record(size_logs[-1], expected=_idempotency_size_line(cache))
+        assert len(cache.seen) == 2
+
+    def test_idempotency_size_on_cap_eviction_with_retained_bytes(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cache = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
+        assert cache.is_duplicate("a", now=100.0) is False
+        rec_a = cache.record("a")
+        assert rec_a is not None
+        rec_a.result_bytes = 42
+        cache.result_bytes = 42
+        with caplog.at_level(logging.DEBUG):
+            caplog.clear()
+            assert cache.is_duplicate("b", now=101.0) is False
+        size_logs = [r for r in caplog.records if r.getMessage().startswith("idempotency_size")]
+        assert size_logs
+        _assert_soak_diagnostic_record(size_logs[-1], expected=_idempotency_size_line(cache))
+        assert cache.result_bytes == 42
+        assert cache.is_duplicate("c", now=102.0) is False
+        assert len(cache.seen) == 2
+
+    def test_idempotency_claim_unchanged_when_debug_disabled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cache_on = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
+        cache_off = _IdempotencyCache(ttl_seconds=60.0, max_entries=2)
+        for cache, level in ((cache_on, logging.DEBUG), (cache_off, logging.INFO)):
+            with caplog.at_level(level):
+                caplog.clear()
+                assert cache.is_duplicate("a", now=100.0) is False
+                assert cache.is_duplicate("a", now=101.0) is True
+                assert cache.is_duplicate("b", now=102.0) is False
+                assert cache.is_duplicate("c", now=103.0) is False
+        assert set(cache_on.seen.keys()) == set(cache_off.seen.keys())
+        assert cache_on.result_bytes == cache_off.result_bytes
+        assert not any(r.getMessage().startswith("idempotency_size") for r in caplog.records)
+
+    def test_idempotency_size_omitted_when_debug_disabled(
+        self, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        cache = _IdempotencyCache()
+        with caplog.at_level(logging.INFO):
+            cache.claim("k", now=100.0)
+        assert not any("idempotency_size" in r.getMessage() for r in caplog.records)
+        assert any("delivery_claim" in r.getMessage() for r in caplog.records)
 
     def test_second_call_within_ttl_returns_true(self) -> None:
         cache = _IdempotencyCache(ttl_seconds=60.0)
