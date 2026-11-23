@@ -31,10 +31,12 @@ One Path B profile; `gateway.multiplex_profiles` **false**. Four jobs at 15-minu
 | `soak84-copilot-turn` | copilot | *pending* | *pending* | *pending* |
 | `soak84-copilot-proactive` | copilot | *pending* | *pending* | *pending* |
 
-| UTC hour | Surface | Inbound attempted | Accepted | Note |
-| --- | --- | --- | --- | --- |
-| *pending* | teams | | | |
-| *pending* | copilot | | | |
+**Hourly inbound ledger:** unattempted hour → **NOT OBSERVED**.
+
+| UTC hour | Surface | Accepted (401/403 none) | Turn done |
+| --- | --- | --- | --- |
+| *pending* | teams | | |
+| *pending* | copilot | | |
 
 Missed 15-minute slots: runbook §2 missed-slot ledger (*pending*).
 
@@ -60,7 +62,7 @@ Restart table: checklist § R8 (*pending*).
 
 ## 8 — R10 client-visible
 
-Row per agent cron fire, script-only proactive fire, and R8 follow-up. Live run appends through soak end (288 fires per job in 72 h). Markers: `soak84 <surface> cron: …`; proactive `soak84 proactive proactive <pid> <UTC>` (no-arg script); or `soak84 proactive <surface> <UTC>`.
+Row per agent cron fire, script-only proactive fire, and R8 follow-up. Live run appends through soak end. Markers: `soak84 <surface> cron: …`; proactive `soak84 proactive proactive <pid> <UTC>` (no-arg script); or `soak84 proactive <surface> <UTC>`.
 
 | Marker | UTC | Surface | Gateway result | Client: rendered / not rendered / not observed |
 | --- | --- | --- | --- | --- |
