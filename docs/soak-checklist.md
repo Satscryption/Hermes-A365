@@ -8,7 +8,7 @@ Operator boundary checks for the live soak. Execute in the order in [`soak-valid
 | --- | --- |
 | PASS | Required observable evidence met for the boundary or row. |
 | FAIL | Explicit failure rule triggered (e.g. R4 delivery failure across token refresh). |
-| NOT OBSERVED | Coverage attempted but evidence missing, uninstrumented, or not yet reviewed. |
+| NOT OBSERVED | Unattempted coverage, or coverage attempted with evidence missing, uninstrumented, or not yet reviewed. |
 
 Missing evidence cannot become PASS. No blanket PASS while required rows are pending.
 
@@ -54,7 +54,7 @@ Follow [`soak-validation.md`](soak-validation.md) §5. Threshold **1/24** day ca
 
 **Observable evidence:** `prune_conversations` return count, adapter prune log line, harness JSON (`pruned_count`, `target_summaries`, `removed_target_post_count`), sanitized pin/age/presence on disk and in memory, survivor vs removed `send` results. Probe hours and probe `_bf_token_cache` do not count toward R3/R4.
 
-**PASS:** unpinned dormant target absent from memory and persistence; pinned target survives; removed-target `send` fails with **zero** outbound POSTs on that attempt; threshold restored; gateway restart; inbound restores removed chat; proactive succeeds before new inbound.
+**PASS:** unpinned dormant target absent from memory and persistence; pinned target survives; survivor `send` delivers; removed-target `send` fails with **zero** outbound POSTs on that attempt; threshold restored; gateway restart; inbound restores removed chat; proactive succeeds before new inbound.
 
 | Pre-init 1/24? | Unpinned pruned? | Pinned kept? | Zero POST removed? | Restored after gateway? | Verdict |
 | --- | --- | --- | --- | --- | --- |
@@ -64,7 +64,7 @@ Follow [`soak-validation.md`](soak-validation.md) §5. Threshold **1/24** day ca
 
 Retain existing cap and TTL. **Observable evidence (DEBUG `idempotency_size`):** `entries`, `cap`, `ttl_seconds`, `result_bytes`, plus delivery/release/full-cache log events. Compare equivalent hourly windows across separate process lifetimes.
 
-**PASS:** occupancy never exceeds effective cap; after warm-up, expiry-driven turnover rather than unbounded growth.
+**PASS:** occupancy never exceeds effective cap; after warm-up, expiry-driven turnover rather than cumulative growth throughout the run (including growth that stays under the cap), measured over equivalent hourly windows.
 
 **NOT OBSERVED:** insufficient windows or ambiguous cap-disable path without retained records.
 
@@ -74,7 +74,7 @@ Retain existing cap and TTL. **Observable evidence (DEBUG `idempotency_size`):**
 
 ## R8 — Gateway and tunnel restart
 
-One **gateway restart** and one separate **tunnel restart** on an established Path B conversation (confirmed profile only). Record interrupted-turn outcome and outage duration.
+One **gateway restart** and one separate **tunnel restart** on an established Path B conversation (confirmed profile only). Record interrupted-turn outcome and outage duration. Classify tunnel and hosting faults; record them; do not fix them.
 
 **PASS:** after recovery, proactive delivery to persisted cron targets **before** new inbound; marked follow-up on scheduled Teams and Copilot conversations; persisted routing and subsequent Path B gateway traffic. In-memory interrupted turn need not resume.
 
@@ -85,7 +85,7 @@ One **gateway restart** and one separate **tunnel restart** on an established Pa
 
 ## R10 — Client-visible (Teams and Copilot)
 
-One row per agent cron fire, each script-only proactive fire (`soak84 proactive <surface> <UTC>` from `soak_driver.py` with `<surface>` `teams` or `copilot`), and each R8 follow-up. Gateway cron markers use the `soak84 <surface> cron:` prompt form from scheduling.
+One row per agent cron fire, each script-only proactive fire, and each R8 follow-up. Scheduled cron uses `--script soak_driver.py` with no arguments, so each fire prints `soak84 proactive proactive <pid> <UTC>`. Explicit `teams`/`copilot` argv or `SOAK84_SURFACE` yields `soak84 proactive <surface> <UTC>` (no pid). Agent cron markers use the `soak84 <surface> cron:` prompt form from scheduling.
 
 | Marker | UTC | Surface | Gateway result | Client: rendered / not rendered / not observed |
 | --- | --- | --- | --- | --- |
@@ -104,7 +104,7 @@ Each UTC day, review DEBUG diagnostics and boundary tables above. Record only **
 
 ## Allowlisted export (R1 / I2)
 
-Exported excerpts and child-issue references use aliases and the fields named in this checklist and the pending report template. Omit secret-bearing log lines even when DEBUG is enabled.
+Exported excerpts use aliases and the fields named in this checklist and the pending report template. Child-issue references are limited to sanitized non-security citations. Omit secret-bearing log lines even when DEBUG is enabled.
 
 ## Restoration
 
