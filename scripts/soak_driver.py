@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# ruff: noqa: E501, I001
+# ruff: noqa: E501, I001, E702
 import argparse
 import asyncio
 import json
@@ -16,8 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
 # fmt: off
 def format_marker(*, now: datetime | None = None, surface: str | None = None) -> str:
     when = now or datetime.now(UTC)
-    token = surface or os.environ.get("SOAK84_SURFACE") or "proactive"
-    return f"soak84 proactive {token} {when.strftime('%Y-%m-%dT%H:%M:%SZ')}"
+    stamp = when.strftime('%Y-%m-%dT%H:%M:%SZ')
+    token = surface if surface is not None else os.environ.get("SOAK84_SURFACE")
+    if token:
+        return f"soak84 proactive {token} {stamp}"
+    return f"soak84 proactive proactive {os.getpid()} {stamp}"
 
 def _load_json(path: Path) -> dict[str, Any]:
     with path.open(encoding="utf-8") as handle:
@@ -39,9 +42,7 @@ def platform_extra_from_config(path: Path) -> dict[str, Any]:
         raise SystemExit(f"{path}: conversations_prune_max_age_days is not numeric") from err
     return dict(extra)
 
-def prepare_stopped_registry(
-    registry_path: Path, targets: dict[str, Any], *, now: float
-) -> dict[str, str]:
+def prepare_stopped_registry(registry_path: Path, targets: dict[str, Any], *, now: float) -> dict[str, str]:
     from hermes_a365.plugin.conversations import ConversationRef, ConversationRegistry
     pin_key, stale_key = str(targets["pinned_alias"]), str(targets["unpinned_alias"])
     reg, stamp = ConversationRegistry.load(registry_path), float(now)
@@ -69,7 +70,8 @@ async def execute_prune_probe(adapter: Any, *, registry_path: Path, pinned_chat:
             nonlocal drop_seen
             if record.msg == "agent365 prune_conversations: dropped %d stale entry(ies); %d remain.":
                 drop_seen = True
-    drop_h = _H()
+    drop_h, prior = _H(), log.level
+    log.setLevel(logging.INFO)
     log.addHandler(drop_h)
     try:
         dropped = await adapter.prune_conversations()
@@ -90,22 +92,18 @@ async def execute_prune_probe(adapter: Any, *, registry_path: Path, pinned_chat:
             "survivor_send_ok": bool(survivor.success), "removed_send_ok": bool(removed.success),
             "removed_target_post_count": post_counter() - before_removed}
     finally:
-        log.removeHandler(drop_h)
-        await adapter.disconnect()
-
+        log.removeHandler(drop_h); log.setLevel(prior); await adapter.disconnect()
 async def run_prune_probe(platform_config: Path, targets: Path, *, adapter_factory: Callable[[Any], Any] | None = None) -> dict[str, Any]:
     from gateway.config import PlatformConfig
     from hermes_a365.plugin.adapter import Agent365Adapter
     target_map, extra = _load_json(targets), platform_extra_from_config(platform_config)
     threshold = float(extra["conversations_prune_max_age_days"])
     pin_alias, stale_alias = str(target_map["pinned_alias"]), str(target_map["unpinned_alias"])
-    pin_chat = str(target_map[pin_alias]["chat_id"])
-    stale_chat = str(target_map[stale_alias]["chat_id"])
     factory = adapter_factory or (lambda cfg: Agent365Adapter(cfg))
     adapter = factory(PlatformConfig(enabled=True, extra=extra))
     if adapter._conversations_prune_max_age_days != threshold:
         raise SystemExit("prune threshold not captured at adapter init")
-    posts: dict[str, int] = {"count": 0}
+    posts = {"count": 0}
     if not await adapter.connect():
         await adapter.disconnect()
         raise SystemExit("adapter connect failed")
@@ -117,17 +115,20 @@ async def run_prune_probe(platform_config: Path, targets: Path, *, adapter_facto
             return await real_post(*args, **kwargs)
         client.post = _counting_post  # type: ignore[method-assign]
     return await execute_prune_probe(
-        adapter, registry_path=Path(str(extra["conversations_path"])), pinned_chat=pin_chat,
-        unpinned_chat=stale_chat, pinned_alias=pin_alias, unpinned_alias=stale_alias,
-        post_counter=lambda: posts["count"],
+        adapter, registry_path=Path(str(extra["conversations_path"])),
+        pinned_chat=str(target_map[pin_alias]["chat_id"]), unpinned_chat=str(target_map[stale_alias]["chat_id"]),
+        pinned_alias=pin_alias, unpinned_alias=stale_alias, post_counter=lambda: posts["count"],
     )
 
 def main(argv: list[str] | None = None) -> int:
     argv = list(argv if argv is not None else sys.argv[1:])
-    if not argv or argv[0] not in ("prepare-registry", "prune-probe"):
-        sys.stdout.write(format_marker(surface=None if not argv else argv[0]) + "\n")
-        return 0
-    parser = argparse.ArgumentParser(description="Path B soak harness (#84)")
+    if not argv:
+        sys.stdout.write(format_marker() + "\n"); return 0
+    if argv[0] in ("teams", "copilot"):
+        sys.stdout.write(format_marker(surface=argv[0]) + "\n"); return 0
+    if argv[0] not in ("prepare-registry", "prune-probe"):
+        return 2
+    parser = argparse.ArgumentParser()
     subs = parser.add_subparsers(dest="command", required=True)
     prep = subs.add_parser("prepare-registry")
     prep.add_argument("--registry-path", type=Path, required=True)

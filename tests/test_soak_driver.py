@@ -67,6 +67,23 @@ def _write_probe_inputs(tmp_path: Path) -> tuple[Path, Path]:
     return cfg, tgt
 
 
+def _wired_probe_adapter(monkeypatch: pytest.MonkeyPatch, conv_path: Path) -> Any:
+    extra = _platform_extra(conv_path)
+    a = tap._make_adapter(monkeypatch, **extra)
+    a._http_client = MagicMock()
+    a._bridge_cfg = MagicMock()
+    a._fmi_cache = MagicMock()
+    a._user_cache = MagicMock()
+    a._bf_token_cache = MagicMock()
+    bridge = tap.adapter_mod._import_bridge()
+    monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "B")))
+    a._http_client.post = AsyncMock(
+        return_value=MagicMock(status_code=201, json=MagicMock(return_value={"id": "new-id"}))
+    )
+    monkeypatch.setattr(a, "_cached_inbound_for", lambda _cid: None)
+    return a
+
+
 class TestSoakMarker:
     def test_unique_utc_marker_per_surface(self) -> None:
         fixed = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
@@ -77,15 +94,36 @@ class TestSoakMarker:
             now=fixed, surface="teams"
         )
 
+    def test_no_arg_marker_includes_run_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fixed = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        monkeypatch.delenv("SOAK84_SURFACE", raising=False)
+        monkeypatch.setattr(soak.os, "getpid", lambda: 4242)
+        assert soak.format_marker(now=fixed) == (
+            "soak84 proactive proactive 4242 2026-01-02T03:04:05Z"
+        )
+
+    def test_no_arg_markers_differ_by_run_token(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        fixed = datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)
+        monkeypatch.delenv("SOAK84_SURFACE", raising=False)
+        monkeypatch.setattr(soak.os, "getpid", lambda: 1)
+        one = soak.format_marker(now=fixed)
+        monkeypatch.setattr(soak.os, "getpid", lambda: 2)
+        two = soak.format_marker(now=fixed)
+        assert one != two
+
     def test_default_main_prints_marker(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert soak.main([]) == 0
         out = capsys.readouterr().out.strip()
-        assert out.startswith("soak84 proactive ")
+        assert out.startswith("soak84 proactive proactive ")
         assert "T" in out and out.endswith("Z")
 
     def test_surface_argv_marker(self, capsys: pytest.CaptureFixture[str]) -> None:
         assert soak.main(["copilot"]) == 0
         assert "soak84 proactive copilot " in capsys.readouterr().out
+
+    def test_unknown_argv_exits_nonzero(self, capsys: pytest.CaptureFixture[str]) -> None:
+        assert soak.main(["not-a-command"]) == 2
+        assert capsys.readouterr().out == ""
 
 
 class TestSoakPruneProbeConfig:
@@ -203,6 +241,32 @@ class TestExecutePruneProbe:
         assert seen["disconnect"] is True
 
     @pytest.mark.asyncio
+    async def test_prune_drop_log_seen_without_caplog_level(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        conv_path = tmp_path / "conversations.json"
+        targets = _targets(tmp_path)
+        soak.prepare_stopped_registry(conv_path, targets, now=1_700_000_000.0)
+        a = _wired_probe_adapter(monkeypatch, conv_path)
+        a._mark_connected()
+        log = logging.getLogger("hermes_a365.plugin.adapter")
+        prior = logging.WARNING
+        log.setLevel(prior)
+        pinned = targets["dormant_pinned"]["chat_id"]
+        unpinned = targets["dormant_unpinned"]["chat_id"]
+        record = await soak.execute_prune_probe(
+            a,
+            registry_path=conv_path,
+            pinned_chat=pinned,
+            unpinned_chat=unpinned,
+            pinned_alias="dormant_pinned",
+            unpinned_alias="dormant_unpinned",
+            post_counter=lambda: 0,
+        )
+        assert record["prune_dropped_log_emitted"] is True
+        assert log.level == prior
+
+    @pytest.mark.asyncio
     async def test_threshold_captured_at_init_not_mutated_extra(
         self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
     ) -> None:
@@ -212,23 +276,6 @@ class TestExecutePruneProbe:
         assert a._conversations_prune_max_age_days == pytest.approx(1.0 / 24.0)
         a.config.extra["conversations_prune_max_age_days"] = 30.0
         assert a._conversations_prune_max_age_days == pytest.approx(1.0 / 24.0)
-
-
-def _wired_probe_adapter(monkeypatch: pytest.MonkeyPatch, conv_path: Path) -> Any:
-    extra = _platform_extra(conv_path)
-    a = tap._make_adapter(monkeypatch, **extra)
-    a._http_client = MagicMock()
-    a._bridge_cfg = MagicMock()
-    a._fmi_cache = MagicMock()
-    a._user_cache = MagicMock()
-    a._bf_token_cache = MagicMock()
-    bridge = tap.adapter_mod._import_bridge()
-    monkeypatch.setattr(bridge, "acquire_reply_token", AsyncMock(return_value=("tok", "B")))
-    a._http_client.post = AsyncMock(
-        return_value=MagicMock(status_code=201, json=MagicMock(return_value={"id": "new-id"}))
-    )
-    monkeypatch.setattr(a, "_cached_inbound_for", lambda _cid: None)
-    return a
 
 
 class TestRunPruneProbe:
