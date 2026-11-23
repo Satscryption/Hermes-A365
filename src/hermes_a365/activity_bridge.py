@@ -1283,7 +1283,7 @@ def _debug_token_cache_fill(
     key_digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:12]
     prev_expiry = _TOKEN_CACHE_COLD_MARKER if previous_expiry is None else f"{previous_expiry:.3f}"
     logger.debug(
-        "token_cache_fill cache_kind=%s key_digest=%s "
+        "token_cache_fill cache_kind=%s key_digest=%s prev_expiry=%s "
         "eligibility_at=%.3f replacement_expiry=%.3f",
         cache_kind,
         key_digest,
