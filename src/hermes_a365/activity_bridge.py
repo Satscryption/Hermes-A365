@@ -1267,22 +1267,29 @@ def _safe_log_field(value: Any, *, limit: int = 160) -> str:
     )
 
 
+_TOKEN_CACHE_COLD_MARKER = "cold"
+
+
 def _debug_token_cache_fill(
-    cache_kind: str,
     *,
-    entries: int,
-    expires_at: float,
+    cache_kind: str,
     key_material: str,
+    previous_expiry: float | None,
+    eligibility_at: float,
+    replacement_expiry: float,
 ) -> None:
     if not logger.isEnabledFor(logging.DEBUG):
         return
     key_digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:12]
+    prev_expiry = _TOKEN_CACHE_COLD_MARKER if previous_expiry is None else f"{previous_expiry:.3f}"
     logger.debug(
-        "token_cache_fill cache_kind=%s entries=%d expires_at=%.3f key_digest=%s",
+        "token_cache_fill cache_kind=%s key_digest=%s "
+        "eligibility_at=%.3f replacement_expiry=%.3f",
         cache_kind,
-        entries,
-        expires_at,
         key_digest,
+        prev_expiry,
+        eligibility_at,
+        replacement_expiry,
     )
 
 
@@ -1291,7 +1298,7 @@ def _debug_jwt_validated(cache: _JwksCache, *, kid: str) -> None:
         return
     kid_digest = hashlib.sha256(str(kid).encode("utf-8")).hexdigest()[:12]
     logger.debug(
-        "jwt_validated jwks_fetched_at=%.3f jwks_keys=%d kid_digest=%s",
+        "jwt_validated validator=bf jwks_fetched_at=%.3f jwks_keys=%d kid_digest=%s",
         cache.fetched_at,
         len(cache.keys_by_kid),
         kid_digest,
@@ -2481,9 +2488,10 @@ class _IdempotencyCache:
         )
         if logger.isEnabledFor(logging.DEBUG):
             logger.debug(
-                "idempotency_size entries=%d cap=%d result_bytes=%d",
+                "idempotency_size entries=%d cap=%d ttl_seconds=%.3f result_bytes=%d",
                 len(self.seen),
                 self.max_entries,
+                self.ttl_seconds,
                 self.result_bytes,
             )
 
@@ -3485,8 +3493,10 @@ async def acquire_bf_s2s_token(
     cur = now if now is not None else _time.time()
     cache_key = (tenant_id, scope)
     cached = bf_cache.by_key.get(cache_key)
+    eligibility_at = cur
     if cached and (cur + TOKEN_REFRESH_SKEW_SECONDS) < cached[1]:
         return cached[0]
+    previous_expiry = None if cached is None else cached[1]
 
     # Use the lower-level post + parse explicitly so we can detect
     # AADSTS82001 and re-raise with a clear pointer for operators.
@@ -3540,13 +3550,14 @@ async def acquire_bf_s2s_token(
     payload = resp.json()
     token = payload["access_token"]
     ttl = float(payload.get("expires_in", 3600))
-    expires_at = cur + ttl
-    bf_cache.by_key[cache_key] = (token, expires_at)
+    replacement_expiry = cur + ttl
+    bf_cache.by_key[cache_key] = (token, replacement_expiry)
     _debug_token_cache_fill(
-        "bf_s2s",
-        entries=len(bf_cache.by_key),
-        expires_at=expires_at,
+        cache_kind="bf_s2s",
         key_material=f"{tenant_id}\x1e{scope}",
+        previous_expiry=previous_expiry,
+        eligibility_at=eligibility_at,
+        replacement_expiry=replacement_expiry,
     )
     return token
 
