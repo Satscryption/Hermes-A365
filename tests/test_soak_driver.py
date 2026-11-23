@@ -30,6 +30,21 @@ def _load_soak_driver() -> Any:
 soak = _load_soak_driver()
 
 
+@pytest.fixture(autouse=True)
+def _restore_adapter_logger_state() -> Any:
+    log = logging.getLogger("hermes_a365.plugin.adapter")
+    level, disabled, propagate = log.level, log.disabled, log.propagate
+    handlers = tuple(log.handlers)
+    yield
+    log.setLevel(level)
+    log.disabled = disabled
+    log.propagate = propagate
+    orig = set(handlers)
+    for handler in list(log.handlers):
+        if handler not in orig:
+            log.removeHandler(handler)
+
+
 def _targets(tmp_path: Path) -> dict[str, Any]:
     return {
         "pinned_alias": "dormant_pinned",
@@ -254,20 +269,17 @@ class TestExecutePruneProbe:
         log.setLevel(prior)
         pinned = targets["dormant_pinned"]["chat_id"]
         unpinned = targets["dormant_unpinned"]["chat_id"]
-        try:
-            record = await soak.execute_prune_probe(
-                a,
-                registry_path=conv_path,
-                pinned_chat=pinned,
-                unpinned_chat=unpinned,
-                pinned_alias="dormant_pinned",
-                unpinned_alias="dormant_unpinned",
-                post_counter=lambda: 0,
-            )
-            assert record["prune_dropped_log_emitted"] is True
-            assert log.level == prior
-        finally:
-            log.setLevel(logging.NOTSET)
+        record = await soak.execute_prune_probe(
+            a,
+            registry_path=conv_path,
+            pinned_chat=pinned,
+            unpinned_chat=unpinned,
+            pinned_alias="dormant_pinned",
+            unpinned_alias="dormant_unpinned",
+            post_counter=lambda: 0,
+        )
+        assert record["prune_dropped_log_emitted"] is True
+        assert log.level == prior
 
     @pytest.mark.asyncio
     async def test_threshold_captured_at_init_not_mutated_extra(
