@@ -1267,6 +1267,37 @@ def _safe_log_field(value: Any, *, limit: int = 160) -> str:
     )
 
 
+def _debug_token_cache_fill(
+    cache_kind: str,
+    *,
+    entries: int,
+    expires_at: float,
+    key_material: str,
+) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    key_digest = hashlib.sha256(key_material.encode("utf-8")).hexdigest()[:12]
+    logger.debug(
+        "token_cache_fill cache_kind=%s entries=%d expires_at=%.3f key_digest=%s",
+        cache_kind,
+        entries,
+        expires_at,
+        key_digest,
+    )
+
+
+def _debug_jwt_validated(cache: _JwksCache, *, kid: str) -> None:
+    if not logger.isEnabledFor(logging.DEBUG):
+        return
+    kid_digest = hashlib.sha256(str(kid).encode("utf-8")).hexdigest()[:12]
+    logger.debug(
+        "jwt_validated jwks_fetched_at=%.3f jwks_keys=%d kid_digest=%s",
+        cache.fetched_at,
+        len(cache.keys_by_kid),
+        kid_digest,
+    )
+
+
 def _safe_url_host(value: Any) -> str:
     try:
         return _safe_log_field(urlparse(str(value or "")).hostname or "invalid")
@@ -2448,6 +2479,13 @@ class _IdempotencyCache:
             reason,
             record.attempts,
         )
+        if logger.isEnabledFor(logging.DEBUG):
+            logger.debug(
+                "idempotency_size entries=%d cap=%d result_bytes=%d",
+                len(self.seen),
+                self.max_entries,
+                self.result_bytes,
+            )
 
     def claim(
         self, delivery_id: str, *, now: float | None = None, activity_type: str = ""
@@ -3032,6 +3070,7 @@ async def validate_inbound_jwt_bf(
             f"BF token serviceUrl {token_service_url!r} does not match "
             f"activity serviceUrl {expected_service_url!r}"
         )
+    _debug_jwt_validated(cache, kid=kid)
     return claims
 
 
@@ -3501,7 +3540,14 @@ async def acquire_bf_s2s_token(
     payload = resp.json()
     token = payload["access_token"]
     ttl = float(payload.get("expires_in", 3600))
-    bf_cache.by_key[cache_key] = (token, cur + ttl)
+    expires_at = cur + ttl
+    bf_cache.by_key[cache_key] = (token, expires_at)
+    _debug_token_cache_fill(
+        "bf_s2s",
+        entries=len(bf_cache.by_key),
+        expires_at=expires_at,
+        key_material=f"{tenant_id}\x1e{scope}",
+    )
     return token
 
 
