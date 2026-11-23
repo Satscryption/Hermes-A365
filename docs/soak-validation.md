@@ -1,150 +1,104 @@
 # Path B soak validation runbook (#84)
 
-Ordered operator template for a multi-day Path B gateway soak. **Preparation only:** completing or filing this document does not schedule jobs, stand up a tenant, or start the soak. Leave every live field **pending** until recorded evidence exists; missing evidence cannot become **PASS**.
+Ordered Path B operator template. **Preparation only:** filing this does not schedule jobs, confirm a stand-up, or start the soak. Leave live fields **pending**; missing evidence cannot become **PASS**. [#84](https://github.com/Satscryption/Hermes-A365/issues/84) stays open while required evidence is missing.
 
-Refs [#84](https://github.com/Satscryption/Hermes-A365/issues/84). Path B provisioning context: [`quickstart-path-b.md`](quickstart-path-b.md), [`references/live-tenant-test.md`](../references/live-tenant-test.md) §11. Walk resources stay on [#187](https://github.com/Satscryption/Hermes-A365/issues/187).
+Provisioning: [`quickstart-path-b.md`](quickstart-path-b.md). [#187](https://github.com/Satscryption/Hermes-A365/issues/187) walk resources stay unused.
 
-**Execution order:** preflight confirmation → Path B scheduling → boundary probes → daily review → client-visible record → restoration and report.
+**Order:** preflight → Path B scheduling → boundary probes (R4–R7, R6, R8) → daily review → client-visible record (R10) → restoration and report.
 
-## 1 — Preflight confirmation (R1)
+## 1 — Preflight (R1)
 
-Record before any soak scheduling. Scheduling before this block is signed is a **failed preflight**.
+Scheduling before recorded confirmation is **failed preflight**.
 
-| Field | Recorded value |
+| Field | Value |
 | --- | --- |
-| Walk owner (#187) | |
-| Stand-up alias (isolated Path B tenant) | |
-| Soak Hermes profile alias | |
-| Owner-confirmed Hermes build (tag / commit) | |
-| Owner-confirmed `a365` CLI version | |
-| Fresh isolated Path B tenant confirmed | ☐ yes (soak target) |
-| No walk resource in use for soak window | ☐ yes |
+| Walk owner | |
+| Stand-up alias / profile alias `<profile>` | |
+| Q1 tuple: Hermes-A365 `0.9.8` git SHA, wheel+sdist digests, plugin version, Hermes upstream ref, Python, OS, `a365`, `az` | |
+| Hermes build accepts §2 commands; delivery observed on gateway adapter for this process lifetime | |
+| Fresh isolated Path B tenant (soak target); no walk resource in use | ☐ / ☐ |
+| Effective soak settings; UTC soak start/end (when live); gateway process lifetime(s) | |
 | Preflight signed (UTC) | |
 
-**Verdict (R1):** **PASS** only when every row is filled and both boxes are checked. **FAIL** if scheduling or live probes begin first.
+Keep exact commands, job IDs, preflight evidence. Hours on a prior build pin do not count toward R3.
 
-## 2 — Path B scheduling (R3)
+## 2 — Scheduling and inbound (R3)
 
-**Scope:** 72 hours of **observed gateway operation** on one **unchanged** Hermes-A365 + Hermes build, **excluding** operator downtime. Require at least one uninterrupted interval **> 24 h**. One Path B profile; leave `gateway.multiplex_profiles` **false**.
+**Scope:** ≥72 h observed gateway on one unchanged Q1 pin, excluding **all** downtime; one uninterrupted interval **>24 h**. One Path B profile; `gateway.multiplex_profiles` **false**. Two Path B conversations (Teams, Copilot Chat). Four native cron jobs (agent turn + script-only proactive per surface, 15-min cadence). Inbound ≥ hourly per surface (operator message, not cron). Cron outbound does not satisfy inbound validation.
 
-**Four Hermes cron jobs** (native scheduler, 15-minute cadence): on each of two persisted targets (**Teams** Path A 1:1 and **Copilot Chat**), one **agent-backed turn** and one **script-only proactive** send. Distinct conversation ids and job names. Cron-generated outbound exercises delivery and registry persistence; it **does not** satisfy the Path B **inbound** validator (§3).
+Verify against owner-confirmed Hermes build; stop if rejected. This repo does not vendor Hermes CLI. Job create / process exit is not delivery evidence. Record scheduled, attempted, and successful counts.
 
-Verify every command form below against the owner-confirmed Hermes build during preflight. This repo does not vendor the Hermes CLI. Job creation or a zero exit from `hermes cron create` is **not** delivery evidence.
+```text
+hermes --profile <profile> cron create "*/15 * * * *" \
+  "soak84 <surface> cron: return a unique marked acknowledgement" \
+  --timezone UTC --deliver "agent365:<turn-chat>" --name "soak84-<surface>-turn"
 
-### Teams target (`<teams-conv-id>`)
-
-```bash
-hermes cron create "every 15m" \
-  'Soak084 Teams agent turn: reply with one line "soak084-teams-turn" and the current UTC ISO-8601 timestamp.' \
-  --name soak084-teams-agent-turn \
-  --deliver agent365:<teams-conv-id>
-
-hermes cron create "every 15m" \
-  --no-agent \
-  --script soak084-proactive-teams.sh \
-  --name soak084-teams-script-proactive \
-  --deliver agent365:<teams-conv-id>
+hermes --profile <profile> cron create "*/15 * * * *" \
+  --no-agent --script soak_driver.py \
+  --timezone UTC --deliver "agent365:<proactive-chat>" --name "soak84-<surface>-proactive"
 ```
 
-### Copilot Chat target (`<copilot-conv-id>`)
+`<surface>` is `teams` or `copilot`. Copy `soak_driver.py` into that profile’s scripts directory.
 
-```bash
-hermes cron create "every 15m" \
-  'Soak084 Copilot agent turn: reply with one line "soak084-copilot-turn" and the current UTC ISO-8601 timestamp.' \
-  --name soak084-copilot-agent-turn \
-  --deliver agent365:<copilot-conv-id>
+**Missed-slot ledger (each 15-min slot):** | UTC | Job | Attempted | Gateway completion | Note |
 
-hermes cron create "every 15m" \
-  --no-agent \
-  --script soak084-proactive-copilot.sh \
-  --name soak084-copilot-script-proactive \
-  --deliver agent365:<copilot-conv-id>
+**Hourly inbound ledger:** | UTC hour | Surface | Accepted (401/403 none) | Turn done | — unattempted hour → **NOT OBSERVED**.
+
+## 3 — R4 token boundary (`_BfTokenCache`)
+
+Path B only; process exit is cache-lifetime boundary. **PASS:** warm replacement at/after prior expiry minus 300 s skew (`activity_bridge.py:1050`, decision `:3449`), advancing expiry, marked delivery across boundary. **FAIL:** marked delivery worked before boundary, then failed across refresh eligibility/expiry — token acquisition fail (`adapter.py:11258`), POST exception (`:11305`), non-2xx (`:11323`), or no gateway-confirmed completion by next 15-min slot. Log kind `bf_s2s`, key digest, process lifetime, prior expiry, eligibility UTC, marker, delivery result/status. Cold fill ≠ PASS; cache fill does not override delivery failure; unattempted/uninstrumented → **NOT OBSERVED**. Gateway success, client miss → R10.
+
+## 4 — R5 JWKS (Path B)
+
+**Refresh PASS:** accepted Path B traffic + advancing `_bf_jwks_cache` `fetched_at` over 24 h TTL (`activity_bridge.py:968`, `:2111`). **Rollover PASS:** accepted traffic with changed signing-key digest. No live rollover → **NOT OBSERVED**. Offline two-key `validate_inbound_jwt_bf` test is supplemental.
+
+## 5 — R6 prune (owned adapter, one profile)
+
+Set `gateway.platforms.agent365.extra.conversations_prune_max_age_days` to **1/24** before constructing probe adapter (`adapter.py:1949`; prune `:5675`, log `:5707`). Two dormant chats (not cron targets): inbound seed → stop gateway (registry+port free) → while stopped `ConversationRegistry.load`/`pin`/`unpin`/`save` (`conversations.py:525`, `:399`, `:413`, `:554`); no JSON hand-edit.
+
+```text
+<Hermes-python> scripts/soak_driver.py prune-probe \
+  --platform-config <local-effective-platform-config.json> \
+  --targets <local-target-alias-map.json>
 ```
 
-Install `soak084-proactive-*.sh` under `~/.hermes/scripts/` on the soak profile (non-empty stdout → proactive `sendToConversation` per [`adapter.py`](../src/hermes_a365/plugin/adapter.py) `_send_proactive`).
+Harness keeps one `Agent365Adapter`, `connect()` (`:3666`), >1 h idle, `prune_conversations()`, inspect memory+persistence. **PASS:** unpinned gone both places; pinned remains. Before inbound this lifetime: `send` (`:5825`) both — survivor delivers; removed fails locally, **zero POSTs** (`:11192`). `disconnect()` (`:3834`). Do not run beside gateway on same registry; probe hours/`_bf_token_cache` exclude R3/R4. Restore threshold; start gateway; inbound restores removed chat; proactive before new inbound.
 
-**Observed hours (exclude downtime):**
-
-| Interval start (UTC) | Interval end (UTC) | Gateway up? | Notes |
-| --- | --- | --- | --- |
-| | | | |
-
-**Verdict (R3):** **PASS** when summed observed hours ≥ 72, one row is uninterrupted > 24 h, four jobs remain scheduled on unchanged build, and gateway logs show periodic agent turns plus proactive sends on both targets. **FAIL** otherwise.
-
-## 3 — Inbound validator (Path B, with R3)
-
-At least **hourly authenticated Path B inbound** on **each** target (operator-initiated message, not cron). Marker example: `soak084-inbound-<surface> <UTC>`.
-
-| Time (UTC) | Surface | Inbound accepted (no 401/403)? | Turn completed? |
-| --- | --- | --- | --- |
-| | Teams | | |
-| | Copilot | | |
-
-**Verdict:** **PASS** when ≥ 72 h of hourly rows exist per surface with JWT validation success (`validate_inbound_jwt_bf` branch per [`activity_bridge.py`](../src/hermes_a365/activity_bridge.py)). **FAIL** on sustained rejections or gaps.
-
-## 4 — Boundary probes (R6)
-
-**Registry prune** — owned soak adapter vs separate **probe** adapter. Shortened threshold is read at `Agent365Adapter` init (`conversations_prune_max_age_days`, default 30 — [`adapter.py`](../src/hermes_a365/plugin/adapter.py) init and `prune_conversations` at `:5675`). Set the shortened value in `platforms.agent365.extra` **before** constructing the probe adapter. The probe is a **separate live gateway**; its hours do **not** count toward R3. Do **not** assume a running-gateway periodic prune hook — wire `await adapter.prune_conversations()` explicitly (cron one-shot or driver).
-
-**Owned-adapter procedure:**
-
-1. On the probe profile, set `conversations_prune_max_age_days` to the owner-agreed shortened days (example `0.001`).
-2. Seed registry entries (stale, pinned, in-flight); record `conversations.json` fingerprint.
-3. Invoke `await adapter.prune_conversations()` once; capture log line `agent365 prune_conversations: dropped …`.
-4. Assert stale unpinned entries dropped; pinned / active / `last_used_at is None` retained per [`conversations.py`](../src/hermes_a365/plugin/conversations.py) `prune_old_entries`.
-
-**Driver invocation (when present):**
-
-```bash
-python scripts/soak_driver.py prune-probe \
-  --soak-profile <soak-profile-alias> \
-  --probe-profile <probe-profile-alias>
-```
-
-**Evidence:** | Prune threshold set pre-init? | Entries dropped? | Pinned retained? | Probe isolated from soak gateway? | **Verdict** |
-| --- | --- | --- | --- | --- |
-| | | | | **PASS** / **FAIL** |
-
-## 5 — Restart and tunnel boundaries (R8)
-
-During the soak window, execute **once per surface** (log only; do not fix tunnel/hosting faults):
-
-1. **Gateway restart** — stop/start Hermes gateway; note PID and registry reload.
-2. **Tunnel restart** — restart cloudflared (or named tunnel); re-confirm public URL if ephemeral.
-3. **Proactive before inbound** — on each persisted Path B cron target, confirm one proactive delivery succeeds **before** the next operator inbound on that chat ([`send`](../src/hermes_a365/plugin/adapter.py) proactive path via `_send_proactive` at `:11167`).
-4. **Marked follow-up** — after restart, send one marked inbound per scheduled conversation; confirm reply chain.
-
-Classify tunnel/hosting failures as **observed external** (record timestamps; out of scope to repair).
-
-| Event (UTC) | Surface | Proactive OK pre-inbound? | Follow-up turn OK? | Tunnel/hosting note |
-| --- | --- | --- | --- | --- |
-| | | | | |
-
-**Verdict (R8):** **PASS** when all four steps are documented for both surfaces. **FAIL** if proactive recovery is untested after restart.
-
-## 6 — Client-visible delivery (R10)
-
-For **every** scheduled cron turn and every R8 follow-up, record client UI outcome:
-
-| Event id | Surface | Scheduled / follow-up | Gateway send OK? | Client: rendered / not rendered / not observed |
+| Pre-init 1/24? | Unpinned pruned? | Pinned kept? | Zero POST removed? | Verdict |
 | --- | --- | --- | --- | --- |
 
-A **gateway success** with a **client miss** is **R10 evidence**, not an R4 failure, and does not trigger extra rendering work. **R4 failure** (gateway/outbound): log shows send error, non-2xx, or `delivery_failed` on the cron job — file separately.
+## 6 — R7 idempotency
 
-**Verdict (R10):** **PASS** when the table is complete for the soak window. **FAIL** on missing rows.
+Retain cap/TTL (`activity_bridge.py:1001`, `:1011`). **PASS:** occupancy ≤ effective cap; after warm-up, expiry turnover in equivalent hourly windows; separate process lifetimes. `:2388` disables when cap non-positive. Else **NOT OBSERVED**.
 
-## 7 — Daily subsystem review
+## 7 — R8 restart
 
-Once per soak day, review allowlisted exports (gateway log excerpts, `hermes cron runs`, sanitized registry snapshots — no secrets/tokens):
+One **gateway restart** and one separate **tunnel restart** on an established Path B conversation (confirmed profile only — not walk profile/hosts named in `live-tenant-test.md`). Record interrupted-turn outcome + outage duration. After recovery: proactive to persisted cron targets before new inbound; marked follow-up per scheduled conversation (§9d.6 shape at `live-tenant-test.md:951`, `:967`). **PASS:** persisted routing + later Path B gateway traffic; in-memory interrupted turn need not resume. R10 on follow-ups. Classify tunnel/hosting faults; do not fix.
 
-| Day | Token caches (FMI / user / BF) | JWKS refresh | Idempotency cache growth | Registry / prune signals | Notes |
-| --- | --- | --- | --- | --- | --- |
-| | | | | | |
+## 8 — R10 client-visible
 
-**Verdict:** **PASS** when each day has a row. Anomalies become follow-up issues; they do not auto-fail R3 unless gateway observed hours drop.
+Row per agent cron fire, script-only proactive fire, and R8 follow-up:
 
-## 8 — Restoration and report
+| Marker | UTC | Surface | Gateway result | Client: rendered / not rendered / not observed |
 
-Teardown: pause/remove soak cron jobs, restore default prune threshold on probe profile, release tunnel, document profile env reversions. Export allowlisted evidence bundle for [#84](https://github.com/Satscryption/Hermes-A365/issues/84) comment (not in-repo secrets).
+#290/#337/#338 may explain client miss when gateway POST succeeded.
 
-**Overall soak verdict:** **PENDING** until R1, R3, R6, R8, and R10 are all **PASS** with recorded evidence. R9 and R11 remain retired — do not reopen.
+## 9 — Daily review, verdicts, restoration
+
+Daily allowlisted excerpts only (no tokens, assertions, credentials, claims, cache values, bodies, raw ids):
+
+| Day | `_BfTokenCache` diagnostics | JWKS | Idempotency | Notes |
+
+Also log interruptions and evidence references in the pending report.
+
+| Req | PASS / FAIL / NOT OBSERVED | Evidence |
+| --- | --- | --- |
+| R3 | | |
+| R4 | | |
+| R5 | | |
+| R6 | | |
+| R7 | | |
+| R8 | | |
+| R10 | | |
+
+**Restoration:** remove soak cron jobs; restore settings on isolated stand-up; release tunnel. Overall **PENDING** until rows filled. R9/R11 **retired**.
