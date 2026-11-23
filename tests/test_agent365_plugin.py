@@ -1762,7 +1762,7 @@ class TestMessagesRoutePathBDispatch:
 
     def test_bf_iss_dispatches_to_bf_validator(self, monkeypatch: pytest.MonkeyPatch) -> None:
         """BF-issued token → adapter calls ``validate_inbound_jwt_bf``
-        with the activity's serviceUrl + bot app id, NOT the A365
+        with the activity's serviceUrl and channelId + bot app id, NOT the A365
         validator. With ``bf_app_id`` unset (default), the expected
         audience falls back to ``blueprint_app_id`` — preserves
         pre-#36 behaviour for operators on Path A only or for the
@@ -1795,6 +1795,7 @@ class TestMessagesRoutePathBDispatch:
         # bf_app_id is unset by default → falls back to blueprint.
         assert kwargs["expected_app_id"] == a.blueprint_app_id
         assert kwargs["expected_service_url"] == body["serviceUrl"]
+        assert kwargs["channel_id"] == body["channelId"]
         assert kwargs["cache"] is a._bf_jwks_cache
         # A365 validator NOT called.
         a365_validator.assert_not_awaited()
@@ -1910,6 +1911,30 @@ class TestMessagesRoutePathBDispatch:
         assert r.json()["detail"] == "invalid bearer token"
         assert "BF signature/aud/iss" not in r.text
         assert a._handled_events == []
+
+    def test_gateway_rejects_unendorsed_channel(
+        self, monkeypatch: pytest.MonkeyPatch, rsa_keypair: tuple[Any, dict[str, Any]]
+    ) -> None:
+        import httpx
+        from fastapi.testclient import TestClient
+        from test_activity_bridge import BF_ISSUER, _bf_jwks_transport, _make_token
+
+        adapter = _make_adapter(monkeypatch)
+        priv, jwk = rsa_keypair
+        token = _make_token(priv, aud=adapter.blueprint_app_id, iss=BF_ISSUER)
+        activity = {**_make_inbound(path="B"), "type": "conversationUpdate"}
+        with TestClient(adapter.build_app()) as client:
+            adapter._http_client = httpx.AsyncClient(
+                transport=_bf_jwks_transport({**jwk, "endorsements": ["directline"]})
+            )
+            response = client.post(
+                "/api/messages",
+                json=activity,
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        assert response.status_code == 403
+        assert response.json()["detail"] == "invalid bearer token"
+        assert adapter._handled_events == []
 
 
 # ---------------------------------------------------------------------------

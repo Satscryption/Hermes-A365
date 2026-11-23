@@ -229,9 +229,9 @@ class TestJwtRequiresExpAndNbf:
 
     @pytest.mark.asyncio
     async def test_validate_inbound_jwt_bf_accepts_complete_token(
-        self, rsa_keypair: tuple[Any, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[Any, dict[str, Any]]
     ) -> None:
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="bot-app-id",
@@ -243,6 +243,7 @@ class TestJwtRequiresExpAndNbf:
                 token=token,
                 expected_app_id="bot-app-id",
                 expected_service_url=BF_TEST_SERVICE_URL,
+                channel_id="msteams",
                 client=client,
                 cache=_JwksCache(),
             )
@@ -251,9 +252,9 @@ class TestJwtRequiresExpAndNbf:
 
     @pytest.mark.asyncio
     async def test_validate_inbound_jwt_bf_requires_exp(
-        self, rsa_keypair: tuple[Any, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[Any, dict[str, Any]]
     ) -> None:
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="bot-app-id",
@@ -278,15 +279,16 @@ class TestJwtRequiresExpAndNbf:
                     token=token,
                     expected_app_id="bot-app-id",
                     expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
                     client=client,
                     cache=_JwksCache(),
                 )
 
     @pytest.mark.asyncio
     async def test_validate_inbound_jwt_bf_requires_nbf(
-        self, rsa_keypair: tuple[Any, dict[str, Any]]
+        self, bf_rsa_keypair: tuple[Any, dict[str, Any]]
     ) -> None:
-        priv, jwk = rsa_keypair
+        priv, jwk = bf_rsa_keypair
         token = _make_token(
             priv,
             aud="bot-app-id",
@@ -311,6 +313,7 @@ class TestJwtRequiresExpAndNbf:
                     token=token,
                     expected_app_id="bot-app-id",
                     expected_service_url=BF_TEST_SERVICE_URL,
+                    channel_id="msteams",
                     client=client,
                     cache=_JwksCache(),
                 )
