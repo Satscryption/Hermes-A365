@@ -254,17 +254,20 @@ class TestExecutePruneProbe:
         log.setLevel(prior)
         pinned = targets["dormant_pinned"]["chat_id"]
         unpinned = targets["dormant_unpinned"]["chat_id"]
-        record = await soak.execute_prune_probe(
-            a,
-            registry_path=conv_path,
-            pinned_chat=pinned,
-            unpinned_chat=unpinned,
-            pinned_alias="dormant_pinned",
-            unpinned_alias="dormant_unpinned",
-            post_counter=lambda: 0,
-        )
-        assert record["prune_dropped_log_emitted"] is True
-        assert log.level == prior
+        try:
+            record = await soak.execute_prune_probe(
+                a,
+                registry_path=conv_path,
+                pinned_chat=pinned,
+                unpinned_chat=unpinned,
+                pinned_alias="dormant_pinned",
+                unpinned_alias="dormant_unpinned",
+                post_counter=lambda: 0,
+            )
+            assert record["prune_dropped_log_emitted"] is True
+            assert log.level == prior
+        finally:
+            log.setLevel(logging.NOTSET)
 
     @pytest.mark.asyncio
     async def test_threshold_captured_at_init_not_mutated_extra(
