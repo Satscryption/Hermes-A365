@@ -2876,22 +2876,33 @@ class Agent365Adapter(BasePlatformAdapter):
                     # an oversized activity id/name must not leave stale
                     # registry, stream, or watchdog state behind.
                     #
-                    # installationUpdate remove is the user-level uninstall.
-                    # Bot Framework delivers it on the personal ``a:…`` chat
-                    # only, while a Copilot turn keeps running on the sibling
-                    # ``19:…`` groupChat. Retire every cached conversation for
-                    # that same user and bot. A conversationUpdate that merely
-                    # removes the bot from one chat stays single-conversation.
+                    # installationUpdate remove on the personal Teams 1:1 evicts
+                    # only that registry record. Sibling Copilot app threads for
+                    # the same user and bot still run teardown (#156) but keep
+                    # their cached ref (#358). conversationUpdate bot removal
+                    # stays single-chat.
                     if (
                         str(activity.get("type") or "") == "installationUpdate"
                         and str(activity.get("action") or "").lower() == "remove"
                     ):
                         # JWT aud is not a bot id. A weak audience must not
                         # widen uninstall to another app's conversations.
-                        target_ids = self._uninstall_conversation_ids(activity)
+                        registry_ids = self._uninstall_conversation_ids(activity)
+                        teardown_ids = self._uninstall_teardown_conversation_ids(
+                            activity
+                        )
+                        registry_evict_ids = (
+                            set(registry_ids)
+                            if set(registry_ids) != set(teardown_ids)
+                            else None
+                        )
+                        target_ids = teardown_ids
                     else:
+                        registry_evict_ids = None
                         target_ids = [lifecycle_conv_id] if lifecycle_conv_id else []
-                    if target_ids and not await self._evict_conversations(target_ids):
+                    if target_ids and not await self._evict_conversations(
+                        target_ids, registry_evict_ids=registry_evict_ids
+                    ):
                         if delivery_id is not None:
                             self._idempotency_cache.forget(delivery_id)
                         return JSONResponse(
@@ -15619,22 +15630,10 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._active_stream_by_chat.get(chat_id) == message_id:
             self._active_stream_by_chat.pop(chat_id, None)
 
-    def _uninstall_conversation_ids(
+    def _uninstall_teardown_conversation_ids(
         self, activity: dict[str, Any], *, jwt_app_id: str = ""
     ) -> list[str]:
-        """Conversation ids to retire for an ``installationUpdate`` remove.
-
-        Always includes the conversation named on the activity. Also includes
-        every cached conversation for the same Entra user and the same bot
-        app when both sides have equal strong ids.
-
-        The named conversation's cached ref may supply an ``aadObjectId`` or
-        app GUID the uninstall payload omitted. That copy happens only when
-        this side has no strong id. Disagreeing object ids or app GUIDs are
-        not unioned, and a conflict retires only the named chat. ``from.id``
-        alone never selects a sibling. ``jwt_app_id`` (the inbound audience)
-        is ignored: a weak ``aud`` must not authorize retiring another chat.
-        """
+        """Every chat that must run uninstall teardown for this remove."""
         del jwt_app_id
         conv = activity.get("conversation")
         named = (
@@ -15652,23 +15651,49 @@ class Agent365Adapter(BasePlatformAdapter):
 
         add(named)
         anchor = _parties_from_activity(activity)
-        if named:
-            cached = self._conversations.get(named)
-            if cached is not None and not anchor.absorb(_parties_from_ref(cached)):
-                return ordered
+        cached = self._conversations.get(named) if named else None
+        if named and cached is not None and not anchor.absorb(_parties_from_ref(cached)):
+            return ordered
         if not anchor.can_fan_out():
-            # No aadObjectId or no app GUID: retire only the named chat.
             return ordered
         for ref in self._conversations.items():
             if _same_uninstall_parties(anchor, _parties_from_ref(ref)):
                 add(ref.conversation_id)
         if len(ordered) > 1:
             logger.info(
-                "agent365 uninstall also retiring %d other cached "
+                "agent365 uninstall tearing down %d matched "
                 "conversation(s) for the same user and bot",
-                len(ordered) - 1,
+                len(ordered),
             )
         return ordered
+
+    def _uninstall_conversation_ids(
+        self, activity: dict[str, Any], *, jwt_app_id: str = ""
+    ) -> list[str]:
+        """Registry rows to drop for ``installationUpdate`` remove (#358, #156)."""
+        del jwt_app_id
+        conv = activity.get("conversation")
+        named = (
+            str(conv.get("id")).strip()
+            if isinstance(conv, dict) and isinstance(conv.get("id"), str)
+            else ""
+        )
+        matched = self._uninstall_teardown_conversation_ids(activity)
+        conv_type = (
+            str(conv.get("conversationType") or "").strip().lower()
+            if isinstance(conv, dict)
+            else ""
+        )
+        if not conv_type and named:
+            cached = self._conversations.get(named)
+            if cached is not None:
+                raw = cached.raw if isinstance(cached.raw, dict) else {}
+                conv_raw = raw.get("conversation")
+                if isinstance(conv_raw, dict):
+                    conv_type = str(conv_raw.get("conversationType") or "").strip().lower()
+        if named and conv_type == "personal":
+            return [named]
+        return matched
 
     def _retirement_not_adopted(self, chat_id: str) -> bool:
         """True when a pre-armed chat never entered teardown."""
@@ -15866,6 +15891,17 @@ class Agent365Adapter(BasePlatformAdapter):
                 if not tasks:
                     self._outbound_tasks_by_chat.pop(chat_id, None)
 
+    async def _teardown_conversation_without_registry(self, chat_id: str) -> bool:
+        """Drop live chat state and bump generation without registry eviction."""
+        chat_id = str(chat_id)
+        current = asyncio.current_task()
+        if current is not None:
+            self._pre_auth_chat_task_done(chat_id, current)
+        ok = await self._teardown_chat_state(chat_id)
+        if ok and self._conversations.get(chat_id) is not None:
+            self._retiring_chats.discard(chat_id)  # #358 proactive after teardown
+        return ok
+
     async def _evict_armed_conversations(
         self,
         ordered: list[str],
@@ -15873,6 +15909,8 @@ class Agent365Adapter(BasePlatformAdapter):
         finished: set[str],
         failed_holder: list[bool],
         committed: set[str],
+        *,
+        registry_evict_ids: set[str] | None = None,
     ) -> bool:
         """Evict ``ordered``, skipping chats already settled in this call."""
         for chat_id in ordered:
@@ -15880,7 +15918,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 continue
             generation_before = self._chat_generation(chat_id)
             try:
-                adopted = await self._evict_conversation(chat_id)
+                if registry_evict_ids is not None and chat_id not in registry_evict_ids:
+                    adopted = await self._teardown_conversation_without_registry(chat_id)
+                else:
+                    adopted = await self._evict_conversation(chat_id)
             except asyncio.CancelledError:
                 # ``_evict_conversation`` re-raises only after a shielded
                 # eviction task has finished. A cancel during persist-owner
@@ -15903,6 +15944,8 @@ class Agent365Adapter(BasePlatformAdapter):
         finished: set[str],
         failed_holder: list[bool],
         committed: set[str],
+        *,
+        registry_evict_ids: set[str] | None = None,
     ) -> bool:
         """Finish armed teardowns after this uninstall task was cancelled.
 
@@ -15923,16 +15966,28 @@ class Agent365Adapter(BasePlatformAdapter):
             # that chat is adopted (#156, #158).
             await self._cancel_matched_outbound(ordered)
             return await self._evict_armed_conversations(
-                ordered, armed, finished, failed_holder, committed
+                ordered,
+                armed,
+                finished,
+                failed_holder,
+                committed,
+                registry_evict_ids=registry_evict_ids,
             )
         finally:
             if current is not None and current.cancelling() == 0:
                 current.cancel()
 
-    async def _evict_conversations(self, chat_ids: list[str]) -> bool:
+    async def _evict_conversations(
+        self,
+        chat_ids: list[str],
+        *,
+        registry_evict_ids: set[str] | None = None,
+    ) -> bool:
         """Retire each chat via the existing teardown + registry eviction.
 
-        Every target is added to ``_retiring_chats`` before the first await
+        Optional ``registry_evict_ids`` limits which rows ``_conversations.evict``
+        removes after teardown (#358). Every target is added to ``_retiring_chats``
+        before the first await
         so a sibling turn cannot post while this chat's teardown is still
         starting. In-flight outbound posts on all of those chats are
         cancelled together before any model turn is interrupted. That
@@ -15969,13 +16024,23 @@ class Agent365Adapter(BasePlatformAdapter):
             )
             await self._await_uninstall_commit(commit)
             outcome = await self._evict_armed_conversations(
-                ordered, armed, finished, failed_holder, committed
+                ordered,
+                armed,
+                finished,
+                failed_holder,
+                committed,
+                registry_evict_ids=registry_evict_ids,
             )
             return outcome
         except asyncio.CancelledError:
             try:
                 outcome = await self._evict_armed_after_cancel(
-                    ordered, armed, finished, failed_holder, committed
+                    ordered,
+                    armed,
+                    finished,
+                    failed_holder,
+                    committed,
+                    registry_evict_ids=registry_evict_ids,
                 )
             except asyncio.CancelledError:
                 await self._release_unadopted_retirements(armed, committed)

@@ -8,6 +8,11 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
+- **#358 — Personal Teams uninstall scope:** personal ``installationUpdate``
+  remove drops only the 1:1 registry row; sibling Copilot threads keep their
+  ref but still run teardown (#156), and blank ``conversationType`` falls back
+  to the cached personal ref.
+
 - **#356 — Personal Teams stream edit `403 ContentStreamNotAllowed`:** recovery
   final POST, plain notify with partial removal, no duplicate when complete.
 
