@@ -2031,6 +2031,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # adapter typing pulses and fresh stream opens until the next outer
         # personal turn starts (#326 M2).
         self._personal_stream_cancelled: set[str] = set()
+        self._personal_stream_plain_fallback_pending: dict[str, str] = {}
         # Personal turns nest when Hermes runs an in-band follow-up before
         # the outer stream consumer is cancelled. The outer 1:1 stream is
         # finalized only when this count returns to 0 (#161).
@@ -4082,6 +4083,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._active_stream_by_chat.clear()
         self._personal_stream_final_posted.clear()
         self._personal_stream_cancelled.clear()
+        self._personal_stream_plain_fallback_pending.clear()
         self._personal_processing_depth.clear()
         self._personal_final_landed.clear()
         self._nested_personal_reply.clear()
@@ -6083,6 +6085,48 @@ class Agent365Adapter(BasePlatformAdapter):
                 success=False,
                 error="agent365 send: personal stream suppressed after user cancellation",
             )
+        plain_stream_id = self._personal_stream_plain_fallback_pending.get(str(chat_id))
+        if chat_type == "personal" and reply_to is not None and plain_stream_id:
+            if (metadata or {}).get("expect_edits") and not self._metadata_requests_stream_final(
+                metadata
+            ):
+                return SendResult(success=True, message_id=plain_stream_id)
+            if self._metadata_requests_stream_final(metadata):
+                self._personal_stream_plain_fallback_pending.pop(str(chat_id), None)
+                if not await self._delete_activity(
+                    inbound=inbound,
+                    activity_id=plain_stream_id,
+                    chat_id=str(chat_id),
+                    validated_path=turn_validated_path,
+                ):
+                    logger.warning(
+                        "agent365 personal stream plain fallback partial removal failed: "
+                        "chat_id=%s stream_id=%s",
+                        chat_id,
+                        plain_stream_id,
+                    )
+                result = await self._send_reply_activity(
+                    inbound=inbound,
+                    content=content,
+                    log_context="send",
+                    citations=(metadata or {}).get("citations"),
+                    validated_path=turn_validated_path,
+                    reply_origin=coalesced_origin,
+                )
+                logger.info(
+                    "agent365 personal stream fallback after rejected edit: "
+                    "path=plain_send chat_id=%s outcome=%s",
+                    chat_id,
+                    "delivered" if result.success else "rejected",
+                )
+                if result.success and result.message_id:
+                    anchor = self._personal_reply_anchor(reply_to, inbound)
+                    self._record_recently_finalized(result.message_id, chat_id)
+                    self._remember_personal_final_anchor(chat_id, anchor)
+                    self._mark_personal_stream_final_posted(chat_id)
+                elif plain_stream_id:
+                    self._personal_stream_plain_fallback_pending[str(chat_id)] = plain_stream_id
+                return result
         if (
             chat_type == "personal"
             and reply_to is not None
@@ -6334,6 +6378,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if prev_depth == 0:
                     self._clear_personal_typing_suppression(chat_id)
                     self._personal_stream_cancelled.discard(str(chat_id))
+                    self._personal_stream_plain_fallback_pending.pop(str(chat_id), None)
                     if record is not None:
                         session_key = str(record.session_key or "").strip()
                         if session_key:
@@ -11603,6 +11648,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # something non-empty to POST as the close (BF rejects
             # empty-text final activities with 400 BadSyntax).
             "last_content": clean_content,
+            "last_accepted_content": clean_content,
         }
         self._active_stream_by_chat[chat_id] = bf_stream_id
         if not finalize:
@@ -15150,6 +15196,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._drop_stream_state(chat_id, message_id)
                     self._record_recently_finalized(message_id, chat_id, loop_now)
                     self._mark_personal_stream_final_posted(chat_id)
+                else:
+                    state["last_accepted_content"] = clean_content
                 return SendResult(success=True, message_id=state.get("bf_stream_id") or "")
 
             code, body = self._bf_error_parts(resp)
@@ -15170,6 +15218,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 # error tags Hermes can surface to operators. The log line
                 # above keeps the HTTP status and BF body (#83).
                 err_msg = self._extract_error_message(resp)
+                recovery_msg = ""
+                try:
+                    _err = (resp.json() or {}).get("error") or {}
+                    if isinstance(_err, dict) and isinstance(_err.get("message"), str):
+                        recovery_msg = _err.get("message")
+                except Exception:
+                    pass
                 low = err_msg.lower()
                 if (
                     wire_finalize
@@ -15190,6 +15245,55 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._remember_personal_final_anchor(chat_id, anchor)
                     self._mark_personal_stream_final_posted(chat_id)
                     return SendResult(success=True, message_id=landed_id)
+                if (
+                    code == "ContentStreamNotAllowed"
+                    and state.get("bf_stream_id")
+                    and recovery_msg.strip()
+                    and "already completed" not in low
+                    and "exceeded streaming time" not in low
+                    and "canceled by user" not in low
+                    and "cancelled by user" not in low
+                    and "message size too large" not in low
+                ):
+                    bf_stream_id = str(state["bf_stream_id"])
+                    outcome = await self._auto_finalize_stale_stream(
+                        chat_id=str(chat_id),
+                        message_id=str(message_id),
+                        inbound=inbound,
+                        final_content=clean_content,
+                        recovery_mode=True,
+                    )
+                    if outcome is True or (outcome == "already_completed" and wire_finalize):
+                        if wire_finalize:
+                            anchor = str(state.get("reply_anchor") or "") or (
+                                self._personal_reply_anchor(None, inbound)
+                            )
+                            if outcome == "already_completed":
+                                landed_id = str(state.get("bf_stream_id") or message_id)
+                                for tomb_id in {requested_message_id, str(message_id), landed_id}:
+                                    if tomb_id:
+                                        self._record_recently_finalized(tomb_id, chat_id, loop_now)
+                                self._remember_personal_final_anchor(chat_id, anchor)
+                                self._mark_personal_stream_final_posted(chat_id)
+                                return SendResult(success=True, message_id=landed_id)
+                            self._remember_personal_final_anchor(chat_id, anchor)
+                        else:
+                            self._personal_stream_plain_fallback_pending[
+                                str(chat_id)
+                            ] = bf_stream_id
+                        return SendResult(success=True, message_id=bf_stream_id)
+                    if wire_finalize and _strip_streaming_cursor(
+                        str(state.get("last_accepted_content") or "")
+                    ) == _strip_streaming_cursor(clean_content):
+                        self._personal_stream_plain_fallback_pending.pop(str(chat_id), None)
+                        anchor = str(state.get("reply_anchor") or "") or (
+                            self._personal_reply_anchor(None, inbound)
+                        )
+                        if anchor:
+                            self._remember_personal_final_anchor(chat_id, anchor)
+                            self._mark_personal_stream_final_posted(chat_id)
+                    elif sid := str(state.get("bf_stream_id") or "").strip():
+                        self._personal_stream_plain_fallback_pending[str(chat_id)] = sid
                 if state.get("bf_stream_id"):
                     for raw in (
                         requested_message_id,
@@ -15209,13 +15313,14 @@ class Agent365Adapter(BasePlatformAdapter):
                     short = "streaming timeout"
                 elif "canceled by user" in low or "cancelled by user" in low:
                     short = "streaming canceled by user"
-                    cancel_key = str(chat_id)
-                    if cancel_key:
-                        self._personal_stream_cancelled.add(cancel_key)
                 elif "message size too large" in low:
                     short = "streaming message too large"
                 elif "already completed" in low:
                     short = "streaming already completed"
+                if short == "streaming canceled by user":
+                    cancel_key = str(chat_id)
+                    if cancel_key:
+                        self._personal_stream_cancelled.add(cancel_key)
                 return SendResult(success=False, error=short)
 
             if resp.status_code == 429:
@@ -15266,7 +15371,9 @@ class Agent365Adapter(BasePlatformAdapter):
         chat_id: str,
         message_id: str,
         inbound: dict[str, Any],
-    ) -> bool:
+        final_content: str | None = None,
+        recovery_mode: bool = False,
+    ) -> bool | str:
         """Emit a synthetic ``streamType=final`` POST to close a stream
         that Hermes' consumer abandoned without calling
         ``edit_message(finalize=True)``. Best-effort: any failure here
@@ -15284,7 +15391,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # Nothing to close, or never received a stream id from
             # Microsoft (stream-start failed). Just drop the slot.
             self._drop_stream_state(chat_id, message_id)
-            return True
+            return not recovery_mode
         auth_inbound = self._inbound_for_record(state.get("authority_record"), chat_id)
         if auth_inbound is not None:
             inbound = auth_inbound
@@ -15304,14 +15411,16 @@ class Agent365Adapter(BasePlatformAdapter):
         conv_id = conv.get("id")
         if not service_url or not conv_id:
             self._drop_stream_state(chat_id, message_id)
-            return True
+            return not recovery_mode
 
         # BF rejects final activities with empty text (400 BadSyntax).
         # Use the last content we streamed for this stream; fall back to
         # a single space if nothing was tracked. The text content is
         # what becomes the visible bubble's final state, so this is
         # also what the user reads.
-        final_text = state.get("last_content") or " "
+        final_text = (
+            final_content if final_content is not None else (state.get("last_content") or " ")
+        )
         bridge = _import_bridge()
         activity = {
             "type": "message",
@@ -15366,6 +15475,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 bf_error_body=str(e),
                 attempt=1,
             )
+            if recovery_mode:
+                return False
             return self._record_stale_finalize_failure(
                 chat_id=chat_id,
                 message_id=message_id,
@@ -15379,11 +15490,12 @@ class Agent365Adapter(BasePlatformAdapter):
             return False
 
         if 200 <= resp.status_code < 300:
-            logger.info(
-                "agent365 auto-finalize stale stream %s: status=%s",
-                bf_stream_id,
-                resp.status_code,
-            )
+            if not recovery_mode:
+                logger.info(
+                    "agent365 auto-finalize stale stream %s: status=%s",
+                    bf_stream_id,
+                    resp.status_code,
+                )
             self._drop_stream_state(chat_id, message_id)
             loop_now = asyncio.get_event_loop().time()
             self._record_recently_finalized(message_id, chat_id, loop_now)
@@ -15401,6 +15513,17 @@ class Agent365Adapter(BasePlatformAdapter):
             bf_error_body=body,
             attempt=1,
         )
+        if recovery_mode:
+            em = self._extract_error_message(resp).casefold()
+            if (
+                resp.status_code == 403
+                and code == "ContentStreamNotAllowed"
+                and "already completed" in em
+                and "cancel" not in em
+            ):
+                self._drop_stream_state(chat_id, message_id)
+                return "already_completed"
+            return False
         return self._record_stale_finalize_failure(
             chat_id=chat_id,
             message_id=message_id,
