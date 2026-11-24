@@ -7232,18 +7232,28 @@ class Agent365Adapter(BasePlatformAdapter):
         """Suppress informative typing once a split marked answer is buffered (#357)."""
         return self._split_marked_answer_pending(buf, turn)
 
-    async def _finalize_keepalive_before_plain_overflow(
+    async def _close_keepalive_before_plain_send(
         self, chat_id: str, buf: dict[str, Any]
     ) -> bool:
-        """Close an open informative stream before plain overflow. Caller holds the lock."""
-        stream = self._keepalive_state(buf)
-        stream_id = str(stream.get("stream_id") or "")
+        """Close an open informative stream before a plain chunk send. Caller holds the lock."""
+        stream_id = str(self._keepalive_state(buf).get("stream_id") or "")
         if not stream_id:
             return True
         self._cancel_turn_buffer_keepalive(buf)
         if self._turn_buffers.get(chat_id) is not buf:
             return False
         return await self._close_turn_buffer_keepalive_locked(chat_id)
+
+    def _defer_turn_buffer_plain_chunk(
+        self, chat_id: str, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> None:
+        record = self._delivery_record(buf, turn)
+        if record.get("force_plain"):
+            record["plain_attempts"] = int(record.get("plain_attempts") or 0) + 1
+        else:
+            record["state"] = "DEFERRED"
+        buf["retry_turn_key"] = record["turn_key"]
+        self._schedule_turn_buffer_retry_if_allowed(chat_id, record["turn_key"])
 
     def _unmarked_final_merge_active(self, buf: dict[str, Any], turn: dict[str, Any]) -> bool:
         if self._turn_has_marked_answer(buf, turn):
@@ -10334,16 +10344,12 @@ class Agent365Adapter(BasePlatformAdapter):
                         self._release_copilot_member_added_for_turn(chat_id, turn)
                         first_chunk_on_stream = False
                         continue
-                plain_overflow = chunked_flush and not first_chunk_on_stream
-                if plain_overflow:
+                plain_chunk = not first_chunk_on_stream
+                if plain_chunk:
                     live = self._turn_buffers.get(chat_id)
                     if isinstance(live, dict):
-                        if not await self._finalize_keepalive_before_plain_overflow(
-                            chat_id, live
-                        ):
-                            turn_key = self._delivery_record(buf, turn)["turn_key"]
-                            live["retry_turn_key"] = turn_key
-                            self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
+                        if not await self._close_keepalive_before_plain_send(chat_id, live):
+                            self._defer_turn_buffer_plain_chunk(chat_id, live, turn)
                             return
                         live["plain_overflow_keepalive_block"] = True
                         buf = live
@@ -10405,7 +10411,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         [str(segment.get("id") or "") for segment in chunk_segments],
                     )
                 finally:
-                    if plain_overflow:
+                    if plain_chunk:
                         live = self._turn_buffers.get(chat_id)
                         if isinstance(live, dict):
                             live.pop("plain_overflow_keepalive_block", None)

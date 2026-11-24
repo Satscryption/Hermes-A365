@@ -8867,6 +8867,84 @@ class TestEditMessage:
         assert any(part_two in str(segment.get("text") or "") for segment in buf["segments"])
 
     @pytest.mark.asyncio
+    async def test_issue357_single_chunk_retry_closes_before_plain_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0.01)
+        part_two = "y" * (6579 - 3499)
+        close_calls = 0
+        orig_close = a._close_turn_buffer_keepalive_locked
+
+        async def close_then_ok(_chat_id: str) -> bool:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                return False
+            return await orig_close(_chat_id)
+
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", close_then_ok)
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        await a.on_processing_complete(event, outcome="success")
+        assert overflow_at == []
+        assert any(part_two in str(s.get("text") or "") for s in a._turn_buffers[chat]["segments"])
+        await asyncio.wait_for(a._flush_turn_buffer(chat), timeout=3.0)
+        assert close_calls >= 2
+        assert overflow_at == [len(posts)], "overflow must send exactly once on retry"
+        assert posts[overflow_at[0] - 1 : overflow_at[0]] == [] or (
+            (posts[overflow_at[0] - 1].get("entities") or [{}])[0].get("streamType")
+            == "final"
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue357_plain_close_failure_exhausts_plain_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, _posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_FORCE_PLAIN_MAX_ATTEMPTS", 2)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0.01)
+        part_two = "y" * (6579 - 3499)
+
+        async def fail_close(_chat_id: str) -> bool:
+            return False
+
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", fail_close)
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        await a.on_processing_complete(event, outcome="success")
+        buf = a._turn_buffers[chat]
+        turn = next(t for t in buf["turns"] if isinstance(t, dict))
+        record = a._delivery_record(buf, turn)
+        record["force_plain"] = True
+        record["plain_attempts"] = 0
+        record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+
+        async def drain_retries() -> None:
+            for _ in range(12):
+                if record.get("force_plain_exhausted"):
+                    return
+                await a._flush_turn_buffer(chat)
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(drain_retries(), timeout=3.0)
+        assert record.get("force_plain_exhausted")
+        assert int(record.get("plain_attempts") or 0) >= 2
+        assert overflow_at == []
+
+    @pytest.mark.asyncio
     async def test_issue357_nested_split_keepalive_sleeper_survives(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
