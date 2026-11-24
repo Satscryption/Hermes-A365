@@ -8733,6 +8733,199 @@ class TestEditMessage:
             for body in posts[overflow_idx:]
         )
 
+    @staticmethod
+    def _issue357_wrap_finish_leave_stream_id(adapter: Any) -> Any:
+        orig = adapter._finish_delivered
+
+        def wrap(
+            chat_id: str,
+            buf: dict[str, Any],
+            turn: dict[str, Any],
+            record: dict[str, Any],
+            *,
+            stream_id: str,
+            **kwargs: Any,
+        ) -> tuple[str, str | None]:
+            kept = str(stream_id or "")
+            out = orig(
+                chat_id,
+                buf,
+                turn,
+                record,
+                stream_id=stream_id,
+                **kwargs,
+            )
+            live = adapter._turn_buffers.get(chat_id)
+            if kept and isinstance(live, dict):
+                stream = adapter_mod.Agent365Adapter._keepalive_state(live)
+                stream["stream_id"] = kept
+                live["keepalive"] = stream
+            return out
+
+        return wrap
+
+    @staticmethod
+    def _issue357_split_overflow_common(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[Any, str, _StubMessageEvent, list[dict[str, Any]], list[int]]:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-overflow-wire"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-357", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow_at: list[int] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return TestEditMessage._http_result(201, "ka-357-wire")
+            if entity.get("streamId") == "ka-357-wire":
+                return TestEditMessage._http_result(202, "ka-357-wire")
+            return TestEditMessage._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**_kwargs: Any) -> None:
+            overflow_at.append(len(posts))
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-357",
+        )
+        return a, chat, event, posts, overflow_at
+
+    @pytest.mark.asyncio
+    async def test_issue357_plain_overflow_finalize_no_deadlock_with_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-357-wire",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content="y" * (6579 - 3499), reply_to="act-357")
+        await asyncio.wait_for(
+            a.on_processing_complete(event, outcome="success"),
+            timeout=5.0,
+        )
+        assert overflow_at, "overflow plain send should run"
+        overflow_idx = overflow_at[0]
+        finals_before = [
+            body
+            for body in posts[:overflow_idx]
+            if (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert finals_before, "keep-alive must finalize before overflow"
+        assert any(
+            (body.get("entities") or [{}])[0].get("streamId") == "ka-357-wire"
+            for body in finals_before
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue357_plain_overflow_close_failure_defers_chunk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, _posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+
+        async def fail_close(_chat_id: str) -> bool:
+            return False
+
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", fail_close)
+        part_two = "y" * (6579 - 3499)
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        await a.on_processing_complete(event, outcome="success")
+        assert overflow_at == []
+        buf = a._turn_buffers[chat]
+        assert buf.get("retry_turn_key")
+        assert any(part_two in str(segment.get("text") or "") for segment in buf["segments"])
+
+    @pytest.mark.asyncio
+    async def test_issue357_nested_split_keepalive_sleeper_survives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-nested-sleeper"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-outer", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        outer_event = _StubMessageEvent(
+            text="outer",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(outer_event)
+        await a.send(chat_id=chat, content="Outer still open", reply_to="act-outer")
+        inbound["id"] = "act-inner"
+        inner_event = _StubMessageEvent(
+            text="inner",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-inner",
+        )
+        _prime_processing_turn(a, inbound, inner_event)
+        await a.on_processing_start(inner_event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-inner")
+        await a.send(chat_id=chat, content="y" * (6579 - 3499), reply_to="act-inner")
+        await a.on_processing_complete(inner_event, outcome="success")
+        await asyncio.sleep(0)
+        buf = a._turn_buffers[chat]
+        task = buf.get("keepalive_task")
+        assert isinstance(task, asyncio.Task)
+        assert not task.done()
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-nested")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert any(
+            body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
+            and body.get("type") == "typing"
+            for body in posts
+        )
+
     @pytest.mark.asyncio
     async def test_open_turn_is_not_posted_before_complete(
         self, monkeypatch: pytest.MonkeyPatch

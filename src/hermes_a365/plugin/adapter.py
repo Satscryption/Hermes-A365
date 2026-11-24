@@ -7234,16 +7234,16 @@ class Agent365Adapter(BasePlatformAdapter):
 
     async def _finalize_keepalive_before_plain_overflow(
         self, chat_id: str, buf: dict[str, Any]
-    ) -> None:
-        """Close an open informative stream on the wire before plain overflow (#357)."""
-        self._cancel_turn_buffer_keepalive(buf)
+    ) -> bool:
+        """Close an open informative stream before plain overflow. Caller holds the lock."""
         stream = self._keepalive_state(buf)
-        if not str(stream.get("stream_id") or ""):
-            return
-        async with self._turn_buffer_lock(buf):
-            if self._turn_buffers.get(chat_id) is not buf:
-                return
-            await self._close_turn_buffer_keepalive_locked(chat_id)
+        stream_id = str(stream.get("stream_id") or "")
+        if not stream_id:
+            return True
+        self._cancel_turn_buffer_keepalive(buf)
+        if self._turn_buffers.get(chat_id) is not buf:
+            return False
+        return await self._close_turn_buffer_keepalive_locked(chat_id)
 
     def _unmarked_final_merge_active(self, buf: dict[str, Any], turn: dict[str, Any]) -> bool:
         if self._turn_has_marked_answer(buf, turn):
@@ -10221,7 +10221,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stream_record = self._delivery_record(buf, turn)
             first_chunk_on_stream = not stream_record.get("answer_final_settled")
             chunked_flush = len(chunks) > 1
-            if chunked_flush:
+            if chunked_flush and str(self._keepalive_state(buf).get("stream_id") or ""):
                 self._cancel_turn_buffer_keepalive(buf)
             for chunk_segments, content in chunks:
                 if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(chat_id):
@@ -10338,7 +10338,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 if plain_overflow:
                     live = self._turn_buffers.get(chat_id)
                     if isinstance(live, dict):
-                        await self._finalize_keepalive_before_plain_overflow(chat_id, live)
+                        if not await self._finalize_keepalive_before_plain_overflow(
+                            chat_id, live
+                        ):
+                            turn_key = self._delivery_record(buf, turn)["turn_key"]
+                            live["retry_turn_key"] = turn_key
+                            self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
+                            return
                         live["plain_overflow_keepalive_block"] = True
                         buf = live
                 try:
