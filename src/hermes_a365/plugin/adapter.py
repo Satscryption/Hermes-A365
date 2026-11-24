@@ -7232,16 +7232,18 @@ class Agent365Adapter(BasePlatformAdapter):
         """Suppress informative typing once a split marked answer is buffered (#357)."""
         return self._split_marked_answer_pending(buf, turn)
 
-    def _retire_keepalive_for_plain_overflow(self, chat_id: str, buf: dict[str, Any]) -> None:
-        """End informative stream state before plain overflow chunks (#357)."""
+    async def _finalize_keepalive_before_plain_overflow(
+        self, chat_id: str, buf: dict[str, Any]
+    ) -> None:
+        """Close an open informative stream on the wire before plain overflow (#357)."""
         self._cancel_turn_buffer_keepalive(buf)
         stream = self._keepalive_state(buf)
-        stream["stream_id"] = ""
-        stream["stopped"] = True
-        if not stream.get("closed_by"):
-            stream["closed_by"] = "plain_overflow"
-        buf["keepalive"] = stream
-        buf["skip_stream_open"] = True
+        if not str(stream.get("stream_id") or ""):
+            return
+        async with self._turn_buffer_lock(buf):
+            if self._turn_buffers.get(chat_id) is not buf:
+                return
+            await self._close_turn_buffer_keepalive_locked(chat_id)
 
     def _unmarked_final_merge_active(self, buf: dict[str, Any], turn: dict[str, Any]) -> bool:
         if self._turn_has_marked_answer(buf, turn):
@@ -7673,7 +7675,9 @@ class Agent365Adapter(BasePlatformAdapter):
     @staticmethod
     def _turn_buffer_delivery_blocks_keepalive(buf: dict[str, Any]) -> bool:
         return bool(
-            buf.get("answer_final_in_progress") or buf.get("plain_reply_flush_in_progress")
+            buf.get("answer_final_in_progress")
+            or buf.get("plain_reply_flush_in_progress")
+            or buf.get("plain_overflow_keepalive_block")
         )
 
     def _plain_flush_retry_still_valid(
@@ -10330,67 +10334,75 @@ class Agent365Adapter(BasePlatformAdapter):
                         self._release_copilot_member_added_for_turn(chat_id, turn)
                         first_chunk_on_stream = False
                         continue
-                if chunked_flush and not first_chunk_on_stream:
+                plain_overflow = chunked_flush and not first_chunk_on_stream
+                if plain_overflow:
                     live = self._turn_buffers.get(chat_id)
                     if isinstance(live, dict):
-                        self._retire_keepalive_for_plain_overflow(chat_id, live)
+                        await self._finalize_keepalive_before_plain_overflow(chat_id, live)
+                        live["plain_overflow_keepalive_block"] = True
                         buf = live
-                result = await self._send_reply_activity(
-                    inbound=inbound,
-                    content=content,
-                    log_context="turn buffer",
-                    validated_path=path,
-                    reply_origin=reply_origin,
-                    turn_buffer_flush=(
-                        chat_id,
-                        buf,
-                        tuple(str(segment.get("id") or "") for segment in chunk_segments),
-                    ),
-                )
-                if not result.success:
-                    error = str(result.error or "")
+                try:
+                    result = await self._send_reply_activity(
+                        inbound=inbound,
+                        content=content,
+                        log_context="turn buffer",
+                        validated_path=path,
+                        reply_origin=reply_origin,
+                        turn_buffer_flush=(
+                            chat_id,
+                            buf,
+                            tuple(str(segment.get("id") or "") for segment in chunk_segments),
+                        ),
+                    )
+                    if not result.success:
+                        error = str(result.error or "")
+                        live = self._turn_buffers.get(chat_id)
+                        if live is None:
+                            return
+                        buf = live
+                        if _POST_SEND_TIMEOUT_MARKER in error.casefold():
+                            logger.warning(
+                                "agent365 turn buffer treating timed-out post as "
+                                "delivered: chat_id=%s error=%s",
+                                chat_id,
+                                error,
+                            )
+                            record = self._delivery_record(buf, turn)
+                            record["state"] = "DONE"
+                            record["plain_due"] = False
+                            record["plain_reason"] = ""
+                            record["answer_final_settled"] = True
+                            buf.pop("keepalive_rotated", None)
+                            self._remove_turn_segments(
+                                buf,
+                                [str(segment.get("id") or "") for segment in chunk_segments],
+                            )
+                            self._purge_turn_delivery_records(buf)
+                            self._bump_answer_delivered_epoch(buf)
+                            self._release_copilot_member_added_for_turn(chat_id, turn)
+                            continue
+                        logger.warning(
+                            "agent365 turn buffer flush failed: chat_id=%s error=%s",
+                            chat_id,
+                            error,
+                        )
+                        turn_key = self._delivery_record(buf, turn)["turn_key"]
+                        buf["retry_turn_key"] = turn_key
+                        self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
+                        return
                     live = self._turn_buffers.get(chat_id)
                     if live is None:
                         return
                     buf = live
-                    if _POST_SEND_TIMEOUT_MARKER in error.casefold():
-                        logger.warning(
-                            "agent365 turn buffer treating timed-out post as "
-                            "delivered: chat_id=%s error=%s",
-                            chat_id,
-                            error,
-                        )
-                        record = self._delivery_record(buf, turn)
-                        record["state"] = "DONE"
-                        record["plain_due"] = False
-                        record["plain_reason"] = ""
-                        record["answer_final_settled"] = True
-                        buf.pop("keepalive_rotated", None)
-                        self._remove_turn_segments(
-                            buf,
-                            [str(segment.get("id") or "") for segment in chunk_segments],
-                        )
-                        self._purge_turn_delivery_records(buf)
-                        self._bump_answer_delivered_epoch(buf)
-                        self._release_copilot_member_added_for_turn(chat_id, turn)
-                        continue
-                    logger.warning(
-                        "agent365 turn buffer flush failed: chat_id=%s error=%s",
-                        chat_id,
-                        error,
+                    self._remove_turn_segments(
+                        buf,
+                        [str(segment.get("id") or "") for segment in chunk_segments],
                     )
-                    turn_key = self._delivery_record(buf, turn)["turn_key"]
-                    buf["retry_turn_key"] = turn_key
-                    self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
-                    return
-                live = self._turn_buffers.get(chat_id)
-                if live is None:
-                    return
-                buf = live
-                self._remove_turn_segments(
-                    buf,
-                    [str(segment.get("id") or "") for segment in chunk_segments],
-                )
+                finally:
+                    if plain_overflow:
+                        live = self._turn_buffers.get(chat_id)
+                        if isinstance(live, dict):
+                            live.pop("plain_overflow_keepalive_block", None)
             if link_alone and suffix.strip():
                 link_closed = await self._close_turn_buffer_keepalive_locked(chat_id)
                 if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(chat_id):
