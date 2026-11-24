@@ -8,6 +8,11 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
+- **#356 — Personal Teams stream edits rejected with 403 ContentStreamNotAllowed**
+  close the open stream with a recovery `streamType=final` when possible,
+  route a failed recovery to one plain `send_reply` (not a second stream),
+  and add INFO diagnostics for stream start and fallback cleanup.
+
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 
 ## [0.9.8] — 2026-11-23

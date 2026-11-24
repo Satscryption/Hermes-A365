@@ -2030,6 +2030,10 @@ class Agent365Adapter(BasePlatformAdapter):
         # adapter typing pulses and fresh stream opens until the next outer
         # personal turn starts (#326 M2).
         self._personal_stream_cancelled: set[str] = set()
+        # After a recoverable stream-edit 403 fails to close via
+        # streamType=final, the next notify send must plain-post once
+        # instead of opening another stream (#356).
+        self._personal_stream_plain_fallback_pending: set[str] = set()
         # Personal turns nest when Hermes runs an in-band follow-up before
         # the outer stream consumer is cancelled. The outer 1:1 stream is
         # finalized only when this count returns to 0 (#161).
@@ -4081,6 +4085,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._active_stream_by_chat.clear()
         self._personal_stream_final_posted.clear()
         self._personal_stream_cancelled.clear()
+        self._personal_stream_plain_fallback_pending.clear()
         self._personal_processing_depth.clear()
         self._personal_final_landed.clear()
         self._nested_personal_reply.clear()
@@ -6085,6 +6090,39 @@ class Agent365Adapter(BasePlatformAdapter):
         if (
             chat_type == "personal"
             and reply_to is not None
+            and chat_id in self._personal_stream_plain_fallback_pending
+            and self._metadata_requests_stream_final(metadata)
+        ):
+            self._personal_stream_plain_fallback_pending.discard(str(chat_id))
+            logger.info(
+                "agent365 personal stream fallback after rejected edit: "
+                "path=plain_send chat_id=%s",
+                chat_id,
+            )
+            result = await self._send_reply_activity(
+                inbound=inbound,
+                content=content,
+                log_context="send",
+                citations=(metadata or {}).get("citations"),
+                validated_path=turn_validated_path,
+                reply_origin=coalesced_origin,
+            )
+            outcome = "delivered" if result.success else "rejected"
+            logger.info(
+                "agent365 personal stream plain fallback cleanup: "
+                "chat_id=%s outcome=%s",
+                chat_id,
+                outcome,
+            )
+            if result.success and result.message_id:
+                anchor = self._personal_reply_anchor(reply_to, inbound)
+                self._record_recently_finalized(result.message_id, chat_id)
+                self._remember_personal_final_anchor(chat_id, anchor)
+                self._mark_personal_stream_final_posted(chat_id)
+            return result
+        if (
+            chat_type == "personal"
+            and reply_to is not None
             and chat_id not in self._active_stream_by_chat
         ):
             stream_result = await self._send_stream_start(
@@ -6333,6 +6371,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if prev_depth == 0:
                     self._clear_personal_typing_suppression(chat_id)
                     self._personal_stream_cancelled.discard(str(chat_id))
+                    self._personal_stream_plain_fallback_pending.discard(str(chat_id))
                     if record is not None:
                         session_key = str(record.session_key or "").strip()
                         if session_key:
@@ -11486,6 +11525,11 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 stream-start 201 without id; falling back")
             return None
         bf_stream_id = str(bf_stream_id)
+        logger.info(
+            "agent365 personal stream started: chat_id=%s stream_id=%s",
+            chat_id,
+            bf_stream_id,
+        )
         self._remember_bot_reply(bf_stream_id, conversation_id=str(chat_id))
 
         loop = asyncio.get_event_loop()
@@ -14243,6 +14287,23 @@ class Agent365Adapter(BasePlatformAdapter):
             code_out,
         )
 
+    @staticmethod
+    def _personal_stream_403_needs_recovery_final(
+        *, code: str, err_msg: str, bf_stream_id: Any
+    ) -> bool:
+        if not bf_stream_id or code != "ContentStreamNotAllowed":
+            return False
+        low = err_msg.casefold()
+        if "already completed" in low:
+            return False
+        if "exceeded streaming time" in low:
+            return False
+        if "canceled by user" in low or "cancelled by user" in low:
+            return False
+        if "message size too large" in low:
+            return False
+        return True
+
     def _stream_edit_should_retry(
         self,
         state: dict[str, Any],
@@ -15010,6 +15071,11 @@ class Agent365Adapter(BasePlatformAdapter):
                         error="streaming start returned no id",
                     )
                 state["bf_stream_id"] = str(stream_id)
+                logger.info(
+                    "agent365 personal stream started: chat_id=%s stream_id=%s",
+                    chat_id,
+                    str(stream_id),
+                )
                 self._remember_bot_reply(str(stream_id), conversation_id=str(chat_id))
                 self._active_stream_by_chat[chat_id] = message_id
                 if finalize:
@@ -15094,6 +15160,41 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._remember_personal_final_anchor(chat_id, anchor)
                     self._mark_personal_stream_final_posted(chat_id)
                     return SendResult(success=True, message_id=landed_id)
+                if self._personal_stream_403_needs_recovery_final(
+                    code=code, err_msg=err_msg, bf_stream_id=state.get("bf_stream_id")
+                ):
+                    bf_stream_id = str(state["bf_stream_id"])
+                    logger.info(
+                        "agent365 personal stream recovery final attempted: "
+                        "chat_id=%s stream_id=%s",
+                        chat_id,
+                        bf_stream_id,
+                    )
+                    state["last_content"] = clean_content
+                    closed = await self._auto_finalize_stale_stream(
+                        chat_id=str(chat_id),
+                        message_id=str(message_id),
+                        inbound=inbound,
+                    )
+                    logger.info(
+                        "agent365 personal stream recovery final outcome: "
+                        "chat_id=%s stream_id=%s result=%s",
+                        chat_id,
+                        bf_stream_id,
+                        "delivered" if closed else "rejected",
+                    )
+                    if closed:
+                        anchor = str(state.get("reply_anchor") or "")
+                        if not anchor:
+                            anchor = self._personal_reply_anchor(None, inbound)
+                        self._remember_personal_final_anchor(chat_id, anchor)
+                        return SendResult(success=True, message_id=bf_stream_id)
+                    self._personal_stream_plain_fallback_pending.add(str(chat_id))
+                    logger.info(
+                        "agent365 personal stream fallback after rejected edit: "
+                        "path=pending_plain_send chat_id=%s",
+                        chat_id,
+                    )
                 if state.get("bf_stream_id"):
                     for raw in (
                         requested_message_id,
@@ -15113,13 +15214,14 @@ class Agent365Adapter(BasePlatformAdapter):
                     short = "streaming timeout"
                 elif "canceled by user" in low or "cancelled by user" in low:
                     short = "streaming canceled by user"
-                    cancel_key = str(chat_id)
-                    if cancel_key:
-                        self._personal_stream_cancelled.add(cancel_key)
                 elif "message size too large" in low:
                     short = "streaming message too large"
                 elif "already completed" in low:
                     short = "streaming already completed"
+                if short == "streaming canceled by user":
+                    cancel_key = str(chat_id)
+                    if cancel_key:
+                        self._personal_stream_cancelled.add(cancel_key)
                 return SendResult(success=False, error=short)
 
             if resp.status_code == 429:
