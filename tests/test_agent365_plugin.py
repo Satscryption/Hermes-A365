@@ -8342,6 +8342,79 @@ class TestEditMessage:
         assert "conv-G-split" not in a._turn_buffers
 
     @pytest.mark.asyncio
+    async def test_issue357_long_split_no_empty_or_misleading_posts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#357: capped split delivery posts only substantive chunks and neutral keep-alive."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-split"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-357", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-357")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            overflow.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        part_one = "x" * 3499
+        part_two = "y" * (6579 - 3499)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-357",
+        )
+        await a.on_processing_start(event)
+        first = await a.send(chat_id=chat, content=part_one, reply_to="act-357")
+        assert first.success is True
+        second = await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        assert second.success is True
+        buf = a._turn_buffers[chat]
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
+        await a.on_processing_complete(event, outcome="success")
+        for body in posts:
+            if body.get("type") in ("message", "typing"):
+                assert str(body.get("text") or "").strip()
+                assert body.get("text") != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        finals = [
+            body
+            for body in posts
+            if body.get("type") == "message"
+            and (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert len(finals) == 1
+        assert finals[0]["text"] == part_one
+        assert overflow == [part_two]
+        informative_texts = [
+            str(body.get("text") or "")
+            for body in posts
+            if (body.get("entities") or [{}])[0].get("streamType") == "informative"
+        ]
+        assert adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT not in informative_texts
+        assert "new message" not in " ".join(informative_texts).casefold()
+
+    @pytest.mark.asyncio
     async def test_open_turn_is_not_posted_before_complete(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -9613,7 +9686,7 @@ class TestEditMessage:
         }
         assert (
             a._sanitize_informative_stream_text(buf_slow, turn, "slept", for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
         clipped = "x" * adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
         long_answer = clipped + "tail"
@@ -9623,7 +9696,7 @@ class TestEditMessage:
         }
         assert (
             a._sanitize_informative_stream_text(buf_long, turn, clipped, for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
 
     def test_walk095_sanitize_uses_progress_fallback_after_interval(
@@ -9656,12 +9729,12 @@ class TestEditMessage:
         joined = "Line one.\n\nLine two."
         assert (
             a._sanitize_informative_stream_text(buf, turn, joined, for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
         prefix = "Line one.\n\nLine tw"
         assert (
             a._sanitize_informative_stream_text(buf, turn, prefix, for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
@@ -12808,9 +12881,33 @@ class TestEditMessage:
             "segments": [],
         }
         text = a._informative_text_for_turn(buf, turn)
-        assert text == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert text == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         assert text != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert "new message" not in text.casefold()
         assert text.strip()
+
+    def test_informative_status_claims_new_message_only_when_rotation_plain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        turn = {"seq": "1", "inbound": _make_inbound(conv_id="c", activity_id="a")}
+        buf_idle: dict[str, Any] = {
+            "turns": [turn],
+            "segments": [],
+            "keepalive": {"stream_id": "ka", "opened_mono": time.monotonic()},
+        }
+        assert not a._informative_status_claims_new_message(buf_idle)
+        assert (
+            a._visible_informative_fallback_text(buf_idle, turn)
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
+        )
+        buf_rotated: dict[str, Any] = dict(buf_idle)
+        buf_rotated["keepalive_rotated"] = True
+        assert a._informative_status_claims_new_message(buf_rotated)
+        assert (
+            a._visible_informative_fallback_text(buf_rotated, turn)
+            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        )
 
     def test_rotation_close_text_prefers_progress_over_leadin(
         self, monkeypatch: pytest.MonkeyPatch
@@ -15065,11 +15162,7 @@ class TestEditMessage:
         await a.send(chat_id=chat, content="Part two of the answer.", reply_to=None)
         await self._spin_until(
             lambda: any(
-                body.get("text")
-                in (
-                    adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
-                    adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
-                )
+                body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
                 and body.get("type") == "typing"
                 for body in posts
             )
@@ -15184,11 +15277,7 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await self._spin_until(
             lambda: any(
-                body.get("text")
-                in (
-                    adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
-                    adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
-                )
+                body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
                 and body.get("type") == "typing"
                 for body in posts
             )
@@ -15197,7 +15286,7 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert posts[0]["text"] in (
             adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
-            adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
+            adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT,
         )
         assert not any(
             body.get("type") == "typing" and not str(body.get("text") or "").strip()

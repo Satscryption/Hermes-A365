@@ -10,6 +10,10 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 
+### Fixed
+
+- **#357 — Copilot long split replies: no empty shell or misleading keep-alive.** Informative heartbeats use neutral status text unless stream rotation or plain delivery is active; placeholder keep-alive bodies are not posted on an open stream, and multi-chunk turn flushes block overlapping keep-alive posts.
+
 ## [0.9.8] — 2026-11-23
 
 Turn-buffer reason tokens (#300), delivery-cache reclaim tests (#301),
