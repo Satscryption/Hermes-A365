@@ -13,6 +13,10 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 
+### Fixed
+
+- **#357 — Copilot long split replies: no empty shell or misleading keep-alive.** Informative heartbeats use neutral status text unless stream rotation or plain delivery is active; once a marked answer is buffering, further informative typing on the stream is suppressed so a split delivery does not leave an open shell between the stream final and plain overflow; placeholder keep-alive bodies are skipped on an open stream after the first interval; plain overflow closes any open informative stream with a keep-alive final instead of setting stop flags that would block a later turn.
+
 ## [0.9.8] — 2026-11-23
 
 Turn-buffer reason tokens (#300), delivery-cache reclaim tests (#301),
