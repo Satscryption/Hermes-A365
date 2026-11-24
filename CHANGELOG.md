@@ -8,9 +8,8 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
-- **#356 — Personal Teams `403 ContentStreamNotAllowed` on stream edits**
-  recovery `streamType=final`, plain-notify fallback with partial removal,
-  and duplicate-suppression when the stream already holds the full reply.
+- **#356 — Personal Teams stream edit `403 ContentStreamNotAllowed`:** recovery
+  final POST, plain notify with partial removal, no duplicate when complete.
 
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 

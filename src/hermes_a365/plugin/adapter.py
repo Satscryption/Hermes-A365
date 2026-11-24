@@ -2030,7 +2030,6 @@ class Agent365Adapter(BasePlatformAdapter):
         # adapter typing pulses and fresh stream opens until the next outer
         # personal turn starts (#326 M2).
         self._personal_stream_cancelled: set[str] = set()
-        # Plain notify after failed 403 recovery (#356); value is bf stream id.
         self._personal_stream_plain_fallback_pending: dict[str, str] = {}
         # Personal turns nest when Hermes runs an in-band follow-up before
         # the outer stream consumer is cancelled. The outer 1:1 stream is
@@ -6100,8 +6099,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     validated_path=turn_validated_path,
                 ):
                     logger.warning(
-                        "agent365 personal stream plain fallback partial "
-                        "removal failed: chat_id=%s stream_id=%s",
+                        "agent365 personal stream plain fallback partial removal failed: "
+                        "chat_id=%s stream_id=%s",
                         chat_id,
                         plain_stream_id,
                     )
@@ -11532,11 +11531,6 @@ class Agent365Adapter(BasePlatformAdapter):
             logger.warning("agent365 stream-start 201 without id; falling back")
             return None
         bf_stream_id = str(bf_stream_id)
-        logger.info(
-            "agent365 personal stream started: chat_id=%s stream_id=%s",
-            chat_id,
-            bf_stream_id,
-        )
         self._remember_bot_reply(bf_stream_id, conversation_id=str(chat_id))
 
         loop = asyncio.get_event_loop()
@@ -15128,15 +15122,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 # error tags Hermes can surface to operators. The log line
                 # above keeps the HTTP status and BF body (#83).
                 err_msg = self._extract_error_message(resp)
+                recovery_msg = ""
                 try:
                     _err = (resp.json() or {}).get("error") or {}
-                    recovery_msg = (
-                        _err.get("message")
-                        if isinstance(_err, dict) and isinstance(_err.get("message"), str)
-                        else ""
-                    )
+                    if isinstance(_err, dict) and isinstance(_err.get("message"), str):
+                        recovery_msg = _err.get("message")
                 except Exception:
-                    recovery_msg = ""
+                    pass
                 low = err_msg.lower()
                 if (
                     wire_finalize
@@ -15192,7 +15184,7 @@ class Agent365Adapter(BasePlatformAdapter):
                         else:
                             self._personal_stream_plain_fallback_pending[str(chat_id)] = bf_stream_id
                         return SendResult(success=True, message_id=bf_stream_id)
-                    if _strip_streaming_cursor(
+                    if wire_finalize and _strip_streaming_cursor(
                         str(state.get("last_accepted_content") or "")
                     ) == _strip_streaming_cursor(clean_content):
                         self._personal_stream_plain_fallback_pending.pop(str(chat_id), None)

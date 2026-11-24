@@ -22779,6 +22779,44 @@ class TestPersonalChatStreamCompletion:
         assert post_mock.await_count == 3
 
     @pytest.mark.asyncio
+    async def test_issue356_nonfinal_403_matching_accepted_allows_longer_notify(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        conv = "conv-356-same"
+        inbound = _make_inbound(conv_id=conv, activity_id="act-same")
+        rejected = self._generic_content_stream_not_allowed()
+        responses = [
+            MagicMock(status_code=201, text="", json=lambda: {"id": "bf-same"}),
+            MagicMock(status_code=202, text="", json=lambda: {}),
+            MagicMock(status_code=403, text="", json=lambda body=rejected: body),
+            MagicMock(status_code=403, text="", json=lambda body=rejected: body),
+        ]
+        self._wire_stream_fake(a, inbound, responses)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        send_reply = AsyncMock(
+            return_value=SimpleNamespace(status_code=201, json=lambda: {"id": "plain-same"})
+        )
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+
+        await a.edit_message(conv, "m-same", "Chunk", finalize=False)
+        await a.edit_message(conv, "m-same", "Chunk", finalize=False)
+        failed = await a.edit_message(conv, "m-same", "Chunk", finalize=False)
+        assert failed.success is False
+        assert conv in a._personal_stream_plain_fallback_pending
+        assert "act-same" not in (a._personal_final_landed.get(conv) or set())
+
+        full = "Chunk with more detail."
+        notify = await a.send(
+            conv, full, reply_to="act-same", metadata={"notify": True}
+        )
+        assert notify.success is True
+        assert send_reply.await_count == 1
+        assert send_reply.await_args.kwargs["reply"]["text"] == full
+
+    @pytest.mark.asyncio
     async def test_issue356_finalize_403_recovers_without_plain_duplicate(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -22953,7 +22991,7 @@ class TestPersonalChatStreamCompletion:
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-t"}),
             MagicMock(status_code=403, text="", json=lambda body=body: body),
         ]
-        post_mock, _, _ = self._wire_stream_fake(a, inbound, responses)
+        post_mock, attempts, _ = self._wire_stream_fake(a, inbound, responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
         await a.edit_message(conv, "m-t", "Part", finalize=False)
@@ -22961,10 +22999,19 @@ class TestPersonalChatStreamCompletion:
         failed = await a.edit_message(conv, "m-t", "Part 2", finalize=False)
         assert failed.success is False
         assert post_mock.await_count == posts_before + 1
+        pending = getattr(a, "_personal_stream_plain_fallback_pending", None)
+        if pending is not None:
+            assert conv not in pending
+        assert not any(
+            e.get("streamType") == "final"
+            for body in attempts
+            for e in body.get("entities") or []
+            if e.get("type") == "streaminfo"
+        )
 
     @pytest.mark.asyncio
     async def test_issue356_empty_403_message_skips_recovery(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-356-empty", activity_id="act-empty")
@@ -22972,14 +23019,29 @@ class TestPersonalChatStreamCompletion:
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-empty"}),
             MagicMock(status_code=403, text="", json=lambda: {"error": {"code": "ContentStreamNotAllowed"}}),
         ]
-        post_mock, _, _ = self._wire_stream_fake(a, inbound, responses)
+        conv = "conv-356-empty"
+        post_mock, attempts, _ = self._wire_stream_fake(a, inbound, responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
-        await a.edit_message("conv-356-empty", "m-empty", "A", finalize=False)
+        caplog.set_level(logging.WARNING)
+        await a.edit_message(conv, "m-empty", "A", finalize=False)
         before = post_mock.await_count
-        failed = await a.edit_message("conv-356-empty", "m-empty", "A B", finalize=False)
+        failed = await a.edit_message(conv, "m-empty", "A B", finalize=False)
         assert failed.success is False
         assert post_mock.await_count == before + 1
+        pending = getattr(a, "_personal_stream_plain_fallback_pending", None)
+        if pending is not None:
+            assert conv not in pending
+        assert not any(
+            e.get("streamType") == "final"
+            for body in attempts
+            for e in body.get("entities") or []
+            if e.get("type") == "streaminfo"
+        )
+        assert not any(
+            "phase=auto-finalize" in r.message
+            for r in caplog.records
+        )
 
     @pytest.mark.asyncio
     async def test_issue356_force_drop_age_is_not_recovery_delivered(
