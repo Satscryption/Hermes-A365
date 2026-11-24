@@ -7067,9 +7067,12 @@ class Agent365Adapter(BasePlatformAdapter):
         stream = self._keepalive_state(buf)
         stream_id = str(stream.get("stream_id") or "")
         opened = stream.get("opened_mono")
-        if stream_id and isinstance(opened, (int, float)):
-            if _keepalive_rotation_due(time.monotonic() - float(opened)):
-                return True
+        if (
+            stream_id
+            and isinstance(opened, (int, float))
+            and _keepalive_rotation_due(time.monotonic() - float(opened))
+        ):
+            return True
         turn = self._keepalive_turn(buf)
         if isinstance(turn, dict):
             record = self._delivery_record(buf, turn)
@@ -7160,6 +7163,40 @@ class Agent365Adapter(BasePlatformAdapter):
             if _segment_is_marked_answer(segment):
                 return True
         return False
+
+    def _split_marked_answer_pending(self, buf: dict[str, Any], turn: dict[str, Any]) -> bool:
+        """True when a marked answer will flush as stream final plus plain overflow."""
+        if not isinstance(turn, dict):
+            return False
+        seq = str(turn.get("seq") or "")
+        answer_segments: list[dict[str, str]] = []
+        for segment in buf.get("segments") or []:
+            if str(segment.get("turn") or "") != seq:
+                continue
+            if not _segment_is_marked_answer(segment):
+                continue
+            if str(segment.get("text") or "").strip():
+                answer_segments.append(segment)
+        if not answer_segments:
+            return False
+        return len(self._chunk_turn_segments(answer_segments)) > 1
+
+    def _marked_answer_blocks_informative_keepalive(
+        self, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> bool:
+        """Suppress informative typing once a split marked answer is buffered (#357)."""
+        return self._split_marked_answer_pending(buf, turn)
+
+    def _retire_keepalive_for_plain_overflow(self, chat_id: str, buf: dict[str, Any]) -> None:
+        """End informative stream state before plain overflow chunks (#357)."""
+        self._cancel_turn_buffer_keepalive(buf)
+        stream = self._keepalive_state(buf)
+        stream["stream_id"] = ""
+        stream["stopped"] = True
+        if not stream.get("closed_by"):
+            stream["closed_by"] = "plain_overflow"
+        buf["keepalive"] = stream
+        buf["skip_stream_open"] = True
 
     def _unmarked_final_merge_active(self, buf: dict[str, Any], turn: dict[str, Any]) -> bool:
         if self._turn_has_marked_answer(buf, turn):
@@ -7591,9 +7628,7 @@ class Agent365Adapter(BasePlatformAdapter):
     @staticmethod
     def _turn_buffer_delivery_blocks_keepalive(buf: dict[str, Any]) -> bool:
         return bool(
-            buf.get("answer_final_in_progress")
-            or buf.get("plain_reply_flush_in_progress")
-            or buf.get("chunked_turn_flush_in_progress")
+            buf.get("answer_final_in_progress") or buf.get("plain_reply_flush_in_progress")
         )
 
     def _plain_flush_retry_still_valid(
@@ -7737,6 +7772,16 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id,
                 )
                 return
+            turn = self._keepalive_turn(buf)
+            if isinstance(turn, dict) and self._marked_answer_blocks_informative_keepalive(
+                buf, turn
+            ):
+                logger.debug(
+                    "agent365 turn buffer keep-alive skip emit: "
+                    "chat_id=%s reason=split_marked_answer_buffered",
+                    chat_id,
+                )
+                return
             if not self._turn_buffer_keepalive_needed(chat_id):
                 logger.debug(
                     "agent365 turn buffer keep-alive exit: chat_id=%s reason=%s",
@@ -7855,6 +7900,13 @@ class Agent365Adapter(BasePlatformAdapter):
             not for_answer
             and self._turn_buffer_delivery_blocks_keepalive(buf)
             and not during_answer_delivery
+        ):
+            return False
+        turn = turn_for_text if isinstance(turn_for_text, dict) else self._keepalive_turn(buf)
+        if (
+            not for_answer
+            and isinstance(turn, dict)
+            and self._marked_answer_blocks_informative_keepalive(buf, turn)
         ):
             return False
         if not for_answer and not self._turn_buffer_keepalive_needed(chat_id):
@@ -8292,19 +8344,13 @@ class Agent365Adapter(BasePlatformAdapter):
             return empty
         body_text = (text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT).strip()
         buf = self._turn_buffers.get(chat_id)
-        if (
-            not final
-            and isinstance(buf, dict)
-            and buf.get("keepalive_first_interval_elapsed")
-            and (not body_text or Agent365Adapter._is_placeholder_informative_text(body_text))
-        ):
-            body_text = self._visible_informative_fallback_text(buf, turn).strip()
+        placeholder = Agent365Adapter._is_placeholder_informative_text(body_text)
         if (
             not final
             and stream_id
             and isinstance(buf, dict)
             and buf.get("keepalive_first_interval_elapsed")
-            and Agent365Adapter._is_placeholder_informative_text(body_text)
+            and placeholder
         ):
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s "
@@ -8312,6 +8358,13 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return empty
+        if (
+            not final
+            and isinstance(buf, dict)
+            and buf.get("keepalive_first_interval_elapsed")
+            and (not body_text or placeholder)
+        ):
+            body_text = self._visible_informative_fallback_text(buf, turn).strip()
         if not body_text:
             logger.debug(
                 "agent365 turn buffer keep-alive skip post: chat_id=%s reason=empty text",
@@ -10120,11 +10173,9 @@ class Agent365Adapter(BasePlatformAdapter):
             first_chunk_on_stream = not stream_record.get("answer_final_settled")
             chunked_flush = len(chunks) > 1
             if chunked_flush:
-                buf["chunked_turn_flush_in_progress"] = True
+                self._cancel_turn_buffer_keepalive(buf)
             for chunk_segments, content in chunks:
                 if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(chat_id):
-                    if chunked_flush:
-                        buf.pop("chunked_turn_flush_in_progress", None)
                     return
                 if first_chunk_on_stream:
                     chunk_ids = [str(segment.get("id") or "") for segment in chunk_segments]
@@ -10234,6 +10285,11 @@ class Agent365Adapter(BasePlatformAdapter):
                         self._release_copilot_member_added_for_turn(chat_id, turn)
                         first_chunk_on_stream = False
                         continue
+                if chunked_flush and not first_chunk_on_stream:
+                    live = self._turn_buffers.get(chat_id)
+                    if isinstance(live, dict):
+                        self._retire_keepalive_for_plain_overflow(chat_id, live)
+                        buf = live
                 result = await self._send_reply_activity(
                     inbound=inbound,
                     content=content,
@@ -10290,8 +10346,6 @@ class Agent365Adapter(BasePlatformAdapter):
                     buf,
                     [str(segment.get("id") or "") for segment in chunk_segments],
                 )
-            if chunked_flush:
-                buf.pop("chunked_turn_flush_in_progress", None)
             if link_alone and suffix.strip():
                 link_closed = await self._close_turn_buffer_keepalive_locked(chat_id)
                 if not self._turn_buffers.get(chat_id) or self._turn_reply_blocked(chat_id):

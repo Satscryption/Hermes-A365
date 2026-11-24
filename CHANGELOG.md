@@ -12,7 +12,7 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ### Fixed
 
-- **#357 — Copilot long split replies: no empty shell or misleading keep-alive.** Informative heartbeats use neutral status text unless stream rotation or plain delivery is active; placeholder keep-alive bodies are not posted on an open stream, and multi-chunk turn flushes block overlapping keep-alive posts.
+- **#357 — Copilot long split replies: no empty shell or misleading keep-alive.** Informative heartbeats use neutral status text unless stream rotation or plain delivery is active; once a marked answer is buffering, further informative typing on the stream is suppressed so a split delivery does not leave an open shell between the stream final and plain overflow; placeholder keep-alive bodies are skipped on an open stream after the first interval.
 
 ## [0.9.8] — 2026-11-23
 

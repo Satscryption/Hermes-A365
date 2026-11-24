@@ -8390,8 +8390,10 @@ class TestEditMessage:
         second = await a.send(chat_id=chat, content=part_two, reply_to="act-357")
         assert second.success is True
         buf = a._turn_buffers[chat]
+        before_emit = len(posts)
         buf["keepalive_first_interval_elapsed"] = True
         await a._emit_turn_buffer_keepalive(chat)
+        assert len(posts) == before_emit, "keep-alive must not post once marked answer is buffering"
         await a.on_processing_complete(event, outcome="success")
         for body in posts:
             if body.get("type") in ("message", "typing"):
@@ -8406,6 +8408,13 @@ class TestEditMessage:
         assert len(finals) == 1
         assert finals[0]["text"] == part_one
         assert overflow == [part_two]
+        final_idx = posts.index(finals[0])
+        after_final = posts[final_idx + 1 :]
+        assert not any(
+            body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+            for body in after_final
+        )
         informative_texts = [
             str(body.get("text") or "")
             for body in posts
@@ -8413,6 +8422,90 @@ class TestEditMessage:
         ]
         assert adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT not in informative_texts
         assert "new message" not in " ".join(informative_texts).casefold()
+
+    @pytest.mark.asyncio
+    async def test_issue357_split_flush_retry_leaves_next_silent_keepalive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Early split flush exit must not strand keep-alive for the next silent turn."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-retry-keepalive"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+
+        async def fail_deliver(*_args: Any, **_kwargs: Any) -> tuple[str, str | None]:
+            return ("retry", None)
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", fail_deliver)
+        event = _StubMessageEvent(
+            text="split",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-1")
+        await a.send(chat_id=chat, content="y" * 3080, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        buf = a._turn_buffers.get(chat)
+        assert buf is not None
+        assert "chunked_turn_flush_in_progress" not in buf
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-after-retry")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert any(
+            body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
+            and body.get("type") == "typing"
+            for body in posts
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue357_placeholder_skipped_on_open_stream_after_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-placeholder"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        turn = {"seq": "1", "inbound": inbound}
+        buf: dict[str, Any] = {
+            "turns": [turn],
+            "keepalive_first_interval_elapsed": True,
+            "keepalive": {
+                "stream_id": "ka-open",
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            },
+        }
+        a._turn_buffers[chat] = buf
+        result = await a._post_keepalive_activity(
+            chat,
+            turn,
+            stream_id="ka-open",
+            sequence=2,
+            final=False,
+            text=adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
+        )
+        assert result.status is None
+        assert post_mock.await_count == 0
 
     @pytest.mark.asyncio
     async def test_open_turn_is_not_posted_before_complete(
