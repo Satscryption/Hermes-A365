@@ -8,13 +8,10 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
-- **#358 — Personal Teams uninstall scope:** A user-scoped
-  ``installationUpdate`` remove on the personal 1:1 retires only that
-  conversation's registry record; sibling Microsoft 365 Copilot app threads
-  for the same user and agent stay cached. Siblings still run lifecycle
-  teardown so in-flight Copilot work is cancelled; proactive send can use the
-  surviving ref at the bumped chat generation. Empty ``conversationType``
-  falls back to the cached personal ref.
+- **#358 — Personal Teams uninstall scope:** personal ``installationUpdate``
+  remove drops only the 1:1 registry row; sibling Copilot threads keep their
+  ref but still run teardown (#156), and blank ``conversationType`` falls back
+  to the cached personal ref.
 
 - **#356 — Personal Teams stream edit `403 ContentStreamNotAllowed`:** recovery
   final POST, plain notify with partial removal, no duplicate when complete.

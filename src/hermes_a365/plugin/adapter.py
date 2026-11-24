@@ -15630,30 +15630,6 @@ class Agent365Adapter(BasePlatformAdapter):
         if self._active_stream_by_chat.get(chat_id) == message_id:
             self._active_stream_by_chat.pop(chat_id, None)
 
-    def _uninstall_conversation_type(
-        self,
-        activity: dict[str, Any],
-        named: str,
-        cached: ConversationRef | None = None,
-    ) -> str:
-        """Resolve ``conversationType`` for an uninstall, including cache fallback."""
-        conv = activity.get("conversation")
-        conv_type = (
-            str(conv.get("conversationType") or "").strip().lower()
-            if isinstance(conv, dict)
-            else ""
-        )
-        if conv_type:
-            return conv_type
-        if cached is None and named:
-            cached = self._conversations.get(named)
-        if cached is not None:
-            raw = cached.raw if isinstance(cached.raw, dict) else {}
-            conv_raw = raw.get("conversation")
-            if isinstance(conv_raw, dict):
-                return str(conv_raw.get("conversationType") or "").strip().lower()
-        return ""
-
     def _uninstall_teardown_conversation_ids(
         self, activity: dict[str, Any], *, jwt_app_id: str = ""
     ) -> list[str]:
@@ -15694,37 +15670,28 @@ class Agent365Adapter(BasePlatformAdapter):
     def _uninstall_conversation_ids(
         self, activity: dict[str, Any], *, jwt_app_id: str = ""
     ) -> list[str]:
-        """Registry ids to evict for an ``installationUpdate`` remove.
-
-        Always includes the conversation named on the activity. On the
-        personal Teams 1:1 (``conversationType`` ``personal``, including
-        when that type is read from the cached ref) that is the only
-        registry eviction — siblings are torn down separately. On any other
-        conversation type, also includes every cached conversation for the
-        same Entra user and the same bot app when both sides have equal
-        strong ids.
-
-        The named conversation's cached ref may supply an ``aadObjectId`` or
-        app GUID the uninstall payload omitted. That copy happens only when
-        this side has no strong id. Disagreeing object ids or app GUIDs are
-        not unioned, and a conflict retires only the named chat. ``from.id``
-        alone never selects a sibling. ``jwt_app_id`` (the inbound audience)
-        is ignored: a weak ``aud`` must not authorize retiring another chat.
-        """
+        """Registry rows to drop for ``installationUpdate`` remove (#358, #156)."""
+        del jwt_app_id
         conv = activity.get("conversation")
         named = (
             str(conv.get("id")).strip()
             if isinstance(conv, dict) and isinstance(conv.get("id"), str)
             else ""
         )
-        cached = self._conversations.get(named) if named else None
-        matched = self._uninstall_teardown_conversation_ids(
-            activity, jwt_app_id=jwt_app_id
+        matched = self._uninstall_teardown_conversation_ids(activity)
+        conv_type = (
+            str(conv.get("conversationType") or "").strip().lower()
+            if isinstance(conv, dict)
+            else ""
         )
-        if (
-            named
-            and self._uninstall_conversation_type(activity, named, cached) == "personal"
-        ):
+        if not conv_type and named:
+            cached = self._conversations.get(named)
+            if cached is not None:
+                raw = cached.raw if isinstance(cached.raw, dict) else {}
+                conv_raw = raw.get("conversation")
+                if isinstance(conv_raw, dict):
+                    conv_type = str(conv_raw.get("conversationType") or "").strip().lower()
+        if named and conv_type == "personal":
             return [named]
         return matched
 
@@ -15932,9 +15899,7 @@ class Agent365Adapter(BasePlatformAdapter):
             self._pre_auth_chat_task_done(chat_id, current)
         ok = await self._teardown_chat_state(chat_id)
         if ok and self._conversations.get(chat_id) is not None:
-            # The cached ref survives for proactive delivery; do not leave a
-            # sibling stuck in ``_retiring_chats`` after teardown (#358).
-            self._retiring_chats.discard(chat_id)
+            self._retiring_chats.discard(chat_id)  # #358 proactive after teardown
         return ok
 
     async def _evict_armed_conversations(
@@ -16018,14 +15983,11 @@ class Agent365Adapter(BasePlatformAdapter):
         *,
         registry_evict_ids: set[str] | None = None,
     ) -> bool:
-        """Teardown every ``chat_id``; evict registry rows for ``registry_evict_ids``.
+        """Retire each chat via the existing teardown + registry eviction.
 
-        When ``registry_evict_ids`` is omitted, every chat is evicted from the
-        registry after teardown. When it is a strict subset, matched siblings
-        only run teardown so their conversation ref survives for a later
-        proactive send at the new generation.
-
-        Every target is added to ``_retiring_chats`` before the first await
+        Optional ``registry_evict_ids`` limits which rows ``_conversations.evict``
+        removes after teardown (#358). Every target is added to ``_retiring_chats``
+        before the first await
         so a sibling turn cannot post while this chat's teardown is still
         starting. In-flight outbound posts on all of those chats are
         cancelled together before any model turn is interrupted. That
