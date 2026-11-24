@@ -2998,6 +2998,127 @@ class TestLifecycleCapture:
         assert "a:personal" in a._conversations
         a.handle_message.assert_not_called()
 
+    @pytest.mark.asyncio
+    async def test_proactive_send_after_personal_remove_uses_surviving_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#358 round 2: sibling ref survives teardown and send() works at new gen."""
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        copilot = "19:copilot@thread.v2"
+        monkeypatch.setattr(adapter_mod, "_COALESCED_REPLY_SHUTDOWN_TIMEOUT_SEC", 0.2)
+        a = _make_adapter(monkeypatch)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge,
+            "validate_inbound_jwt",
+            AsyncMock(return_value={"aud": "x", "iss": "y", "azp": "z"}),
+        )
+
+        def seed(conv_id: str, conv_type: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            recip_id = app_id if conv_type == "groupChat" else f"28:{app_id}"
+            activity["recipient"] = {"id": recip_id, "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed("a:personal", "personal")
+        seed(copilot, "groupChat")
+        gen_before = a._chat_generation(copilot)
+
+        async def record_send(**_kwargs: Any) -> Any:
+            return adapter_mod.SendResult(success=True, message_id="proactive")
+
+        monkeypatch.setattr(a, "_send_reply_activity", record_send)
+        client = self._client(a, monkeypatch)
+        a._http_client.post = AsyncMock(
+            return_value=MagicMock(
+                status_code=201,
+                json=MagicMock(return_value={"id": "new-proactive-358"}),
+            )
+        )
+        a._bridge_cfg = MagicMock()
+        a._bridge_cfg.tenant_id = "tenant-b"
+        a._bridge_cfg.blueprint_client_id = "blueprint-app-id"
+        a._bridge_cfg.blueprint_client_secret = "sek"
+        a._fmi_cache = MagicMock()
+        a._user_cache = MagicMock()
+        a._bf_token_cache = MagicMock()
+        monkeypatch.setattr(
+            bridge,
+            "acquire_reply_token",
+            AsyncMock(return_value=("bf-bearer", "B")),
+        )
+        monkeypatch.setattr(a, "_cached_inbound_for", lambda _chat_id: None)
+        body = self._lifecycle_body(
+            conv_id="a:personal",
+            id="rm-proactive-358",
+            type="installationUpdate",
+            action="remove",
+        )
+        body["from"] = {"id": "29:personal", "aadObjectId": user}
+        body["recipient"] = {"id": f"28:{app_id}", "name": "Bot"}
+        body["conversation"] = {"id": "a:personal", "conversationType": "personal"}
+        response = client.post(
+            "/api/messages", json=body, headers={"Authorization": "Bearer a.b.c"}
+        )
+        assert response.json()["lifecycle"] == "evict"
+        assert copilot in a._conversations
+        assert copilot not in a._retiring_chats
+        assert a._chat_generation(copilot) > gen_before
+        send_result = await a.send(copilot, "proactive after personal remove")
+        assert send_result.success is True
+        assert send_result.message_id == "new-proactive-358"
+        assert a._http_client.post.await_count == 1
+
+    def test_uninstall_blank_conversation_type_uses_cached_personal_ref(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#358 round 2: omit conversationType when the cached personal ref has it."""
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        a = _make_adapter(monkeypatch)
+
+        def seed(conv_id: str, conv_type: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            activity["recipient"] = {"id": f"28:{app_id}", "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed("a:personal", "personal")
+        seed("19:copilot-a@thread.v2", "groupChat")
+        activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:personal", "aadObjectId": user},
+            "recipient": {"id": f"28:{app_id}", "name": "Bot"},
+            "conversation": {"id": "a:personal"},
+        }
+        assert a._uninstall_conversation_ids(activity) == ["a:personal"]
+        teardown = a._uninstall_teardown_conversation_ids(activity)
+        assert "a:personal" in teardown
+        assert "19:copilot-a@thread.v2" in teardown
+
+        client = self._client(a, monkeypatch)
+        route_body = self._lifecycle_body(
+            conv_id="a:personal",
+            type="installationUpdate",
+            action="remove",
+        )
+        route_body["from"] = activity["from"]
+        route_body["recipient"] = activity["recipient"]
+        route_body["conversation"] = activity["conversation"]
+        response = client.post(
+            "/api/messages",
+            json=route_body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json()["lifecycle"] == "evict"
+        assert "a:personal" not in a._conversations
+        assert "19:copilot-a@thread.v2" in a._conversations
+
     def test_groupchat_installation_remove_still_fans_out_siblings(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -3033,10 +3154,9 @@ class TestLifecycleCapture:
     async def test_uninstall_retires_same_user_bot_group_chat_only(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # installationUpdate remove on the personal 1:1 retires only that chat.
-        # Copilot groupChat stays registered and its in-flight turn may finish.
-        # A different Entra user and a different bot keep running. A
-        # cancellation-resistant outbound task must not hang cleanup.
+        # Personal remove evicts only the 1:1 record. Copilot still runs
+        # teardown (#156): the in-flight turn is cancelled and its late post
+        # is blocked, but the sibling registry row survives (#358).
         import httpx
 
         user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -3199,9 +3319,10 @@ class TestLifecycleCapture:
             assert stuck_task is not None and stuck_task.done() is False
             assert copilot in a._conversations
             assert "a:personal" not in a._conversations
-            assert "mid-cc" in a._coalesced_replies
-            assert copilot in a._active_coalesced_reply_by_chat
-            reply_task.cancel.assert_not_called()
+            assert "mid-cc" not in a._coalesced_replies
+            assert copilot not in a._active_coalesced_reply_by_chat
+            reply_task.cancel.assert_called()
+            assert copilot not in a._retiring_chats
             assert other_user_chat in a._conversations
             assert other_bot_chat in a._conversations
             assert a._coalesced_replies["mid-other-bot"]["content"] == "keep"
@@ -3211,8 +3332,11 @@ class TestLifecycleCapture:
 
             release.set()
             await asyncio.wait_for(asyncio.gather(*turn_tasks), timeout=1)
-            assert results[copilot].success is True
-            assert copilot in sent
+            assert results[copilot].success is False
+            assert "lifecycle changed" in str(results[copilot].error) or (
+                "disconnecting" in str(results[copilot].error)
+            )
+            assert copilot not in sent
             assert results[other_user_chat].success is True
             assert results[other_bot_chat].success is True
             assert other_user_chat in sent
