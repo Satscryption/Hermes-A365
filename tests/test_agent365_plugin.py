@@ -22746,7 +22746,7 @@ class TestPersonalChatStreamCompletion:
             MagicMock(status_code=403, text="", json=lambda body=rejected: body),
             MagicMock(status_code=202, text="", json=lambda: {}),
         ]
-        post_mock, attempts, _ = self._wire_stream_fake(a, inbound, responses)
+        post_mock, _attempts, _ = self._wire_stream_fake(a, inbound, responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
         caplog.set_level("INFO")
@@ -23017,7 +23017,11 @@ class TestPersonalChatStreamCompletion:
         inbound = _make_inbound(conv_id="conv-356-empty", activity_id="act-empty")
         responses = [
             MagicMock(status_code=201, text="", json=lambda: {"id": "bf-empty"}),
-            MagicMock(status_code=403, text="", json=lambda: {"error": {"code": "ContentStreamNotAllowed"}}),
+            MagicMock(
+                status_code=403,
+                text="",
+                json=lambda: {"error": {"code": "ContentStreamNotAllowed"}},
+            ),
         ]
         conv = "conv-356-empty"
         post_mock, attempts, _ = self._wire_stream_fake(a, inbound, responses)

@@ -15169,8 +15169,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                     if outcome is True or (outcome == "already_completed" and wire_finalize):
                         if wire_finalize:
-                            anchor = str(state.get("reply_anchor") or "") or self._personal_reply_anchor(
-                                None, inbound
+                            anchor = str(state.get("reply_anchor") or "") or (
+                                self._personal_reply_anchor(None, inbound)
                             )
                             if outcome == "already_completed":
                                 landed_id = str(state.get("bf_stream_id") or message_id)
@@ -15182,14 +15182,16 @@ class Agent365Adapter(BasePlatformAdapter):
                                 return SendResult(success=True, message_id=landed_id)
                             self._remember_personal_final_anchor(chat_id, anchor)
                         else:
-                            self._personal_stream_plain_fallback_pending[str(chat_id)] = bf_stream_id
+                            self._personal_stream_plain_fallback_pending[
+                                str(chat_id)
+                            ] = bf_stream_id
                         return SendResult(success=True, message_id=bf_stream_id)
                     if wire_finalize and _strip_streaming_cursor(
                         str(state.get("last_accepted_content") or "")
                     ) == _strip_streaming_cursor(clean_content):
                         self._personal_stream_plain_fallback_pending.pop(str(chat_id), None)
-                        anchor = str(state.get("reply_anchor") or "") or self._personal_reply_anchor(
-                            None, inbound
+                        anchor = str(state.get("reply_anchor") or "") or (
+                            self._personal_reply_anchor(None, inbound)
                         )
                         if anchor:
                             self._remember_personal_final_anchor(chat_id, anchor)
@@ -15293,7 +15295,7 @@ class Agent365Adapter(BasePlatformAdapter):
             # Nothing to close, or never received a stream id from
             # Microsoft (stream-start failed). Just drop the slot.
             self._drop_stream_state(chat_id, message_id)
-            return False if recovery_mode else True
+            return not recovery_mode
         auth_inbound = self._inbound_for_record(state.get("authority_record"), chat_id)
         if auth_inbound is not None:
             inbound = auth_inbound
@@ -15313,7 +15315,7 @@ class Agent365Adapter(BasePlatformAdapter):
         conv_id = conv.get("id")
         if not service_url or not conv_id:
             self._drop_stream_state(chat_id, message_id)
-            return False if recovery_mode else True
+            return not recovery_mode
 
         # BF rejects final activities with empty text (400 BadSyntax).
         # Use the last content we streamed for this stream; fall back to
