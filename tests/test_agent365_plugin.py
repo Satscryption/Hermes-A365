@@ -2695,10 +2695,7 @@ class TestLifecycleCapture:
 
         ids = a._uninstall_conversation_ids(activity)
 
-        assert "a:personal" in ids
-        assert "19:copilot@thread.v2" in ids
-        assert "19:other-user@thread.v2" not in ids
-        assert "19:other-bot@thread.v2" not in ids
+        assert ids == ["a:personal"]
         anonymous = a._uninstall_conversation_ids(
             {
                 "type": "installationUpdate",
@@ -2749,10 +2746,7 @@ class TestLifecycleCapture:
 
         ids = a._uninstall_conversation_ids(activity)
 
-        assert "a:personal" in ids
-        assert "19:copilot@thread.v2" in ids
-        assert "19:no-aad@thread.v2" not in ids
-        assert "19:activity-from@thread.v2" not in ids
+        assert ids == ["a:personal"]
 
     def test_uninstall_absorb_does_not_union_disagreeing_object_ids(
         self, monkeypatch: pytest.MonkeyPatch
@@ -2820,14 +2814,12 @@ class TestLifecycleCapture:
                 "applicationId": "copilot",
                 "name": "Bot",
             },
-            "conversation": {"id": "a:personal"},
+            "conversation": {"id": "a:personal", "conversationType": "personal"},
         }
 
         ids = a._uninstall_conversation_ids(activity)
 
-        assert "a:personal" in ids
-        assert "19:orgid@thread.v2" in ids
-        assert "19:other-guid@thread.v2" not in ids
+        assert ids == ["a:personal"]
 
         veto = _make_adapter(monkeypatch)
         anchor = _make_inbound(path="B", conv_id="a:personal", activity_id="anchor")
@@ -2899,16 +2891,152 @@ class TestLifecycleCapture:
         assert "a:personal" not in a._conversations
         assert "19:copilot@thread.v2" in a._conversations
 
+    def test_personal_teams_remove_retires_only_teams_1_1(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#358: user-scoped Teams uninstall leaves sibling Copilot records."""
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        a = _make_adapter(monkeypatch)
+
+        def seed(conv_id: str, conv_type: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            activity["recipient"] = {"id": f"28:{app_id}", "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed("a:personal", "personal")
+        seed("19:copilot-a@thread.v2", "groupChat")
+        seed("19:copilot-b@thread.v2", "groupChat")
+        assert len(a._conversations) == 3
+
+        activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:personal-channel", "aadObjectId": user},
+            "recipient": {"id": f"28:{app_id}", "name": "Bot"},
+            "conversation": {"id": "a:personal", "conversationType": "personal"},
+        }
+        assert a._uninstall_conversation_ids(activity) == ["a:personal"]
+
+        client = self._client(a, monkeypatch)
+        body = self._lifecycle_body(
+            conv_id="a:personal",
+            type="installationUpdate",
+            action="remove",
+        )
+        body["from"] = activity["from"]
+        body["recipient"] = activity["recipient"]
+        body["conversation"] = activity["conversation"]
+        response = client.post(
+            "/api/messages",
+            json=body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert response.json() == {"status": "acked", "lifecycle": "evict"}
+        assert "a:personal" not in a._conversations
+        assert "19:copilot-a@thread.v2" in a._conversations
+        assert "19:copilot-b@thread.v2" in a._conversations
+        assert len(a._conversations) == 2
+        assert a._handled_events == []
+
+    def test_personal_teams_re_add_restores_record_without_agent_turn(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#358: install-add on Teams 1:1 after remove recreates ref, no turn."""
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        a = _make_adapter(monkeypatch)
+        monkeypatch.setattr(a, "handle_message", MagicMock())
+
+        def seed(conv_id: str, conv_type: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            activity["recipient"] = {"id": f"28:{app_id}", "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed("19:copilot-a@thread.v2", "groupChat")
+        seed("19:copilot-b@thread.v2", "groupChat")
+
+        client = self._client(a, monkeypatch)
+        parties = {
+            "from": {"id": "29:personal", "aadObjectId": user},
+            "recipient": {"id": f"28:{app_id}", "name": "Bot"},
+            "conversation": {"id": "a:personal", "conversationType": "personal"},
+        }
+        remove_body = self._lifecycle_body(
+            conv_id="a:personal",
+            id="rm-358",
+            type="installationUpdate",
+            action="remove",
+            **parties,
+        )
+        remove = client.post(
+            "/api/messages",
+            json=remove_body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert remove.json()["lifecycle"] == "evict"
+        assert len(a._conversations) == 2
+
+        add_body = self._lifecycle_body(
+            conv_id="a:personal",
+            id="add-358",
+            type="installationUpdate",
+            action="add",
+            **parties,
+        )
+        add = client.post(
+            "/api/messages",
+            json=add_body,
+            headers={"Authorization": "Bearer a.b.c"},
+        )
+        assert add.json()["lifecycle"] == "upsert"
+        assert len(a._conversations) == 3
+        assert "a:personal" in a._conversations
+        a.handle_message.assert_not_called()
+
+    def test_groupchat_installation_remove_still_fans_out_siblings(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Non-personal installationUpdate remove may still retire same user/bot."""
+        user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+        app_id = "11111111-1111-1111-1111-111111111111"
+        a = _make_adapter(monkeypatch)
+
+        def seed(conv_id: str, conv_type: str) -> None:
+            activity = _make_inbound(path="B", conv_id=conv_id, activity_id=conv_id)
+            activity["conversation"]["conversationType"] = conv_type
+            activity["from"] = {"id": f"29:{conv_id}", "aadObjectId": user, "name": "User"}
+            activity["recipient"] = {"id": app_id, "name": "Bot"}
+            a._conversations.upsert(adapter_mod.ConversationRef.from_activity(activity))
+
+        seed("19:primary@thread.v2", "groupChat")
+        seed("19:sibling@thread.v2", "groupChat")
+        activity = {
+            "type": "installationUpdate",
+            "action": "remove",
+            "from": {"id": "29:chan", "aadObjectId": user},
+            "recipient": {"id": app_id, "name": "Bot"},
+            "conversation": {
+                "id": "19:primary@thread.v2",
+                "conversationType": "groupChat",
+            },
+        }
+        ids = a._uninstall_conversation_ids(activity)
+        assert "19:primary@thread.v2" in ids
+        assert "19:sibling@thread.v2" in ids
+
     @pytest.mark.asyncio
     async def test_uninstall_retires_same_user_bot_group_chat_only(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        # Walk row 2b / F9: installationUpdate remove arrives on the personal
-        # chat while Copilot Chat (groupChat, different from.id, app id in
-        # recipient.id instead of 28:<guid>) is mid-turn. That turn's late
-        # post is blocked. A different Entra user and a different bot keep
-        # running. A cancellation-resistant outbound task must not hang
-        # cleanup.
+        # installationUpdate remove on the personal 1:1 retires only that chat.
+        # Copilot groupChat stays registered and its in-flight turn may finish.
+        # A different Entra user and a different bot keep running. A
+        # cancellation-resistant outbound task must not hang cleanup.
         import httpx
 
         user = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
@@ -3069,11 +3197,11 @@ class TestLifecycleCapture:
             assert uninstall.status_code == 200
             assert uninstall.json()["lifecycle"] == "evict"
             assert stuck_task is not None and stuck_task.done() is False
-            assert copilot not in a._conversations
+            assert copilot in a._conversations
             assert "a:personal" not in a._conversations
-            assert "mid-cc" not in a._coalesced_replies
-            assert copilot not in a._active_coalesced_reply_by_chat
-            reply_task.cancel.assert_called()
+            assert "mid-cc" in a._coalesced_replies
+            assert copilot in a._active_coalesced_reply_by_chat
+            reply_task.cancel.assert_not_called()
             assert other_user_chat in a._conversations
             assert other_bot_chat in a._conversations
             assert a._coalesced_replies["mid-other-bot"]["content"] == "keep"
@@ -3083,11 +3211,8 @@ class TestLifecycleCapture:
 
             release.set()
             await asyncio.wait_for(asyncio.gather(*turn_tasks), timeout=1)
-            assert results[copilot].success is False
-            assert "lifecycle changed" in str(results[copilot].error) or (
-                "disconnecting" in str(results[copilot].error)
-            )
-            assert copilot not in sent
+            assert results[copilot].success is True
+            assert copilot in sent
             assert results[other_user_chat].success is True
             assert results[other_bot_chat].success is True
             assert other_user_chat in sent

@@ -2875,12 +2875,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     # an oversized activity id/name must not leave stale
                     # registry, stream, or watchdog state behind.
                     #
-                    # installationUpdate remove is the user-level uninstall.
-                    # Bot Framework delivers it on the personal ``a:…`` chat
-                    # only, while a Copilot turn keeps running on the sibling
-                    # ``19:…`` groupChat. Retire every cached conversation for
-                    # that same user and bot. A conversationUpdate that merely
-                    # removes the bot from one chat stays single-conversation.
+                    # installationUpdate remove on the personal Teams 1:1 is a
+                    # user-scoped uninstall of that chat only; sibling Copilot
+                    # app threads stay registered. A conversationUpdate that
+                    # removes the bot from one chat also stays single-chat.
                     if (
                         str(activity.get("type") or "") == "installationUpdate"
                         and str(activity.get("action") or "").lower() == "remove"
@@ -15504,9 +15502,12 @@ class Agent365Adapter(BasePlatformAdapter):
     ) -> list[str]:
         """Conversation ids to retire for an ``installationUpdate`` remove.
 
-        Always includes the conversation named on the activity. Also includes
-        every cached conversation for the same Entra user and the same bot
-        app when both sides have equal strong ids.
+        Always includes the conversation named on the activity. On the
+        personal Teams 1:1 (``conversationType`` ``personal``) that is the
+        full scope — sibling Copilot app threads for the same user and bot
+        stay cached. On any other conversation type, also includes every
+        cached conversation for the same Entra user and the same bot app
+        when both sides have equal strong ids.
 
         The named conversation's cached ref may supply an ``aadObjectId`` or
         app GUID the uninstall payload omitted. That copy happens only when
@@ -15536,6 +15537,13 @@ class Agent365Adapter(BasePlatformAdapter):
             cached = self._conversations.get(named)
             if cached is not None and not anchor.absorb(_parties_from_ref(cached)):
                 return ordered
+        conv_type = (
+            str(conv.get("conversationType") or "").strip().lower()
+            if isinstance(conv, dict)
+            else ""
+        )
+        if conv_type == "personal":
+            return ordered
         if not anchor.can_fan_out():
             # No aadObjectId or no app GUID: retire only the named chat.
             return ordered
