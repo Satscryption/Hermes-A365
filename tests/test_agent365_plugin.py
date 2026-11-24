@@ -8467,6 +8467,669 @@ class TestEditMessage:
         assert "conv-G-split" not in a._turn_buffers
 
     @pytest.mark.asyncio
+    async def test_issue357_long_split_no_empty_or_misleading_posts(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """#357: capped split delivery posts only substantive chunks and neutral keep-alive."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-split"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-357", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-357")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            overflow.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        part_one = "x" * 3499
+        part_two = "y" * (6579 - 3499)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-357",
+        )
+        await a.on_processing_start(event)
+        first = await a.send(chat_id=chat, content=part_one, reply_to="act-357")
+        assert first.success is True
+        second = await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        assert second.success is True
+        buf = a._turn_buffers[chat]
+        before_emit = len(posts)
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert len(posts) == before_emit, "keep-alive must not post once marked answer is buffering"
+        await a.on_processing_complete(event, outcome="success")
+        for body in posts:
+            if body.get("type") in ("message", "typing"):
+                assert str(body.get("text") or "").strip()
+                assert body.get("text") != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        finals = [
+            body
+            for body in posts
+            if body.get("type") == "message"
+            and (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert len(finals) == 1
+        assert finals[0]["text"] == part_one
+        assert overflow == [part_two]
+        final_idx = posts.index(finals[0])
+        after_final = posts[final_idx + 1 :]
+        assert not any(
+            body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+            for body in after_final
+        )
+        informative_texts = [
+            str(body.get("text") or "")
+            for body in posts
+            if (body.get("entities") or [{}])[0].get("streamType") == "informative"
+        ]
+        assert adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT not in informative_texts
+        assert "new message" not in " ".join(informative_texts).casefold()
+
+    @pytest.mark.asyncio
+    async def test_issue357_split_flush_retry_leaves_next_silent_keepalive(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Early split flush exit must not strand keep-alive for the next silent turn."""
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-retry-keepalive"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+
+        async def fail_deliver(*_args: Any, **_kwargs: Any) -> tuple[str, str | None]:
+            return ("retry", None)
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", fail_deliver)
+        event = _StubMessageEvent(
+            text="split",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-1")
+        await a.send(chat_id=chat, content="y" * 3080, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        buf = a._turn_buffers.get(chat)
+        assert buf is not None
+        assert "chunked_turn_flush_in_progress" not in buf
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-after-retry")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert any(
+            body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
+            and body.get("type") == "typing"
+            for body in posts
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue357_placeholder_skipped_on_open_stream_after_interval(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-placeholder"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        turn = {"seq": "1", "inbound": inbound}
+        buf: dict[str, Any] = {
+            "turns": [turn],
+            "keepalive_first_interval_elapsed": True,
+            "keepalive": {
+                "stream_id": "ka-open",
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            },
+        }
+        a._turn_buffers[chat] = buf
+        result = await a._post_keepalive_activity(
+            chat,
+            turn,
+            stream_id="ka-open",
+            sequence=2,
+            final=False,
+            text=adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
+        )
+        assert result.status is None
+        assert post_mock.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_issue357_overflow_plain_failure_keeps_keepalive_healthy(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-overflow-fail"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        part_two = "y" * (6579 - 3499)
+        plain_attempts = 0
+        orig_send = a._send_reply_activity
+
+        async def fail_first_plain(*args: Any, **kwargs: Any) -> Any:
+            nonlocal plain_attempts
+            plain_attempts += 1
+            if plain_attempts == 1:
+                return adapter_mod.SendResult(success=False, error="overflow failed")
+            return await orig_send(*args, **kwargs)
+
+        monkeypatch.setattr(a, "_send_reply_activity", fail_first_plain)
+        event = _StubMessageEvent(
+            text="split",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-1")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        buf = a._turn_buffers.get(chat)
+        assert buf is not None
+        stream = adapter_mod.Agent365Adapter._keepalive_state(buf)
+        assert not stream.get("stopped")
+        assert not buf.get("skip_stream_open")
+        assert "plain_overflow_keepalive_block" not in buf
+        assert any(part_two in str(segment.get("text") or "") for segment in buf["segments"])
+        turn = next(t for t in buf["turns"] if isinstance(t, dict))
+        record = a._delivery_record(buf, turn)
+        pre = a._answer_deliver_pre_post(
+            chat,
+            buf,
+            turn,
+            record,
+            chunk_segment_ids=[str(buf["segments"][-1].get("id") or "")],
+        )
+        assert pre is None or pre[1] != "user cancelled"
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-after-overflow-fail")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert any(
+            body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
+            and body.get("type") == "typing"
+            for body in posts
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue357_nested_split_leaves_keepalive_flags_clean(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-nested-split"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-outer", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        outer_event = _StubMessageEvent(
+            text="outer",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(outer_event)
+        await a.send(chat_id=chat, content="Outer still open", reply_to="act-outer")
+        inbound["id"] = "act-inner"
+        inner_event = _StubMessageEvent(
+            text="inner",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-inner",
+        )
+        _prime_processing_turn(a, inbound, inner_event)
+        await a.on_processing_start(inner_event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-inner")
+        await a.send(chat_id=chat, content="y" * (6579 - 3499), reply_to="act-inner")
+        await a.on_processing_complete(inner_event, outcome="success")
+        buf = a._turn_buffers[chat]
+        assert buf["depth"] == 1
+        stream = adapter_mod.Agent365Adapter._keepalive_state(buf)
+        assert not stream.get("stopped")
+        assert not buf.get("skip_stream_open")
+        assert "plain_overflow_keepalive_block" not in buf
+        assert send_reply_mock.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_issue357_split_closes_open_informative_before_overflow(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-open-stream"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-357", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow_at: list[int] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-pre")
+            if entity.get("streamId") == "ka-pre":
+                return self._http_result(202, "ka-pre")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        overflow_keepalive_snapshots: list[dict[str, Any]] = []
+
+        async def send_reply(**kwargs: Any) -> None:
+            overflow_at.append(len(posts))
+            live = a._turn_buffers.get(chat)
+            if isinstance(live, dict):
+                stream = adapter_mod.Agent365Adapter._keepalive_state(live)
+                overflow_keepalive_snapshots.append(
+                    {
+                        "stopped": bool(stream.get("stopped")),
+                        "skip_stream_open": bool(live.get("skip_stream_open")),
+                    }
+                )
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-357",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = buf["turns"][0]
+        buf["keepalive"] = {
+            "stream_id": "ka-pre",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._post_keepalive_activity(
+            chat,
+            turn,
+            stream_id="ka-pre",
+            sequence=2,
+            final=False,
+            text="Prior tool progress",
+        )
+        part_one = "x" * 3499
+        part_two = "y" * (6579 - 3499)
+        await a.send(chat_id=chat, content=part_one, reply_to="act-357")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        await a.on_processing_complete(event, outcome="success")
+        assert overflow_keepalive_snapshots == [
+            {"stopped": False, "skip_stream_open": False}
+        ]
+        assert overflow_at == [len(posts)], "overflow plain send should happen once at the end"
+        overflow_idx = overflow_at[0]
+        finals_before_overflow = [
+            index
+            for index, body in enumerate(posts[:overflow_idx])
+            if (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert finals_before_overflow, "open informative stream must finalize before overflow"
+        chunk_finals = [
+            body
+            for body in posts
+            if body.get("type") == "message"
+            and (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert len(chunk_finals) == 1
+        assert chunk_finals[0]["text"] == part_one
+        final_idx = posts.index(chunk_finals[0])
+        assert not any(
+            body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+            for body in posts[final_idx + 1 : overflow_idx]
+        )
+        assert not any(
+            body.get("type") == "typing"
+            and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+            for body in posts[overflow_idx:]
+        )
+
+    @staticmethod
+    def _issue357_wrap_finish_leave_stream_id(adapter: Any) -> Any:
+        orig = adapter._finish_delivered
+
+        def wrap(
+            chat_id: str,
+            buf: dict[str, Any],
+            turn: dict[str, Any],
+            record: dict[str, Any],
+            *,
+            stream_id: str,
+            **kwargs: Any,
+        ) -> tuple[str, str | None]:
+            kept = str(stream_id or "")
+            out = orig(
+                chat_id,
+                buf,
+                turn,
+                record,
+                stream_id=stream_id,
+                **kwargs,
+            )
+            live = adapter._turn_buffers.get(chat_id)
+            if kept and isinstance(live, dict):
+                stream = adapter_mod.Agent365Adapter._keepalive_state(live)
+                stream["stream_id"] = kept
+                live["keepalive"] = stream
+            return out
+
+        return wrap
+
+    @staticmethod
+    def _issue357_split_overflow_common(
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> tuple[Any, str, _StubMessageEvent, list[dict[str, Any]], list[int]]:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-overflow-wire"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-357", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        TestEditMessage._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow_at: list[int] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return TestEditMessage._http_result(201, "ka-357-wire")
+            if entity.get("streamId") == "ka-357-wire":
+                return TestEditMessage._http_result(202, "ka-357-wire")
+            return TestEditMessage._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**_kwargs: Any) -> None:
+            overflow_at.append(len(posts))
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-357",
+        )
+        return a, chat, event, posts, overflow_at
+
+    @pytest.mark.asyncio
+    async def test_issue357_plain_overflow_finalize_no_deadlock_with_stream(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-357-wire",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content="y" * (6579 - 3499), reply_to="act-357")
+        await asyncio.wait_for(
+            a.on_processing_complete(event, outcome="success"),
+            timeout=5.0,
+        )
+        assert overflow_at, "overflow plain send should run"
+        overflow_idx = overflow_at[0]
+        finals_before = [
+            body
+            for body in posts[:overflow_idx]
+            if (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert finals_before, "keep-alive must finalize before overflow"
+        assert any(
+            (body.get("entities") or [{}])[0].get("streamId") == "ka-357-wire"
+            for body in finals_before
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue357_plain_overflow_close_failure_defers_chunk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, _posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+
+        async def fail_close(_chat_id: str) -> bool:
+            return False
+
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", fail_close)
+        part_two = "y" * (6579 - 3499)
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        await a.on_processing_complete(event, outcome="success")
+        assert overflow_at == []
+        buf = a._turn_buffers[chat]
+        assert buf.get("retry_turn_key")
+        assert any(part_two in str(segment.get("text") or "") for segment in buf["segments"])
+
+    @pytest.mark.asyncio
+    async def test_issue357_single_chunk_retry_closes_before_plain_send(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0.01)
+        part_two = "y" * (6579 - 3499)
+        close_calls = 0
+        orig_close = a._close_turn_buffer_keepalive_locked
+
+        async def close_then_ok(_chat_id: str) -> bool:
+            nonlocal close_calls
+            close_calls += 1
+            if close_calls == 1:
+                return False
+            return await orig_close(_chat_id)
+
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", close_then_ok)
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        await a.on_processing_complete(event, outcome="success")
+        assert overflow_at == []
+        assert any(part_two in str(s.get("text") or "") for s in a._turn_buffers[chat]["segments"])
+        await asyncio.wait_for(a._flush_turn_buffer(chat), timeout=3.0)
+        assert close_calls >= 2
+        assert overflow_at == [len(posts)], "overflow must send exactly once on retry"
+        assert posts[overflow_at[0] - 1 : overflow_at[0]] == [] or (
+            (posts[overflow_at[0] - 1].get("entities") or [{}])[0].get("streamType")
+            == "final"
+        )
+
+    @pytest.mark.asyncio
+    async def test_issue357_plain_close_failure_exhausts_plain_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a, chat, event, _posts, overflow_at = self._issue357_split_overflow_common(monkeypatch)
+        monkeypatch.setattr(
+            a,
+            "_finish_delivered",
+            self._issue357_wrap_finish_leave_stream_id(a),
+        )
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_FORCE_PLAIN_MAX_ATTEMPTS", 2)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 0.01)
+        part_two = "y" * (6579 - 3499)
+
+        async def fail_close(_chat_id: str) -> bool:
+            return False
+
+        monkeypatch.setattr(a, "_close_turn_buffer_keepalive_locked", fail_close)
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-357")
+        await a.send(chat_id=chat, content=part_two, reply_to="act-357")
+        await a.on_processing_complete(event, outcome="success")
+        buf = a._turn_buffers[chat]
+        turn = next(t for t in buf["turns"] if isinstance(t, dict))
+        record = a._delivery_record(buf, turn)
+        record["force_plain"] = True
+        record["plain_attempts"] = 0
+        record["deferral_count"] = adapter_mod._TURN_BUFFER_DEFERRED_RETRY_LIMIT
+
+        async def drain_retries() -> None:
+            for _ in range(12):
+                if record.get("force_plain_exhausted"):
+                    return
+                await a._flush_turn_buffer(chat)
+                await asyncio.sleep(0.02)
+
+        await asyncio.wait_for(drain_retries(), timeout=3.0)
+        assert record.get("force_plain_exhausted")
+        assert int(record.get("plain_attempts") or 0) >= 2
+        assert overflow_at == []
+
+    @pytest.mark.asyncio
+    async def test_issue357_nested_split_keepalive_sleeper_survives(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-357-nested-sleeper"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-outer", path="B")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        ref = a._conversations.get(chat)
+        assert ref is not None
+        ref.validated_path = "B"
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(bridge, "send_reply", AsyncMock(return_value=None))
+        outer_event = _StubMessageEvent(
+            text="outer",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-outer",
+        )
+        await a.on_processing_start(outer_event)
+        await a.send(chat_id=chat, content="Outer still open", reply_to="act-outer")
+        inbound["id"] = "act-inner"
+        inner_event = _StubMessageEvent(
+            text="inner",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-inner",
+        )
+        _prime_processing_turn(a, inbound, inner_event)
+        await a.on_processing_start(inner_event)
+        await a.send(chat_id=chat, content="x" * 3499, reply_to="act-inner")
+        await a.send(chat_id=chat, content="y" * (6579 - 3499), reply_to="act-inner")
+        await a.on_processing_complete(inner_event, outcome="success")
+        await asyncio.sleep(0)
+        buf = a._turn_buffers[chat]
+        task = buf.get("keepalive_task")
+        assert isinstance(task, asyncio.Task)
+        assert not task.done()
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-nested")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        buf["keepalive_first_interval_elapsed"] = True
+        await a._emit_turn_buffer_keepalive(chat)
+        assert any(
+            body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
+            and body.get("type") == "typing"
+            for body in posts
+        )
+
+    @pytest.mark.asyncio
     async def test_open_turn_is_not_posted_before_complete(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -9738,7 +10401,7 @@ class TestEditMessage:
         }
         assert (
             a._sanitize_informative_stream_text(buf_slow, turn, "slept", for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
         clipped = "x" * adapter_mod._INFORMATIVE_TEXT_MAX_CHARS
         long_answer = clipped + "tail"
@@ -9748,7 +10411,7 @@ class TestEditMessage:
         }
         assert (
             a._sanitize_informative_stream_text(buf_long, turn, clipped, for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
 
     def test_walk095_sanitize_uses_progress_fallback_after_interval(
@@ -9781,12 +10444,12 @@ class TestEditMessage:
         joined = "Line one.\n\nLine two."
         assert (
             a._sanitize_informative_stream_text(buf, turn, joined, for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
         prefix = "Line one.\n\nLine tw"
         assert (
             a._sanitize_informative_stream_text(buf, turn, prefix, for_answer=False)
-            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         )
         assert a._informative_text_is_answer_body_leak(buf, turn, prefix)
 
@@ -12933,9 +13596,33 @@ class TestEditMessage:
             "segments": [],
         }
         text = a._informative_text_for_turn(buf, turn)
-        assert text == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        assert text == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
         assert text != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
+        assert "new message" not in text.casefold()
         assert text.strip()
+
+    def test_informative_status_claims_new_message_only_when_rotation_plain(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        turn = {"seq": "1", "inbound": _make_inbound(conv_id="c", activity_id="a")}
+        buf_idle: dict[str, Any] = {
+            "turns": [turn],
+            "segments": [],
+            "keepalive": {"stream_id": "ka", "opened_mono": time.monotonic()},
+        }
+        assert not a._informative_status_claims_new_message(buf_idle)
+        assert (
+            a._visible_informative_fallback_text(buf_idle, turn)
+            == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
+        )
+        buf_rotated: dict[str, Any] = dict(buf_idle)
+        buf_rotated["keepalive_rotated"] = True
+        assert a._informative_status_claims_new_message(buf_rotated)
+        assert (
+            a._visible_informative_fallback_text(buf_rotated, turn)
+            == adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT
+        )
 
     def test_rotation_close_text_prefers_progress_over_leadin(
         self, monkeypatch: pytest.MonkeyPatch
@@ -15190,11 +15877,7 @@ class TestEditMessage:
         await a.send(chat_id=chat, content="Part two of the answer.", reply_to=None)
         await self._spin_until(
             lambda: any(
-                body.get("text")
-                in (
-                    adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
-                    adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
-                )
+                body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
                 and body.get("type") == "typing"
                 for body in posts
             )
@@ -15309,11 +15992,7 @@ class TestEditMessage:
         await a.on_processing_start(event)
         await self._spin_until(
             lambda: any(
-                body.get("text")
-                in (
-                    adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
-                    adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
-                )
+                body.get("text") == adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT
                 and body.get("type") == "typing"
                 for body in posts
             )
@@ -15322,7 +16001,7 @@ class TestEditMessage:
         await a.on_processing_complete(event, outcome="success")
         assert posts[0]["text"] in (
             adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT,
-            adapter_mod._KEEPALIVE_ROTATION_STATUS_TEXT,
+            adapter_mod._KEEPALIVE_NEUTRAL_STATUS_TEXT,
         )
         assert not any(
             body.get("type") == "typing" and not str(body.get("text") or "").strip()
