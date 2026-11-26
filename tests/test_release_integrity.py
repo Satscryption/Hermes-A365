@@ -508,10 +508,10 @@ def test_live_0_9_8_section_still_parses() -> None:
 
     assert notes.version == "0.9.8"
     assert notes.title == (
-        "v0.9.8 \u2014 Hardened Path B inbound token signing-key endorsement validation, "
-        "turn-buffer and coalesced-reply fixes, Path B allowlist admission during UPN "
-        "refresh, doctor update notices, Path B soak preparation, and Teams and Copilot "
-        "delivery fixes."
+        "v0.9.8 \u2014 Stricter inbound token validation on Path B for the activity's "
+        "claimed channel, turn-buffer and coalesced-reply fixes, Path B allowlist "
+        "admission, doctor update notices, Path B soak preparation, and Teams and "
+        "Copilot delivery fixes."
     )
     assert len(notes.title) <= mod.TITLE_LIMIT
     assert (

@@ -12,19 +12,19 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [0.9.8] — 2026-11-23
 
-Hardened Path B inbound token signing-key endorsement validation,
-turn-buffer and coalesced-reply fixes, Path B allowlist admission during
-UPN refresh, doctor update notices, Path B soak preparation, and Teams
-and Copilot delivery fixes.
+Stricter inbound token validation on Path B for the activity's claimed
+channel, turn-buffer and coalesced-reply fixes, Path B allowlist admission,
+doctor update notices, Path B soak preparation, and Teams and Copilot
+delivery fixes.
 Ships from ``main`` via PRs #344, #345, #346, #347, #348, #349, #350,
 #351, #352, #353, #354, #355, #360, #361, and #362, and commit
 ``e85a17ad``.
 
 ### Security
 
-- **Hardened Path B token signing-key endorsement validation (``e85a17ad``).**
-  Path B inbound token validation now checks that the verified signing
-  key's endorsements include the activity's claimed channel. Refs commit
+- **Stricter inbound token validation on Path B (``e85a17ad``).**
+  Path B now applies stricter inbound token validation for the activity's
+  claimed channel. Refs commit
   [e85a17ad](https://github.com/Satscryption/Hermes-A365/commit/e85a17ad1e54bfa089144dd5909829889f639a6e).
 
 ### Fixed
@@ -48,23 +48,27 @@ Ships from ``main`` via PRs #344, #345, #346, #347, #348, #349, #350,
 - **#356 — Personal Teams stream finishes one reply when a stream edit is rejected (#360).**
   When a personal Teams stream edit is rejected with ``403 ContentStreamNotAllowed``,
   the adapter tries to close the open stream with a recovery ``streamType=final``
-  using the latest text. If that close fails, the terminal notify send uses one
-  plain ``send_reply`` instead of opening a second stream. Refs
+  using the latest text. If that close delivers the final, the reply is complete.
+  Otherwise the terminal notify uses one plain ``send_reply`` instead of opening
+  a second stream, after trying to remove the partial stream activity, and skips
+  that plain copy when the accepted stream text already matches the full reply. Refs
   [#356](https://github.com/Satscryption/Hermes-A365/issues/356),
   [#360](https://github.com/Satscryption/Hermes-A365/pull/360).
 
 - **#357 — Copilot long split replies leave no empty bubble or misleading keep-alive (#361).**
-  Informative heartbeats use neutral status text unless stream rotation or
-  plain delivery is active. Placeholder keep-alive bodies are no longer posted
-  on an open informative stream, and multi-chunk flushes block overlapping
-  keep-alive posts that could insert an empty shell between capped content
-  parts. Refs
+  Informative heartbeats prefer the latest tool progress or commentary.
+  When neither is available, they use neutral status text unless stream
+  rotation or plain delivery is active. Placeholder keep-alive bodies are
+  skipped on an open informative stream after the first interval, and
+  multi-chunk flushes block overlapping keep-alive posts that could insert
+  an empty shell between capped content parts. Refs
   [#357](https://github.com/Satscryption/Hermes-A365/issues/357),
   [#361](https://github.com/Satscryption/Hermes-A365/pull/361).
 
 - **#358 — Teams uninstall retires only the uninstalled conversation record (#362).**
   A user-scoped ``installationUpdate`` remove on the personal Teams 1:1 evicts
-  only that chat. Sibling Microsoft 365 Copilot app threads stay cached.
+  only that chat. A blank ``conversationType`` uses the cached conversation's type before that decision.
+  Sibling Microsoft 365 Copilot app threads stay cached.
   Matched siblings still run lifecycle teardown so in-flight work is cancelled
   (#156), and proactive send can use the surviving ref. Refs
   [#358](https://github.com/Satscryption/Hermes-A365/issues/358),
