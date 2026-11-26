@@ -24724,6 +24724,148 @@ class TestSendOrUpdateStatus:
         assert a._coalesced_status_tasks == {}
 
 
+class TestIssue366LongFinalReply:
+    @staticmethod
+    def _body(length: int) -> str:
+        paragraph = "Explanation paragraph with enough words to read naturally. "
+        parts = [paragraph * 12]
+        text = "\n\n".join(parts)
+        while len(text) < length:
+            parts.append(paragraph * 8)
+            text = "\n\n".join(parts)
+        return text[:length]
+
+    def test_split_text_lossless_hard_break_without_whitespace(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        limit = a.MAX_MESSAGE_LENGTH
+        text = "m" * (limit + 919)
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
+        assert "".join(pieces) == text
+        assert all(len(piece) <= limit for piece in pieces)
+        assert len(pieces) == 2
+        assert len(pieces[0]) == limit
+
+    def test_chunk_turn_segments_3818_stays_single_message(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        body = "k" * 3818
+        segments = [{"id": "turnbuf:1", "text": body, "turn": "1"}]
+        chunks = a._chunk_turn_segments(segments)
+        assert len(chunks) == 1
+        merged = "\n\n".join(
+            str(segment.get("text") or "")
+            for chunk in chunks
+            for segment in chunk
+        )
+        assert merged == body
+        assert len(merged) <= a.MAX_MESSAGE_LENGTH
+
+    def test_chunk_turn_segments_4581_splits_within_cap(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        body = self._body(4581)
+        segments = [{"id": "turnbuf:9", "text": body, "turn": "1"}]
+        chunks = a._chunk_turn_segments(segments)
+        parts = [
+            str(segment.get("text") or "")
+            for chunk in chunks
+            for segment in chunk
+        ]
+        assert "".join(parts) == body
+        assert len(parts) > 1
+        assert all(len(part) <= a.MAX_MESSAGE_LENGTH for part in parts)
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_send_accepts_4581_char_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-send"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-366-send")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        body = self._body(4581)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-366-send",
+        )
+        await a.on_processing_start(event)
+        result = await a.send(chat_id=chat, content=body, reply_to="act-366-send")
+        assert result.success is True
+        stored = "".join(
+            str(segment.get("text") or "")
+            for segment in a._turn_buffers[chat]["segments"]
+        )
+        assert stored == body
+
+    def test_issue366_delivered_chunks_are_not_3500_char_prefix(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        body = self._body(4581)
+        segments = [{"id": "turnbuf:1", "text": body, "turn": "1"}]
+        chunk_bodies = [
+            "\n\n".join(str(segment.get("text") or "") for segment in chunk)
+            for chunk in a._chunk_turn_segments(segments)
+        ]
+        joined = "".join(chunk_bodies)
+        assert joined == body
+        assert joined != body[:3500]
+        assert all(len(chunk) <= a.MAX_MESSAGE_LENGTH for chunk in chunk_bodies)
+
+    @pytest.mark.asyncio
+    async def test_issue366_flush_posts_full_4581_body_in_chunks(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-flush"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-366")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _chat_id: False)
+        bridge = adapter_mod._import_bridge()
+        body = self._body(4581)
+        posted: list[str] = []
+
+        async def deliver(
+            _chat_id: str,
+            _turn: dict[str, Any],
+            content: str,
+            _chunk_ids: list[str],
+        ) -> tuple[str, str | None]:
+            posted.append(content)
+            return ("delivered", "stream-final")
+
+        async def send_reply(**kwargs: Any) -> None:
+            posted.append(str((kwargs.get("reply") or {}).get("text") or ""))
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", deliver)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-366",
+        )
+        await a.on_processing_start(event)
+        sent = await a.send(chat_id=chat, content=body, reply_to="act-366")
+        assert sent.success is True
+        assert "Response formatting failed" not in body
+        await a.on_processing_complete(event, outcome="success")
+        assert "".join(posted) == body
+        assert len(posted) > 1
+        assert all(len(part) <= a.MAX_MESSAGE_LENGTH for part in posted)
+        assert all("Response formatting failed, plain text:" not in part for part in posted)
+
+
 class TestStreamingOverflowLimit:
     def test_streaming_overflow_limit_only_for_personal_session_task(
         self, monkeypatch: pytest.MonkeyPatch
