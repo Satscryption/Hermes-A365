@@ -1,0 +1,19 @@
+output "resource_group_name" {
+  description = "Deployed resource group name."
+  value       = azurerm_resource_group.main.name
+}
+
+output "public_ip_address" {
+  description = "Static public IPv4 on the gateway NIC."
+  value       = azurerm_public_ip.main.ip_address
+}
+
+output "fqdn" {
+  description = "FQDN for the public IP."
+  value       = azurerm_public_ip.main.fqdn
+}
+
+output "messages_endpoint" {
+  description = "Bot Framework messaging endpoint URL."
+  value       = "https://${azurerm_public_ip.main.fqdn}/api/messages"
+}
