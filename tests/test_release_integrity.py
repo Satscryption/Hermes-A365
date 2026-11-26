@@ -508,13 +508,17 @@ def test_live_0_9_8_section_still_parses() -> None:
 
     assert notes.version == "0.9.8"
     assert notes.title == (
-        "v0.9.8 \u2014 Turn-buffer reason tokens (#300), delivery-cache reclaim tests "
-        "(#301), coalesced reply-origin binding (#312), Path B allowlist admission during "
-        "UPN object-ID refresh (#336), and a separate doctor notice for upstream CLI "
-        "updates (#339)."
+        "v0.9.8 \u2014 Stricter inbound token validation on Path B for the activity's "
+        "claimed channel, turn-buffer and coalesced-reply fixes, Path B allowlist "
+        "admission, doctor update notices, Path B soak preparation, and Teams and "
+        "Copilot delivery fixes."
     )
     assert len(notes.title) <= mod.TITLE_LIMIT
-    assert ("Ships from ``main`` via PRs #344, #345, #346, #347, #348, and #349.") in notes.body
+    assert (
+        "Ships from ``main`` via PRs #344, #345, #346, #347, #348, #349, #350,\n"
+        "#351, #352, #353, #354, #355, #360, #361, and #362, and commit\n"
+        "``e85a17ad``."
+    ) in notes.body
     assert "2026-11-23" in notes.body
 
 

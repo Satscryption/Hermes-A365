@@ -8,27 +8,24 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
-- **#358 — Personal Teams uninstall scope:** personal ``installationUpdate``
-  remove drops only the 1:1 registry row; sibling Copilot threads keep their
-  ref but still run teardown (#156), and blank ``conversationType`` falls back
-  to the cached personal ref.
-
-- **#356 — Personal Teams stream edit `403 ContentStreamNotAllowed`:** recovery
-  final POST, plain notify with partial removal, no duplicate when complete.
-
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
-
-### Fixed
-
-- **#357 — Copilot long split replies: no empty shell or misleading keep-alive.** Informative heartbeats use neutral status text unless stream rotation or plain delivery is active; once a marked answer is buffering, further informative typing on the stream is suppressed so a split delivery does not leave an open shell between the stream final and plain overflow; placeholder keep-alive bodies are skipped on an open stream after the first interval; plain overflow closes any open informative stream with a keep-alive final instead of setting stop flags that would block a later turn.
 
 ## [0.9.8] — 2026-11-23
 
-Turn-buffer reason tokens (#300), delivery-cache reclaim tests (#301),
-coalesced reply-origin binding (#312), Path B allowlist admission during
-UPN object-ID refresh (#336), and a separate doctor notice for upstream
-CLI updates (#339).
-Ships from ``main`` via PRs #344, #345, #346, #347, #348, and #349.
+Stricter inbound token validation on Path B for the activity's claimed
+channel, turn-buffer and coalesced-reply fixes, Path B allowlist admission,
+doctor update notices, Path B soak preparation, and Teams and Copilot
+delivery fixes.
+Ships from ``main`` via PRs #344, #345, #346, #347, #348, #349, #350,
+#351, #352, #353, #354, #355, #360, #361, and #362, and commit
+``e85a17ad``.
+
+### Security
+
+- **Stricter inbound token validation on Path B (``e85a17ad``).**
+  Path B now applies stricter inbound token validation for the activity's
+  claimed channel. Refs commit
+  [e85a17ad](https://github.com/Satscryption/Hermes-A365/commit/e85a17ad1e54bfa089144dd5909829889f639a6e).
 
 ### Fixed
 
@@ -48,6 +45,35 @@ Ships from ``main`` via PRs #344, #345, #346, #347, #348, and #349.
   [#348](https://github.com/Satscryption/Hermes-A365/pull/348),
   [#349](https://github.com/Satscryption/Hermes-A365/pull/349).
 
+- **#356 — Personal Teams stream finishes one reply when a stream edit is rejected (#360).**
+  When a personal Teams stream edit is rejected with ``403 ContentStreamNotAllowed``,
+  the adapter tries to close the open stream with a recovery ``streamType=final``
+  using the latest text. If that close delivers the final, the reply is complete.
+  Otherwise the terminal notify uses one plain ``send_reply`` instead of opening
+  a second stream, after trying to remove the partial stream activity, and skips
+  that plain copy when the accepted stream text already matches the full reply. Refs
+  [#356](https://github.com/Satscryption/Hermes-A365/issues/356),
+  [#360](https://github.com/Satscryption/Hermes-A365/pull/360).
+
+- **#357 — Copilot long split replies leave no empty bubble or misleading keep-alive (#361).**
+  Informative heartbeats prefer the latest tool progress or commentary.
+  When neither is available, they use neutral status text unless stream
+  rotation or plain delivery is active. Placeholder keep-alive bodies are
+  skipped on an open informative stream after the first interval, and
+  multi-chunk flushes block overlapping keep-alive posts that could insert
+  an empty shell between capped content parts. Refs
+  [#357](https://github.com/Satscryption/Hermes-A365/issues/357),
+  [#361](https://github.com/Satscryption/Hermes-A365/pull/361).
+
+- **#358 — Teams uninstall retires only the uninstalled conversation record (#362).**
+  A user-scoped ``installationUpdate`` remove on the personal Teams 1:1 evicts
+  only that chat. A blank ``conversationType`` uses the cached conversation's type before that decision.
+  Sibling Microsoft 365 Copilot app threads stay cached.
+  Matched siblings still run lifecycle teardown so in-flight work is cancelled
+  (#156), and proactive send can use the surviving ref. Refs
+  [#358](https://github.com/Satscryption/Hermes-A365/issues/358),
+  [#362](https://github.com/Satscryption/Hermes-A365/pull/362).
+
 ### Changed
 
 - **#336 — Path B allowlist admission during UPN object-ID refresh (#347).**
@@ -62,6 +88,43 @@ Ships from ``main`` via PRs #344, #345, #346, #347, #348, and #349.
   overall doctor warning. Refs
   [#339](https://github.com/Satscryption/Hermes-A365/issues/339),
   [#345](https://github.com/Satscryption/Hermes-A365/pull/345).
+
+### Added
+
+- **#84 — Path B soak diagnostics for token fill, JWT accept, and idempotency size (#351).**
+  Adds DEBUG-level activity-bridge records for Path B token cache fills,
+  inbound JWT acceptance, and idempotency cache occupancy during long soak
+  runs. Refs
+  [#84](https://github.com/Satscryption/Hermes-A365/issues/84),
+  [#351](https://github.com/Satscryption/Hermes-A365/pull/351).
+
+- **#84 — Operator soak driver for marker sends and prune probe (#353).**
+  Adds an operator-only ``scripts/soak_driver.py`` harness for cron marker
+  output, offline registry pin preparation, and an owned-adapter prune/send
+  probe. Includes offline harness tests; this does not start a live soak.
+  Refs
+  [#84](https://github.com/Satscryption/Hermes-A365/issues/84),
+  [#353](https://github.com/Satscryption/Hermes-A365/pull/353).
+
+### Docs
+
+- **#84 — Path B soak validation runbook (#350).**
+  Adds ``docs/soak-validation.md``, the operator runbook for a multi-day
+  Path B soak. Refs
+  [#84](https://github.com/Satscryption/Hermes-A365/issues/84),
+  [#350](https://github.com/Satscryption/Hermes-A365/pull/350).
+
+- **#84 — Path B soak checklist (#354).**
+  Adds ``docs/soak-checklist.md``, the operator checklist for Path B soak
+  boundary evidence, verdict rules, and pending report rows. Refs
+  [#84](https://github.com/Satscryption/Hermes-A365/issues/84),
+  [#354](https://github.com/Satscryption/Hermes-A365/pull/354).
+
+- **#84 — Path B soak report template (#355).**
+  Adds ``reports/084-soak.md``, a pending operator report template for
+  tracking Path B soak evidence and verdicts. Refs
+  [#84](https://github.com/Satscryption/Hermes-A365/issues/84),
+  [#355](https://github.com/Satscryption/Hermes-A365/pull/355).
 
 ### Tests
 
