@@ -25189,6 +25189,46 @@ class TestIssue366LongFinalReply:
             content = f"{prefix}{sep}{base}" if base.strip() else prefix
         assert content == expected
 
+    @staticmethod
+    def _stitch_split_pieces(pieces: list[str]) -> str:
+        text = pieces[0]
+        for piece in pieces[1:]:
+            reopened = piece.lstrip().startswith("```")
+            if text.rstrip().endswith("```") and reopened:
+                cut = text.rfind("\n```")
+                if cut != -1:
+                    text = text[:cut]
+                piece = piece.lstrip()
+                fence_nl = piece.find("\n")
+                if fence_nl != -1:
+                    piece = piece[fence_nl + 1 :]
+            text += piece
+        return text
+
+    @pytest.mark.timeout(5)
+    def test_split_fence_opener_long_run_terminates_with_intro(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        limit = a.MAX_MESSAGE_LENGTH
+        text = "intro\n\n```python\n" + ("x" * 5000)
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
+        assert pieces
+        assert all(len(piece) <= limit for piece in pieces)
+        assert self._stitch_split_pieces(pieces) == text
+
+    @pytest.mark.timeout(5)
+    def test_split_fence_opener_long_run_terminates_without_intro(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        limit = a.MAX_MESSAGE_LENGTH
+        text = "```python\n" + ("x" * 5000)
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
+        assert len(pieces) > 1
+        assert all(len(piece) <= limit for piece in pieces)
+        assert self._stitch_split_pieces(pieces) == text
+
     def test_split_code_fence_reopens_on_next_piece(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
@@ -25198,6 +25238,9 @@ class TestIssue366LongFinalReply:
         pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
         assert len(pieces) > 1
         assert all(len(piece) <= limit for piece in pieces)
+        assert self._stitch_split_pieces(pieces) == text
+        for piece in pieces:
+            assert piece != "```python\n\n\n```"
         for index, piece in enumerate(pieces[:-1]):
             nxt = pieces[index + 1]
             if piece.rstrip().endswith("```") and nxt.lstrip().startswith("```python"):
@@ -25214,6 +25257,89 @@ class TestIssue366LongFinalReply:
         assert "".join(pieces) == text
         for piece in pieces:
             assert not piece.endswith("\ud800") or piece.endswith("\ud800\udc00")
+
+    @pytest.mark.timeout(5)
+    def test_split_surrogate_pair_progresses_at_tiny_limit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        text = "\ud800\udc00" + ("a" * 10)
+        for limit in (1, 2):
+            pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
+            assert "".join(pieces) == text
+            assert len(pieces) > 1
+            for piece in pieces:
+                assert not piece.endswith("\ud800") or piece.endswith("\ud800\udc00")
+
+    @pytest.mark.asyncio
+    async def test_deliver_turn_answer_locked_prefix_overflow_keeps_full_chunk(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-prefix-deliver"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-prefix-deliver")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        limit = a.MAX_MESSAGE_LENGTH
+        prefix_text = "Lead-in"
+        body = "z" * limit
+        buf = {
+            "turns": [{"seq": "1", "inbound": inbound, "open": False}],
+            "segments": [
+                {
+                    "id": "turnbuf:1",
+                    "text": prefix_text,
+                    "turn": "1",
+                    "kind": "commentary",
+                    "informative_displayed": False,
+                    "reply_to": "act-prefix-deliver",
+                    "notify": True,
+                },
+                {
+                    "id": "turnbuf:2",
+                    "text": body,
+                    "turn": "1",
+                    "kind": "answer",
+                    "notify": True,
+                    "reply_to": "act-prefix-deliver",
+                },
+            ],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+            "keepalive": {
+                "stream_id": "stream-prefix",
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            },
+        }
+        a._turn_buffers[chat] = buf
+        turn = buf["turns"][0]
+        posted: list[str] = []
+
+        async def send_reply_activity(**kwargs: Any) -> adapter_mod.SendResult:
+            posted.append(str(kwargs.get("content") or ""))
+            return adapter_mod.SendResult(success=True, message_id="plain-overflow")
+
+        monkeypatch.setattr(a, "_send_reply_activity", send_reply_activity)
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs.get("json") or {}
+            entities = activity.get("entities") or []
+            if entities and entities[0].get("streamType") == "final":
+                posted.append(str(activity.get("text") or ""))
+            return MagicMock(status_code=202, text="", json=lambda: {"id": "stream-prefix"})
+
+        a._http_client.post = post
+        outcome, _ = await a._deliver_turn_answer_locked(chat, turn, body, ["turnbuf:2"])
+        assert outcome == "delivered"
+        expected = f"{prefix_text}\n\n{body}"
+        assert "".join(posted) == expected
+        assert len(posted) > 1
+        assert all(len(part) <= limit for part in posted)
 
     def test_split_prefers_paragraph_then_line_then_space(
         self, monkeypatch: pytest.MonkeyPatch

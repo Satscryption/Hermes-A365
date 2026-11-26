@@ -9214,6 +9214,7 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         if self._turn_buffers.get(chat_id) is not buf:
             return ("retry", None)
+        overflow_tail: list[str] = []
         pending_informative = [
             str(segment.get("text") or "").strip()
             for segment in self._answer_informative_prefix_segments(buf, turn)
@@ -9223,14 +9224,13 @@ class Agent365Adapter(BasePlatformAdapter):
             base = str(content or "")
             sep = "\n\n"
             limit = self.MAX_MESSAGE_LENGTH
-            overhead = len(prefix) + (len(sep) if prefix and base.strip() else 0)
-            if base.strip() and overhead + len(base) > limit:
-                room = max(0, limit - overhead)
-                if room:
-                    base = self._split_text_for_message_limit(base, room)[0]
-                else:
-                    base = ""
-            content = f"{prefix}{sep}{base}" if base.strip() else prefix
+            combined = f"{prefix}{sep}{base}" if base.strip() else prefix
+            if len(combined) > limit:
+                parts = self._split_text_for_message_limit(combined, limit)
+                content = parts[0]
+                overflow_tail = parts[1:]
+            else:
+                content = combined
 
         plain_route = await self._maybe_route_plain_turn_answer(
             chat_id,
@@ -9408,7 +9408,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     set_had_landed(record)
                     self._touch_keepalive_emit(chat_id, buf)
                     activity_id = result.stream_id or stream_id
-                    return self._finish_delivered(
+                    outcome = self._finish_delivered(
                         chat_id,
                         buf,
                         turn,
@@ -9418,6 +9418,21 @@ class Agent365Adapter(BasePlatformAdapter):
                         activity_id=activity_id or None,
                         chunk_segment_ids=chunk_segment_ids,
                     )
+                    if overflow_tail and isinstance(turn.get("inbound"), dict):
+                        inbound = turn["inbound"]
+                        path = turn.get("validated_path")
+                        path = path if isinstance(path, str) else None
+                        origin = turn.get("authority_record")
+                        ro = origin if isinstance(origin, TurnAuthorityRecord) else None
+                        for tail in overflow_tail:
+                            await self._send_reply_activity(
+                                inbound=inbound,
+                                content=tail,
+                                log_context="turn buffer prefix overflow",
+                                validated_path=path,
+                                reply_origin=ro,
+                            )
+                    return outcome
                 if classified == _ANSWER_FINAL_ALREADY_COMPLETED:
                     if landing_bits(record):
                         return self._finish_delivered(
@@ -10108,6 +10123,17 @@ class Agent365Adapter(BasePlatformAdapter):
         return open_info
 
     @staticmethod
+    def _markdown_fence_piece_has_body(piece: str) -> bool:
+        in_fence = False
+        for line in piece.split("\n"):
+            s = line.strip()
+            if s.startswith("```"):
+                in_fence = not in_fence
+            elif in_fence and s:
+                return True
+        return not in_fence
+
+    @staticmethod
     def _split_text_for_message_limit(text: str, limit: int) -> list[str]:
         """Split ``text`` into ordered pieces each at most ``limit`` characters.
 
@@ -10130,6 +10156,10 @@ class Agent365Adapter(BasePlatformAdapter):
                 if index > 0:
                     split_at = index + len(separator)
                     break
+            if split_at > 0 and not Agent365Adapter._markdown_fence_piece_has_body(
+                rest[:split_at]
+            ):
+                split_at = 0
             if split_at <= 0:
                 split_at = limit
                 if split_at > 0 and split_at < len(rest):
@@ -10137,6 +10167,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     low = rest[split_at]
                     if "\ud800" <= high <= "\udbff" and "\udc00" <= low <= "\udfff":
                         split_at -= 1
+                if split_at <= 0 and len(rest) >= 2 and "\ud800" <= rest[0] <= "\udbff" and "\udc00" <= rest[1] <= "\udfff":
+                    split_at = 2
+                elif split_at <= 0:
+                    split_at = min(limit, len(rest))
             piece = rest[:split_at]
             rest = rest[split_at:]
             # Splitting inside an open fence breaks rendering unless we
@@ -10146,7 +10180,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 while len(piece) + len(fence_close) > limit and piece:
                     rest = piece[-1] + rest
                     piece = piece[:-1]
-                if piece and len(piece) + len(fence_close) <= limit:
+                if piece and len(piece) + len(fence_close) <= limit and Agent365Adapter._markdown_fence_piece_has_body(piece):
                     piece += fence_close
                     reopen = f"```{reopen_info}\n" if reopen_info else "```\n"
                     rest = reopen + rest
