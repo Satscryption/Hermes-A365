@@ -19489,7 +19489,7 @@ class TestEditMessage:
         await a._flush_turn_buffer(chat)
         assert send_reply_mock.await_count == 1
         tail = str(send_reply_mock.await_args.kwargs["reply"]["text"])
-        assert delivered + [tail] == pieces
+        assert [*delivered, tail] == pieces
         assert chat not in a._turn_buffers
 
     @pytest.mark.asyncio
@@ -19520,6 +19520,7 @@ class TestEditMessage:
         )
         assert len(pieces) == 3
         posted: list[str] = []
+        stream_finals: list[str] = []
         plain_calls = {"n": 0}
         bridge = adapter_mod._import_bridge()
 
@@ -19529,7 +19530,9 @@ class TestEditMessage:
             if entity.get("streamType") == "informative" and "streamId" not in entity:
                 return self._http_result(201, "ka-pfx-8k")
             if activity.get("type") == "message" and entity.get("streamType") == "final":
-                posted.append(str(activity.get("text") or ""))
+                text = str(activity.get("text") or "")
+                posted.append(text)
+                stream_finals.append(text)
                 return self._http_result(202)
             return self._http_result(202)
 
@@ -19577,8 +19580,122 @@ class TestEditMessage:
         assert send_reply_mock.await_count == 2
         tails = [str(call.kwargs["reply"]["text"]) for call in send_reply_mock.await_args_list]
         assert delivered + tails == pieces
+        assert len(stream_finals) == 1
+        assert stream_finals[0] == pieces[0]
         assert all(len(part) <= a.MAX_MESSAGE_LENGTH for part in pieces)
         assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_prefixed_three_piece_distinct_tails_retry_sequence(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-pfx-yz-3pc"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-pfx-yz")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        monkeypatch.setattr(
+            a,
+            "_flush_undisplayed_informative_for_turn_locked",
+            AsyncMock(return_value=None),
+        )
+        lead = "Lead-in"
+        body = "y" * 4000 + "z" * 4000
+        combined = f"{lead}\n\n{body}"
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(
+            combined, a.MAX_MESSAGE_LENGTH
+        )
+        assert len(pieces) == 3
+        assert pieces[1] != pieces[2]
+        assert pieces[2].startswith("z")
+        posted: list[str] = []
+        stream_finals: list[str] = []
+        plain_calls = {"n": 0}
+        bridge = adapter_mod._import_bridge()
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            entity = (activity.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-pfx-yz")
+            if activity.get("type") == "message" and entity.get("streamType") == "final":
+                text = str(activity.get("text") or "")
+                posted.append(text)
+                stream_finals.append(text)
+                return self._http_result(202)
+            return self._http_result(202)
+
+        async def send_reply(**kwargs: Any) -> None:
+            text = str((kwargs.get("reply") or {}).get("text") or "")
+            if text == pieces[2]:
+                plain_calls["n"] += 1
+                if plain_calls["n"] == 1:
+                    raise RuntimeError("second tail failed")
+            posted.append(text)
+
+        a._http_client.post = post
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-pfx-yz",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-pfx-yz",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id=chat, content=lead, metadata={"informative_update": True})
+        await a.send(chat_id=chat, content=body, reply_to="act-pfx-yz")
+        keepalive_task = buf.get("keepalive_task")
+        if isinstance(keepalive_task, asyncio.Task):
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        await a.on_processing_complete(event, outcome="success")
+        assert posted == [*pieces[:2]]
+        assert len(stream_finals) == 1
+        task = buf.get("retry_task")
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        buf["retry_task"] = None
+
+        async def flush_send(**kwargs: Any) -> None:
+            posted.append(str((kwargs.get("reply") or {}).get("text") or ""))
+
+        send_reply_mock = AsyncMock(side_effect=flush_send)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        await a._flush_turn_buffer(chat)
+        retry_tails = [
+            str(call.kwargs["reply"]["text"]) for call in send_reply_mock.await_args_list
+        ]
+        assert retry_tails == [pieces[2]]
+        assert posted == pieces
+        assert posted.count(pieces[1]) == 1
+        assert len(stream_finals) == 1
+        assert stream_finals[0] == pieces[0]
+        assert chat not in a._turn_buffers
+
+    def test_prefixed_overflow_resume_cursor_guard_in_source(self) -> None:
+        import inspect
+
+        src = inspect.getsource(adapter_mod.Agent365Adapter._deliver_turn_answer_locked)
+        assert "start = max(start, int(ov.get(\"i\") or 0), 1)" in src
+
+    def test_prefixed_overflow_skip_landed_stream_final_guard_in_source(self) -> None:
+        import inspect
+
+        src = inspect.getsource(adapter_mod.Agent365Adapter._deliver_turn_answer_locked)
+        assert 'resume_i = int((record.get("prefix_overflow")' in src
 
     @pytest.mark.asyncio
     async def test_prefixed_overflow_stream_final_already_completed_posts_tail(

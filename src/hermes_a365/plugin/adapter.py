@@ -9357,6 +9357,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     return ("blocked", None)
                 return ("retry", None)
 
+            resume_i = int((record.get("prefix_overflow") or {}).get("i") or 0)
+            if len(prefix_split) > 1 and resume_i >= 1:
+                return await _emit_prefix_overflow_rest(max(resume_i, 1), stream_id)
+
             answer_outbound_deadline = time.monotonic() + _answer_final_cap_remaining_sec(stream)
             result = await self._post_answer_final(
                 chat_id,
@@ -9445,6 +9449,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     self._touch_keepalive_emit(chat_id, buf)
                     activity_id = result.stream_id or stream_id
                     if len(prefix_split) > 1:
+                        record.setdefault("prefix_overflow", {})["i"] = 1
                         return await _emit_prefix_overflow_rest(1, stream_id)
                     return self._finish_delivered(
                         chat_id,
@@ -9459,6 +9464,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 if classified == _ANSWER_FINAL_ALREADY_COMPLETED:
                     if landing_bits(record):
                         if len(prefix_split) > 1:
+                            record.setdefault("prefix_overflow", {})["i"] = 1
                             return await _emit_prefix_overflow_rest(
                                 1, stream_id, "already completed"
                             )
