@@ -9408,6 +9408,29 @@ class Agent365Adapter(BasePlatformAdapter):
                     set_had_landed(record)
                     self._touch_keepalive_emit(chat_id, buf)
                     activity_id = result.stream_id or stream_id
+                    if overflow_tail and isinstance(turn.get("inbound"), dict):
+                        inbound = turn["inbound"]
+                        path = turn.get("validated_path")
+                        path = path if isinstance(path, str) else None
+                        ro = turn.get("authority_record")
+                        ro = ro if isinstance(ro, TurnAuthorityRecord) else None
+                        for tail in overflow_tail:
+                            tr = await self._send_reply_activity(
+                                inbound=inbound,
+                                content=tail,
+                                log_context="turn buffer prefix overflow",
+                                validated_path=path,
+                                reply_origin=ro,
+                                turn_buffer_flush=(chat_id, buf, tuple(chunk_segment_ids)),
+                            )
+                            if not tr.success and _POST_SEND_TIMEOUT_MARKER not in str(
+                                tr.error or ""
+                            ).casefold():
+                                if (live := self._turn_buffers.get(chat_id)):
+                                    tk = self._delivery_record(live, turn)["turn_key"]
+                                    live["retry_turn_key"] = tk
+                                    self._schedule_turn_buffer_retry_if_allowed(chat_id, tk)
+                                return ("retry", None)
                     outcome = self._finish_delivered(
                         chat_id,
                         buf,
@@ -9418,20 +9441,6 @@ class Agent365Adapter(BasePlatformAdapter):
                         activity_id=activity_id or None,
                         chunk_segment_ids=chunk_segment_ids,
                     )
-                    if overflow_tail and isinstance(turn.get("inbound"), dict):
-                        inbound = turn["inbound"]
-                        path = turn.get("validated_path")
-                        path = path if isinstance(path, str) else None
-                        origin = turn.get("authority_record")
-                        ro = origin if isinstance(origin, TurnAuthorityRecord) else None
-                        for tail in overflow_tail:
-                            await self._send_reply_activity(
-                                inbound=inbound,
-                                content=tail,
-                                log_context="turn buffer prefix overflow",
-                                validated_path=path,
-                                reply_origin=ro,
-                            )
                     return outcome
                 if classified == _ANSWER_FINAL_ALREADY_COMPLETED:
                     if landing_bits(record):
@@ -10116,10 +10125,7 @@ class Agent365Adapter(BasePlatformAdapter):
             stripped = line.strip()
             if not stripped.startswith("```"):
                 continue
-            if open_info is not None:
-                open_info = None
-            else:
-                open_info = stripped[3:].strip()
+            open_info = None if open_info is not None else stripped[3:].strip()
         return open_info
 
     @staticmethod
@@ -10167,7 +10173,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     low = rest[split_at]
                     if "\ud800" <= high <= "\udbff" and "\udc00" <= low <= "\udfff":
                         split_at -= 1
-                if split_at <= 0 and len(rest) >= 2 and "\ud800" <= rest[0] <= "\udbff" and "\udc00" <= rest[1] <= "\udfff":
+                if split_at <= 0 and len(rest) >= 2 and (
+                    "\ud800" <= rest[0] <= "\udbff" and "\udc00" <= rest[1] <= "\udfff"
+                ):
                     split_at = 2
                 elif split_at <= 0:
                     split_at = min(limit, len(rest))
@@ -10180,7 +10188,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 while len(piece) + len(fence_close) > limit and piece:
                     rest = piece[-1] + rest
                     piece = piece[:-1]
-                if piece and len(piece) + len(fence_close) <= limit and Agent365Adapter._markdown_fence_piece_has_body(piece):
+                fence_has_body = Agent365Adapter._markdown_fence_piece_has_body(piece)
+                if piece and len(piece) + len(fence_close) <= limit and fence_has_body:
                     piece += fence_close
                     reopen = f"```{reopen_info}\n" if reopen_info else "```\n"
                     rest = reopen + rest

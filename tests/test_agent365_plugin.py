@@ -25262,7 +25262,7 @@ class TestIssue366LongFinalReply:
     def test_split_surrogate_pair_progresses_at_tiny_limit(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
-        a = _make_adapter(monkeypatch)
+        _make_adapter(monkeypatch)
         text = "\ud800\udc00" + ("a" * 10)
         for limit in (1, 2):
             pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
@@ -25339,6 +25339,95 @@ class TestIssue366LongFinalReply:
         expected = f"{prefix_text}\n\n{body}"
         assert "".join(posted) == expected
         assert len(posted) > 1
+        assert all(len(part) <= limit for part in posted)
+
+    @pytest.mark.asyncio
+    async def test_deliver_turn_answer_locked_prefix_overflow_tail_failure_retries(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-prefix-overflow-retry"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-prefix-retry")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        limit = a.MAX_MESSAGE_LENGTH
+        prefix_text = "Lead-in"
+        body = "z" * limit
+        buf = {
+            "turns": [{"seq": "1", "inbound": inbound, "open": False}],
+            "segments": [
+                {
+                    "id": "turnbuf:1",
+                    "text": prefix_text,
+                    "turn": "1",
+                    "kind": "commentary",
+                    "informative_displayed": False,
+                    "reply_to": "act-prefix-retry",
+                    "notify": True,
+                },
+                {
+                    "id": "turnbuf:2",
+                    "text": body,
+                    "turn": "1",
+                    "kind": "answer",
+                    "notify": True,
+                    "reply_to": "act-prefix-retry",
+                },
+            ],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+            "keepalive": {
+                "stream_id": "stream-prefix-retry",
+                "sequence": 1,
+                "opened_mono": time.monotonic(),
+            },
+        }
+        a._turn_buffers[chat] = buf
+        turn = buf["turns"][0]
+        posted: list[str] = []
+        tail_calls = {"n": 0}
+
+        async def send_reply_activity(**kwargs: Any) -> adapter_mod.SendResult:
+            content = str(kwargs.get("content") or "")
+            if kwargs.get("log_context") == "turn buffer prefix overflow":
+                tail_calls["n"] += 1
+                if tail_calls["n"] == 1:
+                    return adapter_mod.SendResult(
+                        success=False, error="prefix overflow tail failed"
+                    )
+            posted.append(content)
+            return adapter_mod.SendResult(success=True, message_id="plain-overflow-retry")
+
+        monkeypatch.setattr(a, "_send_reply_activity", send_reply_activity)
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs.get("json") or {}
+            entities = activity.get("entities") or []
+            if entities and entities[0].get("streamType") == "final":
+                posted.append(str(activity.get("text") or ""))
+            return MagicMock(
+                status_code=202, text="", json=lambda: {"id": "stream-prefix-retry"}
+            )
+
+        a._http_client.post = post
+        combined = f"{prefix_text}\n\n{body}"
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(combined, limit)
+        outcome, _ = await a._deliver_turn_answer_locked(chat, turn, body, ["turnbuf:2"])
+        assert outcome == "retry"
+        assert any(s.get("id") == "turnbuf:2" for s in buf["segments"])
+        record = a._delivery_record(buf, turn)
+        assert record.get("answer_final_settled") is not True
+        assert buf.get("retry_turn_key") == record["turn_key"]
+        assert pieces[0] in posted[0]
+        assert tail_calls["n"] == 1
+        outcome, _ = await a._deliver_turn_answer_locked(chat, turn, body, ["turnbuf:2"])
+        assert outcome == "delivered"
+        assert pieces[-1] in posted
+        assert "".join(pieces) == combined
         assert all(len(part) <= limit for part in posted)
 
     def test_split_prefers_paragraph_then_line_then_space(
