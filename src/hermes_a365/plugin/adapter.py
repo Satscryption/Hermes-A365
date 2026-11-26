@@ -9214,23 +9214,13 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         if self._turn_buffers.get(chat_id) is not buf:
             return ("retry", None)
-        overflow_tail: list[str] = []
         pending_informative = [
             str(segment.get("text") or "").strip()
             for segment in self._answer_informative_prefix_segments(buf, turn)
         ]
         if pending_informative:
             prefix = "\n\n".join(pending_informative)
-            base = str(content or "")
-            sep = "\n\n"
-            limit = self.MAX_MESSAGE_LENGTH
-            combined = f"{prefix}{sep}{base}" if base.strip() else prefix
-            if len(combined) > limit:
-                parts = self._split_text_for_message_limit(combined, limit)
-                content = parts[0]
-                overflow_tail = parts[1:]
-            else:
-                content = combined
+            content = f"{prefix}\n\n{content}" if str(content or "").strip() else prefix
 
         plain_route = await self._maybe_route_plain_turn_answer(
             chat_id,
@@ -9408,30 +9398,7 @@ class Agent365Adapter(BasePlatformAdapter):
                     set_had_landed(record)
                     self._touch_keepalive_emit(chat_id, buf)
                     activity_id = result.stream_id or stream_id
-                    if overflow_tail and isinstance(turn.get("inbound"), dict):
-                        inbound = turn["inbound"]
-                        path = turn.get("validated_path")
-                        path = path if isinstance(path, str) else None
-                        ro = turn.get("authority_record")
-                        ro = ro if isinstance(ro, TurnAuthorityRecord) else None
-                        for tail in overflow_tail:
-                            tr = await self._send_reply_activity(
-                                inbound=inbound,
-                                content=tail,
-                                log_context="turn buffer prefix overflow",
-                                validated_path=path,
-                                reply_origin=ro,
-                                turn_buffer_flush=(chat_id, buf, tuple(chunk_segment_ids)),
-                            )
-                            if not tr.success and _POST_SEND_TIMEOUT_MARKER not in str(
-                                tr.error or ""
-                            ).casefold():
-                                if (live := self._turn_buffers.get(chat_id)):
-                                    tk = self._delivery_record(live, turn)["turn_key"]
-                                    live["retry_turn_key"] = tk
-                                    self._schedule_turn_buffer_retry_if_allowed(chat_id, tk)
-                                return ("retry", None)
-                    outcome = self._finish_delivered(
+                    return self._finish_delivered(
                         chat_id,
                         buf,
                         turn,
@@ -9441,7 +9408,6 @@ class Agent365Adapter(BasePlatformAdapter):
                         activity_id=activity_id or None,
                         chunk_segment_ids=chunk_segment_ids,
                     )
-                    return outcome
                 if classified == _ANSWER_FINAL_ALREADY_COMPLETED:
                     if landing_bits(record):
                         return self._finish_delivered(
