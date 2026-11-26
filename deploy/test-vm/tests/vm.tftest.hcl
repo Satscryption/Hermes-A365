@@ -30,8 +30,8 @@ run "plan_vm_defaults" {
   }
 
   assert {
-    condition     = azurerm_linux_virtual_machine.main.source_image_reference[0].version == var.image_version
-    error_message = "Image version must match var.image_version."
+    condition     = azurerm_linux_virtual_machine.main.source_image_reference[0].version == "24.04.202611170"
+    error_message = "Image version must be the pinned Ubuntu 24.04 build."
   }
 
   assert {

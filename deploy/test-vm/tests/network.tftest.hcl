@@ -76,8 +76,13 @@ run "plan_network" {
   }
 
   assert {
-    condition     = endswith(output.messages_endpoint, "/api/messages")
-    error_message = "messages_endpoint output must end with /api/messages."
+    condition     = azurerm_public_ip.main.domain_name_label == var.dns_label
+    error_message = "Public IP domain_name_label must match dns_label."
+  }
+
+  assert {
+    condition     = output.messages_endpoint == "https://${var.dns_label}.centralindia.cloudapp.azure.com/api/messages"
+    error_message = "messages_endpoint must be the FQDN-derived Bot Framework URL."
   }
 }
 
