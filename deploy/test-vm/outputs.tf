@@ -17,3 +17,8 @@ output "messages_endpoint" {
   description = "Bot Framework messaging endpoint URL."
   value       = "https://${azurerm_public_ip.main.fqdn}/api/messages"
 }
+
+output "vm_name" {
+  description = "Linux VM resource name."
+  value       = azurerm_linux_virtual_machine.main.name
+}

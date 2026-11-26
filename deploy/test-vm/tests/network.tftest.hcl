@@ -1,8 +1,11 @@
 mock_provider "azurerm" {}
 
 variables {
-  name_prefix = "example-walk"
-  dns_label   = "example-walk"
+  name_prefix          = "example-walk"
+  dns_label            = "example-walk"
+  admin_ssh_public_key = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIORxucrWMA7qXjLipQktiRvQyFszhXiTMU/Q+HKfamXU"
+  hermes_a365_ref      = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  hermes_agent_ref     = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
 }
 
 run "plan_network" {
