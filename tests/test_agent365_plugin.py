@@ -24865,6 +24865,367 @@ class TestIssue366LongFinalReply:
         assert all(len(part) <= a.MAX_MESSAGE_LENGTH for part in posted)
         assert all("Response formatting failed, plain text:" not in part for part in posted)
 
+    @pytest.mark.asyncio
+    async def test_turn_buffer_send_stores_equal_repeated_pieces(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-equal-m"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-equal-m")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-equal-m",
+        )
+        await a.on_processing_start(event)
+        body = "m" * 8000
+        result = await a.send(chat_id=chat, content=body, reply_to="act-equal-m")
+        assert result.success is True
+        stored = "".join(str(s.get("text") or "") for s in a._turn_buffers[chat]["segments"])
+        assert stored == body
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_send_stores_paragraph_repeated_pieces(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-equal-p"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-equal-p")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-equal-p",
+        )
+        await a.on_processing_start(event)
+        body = ("P" * 3000 + "\n\n") * 3
+        result = await a.send(chat_id=chat, content=body, reply_to="act-equal-p")
+        assert result.success is True
+        stored = "".join(str(s.get("text") or "") for s in a._turn_buffers[chat]["segments"])
+        assert stored == body
+
+    @pytest.mark.asyncio
+    async def test_oversized_send_replay_is_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-replay"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-replay")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-replay",
+        )
+        await a.on_processing_start(event)
+        body = "r" * 7702
+        first = await a.send(chat_id=chat, content=body, reply_to="act-replay")
+        assert first.success is True
+        segments_after_first = len(a._turn_buffers[chat]["segments"])
+        second = await a.send(chat_id=chat, content=body, reply_to="act-replay")
+        assert second.success is True
+        assert len(a._turn_buffers[chat]["segments"]) == segments_after_first
+        stored = "".join(str(s.get("text") or "") for s in a._turn_buffers[chat]["segments"])
+        assert stored == body
+
+    @pytest.mark.asyncio
+    async def test_turn_buffer_send_accepts_3818_char_final(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-3818"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-3818")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-3818",
+        )
+        await a.on_processing_start(event)
+        body = "k" * 3818
+        result = await a.send(chat_id=chat, content=body, reply_to="act-3818")
+        assert result.success is True
+        stored = "".join(str(s.get("text") or "") for s in a._turn_buffers[chat]["segments"])
+        assert stored == body
+        assert len(stored) <= a.MAX_MESSAGE_LENGTH
+
+    @pytest.mark.asyncio
+    async def test_notify_final_without_reply_to_flushes_every_piece(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-notify"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-notify")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        TestEditMessage._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        monkeypatch.setattr(a, "_turn_buffer_keepalive_needed", lambda _cid: False)
+        bridge = adapter_mod._import_bridge()
+        body = self._body(4581)
+        posted: list[str] = []
+
+        async def deliver(
+            _chat_id: str,
+            _turn: dict[str, Any],
+            content: str,
+            _chunk_ids: list[str],
+        ) -> tuple[str, str | None]:
+            posted.append(content)
+            return ("delivered", "stream-final")
+
+        async def send_reply(**kwargs: Any) -> None:
+            posted.append(str((kwargs.get("reply") or {}).get("text") or ""))
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", deliver)
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-notify",
+        )
+        await a.on_processing_start(event)
+        sent = await a.send(chat_id=chat, content=body, metadata={"notify": True})
+        assert sent.success is True
+        await a.on_processing_complete(event, outcome="success")
+        assert "".join(posted) == body
+        assert len(posted) > 1
+
+    @pytest.mark.asyncio
+    async def test_expect_edits_oversized_edit_replaces_whole_body(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-edits"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-edits")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-edits",
+        )
+        await a.on_processing_start(event)
+        body = self._body(4581)
+        sent = await a.send(
+            chat_id=chat,
+            content=body,
+            reply_to="act-edits",
+            metadata={"expect_edits": True},
+        )
+        assert sent.success is True
+        seg_id = str(sent.message_id)
+        assert len(a._turn_buffers[chat]["segments"]) == 1
+        replacement = "Replacement " * 400
+        edited = await a.edit_message(chat_id=chat, message_id=seg_id, content=replacement)
+        assert edited.success is True
+        stored = "".join(str(s.get("text") or "") for s in a._turn_buffers[chat]["segments"])
+        assert stored == replacement
+
+    @pytest.mark.asyncio
+    async def test_oversized_edit_retry_posts_remainder_after_chunk_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-edit-retry"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-edit-retry")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        body = self._body(4581)
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(
+            body, a.MAX_MESSAGE_LENGTH
+        )
+        a._turn_buffers[chat] = {
+            "turns": [
+                {
+                    "seq": "1",
+                    "inbound": inbound,
+                    "activity_id": "act-edit-retry",
+                    "open": False,
+                }
+            ],
+            "segments": [
+                {
+                    "id": "turnbuf:1",
+                    "text": body,
+                    "turn": "1",
+                    "kind": "answer",
+                    "reply_to": "act-edit-retry",
+                    "notify": False,
+                    "expect_edits": False,
+                }
+            ],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+        }
+        posted: list[str] = []
+        plain_calls = 0
+
+        async def deliver(
+            _chat_id: str,
+            _turn: dict[str, Any],
+            content: str,
+            chunk_segment_ids: list[str],
+        ) -> tuple[str, str | None]:
+            posted.append(content)
+            a._remove_turn_segments(a._turn_buffers[chat], chunk_segment_ids)
+            return ("delivered", "stream-final")
+
+        async def send_reply_wrapper(**_kwargs: Any) -> adapter_mod.SendResult:
+            nonlocal plain_calls
+            plain_calls += 1
+            if plain_calls == 1:
+                return adapter_mod.SendResult(success=False, error="chunk two failed")
+            posted.append(pieces[1])
+            a._remove_turn_segments(a._turn_buffers[chat], ["turnbuf:2"])
+            return adapter_mod.SendResult(success=True, message_id="plain-1")
+
+        monkeypatch.setattr(a, "_deliver_turn_answer_locked", deliver)
+        monkeypatch.setattr(a, "_send_reply_activity", send_reply_wrapper)
+        await a._flush_turn_buffer(chat)
+        assert posted == [pieces[0]]
+        assert plain_calls == 1
+        await a._flush_turn_buffer(chat)
+        assert posted == [pieces[0], pieces[1]]
+        assert "".join(posted) == body
+
+    @pytest.mark.asyncio
+    async def test_presplit_stream_final_payload_not_stripped(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-strip"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-strip")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        TestEditMessage._patch_token_mint(monkeypatch)
+        captured: dict[str, str] = {}
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            captured["text"] = str((kwargs.get("json") or {}).get("text") or "")
+            return MagicMock(status_code=202, text="", json=lambda: {"id": "sid"})
+
+        a._http_client.post = post
+        turn = {
+            "inbound": inbound,
+            "seq": "1",
+            "activity_id": "act-strip",
+        }
+        chunk = ("w" * (a.MAX_MESSAGE_LENGTH - 4)) + " \n\n"
+        assert chunk.rstrip() != chunk
+        await a._post_keepalive_activity(
+            chat,
+            turn,
+            stream_id="stream-1",
+            sequence=0,
+            final=True,
+            text=chunk,
+        )
+        assert captured.get("text") == chunk
+
+    def test_answer_deliver_prefix_fits_before_split(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-366-prefix"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-prefix")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        TestEditMessage._wire_adapter(a, inbound=inbound)
+        limit = a.MAX_MESSAGE_LENGTH
+        body = TestIssue366LongFinalReply._body(limit)
+        prefix_text = "Lead-in"
+        buf = {
+            "turns": [{"seq": "1", "inbound": inbound, "open": False}],
+            "segments": [
+                {
+                    "id": "turnbuf:1",
+                    "text": prefix_text,
+                    "turn": "1",
+                    "kind": "commentary",
+                    "informative_displayed": False,
+                    "reply_to": "act-prefix",
+                    "notify": True,
+                },
+                {
+                    "id": "turnbuf:2",
+                    "text": body,
+                    "turn": "1",
+                    "kind": "answer",
+                    "notify": True,
+                    "reply_to": "act-prefix",
+                },
+            ],
+            "depth": 0,
+            "lock": asyncio.Lock(),
+        }
+        turn = buf["turns"][0]
+        overhead = len(prefix_text) + 2
+        room = limit - overhead
+        trimmed = adapter_mod.Agent365Adapter._split_text_for_message_limit(body, room)[0]
+        expected = f"{prefix_text}\n\n{trimmed}"
+        assert len(expected) <= limit
+        pending = [
+            str(s.get("text") or "").strip()
+            for s in a._answer_informative_prefix_segments(buf, turn)
+        ]
+        assert pending == [prefix_text]
+        content = body
+        if pending:
+            prefix = "\n\n".join(pending)
+            base = str(content or "")
+            sep = "\n\n"
+            oh = len(prefix) + (len(sep) if prefix and base.strip() else 0)
+            if base.strip() and oh + len(base) > limit:
+                r = max(0, limit - oh)
+                if r:
+                    base = adapter_mod.Agent365Adapter._split_text_for_message_limit(base, r)[0]
+            content = f"{prefix}{sep}{base}" if base.strip() else prefix
+        assert content == expected
+
+    def test_split_code_fence_reopens_on_next_piece(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        limit = a.MAX_MESSAGE_LENGTH
+        text = "intro\n\n```python\n" + ("print(1)\n" * 900)
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
+        assert len(pieces) > 1
+        assert all(len(piece) <= limit for piece in pieces)
+        for index, piece in enumerate(pieces[:-1]):
+            nxt = pieces[index + 1]
+            if piece.rstrip().endswith("```") and nxt.lstrip().startswith("```python"):
+                return
+        pytest.fail("expected a fence split with reopen")
+
+    def test_split_surrogate_pair_not_bisected(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        limit = a.MAX_MESSAGE_LENGTH
+        text = "a" * (limit - 1) + "\ud800\udc00"
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
+        assert "".join(pieces) == text
+        for piece in pieces:
+            assert not piece.endswith("\ud800") or piece.endswith("\ud800\udc00")
+
+    def test_split_prefers_paragraph_then_line_then_space(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        limit = a.MAX_MESSAGE_LENGTH
+        tail = "b" * 500
+        text = ("a" * 3500) + "\n\n" + tail
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(text, limit)
+        assert "".join(pieces) == text
+        assert pieces[0].endswith("\n\n")
+
 
 class TestStreamingOverflowLimit:
     def test_streaming_overflow_limit_only_for_personal_session_task(

@@ -8412,7 +8412,9 @@ class Agent365Adapter(BasePlatformAdapter):
         empty = _KeepalivePost(None, "", "", False)
         if final and not stream_id:
             return empty
-        body_text = (text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT).strip()
+        raw_final = text if text is not None else _TURN_BUFFER_KEEPALIVE_TEXT
+        capped_final = final and text is not None and len(text) <= self.MAX_MESSAGE_LENGTH
+        body_text = raw_final if capped_final else raw_final.strip()
         buf = self._turn_buffers.get(chat_id)
         placeholder = Agent365Adapter._is_placeholder_informative_text(body_text)
         if (
@@ -8454,7 +8456,9 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id,
                 )
                 return empty
-        if final and text is not None:
+        if capped_final:
+            payload_text = text
+        elif final and text is not None:
             payload_text = body_text[: self.MAX_MESSAGE_LENGTH]
         else:
             payload_text = body_text[:_INFORMATIVE_TEXT_MAX_CHARS]
@@ -9216,7 +9220,17 @@ class Agent365Adapter(BasePlatformAdapter):
         ]
         if pending_informative:
             prefix = "\n\n".join(pending_informative)
-            content = f"{prefix}\n\n{content}" if str(content or "").strip() else prefix
+            base = str(content or "")
+            sep = "\n\n"
+            limit = self.MAX_MESSAGE_LENGTH
+            overhead = len(prefix) + (len(sep) if prefix and base.strip() else 0)
+            if base.strip() and overhead + len(base) > limit:
+                room = max(0, limit - overhead)
+                if room:
+                    base = self._split_text_for_message_limit(base, room)[0]
+                else:
+                    base = ""
+            content = f"{prefix}{sep}{base}" if base.strip() else prefix
 
         plain_route = await self._maybe_route_plain_turn_answer(
             chat_id,
@@ -9871,12 +9885,45 @@ class Agent365Adapter(BasePlatformAdapter):
             return self._append_turn_buffer_segment(
                 chat_id, content, reply_to=reply_to, metadata=metadata
             )
+        if (metadata or {}).get("expect_edits"):
+            return self._append_turn_buffer_segment(
+                chat_id,
+                content,
+                reply_to=reply_to,
+                metadata=metadata,
+                allow_oversized=True,
+            )
         pieces = self._split_text_for_message_limit(text, limit)
+        buf = self._turn_buffers.get(chat_id)
+        if buf is not None:
+            turn = self._turn_for_send(buf, reply_to)
+            if turn is not None:
+                turn_seq = str(turn.get("seq") or "")
+                own = [
+                    segment
+                    for segment in buf["segments"]
+                    if str(segment.get("turn") or "") == turn_seq
+                ]
+                if len(own) >= len(pieces) and [s["text"] for s in own[-len(pieces) :]] == pieces:
+                    return SendResult(success=True, message_id=own[-1]["id"])
         last: SendResult | None = None
         for index, piece in enumerate(pieces):
-            piece_metadata = metadata if index == 0 else None
+            if metadata is None:
+                piece_metadata = None
+            elif index == 0:
+                piece_metadata = dict(metadata)
+            else:
+                piece_metadata = {
+                    key: metadata[key]
+                    for key in ("notify", "expect_edits")
+                    if metadata.get(key)
+                } or None
             last = self._append_turn_buffer_segment(
-                chat_id, piece, reply_to=reply_to, metadata=piece_metadata
+                chat_id,
+                piece,
+                reply_to=reply_to,
+                metadata=piece_metadata,
+                allow_tail_dedup=False,
             )
             if not last.success:
                 return last
@@ -9890,6 +9937,8 @@ class Agent365Adapter(BasePlatformAdapter):
         *,
         reply_to: Any | None = None,
         metadata: dict[str, Any] | None = None,
+        allow_oversized: bool = False,
+        allow_tail_dedup: bool = True,
     ) -> SendResult:
         """Append one local segment onto the turn it belongs to. No network."""
         buf = self._turn_buffers.get(chat_id)
@@ -9905,7 +9954,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 error=f"agent365 send: no turn buffer for chat_id={chat_id!r}",
             )
         text = _strip_streaming_cursor(content)
-        if len(text) > self.MAX_MESSAGE_LENGTH:
+        if len(text) > self.MAX_MESSAGE_LENGTH and not allow_oversized:
             return SendResult(
                 success=False,
                 error=(
@@ -9917,7 +9966,7 @@ class Agent365Adapter(BasePlatformAdapter):
         self._delivery_record(buf, turn)
         turn_seq = str(turn.get("seq") or "")
         own = [segment for segment in segments if str(segment.get("turn") or "") == turn_seq]
-        if own and own[-1]["text"] == text:
+        if allow_tail_dedup and own and own[-1]["text"] == text:
             return SendResult(success=True, message_id=own[-1]["id"])
         self._turn_buffer_seq += 1
         segment_id = f"turnbuf:{self._turn_buffer_seq}"
@@ -10046,6 +10095,19 @@ class Agent365Adapter(BasePlatformAdapter):
         )
 
     @staticmethod
+    def _markdown_fence_open_info(text: str) -> str | None:
+        open_info: str | None = None
+        for line in text.split("\n"):
+            stripped = line.strip()
+            if not stripped.startswith("```"):
+                continue
+            if open_info is not None:
+                open_info = None
+            else:
+                open_info = stripped[3:].strip()
+        return open_info
+
+    @staticmethod
     def _split_text_for_message_limit(text: str, limit: int) -> list[str]:
         """Split ``text`` into ordered pieces each at most ``limit`` characters.
 
@@ -10056,6 +10118,7 @@ class Agent365Adapter(BasePlatformAdapter):
             return [text]
         parts: list[str] = []
         rest = text
+        fence_close = "\n```"
         while rest:
             if len(rest) <= limit:
                 parts.append(rest)
@@ -10069,16 +10132,61 @@ class Agent365Adapter(BasePlatformAdapter):
                     break
             if split_at <= 0:
                 split_at = limit
-            parts.append(rest[:split_at])
+                if split_at > 0 and split_at < len(rest):
+                    high = rest[split_at - 1]
+                    low = rest[split_at]
+                    if "\ud800" <= high <= "\udbff" and "\udc00" <= low <= "\udfff":
+                        split_at -= 1
+            piece = rest[:split_at]
             rest = rest[split_at:]
+            # Splitting inside an open fence breaks rendering unless we
+            # close the fence at the piece boundary and reopen it next.
+            reopen_info = Agent365Adapter._markdown_fence_open_info(piece)
+            if reopen_info is not None:
+                while len(piece) + len(fence_close) > limit and piece:
+                    rest = piece[-1] + rest
+                    piece = piece[:-1]
+                if piece and len(piece) + len(fence_close) <= limit:
+                    piece += fence_close
+                    reopen = f"```{reopen_info}\n" if reopen_info else "```\n"
+                    rest = reopen + rest
+            parts.append(piece)
         return parts
+
+    def _expand_oversized_flush_segments(
+        self, buf: dict[str, Any], segments: list[dict[str, str]]
+    ) -> list[dict[str, str]]:
+        limit = self.MAX_MESSAGE_LENGTH
+        segments_list: list[dict[str, str]] = list(buf.get("segments") or [])
+        expanded: list[dict[str, str]] = []
+        for segment in segments:
+            text = str(segment.get("text") or "")
+            seg_id = str(segment.get("id") or "")
+            if len(text) <= limit:
+                expanded.append(segment)
+                continue
+            pieces = self._split_text_for_message_limit(text, limit)
+            replacements: list[dict[str, str]] = []
+            for piece in pieces:
+                self._turn_buffer_seq += 1
+                piece_segment = dict(segment)
+                piece_segment["id"] = f"turnbuf:{self._turn_buffer_seq}"
+                piece_segment["text"] = piece
+                replacements.append(piece_segment)
+            if seg_id:
+                for index, stored in enumerate(segments_list):
+                    if str(stored.get("id") or "") == seg_id:
+                        segments_list[index : index + 1] = replacements
+                        break
+            buf["segments"] = segments_list
+            expanded.extend(replacements)
+        return expanded
 
     def _chunk_turn_segments(self, segments: list[dict[str, str]]) -> list[list[dict[str, str]]]:
         """Split one turn's segments into ordered posts that fit the wire limit.
 
-        Segments are joined with a blank line. A single segment longer than
-        ``MAX_MESSAGE_LENGTH`` is split on text boundaries; the join of
-        several shorter segments is not.
+        Segments are joined with a blank line. When the joined text or a
+        single segment exceeds ``MAX_MESSAGE_LENGTH``, split on text boundaries.
         """
         limit = self.MAX_MESSAGE_LENGTH
         chunks: list[list[dict[str, str]]] = []
@@ -10097,11 +10205,9 @@ class Agent365Adapter(BasePlatformAdapter):
             if len(text) > limit:
                 flush_current()
                 pieces = self._split_text_for_message_limit(text, limit)
-                for index, piece in enumerate(pieces):
+                for piece in pieces:
                     piece_segment = dict(segment)
                     piece_segment["text"] = piece
-                    if index < len(pieces) - 1:
-                        piece_segment["id"] = ""
                     chunks.append([piece_segment])
                 continue
             extra = len(text) if not current else len(text) + 2
@@ -10282,6 +10388,7 @@ class Agent365Adapter(BasePlatformAdapter):
                 buf["retry_turn_key"] = turn_key
                 self._schedule_turn_buffer_retry_if_allowed(chat_id, turn_key)
                 return
+            kept = self._expand_oversized_flush_segments(buf, kept)
             chunks: list[tuple[list[dict[str, str]], str]] = []
             for chunk in self._chunk_turn_segments(kept):
                 chunks.append(
