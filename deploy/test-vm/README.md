@@ -1,5 +1,5 @@
 # Disposable test VM
-Ubuntu VM, public IP, and edge network for Hermes-A365. Caddy forwards only `/api/messages` to loopback. Needs Terraform 1.9+, Azure access, and B-series quota.
+Ubuntu VM, public IP, and edge network for Hermes-A365. Caddy forwards only `/api/messages` to loopback. Needs Terraform 1.11 or later, Azure access, and B-series quota.
 
 ```bash
 terraform init

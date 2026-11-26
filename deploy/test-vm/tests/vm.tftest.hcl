@@ -30,8 +30,8 @@ run "plan_vm_defaults" {
   }
 
   assert {
-    condition     = azurerm_linux_virtual_machine.main.source_image_reference[0].version != "latest" && var.image_version == "24.04.202611170"
-    error_message = "Image version must not be latest."
+    condition     = azurerm_linux_virtual_machine.main.source_image_reference[0].version == var.image_version
+    error_message = "Image version must match var.image_version."
   }
 
   assert {
@@ -49,10 +49,22 @@ run "plan_vm_defaults" {
       strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "/api/messages"),
       strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "127.0.0.1:3978"),
       strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "admin off"),
+      strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "UV_PYTHON_INSTALL_DIR=/opt/hermes/python"),
+      strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "set -euo pipefail"),
+      strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "- default"),
+      strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "/etc/hermes-bootstrap/Caddyfile"),
+      strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "install -m 0644 /etc/hermes-bootstrap/Caddyfile /etc/caddy/Caddyfile"),
+      strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "caddy validate --config /etc/caddy/Caddyfile"),
+      strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "hermes-a365[bridge]"),
+      !strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "{ admin off }"),
+      !strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "handle @messages { reverse_proxy"),
+      !strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "handle { respond 404"),
+      !strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "path: /etc/caddy/Caddyfile"),
+      can(regex("apt-get install -y caddy[\\s\\S]*install -m 0644 /etc/hermes-bootstrap/Caddyfile", base64decode(azurerm_linux_virtual_machine.main.custom_data))),
       !strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "enable hermes-gateway"),
       !strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "start hermes-gateway"),
     ])
-    error_message = "cloud-init must proxy /api/messages with admin off and must not auto-start hermes-gateway."
+    error_message = "cloud-init must satisfy bootstrap, Caddy, uv, and gateway constraints."
   }
 }
 

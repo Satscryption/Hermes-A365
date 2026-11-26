@@ -68,7 +68,9 @@ run "plan_network" {
       contains(keys(azurerm_virtual_network.main.tags), key) &&
       contains(keys(azurerm_network_security_group.main.tags), key) &&
       contains(keys(azurerm_public_ip.main.tags), key) &&
-      contains(keys(azurerm_network_interface.main.tags), key)
+      contains(keys(azurerm_network_interface.main.tags), key) &&
+      contains(keys(azurerm_linux_virtual_machine.main.tags), key) &&
+      contains(keys(azurerm_dev_test_global_vm_shutdown_schedule.main.tags), key)
     ])
     error_message = "Every taggable resource must include purpose, owner, and deadline tags."
   }

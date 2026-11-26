@@ -1,5 +1,5 @@
 terraform {
-  required_version = ">= 1.9.0, < 2.0.0"
+  required_version = ">= 1.11.0, < 2.0.0"
 
   required_providers {
     azurerm = {
@@ -10,5 +10,9 @@ terraform {
 }
 
 provider "azurerm" {
-  features {}
+  features {
+    virtual_machine {
+      delete_os_disk_on_deletion = true
+    }
+  }
 }
