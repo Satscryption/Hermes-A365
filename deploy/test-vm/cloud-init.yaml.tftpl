@@ -1,0 +1,38 @@
+#cloud-config
+users:
+  - default
+  - {name: hermes, system: true, shell: /usr/sbin/nologin, homedir: /var/lib/hermes}
+write_files:
+  - path: /etc/hermes-bootstrap/Caddyfile
+    content: |
+      {
+        admin off
+      }
+      ${fqdn} {
+        @messages path /api/messages
+        handle @messages {
+          reverse_proxy 127.0.0.1:3978
+        }
+        handle {
+          respond 404
+        }
+      }
+  - path: /etc/systemd/system/hermes-gateway.service
+    content: |
+      [Service]
+      User=hermes
+      Environment=HOME=/var/lib/hermes
+      Environment=HERMES_HOME=/var/lib/hermes/.hermes
+      ExecStart=/opt/hermes/venv/bin/hermes gateway run
+      Restart=no
+      NoNewPrivileges=true
+      ProtectSystem=strict
+      ProtectHome=true
+      PrivateTmp=true
+      ReadWritePaths=/var/lib/hermes
+      CapabilityBoundingSet=
+runcmd:
+  - install -d -m 0700 -o hermes -g hermes /var/lib/hermes
+  - bash -c 'set -euo pipefail; apt-get update && apt-get install -y caddy git curl ca-certificates && echo net.ipv4.tcp_mtu_probing=1 >/etc/sysctl.d/99-hermes.conf && echo "precedence ::ffff:0:0/96  100" >>/etc/gai.conf && printf "%s\n" "Unattended-Upgrade::Automatic-Reboot \"false\";" >/etc/apt/apt.conf.d/51hermes-no-reboot && sysctl --system'
+  - bash -c 'set -euo pipefail; curl -LsSf https://astral.sh/uv/${uv_version}/install.sh | sh && install -d -m 0755 /opt/hermes /opt/hermes/python && export UV_PYTHON_INSTALL_DIR=/opt/hermes/python && /root/.local/bin/uv venv /opt/hermes/venv --python 3.14 && UV_PYTHON_INSTALL_DIR=/opt/hermes/python /root/.local/bin/uv pip install --python /opt/hermes/venv/bin/python "hermes-agent @ git+https://github.com/NousResearch/hermes-agent@${hermes_agent_ref}" "hermes-a365[bridge] @ git+https://github.com/Satscryption/Hermes-A365@${hermes_a365_ref}" && chmod -R a+rX /opt/hermes'
+  - bash -c 'set -euo pipefail; install -m 0644 /etc/hermes-bootstrap/Caddyfile /etc/caddy/Caddyfile && caddy validate --config /etc/caddy/Caddyfile && systemctl enable --now caddy && systemctl restart caddy && systemctl daemon-reload'
