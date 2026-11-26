@@ -19393,6 +19393,339 @@ class TestEditMessage:
         assert send_reply_mock.await_args.kwargs["reply"]["text"] == parts[2]
         assert "conv-G-ov-retry" not in a._turn_buffers
 
+    @staticmethod
+    def _prefix_overflow_lead_segment(turn_seq: str, text: str = "Lead-in") -> dict[str, Any]:
+        return {
+            "id": "turnbuf:lead",
+            "text": text,
+            "turn": turn_seq,
+            "kind": "commentary",
+            "reply_to": "",
+            "notify": False,
+            "expect_edits": False,
+            "informative_update": True,
+        }
+
+    @pytest.mark.asyncio
+    async def test_prefixed_long_answer_tail_failure_resumes_in_order(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-pfx-4k-tail"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-pfx-4k")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        monkeypatch.setattr(
+            a,
+            "_flush_undisplayed_informative_for_turn_locked",
+            AsyncMock(return_value=None),
+        )
+        lead = "Lead-in"
+        body = "x" * 3992
+        combined = f"{lead}\n\n{body}"
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(
+            combined, a.MAX_MESSAGE_LENGTH
+        )
+        assert len(pieces) == 2
+        posted: list[str] = []
+        plain_calls = {"n": 0}
+        bridge = adapter_mod._import_bridge()
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            entity = (activity.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-pfx-4k")
+            if activity.get("type") == "message" and entity.get("streamType") == "final":
+                posted.append(str(activity.get("text") or ""))
+                return self._http_result(202)
+            return self._http_result(202)
+
+        async def send_reply(**kwargs: Any) -> None:
+            text = str((kwargs.get("reply") or {}).get("text") or "")
+            if text == pieces[1]:
+                plain_calls["n"] += 1
+                if plain_calls["n"] == 1:
+                    raise RuntimeError("tail failed")
+            posted.append(text)
+
+        a._http_client.post = post
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-pfx-4k",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-pfx-4k",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id=chat, content=lead, metadata={"informative_update": True})
+        await a.send(chat_id=chat, content=body, reply_to="act-pfx-4k")
+        keepalive_task = buf.get("keepalive_task")
+        if isinstance(keepalive_task, asyncio.Task):
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        await a.on_processing_complete(event, outcome="success")
+        assert posted == [pieces[0]]
+        task = buf.get("retry_task")
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        buf["retry_task"] = None
+        delivered = list(posted)
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        await a._flush_turn_buffer(chat)
+        assert send_reply_mock.await_count == 1
+        tail = str(send_reply_mock.await_args.kwargs["reply"]["text"])
+        assert delivered + [tail] == pieces
+        assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_prefixed_eight_k_three_piece_second_tail_failure_resumes(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-pfx-8k-3pc"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-pfx-8k")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        monkeypatch.setattr(
+            a,
+            "_flush_undisplayed_informative_for_turn_locked",
+            AsyncMock(return_value=None),
+        )
+        lead = "Lead-in"
+        body = "y" * 8000
+        combined = f"{lead}\n\n{body}"
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(
+            combined, a.MAX_MESSAGE_LENGTH
+        )
+        assert len(pieces) == 3
+        posted: list[str] = []
+        plain_calls = {"n": 0}
+        bridge = adapter_mod._import_bridge()
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            entity = (activity.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-pfx-8k")
+            if activity.get("type") == "message" and entity.get("streamType") == "final":
+                posted.append(str(activity.get("text") or ""))
+                return self._http_result(202)
+            return self._http_result(202)
+
+        async def send_reply(**kwargs: Any) -> None:
+            text = str((kwargs.get("reply") or {}).get("text") or "")
+            if text == pieces[2]:
+                plain_calls["n"] += 1
+                if plain_calls["n"] == 1:
+                    raise RuntimeError("second tail failed")
+            posted.append(text)
+
+        a._http_client.post = post
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_RETRY_DELAY_SEC", 3600)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-pfx-8k",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-pfx-8k",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id=chat, content=lead, metadata={"informative_update": True})
+        await a.send(chat_id=chat, content=body, reply_to="act-pfx-8k")
+        keepalive_task = buf.get("keepalive_task")
+        if isinstance(keepalive_task, asyncio.Task):
+            keepalive_task.cancel()
+            await asyncio.gather(keepalive_task, return_exceptions=True)
+        await a.on_processing_complete(event, outcome="success")
+        assert posted[0] == pieces[0]
+        assert all(len(part) <= a.MAX_MESSAGE_LENGTH for part in pieces)
+        task = buf.get("retry_task")
+        assert isinstance(task, asyncio.Task)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        buf["retry_task"] = None
+        delivered = list(posted)
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+        await a._flush_turn_buffer(chat)
+        assert send_reply_mock.await_count == 2
+        tails = [str(call.kwargs["reply"]["text"]) for call in send_reply_mock.await_args_list]
+        assert delivered + tails == pieces
+        assert all(len(part) <= a.MAX_MESSAGE_LENGTH for part in pieces)
+        assert chat not in a._turn_buffers
+
+    @pytest.mark.asyncio
+    async def test_prefixed_overflow_stream_final_already_completed_posts_tail(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import hashlib
+
+        a = _make_adapter(monkeypatch)
+        chat = "conv-pfx-403-tail"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-pfx-403")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        monkeypatch.setattr(
+            a,
+            "_flush_undisplayed_informative_for_turn_locked",
+            AsyncMock(return_value=None),
+        )
+        lead = "Lead-in"
+        body = "z" * 3992
+        combined = f"{lead}\n\n{body}"
+        pieces = adapter_mod.Agent365Adapter._split_text_for_message_limit(
+            combined, a.MAX_MESSAGE_LENGTH
+        )
+        digest = hashlib.sha256(combined.encode()).hexdigest()
+        posted: list[str] = []
+        finals = {"n": 0}
+        bridge = adapter_mod._import_bridge()
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            activity = kwargs["json"]
+            entity = (activity.get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-pfx-403")
+            if activity.get("type") == "message" and entity.get("streamType") == "final":
+                finals["n"] += 1
+                return MagicMock(
+                    status_code=403,
+                    text="already completed",
+                    json=lambda: {"error": {"message": "already completed"}},
+                )
+            return self._http_result(202)
+
+        async def send_reply(**kwargs: Any) -> None:
+            posted.append(str((kwargs.get("reply") or {}).get("text") or ""))
+
+        a._http_client.post = post
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-pfx-403",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = buf["turns"][0]
+        turn["open"] = False
+        buf["segments"] = [
+            self._prefix_overflow_lead_segment(str(turn["seq"]), lead),
+            {
+                "id": "turnbuf:ans",
+                "text": body,
+                "turn": str(turn["seq"]),
+                "kind": "answer",
+                "reply_to": "act-pfx-403",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            },
+        ]
+        buf["keepalive"] = {
+            "stream_id": "ka-pfx-403",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        record = a._delivery_record(buf, turn)
+        record["had_landed"] = True
+        record["prefix_overflow"] = {"n": len(pieces), "h": digest, "i": 0}
+        chunk_ids = [str(s["id"]) for s in buf["segments"]]
+        outcome, _ = await a._deliver_turn_answer_locked(chat, turn, body, chunk_ids)
+        assert outcome == "delivered"
+        assert finals["n"] == 1
+        assert posted == [pieces[1]]
+        assert record.get("state") == "DONE"
+        assert not buf.get("segments")
+
+    @pytest.mark.asyncio
+    async def test_prefixed_overflow_fits_single_post_unchanged(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-pfx-fit"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-pfx-fit")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        self._no_sleep(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        monkeypatch.setattr(
+            a,
+            "_flush_undisplayed_informative_for_turn_locked",
+            AsyncMock(return_value=None),
+        )
+        lead = "Lead-in"
+        body = "short answer"
+        combined = f"{lead}\n\n{body}"
+        posts: list[dict[str, Any]] = []
+        bridge = adapter_mod._import_bridge()
+        send_reply_mock = AsyncMock(return_value=None)
+        monkeypatch.setattr(bridge, "send_reply", send_reply_mock)
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "ka-pfx-fit")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-pfx-fit",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        buf["keepalive"] = {
+            "stream_id": "ka-pfx-fit",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        await a.send(chat_id=chat, content=lead, metadata={"informative_update": True})
+        await a.send(chat_id=chat, content=body, reply_to="act-pfx-fit")
+        await a.on_processing_complete(event, outcome="success")
+        finals = [
+            str(body.get("text") or "")
+            for body in posts
+            if body.get("type") == "message"
+            and (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ]
+        assert finals == [combined]
+        assert send_reply_mock.await_count == 0
+        assert chat not in a._turn_buffers
+
     @pytest.mark.asyncio
     async def test_overflow_after_uncertain_first_chunk_plain_on_retry(
         self, monkeypatch: pytest.MonkeyPatch

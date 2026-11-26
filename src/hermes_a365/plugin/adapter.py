@@ -8916,6 +8916,10 @@ class Agent365Adapter(BasePlatformAdapter):
             closed_by_turn_key,
         )
 
+        ov = record.get("prefix_overflow")
+        if isinstance(ov, dict) and int(ov.get("i") or 0) > 0:
+            return None
+
         stream = self._keepalive_stream(buf)
         stream_id = str(stream.get("stream_id") or "")
         closed_by = str(stream.get("closed_by") or "")
@@ -9197,6 +9201,63 @@ class Agent365Adapter(BasePlatformAdapter):
         record["not_sent_probes_left"] = 1
         record["may_have_landed_probes_left"] = 1
 
+        buf["answer_final_in_progress"] = True
+        self._cancel_segment_informative_task(buf)
+        await self._flush_undisplayed_informative_for_turn_locked(
+            chat_id, buf, turn, during_answer_delivery=True
+        )
+        if self._turn_buffers.get(chat_id) is not buf:
+            return ("retry", None)
+        prefix_split: list[str] = []
+        pending_informative = [
+            str(segment.get("text") or "").strip()
+            for segment in self._answer_informative_prefix_segments(buf, turn)
+        ]
+        if pending_informative:
+            prefix = "\n\n".join(pending_informative)
+            base = str(content or "")
+            combined = f"{prefix}\n\n{base}" if base.strip() else prefix
+            if len(combined) > self.MAX_MESSAGE_LENGTH:
+                prefix_split = self._split_text_for_message_limit(combined, self.MAX_MESSAGE_LENGTH)
+                digest = hashlib.sha256(combined.encode()).hexdigest()
+                ov = record.get("prefix_overflow")
+                if isinstance(ov, dict) and ov.get("n") and (ov["n"] != len(prefix_split) or ov.get("h") != digest):  # noqa: E501
+                    record["state"] = "DEFERRED"
+                    return ("retry", None)
+                if not isinstance(ov, dict) or not ov.get("n"):
+                    record["prefix_overflow"] = {"n": len(prefix_split), "h": digest, "i": 0}
+                content = prefix_split[0]
+            else:
+                content = combined
+
+        async def _emit_prefix_overflow_rest(
+            start: int, stream_id: str, log_suffix: str = ""
+        ) -> tuple[str, str | None]:
+            ov = record.setdefault("prefix_overflow", {})
+            flush = (chat_id, buf, tuple(chunk_segment_ids))
+            start = max(start, int(ov.get("i") or 0), 1)
+            inbound = turn["inbound"]
+            path = turn.get("validated_path") if isinstance(turn.get("validated_path"), str) else None  # noqa: E501
+            ro = turn.get("authority_record") if isinstance(turn.get("authority_record"), TurnAuthorityRecord) else None  # noqa: E501
+            for idx in range(start, len(prefix_split)):
+                ov["i"] = idx
+                tr = await self._send_reply_activity(
+                    inbound=inbound, content=prefix_split[idx], log_context="turn buffer prefix overflow",  # noqa: E501
+                    validated_path=path, reply_origin=ro, turn_buffer_flush=flush,
+                )
+                if not tr.success and _POST_SEND_TIMEOUT_MARKER not in str(tr.error or "").casefold():  # noqa: E501
+                    record["state"] = "DEFERRED"
+                    if live := self._turn_buffers.get(chat_id):
+                        live["retry_turn_key"] = record["turn_key"]
+                        self._schedule_turn_buffer_retry_if_allowed(chat_id, record["turn_key"])
+                    return ("retry", None)
+                ov["i"] = idx + 1
+            record.pop("prefix_overflow", None)
+            return self._finish_delivered(
+                chat_id, buf, turn, record, stream_id=stream_id, content="".join(prefix_split),
+                activity_id=None, chunk_segment_ids=chunk_segment_ids, log_suffix=log_suffix,
+            )
+
         early = self._answer_deliver_pre_post(
             chat_id,
             buf,
@@ -9206,21 +9267,6 @@ class Agent365Adapter(BasePlatformAdapter):
         )
         if early is not None:
             return early
-
-        buf["answer_final_in_progress"] = True
-        self._cancel_segment_informative_task(buf)
-        await self._flush_undisplayed_informative_for_turn_locked(
-            chat_id, buf, turn, during_answer_delivery=True
-        )
-        if self._turn_buffers.get(chat_id) is not buf:
-            return ("retry", None)
-        pending_informative = [
-            str(segment.get("text") or "").strip()
-            for segment in self._answer_informative_prefix_segments(buf, turn)
-        ]
-        if pending_informative:
-            prefix = "\n\n".join(pending_informative)
-            content = f"{prefix}\n\n{content}" if str(content or "").strip() else prefix
 
         plain_route = await self._maybe_route_plain_turn_answer(
             chat_id,
@@ -9398,6 +9444,8 @@ class Agent365Adapter(BasePlatformAdapter):
                     set_had_landed(record)
                     self._touch_keepalive_emit(chat_id, buf)
                     activity_id = result.stream_id or stream_id
+                    if len(prefix_split) > 1:
+                        return await _emit_prefix_overflow_rest(1, stream_id)
                     return self._finish_delivered(
                         chat_id,
                         buf,
@@ -9410,6 +9458,10 @@ class Agent365Adapter(BasePlatformAdapter):
                     )
                 if classified == _ANSWER_FINAL_ALREADY_COMPLETED:
                     if landing_bits(record):
+                        if len(prefix_split) > 1:
+                            return await _emit_prefix_overflow_rest(
+                                1, stream_id, "already completed"
+                            )
                         return self._finish_delivered(
                             chat_id,
                             buf,
