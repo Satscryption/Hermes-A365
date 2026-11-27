@@ -6162,3 +6162,62 @@ class TestUpnObjectIdResolver:
             else:
                 token.assert_called_once()
                 fetch.assert_called_once()
+
+
+def test_upn_entry_never_admits_sender_with_different_aad_object_id(monkeypatch):
+    from io import BytesIO
+
+    from hermes_a365 import activity_bridge as bridge
+
+    upn = TestUpnObjectIdResolver.UPN
+    oid_x = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    oid_y = "ffffffff-1111-2222-3333-444444444444"
+    cfg = _cfg()
+    cfg.allowed_users = (upn,)
+    cfg.allow_all_users = False
+    monkeypatch.setattr(bridge, "acquire_token", lambda **_kw: {"access_token": "token"})
+    resolver = bridge.UpnObjectIdResolver(
+        cfg,
+        fetch=lambda *_a, **_kw: BytesIO(json.dumps({"id": oid_x}).encode()),
+    )
+    resolver.refresh()
+    allowed = resolver.effective_allowed_users()
+    hit = _inbound_message_activity()
+    hit["from"] = {"id": "29:opaque", "aadObjectId": oid_x}
+    miss = _inbound_message_activity()
+    miss["from"] = {"id": "29:other", "aadObjectId": oid_y}
+    assert _activity_user_authorized(hit, allowed_users=allowed, allow_all=False)
+    assert not _activity_user_authorized(miss, allowed_users=allowed, allow_all=False)
+
+    import urllib.error
+
+    def denied(*_a, **_kw):
+        raise urllib.error.HTTPError("https://x", 403, "x", {}, None)
+
+    resolver2 = bridge.UpnObjectIdResolver(cfg, fetch=denied)
+    resolver2.refresh()
+    denied_users = resolver2.effective_allowed_users()
+    assert not _activity_user_authorized(hit, allowed_users=denied_users, allow_all=False)
+
+
+def test_path_b_sender_admitted_only_by_listed_object_id():
+    oid_x = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+    oid_y = "ffffffff-1111-2222-3333-444444444444"
+    cfg = _cfg()
+    cfg.allowed_users = (oid_x.upper(),)
+    cfg.allow_all_users = False
+    hit = _inbound_message_activity()
+    hit["from"] = {"id": "29:opaque", "aadObjectId": oid_x}
+    miss = _inbound_message_activity()
+    miss["from"] = {"id": "29:other", "aadObjectId": oid_y}
+    upn_only = _inbound_message_activity()
+    upn_only["from"] = {"userPrincipalName": TestUpnObjectIdResolver.UPN}
+    assert _activity_user_authorized(
+        hit, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+    )
+    assert not _activity_user_authorized(
+        miss, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+    )
+    assert not _activity_user_authorized(
+        upn_only, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+    )

@@ -197,6 +197,16 @@
           },
           "subparsers_required": true
         },
+        "allowlist": {
+          "actions": [],
+          "subparsers": {
+            "resolve": {
+              "actions": [],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
+        },
         "bot-service": {
           "actions": [],
           "subparsers": {
@@ -1148,6 +1158,16 @@
             }
           },
           "subparsers_required": true
+        },
+        "allowlist": {
+          "actions": [],
+          "subparsers": {
+            "resolve": {
+              "actions": [],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
         },
         "bot-service": {
           "actions": [],
