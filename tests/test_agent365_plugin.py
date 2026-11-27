@@ -7148,6 +7148,32 @@ class Test226PreambleVsAnswerDesign:
         assert len(over_cap) == 201
         assert not adapter_mod._segment_is_intent_preamble(over_cap)
 
+    def test_issue363_partition_drops_draft_remark_before_tool(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        remark = (
+            "That draft came out at 1,040 words, over the 800-word target. "
+            "Trimming it down."
+        )
+        a = Test226PreambleVsAnswerDesign._adapter(monkeypatch)
+        segments = [
+            _design_turn_segment(
+                remark,
+                seg_id="turnbuf:1",
+                reply_to="act-1",
+                expect_edits=True,
+            ),
+            _design_turn_segment(_HERMES_PROGRESS_LINE, seg_id="turnbuf:2", kind="progress"),
+            _design_turn_segment(
+                "1. Section 1\n\nAnswer body.",
+                seg_id="turnbuf:3",
+                reply_to="act-1",
+            ),
+        ]
+        final_body = Test226PreambleVsAnswerDesign._final_body(a, segments)
+        assert final_body == "1. Section 1\n\nAnswer body."
+        assert remark not in final_body
+
     @pytest.mark.asyncio
     async def test_design_l3_edited_leadin_stays_commentary(
         self, monkeypatch: pytest.MonkeyPatch
@@ -7308,6 +7334,200 @@ class Test226PreambleVsAnswerDesign:
             and (post.get("entities") or [{}])[0].get("streamType") == "informative"
         ]
         assert len(edited_informative) == 1
+
+
+class TestIssue363DraftRemarks:
+    _REMARK = (
+        "That draft came out at 1,040 words, over the 800-word target. "
+        "Trimming it down."
+    )
+
+    @staticmethod
+    def _long_answer() -> str:
+        filler = TestIssue366LongFinalReply._body(4500)
+        return f"1. Section 1\n\n{filler}"
+
+    @pytest.mark.asyncio
+    async def test_issue363_long_split_reply_starts_with_requested_content(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-long-split"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-363")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            overflow.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        answer = self._long_answer()
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363",
+        )
+        await a.on_processing_start(event)
+        await a.send(
+            chat_id=chat,
+            content=self._REMARK,
+            reply_to="act-363",
+            metadata={"expect_edits": True},
+        )
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.send(chat_id=chat, content=answer, reply_to="act-363")
+        await a.on_processing_complete(event, outcome="success")
+        delivered = [
+            str(body.get("text") or "")
+            for body in posts
+            if body.get("type") == "message"
+            and (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ] + overflow
+        assert delivered
+        assert delivered[0].startswith("1. Section 1")
+        joined = "".join(delivered)
+        assert joined == answer
+        assert self._REMARK not in joined
+
+    @pytest.mark.asyncio
+    async def test_issue363_unscoped_remark_not_prefixed(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-unscoped"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-u")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-363-u")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            overflow.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        answer = self._long_answer()
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-u",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=self._REMARK, reply_to=None)
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.send(chat_id=chat, content=answer, reply_to="act-363-u")
+        await a.on_processing_complete(event, outcome="success")
+        delivered = [
+            str(body.get("text") or "")
+            for body in posts
+            if body.get("type") == "message"
+            and (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ] + overflow
+        joined = "".join(delivered)
+        assert joined == answer
+        assert self._REMARK not in joined
+
+    @pytest.mark.asyncio
+    async def test_issue363_no_tool_answer_with_word_count_delivered_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-word-count"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-wc")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-363-wc")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        answer = "The draft came out at 1,040 words."
+        event = _StubMessageEvent(
+            text="count",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-wc",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=answer, reply_to="act-363-wc")
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == answer
+
+    @pytest.mark.asyncio
+    async def test_issue363_post_tool_answer_sentence_delivered_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-post-tool"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-pt")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-363-pt")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        answer = "The draft came out at 1,040 words."
+        event = _StubMessageEvent(
+            text="count",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-pt",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.send(chat_id=chat, content=answer, reply_to="act-363-pt")
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == answer
 
 
 # ---------------------------------------------------------------------------

@@ -941,6 +941,21 @@ _INTENT_PREAMBLE_SENTENCE_CUE = re.compile(
     r"i['\u2019]m about to|i am about to|let me|allow me to)\b",
     re.IGNORECASE,
 )
+_DRAFT_REMARK_SENTENCE_CUE = re.compile(
+    r"^(?:"
+    r"(?:Trimming|Tightening|Shortening)\b"
+    r"|"
+    r".*\b\d[\d,]*\s*-?\s*(?:word|character)s?\b"
+    r"|"
+    r".*\b(?:word|character)\s+counts?\b"
+    r"|"
+    r".*\b(?:too\s+)?(?:long|short)\b"
+    r"|"
+    r".*\b(?:over|under)\b.*\b(?:the\s+)?(?:\d[\d,]*\s*-?\s*)?"
+    r"(?:word\s+)?(?:target|limit|cap|budget|maximum|max)\b"
+    r")",
+    re.IGNORECASE,
+)
 
 
 def _normalize_intent_preamble_text(text: str) -> str:
@@ -962,7 +977,10 @@ def _segment_is_intent_preamble(text: str) -> bool:
     if not sentences:
         return False
     return all(
-        bool(_INTENT_PREAMBLE_SENTENCE_CUE.match(sentence.strip()))
+        bool(
+            _INTENT_PREAMBLE_SENTENCE_CUE.match(sentence.strip())
+            or _DRAFT_REMARK_SENTENCE_CUE.match(sentence.strip())
+        )
         for sentence in sentences
         if sentence.strip()
     )
@@ -7361,6 +7379,8 @@ class Agent365Adapter(BasePlatformAdapter):
                 continue
             text = str(segment.get("text") or "").strip()
             if not text or _is_hermes_tool_progress_segment(text):
+                continue
+            if _segment_is_intent_preamble(text):
                 continue
             pending.append(segment)
         return pending
