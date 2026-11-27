@@ -1,0 +1,391 @@
+"""Offline tests for deploy/test-vm/scripts with stub az and terraform on PATH."""
+
+import json
+import os
+import shutil
+import subprocess
+from pathlib import Path
+
+import pytest
+import yaml
+
+ROOT = Path(__file__).resolve().parents[1]
+SCRIPTS = ROOT / "deploy" / "test-vm" / "scripts"
+CLOUD_INIT = ROOT / "deploy" / "test-vm" / "cloud-init.yaml.tftpl"
+APP = "11111111-2222-3333-4444-55555555555a"
+TENANT = "66666666-7777-8888-9999-000000000000"
+
+STUB = r"""#!/usr/bin/env python3
+import json, os, sys
+args = sys.argv[1:]
+with open(os.environ["STUB_LOG"], "a") as f:
+    f.write(json.dumps([os.path.basename(sys.argv[0])] + args) + "\n")
+rules = json.loads(os.environ.get("STUB_RULES", "[]"))
+line = " ".join([os.path.basename(sys.argv[0])] + args)
+for needle, out, rc in rules:
+    if needle in line:
+        sys.stdout.write(out + ("\n" if out else ""))
+        sys.exit(rc)
+sys.exit(0)
+"""
+
+RUNCMD_STUB = r"""#!/usr/bin/env python3
+import json, os, re, sys
+args = sys.argv[1:]
+cmd = os.path.basename(sys.argv[0])
+log = os.environ.get("STUB_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(json.dumps([cmd] + args) + "\n")
+if cmd == "bash":
+    pat = os.environ.get("STUB_BASH_FAIL_PATTERN", "")
+    if pat:
+        for i, a in enumerate(args):
+            if a == "-c" and i + 1 < len(args) and re.search(pat, args[i + 1]):
+                sys.exit(1)
+    sys.exit(0)
+if cmd == "install":
+    sys.exit(0)
+sys.exit(0)
+"""
+
+pytestmark = pytest.mark.skipif(shutil.which("bash") is None, reason="bash required")
+
+
+def run(tmp_path, script, args, rules, env=None):
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name in ("az", "terraform"):
+        stub = bin_dir / name
+        stub.write_text(STUB)
+        stub.chmod(0o755)
+    log = tmp_path / "calls.jsonl"
+    log.write_text("")
+    full_env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "STUB_LOG": str(log),
+        "STUB_RULES": json.dumps(rules),
+        **(env or {}),
+    }
+    proc = subprocess.run(
+        ["bash", str(SCRIPTS / script), *args],
+        capture_output=True,
+        text=True,
+        env=full_env,
+        timeout=60,
+    )
+    calls = [json.loads(x) for x in log.read_text().splitlines()]
+    return proc, calls
+
+
+TF_OUTPUTS = [
+    ["output -raw resource_group_name", "example-walk-rg", 0],
+    ["output -raw bot_resource_group_name", "example-walk-bot-rg", 0],
+    ["output -raw messages_endpoint", "https://example.invalid/api/messages", 0],
+]
+
+
+def mutating(calls):
+    verbs = {"create", "delete", "update", "put", "patch"}
+    return [c for c in calls if c[0] == "az" and verbs & {a.lower() for a in c}]
+
+
+def test_up_creates_bot_group_bot_and_teams_channel(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "false", 0],
+        ["group show -n example-walk-rg --query location", "centralindia", 0],
+        [
+            "group show -n example-walk-rg --query tags",
+            '{"purpose": "example-walk", "owner": "example-team"}',
+            0,
+        ],
+        ["bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId", "", 3],
+        ["account show", "00000000-0000-0000-0000-000000000000", 0],
+        ["rest --method get", "", 3],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode == 0, proc.stderr
+    group_creates = [c for c in calls if c[1:3] == ["group", "create"]]
+    assert len(group_creates) == 1
+    assert "example-walk-bot-rg" in group_creates[0]
+    assert "example-walk-rg" not in group_creates[0]
+    assert {"purpose=example-walk", "owner=example-team"} <= set(group_creates[0])
+    bot_create = next(c for c in calls if c[1:3] == ["bot", "create"])
+    assert {"SingleTenant", "F0", APP, TENANT, "https://example.invalid/api/messages"} <= set(
+        bot_create
+    )
+    put = next(c for c in calls if c[1:4] == ["rest", "--method", "put"])
+    assert "/channels/MsTeamsChannel?api-version=2022-09-15" in " ".join(put)
+    body = json.loads(put[put.index("--body") + 1])
+    assert body["properties"]["properties"]["deploymentEnvironment"] == "CommercialDeployment"
+    assert not any(c[1:3] == ["bot", "msteams"] for c in calls)
+    assert APP not in proc.stdout and TENANT not in proc.stdout
+
+
+def test_up_is_repeatable_and_never_recreates_existing_group(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        ["bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId", APP, 0],
+        ["account show", "00000000-0000-0000-0000-000000000000", 0],
+        ["rest --method get", "true", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not any(c[1:3] == ["group", "create"] for c in calls)
+    assert not any(c[1:3] == ["bot", "create"] for c in calls)
+    assert not any(c[1:4] == ["rest", "--method", "put"] for c in calls)
+    bot_update = next(c for c in calls if c[1:3] == ["bot", "update"])
+    ep = bot_update.index("--endpoint")
+    assert bot_update[ep + 1] == "https://example.invalid/api/messages"
+
+
+def test_up_refuses_invalid_tags_json(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "false", 0],
+        ["group show -n example-walk-rg --query location", "centralindia", 0],
+        ["group show -n example-walk-rg --query tags", "not-json", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_up_refuses_null_tags(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "false", 0],
+        ["group show -n example-walk-rg --query location", "centralindia", 0],
+        ["group show -n example-walk-rg --query tags", "null", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_up_accepts_same_app_id_different_case(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        [
+            "bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId",
+            "11111111-2222-3333-4444-55555555555A",
+            0,
+        ],
+        ["account show", "00000000-0000-0000-0000-000000000000", 0],
+        ["rest --method get", "true", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any(c[1:3] == ["bot", "update"] for c in calls)
+
+
+def test_tf_state_path_with_space_reaches_terraform(tmp_path):
+    state_path = str(tmp_path / "state with spaces.tfstate")
+    rules = [
+        [f"-state={state_path} resource_group_name", "example-walk-rg", 0],
+        [f"-state={state_path} bot_resource_group_name", "example-walk-bot-rg", 0],
+        [f"-state={state_path} messages_endpoint", "https://example.invalid/api/messages", 0],
+        ["group exists", "true", 0],
+        ["bot show", "{}", 0],
+    ]
+    proc, calls = run(tmp_path, "bot-channel.sh", ["status"], rules, {"TF_STATE": state_path})
+    assert proc.returncode == 0, proc.stderr
+    state_args = [a for c in calls if c[0] == "terraform" for a in c if a.startswith("-state=")]
+    assert state_args == [f"-state={state_path}"] * 3
+
+
+def test_up_refuses_other_app_id(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        [
+            "bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId",
+            TENANT,
+            0,
+        ],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+@pytest.mark.parametrize("env", [{}, {"BOT_APP_ID": "not-a-guid", "BOT_TENANT_ID": TENANT}])
+def test_up_requires_ids_before_any_change(tmp_path, env):
+    proc, calls = run(tmp_path, "bot-channel.sh", ["up"], TF_OUTPUTS, env)
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_down_deletes_only_a_bot_only_group(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["resource list -g example-walk-bot-rg", "0", 0],
+        ["group exists -n example-walk-bot-rg", "true", 0],
+    ]
+    # First exists check says present; after delete the stub still says true, so
+    # the readback must fail loudly.
+    proc, calls = run(tmp_path, "bot-channel.sh", ["down"], rules)
+    deletes = [c for c in calls if c[1:3] == ["group", "delete"]]
+    assert len(deletes) == 1 and "example-walk-bot-rg" in deletes[0]
+    assert "example-walk-rg" not in deletes[0]
+    assert proc.returncode != 0
+
+
+def test_down_refuses_group_with_other_resources(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        ["resource list -g example-walk-bot-rg", "2", 0],
+    ]
+    proc, calls = run(tmp_path, "bot-channel.sh", ["down"], rules)
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_status_is_read_only(tmp_path):
+    rules = [*TF_OUTPUTS, ["group exists", "true", 0], ["bot show", "{}", 0]]
+    proc, calls = run(tmp_path, "bot-channel.sh", ["status"], rules)
+    assert proc.returncode == 0, proc.stderr
+    assert mutating(calls) == []
+
+
+CLEAN = [
+    ["group exists", "false", 0],
+    ["resource list --query", "0", 0],
+    ["resource list --resource-type Microsoft.Compute/disks", "0", 0],
+]
+
+
+def test_leftovers_clean(tmp_path):
+    proc, calls = run(
+        tmp_path, "check-leftovers.sh", ["example-walk", "example-walk-vm_disk1_0123abcd"], CLEAN
+    )
+    assert proc.returncode == 0, proc.stdout + proc.stderr
+    assert mutating(calls) == []
+    disk_q = next(c for c in calls if "Microsoft.Compute/disks" in c)
+    q = disk_q[disk_q.index("--query") + 1]
+    assert "starts_with(name, 'example-walk-vm_')" in q
+    assert "name == 'example-walk-vm_disk1_0123abcd'" in q
+    assert "OsDisk" not in q
+    groups = [c[c.index("-n") + 1] for c in calls if c[1:3] == ["group", "exists"]]
+    assert groups == ["example-walk-rg", "example-walk-bot-rg"]
+    assert "NetworkWatcherRG" in proc.stdout
+    assert not any(
+        line.startswith("LEFTOVER") and "NetworkWatcher" in line
+        for line in proc.stdout.splitlines()
+    )
+
+
+def test_leftover_disk_fails(tmp_path):
+    rules = [["resource list --resource-type Microsoft.Compute/disks", "1", 0], *CLEAN]
+    proc, _ = run(tmp_path, "check-leftovers.sh", ["example-walk"], rules)
+    assert proc.returncode == 1
+    assert "LEFTOVER OS disks: 1" in proc.stdout
+
+
+def test_leftover_group_and_tag(tmp_path):
+    rules = [
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        ["resource list --tag walk=1", "0", 0],
+        ["group list --tag walk=1", "1", 0],
+        *CLEAN,
+    ]
+    proc, _ = run(
+        tmp_path, "check-leftovers.sh", ["example-walk"], rules, {"LEFTOVER_TAG": "walk=1"}
+    )
+    assert proc.returncode == 1
+    assert "LEFTOVER resource group example-walk-bot-rg" in proc.stdout
+    assert "LEFTOVER resource groups tagged walk=1: 1" in proc.stdout
+
+
+@pytest.mark.parametrize("args", [["AB"], ["example-walk", "bad'name"], []])
+def test_leftovers_rejects_bad_input(tmp_path, args):
+    proc, calls = run(tmp_path, "check-leftovers.sh", args, CLEAN)
+    assert proc.returncode == 2
+    assert calls == []
+
+
+def render_runcmd_items():
+    text = CLOUD_INIT.read_text()
+    for name, val in [
+        ("fqdn", "example-walk.example.invalid"),
+        ("uv_version", "0.0.0"),
+        ("hermes_agent_ref", "dddddddddddddddddddddddddddddddddddddddd"),
+        ("hermes_a365_ref", "cccccccccccccccccccccccccccccccccccccccc"),
+    ]:
+        text = text.replace(f"${{{name}}}", val)
+    return yaml.safe_load(text)["runcmd"]
+
+
+def bash_c_scripts(calls):
+    scripts = []
+    for c in calls:
+        if c[0] != "bash":
+            continue
+        for i, a in enumerate(c[1:]):
+            if a == "-c":
+                scripts.append(c[i + 2])
+                break
+    return scripts
+
+
+def run_runcmd_script(tmp_path, fail_pattern=None):
+    items = render_runcmd_items()
+    script = tmp_path / "runcmd.sh"
+    script.write_text("\n".join(items) + "\n")
+    script.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name in ("bash", "install"):
+        stub = bin_dir / name
+        stub.write_text(RUNCMD_STUB)
+        stub.chmod(0o755)
+    log = tmp_path / "runcmd_calls.jsonl"
+    log.write_text("")
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "STUB_LOG": str(log),
+    }
+    if fail_pattern:
+        env["STUB_BASH_FAIL_PATTERN"] = fail_pattern
+    proc = subprocess.run(["sh", str(script)], capture_output=True, text=True, env=env, timeout=120)
+    calls = [json.loads(x) for x in log.read_text().splitlines() if x.strip()]
+    return proc, calls
+
+
+def test_runcmd_fails_closed_when_hermes_agent_install_fails(tmp_path):
+    proc, calls = run_runcmd_script(tmp_path, fail_pattern=r"-e /opt/hermes/hermes-agent")
+    assert proc.returncode != 0
+    scripts = bash_c_scripts(calls)
+    assert not any("hermes-a365[bridge]" in s for s in scripts)
+    assert not any("import hermes_cli.main" in s for s in scripts)
+
+
+def test_runcmd_separate_agent_and_bridge_install_steps(tmp_path):
+    proc, calls = run_runcmd_script(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    scripts = bash_c_scripts(calls)
+    agent = [s for s in scripts if "-e /opt/hermes/hermes-agent" in s]
+    bridge = [s for s in scripts if "hermes-a365[bridge]" in s]
+    assert len(agent) == 1
+    assert len(bridge) == 1
+    assert scripts.index(agent[0]) < scripts.index(bridge[0])
+    assert not any("hermes-agent" in s and "hermes-a365[bridge]" in s for s in scripts)
+    assert "import hermes_cli.main" in scripts[-1]

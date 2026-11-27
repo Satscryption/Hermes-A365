@@ -103,3 +103,39 @@ run "reject_latest_image" {
     var.image_version,
   ]
 }
+
+run "plan_vm_install_steps" {
+  command = plan
+
+  override_resource {
+    target          = azurerm_public_ip.main
+    override_during = plan
+    values = {
+      fqdn = "example-walk.centralindia.cloudapp.azure.com"
+    }
+  }
+
+  assert {
+    condition     = can(regex("runcmd:\\n  - set -e\\n", base64decode(azurerm_linux_virtual_machine.main.custom_data)))
+    error_message = "runcmd must start with set -e so a failed step fails cloud-init."
+  }
+
+  assert {
+    condition     = strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "fetch -q --depth 1 https://github.com/NousResearch/hermes-agent dddddddddddddddddddddddddddddddddddddddd && git -C /opt/hermes/hermes-agent checkout -q --detach FETCH_HEAD")
+    error_message = "hermes-agent must be fetched at the pinned ref."
+  }
+
+  assert {
+    condition = alltrue([
+      can(regex("-e /opt/hermes/hermes-agent'\\n  - bash -c '[^\\n]*\"hermes-a365\\[bridge\\] @ git\\+https://github.com/Satscryption/Hermes-A365@cccccccccccccccccccccccccccccccccccccccc\"", base64decode(azurerm_linux_virtual_machine.main.custom_data))),
+      !can(regex("hermes-agent[^\\n]*hermes-a365\\[bridge\\]", base64decode(azurerm_linux_virtual_machine.main.custom_data))),
+      !strcontains(base64decode(azurerm_linux_virtual_machine.main.custom_data), "git+https://github.com/NousResearch/hermes-agent"),
+    ])
+    error_message = "hermes-agent (editable) and hermes-a365[bridge] must be separate, ordered install steps."
+  }
+
+  assert {
+    condition     = endswith(trimspace(base64decode(azurerm_linux_virtual_machine.main.custom_data)), "/opt/hermes/venv/bin/python -c \"import hermes_cli.main, gateway.run, hermes_a365, hermes_a365.plugin\"; rm -rf \"$t\"'")
+    error_message = "The last runcmd step must be the venv import check."
+  }
+}
