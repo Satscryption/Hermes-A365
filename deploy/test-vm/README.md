@@ -15,11 +15,19 @@ t=$(mktemp -d); HOME=$t HERMES_HOME=$t/.hermes /opt/hermes/venv/bin/python -c "i
 ```
 hermes-agent is installed editable from a pinned checkout in `/opt/hermes/hermes-agent` (its build refuses wheels), then `hermes-a365[bridge]` in a second step, which raises PyJWT to the bridge floor.
 
-After apply: inject secrets on the VM, start `hermes-gateway`, create bot/channel/identity, model login—never in tfvars/state/repo.
+## After apply
+Bot and Teams channel: one repeatable command, run from this directory. It creates a separate resource group (`bot_resource_group_name` output, tagged like the VM's group), an F0 single-tenant Azure Bot pointing at `messages_endpoint`, and the Teams channel. It never touches the VM's resource group, so its tags stay as Terraform set them. Nothing it uses is written to tfvars, state, outputs or the repo.
+
+```bash
+BOT_APP_ID=... BOT_TENANT_ID=... scripts/bot-channel.sh up   # also: status, down
+```
+Set `TF_STATE=path` if you keep state outside this directory. Re-running `up` is safe: an existing group is never re-created, the endpoint is re-applied, and an enabled channel is left alone.
+
+Still manual and never in Terraform: the Entra app registrations (agent blueprint and bot app) and their secrets, the Teams app package, secrets injected on the VM, starting `hermes-gateway`, and the model login (`xai-oauth` device-code flow on the VM).
 
 ## Teardown
 1. Stop the gateway, sign out the model login, remove the manual Entra and Teams items.
-2. Remove the bot and its channel.
+2. `scripts/bot-channel.sh down` deletes the bot group (bot and channel go with it).
 3. Record `terraform output -raw os_disk_name`, then `terraform destroy`. The provider deletes the OS disk with the VM.
 4. `scripts/check-leftovers.sh <name_prefix> <os_disk_name>` (read-only; set `LEFTOVER_TAG=key=value` to also check by tag). OS disk names vary between builds (`<vm>_OsDisk_1_<id>` or `<vm>_disk1_<id>`), so match the recorded name or the `<vm>_` prefix, not a fixed word.
 

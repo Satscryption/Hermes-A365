@@ -10,6 +10,8 @@ import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "deploy" / "test-vm" / "scripts"
+APP = "11111111-2222-3333-4444-555555555555"
+TENANT = "66666666-7777-8888-9999-000000000000"
 
 STUB = r"""#!/usr/bin/env python3
 import json, os, sys
@@ -55,9 +57,125 @@ def run(tmp_path, script, args, rules, env=None):
     return proc, calls
 
 
+TF_OUTPUTS = [
+    ["output -raw resource_group_name", "example-walk-rg", 0],
+    ["output -raw bot_resource_group_name", "example-walk-bot-rg", 0],
+    ["output -raw messages_endpoint", "https://example.invalid/api/messages", 0],
+]
+
+
 def mutating(calls):
     verbs = {"create", "delete", "update", "put", "patch"}
     return [c for c in calls if c[0] == "az" and verbs & {a.lower() for a in c}]
+
+
+def test_up_creates_bot_group_bot_and_teams_channel(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "false", 0],
+        ["group show -n example-walk-rg --query location", "centralindia", 0],
+        [
+            "group show -n example-walk-rg --query tags",
+            '{"purpose": "example-walk", "owner": "example-team"}',
+            0,
+        ],
+        ["bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId", "", 3],
+        ["account show", "00000000-0000-0000-0000-000000000000", 0],
+        ["rest --method get", "", 3],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode == 0, proc.stderr
+    group_creates = [c for c in calls if c[1:3] == ["group", "create"]]
+    assert len(group_creates) == 1
+    assert "example-walk-bot-rg" in group_creates[0]
+    assert "example-walk-rg" not in group_creates[0]
+    assert {"purpose=example-walk", "owner=example-team"} <= set(group_creates[0])
+    bot_create = next(c for c in calls if c[1:3] == ["bot", "create"])
+    assert {"SingleTenant", "F0", APP, TENANT, "https://example.invalid/api/messages"} <= set(
+        bot_create
+    )
+    put = next(c for c in calls if c[1:4] == ["rest", "--method", "put"])
+    assert "/channels/MsTeamsChannel?api-version=2022-09-15" in " ".join(put)
+    body = json.loads(put[put.index("--body") + 1])
+    assert body["properties"]["properties"]["deploymentEnvironment"] == "CommercialDeployment"
+    assert not any(c[1:3] == ["bot", "msteams"] for c in calls)
+    assert APP not in proc.stdout and TENANT not in proc.stdout
+
+
+def test_up_is_repeatable_and_never_recreates_existing_group(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        ["bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId", APP, 0],
+        ["account show", "00000000-0000-0000-0000-000000000000", 0],
+        ["rest --method get", "true", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert not any(c[1:3] == ["group", "create"] for c in calls)
+    assert not any(c[1:3] == ["bot", "create"] for c in calls)
+    assert not any(c[1:4] == ["rest", "--method", "put"] for c in calls)
+
+
+def test_up_refuses_other_app_id(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        [
+            "bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId",
+            TENANT,
+            0,
+        ],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+@pytest.mark.parametrize("env", [{}, {"BOT_APP_ID": "not-a-guid", "BOT_TENANT_ID": TENANT}])
+def test_up_requires_ids_before_any_change(tmp_path, env):
+    proc, calls = run(tmp_path, "bot-channel.sh", ["up"], TF_OUTPUTS, env)
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_down_deletes_only_a_bot_only_group(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["resource list -g example-walk-bot-rg", "0", 0],
+        ["group exists -n example-walk-bot-rg", "true", 0],
+    ]
+    # First exists check says present; after delete the stub still says true, so
+    # the readback must fail loudly.
+    proc, calls = run(tmp_path, "bot-channel.sh", ["down"], rules)
+    deletes = [c for c in calls if c[1:3] == ["group", "delete"]]
+    assert len(deletes) == 1 and "example-walk-bot-rg" in deletes[0]
+    assert "example-walk-rg" not in deletes[0]
+    assert proc.returncode != 0
+
+
+def test_down_refuses_group_with_other_resources(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        ["resource list -g example-walk-bot-rg", "2", 0],
+    ]
+    proc, calls = run(tmp_path, "bot-channel.sh", ["down"], rules)
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_status_is_read_only(tmp_path):
+    rules = [*TF_OUTPUTS, ["group exists", "true", 0], ["bot show", "{}", 0]]
+    proc, calls = run(tmp_path, "bot-channel.sh", ["status"], rules)
+    assert proc.returncode == 0, proc.stderr
+    assert mutating(calls) == []
 
 
 CLEAN = [
