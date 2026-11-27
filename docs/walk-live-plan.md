@@ -6,7 +6,7 @@ standup, gateway modes, and the #90 matrix checklist stay on that issue and in
 [`references/live-tenant-test.md`](../references/live-tenant-test.md). This
 file records **supplemental Copilot Chat (Path B, B-CC) rows** exercised on
 walk094 / walk095 / walk097 profiles (`evidence.sh`, `log.md`, `agent.log` at
-DEBUG).
+DEBUG). It also holds the **Path A Teams 1:1 Stop** walk row in section **T**.
 
 Record pass/fail, timestamps, and sanitized evidence paths on the walk issue.
 Do not copy secrets or tokens into the log.
@@ -74,6 +74,15 @@ Path: **B-CC**. Use lead-in + `sleep` probes from walk094 unless noted.
 | K2 | Two lead-ins + `sleep 40` + answer (walk094 K2) | Same keep-alive text rules as K1 | Same as K1 | Second lead-in stays informative only |
 | K3 | Lead-in + `sleep` long enough for stream age **~100 s** before answer (walk094 K3) | Progress line on stream throughout; rotation must remain **allowed** before post-tool answer | Stream age approaches cap without spurious “stuck” shell; no duplicate answer bubbles | Pre-#214: rotation blocked when lead-in was kept as answer |
 | K4 | Lead-in + tool **> 120 s** (for example `sleep 130`, walk094 K4) | Near **~115 s** stream age, one rotation close on old id; post-tool answer lands once (stream or plain after rotation per #247) | Rotation final ~115 s (`_keepalive_rotation_age_sec`); cap **120.0** s; `test_walk094_k4_keepalive_rotates_past_two_minute_stream_age_with_leadin` | Exercises stream-cap rotation (#214, #247) |
+
+## T — Teams 1:1 streamed reply Stop (Path A)
+
+Path: **Path A** Teams 1:1 personal chat. Long tool + answer prompts exercise
+progressive `streamType=streaming` delivery.
+
+| Row | Prompt (representative) | Expected UI | Stop | Expected log (minimum) | Notes |
+| --- | --- | --- | --- | --- | --- |
+| T1 | Long-running reply (lead-in + tool, then answer) | Stream renders progressively; final reply arrives | **PASS:** stream renders and final reply arrives; log shows no inbound cancel activity and no 403 `ContentStreamNotAllowed`. **Stop control:** record whether one is present; if present, record as a documentation drift finding for #338, not as a failure. **FAIL:** stream breaks, final reply missing, or 403 `ContentStreamNotAllowed`. | Sanitized adapter/bridge log: confirm `turn reply delivered` (or equivalent final settlement), absence of inbound cancel activities, and no `http_status=403` / `ContentStreamNotAllowed` on stream updates | #338 |
 
 ## References
 
