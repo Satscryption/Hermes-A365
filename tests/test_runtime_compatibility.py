@@ -286,9 +286,10 @@ def test_part2_preserved_surfaces() -> None:
         "references/v1-compatibility-matrix.md": (
             "63fca921fad16fe50a8dfcbcb25c2b329f314abe56309172a0f0aa26ffe5a6ce"
         ),
-        # Intended: admit_turn_authority, cancel_session_processing, handle_message.
+        # Intended: admit_turn_authority, cancel_session_processing, handle_message,
+        # HERMES_A365_COPILOT_FIRST_TURN_PLAIN (#290, opt-in experiment flag, off by default).
         "src/hermes_a365/surface.py": (
-            "22d1231171ef751abc61db841400eebf64d7b5c05735ee157eebe52e5b15a19f"
+            "8bf6a0badb2f635dbc3637ccea4e901c2304c56ba4c311f061c98179d35e65fe"
         ),
         "src/hermes_a365/publish.py": (
             "5a096fd642f5e8ddc953d3dba45232a5328dd324cd1a3e3c3e775086bcdb72bc"

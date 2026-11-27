@@ -68,6 +68,10 @@ Rules that the implementation has to keep:
 
 Personal Teams 1:1 stays on the other path: `_send_stream_start` / `edit_message` with `streamType=streaming` and a final that requires the 201 id (#161). Do not send those chats through the turn buffer.
 
+### Optional first-turn plain reply
+
+`HERMES_A365_COPILOT_FIRST_TURN_PLAIN` is opt-in and default off. When enabled, the first Path B `groupChat` answer for a registered `membersAdded` marker with no open stream may post as one plain message instead of informative opener, minimum stream age, and final. Later turns, personal chats, channels, and turns that already opened a stream keep the default streamed delivery.
+
 ## Delivery path
 
 ### What stays

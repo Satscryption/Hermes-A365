@@ -10814,6 +10814,214 @@ class TestEditMessage:
         assert chat not in a._copilot_member_added_claims
 
     @pytest.mark.asyncio
+    async def test_copilot_first_turn_plain_flag_bot_add_before_message_posts_plain(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "true")
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 0.83
+        await self._receive_first_contact_activity(a, inbound)
+        clock["t"] += 4.3
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 1
+        plain = post_mock.await_args.kwargs["json"]
+        assert plain["type"] == "message"
+        assert plain["text"] == "Hello."
+        assert not any(e.get("type") == "streaminfo" for e in plain.get("entities", []))
+        assert not [call for call in sleep_mock.await_args_list if call.args[0] > 0]
+        logs = [r for r in caplog.records if "reason=first turn plain" in r.message]
+        assert len(logs) == 1
+        await a.on_processing_complete(a.handle_message.call_args.args[0], outcome="success")
+        assert post_mock.await_count == 1
+
+    @pytest.mark.parametrize(
+        "flag_value",
+        [pytest.param(None, id="unset"), "", "0", "false", "off", "maybe"],
+    )
+    @pytest.mark.asyncio
+    async def test_copilot_first_turn_plain_flag_off_keeps_stream_hold(
+        self, monkeypatch: pytest.MonkeyPatch, flag_value: str | None
+    ) -> None:
+        if flag_value is None:
+            monkeypatch.delenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", flag_value)
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 0.83
+        await self._receive_first_contact_activity(a, inbound)
+        clock["t"] += 4.3
+        await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["entities"][0]["streamType"] == "informative"
+        assert final["entities"][0]["streamType"] == "final"
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0] == [10.0]
+
+    @pytest.mark.asyncio
+    async def test_copilot_first_turn_plain_flag_keeps_first_contact_reason(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "yes")
+        a, inbound, post_mock, _sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        await self._receive_first_contact_activity(a, inbound)
+        clock["t"] += 0.143
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 5.157
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 1
+        assert "reason=first contact" in caplog.text
+        assert "reason=first turn plain" not in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_copilot_first_turn_plain_flag_second_turn_streams(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "on")
+        a, inbound, post_mock, _sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 1.0
+        await self._receive_first_contact_activity(a, inbound)
+        await self._answer_first_contact_turn(a)
+        inbound["id"] = "act-2"
+        clock["t"] += 1.0
+        await self._receive_first_contact_activity(a, inbound)
+        await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 3
+        plain, opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert not any(e.get("type") == "streaminfo" for e in plain.get("entities", []))
+        assert opener["entities"][0]["streamType"] == "informative"
+        assert final["entities"][0]["streamType"] == "final"
+
+    @pytest.mark.asyncio
+    async def test_copilot_first_turn_plain_flag_open_stream_keeps_hold(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "1")
+        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        chat = inbound["conversation"]["id"]
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 0.5
+        await self._receive_first_contact_activity(a, inbound)
+        buf = a._turn_buffers[chat]
+        async with a._turn_buffer_lock(buf):
+            await a._post_informative_locked(
+                chat, buf, allow_restart=False, text_override="Checking."
+            )
+        await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 2
+        assert [call.args[0] for call in sleep_mock.await_args_list if call.args[0] > 0]
+
+    @pytest.mark.asyncio
+    async def test_teams_personal_turn_unaffected_by_first_turn_plain_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "true")
+        a = _make_adapter(monkeypatch)
+        chat = "a:personal-first-turn-plain"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "personal"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        ensure_mock = AsyncMock()
+        monkeypatch.setattr(a, "_ensure_copilot_min_stream_age_before_final_locked", ensure_mock)
+        plain_due_mock = MagicMock(return_value=False)
+        monkeypatch.setattr(a, "_copilot_first_turn_plain_due", plain_due_mock)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        assert chat not in a._turn_buffers
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        plain_due_mock.assert_not_called()
+        ensure_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_teams_channel_turn_unaffected_by_first_turn_plain_flag(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "true")
+        a = _make_adapter(monkeypatch)
+        chat = "19:channel-first-turn-plain@thread.v2"
+        inbound = _make_inbound(conv_id=chat, path="B")
+        inbound["conversation"]["conversationType"] = "channel"
+        post_mock = self._wire_adapter(a, inbound=inbound)
+        bridge = adapter_mod._import_bridge()
+        monkeypatch.setattr(
+            bridge, "acquire_reply_token", AsyncMock(return_value=("bearer-test", "B"))
+        )
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        self._advance_monotonic_sleep(monkeypatch)
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        turn = buf["turns"][0]
+        turn["copilot_post_member_added"] = True
+        assert not a._copilot_first_turn_plain_due(chat, buf, turn)
+        await a.send(chat_id=chat, content="Hello.", reply_to="act-1")
+        await a.on_processing_complete(event, outcome="success")
+        await asyncio.sleep(0)
+        assert post_mock.await_count == 2
+        opener, final = [call.kwargs["json"] for call in post_mock.await_args_list]
+        assert opener["entities"][0]["streamType"] == "informative"
+        assert final["entities"][0]["streamType"] == "final"
+
+    @pytest.mark.parametrize(
+        ("raw", "expected"),
+        [
+            ("1", True),
+            ("true", True),
+            ("YES", True),
+            ("on", True),
+            (None, False),
+            ("", False),
+            ("0", False),
+            ("false", False),
+            ("off", False),
+            ("maybe", False),
+        ],
+    )
+    def test_copilot_first_turn_plain_flag_parsed_in_adapter_init(
+        self, monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: bool
+    ) -> None:
+        if raw is None:
+            monkeypatch.delenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", raising=False)
+        else:
+            monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", raw)
+        a = _make_adapter(monkeypatch)
+        assert a._copilot_first_turn_plain_enabled is expected
+
+    @pytest.mark.asyncio
+    async def test_teams_path_b_group_chat_first_turn_with_first_turn_plain_flag(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        """Path B groupChat (Copilot and Teams share the shape) with flag on."""
+        monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "true")
+        a, inbound, post_mock, _sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        inbound["channelId"] = "msteams"
+        await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
+        clock["t"] += 0.5
+        await self._receive_first_contact_activity(a, inbound)
+        with caplog.at_level(logging.INFO, logger="hermes_a365.plugin.adapter"):
+            await self._answer_first_contact_turn(a)
+        assert post_mock.await_count == 1
+        plain = post_mock.await_args.kwargs["json"]
+        assert plain["type"] == "message"
+        assert not any(e.get("type") == "streaminfo" for e in plain.get("entities", []))
+        assert "reason=first turn plain" in caplog.text
+
+    @pytest.mark.asyncio
     async def test_copilot_member_added_during_min_stream_age_wait_applies_to_current_turn(
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
