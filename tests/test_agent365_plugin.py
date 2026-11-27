@@ -7529,6 +7529,151 @@ class TestIssue363DraftRemarks:
         final = next(body for body in posts if body.get("type") == "message")
         assert final["text"] == answer
 
+    _FALSE_DROP_SENTENCES = (
+        "In short, the capital of France is Paris.",
+        "The password must be 12 characters.",
+        "The essay should be 800 words.",
+        "A word counts as one token.",
+        "Spending is under the budget.",
+        "We went over the limit.",
+        "Look under the cap of the pen.",
+        "We are over Max.",
+        "Trimming the hedges is Saturday's job.",
+        "US short rates rose.",
+        "The Long family arrived.",
+        "3.5 words remain.",
+    )
+
+    @pytest.mark.parametrize("sentence", _FALSE_DROP_SENTENCES)
+    @pytest.mark.parametrize("path", ("marked_pre_tool", "long_split_marked", "long_split_commentary"))
+    @pytest.mark.asyncio
+    async def test_issue363_short_pre_tool_answer_with_length_vocabulary_kept(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sentence: str,
+        path: str,
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-G-363-vocab-{path}-{abs(hash(sentence)) % 10_000}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-vocab")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-vocab")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            overflow.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        long_answer = self._long_answer()
+        tail = "Done." if path == "marked_pre_tool" else long_answer
+        event = _StubMessageEvent(
+            text="reply",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-vocab",
+        )
+        await a.on_processing_start(event)
+        if path == "marked_pre_tool":
+            await a.send(
+                chat_id=chat,
+                content=sentence,
+                reply_to="act-vocab",
+                metadata={"expect_edits": True},
+            )
+        elif path == "long_split_marked":
+            await a.send(
+                chat_id=chat,
+                content=sentence,
+                reply_to="act-vocab",
+                metadata={"expect_edits": True},
+            )
+        else:
+            await a.send(
+                chat_id=chat,
+                content=sentence,
+                reply_to=None,
+                metadata={"informative_update": True},
+            )
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.send(chat_id=chat, content=tail, reply_to="act-vocab")
+        if path == "long_split_commentary":
+            buf = a._turn_buffers[chat]
+            turn = a._keepalive_turn(buf)
+            assert isinstance(turn, dict)
+            prefix_texts = [
+                str(segment.get("text") or "")
+                for segment in a._answer_informative_prefix_segments(buf, turn)
+            ]
+            assert sentence in prefix_texts
+            await a.on_processing_complete(event, outcome="success")
+            return
+        await a.on_processing_complete(event, outcome="success")
+        if path == "marked_pre_tool":
+            final = next(body for body in posts if body.get("type") == "message")
+            assert sentence in final["text"]
+            return
+        delivered = [
+            str(body.get("text") or "")
+            for body in posts
+            if body.get("type") == "message"
+            and (body.get("entities") or [{}])[0].get("streamType") == "final"
+        ] + overflow
+        joined = "".join(delivered)
+        assert sentence in joined
+
+    @pytest.mark.asyncio
+    async def test_issue363_mixed_remark_and_answer_segment_delivered_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-mixed"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-mixed")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-mixed")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        content = (
+            "That draft came out at 1,040 words, over the 800-word target. "
+            "Here is the essay."
+        )
+        event = _StubMessageEvent(
+            text="essay",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-mixed",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=content, reply_to="act-363-mixed")
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == content
+
 
 # ---------------------------------------------------------------------------
 # Slice 19o — send_typing + send_image
