@@ -15,7 +15,11 @@ usage() { echo "usage: $0 up|status|down" >&2; exit 2; }
 [[ $# -eq 1 ]] || usage
 action=$1
 module_dir=$(cd "$(dirname "$0")/.." && pwd)
-tf_out() { terraform -chdir="$module_dir" output -raw ${TF_STATE:+"-state=$TF_STATE"} "$1"; }
+tf_out() {
+  local state_args=()
+  [[ -n ${TF_STATE:-} ]] && state_args+=("-state=$TF_STATE")
+  terraform -chdir="$module_dir" output -raw ${state_args[@]+"${state_args[@]}"} "$1"
+}
 
 vm_rg=$(tf_out resource_group_name)
 bot_rg=$(tf_out bot_resource_group_name)
@@ -46,9 +50,21 @@ up() {
   [[ ${BOT_TENANT_ID:-} =~ $guid ]] || { echo "BOT_TENANT_ID must be set to the tenant ID" >&2; exit 1; }
 
   if [[ $(az group exists -n "$bot_rg") != true ]]; then
-    local location tag tags=()
+    local location tags_json tag_lines tag tags=()
     location=$(az group show -n "$vm_rg" --query location -o tsv)
-    while IFS= read -r tag; do tags+=("$tag"); done < <(az group show -n "$vm_rg" --query tags -o json | jq -r 'to_entries[] | "\(.key)=\(.value)"')
+    tags_json=$(az group show -n "$vm_rg" --query tags -o json)
+    if [[ $tags_json == null ]]; then
+      echo "VM resource group $vm_rg has no tags; refusing to create bot resource group" >&2
+      exit 1
+    fi
+    tag_lines=$(jq -r 'to_entries[] | "\(.key)=\(.value)"' <<<"$tags_json")
+    while IFS= read -r tag; do
+      [[ -n $tag ]] && tags+=("$tag")
+    done <<<"$tag_lines"
+    if [[ ${#tags[@]} -eq 0 ]]; then
+      echo "VM resource group $vm_rg has no tags; refusing to create bot resource group" >&2
+      exit 1
+    fi
     az group create -n "$bot_rg" -l "$location" --tags "${tags[@]}" -o none
   fi
 
@@ -57,7 +73,7 @@ up() {
   if [[ -z $existing ]]; then
     az bot create -g "$bot_rg" -n "$bot_name" --app-type SingleTenant \
       --appid "$BOT_APP_ID" --tenant-id "$BOT_TENANT_ID" --endpoint "$endpoint" --sku F0 -o none
-  elif [[ $existing != "$BOT_APP_ID" ]]; then
+  elif [[ $(printf '%s' "$existing" | tr '[:upper:]' '[:lower:]') != $(printf '%s' "$BOT_APP_ID" | tr '[:upper:]' '[:lower:]') ]]; then
     echo "bot $bot_name exists with a different app ID; not changing it" >&2
     exit 1
   else

@@ -7,10 +7,12 @@ import subprocess
 from pathlib import Path
 
 import pytest
+import yaml
 
 ROOT = Path(__file__).resolve().parents[1]
 SCRIPTS = ROOT / "deploy" / "test-vm" / "scripts"
-APP = "11111111-2222-3333-4444-555555555555"
+CLOUD_INIT = ROOT / "deploy" / "test-vm" / "cloud-init.yaml.tftpl"
+APP = "11111111-2222-3333-4444-55555555555a"
 TENANT = "66666666-7777-8888-9999-000000000000"
 
 STUB = r"""#!/usr/bin/env python3
@@ -24,6 +26,26 @@ for needle, out, rc in rules:
     if needle in line:
         sys.stdout.write(out + ("\n" if out else ""))
         sys.exit(rc)
+sys.exit(0)
+"""
+
+RUNCMD_STUB = r"""#!/usr/bin/env python3
+import json, os, re, sys
+args = sys.argv[1:]
+cmd = os.path.basename(sys.argv[0])
+log = os.environ.get("STUB_LOG")
+if log:
+    with open(log, "a") as f:
+        f.write(json.dumps([cmd] + args) + "\n")
+if cmd == "bash":
+    pat = os.environ.get("STUB_BASH_FAIL_PATTERN", "")
+    if pat:
+        for i, a in enumerate(args):
+            if a == "-c" and i + 1 < len(args) and re.search(pat, args[i + 1]):
+                sys.exit(1)
+    sys.exit(0)
+if cmd == "install":
+    sys.exit(0)
 sys.exit(0)
 """
 
@@ -119,6 +141,71 @@ def test_up_is_repeatable_and_never_recreates_existing_group(tmp_path):
     assert not any(c[1:3] == ["group", "create"] for c in calls)
     assert not any(c[1:3] == ["bot", "create"] for c in calls)
     assert not any(c[1:4] == ["rest", "--method", "put"] for c in calls)
+    bot_update = next(c for c in calls if c[1:3] == ["bot", "update"])
+    ep = bot_update.index("--endpoint")
+    assert bot_update[ep + 1] == "https://example.invalid/api/messages"
+
+
+def test_up_refuses_invalid_tags_json(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "false", 0],
+        ["group show -n example-walk-rg --query location", "centralindia", 0],
+        ["group show -n example-walk-rg --query tags", "not-json", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_up_refuses_null_tags(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "false", 0],
+        ["group show -n example-walk-rg --query location", "centralindia", 0],
+        ["group show -n example-walk-rg --query tags", "null", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode != 0
+    assert mutating(calls) == []
+
+
+def test_up_accepts_same_app_id_different_case(tmp_path):
+    rules = [
+        *TF_OUTPUTS,
+        ["group exists -n example-walk-bot-rg", "true", 0],
+        [
+            "bot show -g example-walk-bot-rg -n example-walk-bot --query properties.msaAppId",
+            "11111111-2222-3333-4444-55555555555A",
+            0,
+        ],
+        ["account show", "00000000-0000-0000-0000-000000000000", 0],
+        ["rest --method get", "true", 0],
+    ]
+    proc, calls = run(
+        tmp_path, "bot-channel.sh", ["up"], rules, {"BOT_APP_ID": APP, "BOT_TENANT_ID": TENANT}
+    )
+    assert proc.returncode == 0, proc.stderr
+    assert any(c[1:3] == ["bot", "update"] for c in calls)
+
+
+def test_tf_state_path_with_space_reaches_terraform(tmp_path):
+    state_path = str(tmp_path / "state with spaces.tfstate")
+    rules = [
+        [f"-state={state_path} resource_group_name", "example-walk-rg", 0],
+        [f"-state={state_path} bot_resource_group_name", "example-walk-bot-rg", 0],
+        [f"-state={state_path} messages_endpoint", "https://example.invalid/api/messages", 0],
+        ["group exists", "true", 0],
+        ["bot show", "{}", 0],
+    ]
+    proc, calls = run(tmp_path, "bot-channel.sh", ["status"], rules, {"TF_STATE": state_path})
+    assert proc.returncode == 0, proc.stderr
+    state_args = [a for c in calls if c[0] == "terraform" for a in c if a.startswith("-state=")]
+    assert state_args == [f"-state={state_path}"] * 3
 
 
 def test_up_refuses_other_app_id(tmp_path):
@@ -195,8 +282,14 @@ def test_leftovers_clean(tmp_path):
     q = disk_q[disk_q.index("--query") + 1]
     assert "starts_with(name, 'example-walk-vm_')" in q
     assert "name == 'example-walk-vm_disk1_0123abcd'" in q
+    assert "OsDisk" not in q
     groups = [c[c.index("-n") + 1] for c in calls if c[1:3] == ["group", "exists"]]
     assert groups == ["example-walk-rg", "example-walk-bot-rg"]
+    assert "NetworkWatcherRG" in proc.stdout
+    assert not any(
+        line.startswith("LEFTOVER") and "NetworkWatcher" in line
+        for line in proc.stdout.splitlines()
+    )
 
 
 def test_leftover_disk_fails(tmp_path):
@@ -228,6 +321,71 @@ def test_leftovers_rejects_bad_input(tmp_path, args):
     assert calls == []
 
 
-def test_no_fixed_os_disk_word():
-    text = (SCRIPTS / "check-leftovers.sh").read_text()
-    assert "OsDisk" not in text and "osdisk" not in text.lower().replace("os_disk", "")
+def render_runcmd_items():
+    text = CLOUD_INIT.read_text()
+    for name, val in [
+        ("fqdn", "example-walk.example.invalid"),
+        ("uv_version", "0.0.0"),
+        ("hermes_agent_ref", "dddddddddddddddddddddddddddddddddddddddd"),
+        ("hermes_a365_ref", "cccccccccccccccccccccccccccccccccccccccc"),
+    ]:
+        text = text.replace(f"${{{name}}}", val)
+    return yaml.safe_load(text)["runcmd"]
+
+
+def bash_c_scripts(calls):
+    scripts = []
+    for c in calls:
+        if c[0] != "bash":
+            continue
+        for i, a in enumerate(c[1:]):
+            if a == "-c":
+                scripts.append(c[i + 2])
+                break
+    return scripts
+
+
+def run_runcmd_script(tmp_path, fail_pattern=None):
+    items = render_runcmd_items()
+    script = tmp_path / "runcmd.sh"
+    script.write_text("\n".join(items) + "\n")
+    script.chmod(0o755)
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir(exist_ok=True)
+    for name in ("bash", "install"):
+        stub = bin_dir / name
+        stub.write_text(RUNCMD_STUB)
+        stub.chmod(0o755)
+    log = tmp_path / "runcmd_calls.jsonl"
+    log.write_text("")
+    env = {
+        "PATH": f"{bin_dir}{os.pathsep}{os.environ['PATH']}",
+        "HOME": str(tmp_path),
+        "STUB_LOG": str(log),
+    }
+    if fail_pattern:
+        env["STUB_BASH_FAIL_PATTERN"] = fail_pattern
+    proc = subprocess.run(["sh", str(script)], capture_output=True, text=True, env=env, timeout=120)
+    calls = [json.loads(x) for x in log.read_text().splitlines() if x.strip()]
+    return proc, calls
+
+
+def test_runcmd_fails_closed_when_hermes_agent_install_fails(tmp_path):
+    proc, calls = run_runcmd_script(tmp_path, fail_pattern=r"-e /opt/hermes/hermes-agent")
+    assert proc.returncode != 0
+    scripts = bash_c_scripts(calls)
+    assert not any("hermes-a365[bridge]" in s for s in scripts)
+    assert not any("import hermes_cli.main" in s for s in scripts)
+
+
+def test_runcmd_separate_agent_and_bridge_install_steps(tmp_path):
+    proc, calls = run_runcmd_script(tmp_path)
+    assert proc.returncode == 0, proc.stderr
+    scripts = bash_c_scripts(calls)
+    agent = [s for s in scripts if "-e /opt/hermes/hermes-agent" in s]
+    bridge = [s for s in scripts if "hermes-a365[bridge]" in s]
+    assert len(agent) == 1
+    assert len(bridge) == 1
+    assert scripts.index(agent[0]) < scripts.index(bridge[0])
+    assert not any("hermes-agent" in s and "hermes-a365[bridge]" in s for s in scripts)
+    assert "import hermes_cli.main" in scripts[-1]

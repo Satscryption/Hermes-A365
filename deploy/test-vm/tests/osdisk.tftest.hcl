@@ -8,12 +8,17 @@ variables {
   hermes_agent_ref     = "dddddddddddddddddddddddddddddddddddddddd"
 }
 
-run "os_disk_deleted_with_vm" {
+# Source guard, not a behavioural test: terraform test cannot observe provider features. Delete-with-VM is verified at teardown by scripts/check-leftovers.sh.
+run "os_disk_delete_source_guard" {
   command = plan
   assert {
     condition     = can(regex("delete_os_disk_on_deletion\\s*=\\s*true", file("${path.module}/versions.tf")))
     error_message = "The provider must delete the OS disk with the VM."
   }
+}
+
+run "bot_resource_group_separate" {
+  command = plan
   assert {
     condition     = output.bot_resource_group_name == "example-walk-bot-rg" && output.bot_resource_group_name != azurerm_resource_group.main.name
     error_message = "bot rg separate"
@@ -38,7 +43,7 @@ run "os_disk_name_output" {
     }
   }
   assert {
-    condition     = startswith(output.os_disk_name, "${azurerm_linux_virtual_machine.main.name}_")
+    condition     = output.os_disk_name == "example-walk-vm_disk1_0123abcd"
     error_message = "os_disk_name output must be the VM's OS disk name."
   }
 }
