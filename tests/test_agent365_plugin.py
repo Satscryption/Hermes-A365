@@ -10819,7 +10819,6 @@ class TestEditMessage:
     ) -> None:
         monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "true")
         a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
-        chat = inbound["conversation"]["id"]
         await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
         clock["t"] += 0.83
         await self._receive_first_contact_activity(a, inbound)
@@ -10866,8 +10865,7 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
     ) -> None:
         monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "yes")
-        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
-        chat = inbound["conversation"]["id"]
+        a, inbound, post_mock, _sleep_mock, clock = self._first_contact_adapter(monkeypatch)
         await self._receive_first_contact_activity(a, inbound)
         clock["t"] += 0.143
         await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
@@ -10883,8 +10881,7 @@ class TestEditMessage:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "on")
-        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
-        chat = inbound["conversation"]["id"]
+        a, inbound, post_mock, _sleep_mock, clock = self._first_contact_adapter(monkeypatch)
         await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
         clock["t"] += 1.0
         await self._receive_first_contact_activity(a, inbound)
@@ -11011,9 +11008,8 @@ class TestEditMessage:
     ) -> None:
         """Path B groupChat (Copilot and Teams share the shape) with flag on."""
         monkeypatch.setenv("HERMES_A365_COPILOT_FIRST_TURN_PLAIN", "true")
-        a, inbound, post_mock, sleep_mock, clock = self._first_contact_adapter(monkeypatch)
+        a, inbound, post_mock, _sleep_mock, clock = self._first_contact_adapter(monkeypatch)
         inbound["channelId"] = "msteams"
-        chat = inbound["conversation"]["id"]
         await self._receive_first_contact_activity(a, self._first_contact_member_added(inbound))
         clock["t"] += 0.5
         await self._receive_first_contact_activity(a, inbound)
