@@ -8,7 +8,7 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
-- Copilot app: keep pre-tool draft remarks out of delivered replies (#363).
+- Copilot app: undisplayed intent lead-ins are no longer prefixed to long split replies; model remarks about a draft can still appear (#363, follow-up #383).
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 
 ## [0.9.8] — 2026-11-23

@@ -991,34 +991,6 @@ _INTENT_PREAMBLE_SENTENCE_CUE = re.compile(
     r"i['\u2019]m about to|i am about to|let me|allow me to)\b",
     re.IGNORECASE,
 )
-_DRAFT_REMARK_NUM = r"(?<![\d.,])\d[\d,]*(?![\d.])"
-_DRAFT_REMARK_UNIT = rf"{_DRAFT_REMARK_NUM}\s*-?\s*(?:words?|characters?|chars)\b"
-_DRAFT_REMARK_REFERENT = (
-    r"(?:\bdraft\b|"
-    r"(?:[Ii]t|[Tt]his|[Tt]hat)\s+(?:came out|comes in|clocks in|is now|runs)\b)"
-)
-_DRAFT_REMARK_OVER_UNDER = (
-    rf"(?:[Oo]ver|[Uu]nder|[Aa]bove|[Bb]elow)\s+the\s+"
-    rf"(?:{_DRAFT_REMARK_NUM}\s*-?\s*(?:words?\s+)?)?"
-    r"(?:target|limit|cap)\b"
-)
-_DRAFT_REMARK_LENGTH_STATEMENT = re.compile(
-    rf"^(?=.*{_DRAFT_REMARK_UNIT})(?=.*(?:{_DRAFT_REMARK_REFERENT}|{_DRAFT_REMARK_OVER_UNDER}))"
-)
-_DRAFT_REMARK_SIZE_JUDGEMENT = re.compile(r".*\btoo (?:long|short)\b.*")
-_DRAFT_REMARK_EDIT_ACTION = re.compile(
-    r"^(?:[Tt]rimming|[Tt]ightening|[Ss]hortening|[Cc]utting)\s+"
-    r"(?:it|this|that|the draft|the reply|the response)"
-    r"(?:\s+(?:down|back))?\b",
-)
-
-
-def _sentence_matches_draft_remark_shape(sentence: str) -> bool:
-    return bool(
-        _DRAFT_REMARK_LENGTH_STATEMENT.match(sentence)
-        or _DRAFT_REMARK_SIZE_JUDGEMENT.match(sentence)
-        or _DRAFT_REMARK_EDIT_ACTION.match(sentence)
-    )
 
 
 def _normalize_intent_preamble_text(text: str) -> str:
@@ -1032,27 +1004,17 @@ def _normalize_intent_preamble_text(text: str) -> str:
 
 
 def _segment_is_intent_preamble(text: str) -> bool:
-    """True when marked text is a short intent lead-in (#226) or draft-length remark (#363)."""
+    """True when marked text is a short, intent-shaped lead-in (#226)."""
     normalized = _normalize_intent_preamble_text(text)
     if not normalized or len(normalized) > _INTENT_PREAMBLE_MAX_CHARS:
         return False
     sentences = _INTENT_PREAMBLE_SENTENCE_SPLIT.split(normalized)
     if not sentences:
         return False
-    stripped = [sentence.strip() for sentence in sentences if sentence.strip()]
-    if not stripped:
-        return False
-    if all(_INTENT_PREAMBLE_SENTENCE_CUE.match(sentence) for sentence in stripped):
-        return True
-    if not all(
-        _INTENT_PREAMBLE_SENTENCE_CUE.match(sentence)
-        or _sentence_matches_draft_remark_shape(sentence)
-        for sentence in stripped
-    ):
-        return False
-    return any(
-        _DRAFT_REMARK_EDIT_ACTION.match(sentence) or re.search(r"\bdraft\b", sentence)
-        for sentence in stripped
+    return all(
+        bool(_INTENT_PREAMBLE_SENTENCE_CUE.match(sentence.strip()))
+        for sentence in sentences
+        if sentence.strip()
     )
 
 
