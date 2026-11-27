@@ -783,6 +783,56 @@ _HERMES_TOOL_PROGRESS_SHAPES: tuple[tuple[str, str, str], ...] = (
 )
 # Hermes appends a parenthesized repeat count that uses U+00D7.
 _HERMES_TOOL_PROGRESS_REPEAT = re.compile(" \\(\u00d7\\d+\\)$")
+_HERMES_TOOL_PROGRESS_PLAIN_BY_SHAPE: dict[tuple[str, str], str] = {}
+for _shape_emoji, _shape_verb, _shape_connector in _HERMES_TOOL_PROGRESS_SHAPES:
+    _shape_key = (_shape_emoji, _shape_verb)
+    if _shape_key in _HERMES_TOOL_PROGRESS_PLAIN_BY_SHAPE:
+        continue
+    if _shape_emoji == "\U0001f4bb" and _shape_verb == "Running":
+        _HERMES_TOOL_PROGRESS_PLAIN_BY_SHAPE[_shape_key] = f"{_shape_emoji} Running a command"
+    elif _shape_emoji == "\u270d\ufe0f" and _shape_verb == "Writing":
+        _HERMES_TOOL_PROGRESS_PLAIN_BY_SHAPE[_shape_key] = f"{_shape_emoji} Writing a draft"
+    else:
+        _HERMES_TOOL_PROGRESS_PLAIN_BY_SHAPE[_shape_key] = "Working on it"
+_HERMES_TOOL_PROGRESS_PLAIN_DEFAULT = "Working on it"
+
+
+def _hermes_tool_progress_line_shape(line: str) -> tuple[str, str] | None:
+    stripped = _HERMES_TOOL_PROGRESS_REPEAT.sub("", line.strip())
+    if not stripped:
+        return None
+    for emoji, verb, connector in _HERMES_TOOL_PROGRESS_SHAPES:
+        head = f"{emoji} {verb}"
+        if stripped == head:
+            return (emoji, verb)
+        if not connector or not stripped.startswith(head + connector):
+            continue
+        target = stripped[len(head + connector) :].strip()
+        if target and not _hermes_progress_target_is_sentence(target):
+            return (emoji, verb)
+    return None
+
+
+def _plain_tool_progress_summary(text: str) -> str:
+    """Map tool-progress lines to fixed phrases with no targets or commands."""
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    seen: set[str] = set()
+    out: list[str] = []
+    for line in lines:
+        if not _is_hermes_tool_progress_line(line):
+            continue
+        shape = _hermes_tool_progress_line_shape(line)
+        if shape is None:
+            phrase = _HERMES_TOOL_PROGRESS_PLAIN_DEFAULT
+        else:
+            phrase = _HERMES_TOOL_PROGRESS_PLAIN_BY_SHAPE.get(
+                shape, _HERMES_TOOL_PROGRESS_PLAIN_DEFAULT
+            )
+        if phrase in seen:
+            continue
+        seen.add(phrase)
+        out.append(phrase)
+    return "\n".join(out)
 
 
 def _is_hermes_tool_progress_segment(text: str) -> bool:
@@ -2163,6 +2213,7 @@ class Agent365Adapter(BasePlatformAdapter):
         # epoch must be finalized, even after a new turn starts (#203).
         self._keepalive_drop_epoch: dict[str, int] = {}
         self._turn_buffer_seq = 0
+        self._suppressed_progress_seq = 0
 
         # Slice 19x-e (#27) — per-lifetime set of chat_ids the gateway has
         # captured an inbound for since boot. Used as ``send()``'s gate
@@ -5954,6 +6005,21 @@ class Agent365Adapter(BasePlatformAdapter):
                 metadata=metadata,
             )
 
+        if (
+            reply_to is None
+            and not self._metadata_requests_stream_final(metadata)
+            and _is_hermes_tool_progress_segment(content)
+        ):
+            self._suppressed_progress_seq += 1
+            logger.info(
+                "agent365 tool progress not posted: chat_id=%s",
+                chat_id,
+            )
+            return SendResult(
+                success=True,
+                message_id=f"progressoff:{self._suppressed_progress_seq}",
+            )
+
         turn_key: tuple[str, str] | None = None
         turn_validated_path: str | None = None
         coalesced_origin: TurnAuthorityRecord | None = None
@@ -8496,8 +8562,17 @@ class Agent365Adapter(BasePlatformAdapter):
                     chat_id,
                 )
                 return empty
+        if _is_hermes_tool_progress_segment(body_text):
+            body_text = _plain_tool_progress_summary(body_text)
         if capped_final:
-            payload_text = text
+            if (
+                not message_chrome
+                and text is not None
+                and _is_hermes_tool_progress_segment(text)
+            ):
+                payload_text = body_text
+            else:
+                payload_text = text
         elif final and text is not None:
             payload_text = body_text[: self.MAX_MESSAGE_LENGTH]
         else:
@@ -15064,6 +15139,8 @@ class Agent365Adapter(BasePlatformAdapter):
             return await self._edit_nested_personal_reply(
                 str(chat_id), str(message_id), content, finalize=finalize
             )
+        if str(message_id).startswith("progressoff:"):
+            return SendResult(success=True, message_id=str(message_id))
 
         # Slice 19x-d (#4): streaming edits are clear outbound traffic;
         # mark the conversation as recently used so prune respects it.

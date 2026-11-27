@@ -12034,13 +12034,13 @@ class TestEditMessage:
         ]
         first, second = bodies
         assert first["type"] == "typing"
-        assert first["text"] == "💻 Running date"
+        assert first["text"] == "💻 Running a command"
         assert "The date is Thursday." not in first["text"]
         assert first["entities"] == [
             {"type": "streaminfo", "streamType": "informative", "streamSequence": 1}
         ]
         assert second["type"] == "typing"
-        assert second["text"] == "💻 Running date"
+        assert second["text"] == "💻 Running a command"
         assert second["entities"] == [
             {
                 "type": "streaminfo",
@@ -12108,7 +12108,7 @@ class TestEditMessage:
             )
         )
         assert posts[0]["type"] == "typing"
-        assert posts[0]["text"] == "💻 Running noop"
+        assert posts[0]["text"] == "💻 Running a command"
         await a.on_processing_complete(event, outcome="success")
         assert "conv-G-ka-task" not in a._turn_buffers
 
@@ -13431,7 +13431,7 @@ class TestEditMessage:
         await self._cancel_scheduled_turn_buffer_keepalive(buf)
         await a._emit_turn_buffer_keepalive(chat)
         assert len(rotation_finals) == 1
-        assert rotation_finals[0] == progress
+        assert rotation_finals[0] == adapter_mod._plain_tool_progress_summary(progress)
         await a.send(chat_id=chat, content="slept", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 1
@@ -14591,7 +14591,10 @@ class TestEditMessage:
             assert visible
             assert fact not in visible
             assert visible != adapter_mod._TURN_BUFFER_KEEPALIVE_TEXT
-        assert any(progress in text for text in informative_posts[1:])
+        assert any(
+            adapter_mod._plain_tool_progress_summary(progress) in text
+            for text in informative_posts[1:]
+        )
 
     @pytest.mark.asyncio
     async def test_issue247_answer_plain_after_keepalive_rotation_with_reply_to(
@@ -14656,7 +14659,9 @@ class TestEditMessage:
         assert buf.get("keepalive_rotated") is True
         assert not buf["keepalive"].get("stream_id")
         assert len(final_posts) == 1
-        assert final_posts[0]["text"] == progress_line
+        assert final_posts[0]["text"] == adapter_mod._plain_tool_progress_summary(
+            progress_line
+        )
         assert fact not in final_posts[0]["text"]
         await a.send(
             chat_id=chat,
@@ -16772,7 +16777,7 @@ class TestEditMessage:
         )
         await self._spin_until(lambda: len(bodies) >= 1)
         await self._spin_until(lambda: len(bodies) >= 2)
-        assert bodies[-1]["text"] == "💻 Running sleep 40"
+        assert bodies[-1]["text"] == "💻 Running a command"
         answer = await a.send(
             chat_id="conv-G-prog-info",
             content="slept",
@@ -16783,6 +16788,293 @@ class TestEditMessage:
         final = bodies[-1]
         assert final["type"] == "message"
         assert final["text"] == "slept"
+
+    _ISSUE364_SENSITIVE_PROGRESS = (
+        "✍️ Writing /var/lib/hermes/.hermes/cache/scratch/draft.md\n"
+        "💻 Running wc -w /var/lib/hermes/.hermes/cache/scratch/draft.md"
+    )
+    _ISSUE364_PLAIN_INFORMATIVE = "✍️ Writing a draft\n💻 Running a command"
+
+    @staticmethod
+    def _issue364_forbidden_wire_fragment(text: str) -> bool:
+        if not text:
+            return False
+        forbidden = (
+            "/var/lib/hermes",
+            "wc -w",
+            "python3 -",
+            "✍️ Writing /",
+        )
+        if any(part in text for part in forbidden):
+            return True
+        marker = "💻 Running "
+        idx = text.find(marker)
+        while idx >= 0:
+            tail = text[idx + len(marker) :]
+            if not tail.startswith("a command"):
+                return True
+            idx = text.find(marker, idx + 1)
+        return False
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("conversation_type", ["groupChat", "personal"])
+    async def test_issue364_tool_progress_never_shows_paths_or_commands(
+        self, monkeypatch: pytest.MonkeyPatch, conversation_type: str
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-364-{conversation_type}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = conversation_type
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = kwargs["json"]["entities"][0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, "issue364-stream")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        sent = await a.send(
+            chat_id=chat,
+            content=self._ISSUE364_SENSITIVE_PROGRESS,
+            reply_to=None,
+        )
+        assert sent.success is True
+        if conversation_type == "personal":
+            extended = (
+                self._ISSUE364_SENSITIVE_PROGRESS + "\n💻 Running python3 - << 'PY'"
+            )
+            edited = await a.edit_message(
+                chat,
+                sent.message_id,
+                extended,
+            )
+            assert edited.success is True
+            posts_before_final = list(posts)
+        else:
+            await self._spin_until(lambda: len(posts) >= 1)
+            informative = [
+                body
+                for body in posts
+                if body.get("type") == "typing"
+                and (body.get("entities") or [{}])[0].get("streamType") == "informative"
+            ]
+            assert informative
+            assert informative[-1]["text"] == self._ISSUE364_PLAIN_INFORMATIVE
+            posts_before_final = list(posts)
+        await a.send(
+            chat_id=chat,
+            content="Word count: 616",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        await a.on_processing_complete(event, outcome="success")
+        for body in posts:
+            text = str(body.get("text") or "")
+            assert not self._issue364_forbidden_wire_fragment(text)
+        finals = [body for body in posts if body.get("type") == "message"]
+        assert len(finals) == 1
+        assert finals[0]["text"] == "Word count: 616"
+        if conversation_type == "personal":
+            assert not posts_before_final
+
+    def test_issue364_plain_tool_progress_summary_has_no_targets(self) -> None:
+        for emoji, verb, connector in adapter_mod._HERMES_TOOL_PROGRESS_SHAPES:
+            sample = f"{emoji} {verb}{connector}/home/u/secret.txt --flag"
+            summary = adapter_mod._plain_tool_progress_summary(sample)
+            assert "/" not in summary
+            assert "--flag" not in summary
+            assert "secret.txt" not in summary
+        duped = (
+            "💻 Running /bin/a\n"
+            "💻 Running /bin/b\n"
+            "✍️ Writing /tmp/x\n"
+            "✍️ Writing /tmp/y"
+        )
+        summary = adapter_mod._plain_tool_progress_summary(duped)
+        assert summary.splitlines() == ["💻 Running a command", "✍️ Writing a draft"]
+        repeated = "💻 Running wc -w foo (\u00d73)"
+        assert adapter_mod._plain_tool_progress_summary(repeated) == "💻 Running a command"
+
+    @pytest.mark.asyncio
+    async def test_issue364_edit_message_progressoff_is_noop(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        inbound = _make_inbound(conv_id="conv-364-off", activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "personal"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        post_mock = AsyncMock(return_value=self._http_result(202))
+        a._http_client.post = post_mock
+        result = await a.edit_message(
+            "conv-364-off",
+            "progressoff:7",
+            "💻 Running secret-cmd",
+        )
+        assert result.success is True
+        assert result.message_id == "progressoff:7"
+        post_mock.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_issue364_personal_progress_shaped_final_with_reply_to_delivered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-364-personal-reply"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "personal"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        final = await a.send(
+            chat_id=chat,
+            content="💻 Running date",
+            reply_to="act-1",
+        )
+        assert final.success is True
+        assert posts
+        reply_posts = [body for body in posts if body.get("text")]
+        assert reply_posts
+        await a.on_processing_complete(event, outcome="success")
+        posts.clear()
+        await a.on_processing_start(event)
+        notified = await a.send(
+            chat_id=chat,
+            content="💻 Running date",
+            reply_to="act-1",
+            metadata={"notify": True},
+        )
+        assert notified.success is True
+        assert [body for body in posts if body.get("text")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("close_via", ["rotation", "age_budget"])
+    async def test_issue364_rotation_final_never_carries_raw_tool_line(
+        self, monkeypatch: pytest.MonkeyPatch, close_via: str
+    ) -> None:
+        """Keep-alive rotation and age-budget finals must not POST raw tool paths (#364)."""
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-364-final-{close_via}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        raw_progress = (
+            "💻 Running wc -w /var/lib/hermes/.hermes/cache/scratch/draft.md"
+        )
+        plain_close = adapter_mod._plain_tool_progress_summary(raw_progress)
+        final_texts: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "final":
+                final_texts.append(str(body.get("text") or ""))
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, f"ka-364-{close_via}")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        await a.send(chat_id=chat, content="Pending answer", reply_to=None)
+        turn_seq = str(buf["turns"][0]["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:364-progress",
+                "text": raw_progress,
+                "turn": turn_seq,
+                "kind": "progress",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            }
+        ]
+        buf["keepalive"] = {
+            "stream_id": f"stream-364-{close_via}",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        if close_via == "rotation":
+            rotate_at = adapter_mod._keepalive_rotation_age_sec()
+            buf["keepalive"]["opened_mono"] = time.monotonic() - (rotate_at + 0.01)
+            await a._emit_turn_buffer_keepalive(chat)
+        else:
+            max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+            buf["keepalive"]["opened_mono"] = time.monotonic() - (max_age + 1.0)
+            record["may_have_landed"] = False
+            await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert final_texts, f"expected a stream final for {close_via}"
+        for text in final_texts:
+            assert text == plain_close
+            assert not self._issue364_forbidden_wire_fragment(text)
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue364_personal_progress_shaped_final_with_notify_delivered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-364-personal-notify"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "personal"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            return self._http_result(202, "msg-364-notify")
+
+        a._http_client.post = post
+        result = await a.send(
+            chat_id=chat,
+            content="💻 Running date",
+            reply_to=None,
+            metadata={"notify": True},
+        )
+        assert result.success is True
+        assert not str(result.message_id).startswith("progressoff:")
+        assert len(posts) == 1
 
     @pytest.mark.asyncio
     async def test_progress_only_turn_closes_informative_stream(
@@ -19222,7 +19514,7 @@ class TestEditMessage:
         buf["keepalive"]["opened_mono"] = time.monotonic() - (rotate_at + 0.01)
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals
-        assert finals[0] == "💻 Running noop"
+        assert finals[0] == adapter_mod._plain_tool_progress_summary("💻 Running noop")
         assert "keepalive" in closed_by_snap
         assert not buf["keepalive"].get("stream_id")
         await a._drop_turn_buffer("conv-G-ka-seg")
