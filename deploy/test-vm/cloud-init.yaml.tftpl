@@ -32,7 +32,11 @@ write_files:
       ReadWritePaths=/var/lib/hermes
       CapabilityBoundingSet=
 runcmd:
+  - set -e
   - install -d -m 0700 -o hermes -g hermes /var/lib/hermes
   - bash -c 'set -euo pipefail; apt-get update && apt-get install -y caddy git curl ca-certificates && echo net.ipv4.tcp_mtu_probing=1 >/etc/sysctl.d/99-hermes.conf && echo "precedence ::ffff:0:0/96  100" >>/etc/gai.conf && printf "%s\n" "Unattended-Upgrade::Automatic-Reboot \"false\";" >/etc/apt/apt.conf.d/51hermes-no-reboot && sysctl --system'
-  - bash -c 'set -euo pipefail; curl -LsSf https://astral.sh/uv/${uv_version}/install.sh | sh && install -d -m 0755 /opt/hermes /opt/hermes/python && export UV_PYTHON_INSTALL_DIR=/opt/hermes/python && /root/.local/bin/uv venv /opt/hermes/venv --python 3.14 && UV_PYTHON_INSTALL_DIR=/opt/hermes/python /root/.local/bin/uv pip install --python /opt/hermes/venv/bin/python "hermes-agent @ git+https://github.com/NousResearch/hermes-agent@${hermes_agent_ref}" "hermes-a365[bridge] @ git+https://github.com/Satscryption/Hermes-A365@${hermes_a365_ref}" && chmod -R a+rX /opt/hermes'
+  - bash -c 'set -euo pipefail; curl -LsSf https://astral.sh/uv/${uv_version}/install.sh | sh && install -d -m 0755 /opt/hermes /opt/hermes/python && UV_PYTHON_INSTALL_DIR=/opt/hermes/python /root/.local/bin/uv venv /opt/hermes/venv --python 3.14'
+  - bash -c 'set -euo pipefail; git init -q /opt/hermes/hermes-agent && git -C /opt/hermes/hermes-agent fetch -q --depth 1 https://github.com/NousResearch/hermes-agent ${hermes_agent_ref} && git -C /opt/hermes/hermes-agent checkout -q --detach FETCH_HEAD && UV_PYTHON_INSTALL_DIR=/opt/hermes/python /root/.local/bin/uv pip install --python /opt/hermes/venv/bin/python -e /opt/hermes/hermes-agent'
+  - bash -c 'set -euo pipefail; UV_PYTHON_INSTALL_DIR=/opt/hermes/python /root/.local/bin/uv pip install --python /opt/hermes/venv/bin/python "hermes-a365[bridge] @ git+https://github.com/Satscryption/Hermes-A365@${hermes_a365_ref}" && chmod -R a+rX /opt/hermes'
   - bash -c 'set -euo pipefail; install -m 0644 /etc/hermes-bootstrap/Caddyfile /etc/caddy/Caddyfile && caddy validate --config /etc/caddy/Caddyfile && systemctl enable --now caddy && systemctl restart caddy && systemctl daemon-reload'
+  - bash -c 'set -euo pipefail; t=$(mktemp -d); HOME=$t HERMES_HOME=$t/.hermes /opt/hermes/venv/bin/python -c "import hermes_cli.main, gateway.run, hermes_a365, hermes_a365.plugin"; rm -rf "$t"'
