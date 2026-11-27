@@ -6,7 +6,7 @@ standup, gateway modes, and the #90 matrix checklist stay on that issue and in
 [`references/live-tenant-test.md`](../references/live-tenant-test.md). This
 file records **supplemental Copilot Chat (Path B, B-CC) rows** exercised on
 walk094 / walk095 / walk097 profiles (`evidence.sh`, `log.md`, `agent.log` at
-DEBUG).
+DEBUG). It also holds the **Path A Teams 1:1 Stop** walk row in section **T**.
 
 Record pass/fail, timestamps, and sanitized evidence paths on the walk issue.
 Do not copy secrets or tokens into the log.
@@ -82,7 +82,7 @@ progressive `streamType=streaming` delivery.
 
 | Row | Prompt (representative) | Expected UI | Stop | Expected log (minimum) | Notes |
 | --- | --- | --- | --- | --- | --- |
-| T1 | Long-running reply (lead-in + tool, then answer) | Stream renders progressively | Observe and record whether a Stop control is offered; if it is, press it and record whether the gateway receives any activity or a 403 on the next update; grade against the documented client limitation. | Sanitized adapter/bridge log for the turn | #338 |
+| T1 | Long-running reply (lead-in + tool, then answer) | Stream renders progressively; final reply arrives | **PASS:** stream renders and final reply arrives; log shows no inbound cancel activity and no 403 `ContentStreamNotAllowed`. **Stop control:** record whether one is present; if present, record as a documentation drift finding for #338, not as a failure. **FAIL:** stream breaks, final reply missing, or 403 `ContentStreamNotAllowed`. | Sanitized adapter/bridge log: confirm `turn reply delivered` (or equivalent final settlement), absence of inbound cancel activities, and no `http_status=403` / `ContentStreamNotAllowed` on stream updates | #338 |
 
 ## References
 
