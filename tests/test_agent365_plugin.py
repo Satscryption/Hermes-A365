@@ -7310,6 +7310,251 @@ class Test226PreambleVsAnswerDesign:
         assert len(edited_informative) == 1
 
 
+class TestIssue363DraftRemarks:
+    @staticmethod
+    def _long_answer() -> str:
+        filler = TestIssue366LongFinalReply._body(4500)
+        return f"1. Section 1\n\n{filler}"
+
+    @staticmethod
+    def _posted_text(posts: list[dict[str, Any]], overflow: list[str]) -> str:
+        bodies = [str(body.get("text") or "") for body in posts if body.get("type") == "message"]
+        return "".join(bodies + overflow)
+
+    @staticmethod
+    def _wire_long_split(
+        monkeypatch: pytest.MonkeyPatch,
+        a: Any,
+        inbound: dict[str, Any],
+    ) -> tuple[TestEditMessage, list[dict[str, Any]], list[str]]:
+        helpers = TestEditMessage()
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 0)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_INTERVAL_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_DISABLE_SLEEPER", True)
+        a._copilot_min_stream_age_before_final_sec = 0.0
+        posts: list[dict[str, Any]] = []
+        overflow: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-363")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        bridge = adapter_mod._import_bridge()
+
+        async def send_reply(**kwargs: Any) -> None:
+            overflow.append(kwargs["reply"]["text"])
+
+        monkeypatch.setattr(bridge, "send_reply", send_reply)
+        return helpers, posts, overflow
+
+    @pytest.mark.asyncio
+    async def test_issue363_intent_leadin_not_prefixed_to_long_split_reply(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        leadin = "I'll draft it first."
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-intent-leadin"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-leadin")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        _, posts, overflow = self._wire_long_split(monkeypatch, a, inbound)
+        answer = self._long_answer()
+        event = _StubMessageEvent(
+            text="long",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-leadin",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=leadin, reply_to=None)
+        await a.send(chat_id=chat, content=answer, reply_to="act-363-leadin")
+        await a.on_processing_complete(event, outcome="success")
+        message_texts = [
+            str(body.get("text") or "") for body in posts if body.get("type") == "message"
+        ]
+        assert message_texts
+        assert message_texts[0].startswith("1. Section 1")
+        assert not any(leadin in text for text in message_texts)
+        joined = self._posted_text(posts, overflow)
+        assert joined == answer
+
+    @pytest.mark.asyncio
+    async def test_issue363_no_tool_answer_with_word_count_delivered_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-word-count"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-wc")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-363-wc")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        answer = "The draft came out at 1,040 words."
+        event = _StubMessageEvent(
+            text="count",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-wc",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=answer, reply_to="act-363-wc")
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == answer
+
+    @pytest.mark.asyncio
+    async def test_issue363_post_tool_answer_sentence_delivered_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-post-tool"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-pt")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-363-pt")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        answer = "The draft came out at 1,040 words."
+        event = _StubMessageEvent(
+            text="count",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-pt",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.send(chat_id=chat, content=answer, reply_to="act-363-pt")
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == answer
+
+    _FALSE_DROP_SENTENCES = (
+        "In short, the capital of France is Paris.",
+        "The password must be 12 characters.",
+        "The essay should be 800 words.",
+        "A word counts as one token.",
+        "Spending is under the budget.",
+        "We went over the limit.",
+        "Look under the cap of the pen.",
+        "We are over Max.",
+        "Trimming the hedges is Saturday's job.",
+        "US short rates rose.",
+        "The Long family arrived.",
+        "3.5 words remain.",
+        "Cutting it close is risky.",
+        "Cutting this is easy.",
+        "Shortening the response time is the goal.",
+        "Cutting the response time in half saved the launch.",
+        "Trimming the draft budget is Friday's job.",
+        "Tightening the reply all week paid off.",
+        "Cutting that corner saved time.",
+        "Trimming it carefully takes time.",
+        "Cutting it's a mistake.",
+        "The draft law is too long.",
+        "The draft law is 12 words.",
+        "The password draft must be 12 characters.",
+        "The draft is not too long.",
+        "The meeting was too long, but the draft is ready.",
+    )
+
+    @pytest.mark.parametrize("sentence", _FALSE_DROP_SENTENCES)
+    @pytest.mark.parametrize(
+        "path",
+        ("marked_pre_tool", "long_split_marked", "long_split_commentary"),
+    )
+    @pytest.mark.asyncio
+    async def test_issue363_r1_r2_false_drop_sentences_delivered_unchanged(
+        self,
+        monkeypatch: pytest.MonkeyPatch,
+        sentence: str,
+        path: str,
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        slug = abs(hash((sentence, path))) % 10_000
+        chat = f"conv-G-363-fdrop-{path}-{slug}"
+        inbound = _make_inbound(conv_id=chat, activity_id=f"act-{slug}")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        _, posts, overflow = self._wire_long_split(monkeypatch, a, inbound)
+        long_answer = self._long_answer()
+        tail = "Done." if path == "marked_pre_tool" else long_answer
+        event = _StubMessageEvent(
+            text="reply",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id=f"act-{slug}",
+        )
+        await a.on_processing_start(event)
+        marked_send = dict(
+            chat_id=chat,
+            content=sentence,
+            reply_to=f"act-{slug}",
+            metadata={"expect_edits": True},
+        )
+        if path == "long_split_commentary":
+            await a.send(chat_id=chat, content=sentence, reply_to=None)
+        else:
+            await a.send(**marked_send)
+        await a.send(chat_id=chat, content=_HERMES_PROGRESS_LINE, reply_to=None)
+        await a.send(chat_id=chat, content=tail, reply_to=f"act-{slug}")
+        await a.on_processing_complete(event, outcome="success")
+        posted = self._posted_text(posts, overflow)
+        assert sentence in posted
+
+    @pytest.mark.asyncio
+    async def test_issue363_mixed_remark_and_answer_segment_delivered_intact(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        helpers = TestEditMessage()
+        a = _make_adapter(monkeypatch)
+        chat = "conv-G-363-mixed"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-363-mixed")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        helpers._wire_adapter(a, inbound=inbound)
+        helpers._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            entity = (kwargs["json"].get("entities") or [{}])[0]
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return helpers._http_result(201, "ka-mixed")
+            return helpers._http_result(202)
+
+        a._http_client.post = post
+        content = "That draft came out at 1,040 words, over the 800-word target. Here is the essay."
+        event = _StubMessageEvent(
+            text="essay",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-363-mixed",
+        )
+        await a.on_processing_start(event)
+        await a.send(chat_id=chat, content=content, reply_to="act-363-mixed")
+        await a.on_processing_complete(event, outcome="success")
+        final = next(body for body in posts if body.get("type") == "message")
+        assert final["text"] == content
+
+
 # ---------------------------------------------------------------------------
 # Slice 19o — send_typing + send_image
 # ---------------------------------------------------------------------------
@@ -8008,9 +8253,7 @@ class TestEditMessage:
         assert post_mock.await_count == 2
 
     @pytest.mark.asyncio
-    async def test_intermediate_chunk_has_ai_label(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_intermediate_chunk_has_ai_label(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         inbound = _make_inbound(conv_id="conv-S")
         first = MagicMock(status_code=201, text="", json=lambda: {"id": "bf-stream-y"})
@@ -8951,9 +9194,7 @@ class TestEditMessage:
         await a.send(chat_id=chat, content=part_one, reply_to="act-357")
         await a.send(chat_id=chat, content=part_two, reply_to="act-357")
         await a.on_processing_complete(event, outcome="success")
-        assert overflow_keepalive_snapshots == [
-            {"stopped": False, "skip_stream_open": False}
-        ]
+        assert overflow_keepalive_snapshots == [{"stopped": False, "skip_stream_open": False}]
         assert overflow_at == [len(posts)], "overflow plain send should happen once at the end"
         overflow_idx = overflow_at[0]
         finals_before_overflow = [
@@ -9148,8 +9389,7 @@ class TestEditMessage:
         assert close_calls >= 2
         assert overflow_at == [len(posts)], "overflow must send exactly once on retry"
         assert posts[overflow_at[0] - 1 : overflow_at[0]] == [] or (
-            (posts[overflow_at[0] - 1].get("entities") or [{}])[0].get("streamType")
-            == "final"
+            (posts[overflow_at[0] - 1].get("entities") or [{}])[0].get("streamType") == "final"
         )
 
     @pytest.mark.asyncio
@@ -14294,9 +14534,7 @@ class TestEditMessage:
         assert buf.get("keepalive_rotated") is True
         assert not buf["keepalive"].get("stream_id")
         assert len(final_posts) == 1
-        assert final_posts[0]["text"] == adapter_mod._plain_tool_progress_summary(
-            progress_line
-        )
+        assert final_posts[0]["text"] == adapter_mod._plain_tool_progress_summary(progress_line)
         assert fact not in final_posts[0]["text"]
         await a.send(
             chat_id=chat,
@@ -14526,8 +14764,10 @@ class TestEditMessage:
             body = kwargs["json"]
             posts.append(body)
             entity = body["entities"][0]
-            if case_id == "close_rejected" and entity.get("streamType") == "final" and entity.get(
-                "streamId"
+            if (
+                case_id == "close_rejected"
+                and entity.get("streamType") == "final"
+                and entity.get("streamId")
             ):
                 return self._http_result(400)
             if (
@@ -14540,9 +14780,7 @@ class TestEditMessage:
                     text="Content stream finished due to exceeded streaming time",
                     json=lambda: {
                         "error": {
-                            "message": (
-                                "Content stream finished due to exceeded streaming time"
-                            )
+                            "message": ("Content stream finished due to exceeded streaming time")
                         }
                     },
                 )
@@ -14653,16 +14891,13 @@ class TestEditMessage:
 
         caplog.clear()
         with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
-            route = a._answer_deliver_pre_post(
-                chat, buf, turn, record_after, chunk_segment_ids=[]
-            )
+            route = a._answer_deliver_pre_post(chat, buf, turn, record_after, chunk_segment_ids=[])
         assert route == ("fallback", "retry_exhausted")
         fb_logs = [r for r in caplog.records if "answer plain fallback" in r.message]
         assert len(fb_logs) == 1
         assert fb_logs[0].levelno == logging.WARNING
         assert fb_logs[0].message == (
-            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
-            "reason=retry_exhausted"
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} reason=retry_exhausted"
         )
 
         await a._drop_turn_buffer(chat)
@@ -14757,17 +14992,14 @@ class TestEditMessage:
         assert buf.get("keepalive_rotated") is True
         caplog.clear()
         with caplog.at_level(logging.INFO, logger=adapter_mod.logger.name):
-            follow = a._answer_deliver_pre_post(
-                chat, buf, turn, record, chunk_segment_ids=[]
-            )
+            follow = a._answer_deliver_pre_post(chat, buf, turn, record, chunk_segment_ids=[])
         logs = [r for r in caplog.records if "answer plain fallback" in r.message]
         assert len(logs) == 1
         if param_id == "retry_exhausted":
             assert follow == ("fallback", "retry_exhausted")
             assert logs[0].levelno == logging.WARNING
             assert logs[0].message == (
-                "agent365 turn buffer answer plain fallback: "
-                f"chat_id={chat} reason=retry_exhausted"
+                f"agent365 turn buffer answer plain fallback: chat_id={chat} reason=retry_exhausted"
             )
         else:
             assert follow == ("fallback", "rotated")
@@ -14811,8 +15043,7 @@ class TestEditMessage:
         assert len(logs) == 1
         assert logs[0].levelno == logging.WARNING
         assert logs[0].message == (
-            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
-            f"reason={stored_reason}"
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} reason={stored_reason}"
         )
         assert "stream retry exhausted" not in logs[0].message
         assert record.get("plain_reason") == stored_reason
@@ -14855,8 +15086,7 @@ class TestEditMessage:
         assert len(logs) == 1
         assert logs[0].levelno == logging.WARNING
         assert logs[0].message == (
-            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
-            "reason=retry_exhausted"
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} reason=retry_exhausted"
         )
         if plain_reason_setup == "empty":
             assert record.get("plain_reason") == ""
@@ -14937,8 +15167,7 @@ class TestEditMessage:
         assert len(logs) == 1
         assert logs[0].levelno == logging.WARNING
         assert logs[0].message == (
-            f"agent365 turn buffer answer plain fallback: chat_id={chat} "
-            "reason=retry_exhausted"
+            f"agent365 turn buffer answer plain fallback: chat_id={chat} reason=retry_exhausted"
         )
 
     @staticmethod
@@ -16487,9 +16716,7 @@ class TestEditMessage:
         )
         assert sent.success is True
         if conversation_type == "personal":
-            extended = (
-                self._ISSUE364_SENSITIVE_PROGRESS + "\n💻 Running python3 - << 'PY'"
-            )
+            extended = self._ISSUE364_SENSITIVE_PROGRESS + "\n💻 Running python3 - << 'PY'"
             edited = await a.edit_message(
                 chat,
                 sent.message_id,
@@ -16531,12 +16758,7 @@ class TestEditMessage:
             assert "/" not in summary
             assert "--flag" not in summary
             assert "secret.txt" not in summary
-        duped = (
-            "💻 Running /bin/a\n"
-            "💻 Running /bin/b\n"
-            "✍️ Writing /tmp/x\n"
-            "✍️ Writing /tmp/y"
-        )
+        duped = "💻 Running /bin/a\n💻 Running /bin/b\n✍️ Writing /tmp/x\n✍️ Writing /tmp/y"
         summary = adapter_mod._plain_tool_progress_summary(duped)
         assert summary.splitlines() == ["💻 Running a command", "✍️ Writing a draft"]
         repeated = "💻 Running wc -w foo (\u00d73)"
@@ -16621,9 +16843,7 @@ class TestEditMessage:
         monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
         monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
         a._copilot_min_stream_age_before_final_sec = 0
-        raw_progress = (
-            "💻 Running wc -w /var/lib/hermes/.hermes/cache/scratch/draft.md"
-        )
+        raw_progress = "💻 Running wc -w /var/lib/hermes/.hermes/cache/scratch/draft.md"
         plain_close = adapter_mod._plain_tool_progress_summary(raw_progress)
         final_texts: list[str] = []
 
@@ -16675,9 +16895,7 @@ class TestEditMessage:
             max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
             buf["keepalive"]["opened_mono"] = time.monotonic() - (max_age + 1.0)
             record["may_have_landed"] = False
-            await a._maybe_route_plain_turn_answer(
-                chat, buf, turn, record, chunk_segment_ids=[]
-            )
+            await a._maybe_route_plain_turn_answer(chat, buf, turn, record, chunk_segment_ids=[])
         assert final_texts, f"expected a stream final for {close_via}"
         for text in final_texts:
             assert text == plain_close
@@ -22336,10 +22554,9 @@ class TestEditMessage:
             reply_to="act-before-restart",
         )
         assert result.success is False
-        assert (
-            "no cached inbound for exact turn" in str(result.error)
-            or "no turn authority" in str(result.error)
-        )
+        assert "no cached inbound for exact turn" in str(
+            result.error
+        ) or "no turn authority" in str(result.error)
         assert a._coalesced_replies == {}
 
     @pytest.mark.asyncio
@@ -22682,8 +22899,7 @@ class TestEditMessage:
         # the log keeps the status and the BF body (#83).
         assert ("conv-X", "m1") not in a._streams
         assert any(
-            record.message
-            == "agent365 personal stream edit failed: phase=edit finalize=False "
+            record.message == "agent365 personal stream edit failed: phase=edit finalize=False "
             "http_status=403 attempt=1 bf_error_code=ContentStreamNotAllowed"
             for record in caplog.records
         )
@@ -22752,8 +22968,7 @@ class TestEditMessage:
         assert post_mock.await_count == 1 + adapter_mod._STREAM_EDIT_MAX_ATTEMPTS
         assert ("conv-R", "m1") in a._streams
         assert any(
-            record.message
-            == "agent365 personal stream edit failed: phase=edit finalize=False "
+            record.message == "agent365 personal stream edit failed: phase=edit finalize=False "
             "http_status=429 attempt=3 bf_error_code=TooManyRequests"
             for record in caplog.records
         )
@@ -22888,8 +23103,7 @@ class TestEditMessage:
         assert result.success is True
         assert post_mock.await_count == 3
         assert any(
-            record.message
-            == "agent365 personal stream edit failed: phase=edit finalize=False "
+            record.message == "agent365 personal stream edit failed: phase=edit finalize=False "
             "http_status=502 attempt=1 bf_error_code=BadGateway"
             for record in caplog.records
         )
@@ -22922,8 +23136,7 @@ class TestEditMessage:
         assert ("conv-keep", "m1") in a._streams
         assert send_reply.await_count == 0
         assert any(
-            record.message
-            == "agent365 personal stream edit failed: phase=edit finalize=False "
+            record.message == "agent365 personal stream edit failed: phase=edit finalize=False "
             "http_status=400 attempt=1 bf_error_code=BadSyntax"
             for record in caplog.records
         )
@@ -22996,8 +23209,7 @@ class TestEditMessage:
         assert result.success is False
         assert post_mock.await_count == 1 + adapter_mod._STREAM_EDIT_MAX_ATTEMPTS
         assert any(
-            record.message
-            == "agent365 personal stream edit failed: phase=edit finalize=False "
+            record.message == "agent365 personal stream edit failed: phase=edit finalize=False "
             "http_status=502 attempt=3 bf_error_code=other"
             for record in caplog.records
         )
@@ -23273,9 +23485,7 @@ class TestEditMessage:
                 MagicMock(status_code=403, text="", json=lambda body=body: body),
             ]
             adapter = _make_adapter(monkeypatch)
-            post_mock = self._wire_adapter(
-                adapter, inbound=case_inbound, post_responses=responses
-            )
+            post_mock = self._wire_adapter(adapter, inbound=case_inbound, post_responses=responses)
             self._patch_token_mint(monkeypatch)
             self._no_sleep(monkeypatch)
             bridge = adapter_mod._import_bridge()
@@ -23287,9 +23497,9 @@ class TestEditMessage:
             result = await adapter.edit_message(conv_id, f"m-{label}", "A B", finalize=True)
             assert result.success is False, label
             assert result.error == "streaming already completed", label
-            assert f"act-{label}" not in (
-                adapter._personal_final_landed.get(conv_id) or set()
-            ), label
+            assert f"act-{label}" not in (adapter._personal_final_landed.get(conv_id) or set()), (
+                label
+            )
             assert post_mock.await_count == 3, label
             assert send_reply.await_count == 0, label
 
@@ -23496,9 +23706,7 @@ class TestPersonalChatStreamCompletion:
 
         post_mock = AsyncMock(side_effect=_post)
         a._http_client.post = post_mock
-        a._http_client.delete = AsyncMock(
-            return_value=MagicMock(status_code=200, text="")
-        )
+        a._http_client.delete = AsyncMock(return_value=MagicMock(status_code=200, text=""))
         return post_mock, attempts, accepted
 
     @pytest.mark.asyncio
@@ -23516,9 +23724,7 @@ class TestPersonalChatStreamCompletion:
         ]
         if with_retry:
             responses.append(MagicMock(status_code=502, text="", json=lambda body=gateway: body))
-        responses.append(
-            MagicMock(status_code=403, text="", json=lambda body=completed: body)
-        )
+        responses.append(MagicMock(status_code=403, text="", json=lambda body=completed: body))
         post_mock, _attempts, accepted = self._wire_stream_fake(a, inbound, responses)
         TestEditMessage._patch_token_mint(monkeypatch)
         TestEditMessage._no_sleep(monkeypatch)
@@ -23527,12 +23733,8 @@ class TestPersonalChatStreamCompletion:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         await a.edit_message("conv-deliver", "m-deliver", "Hello", finalize=False)
-        await a.edit_message(
-            "conv-deliver", "m-deliver", "Hello world", finalize=False
-        )
-        final = await a.edit_message(
-            "conv-deliver", "m-deliver", "Hello world.", finalize=True
-        )
+        await a.edit_message("conv-deliver", "m-deliver", "Hello world", finalize=False)
+        final = await a.edit_message("conv-deliver", "m-deliver", "Hello world.", finalize=True)
         assert final.success is True
         assert len(accepted) == 2
         assert "act-deliver" in a._personal_final_landed["conv-deliver"]
@@ -23542,9 +23744,7 @@ class TestPersonalChatStreamCompletion:
             assert cleanup.success is True
         assert post_mock.await_count == posts_before
 
-        follow_in = _make_inbound(
-            conv_id="conv-deliver", activity_id="act-follow", text="follow"
-        )
+        follow_in = _make_inbound(conv_id="conv-deliver", activity_id="act-follow", text="follow")
         ref = adapter_mod.ConversationRef.from_activity(follow_in)
         assert ref is not None
         ref.validated_path = "A"
@@ -23597,9 +23797,7 @@ class TestPersonalChatStreamCompletion:
             assert result.success is True
         else:
             await a.edit_message("conv-label", "m-label", "Hi", finalize=False)
-            await a.edit_message(
-                "conv-label", "m-label", "Hi there", finalize=True
-            )
+            await a.edit_message("conv-label", "m-label", "Hi there", finalize=True)
 
         for body in attempts:
             types = [e.get("type") for e in body.get("entities") or []]
@@ -23754,9 +23952,7 @@ class TestPersonalChatStreamCompletion:
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
-        no_open = await edit_only.edit_message(
-            "conv-narrow", "fresh", "Open", finalize=True
-        )
+        no_open = await edit_only.edit_message("conv-narrow", "fresh", "Open", finalize=True)
         assert no_open.success is False
         assert send_reply.await_count == 0
         assert post_mock.await_count == 1
@@ -23768,16 +23964,12 @@ class TestPersonalChatStreamCompletion:
         a = _make_adapter(monkeypatch)
         inbound_g = _make_inbound(conv_id="conv-G", activity_id="act-g")
         inbound_g["conversation"]["conversationType"] = "groupChat"
-        post_mock = TestEditMessage._wire_adapter(
-            a, inbound=inbound_g, post_responses=None
-        )
+        post_mock = TestEditMessage._wire_adapter(a, inbound=inbound_g, post_responses=None)
         TestEditMessage._patch_token_mint(monkeypatch)
         bridge = adapter_mod._import_bridge()
         send_reply = AsyncMock(return_value=None)
         monkeypatch.setattr(bridge, "send_reply", send_reply)
-        coalesced = await a.send(
-            chat_id="conv-G", content="Group", reply_to="act-g"
-        )
+        coalesced = await a.send(chat_id="conv-G", content="Group", reply_to="act-g")
         assert coalesced.success is True
         assert post_mock.await_count == 0
         message_id = str(coalesced.message_id)
@@ -23862,20 +24054,17 @@ class TestPersonalChatStreamCompletion:
             attempt=1,
         )
         assert any(
-            r.message
-            == "agent365 personal stream edit failed: phase=edit finalize=True "
+            r.message == "agent365 personal stream edit failed: phase=edit finalize=True "
             "http_status=403 attempt=2 bf_error_code=ContentStreamNotAllowed"
             for r in caplog.records
         )
         assert any(
-            r.message
-            == "agent365 personal stream edit failed: phase=other finalize=False "
+            r.message == "agent365 personal stream edit failed: phase=other finalize=False "
             "http_status=none attempt=0 bf_error_code=other"
             for r in caplog.records
         )
         assert any(
-            r.message
-            == "agent365 personal stream edit failed: phase=edit finalize=True "
+            r.message == "agent365 personal stream edit failed: phase=edit finalize=True "
             "http_status=503 attempt=1 bf_error_code=other"
             for r in caplog.records
         )
@@ -23977,9 +24166,7 @@ class TestPersonalChatStreamCompletion:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         await a.edit_message("conv-356-mid", "m-356", "Part", finalize=False)
-        recovered = await a.edit_message(
-            "conv-356-mid", "m-356", "Part two", finalize=False
-        )
+        recovered = await a.edit_message("conv-356-mid", "m-356", "Part two", finalize=False)
         assert recovered.success is True
         assert "act-356-mid" not in (a._personal_final_landed.get("conv-356-mid") or set())
         assert a._personal_stream_plain_fallback_pending["conv-356-mid"] == "bf-356-mid"
@@ -24029,9 +24216,7 @@ class TestPersonalChatStreamCompletion:
         assert "act-same" not in (a._personal_final_landed.get(conv) or set())
 
         full = "Chunk with more detail."
-        notify = await a.send(
-            conv, full, reply_to="act-same", metadata={"notify": True}
-        )
+        notify = await a.send(conv, full, reply_to="act-same", metadata={"notify": True})
         assert notify.success is True
         assert send_reply.await_count == 1
         assert send_reply.await_args.kwargs["reply"]["text"] == full
@@ -24056,9 +24241,7 @@ class TestPersonalChatStreamCompletion:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         await a.edit_message("conv-356-fin", "m-356-fin", "Hi", finalize=False)
-        final = await a.edit_message(
-            "conv-356-fin", "m-356-fin", "Hi there.", finalize=True
-        )
+        final = await a.edit_message("conv-356-fin", "m-356-fin", "Hi there.", finalize=True)
         assert final.success is True
         posts_before = post_mock.await_count
         duplicate = await a.send(
@@ -24089,9 +24272,7 @@ class TestPersonalChatStreamCompletion:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         await a.edit_message("conv-356-ok", "m-356-ok", "Part", finalize=False)
-        closed = await a.edit_message(
-            "conv-356-ok", "m-356-ok", "Part final.", finalize=True
-        )
+        closed = await a.edit_message("conv-356-ok", "m-356-ok", "Part final.", finalize=True)
         assert closed.success is True
         finals = [
             entity
@@ -24130,9 +24311,7 @@ class TestPersonalChatStreamCompletion:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         await a.edit_message("conv-356-pln", "m-356-pln", "Part", finalize=False)
-        failed = await a.edit_message(
-            "conv-356-pln", "m-356-pln", "Body", finalize=False
-        )
+        failed = await a.edit_message("conv-356-pln", "m-356-pln", "Body", finalize=False)
         assert failed.success is False
         assert "conv-356-pln" in a._personal_stream_plain_fallback_pending
         posts_before = post_mock.await_count
@@ -24174,9 +24353,7 @@ class TestPersonalChatStreamCompletion:
         monkeypatch.setattr(bridge, "send_reply", send_reply)
 
         await a.edit_message("conv-356-retry", "m-retry", "Body", finalize=False)
-        failed = await a.edit_message(
-            "conv-356-retry", "m-retry", "Body", finalize=True
-        )
+        failed = await a.edit_message("conv-356-retry", "m-retry", "Body", finalize=True)
         assert failed.success is False
         first = await a.send(
             "conv-356-retry", "Body", reply_to="act-356-retry", metadata={"notify": True}
@@ -24262,10 +24439,7 @@ class TestPersonalChatStreamCompletion:
             for e in body.get("entities") or []
             if e.get("type") == "streaminfo"
         )
-        assert not any(
-            "phase=auto-finalize" in r.message
-            for r in caplog.records
-        )
+        assert not any("phase=auto-finalize" in r.message for r in caplog.records)
 
     @pytest.mark.asyncio
     async def test_issue356_force_drop_age_is_not_recovery_delivered(
@@ -24310,9 +24484,7 @@ class TestPersonalChatStreamCompletion:
         self, monkeypatch: pytest.MonkeyPatch
     ) -> None:
         a = _make_adapter(monkeypatch)
-        self._wire_stream_fake(
-            a, _make_inbound(conv_id="conv-A", activity_id="act-a"), []
-        )
+        self._wire_stream_fake(a, _make_inbound(conv_id="conv-A", activity_id="act-a"), [])
         a._personal_stream_plain_fallback_pending["conv-A"] = "bf-a"
         assert "conv-B" not in a._personal_stream_plain_fallback_pending
 
@@ -24428,9 +24600,7 @@ class TestPersonalChatStreamCompletion:
         assert any(row.get("text") == "Short" for row in accepted)
         assert send_reply.await_count == 0
         posts_before = post_mock.await_count
-        again = await a.edit_message(
-            "conv-short-done", "m-short", "tail", finalize=True
-        )
+        again = await a.edit_message("conv-short-done", "m-short", "tail", finalize=True)
         assert again.success is True
         assert post_mock.await_count == posts_before
 
@@ -25048,9 +25218,7 @@ class TestIssue366LongFinalReply:
         chunks = a._chunk_turn_segments(segments)
         assert len(chunks) == 1
         merged = "\n\n".join(
-            str(segment.get("text") or "")
-            for chunk in chunks
-            for segment in chunk
+            str(segment.get("text") or "") for chunk in chunks for segment in chunk
         )
         assert merged == body
         assert len(merged) <= a.MAX_MESSAGE_LENGTH
@@ -25062,11 +25230,7 @@ class TestIssue366LongFinalReply:
         body = self._body(4581)
         segments = [{"id": "turnbuf:9", "text": body, "turn": "1"}]
         chunks = a._chunk_turn_segments(segments)
-        parts = [
-            str(segment.get("text") or "")
-            for chunk in chunks
-            for segment in chunk
-        ]
+        parts = [str(segment.get("text") or "") for chunk in chunks for segment in chunk]
         assert "".join(parts) == body
         assert len(parts) > 1
         assert all(len(part) <= a.MAX_MESSAGE_LENGTH for part in parts)
@@ -25090,8 +25254,7 @@ class TestIssue366LongFinalReply:
         result = await a.send(chat_id=chat, content=body, reply_to="act-366-send")
         assert result.success is True
         stored = "".join(
-            str(segment.get("text") or "")
-            for segment in a._turn_buffers[chat]["segments"]
+            str(segment.get("text") or "") for segment in a._turn_buffers[chat]["segments"]
         )
         assert stored == body
 
@@ -25200,9 +25363,7 @@ class TestIssue366LongFinalReply:
         assert stored == body
 
     @pytest.mark.asyncio
-    async def test_oversized_send_replay_is_noop(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    async def test_oversized_send_replay_is_noop(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         chat = "conv-366-replay"
         inbound = _make_inbound(conv_id=chat, activity_id="act-replay")
@@ -25462,9 +25623,7 @@ class TestIssue366LongFinalReply:
         assert all(len(piece) <= limit for piece in pieces)
         assert self._stitch_split_pieces(pieces) == text
 
-    def test_split_code_fence_reopens_on_next_piece(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_split_code_fence_reopens_on_next_piece(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         limit = a.MAX_MESSAGE_LENGTH
         text = "intro\n\n```python\n" + ("print(1)\n" * 900)
@@ -25480,9 +25639,7 @@ class TestIssue366LongFinalReply:
                 return
         pytest.fail("expected a fence split with reopen")
 
-    def test_split_surrogate_pair_not_bisected(
-        self, monkeypatch: pytest.MonkeyPatch
-    ) -> None:
+    def test_split_surrogate_pair_not_bisected(self, monkeypatch: pytest.MonkeyPatch) -> None:
         a = _make_adapter(monkeypatch)
         limit = a.MAX_MESSAGE_LENGTH
         text = "a" * (limit - 1) + "\ud800\udc00"
@@ -26249,8 +26406,7 @@ class TestSendStreamStart:
         assert result.success is False
         assert "conv-reject" in a._active_stream_by_chat
         assert any(
-            record.message
-            == "agent365 personal stream edit failed: phase=edit finalize=True "
+            record.message == "agent365 personal stream edit failed: phase=edit finalize=True "
             "http_status=400 attempt=1 bf_error_code=BadSyntax"
             for record in caplog.records
         )
@@ -30727,9 +30883,7 @@ class TestPathBM2R1:
         timeout = await a.edit_message("conv-late-timeout", "m-timeout", "Part 2", finalize=False)
         assert timeout.success is False
         posts_before = post_mock.await_count
-        late = await a.edit_message(
-            "conv-late-timeout", "m-timeout", "Tail", finalize=True
-        )
+        late = await a.edit_message("conv-late-timeout", "m-timeout", "Tail", finalize=True)
         assert late.success is False
         assert post_mock.await_count == posts_before
 
@@ -30817,10 +30971,7 @@ class TestPathBM2R1:
         await a.edit_message(conv_id, "m-new", "Fresh", finalize=False)
         await a.edit_message(conv_id, "m-new", "Fresh final", finalize=True)
         assert post_mock.await_count > posts_after_cancel + 1
-        bodies = [
-            call.kwargs.get("json", {}).get("text", "")
-            for call in post_mock.await_args_list
-        ]
+        bodies = [call.kwargs.get("json", {}).get("text", "") for call in post_mock.await_args_list]
         assert not any("STOPPED TEXT" in str(text) for text in bodies)
 
     @pytest.mark.asyncio
@@ -31034,9 +31185,7 @@ class TestPathBM2R1:
                 opened = await a.edit_message(conv_id, activity_id, marker, finalize=False)
                 assert opened.success is True, opened.error
                 clock["bind"]()
-                growing = await a.edit_message(
-                    conv_id, activity_id, f"{marker} …", finalize=False
-                )
+                growing = await a.edit_message(conv_id, activity_id, f"{marker} …", finalize=False)
                 assert growing.success is True, growing.error
                 clock["bind"]()
                 final = await a.edit_message(conv_id, activity_id, f"{marker} END", finalize=True)
@@ -32142,9 +32291,7 @@ class TestTurnFrame:
         adapter_mod._AGENT_TURN_FRAME.set(None)
         replacement = _make_inbound(conv_id=conv, activity_id="nested-repl")
         a._conversations.upsert(adapter_mod.ConversationRef.from_activity(replacement))
-        final = await a.edit_message(
-            conv, str(preview.message_id), "Nested done.", finalize=True
-        )
+        final = await a.edit_message(conv, str(preview.message_id), "Nested done.", finalize=True)
         assert final.success is True
         assert runtime.posted.await_count == 1
         assert runtime.posted.await_args.kwargs["inbound"]["id"] == "nested-admit"
@@ -32243,7 +32390,8 @@ class TestTurnFrame:
         assert runtime.posted.await_args.kwargs["inbound"]["from"]["id"] == "reactor"
 
     async def test_f312_retired_frame_send_is_rejected(
-        self, runtime: Any,
+        self,
+        runtime: Any,
     ) -> None:
         a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
         a._release_turn_authority_owner(user_record)
@@ -32323,7 +32471,8 @@ class TestTurnFrame:
         assert handled == [promoted]
 
     async def test_f312_teardown_clears_ledger_after_coalesced_attach(
-        self, runtime: Any,
+        self,
+        runtime: Any,
     ) -> None:
         a = runtime.adapter
         inbound = _make_inbound(activity_id="teardown-ledger")
@@ -32339,7 +32488,8 @@ class TestTurnFrame:
         assert ("conv-1", "teardown-ledger") not in a._turn_authority_ledger
 
     async def test_f312_coalesced_authority_retires_and_stays_capped(
-        self, runtime: Any,
+        self,
+        runtime: Any,
     ) -> None:
         a = runtime.adapter
         conv = "conv-f312-cap"
@@ -32392,7 +32542,8 @@ class TestTurnFrame:
         assert a._coalesced_turn_authority == {}
 
     async def test_f312_coalesced_shared_anchor_pop_drops_entry(
-        self, runtime: Any,
+        self,
+        runtime: Any,
     ) -> None:
         a, user_record, reaction_record = await self._f312_seed_reaction_turn(runtime)
         key = ("conv-1", "user-act")
@@ -32402,9 +32553,7 @@ class TestTurnFrame:
         a._release_turn_authority_owner(user_record)
         assert a._ledger_record_for_message("user-act", "conv-1") is None
         assert a._coalesced_turn_authority.get(key) is not user_record
-        assert (
-            a._ledger_record_for_message(reaction_record.message_id, "conv-1") is reaction_record
-        )
+        assert a._ledger_record_for_message(reaction_record.message_id, "conv-1") is reaction_record
 
     async def test_f312_coalesced_global_cap_evicts(
         self, runtime: Any, monkeypatch: pytest.MonkeyPatch
@@ -32412,9 +32561,7 @@ class TestTurnFrame:
         global_cap = 6
         per_chat_cap = 3
         monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_TURN_TARGETS", global_cap)
-        monkeypatch.setattr(
-            adapter_mod, "_MAX_COALESCED_TURN_TARGETS_PER_CHAT", per_chat_cap
-        )
+        monkeypatch.setattr(adapter_mod, "_MAX_COALESCED_TURN_TARGETS_PER_CHAT", per_chat_cap)
         a = runtime.adapter
         for chat_idx in range(3):
             conv = f"conv-global-{chat_idx}"
@@ -35697,507 +35844,497 @@ async def _assert_healthz(adapter: Any) -> None:
 
 
 class TestGatewayBridgePidPublication:
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_pid_tracks_serving_lifecycle(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      from hermes_a365.status import _UnavailableQuerySource, collect_status, overall_to_exit_code
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_pid_tracks_serving_lifecycle(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.status import _UnavailableQuerySource, collect_status, overall_to_exit_code
 
-      slug = "gateway-bridge-agent"
-      monkeypatch.delenv("AGENT_IDENTITY", raising=False)
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      assert not pid_path.exists()
+        slug = "gateway-bridge-agent"
+        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        assert not pid_path.exists()
 
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter.connect() is True
-      try:
-          await _assert_healthz(adapter)
-          assert pid_path.exists()
-          assert pid_path.read_text().strip() == str(os.getpid())
-          assert stat.S_IMODE(pid_path.stat().st_mode) == 0o600
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter.connect() is True
+        try:
+            await _assert_healthz(adapter)
+            assert pid_path.exists()
+            assert pid_path.read_text().strip() == str(os.getpid())
+            assert stat.S_IMODE(pid_path.stat().st_mode) == 0o600
 
-          report = collect_status(
-              slug,
-              hermes_home=home,
-              query_source=_UnavailableQuerySource(),
-          )
-          bridge = next(c for c in report.components if c.name == "activity_bridge")
-          assert bridge.state == "ok"
-          assert report.overall == "ok"
-          assert overall_to_exit_code(report.overall) == 0
-      finally:
-          await adapter.disconnect()
+            report = collect_status(
+                slug,
+                hermes_home=home,
+                query_source=_UnavailableQuerySource(),
+            )
+            bridge = next(c for c in report.components if c.name == "activity_bridge")
+            assert bridge.state == "ok"
+            assert report.overall == "ok"
+            assert overall_to_exit_code(report.overall) == 0
+        finally:
+            await adapter.disconnect()
 
-      assert not pid_path.exists()
-      report = collect_status(
-          slug,
-          hermes_home=home,
-          query_source=_UnavailableQuerySource(),
-      )
-      bridge = next(c for c in report.components if c.name == "activity_bridge")
-      assert bridge.state == "missing"
-      assert report.overall == "partial"
-      assert overall_to_exit_code(report.overall) == 1
+        assert not pid_path.exists()
+        report = collect_status(
+            slug,
+            hermes_home=home,
+            query_source=_UnavailableQuerySource(),
+        )
+        bridge = next(c for c in report.components if c.name == "activity_bridge")
+        assert bridge.state == "missing"
+        assert report.overall == "partial"
+        assert overall_to_exit_code(report.overall) == 1
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_no_pid_without_credentials(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      slug = "no-creds-agent"
-      home = Path(os.environ["HERMES_HOME"])
-      _seed_gateway_status_env(home, slug)
-      pid_path = home / "agents" / slug / "bridge.pid"
-      monkeypatch.delenv("A365_TENANT_ID", raising=False)
-      monkeypatch.delenv("A365_APP_ID", raising=False)
-      monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
-      monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
-      cfg = _StubPlatformConfig(extra={"slug": slug, "port": _reserve_local_port()})
-      adapter = adapter_mod.Agent365Adapter(cfg)
-      assert await adapter.connect() is False
-      assert not pid_path.exists()
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_no_pid_without_credentials(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "no-creds-agent"
+        home = Path(os.environ["HERMES_HOME"])
+        _seed_gateway_status_env(home, slug)
+        pid_path = home / "agents" / slug / "bridge.pid"
+        monkeypatch.delenv("A365_TENANT_ID", raising=False)
+        monkeypatch.delenv("A365_APP_ID", raising=False)
+        monkeypatch.delenv("A365_BLUEPRINT_CLIENT_SECRET", raising=False)
+        monkeypatch.delenv("A365_ALLOW_ALL_USERS", raising=False)
+        cfg = _StubPlatformConfig(extra={"slug": slug, "port": _reserve_local_port()})
+        adapter = adapter_mod.Agent365Adapter(cfg)
+        assert await adapter.connect() is False
+        assert not pid_path.exists()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_no_pid_on_persist_failure(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      slug = "persist-fail-agent"
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_no_pid_on_persist_failure(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "persist-fail-agent"
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
 
-      async def fail_persist(*, tentative: bool = False) -> int:
-          if tentative:
-              raise RuntimeError("persistence activation blocked")
-          return 1
+        async def fail_persist(*, tentative: bool = False) -> int:
+            if tentative:
+                raise RuntimeError("persistence activation blocked")
+            return 1
 
-      monkeypatch.setattr(adapter, "_activate_persist_owner", fail_persist)
-      assert await adapter.connect() is False
-      assert not pid_path.exists()
+        monkeypatch.setattr(adapter, "_activate_persist_owner", fail_persist)
+        assert await adapter.connect() is False
+        assert not pid_path.exists()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_no_pid_when_server_dies_before_commit(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      slug = "pre-commit-death"
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      original = adapter._activate_persist_owner
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_no_pid_when_server_dies_before_commit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "pre-commit-death"
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        original = adapter._activate_persist_owner
 
-      async def stop_before_commit(*, tentative: bool = False) -> int:
-          if tentative:
-              if adapter._uvicorn_task is not None:
-                  adapter._uvicorn_server.should_exit = True
-                  with contextlib.suppress(Exception):
-                      await asyncio.wait_for(adapter._uvicorn_task, timeout=2.0)
-              raise RuntimeError("blocked before persistence commit")
-          return await original(tentative=tentative)
+        async def stop_before_commit(*, tentative: bool = False) -> int:
+            if tentative:
+                if adapter._uvicorn_task is not None:
+                    adapter._uvicorn_server.should_exit = True
+                    with contextlib.suppress(Exception):
+                        await asyncio.wait_for(adapter._uvicorn_task, timeout=2.0)
+                raise RuntimeError("blocked before persistence commit")
+            return await original(tentative=tentative)
 
-      monkeypatch.setattr(adapter, "_activate_persist_owner", stop_before_commit)
-      assert await adapter.connect() is False
-      assert not pid_path.exists()
+        monkeypatch.setattr(adapter, "_activate_persist_owner", stop_before_commit)
+        assert await adapter.connect() is False
+        assert not pid_path.exists()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_pid_owner_survives_old_task_cleanup(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      from hermes_a365.status import _UnavailableQuerySource, collect_status
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_pid_owner_survives_old_task_cleanup(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.status import _UnavailableQuerySource, collect_status
 
-      slug = "owner-survival"
-      monkeypatch.delenv("AGENT_IDENTITY", raising=False)
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      older = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await older.connect() is True
-      newer = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await newer.connect() is True
-      try:
-          report = collect_status(
-              slug, hermes_home=home, query_source=_UnavailableQuerySource()
-          )
-          assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
-          older_task = older._uvicorn_task
-          assert older_task is not None
-          older._uvicorn_server.should_exit = True
-          await asyncio.wait_for(older_task, timeout=5.0)
-          assert pid_path.exists()
-          await older.disconnect()
-          assert pid_path.exists()
+        slug = "owner-survival"
+        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        older = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await older.connect() is True
+        newer = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await newer.connect() is True
+        try:
+            report = collect_status(slug, hermes_home=home, query_source=_UnavailableQuerySource())
+            assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
+            older_task = older._uvicorn_task
+            assert older_task is not None
+            older._uvicorn_server.should_exit = True
+            await asyncio.wait_for(older_task, timeout=5.0)
+            assert pid_path.exists()
+            await older.disconnect()
+            assert pid_path.exists()
 
-          newer_task = newer._uvicorn_task
-          assert newer_task is not None
-          newer._uvicorn_server.should_exit = True
-          await asyncio.wait_for(newer_task, timeout=5.0)
-          await asyncio.sleep(0.05)
-          assert not pid_path.exists()
-          report = collect_status(
-              slug, hermes_home=home, query_source=_UnavailableQuerySource()
-          )
-          assert (
-              next(c for c in report.components if c.name == "activity_bridge").state == "missing"
-          )
-      finally:
-          await newer.disconnect()
+            newer_task = newer._uvicorn_task
+            assert newer_task is not None
+            newer._uvicorn_server.should_exit = True
+            await asyncio.wait_for(newer_task, timeout=5.0)
+            await asyncio.sleep(0.05)
+            assert not pid_path.exists()
+            report = collect_status(slug, hermes_home=home, query_source=_UnavailableQuerySource())
+            assert (
+                next(c for c in report.components if c.name == "activity_bridge").state == "missing"
+            )
+        finally:
+            await newer.disconnect()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_pid_cleanup_preserves_foreign_pid(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      import subprocess
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_pid_cleanup_preserves_foreign_pid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import subprocess
 
-      slug = "foreign-pid"
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter.connect() is True
-      child = subprocess.Popen(["sleep", "30"])
-      try:
-          pid_path.write_text(str(child.pid))
-          await adapter.disconnect()
-          assert pid_path.read_text().strip() == str(child.pid)
-      finally:
-          child.terminate()
-          child.wait(timeout=5)
+        slug = "foreign-pid"
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter.connect() is True
+        child = subprocess.Popen(["sleep", "30"])
+        try:
+            pid_path.write_text(str(child.pid))
+            await adapter.disconnect()
+            assert pid_path.read_text().strip() == str(child.pid)
+        finally:
+            child.terminate()
+            child.wait(timeout=5)
 
-  @pytest.mark.asyncio
-  async def test_gateway_publication_preserves_status_pid_contract(
-      self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
-  ) -> None:
-      from hermes_a365._common import slugify
-      from hermes_a365.status import (
-          _UnavailableQuerySource,
-          collect_status,
-          gather_activity_bridge,
-      )
+    @pytest.mark.asyncio
+    async def test_gateway_publication_preserves_status_pid_contract(
+        self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    ) -> None:
+        from hermes_a365._common import slugify
+        from hermes_a365.status import (
+            _UnavailableQuerySource,
+            collect_status,
+            gather_activity_bridge,
+        )
 
-      slug = "status-contract"
-      monkeypatch.delenv("AGENT_IDENTITY", raising=False)
-      home = Path(os.environ["HERMES_HOME"])
-      _seed_gateway_status_env(home, slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter.connect() is True
-      try:
-          report = collect_status(
-              slug, hermes_home=home, query_source=_UnavailableQuerySource()
-          )
-          assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
+        slug = "status-contract"
+        monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+        home = Path(os.environ["HERMES_HOME"])
+        _seed_gateway_status_env(home, slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter.connect() is True
+        try:
+            report = collect_status(slug, hermes_home=home, query_source=_UnavailableQuerySource())
+            assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
 
-          display = "Status Contract"
-          assert slugify(display) == slug
-          display_report = collect_status(
-              display,
-              hermes_home=home,
-              query_source=_UnavailableQuerySource(),
-          )
-          assert (
-              next(c for c in display_report.components if c.name == "activity_bridge").state
-              == "missing"
-          )
+            display = "Status Contract"
+            assert slugify(display) == slug
+            display_report = collect_status(
+                display,
+                hermes_home=home,
+                query_source=_UnavailableQuerySource(),
+            )
+            assert (
+                next(c for c in display_report.components if c.name == "activity_bridge").state
+                == "missing"
+            )
 
-          other_home = tmp_path / "other-hermes"
-          other_home.mkdir()
-          other_profile = other_home / ".env"
-          other_profile.write_text((home / ".env").read_text())
-          other_profile.chmod(0o600)
-          other_agent = other_home / "agents" / slug
-          other_agent.mkdir(parents=True)
-          other_agent_env = other_agent / ".env"
-          other_agent_env.write_text("AA_INSTANCE_ID=other\n")
-          other_agent_env.chmod(0o600)
-          other_report = collect_status(
-              slug,
-              hermes_home=other_home,
-              query_source=_UnavailableQuerySource(),
-          )
-          assert (
-              next(c for c in other_report.components if c.name == "activity_bridge").state
-              == "missing"
-          )
+            other_home = tmp_path / "other-hermes"
+            other_home.mkdir()
+            other_profile = other_home / ".env"
+            other_profile.write_text((home / ".env").read_text())
+            other_profile.chmod(0o600)
+            other_agent = other_home / "agents" / slug
+            other_agent.mkdir(parents=True)
+            other_agent_env = other_agent / ".env"
+            other_agent_env.write_text("AA_INSTANCE_ID=other\n")
+            other_agent_env.chmod(0o600)
+            other_report = collect_status(
+                slug,
+                hermes_home=other_home,
+                query_source=_UnavailableQuerySource(),
+            )
+            assert (
+                next(c for c in other_report.components if c.name == "activity_bridge").state
+                == "missing"
+            )
 
-          other_slug_home = home / "agents" / "other-bridge"
-          other_slug_home.mkdir(parents=True)
-          other_slug_env = other_slug_home / ".env"
-          other_slug_env.write_text("AA_INSTANCE_ID=x\n")
-          other_slug_env.chmod(0o600)
-          assert gather_activity_bridge(home, "other-bridge").state == "missing"
+            other_slug_home = home / "agents" / "other-bridge"
+            other_slug_home.mkdir(parents=True)
+            other_slug_env = other_slug_home / ".env"
+            other_slug_env.write_text("AA_INSTANCE_ID=x\n")
+            other_slug_env.chmod(0o600)
+            assert gather_activity_bridge(home, "other-bridge").state == "missing"
 
-          monkeypatch.delenv("AGENT_IDENTITY", raising=False)
-          _write_matching_allow_all_profile()
-          default_adapter = adapter_mod.Agent365Adapter(
-              _StubPlatformConfig(extra={"port": _reserve_local_port()})
-          )
-          assert default_adapter.slug == ""
-          _seed_gateway_status_env(home, "default")
-          assert await default_adapter.connect() is True
-          default_slug_report = collect_status(
-              "default",
-              hermes_home=home,
-              query_source=_UnavailableQuerySource(),
-          )
-          assert (
-              next(
-                  c for c in default_slug_report.components if c.name == "activity_bridge"
-              ).state
-              == "ok"
-          )
-          await default_adapter.disconnect()
+            monkeypatch.delenv("AGENT_IDENTITY", raising=False)
+            _write_matching_allow_all_profile()
+            default_adapter = adapter_mod.Agent365Adapter(
+                _StubPlatformConfig(extra={"port": _reserve_local_port()})
+            )
+            assert default_adapter.slug == ""
+            _seed_gateway_status_env(home, "default")
+            assert await default_adapter.connect() is True
+            default_slug_report = collect_status(
+                "default",
+                hermes_home=home,
+                query_source=_UnavailableQuerySource(),
+            )
+            assert (
+                next(c for c in default_slug_report.components if c.name == "activity_bridge").state
+                == "ok"
+            )
+            await default_adapter.disconnect()
 
-          skill_report = collect_status(
-              None, hermes_home=home, query_source=_UnavailableQuerySource()
-          )
-          assert "activity_bridge" not in [c.name for c in skill_report.components]
-      finally:
-          await adapter.disconnect()
+            skill_report = collect_status(
+                None, hermes_home=home, query_source=_UnavailableQuerySource()
+            )
+            assert "activity_bridge" not in [c.name for c in skill_report.components]
+        finally:
+            await adapter.disconnect()
 
-      assert gather_activity_bridge(home, slug).state == "missing"
-      (home / "agents" / slug / "bridge.pid").write_text(str(os.getpid()))
-      assert gather_activity_bridge(home, slug).state == "ok"
-      malformed_path = home / "agents" / slug / "bridge.pid"
-      malformed_path.write_text("not-a-pid")
-      assert gather_activity_bridge(home, slug).state == "error"
-      malformed_path.write_text("99999999")
-      assert gather_activity_bridge(home, slug).state == "error"
-      assert gather_activity_bridge(home, "bad/name").state == "missing"
+        assert gather_activity_bridge(home, slug).state == "missing"
+        (home / "agents" / slug / "bridge.pid").write_text(str(os.getpid()))
+        assert gather_activity_bridge(home, slug).state == "ok"
+        malformed_path = home / "agents" / slug / "bridge.pid"
+        malformed_path.write_text("not-a-pid")
+        assert gather_activity_bridge(home, slug).state == "error"
+        malformed_path.write_text("99999999")
+        assert gather_activity_bridge(home, slug).state == "error"
+        assert gather_activity_bridge(home, "bad/name").state == "missing"
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_publish_chmod_failure_cleans_pid(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      from hermes_a365.status import _UnavailableQuerySource, collect_status
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_publish_chmod_failure_cleans_pid(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from hermes_a365.status import _UnavailableQuerySource, collect_status
 
-      slug = "chmod-fail-agent"
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      real_chmod = os.chmod
+        slug = "chmod-fail-agent"
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        real_chmod = os.chmod
 
-      def chmod_fail(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
-          if Path(path) == pid_path:
-              raise OSError("chmod denied after write")
-          real_chmod(path, mode, *args, **kwargs)
+        def chmod_fail(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+            if Path(path) == pid_path:
+                raise OSError("chmod denied after write")
+            real_chmod(path, mode, *args, **kwargs)
 
-      monkeypatch.setattr(os, "chmod", chmod_fail)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter.connect() is True
-      try:
-          assert not pid_path.exists()
-          bridge = next(
-              c
-              for c in collect_status(
-                  slug, hermes_home=home, query_source=_UnavailableQuerySource()
-              ).components
-              if c.name == "activity_bridge"
-          )
-          assert bridge.state == "missing"
-      finally:
-          await adapter.disconnect()
+        monkeypatch.setattr(os, "chmod", chmod_fail)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter.connect() is True
+        try:
+            assert not pid_path.exists()
+            bridge = next(
+                c
+                for c in collect_status(
+                    slug, hermes_home=home, query_source=_UnavailableQuerySource()
+                ).components
+                if c.name == "activity_bridge"
+            )
+            assert bridge.state == "missing"
+        finally:
+            await adapter.disconnect()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_disconnect_retires_without_uvicorn_callback(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      slug = "disconnect-only-retire"
-      pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter.connect() is True
-      task = adapter._uvicorn_task
-      assert task is not None
-      with contextlib.suppress(ValueError):
-          task.remove_done_callback(adapter._bridge_pid_uvicorn_done)
-      await adapter.disconnect()
-      assert not pid_path.exists()
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_disconnect_retires_without_uvicorn_callback(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "disconnect-only-retire"
+        pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter.connect() is True
+        task = adapter._uvicorn_task
+        assert task is not None
+        with contextlib.suppress(ValueError):
+            task.remove_done_callback(adapter._bridge_pid_uvicorn_done)
+        await adapter.disconnect()
+        assert not pid_path.exists()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_skips_publish_when_serve_task_done(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      slug = "dead-serve-task"
-      pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      done_task = asyncio.create_task(asyncio.sleep(0))
-      await done_task
-      adapter._bridge_pid_path = pid_path
-      adapter._bridge_pid_owner_token = "dead-task-token"
-      adapter._uvicorn_task = done_task
-      adapter._publish_bridge_pid_if_ready()
-      assert not pid_path.exists()
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_skips_publish_when_serve_task_done(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "dead-serve-task"
+        pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        done_task = asyncio.create_task(asyncio.sleep(0))
+        await done_task
+        adapter._bridge_pid_path = pid_path
+        adapter._bridge_pid_owner_token = "dead-task-token"
+        adapter._uvicorn_task = done_task
+        adapter._publish_bridge_pid_if_ready()
+        assert not pid_path.exists()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_published_only_after_commit(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      slug = "publish-order"
-      _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
-      order: list[str] = []
-      orig_commit = adapter_mod.Agent365Adapter._commit_persist_owner
-      orig_publish = adapter_mod.Agent365Adapter._publish_bridge_pid_if_ready
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_published_only_after_commit(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "publish-order"
+        _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+        order: list[str] = []
+        orig_commit = adapter_mod.Agent365Adapter._commit_persist_owner
+        orig_publish = adapter_mod.Agent365Adapter._publish_bridge_pid_if_ready
 
-      def track_commit(self: Any) -> None:
-          order.append("commit")
-          orig_commit(self)
+        def track_commit(self: Any) -> None:
+            order.append("commit")
+            orig_commit(self)
 
-      def track_publish(self: Any) -> None:
-          order.append("publish")
-          orig_publish(self)
+        def track_publish(self: Any) -> None:
+            order.append("publish")
+            orig_publish(self)
 
-      monkeypatch.setattr(adapter_mod.Agent365Adapter, "_commit_persist_owner", track_commit)
-      monkeypatch.setattr(
-          adapter_mod.Agent365Adapter, "_publish_bridge_pid_if_ready", track_publish
-      )
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter.connect() is True
-      assert order == ["commit", "publish"]
-      await adapter.disconnect()
+        monkeypatch.setattr(adapter_mod.Agent365Adapter, "_commit_persist_owner", track_commit)
+        monkeypatch.setattr(
+            adapter_mod.Agent365Adapter, "_publish_bridge_pid_if_ready", track_publish
+        )
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter.connect() is True
+        assert order == ["commit", "publish"]
+        await adapter.disconnect()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_no_pid_when_commit_raises(
-      self, monkeypatch: pytest.MonkeyPatch
-  ) -> None:
-      slug = "commit-raise"
-      pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_no_pid_when_commit_raises(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        slug = "commit-raise"
+        pid_path = _seed_gateway_status_env(Path(os.environ["HERMES_HOME"]), slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
 
-      def boom(self: Any) -> None:
-          raise RuntimeError("commit blocked before publish")
+        def boom(self: Any) -> None:
+            raise RuntimeError("commit blocked before publish")
 
-      monkeypatch.setattr(adapter_mod.Agent365Adapter, "_commit_persist_owner", boom)
-      with pytest.raises(RuntimeError, match="commit blocked"):
-          await adapter.connect()
-      assert not pid_path.exists()
+        monkeypatch.setattr(adapter_mod.Agent365Adapter, "_commit_persist_owner", boom)
+        with pytest.raises(RuntimeError, match="commit blocked"):
+            await adapter.connect()
+        assert not pid_path.exists()
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_pid_warnings_redact_contents(
-      self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-  ) -> None:
-      from hermes_a365 import activity_bridge as ab
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_pid_warnings_redact_contents(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from hermes_a365 import activity_bridge as ab
 
-      slug = "warn-redact"
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      canary = "CANARY_SECRET_VALUE"
-      real_chmod = os.chmod
+        slug = "warn-redact"
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        canary = "CANARY_SECRET_VALUE"
+        real_chmod = os.chmod
 
-      def chmod_fail(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
-          if Path(path) == pid_path:
-              raise OSError(canary)
-          real_chmod(path, mode, *args, **kwargs)
+        def chmod_fail(path: Any, mode: int, *args: Any, **kwargs: Any) -> None:
+            if Path(path) == pid_path:
+                raise OSError(canary)
+            real_chmod(path, mode, *args, **kwargs)
 
-      caplog.clear()
-      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
-          monkeypatch.setattr(os, "chmod", chmod_fail)
-          adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-          assert await adapter.connect() is True
-          await adapter.disconnect()
-      assert any("bridge pid publish failed" in r.message for r in caplog.records)
-      assert canary not in caplog.text
-      assert str(os.getpid()) not in caplog.text
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+            monkeypatch.setattr(os, "chmod", chmod_fail)
+            adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+            assert await adapter.connect() is True
+            await adapter.disconnect()
+        assert any("bridge pid publish failed" in r.message for r in caplog.records)
+        assert canary not in caplog.text
+        assert str(os.getpid()) not in caplog.text
 
-      original_read = Path.read_text
+        original_read = Path.read_text
 
-      def flaky_read(self: Path, *args: Any, **kwargs: Any) -> str:
-          if self == pid_path:
-              raise OSError(canary)
-          return original_read(self, *args, **kwargs)
+        def flaky_read(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == pid_path:
+                raise OSError(canary)
+            return original_read(self, *args, **kwargs)
 
-      caplog.clear()
-      monkeypatch.setattr(os, "chmod", real_chmod)
-      adapter2 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter2.connect() is True
-      monkeypatch.setattr(Path, "read_text", flaky_read)
-      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
-          adapter2._retire_bridge_pid_file()
-      assert any("bridge pid retire failed" in r.message for r in caplog.records)
-      assert canary not in caplog.text
+        caplog.clear()
+        monkeypatch.setattr(os, "chmod", real_chmod)
+        adapter2 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter2.connect() is True
+        monkeypatch.setattr(Path, "read_text", flaky_read)
+        with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+            adapter2._retire_bridge_pid_file()
+        assert any("bridge pid retire failed" in r.message for r in caplog.records)
+        assert canary not in caplog.text
 
-      original_remove = ab.remove_pid_file
+        original_remove = ab.remove_pid_file
 
-      def flaky_remove(path: Path) -> None:
-          if path == pid_path:
-              raise OSError(canary)
-          original_remove(path)
+        def flaky_remove(path: Path) -> None:
+            if path == pid_path:
+                raise OSError(canary)
+            original_remove(path)
 
-      caplog.clear()
-      adapter3 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter3.connect() is True
-      monkeypatch.setattr(ab, "remove_pid_file", flaky_remove)
-      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
-          await adapter3.disconnect()
-      assert any("bridge pid retire failed" in r.message for r in caplog.records)
-      assert canary not in caplog.text
+        caplog.clear()
+        adapter3 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter3.connect() is True
+        monkeypatch.setattr(ab, "remove_pid_file", flaky_remove)
+        with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+            await adapter3.disconnect()
+        assert any("bridge pid retire failed" in r.message for r in caplog.records)
+        assert canary not in caplog.text
 
-  @pytest.mark.asyncio
-  async def test_gateway_bridge_pid_io_errors_do_not_break_lifecycle(
-      self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
-  ) -> None:
-      from hermes_a365 import activity_bridge as ab
-      from hermes_a365.status import _UnavailableQuerySource, collect_status
+    @pytest.mark.asyncio
+    async def test_gateway_bridge_pid_io_errors_do_not_break_lifecycle(
+        self, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    ) -> None:
+        from hermes_a365 import activity_bridge as ab
+        from hermes_a365.status import _UnavailableQuerySource, collect_status
 
-      slug = "pid-io"
-      home = Path(os.environ["HERMES_HOME"])
-      pid_path = _seed_gateway_status_env(home, slug)
-      adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter.connect() is True
-      assert pid_path.exists()
-      await adapter.disconnect()
-      assert not pid_path.exists()
+        slug = "pid-io"
+        home = Path(os.environ["HERMES_HOME"])
+        pid_path = _seed_gateway_status_env(home, slug)
+        adapter = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter.connect() is True
+        assert pid_path.exists()
+        await adapter.disconnect()
+        assert not pid_path.exists()
 
-      canary = "CANARY_NOT_IN_WARNING"
-      original_write = ab.write_pid_file
+        canary = "CANARY_NOT_IN_WARNING"
+        original_write = ab.write_pid_file
 
-      def flaky_write(path: Path) -> None:
-          if path == pid_path:
-              path.parent.mkdir(parents=True, exist_ok=True)
-              path.write_text("partial")
-              raise OSError(canary)
-          original_write(path)
+        def flaky_write(path: Path) -> None:
+            if path == pid_path:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("partial")
+                raise OSError(canary)
+            original_write(path)
 
-      monkeypatch.setattr(ab, "write_pid_file", flaky_write)
-      adapter2 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter2.connect() is True
-      await _assert_healthz(adapter2)
-      assert not pid_path.exists() or pid_path.read_text().strip() != str(os.getpid())
+        monkeypatch.setattr(ab, "write_pid_file", flaky_write)
+        adapter2 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter2.connect() is True
+        await _assert_healthz(adapter2)
+        assert not pid_path.exists() or pid_path.read_text().strip() != str(os.getpid())
 
-      caplog.clear()
-      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
-          await adapter2.disconnect()
-      assert canary not in caplog.text
-      for record in caplog.records:
-          if "bridge pid" in record.message:
-              assert canary not in record.message
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+            await adapter2.disconnect()
+        assert canary not in caplog.text
+        for record in caplog.records:
+            if "bridge pid" in record.message:
+                assert canary not in record.message
 
-      read_calls = {"count": 0}
-      original_read_text = Path.read_text
+        read_calls = {"count": 0}
+        original_read_text = Path.read_text
 
-      def flaky_read(self: Path, *args: Any, **kwargs: Any) -> str:
-          if self == pid_path:
-              read_calls["count"] += 1
-              if read_calls["count"] == 1:
-                  raise OSError(canary)
-          return original_read_text(self, *args, **kwargs)
+        def flaky_read(self: Path, *args: Any, **kwargs: Any) -> str:
+            if self == pid_path:
+                read_calls["count"] += 1
+                if read_calls["count"] == 1:
+                    raise OSError(canary)
+            return original_read_text(self, *args, **kwargs)
 
-      original_unlink = Path.unlink
+        original_unlink = Path.unlink
 
-      def flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
-          if self == pid_path:
-              raise OSError(canary)
-          original_unlink(self, *args, **kwargs)
+        def flaky_unlink(self: Path, *args: Any, **kwargs: Any) -> None:
+            if self == pid_path:
+                raise OSError(canary)
+            original_unlink(self, *args, **kwargs)
 
-      monkeypatch.setattr(ab, "write_pid_file", original_write)
-      adapter3 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
-      assert await adapter3.connect() is True
-      report = collect_status(
-          slug, hermes_home=home, query_source=_UnavailableQuerySource()
-      )
-      assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
-      monkeypatch.setattr(Path, "read_text", flaky_read)
-      monkeypatch.setattr(Path, "unlink", flaky_unlink)
-      caplog.clear()
-      with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
-          adapter3._uvicorn_server.should_exit = True
-          await asyncio.wait_for(adapter3._uvicorn_task, timeout=5.0)
-          await asyncio.sleep(0.05)
-          await adapter3.disconnect()
-      assert canary not in caplog.text
+        monkeypatch.setattr(ab, "write_pid_file", original_write)
+        adapter3 = _make_adapter(monkeypatch, slug=slug, port=_reserve_local_port())
+        assert await adapter3.connect() is True
+        report = collect_status(slug, hermes_home=home, query_source=_UnavailableQuerySource())
+        assert next(c for c in report.components if c.name == "activity_bridge").state == "ok"
+        monkeypatch.setattr(Path, "read_text", flaky_read)
+        monkeypatch.setattr(Path, "unlink", flaky_unlink)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="hermes_a365.plugin.adapter"):
+            adapter3._uvicorn_server.should_exit = True
+            await asyncio.wait_for(adapter3._uvicorn_task, timeout=5.0)
+            await asyncio.sleep(0.05)
+            await adapter3.disconnect()
+        assert canary not in caplog.text
 
 
 class TestUpnObjectIdAllowlist:
@@ -36446,9 +36583,12 @@ class TestUpnObjectIdAllowlist:
             }
             monkeypatch.setattr(rt.adapter, "_open_handoff_session_db", lambda: db)
             monkeypatch.setattr(rt.adapter, "_close_handoff_session_db", lambda _db: None)
-            assert rt.adapter._lookup_live_origin_session(
-                conversation_id=ctx.conv["id"], user_id=self.OID
-            ) == "session-1"
+            assert (
+                rt.adapter._lookup_live_origin_session(
+                    conversation_id=ctx.conv["id"], user_id=self.OID
+                )
+                == "session-1"
+            )
             assert db.find_session_by_origin.call_args.kwargs["user_id"] == event.source.user_id
 
     @pytest.mark.parametrize(
@@ -36480,9 +36620,7 @@ class TestUpnObjectIdAllowlist:
             monkeypatch.setattr(rt.adapter, "_open_handoff_session_db", lambda: db)
             monkeypatch.setattr(rt.adapter, "_close_handoff_session_db", lambda _db: None)
             assert (
-                rt.adapter._lookup_live_origin_session(
-                    conversation_id=conv_id, user_id=self.OID
-                )
+                rt.adapter._lookup_live_origin_session(conversation_id=conv_id, user_id=self.OID)
                 == "session-1"
             )
             assert db.find_session_by_origin.call_args.kwargs["user_id"] == message_user_id
@@ -36516,9 +36654,7 @@ class TestUpnObjectIdAllowlist:
             assert "UPN/email" not in caplog.text
             assert "allowlist Graph resolution" not in caplog.text
 
-    async def test_path_b_listed_sender_admitted_while_expired_refresh_in_flight(
-        self, runtime
-    ):
+    async def test_path_b_listed_sender_admitted_while_expired_refresh_in_flight(self, runtime):
         import threading
         import urllib.error
 
@@ -36559,17 +36695,14 @@ class TestUpnObjectIdAllowlist:
             try:
                 assert self.post(rt, activity_id="start-grace").status_code == 200
                 assert await asyncio.to_thread(entered.wait, 2)
-                assert (
-                    self.post(rt, self.OTHER, activity_id="grace-unlisted").status_code == 403
-                )
+                assert self.post(rt, self.OTHER, activity_id="grace-unlisted").status_code == 403
                 grace_start = (
                     rt.adapter._upn_resolver._stale_until - bridge.UPN_OBJECT_ID_GRACE_SECONDS
                 )
                 rt.clock[0] = grace_start + bridge.UPN_OBJECT_ID_GRACE_SECONDS
                 assert self.post(rt, activity_id="past-grace").status_code == 403
                 assert (
-                    self.post(rt, self.OTHER, activity_id="past-grace-unlisted").status_code
-                    == 403
+                    self.post(rt, self.OTHER, activity_id="past-grace-unlisted").status_code == 403
                 )
             finally:
                 release.set()
@@ -36579,9 +36712,7 @@ class TestUpnObjectIdAllowlist:
 
             rt.client.portal.call(wait_refresh)
             assert self.post(rt, activity_id="failed-refresh").status_code == 403
-            assert (
-                self.post(rt, self.OTHER, activity_id="failed-unlisted").status_code == 403
-            )
+            assert self.post(rt, self.OTHER, activity_id="failed-unlisted").status_code == 403
             assert rt.fetch.call_count == 2
             assert "resolved 0 of 1 UPN/email allowlist entries to object IDs" in caplog.text
             rt.clock[0] += bridge.UPN_OBJECT_ID_TTL_SECONDS

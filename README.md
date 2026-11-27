@@ -176,6 +176,11 @@ proactive long-running reply pattern. Outstanding gaps:
   architecturally sound, picked up when concrete operator demand
   surfaces. User-delegated OBO is out of scope for 1.0 (#88).
 
+- **Model drafting remarks (Copilot app).** A reply can occasionally begin
+  with the model's own remarks about its draft (for example length or trimming
+  notes). This is model-side; separating them structurally is tracked in
+  [#383](../../issues/383).
+
 Three issues filed upstream during the validation walkthroughs:
 [microsoft/Agent365-devTools#402](https://github.com/microsoft/Agent365-devTools/issues/402)
 (cosmetic logging — fixed in 1.1.174),

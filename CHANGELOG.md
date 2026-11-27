@@ -8,6 +8,7 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
+- Copilot app: undisplayed intent lead-ins are no longer prefixed to long split replies; model remarks about a draft can still appear (#363, follow-up #383).
 - **`hermes-a365 allowlist resolve`** — offline stdin command that prints
   `A365_ALLOWED_USERS=<object-ids>` via the operator's `az login` (Refs #325).
 - Tests: harness coverage for stream retry limits and delivery cache expiry.

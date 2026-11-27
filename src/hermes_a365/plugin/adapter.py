@@ -7428,6 +7428,8 @@ class Agent365Adapter(BasePlatformAdapter):
             text = str(segment.get("text") or "").strip()
             if not text or _is_hermes_tool_progress_segment(text):
                 continue
+            if _segment_is_intent_preamble(text):
+                continue
             pending.append(segment)
         return pending
 
