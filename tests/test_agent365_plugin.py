@@ -16537,7 +16537,7 @@ class TestEditMessage:
         )
         summary = adapter_mod._plain_tool_progress_summary(duped)
         assert summary.splitlines() == ["💻 Running a command", "✍️ Writing a draft"]
-        repeated = "💻 Running wc -w foo (×3)"
+        repeated = "💻 Running wc -w foo (\u00d73)"
         assert adapter_mod._plain_tool_progress_summary(repeated) == "💻 Running a command"
 
     @pytest.mark.asyncio
