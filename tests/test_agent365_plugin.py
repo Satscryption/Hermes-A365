@@ -13066,7 +13066,7 @@ class TestEditMessage:
         await self._cancel_scheduled_turn_buffer_keepalive(buf)
         await a._emit_turn_buffer_keepalive(chat)
         assert len(rotation_finals) == 1
-        assert rotation_finals[0] == progress
+        assert rotation_finals[0] == adapter_mod._plain_tool_progress_summary(progress)
         await a.send(chat_id=chat, content="slept", reply_to="act-1")
         await a.on_processing_complete(event, outcome="success")
         assert send_reply_mock.await_count == 1
@@ -14294,7 +14294,9 @@ class TestEditMessage:
         assert buf.get("keepalive_rotated") is True
         assert not buf["keepalive"].get("stream_id")
         assert len(final_posts) == 1
-        assert final_posts[0]["text"] == progress_line
+        assert final_posts[0]["text"] == adapter_mod._plain_tool_progress_summary(
+            progress_line
+        )
         assert fact not in final_posts[0]["text"]
         await a.send(
             chat_id=chat,
@@ -16603,6 +16605,111 @@ class TestEditMessage:
         )
         assert notified.success is True
         assert [body for body in posts if body.get("text")]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("close_via", ["rotation", "age_budget"])
+    async def test_issue364_rotation_final_never_carries_raw_tool_line(
+        self, monkeypatch: pytest.MonkeyPatch, close_via: str
+    ) -> None:
+        """Keep-alive rotation and age-budget finals must not POST raw tool paths (#364)."""
+        a = _make_adapter(monkeypatch)
+        chat = f"conv-364-final-{close_via}"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "groupChat"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        monkeypatch.setattr(adapter_mod, "_TURN_BUFFER_KEEPALIVE_FIRST_SEC", 3600)
+        monkeypatch.setattr(adapter_mod, "_STREAMING_MIN_GAP_SEC", 0)
+        a._copilot_min_stream_age_before_final_sec = 0
+        raw_progress = (
+            "💻 Running wc -w /var/lib/hermes/.hermes/cache/scratch/draft.md"
+        )
+        plain_close = adapter_mod._plain_tool_progress_summary(raw_progress)
+        final_texts: list[str] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            body = kwargs["json"]
+            entity = (body.get("entities") or [{}])[0]
+            if entity.get("streamType") == "final":
+                final_texts.append(str(body.get("text") or ""))
+                return self._http_result(202)
+            if entity.get("streamType") == "informative" and "streamId" not in entity:
+                return self._http_result(201, f"ka-364-{close_via}")
+            return self._http_result(202)
+
+        a._http_client.post = post
+        event = _StubMessageEvent(
+            text="hi",
+            source=_StubSessionSource(platform=None, chat_id=chat),
+            message_id="act-1",
+        )
+        await a.on_processing_start(event)
+        buf = a._turn_buffers[chat]
+        await a.send(chat_id=chat, content="Pending answer", reply_to=None)
+        turn_seq = str(buf["turns"][0]["seq"])
+        buf["segments"] = [
+            {
+                "id": "turnbuf:364-progress",
+                "text": raw_progress,
+                "turn": turn_seq,
+                "kind": "progress",
+                "reply_to": "",
+                "notify": False,
+                "expect_edits": False,
+                "informative_update": False,
+            }
+        ]
+        buf["keepalive"] = {
+            "stream_id": f"stream-364-{close_via}",
+            "sequence": 1,
+            "opened_mono": time.monotonic(),
+        }
+        turn = a._keepalive_turn(buf)
+        assert turn is not None
+        record = a._delivery_record(buf, turn)
+        if close_via == "rotation":
+            rotate_at = adapter_mod._keepalive_rotation_age_sec()
+            buf["keepalive"]["opened_mono"] = time.monotonic() - (rotate_at + 0.01)
+            await a._emit_turn_buffer_keepalive(chat)
+        else:
+            max_age = adapter_mod._TURN_BUFFER_KEEPALIVE_STREAM_MAX_AGE_SEC
+            buf["keepalive"]["opened_mono"] = time.monotonic() - (max_age + 1.0)
+            record["may_have_landed"] = False
+            await a._maybe_route_plain_turn_answer(
+                chat, buf, turn, record, chunk_segment_ids=[]
+            )
+        assert final_texts, f"expected a stream final for {close_via}"
+        for text in final_texts:
+            assert text == plain_close
+            assert not self._issue364_forbidden_wire_fragment(text)
+        await a._drop_turn_buffer(chat)
+
+    @pytest.mark.asyncio
+    async def test_issue364_personal_progress_shaped_final_with_notify_delivered(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        a = _make_adapter(monkeypatch)
+        chat = "conv-364-personal-notify"
+        inbound = _make_inbound(conv_id=chat, activity_id="act-1")
+        inbound["conversation"]["conversationType"] = "personal"
+        self._wire_adapter(a, inbound=inbound)
+        self._patch_token_mint(monkeypatch)
+        posts: list[dict[str, Any]] = []
+
+        async def post(*_args: Any, **kwargs: Any) -> MagicMock:
+            posts.append(kwargs["json"])
+            return self._http_result(202, "msg-364-notify")
+
+        a._http_client.post = post
+        result = await a.send(
+            chat_id=chat,
+            content="💻 Running date",
+            reply_to=None,
+            metadata={"notify": True},
+        )
+        assert result.success is True
+        assert not str(result.message_id).startswith("progressoff:")
+        assert len(posts) == 1
 
     @pytest.mark.asyncio
     async def test_progress_only_turn_closes_informative_stream(
@@ -19042,7 +19149,7 @@ class TestEditMessage:
         buf["keepalive"]["opened_mono"] = time.monotonic() - (rotate_at + 0.01)
         await a._emit_turn_buffer_keepalive("conv-G-ka-seg")
         assert finals
-        assert finals[0] == "💻 Running noop"
+        assert finals[0] == adapter_mod._plain_tool_progress_summary("💻 Running noop")
         assert "keepalive" in closed_by_snap
         assert not buf["keepalive"].get("stream_id")
         await a._drop_turn_buffer("conv-G-ka-seg")

@@ -8525,7 +8525,14 @@ class Agent365Adapter(BasePlatformAdapter):
         if _is_hermes_tool_progress_segment(body_text):
             body_text = _plain_tool_progress_summary(body_text)
         if capped_final:
-            payload_text = text
+            if (
+                not message_chrome
+                and text is not None
+                and _is_hermes_tool_progress_segment(text)
+            ):
+                payload_text = body_text
+            else:
+                payload_text = text
         elif final and text is not None:
             payload_text = body_text[: self.MAX_MESSAGE_LENGTH]
         else:
