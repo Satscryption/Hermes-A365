@@ -75,6 +75,15 @@ Path: **B-CC**. Use lead-in + `sleep` probes from walk094 unless noted.
 | K3 | Lead-in + `sleep` long enough for stream age **~100 s** before answer (walk094 K3) | Progress line on stream throughout; rotation must remain **allowed** before post-tool answer | Stream age approaches cap without spurious “stuck” shell; no duplicate answer bubbles | Pre-#214: rotation blocked when lead-in was kept as answer |
 | K4 | Lead-in + tool **> 120 s** (for example `sleep 130`, walk094 K4) | Near **~115 s** stream age, one rotation close on old id; post-tool answer lands once (stream or plain after rotation per #247) | Rotation final ~115 s (`_keepalive_rotation_age_sec`); cap **120.0** s; `test_walk094_k4_keepalive_rotates_past_two_minute_stream_age_with_leadin` | Exercises stream-cap rotation (#214, #247) |
 
+## T — Teams 1:1 streamed reply Stop (Path A)
+
+Path: **Path A** Teams 1:1 personal chat. Long tool + answer prompts exercise
+progressive `streamType=streaming` delivery.
+
+| Row | Prompt (representative) | Expected UI | Stop | Expected log (minimum) | Notes |
+| --- | --- | --- | --- | --- | --- |
+| T1 | Long-running reply (lead-in + tool, then answer) | Stream renders progressively | Observe and record whether a Stop control is offered; if it is, press it and record whether the gateway receives any activity or a 403 on the next update; grade against the documented client limitation. | Sanitized adapter/bridge log for the turn | #338 |
+
 ## References
 
 - Code: `_informative_text_for_turn`, `_visible_informative_fallback_text`,

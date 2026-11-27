@@ -173,6 +173,17 @@ Out-of-scope decisions, with reasons:
   entirely. If you genuinely want web-chat reach, use a generic
   Direct Line skill rather than Hermes-A365.
 
+## Per-surface feature comparison
+
+Client capabilities on **Path A Teams 1:1** (personal chat) vs the
+**Microsoft 365 Copilot app** (Path B Copilot Chat and side-panels). See
+[`activity-protocol-shapes.md`](activity-protocol-shapes.md) → *Streaming and
+reply delivery* for wire behaviour.
+
+| Feature | Teams 1:1 | Microsoft 365 Copilot app |
+|---|---|---|
+| Stop control on streamed replies | not offered by the client | client-side only, no signal to the agent |
+
 ## Validation status
 
 | Surface | Walkthrough | Last validated | Result |

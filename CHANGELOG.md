@@ -10,6 +10,13 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 
+### Documentation
+
+- Document that Teams no longer offers a Stop control for streamed agent replies
+  and that Stop in the Microsoft 365 Copilot app does not reach the agent
+  (#338). State the Bot Framework streamed-message limit as ten minutes in
+  [`references/activity-protocol-shapes.md`](references/activity-protocol-shapes.md).
+
 ## [0.9.8] — 2026-11-23
 
 Stricter inbound token validation on Path B for the activity's claimed
