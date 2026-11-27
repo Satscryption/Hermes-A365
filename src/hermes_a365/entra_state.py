@@ -692,6 +692,76 @@ def graph_error_code(payload: Mapping[str, Any] | None) -> str:
     return _error_code(payload)
 
 
+_USER_LOOKUP_SELECT = frozenset({"id", "userPrincipalName"})
+_THROTTLE_CODES = frozenset({"activityLimitReached", "TooManyRequests"})
+
+
+def assert_user_lookup_url(url: str) -> None:
+    """Reject Graph user reads outside the delegated lookup surface."""
+    parts = urlsplit(url)
+    if parts.scheme != "https" or parts.netloc != _GRAPH_HOST or parts.fragment:
+        raise EntraStateError("refusing a Graph user lookup with an invalid request.")
+    select = _query_select(parts.query)
+    if select is None:
+        raise EntraStateError("refusing a Graph user lookup without $select.")
+    path = parts.path
+    if path.startswith("/v1.0/users/") and select <= _USER_LOOKUP_SELECT:
+        return
+    filt = parse_qs(parts.query, keep_blank_values=True).get("$filter", [""])[0]
+    if path == "/v1.0/users" and filt.startswith("mail eq ") and select == frozenset({"id"}):
+        return
+    raise EntraStateError("refusing an unsupported Graph user lookup.")
+
+
+def user_lookup_graph_get(mutator: Mutator) -> GraphGet:
+    def _status(code: str) -> int:
+        if code in _ACCESS_DENIED_CODES or code.startswith("AADSTS"):
+            return 403
+        if code in _NOT_FOUND_CODES:
+            return 404
+        return 429 if code in _THROTTLE_CODES else 503
+
+    def lookup(url: str) -> dict[str, Any]:
+        assert_user_lookup_url(url)
+        try:
+            text = (
+                mutator.run(["az", "rest", "--method", "GET", "--uri", url], sensitive=True).stdout
+                or ""
+            )
+        except CliInvocationError as exc:
+            if not exc.graph_error:
+                return {"status": 503, "error_code": "UnreadableGraphResponse"}
+            status = _status(exc.graph_error[0])
+            out = {"status": status, "error_code": exc.graph_error[0]}
+            if status == 429:
+                out["retry_after"] = 1
+            return out
+        except AADSTSError as exc:
+            return {"status": 403, "error_code": exc.code}
+        except OSError:
+            return {"status": 503, "error_code": "Unavailable"}
+        body = _parse_graph_json(text)
+        if not isinstance(body, dict):
+            return {"status": 503, "error_code": "UnreadableGraphResponse"}
+        if code := _error_code(body):
+            status = _status(code)
+            out = {"status": status, "error_code": code}
+            if status == 429:
+                out["retry_after"] = 1
+            return out
+        if isinstance(body.get("id"), str):
+            return {"status": 200, "error_code": "", "id": body["id"]}
+        rows = body.get("value") or []
+        ids = [str(row["id"]) for row in rows if isinstance(row, dict) and row.get("id")]
+        return (
+            {"status": 200, "error_code": "", "ids": ids}
+            if ids
+            else {"status": 503, "error_code": "UnreadableGraphResponse"}
+        )
+
+    return lookup
+
+
 def graph_get_from_mutator_for_secret_expiry(
     mutator: Mutator,
     *,

@@ -197,6 +197,25 @@
           },
           "subparsers_required": true
         },
+        "allowlist": {
+          "actions": [],
+          "subparsers": {
+            "resolve": {
+              "actions": [
+                {
+                  "dest": "verify",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--verify"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
+        },
         "bot-service": {
           "actions": [],
           "subparsers": {
@@ -1148,6 +1167,25 @@
             }
           },
           "subparsers_required": true
+        },
+        "allowlist": {
+          "actions": [],
+          "subparsers": {
+            "resolve": {
+              "actions": [
+                {
+                  "dest": "verify",
+                  "nargs": 0,
+                  "option_strings": [
+                    "--verify"
+                  ],
+                  "required": false
+                }
+              ],
+              "subparsers": {}
+            }
+          },
+          "subparsers_required": false
         },
         "bot-service": {
           "actions": [],

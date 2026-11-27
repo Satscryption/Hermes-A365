@@ -3491,10 +3491,7 @@ class TestSenderAllowlistPathBWarning:
         else:
             assert warning is not None
             assert expected_prefix in warning
-            assert (
-                "are resolved through Microsoft Graph with User.ReadBasic.All (application)"
-                in warning
-            )
+            assert "hermes-a365 allowlist resolve" in warning
             assert "activities carry object IDs (aadObjectId)" in warning
             assert "otherwise they match nobody on Path B" in warning
             assert all(entry not in warning for entry in users)
@@ -6162,3 +6159,68 @@ class TestUpnObjectIdResolver:
             else:
                 token.assert_called_once()
                 fetch.assert_called_once()
+
+
+def test_upn_entry_never_admits_sender_with_different_aad_object_id(monkeypatch):
+    from io import BytesIO
+
+    from hermes_a365 import activity_bridge as bridge
+
+    upn = "listed@contoso.example"
+    oid_x = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    oid_y = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+    cfg = _cfg()
+    cfg.allowed_users = (upn,)
+    cfg.allow_all_users = False
+    monkeypatch.setattr(bridge, "acquire_token", lambda **_kw: {"access_token": "token"})
+    resolver = bridge.UpnObjectIdResolver(
+        cfg,
+        fetch=lambda *_a, **_kw: BytesIO(json.dumps({"id": oid_x}).encode()),
+    )
+    resolver.refresh()
+    allowed = resolver.effective_allowed_users()
+    wrong = _inbound_message_activity()
+    wrong["from"] = {"aadObjectId": oid_y, "id": "29:opaque"}
+    assert not _activity_user_authorized(wrong, allowed_users=allowed, allow_all=False)
+
+    def deny(*_a, **_kw):
+        import urllib.error
+
+        raise urllib.error.HTTPError("https://graph.test", 403, "nope", {}, None)
+
+    resolver = bridge.UpnObjectIdResolver(cfg, fetch=deny)
+    resolver.refresh()
+    allowed = resolver.effective_allowed_users()
+    matched = _inbound_message_activity()
+    matched["from"] = {"aadObjectId": oid_x, "id": "29:opaque"}
+    assert not _activity_user_authorized(matched, allowed_users=allowed, allow_all=False)
+
+
+def test_path_b_sender_admitted_only_by_listed_object_id(monkeypatch):
+    from hermes_a365 import activity_bridge as bridge
+
+    oid_x = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+    cfg = _cfg()
+    cfg.allowed_users = (oid_x,)
+    cfg.allow_all_users = False
+    created = []
+
+    def factory(conf):
+        created.append(conf)
+        raise AssertionError("UpnObjectIdResolver must not run for object-id-only allowlists")
+
+    monkeypatch.setattr(bridge, "UpnObjectIdResolver", factory)
+    resolver = None
+    if any("@" in entry for entry in cfg.allowed_users):
+        resolver = bridge.UpnObjectIdResolver(cfg)
+    assert resolver is None
+    admitted = _inbound_message_activity()
+    admitted["from"] = {"aadObjectId": oid_x, "id": "29:opaque"}
+    assert _activity_user_authorized(
+        admitted, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+    )
+    upn_only = _inbound_message_activity()
+    upn_only["from"] = {"userPrincipalName": "someone@contoso.example", "id": "29:opaque"}
+    assert not _activity_user_authorized(
+        upn_only, allowed_users=cfg.allowed_users, allow_all=cfg.allow_all_users
+    )

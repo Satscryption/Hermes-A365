@@ -19,6 +19,7 @@ import sys
 def _build_parser() -> argparse.ArgumentParser:
     """Build the top-level ``hermes-a365`` parser."""
     from hermes_a365 import activity_bridge as _activity_bridge
+    from hermes_a365 import allowlist_resolve as _allowlist_resolve
     from hermes_a365 import bot_service as _bot_service
     from hermes_a365 import cleanup as _cleanup
     from hermes_a365 import consent as _consent
@@ -83,6 +84,15 @@ def _build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    allowlist_p = subs.add_parser("allowlist", help="Sender allowlist utilities")
+    allowlist_subs = allowlist_p.add_subparsers(dest="allowlist_command")
+    _allowlist_resolve.build_parser(
+        allowlist_subs.add_parser(
+            "resolve",
+            help="Resolve UPN/email allowlist entries to Entra object IDs (stdin)",
+        )
+    )
+
     return parser
 
 
@@ -133,6 +143,13 @@ def main(argv: list[str] | None = None) -> int:
     if sub == "bot-service":
         from hermes_a365 import bot_service
         return bot_service.run(args)
+    if sub == "allowlist":
+        allowlist_sub = getattr(args, "allowlist_command", None)
+        if allowlist_sub == "resolve":
+            from hermes_a365 import allowlist_resolve
+            return allowlist_resolve.run(args)
+        print("usage: hermes-a365 allowlist {resolve}", file=sys.stderr)
+        return 2
 
     print(f"unknown subcommand: {sub}", file=sys.stderr)
     return 2

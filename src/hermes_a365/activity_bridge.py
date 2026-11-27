@@ -1656,9 +1656,9 @@ def sender_allowlist_path_b_warning(policy: SenderAllowlist) -> str | None:
     else:
         prefix = f"A365_ALLOWED_USERS contains {alias_count} UPN/email entries"
     return (
-        f"{prefix}; Path B activities carry object IDs (aadObjectId). UPN/email entries "
-        "are resolved through Microsoft Graph with User.ReadBasic.All (application); "
-        "otherwise they match nobody on Path B."
+        f"{prefix}; Path B activities carry object IDs (aadObjectId). "
+        "Resolve UPN/email offline with `hermes-a365 allowlist resolve` "
+        "(stdin) before setting A365_ALLOWED_USERS; otherwise they match nobody on Path B."
     )
 
 
@@ -1723,7 +1723,7 @@ class UpnObjectIdResolver:
         log(
             "resolved %d of %d UPN/email allowlist entries to object IDs; "
             "%d unresolved entries match no Path B sender "
-            "(Graph User.ReadBasic.All application permission required)",
+            "(use `hermes-a365 allowlist resolve` to map UPN/email to object IDs)",
             resolved,
             len(self._cache),
             len(self._cache) - resolved,

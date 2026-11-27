@@ -17379,9 +17379,9 @@ def interactive_setup() -> None:
     print_info("Testing: A365_ALLOW_ALL_USERS=true accepts any signed-in tenant user.")
     print_info(
         "Production: set A365_ALLOWED_USERS to Entra object IDs (aadObjectId) for "
-        "Path B senders. UPN/email entries resolve through Graph with User.ReadBasic.All "
-        "(application, admin consent) on A365_BF_APP_ID when set, else the blueprint; "
-        "without it they match no Path B sender."
+        "Path B senders. For UPN/email entries, run "
+        "`hermes-a365 allowlist resolve` (stdin) and paste the emitted "
+        "A365_ALLOWED_USERS line before starting the gateway."
     )
     allow_all = prompt_yes_no(
         "Allow all users (testing only)?",

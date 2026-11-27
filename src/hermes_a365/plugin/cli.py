@@ -32,6 +32,7 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     # Deferred imports so plugin-load time doesn't pay for them when
     # the operator never invokes the CLI.
     from hermes_a365 import activity_bridge as _activity_bridge
+    from hermes_a365 import allowlist_resolve as _allowlist_resolve
     from hermes_a365 import bot_service as _bot_service
     from hermes_a365 import cleanup as _cleanup
     from hermes_a365 import consent as _consent
@@ -97,12 +98,22 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     )
     _bot_service.build_parser(bot_service_p)
 
+    allowlist_p = subs.add_parser("allowlist", help="Sender allowlist utilities")
+    allowlist_subs = allowlist_p.add_subparsers(dest="allowlist_command")
+    _allowlist_resolve.build_parser(
+        allowlist_subs.add_parser(
+            "resolve",
+            help="Resolve UPN/email allowlist entries to Entra object IDs (stdin)",
+        )
+    )
+
     subparser.set_defaults(func=a365_command)
 
 
 _USAGE = (
     "usage: hermes a365 "
-    "{doctor,license,register,consent,instance,publish,status,cleanup,activity-bridge,bot-service}"
+    "{doctor,license,register,consent,instance,publish,status,cleanup,"
+    "activity-bridge,bot-service,allowlist}"
 )
 
 
@@ -147,6 +158,13 @@ def a365_command(args: argparse.Namespace) -> int:
     if sub == "bot-service":
         from hermes_a365 import bot_service as _bot_service
         return _bot_service.run(args)
+    if sub == "allowlist":
+        allowlist_sub = getattr(args, "allowlist_command", None)
+        if allowlist_sub == "resolve":
+            from hermes_a365 import allowlist_resolve as _allowlist_resolve
+            return _allowlist_resolve.run(args)
+        print("usage: hermes a365 allowlist {resolve}", file=sys.stderr)
+        return 2
 
     print(f"unknown subcommand: {sub}", file=sys.stderr)
     print(_USAGE, file=sys.stderr)

@@ -8,6 +8,7 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 
 ## [Unreleased]
 
+- **`hermes-a365 allowlist resolve`** — offline, stdin-only operator command that resolves sender-allowlist UPN/email entries to Entra object IDs via delegated `az login` Graph reads. Refs [#325](https://github.com/Satscryption/Hermes-A365/issues/325).
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
 
 ## [0.9.8] — 2026-11-23

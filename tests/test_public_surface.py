@@ -257,10 +257,7 @@ def test_security_md_documents_d4_window() -> None:
     "relative_path",
     ["README.md", "docs/quickstart-path-b.md", "src/hermes_a365/plugin/adapter.py"],
 )
-def test_path_b_allowlist_documents_graph_application_permission(relative_path: str) -> None:
+def test_path_b_allowlist_documents_offline_resolve_command(relative_path: str) -> None:
     text = (REPO_ROOT / relative_path).read_text()
-    assert "User.ReadBasic.All" in text
-    assert "application, admin consent" in text
-    assert "A365_BF_APP_ID" in text
-    assert "else the blueprint" in text
-    assert "match no Path B sender" in text
+    assert "hermes-a365 allowlist resolve" in text
+    assert "aadObjectId" in text or "object ID" in text

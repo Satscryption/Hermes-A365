@@ -763,10 +763,9 @@ as `ok`.
 > runtimes deny every end user. The profile file must be owner-only
 > (`chmod 600`); a group- or world-readable file is refused without printing
 > its contents. Path B senders are matched by Entra object ID (`aadObjectId`).
-> UPN/email entries in `A365_ALLOWED_USERS` resolve through Graph and require
-> User.ReadBasic.All (application, admin consent) on the app minting the Path B
-> Graph token (`A365_BF_APP_ID` when set, else the blueprint); without it they
-> match no Path B sender.
+> When the allowlist lists UPNs or email addresses, run `hermes-a365 allowlist resolve`
+> with one entry per line on stdin (after `az login`) and set `A365_ALLOWED_USERS`
+> from the emitted comma-separated object IDs.
 > Bot Framework `personal` /
 > `groupChat` / `channel` values
 > are normalized to Hermes `dm` / `group` / `channel`; JWT-authenticated

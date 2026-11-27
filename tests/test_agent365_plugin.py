@@ -33843,10 +33843,7 @@ class TestSenderAllowlistPathBStartupWarning:
         else:
             assert len(warnings) == 1
             assert expected_fragment in warnings[0]
-            assert (
-                "are resolved through Microsoft Graph with User.ReadBasic.All (application)"
-                in warnings[0]
-            )
+            assert "hermes-a365 allowlist resolve" in warnings[0]
             assert "activities carry object IDs (aadObjectId)" in warnings[0]
             assert "otherwise they match nobody on Path B" in warnings[0]
             assert "one@example.test" not in caplog.text
