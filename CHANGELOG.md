@@ -9,6 +9,10 @@ From 1.0.0, versions follow SemVer 2.0.0 for the public surface frozen in docs/S
 ## [Unreleased]
 
 - Keep the 0.9.x packaging classifiers and the `register --aiteammate` refusal as in 0.9.6; the 1.0 changes return in 1.0.0 (#341, #342).
+- ``HERMES_A365_COPILOT_FIRST_TURN_PLAIN`` — optional, default off. When set,
+  the first Path B group-chat answer after a registered bot ``membersAdded`` may
+  be delivered as a plain message instead of an informative stream opener when
+  no stream is open at answer time.
 
 ## [0.9.8] — 2026-11-23
 

@@ -1117,6 +1117,14 @@ def _copilot_stream_timing_sec(
     return min(parsed, _COPILOT_STREAM_TIMING_MAX_SEC)
 
 
+def _copilot_first_turn_plain_enabled() -> bool:
+    """Parse HERMES_A365_COPILOT_FIRST_TURN_PLAIN (#290). Default off."""
+    raw = _profile_env("HERMES_A365_COPILOT_FIRST_TURN_PLAIN")
+    if raw is None:
+        return False
+    return str(raw).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class _KeepalivePost(NamedTuple):
     """One informative or final POST.
 
@@ -2120,6 +2128,9 @@ class Agent365Adapter(BasePlatformAdapter):
         self._copilot_short_turn_max_duration_sec = _copilot_stream_timing_sec(
             "HERMES_A365_COPILOT_SHORT_TURN_MAX_DURATION_SEC",
         )
+        self._copilot_first_turn_plain_enabled = _copilot_first_turn_plain_enabled()
+        if self._copilot_first_turn_plain_enabled:
+            logger.info("agent365 copilot first-turn plain reply enabled")
         self._orphan_keepalive: dict[str, dict[str, Any]] = {}
         # Incremented when a turn buffer is dropped; late openers from an older
         # epoch must be finalized, even after a new turn starts (#203).
@@ -9004,16 +9015,21 @@ class Agent365Adapter(BasePlatformAdapter):
                 chat_id,
             )
             return ("fallback", "open rejected")
-        if not stream_id and turn.get("copilot_first_contact"):
+        if not stream_id and (
+            turn.get("copilot_first_contact")
+            or self._copilot_first_turn_plain_due(chat_id, buf, turn)
+        ):
             # Claim a late marker exactly as stream delivery would, so plain
             # delivery releases it for this turn rather than pacing the next.
             self._copilot_needs_min_stream_age_before_final(chat_id, turn)
             turn["copilot_member_added_decided"] = True
+            reason = "first contact" if turn.get("copilot_first_contact") else "first turn plain"
             logger.info(
-                "agent365 turn buffer answer plain fallback: chat_id=%s reason=first contact",
+                "agent365 turn buffer answer plain fallback: chat_id=%s reason=%s",
                 chat_id,
+                reason,
             )
-            return ("fallback", "first contact")
+            return ("fallback", reason)
         return None
 
     async def _post_answer_final(
@@ -9634,6 +9650,25 @@ class Agent365Adapter(BasePlatformAdapter):
             if stream_id_now != stream_id_before:
                 return True
         return False
+
+    def _copilot_first_turn_plain_due(
+        self, chat_id: str, buf: dict[str, Any], turn: dict[str, Any]
+    ) -> bool:
+        if not self._copilot_first_turn_plain_enabled:
+            return False
+        if not self._is_copilot_turn_buffer_turn(turn):
+            return False
+        self._apply_copilot_member_added_to_turn(chat_id, turn)
+        if (
+            not turn.get("copilot_post_member_added")
+            and str(chat_id) in self._copilot_member_added_pending
+            and not turn.get("copilot_member_added_decided")
+        ):
+            self._remember_copilot_post_member_added(chat_id, turn)
+        if not turn.get("copilot_post_member_added"):
+            return False
+        stream = self._keepalive_stream(buf)
+        return not str(stream.get("stream_id") or "")
 
     def _copilot_needs_min_stream_age_before_final(
         self, chat_id: str, turn: dict[str, Any]
