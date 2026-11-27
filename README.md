@@ -772,6 +772,9 @@ as `ok`.
 > User.ReadBasic.All (application, admin consent) on the app minting the Path B
 > Graph token (`A365_BF_APP_ID` when set, else the blueprint); without it they
 > match no Path B sender.
+> Alternatively, without any Graph application permission, resolve UPN/email
+> entries once with your own `az login`: `printf '%s\n' <entries> | hermes-a365
+> allowlist resolve`, then paste the printed `A365_ALLOWED_USERS=` line.
 > Bot Framework `personal` /
 > `groupChat` / `channel` values
 > are normalized to Hermes `dm` / `group` / `channel`; JWT-authenticated

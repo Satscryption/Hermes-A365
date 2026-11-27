@@ -96,6 +96,9 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         help="Manage Path B Azure Bot Service resources (create / verify)",
     )
     _bot_service.build_parser(bot_service_p)
+    from hermes_a365 import allowlist_resolve as _allowlist_resolve
+
+    _allowlist_resolve.register(subs)
 
     subparser.set_defaults(func=a365_command)
 
@@ -147,6 +150,8 @@ def a365_command(args: argparse.Namespace) -> int:
     if sub == "bot-service":
         from hermes_a365 import bot_service as _bot_service
         return _bot_service.run(args)
+    if sub == "allowlist" and hasattr(args, "allowlist_run"):
+        return args.allowlist_run(args)
 
     print(f"unknown subcommand: {sub}", file=sys.stderr)
     print(_USAGE, file=sys.stderr)

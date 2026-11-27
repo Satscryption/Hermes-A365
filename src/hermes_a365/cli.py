@@ -83,6 +83,9 @@ def _build_parser() -> argparse.ArgumentParser:
         )
     )
 
+    from hermes_a365 import allowlist_resolve as _allowlist_resolve
+
+    _allowlist_resolve.register(subs)
     return parser
 
 
@@ -133,6 +136,8 @@ def main(argv: list[str] | None = None) -> int:
     if sub == "bot-service":
         from hermes_a365 import bot_service
         return bot_service.run(args)
+    if sub == "allowlist" and hasattr(args, "allowlist_run"):
+        return args.allowlist_run(args)
 
     print(f"unknown subcommand: {sub}", file=sys.stderr)
     return 2
